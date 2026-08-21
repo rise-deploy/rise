@@ -70,11 +70,14 @@ Two read granularities exist, and they are independent grants:
 
 Items the caller cannot `list` are omitted, and their existence is masked: a
 caller with no applicable grant receives an empty collection, never a `403`
-confirming the scope is populated. Addressing one resource by name is different —
-a `get`, `update`, or `delete` the caller does not hold is a `403`. Which
-*collections* exist stays visible to every caller who reaches the API at all,
-matching discovery being a property of the registry rather than of any one
-resource. Who reaches it is the platform-access policy's question rather than
+confirming the scope is populated. Addressing one resource by name is masked the
+same way — a caller who holds no `get` on it receives the `404` a name that does
+not exist receives, on every verb, so the item path cannot hand back one name at
+a time what the listing withholds. A caller who *can* read the resource is told
+which verb they are short instead, with a `403`: they already know it exists, and
+masking would only make the refusal harder to act on. Which *collections* exist
+stays visible to every caller who reaches the API at all, matching discovery
+being a property of the registry rather than of any one resource. Who reaches it is the platform-access policy's question rather than
 authorization's: these routes sit behind `auth.platform_access`, which under its
 default `allow_all` admits every authenticated user.
 
@@ -92,21 +95,35 @@ here. Access for anyone other than an operator comes from a binding.
 
 ### Authorization-changing writes
 
-Attaching a `metadata.ownerReferences` entry is authorized separately, because
-the edge is not inert: deleting the owner starts deletion of the dependent. A
-*new* reference requires `use` on the owner — §2's verb for referencing a
-resource from another resource's fields — and, when the dependent already
-exists, `delete` on the dependent, since the edge is what makes it deletable
-through someone else's resource. Re-sending references that are already stored
-is an ordinary read-modify-write.
+Changing the `metadata.ownerReferences` set is authorized separately, because
+the edge is not inert: deleting the owner starts deletion of the dependent.
+Attaching or removing a reference both require `use` on the owner — §2's verb
+for referencing a resource from another resource's fields. Attaching
+additionally requires `delete` on the dependent when it already exists, since
+the edge is what makes it deletable through someone else's resource; and
+`blockOwnerDeletion: true` requires `delete` on the *owner*, because that flag
+is not a reference but a hold on the owner's own deletion. Removing a reference
+whose owner is already gone or draining is ungated — the store will not accept
+such a reference back, so gating its removal would leave the dependent with no
+legal write at all. Re-sending references that are already stored is an ordinary
+read-modify-write.
 
 A write that changes who can do what — a `Role` or `PlatformRole` body, a
 binding, a `GroupMembership`, an identity or trust mapping, or a label some
 binding selects on — additionally passes ADR-0001 §5's **grant gate**: the
 authority the change would confer must already be held by the writer, over the
 same domain. Holding `create` on `PlatformRoleBinding` therefore does not let a
-caller bind a Role granting more than they have; the refusal is a `403` naming
-the recipient, the domain, and the missing authority.
+caller bind a Role granting more than they have; the refusal is a `403`.
+
+How much that refusal says depends on where its parts came from. A recipient, a
+domain, or a witness tuple the caller supplied in this request is named; one read
+out of stored policy is not, because a refusal that echoes it is a read of policy
+the caller may hold nothing on. So a refused binding create names the subject and
+scope it asked for, a refused `Role` edit names the statements just submitted but
+not the bindings that reference the Role, and a refused access-driving label write
+names neither the subject that would have gained authority nor what it would have
+gained. The full comparison is in the `rise::audit` `resource.grant_gate` record
+either way.
 
 The check and the mutation are one `SERIALIZABLE` transaction with bounded
 retry, so a concurrent revocation either precedes the check or forces the write
@@ -305,6 +322,14 @@ than list granularity projects (its UID and its finalizers): one the caller
 cannot `get` is counted in `hiddenBlockers` rather than named, so the report
 never reads as "nothing is blocking this" while something is.
 
+`hiddenBlockers` is itself a deliberate disclosure: it is a live count of
+resources the caller may not read, so a principal holding only
+`(get, Kind, deletion-blockers)` can watch it move as others create and delete
+children. That is accepted rather than overlooked — a blocker report that
+silently omits blockers is worse than one that says how many it withheld — but
+grant the subresource on that basis, not on the assumption that it reveals
+nothing about a subtree the caller cannot list.
+
 ## Status codes
 
 | Code | Meaning |
@@ -312,8 +337,8 @@ never reads as "nothing is blocking this" while something is.
 | 200 / 201 / 202 | Operation succeeded (200 read/update, 201 create, 202 cascade tombstoned) |
 | 400 | Malformed path, body validation, reserved finalizer prefix, wrong version |
 | 401 | No credentials or JWT verification failed |
-| 403 | Authenticated, but not an operator (or controller not in the allowlist) |
-| 404 | Unknown collection, unknown resource, kind/version mismatch on `uid:` |
+| 403 | Authorized to read the resource but not to perform this verb, or refused by the grant gate |
+| 404 | Unknown collection, unknown resource, kind/version mismatch on `uid:`, or a resource the caller may not read |
 | 405 | Method not valid for the addressed path (e.g. GET on `/status`) |
 | 409 | Name conflict on create, revision conflict on update |
 | 422 | Write targeting a served non-storage version (no conversion yet) |

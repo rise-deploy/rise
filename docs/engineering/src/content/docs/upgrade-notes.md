@@ -55,8 +55,10 @@ Merged to `develop`:
 
   - A collection listing by a caller with no `list` grant returns an **empty
     `200`**, not a `403`. This is deliberate existence masking: a `403` would
-    confirm the scope is populated. Naming one resource exactly is still a
-    `403`.
+    confirm the scope is populated. Naming one resource exactly is masked the
+    same way: a caller with no `get` on it receives a **`404`**, on every verb.
+    A caller who *can* read the resource still gets a `403` naming the verb they
+    are short.
   - Which *collections* exist is now visible to any authenticated caller, since
     the path is classified before any per-resource decision. What a collection
     contains is authorized per item.
@@ -79,12 +81,25 @@ Merged to `develop`:
   - A listing under an ancestor that does not exist returns an empty collection
     rather than `404`, so the ancestor path is not enumerable by name. Item
     paths and creates under a missing ancestor still fail.
-  - Attaching a new `metadata.ownerReferences` entry now requires `use` on the
-    owner, and — when the dependent already exists — `delete` on the dependent.
-    Deleting an owner starts deletion of its dependents, so attaching the edge
-    confers that; re-sending already-stored references is unaffected.
-  - `deletion-blockers` filters its blockers per item and reports a
-    `hiddenBlockers` count for those the caller cannot `list`.
+  - Changing the `metadata.ownerReferences` set is now authorized. Attaching or
+    removing a reference requires `use` on the owner; attaching additionally
+    requires `delete` on the dependent when it already exists, and setting
+    `blockOwnerDeletion: true` requires `delete` on the owner, since that flag
+    holds the owner's own deletion open. Removing a reference whose owner is
+    already gone or draining is ungated, so a dependent is never frozen behind
+    an owner nobody can revive. Re-sending already-stored references is
+    unaffected. Note that the shipped `resource-owner` role does **not** include
+    `use`, so owning a resource does not by itself let you make it the owner of
+    another — author a binding that grants `use` where you need that.
+  - `deletion-blockers` filters its blockers per item on `get` and reports a
+    `hiddenBlockers` count for those the caller cannot read. That count is a
+    deliberate disclosure: it moves as resources the caller cannot see are
+    created and deleted, so grant the subresource on that basis.
+  - A refused authorization-changing write says less than it did. Recipients,
+    domains, and the missing-authority tuples are named only when they came from
+    the request; anything read out of stored policy — including a label write's
+    entire witness list — is withheld. The full comparison is in the
+    `rise::audit` `resource.grant_gate` record.
   - An item a caller can `list` but not `get` is returned projected onto
     `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
     `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,

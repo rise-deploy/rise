@@ -372,6 +372,51 @@ impl AuthorizationContext {
         )))
     }
 
+    /// Require one tuple on a resource the caller addressed *by name*, masking
+    /// the resource's existence from a caller who may not read it.
+    ///
+    /// The collection path answers a listing the caller has no grant in with an
+    /// empty list rather than a 403, so that the ancestor tree is not
+    /// enumerable by name (ADR-0001 §4). A 403 on an item addressed by name
+    /// undoes exactly that: probe `…/organizations/acme`, read the status code,
+    /// and the masked listing above it has told you nothing the item path will
+    /// not confirm one name at a time.
+    ///
+    /// So the answer turns on `get`, not on the verb being attempted. A caller
+    /// who may read the resource gets an ordinary 403 naming the verb they are
+    /// short — they already know it exists, and a refusal they cannot read is
+    /// just a worse error message. A caller who may not read it is told the
+    /// same thing a nonexistent name is told. Both are audited as denials; only
+    /// the wording differs.
+    pub async fn require_visible(
+        &self,
+        target: &ResourceTree,
+        verb: Verb,
+        subresource: Option<&SubresourceName>,
+    ) -> Result<(), ServerError> {
+        if self.allows(target, verb, subresource).await? {
+            return Ok(());
+        }
+        if verb != Verb::Get && self.allows(target, Verb::Get, None).await? {
+            return self.require(target, verb, subresource).await;
+        }
+        let leaf = target.leaf();
+        tracing::warn!(
+            target: "rise::audit",
+            actor = %self.actor,
+            subject = %self.subject(),
+            verb = %verb_name(verb),
+            kind = %leaf.kind,
+            name = %leaf.name,
+            subresource = subresource.map(|s| s.as_ref()),
+            "resource.access_denied_masked"
+        );
+        Err(ServerError::not_found(format!(
+            "{} '{}' not found",
+            leaf.kind, leaf.name
+        )))
+    }
+
     /// Per-item `list`/`get` granularity for a collection (ADR-0001 §4).
     pub async fn filter_list(
         &self,
@@ -452,6 +497,17 @@ pub struct Disclosure {
     /// The domain is one the caller supplied, rather than one derived from
     /// stored policy or the resource tree.
     pub domain: bool,
+    /// The missing tuples were authored in this request, rather than read out
+    /// of a stored Role body the caller may hold no `get` on.
+    ///
+    /// This tracks separately from the other two because a rejection's *witness
+    /// list* has its own provenance: it names the tuples in the claim's `after`
+    /// side that the writer cannot justify. For a Role body edit that side is
+    /// the statements the caller just submitted, so naming them tells them
+    /// nothing they did not write. For a label write it is the body of whatever
+    /// stored Role the selecting binding points at, which is policy the caller
+    /// may not read at all.
+    pub tuples: bool,
 }
 
 impl Disclosure {
@@ -459,19 +515,30 @@ impl Disclosure {
     pub const FROM_REQUEST: Self = Self {
         recipient: true,
         domain: true,
+        tuples: true,
     };
-    /// The recipient is the caller's own, but the domains are derived — a label
-    /// write, whose domains are the written resource and its inheriting
-    /// subtree.
+    /// The recipient and the domains are derived, but the tuples are the
+    /// caller's own: a Role body edit, or a binding edit or delete whose
+    /// before-state the caller may hold no `get` on while its after-state is
+    /// the Role they just named.
+    pub const AUTHORED_TUPLES: Self = Self {
+        recipient: false,
+        domain: false,
+        tuples: true,
+    };
+    /// The recipient is the caller's own; nothing else is. A Group membership
+    /// write, whose domains and witness tuples both come from every stored
+    /// binding that names the Group.
     pub const RECIPIENT_ONLY: Self = Self {
         recipient: true,
         domain: false,
+        tuples: false,
     };
-    /// Everything is read out of stored policy: a Role body edit, or a binding
-    /// edit or delete whose before-state the caller may hold no `get` on.
+    /// Everything is read out of stored policy.
     pub const NONE: Self = Self {
         recipient: false,
         domain: false,
+        tuples: false,
     };
 }
 
@@ -552,10 +619,17 @@ fn render_rejection(rejection: &GateRejection, disclosure: Disclosure) -> String
                     format!(" over {}{selector}", domain.domain.scope)
                 })
                 .unwrap_or_default();
-            format!(
-                "{recipient} would gain {}{scope}, which you do not hold there",
-                render_tuples(missing)
-            )
+            // The witness list is the claim's after-side, which for a derived
+            // change is a stored Role body. Naming it turns a refusal into a
+            // read of policy the caller may hold nothing on — and, paired with
+            // the writes that succeed, into a probe for which label keys drive
+            // access and what the Roles behind them contain. The full list is
+            // in the `resource.grant_gate` audit record either way.
+            let gained = match disclosure.tuples {
+                true => render_tuples(missing),
+                false => "authority".to_owned(),
+            };
+            format!("{recipient} would gain {gained}{scope}, which you do not hold there")
         }
     }
 }
@@ -769,9 +843,10 @@ mod tests {
     /// A rejection whose recipient and domain were read out of stored policy —
     /// a Role edit, a binding edit — says neither. Rendering them would let a
     /// refused write enumerate other organizations' subjects and the resource
-    /// tree beneath the target.
+    /// tree beneath the target. The *tuples* are the caller's own submitted
+    /// statements there, so those are still named.
     #[test]
-    fn a_stored_policy_rejection_discloses_neither_recipient_nor_domain() {
+    fn a_stored_policy_rejection_discloses_only_the_authored_tuples() {
         let outcome = GateOutcome {
             claims: Vec::new(),
             rejections: vec![GateRejection {
@@ -798,7 +873,7 @@ mod tests {
         let error = gate_rejection_to_server_error(
             "editing PlatformRole 'shared'",
             &outcome,
-            Disclosure::NONE,
+            Disclosure::AUTHORED_TUPLES,
         );
         assert!(!error.message.contains("other-org"), "{}", error.message);
         assert!(
@@ -813,11 +888,34 @@ mod tests {
             error.message
         );
         // What is missing is still named: it is a verb and a kind, not an
-        // identity or a path.
+        // identity or a path — and here it is a verb and a kind out of the body
+        // the caller just submitted.
         assert!(
             error.message.contains("delete on example.dev/Widget"),
             "{}",
             error.message
+        );
+
+        // The same rejection under a disclosure that does not own its tuples —
+        // a label write, whose witness list is a stored Role body — names none
+        // of them.
+        let derived = gate_rejection_to_server_error(
+            "editing PlatformRole 'shared'",
+            &outcome,
+            change::label_disclosure(),
+        );
+        assert!(
+            !derived.message.contains("example.dev"),
+            "{}",
+            derived.message
+        );
+        assert!(!derived.message.contains("delete"), "{}", derived.message);
+        assert!(
+            derived
+                .message
+                .contains("another subject would gain authority"),
+            "{}",
+            derived.message
         );
     }
 

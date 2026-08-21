@@ -1227,18 +1227,21 @@ idempotent when a read-modify-write client replays the stored spec.
     `list_deletion_blockers` no longer issues `SET TRANSACTION` when it runs
     inside a caller's transaction, where the statement is a subtransaction and
     PostgreSQL would abort the whole thing.
-  - Reviewed and kept as-is: an item `get`/`update`/`delete` the caller does not
-    hold answers `403` on an existing resource and `404` on a missing one, which
-    confirms existence by name. Authorization here depends on the resource's own
-    labels, so it cannot be decided before the lookup; ADR-0001 §4 requires
-    masking for *collections*, which is implemented, and says nothing about a
-    caller who already names one resource exactly. Kubernetes answers the same
-    way. Recorded here because it is a decision rather than an oversight.
-  - Reviewed and kept as-is: the `deletion-blockers` subresource names the
-    blocking children whether or not the caller could `list` them individually.
-    Naming them is the whole content of the grant; the alternative is a
-    subresource that reports "something blocks this" and nothing more. Now
-    documented at the grant.
+  - Reviewed and kept as-is at the time: an item `get`/`update`/`delete` the
+    caller does not hold answers `403` on an existing resource and `404` on a
+    missing one, which confirms existence by name. ADR-0001 §4 requires masking
+    for *collections* and says nothing about a caller who already names one
+    resource exactly, and Kubernetes answers the same way. The fifth review
+    below overturns this on an argument neither the ADR nor Kubernetes
+    supplies — that it makes the masking on the sibling paths decorative — and
+    the item paths now mask too.
+  - Reviewed and kept as-is at the time: the `deletion-blockers` subresource
+    names the blocking children whether or not the caller could read them
+    individually. Naming them is the whole content of the grant; the alternative
+    is a subresource that reports "something blocks this" and nothing more. The
+    third review below reverses the unfiltered part — the blockers are a
+    collection and are filtered per item — while keeping a count of what was
+    withheld, which is what preserves the grant's content.
 - Third review — a second adversarial round, over the fixed code and treating
   the fixes themselves as unreviewed surface. Seven findings, all fixed here;
   two of them were in the previous round's fixes:
@@ -1296,6 +1299,9 @@ idempotent when a read-modify-write client replays the stored spec.
     authority. That is a verb and a kind, never an identity or a path, and it is
     what makes a refusal actionable at all; if Role bodies are ever meant to be
     confidential, `Disclosure` needs a third axis rather than a special case.
+    The fifth review takes that option: for a change whose witness list is read
+    out of stored policy rather than authored in the request, the tuples are now
+    suppressed too.
   - Raised against increment 9a's algebra and deliberately not changed here:
     `aggregate` credits a recipient's `before` policy with org-tier bindings
     that §1's recipient boundary makes inert for a non-member, which shrinks the
@@ -1343,6 +1349,69 @@ idempotent when a read-modify-write client replays the stored spec.
     `update` on a dependent outlive the cascade meant to collect it. Both
     directions now require `use` on the owner. `delete` on the dependent stays
     an attach-only requirement, because detaching confers deletion on nobody.
+- Fifth review — a fourth adversarial round, again aimed at the previous round's
+  own fixes. Six findings, all fixed here; one of them reverses a decision two
+  earlier rounds recorded as deliberate:
+  - **Addressing a resource by name was an existence oracle.** Recorded twice as
+    a considered decision — Kubernetes answers the same way, and ADR-0001 §4
+    mandates masking only for collections. The argument that overturns it is
+    internal rather than external: the *same handler* answers a listing the
+    caller has no grant in with an empty `200`, and a listing under a
+    nonexistent ancestor the same way, both explicitly so that the tree is not
+    enumerable by name. An item path that answers `403` for a resource that
+    exists and `404` for one that does not hands back, one name at a time,
+    exactly what the listing withholds — which makes the masking decorative. The
+    answer now turns on `get` rather than on the verb attempted: a caller who
+    may read the resource gets an ordinary `403` naming the verb they are short,
+    and a caller who may not gets the `404` a nonexistent name gets. Both are
+    audited as denials.
+  - **A refusal's witness tuples were the third thing worth suppressing.** The
+    previous round split disclosure into recipient and domain and noted that the
+    missing *tuples* still went out, judging them a verb and a kind rather than
+    an identity. They are also, for a derived change, a read of a stored Role
+    body: a label write's claim is `before ⊔ the selecting binding's statements`,
+    so the refusal reported the contents of a Role behind a binding the caller
+    may not read — and paired with the writes that *succeed* (a key no binding
+    selects on is not gated at all), it enumerates the install's access-driving
+    label keys and profiles the authority behind each. `Disclosure` gained a
+    third axis. It is not derivable from the other two: a `Role` body edit's
+    tuples come from the statements the caller just submitted, so that refusal
+    stays fully actionable while its recipient and domain stay hidden.
+  - **A refused label *removal* named a stored label key.** The operation string
+    is prepended outside every `Disclosure` check, and for a removal the key
+    comes from the stored label map rather than the request. A caller holding
+    `update` without `get` could read back a resource's access-driving keys one
+    refused write at a time — and `metadata.revision` is a small integer, so the
+    read-modify-write that path requires is not much of an obstacle. A removal
+    now says only that an access-driving label was removed; a *set*, whose key
+    and value are the caller's own, still names both.
+  - **`deletion-blockers` counted a store failure as a hidden blocker.** Every
+    error from resolving a blocker's ancestry was flattened to "not visible", so
+    a backend failure reported a number instead of an error and a retryable
+    classification would never have reached the loop. Only the not-found answer
+    is folded in now.
+  - **`blockOwnerDeletion` was bought with `use`.** The flag is not a reference
+    but a hold: the owner cannot be collected until the dependent drains, and a
+    dependent carrying a finalizer of its own never does. So `use` — §2's price
+    for *referencing* a resource — bought interference with someone else's
+    `delete`, on the create path with no dependent-side check at all. Raising
+    the flag now requires `delete` on the owner.
+  - **The detach gate could freeze a dependent permanently.** Requiring `use` to
+    remove a reference, added last round, has no answer for an owner that is
+    already gone: the store refuses to carry such a reference back, so the
+    dependent could neither keep the edge nor drop it, and every unrelated field
+    was frozen behind an owner nobody can revive. Detaching from an owner that
+    is absent or draining is ungated — it confers nothing on anyone.
+  - Recorded rather than fixed: `hiddenBlockers` is a live count of resources the
+    caller cannot read, so it moves as others create and delete them. It stays,
+    because a blocker report that silently omits blockers reads as "nothing is
+    blocking this" — but it is now documented as a disclosure at the grant
+    rather than left to be discovered.
+  - Confirmed as intended rather than changed: the shipped `resource-owner` role
+    excludes `use`, which a test pins deliberately. With owner references now
+    gated on `use`, that means owning a resource does not by itself let you make
+    it the owner of another. Widening shipped policy is a product decision, not a
+    review one; the operator note says so.
 - Follow-ups this increment deliberately leaves open:
   - **Group-targeted policy is dark until identity resources exist.** Ties
     resolve against `User` and `Group` resources that no login path writes yet,

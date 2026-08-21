@@ -709,7 +709,7 @@ async fn dispatch_get_inner(
         ResolvedPath::Item { resolved, leaf } => {
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
             let target = authz.tree(row.uid).await?;
-            authz.require(&target, Verb::Get, None).await?;
+            authz.require_visible(&target, Verb::Get, None).await?;
             Ok(Json(resource_response(
                 &row,
                 &resolved.info.api_version,
@@ -725,7 +725,7 @@ async fn dispatch_get_inner(
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
             let target = authz.tree(row.uid).await?;
             authz
-                .require(
+                .require_visible(
                     &target,
                     Verb::Get,
                     Some(&subresource_name(Subresource::DeletionBlockers)?),
@@ -752,8 +752,12 @@ async fn dispatch_get_inner(
                 let visible = match authz.tree(blocker.uid).await {
                     Ok(target) => authz.allows(&target, Verb::Get, None).await?,
                     // A blocker whose ancestry will not resolve cannot be
-                    // authorized; it is counted, never named.
-                    Err(_) => false,
+                    // authorized; it is counted, never named. Only that answer
+                    // is folded in — a store failure counted as "hidden" would
+                    // report a number instead of an error, and would hide a
+                    // retryable classification from the loop above.
+                    Err(error) if error.status == StatusCode::NOT_FOUND => false,
+                    Err(error) => return Err(error),
                 };
                 if !visible {
                     hidden += 1;
@@ -935,7 +939,9 @@ async fn update_once(
             let name = subresource_name(subresource.clone())?;
             match subresource {
                 Subresource::Status => {
-                    authz.require(&target, Verb::Update, Some(&name)).await?;
+                    authz
+                        .require_visible(&target, Verb::Update, Some(&name))
+                        .await?;
                     let body: ControllerStatusUpdate =
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
@@ -946,7 +952,9 @@ async fn update_once(
                     Ok(resp.into_response())
                 }
                 Subresource::Finalizers => {
-                    authz.require(&target, Verb::Update, Some(&name)).await?;
+                    authz
+                        .require_visible(&target, Verb::Update, Some(&name))
+                        .await?;
                     let body: ControllerFinalizerUpdate =
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
@@ -1221,7 +1229,8 @@ fn subresource_name(subresource: Subresource) -> Result<SubresourceName, ServerE
 /// it would make an unrelated update fail because of an edge someone else
 /// attached. The comparison is on the whole reference rather than its UID:
 /// raising `blockOwnerDeletion` on a stored edge strengthens it into a hold on
-/// the owner's deletion, which is a change and has to be authorized like one.
+/// the owner's deletion, which is a change and has to be authorized like one —
+/// with `delete` on the owner, because that is the authority the flag holds up.
 async fn authorize_owner_references(
     authz: &AuthorizationContext,
     dependent: Option<&ResourceTree>,
@@ -1251,7 +1260,11 @@ async fn authorize_owner_references(
     // lifecycle; detaching escapes one the owner's controller put the dependent
     // under, which would otherwise let anyone holding `update` on a dependent
     // outlive the cascade that was meant to collect it.
-    for reference in added.into_iter().chain(removed) {
+    for (reference, introduced) in added
+        .into_iter()
+        .map(|reference| (reference, true))
+        .chain(removed.into_iter().map(|reference| (reference, false)))
+    {
         // Refusals name neither the owner's kind nor its name, and read the same
         // whether or not the UID resolves: the caller addressed it by UID, and a
         // UID can travel further than the standing to read what it points at.
@@ -1263,6 +1276,15 @@ async fn authorize_owner_references(
                 reference.uid()
             ))
         };
+        // A detach from an owner that is gone or already draining is ungated.
+        // The store refuses to carry such a reference back (an absent owner is
+        // a 400, a tombstoned one likewise), so gating the removal would leave
+        // the dependent with no legal write at all: it could neither keep the
+        // edge nor drop it, and every unrelated field would be frozen behind an
+        // owner nobody can revive. Detaching from a dead owner confers nothing.
+        if !introduced && !owner_is_live(authz, reference.uid()).await? {
+            continue;
+        }
         let target = match authz.tree(reference.uid()).await {
             Ok(target) => target,
             Err(error) if error.status == StatusCode::NOT_FOUND => return Err(refusal()),
@@ -1271,8 +1293,31 @@ async fn authorize_owner_references(
         if !authz.allows(&target, Verb::Use, None).await? {
             return Err(refusal());
         }
+        // `blockOwnerDeletion` is not a claim on the owner's lifecycle but a
+        // hold on it: the owner cannot be collected until this dependent
+        // drains, and a dependent carrying a finalizer of its own never does.
+        // `use` is the price of *referencing* a resource (ADR-0001 §2); holding
+        // its deletion open is interference with `delete`, so that is the verb
+        // asked for. It cannot be masked to a UID — refusing the write for a
+        // reason the caller can act on requires naming which authority is
+        // short — so it runs after the `use` check, which has already
+        // established the caller may see this owner at all.
+        if introduced && reference.block_owner_deletion() {
+            authz.require(&target, Verb::Delete, None).await?;
+        }
     }
     Ok(())
+}
+
+/// Whether an owner UID still names a resource that is neither absent nor
+/// draining. Used only to decide whether *detaching* from it needs authority.
+async fn owner_is_live(authz: &AuthorizationContext, uid: Uuid) -> Result<bool, ServerError> {
+    Ok(authz
+        .store()
+        .get(uid)
+        .await
+        .map_err(store_error_to_server_error)?
+        .is_some_and(|row| row.deletion_timestamp.is_none()))
 }
 
 /// `allowedStatusControllerIds` is an authorization decision, and the only one
@@ -1509,7 +1554,7 @@ async fn update_resource(
     // measured against the world as it stands, which is also the world the
     // writer's own authority is measured in (ADR-0001 §6.6).
     let target = authz.tree(row.uid).await?;
-    authz.require(&target, Verb::Update, None).await?;
+    authz.require_visible(&target, Verb::Update, None).await?;
 
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
@@ -1578,7 +1623,7 @@ async fn delete_resource(
     response_api_version: &str,
 ) -> Result<Response, ServerError> {
     let target = authz.tree(row.uid).await?;
-    authz.require(&target, Verb::Delete, None).await?;
+    authz.require_visible(&target, Verb::Delete, None).await?;
     // Deleting policy is a grant: removing a Deny can enlarge what another
     // binding allows (ADR-0001 §5, scenario 31).
     run_gate(authz, change_for_delete(authz, row).await?).await?;
@@ -2259,16 +2304,16 @@ mod dispatch_tests {
         assert_eq!(body["items"].as_array().expect("items").len(), 0);
     }
 
-    /// An item the caller holds no `get` on is refused. Unlike a collection,
-    /// naming one resource exactly is not a scope the caller could be shown a
-    /// filtered view of.
+    /// An item the caller holds no `get` on answers exactly as a name that does
+    /// not exist does. A 403 here would hand back, one name at a time, every
+    /// name the masked listing above it withholds.
     #[sqlx::test]
-    async fn item_without_a_grant_is_refused(pool: sqlx::PgPool) {
+    async fn item_without_a_grant_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &[]).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
 
-        let err = dispatch_get_inner(
+        let refused = dispatch_get_inner(
             &ctx,
             "example.dev/v1/widgets/one".to_string(),
             auth(PLAIN_USER),
@@ -2276,8 +2321,61 @@ mod dispatch_tests {
         )
         .await
         .expect_err("no get grant");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        assert!(err.message.contains("not authorized to get"));
+        let absent = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/no-such-widget".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("no such resource");
+        assert_eq!(refused.status, StatusCode::NOT_FOUND, "{}", refused.message);
+        assert_eq!(absent.status, StatusCode::NOT_FOUND, "{}", absent.message);
+        assert!(
+            !refused.message.contains("authorized"),
+            "{}",
+            refused.message
+        );
+    }
+
+    /// A caller who *can* read the resource is told which verb they are short
+    /// instead: they already know it exists, so masking would only make the
+    /// refusal harder to act on.
+    #[sqlx::test]
+    async fn a_readable_item_refuses_a_write_by_name(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let widget = create_widget(&ctx, "example.dev/v1", "one").await;
+        grant_authenticated(
+            &ctx,
+            "widget-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/one".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "one", "revision": widget["metadata"]["revision"]},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("a reader may not write");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(
+            err.message.contains("not authorized to update"),
+            "{}",
+            err.message
+        );
     }
 
     /// A write is refused the same way, and the resource is left untouched.
@@ -2887,6 +2985,157 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// `blockOwnerDeletion` is not a reference but a hold: the owner cannot be
+    /// collected until the dependent drains. `use` buys the reference; holding
+    /// up a deletion costs `delete` on the owner.
+    #[sqlx::test]
+    async fn holding_an_owner_open_needs_delete_on_it(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
+        // Everything except `delete`.
+        grant_authenticated(
+            &ctx,
+            "widget-user",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list", "create", "update", "use"],
+            }]),
+        )
+        .await;
+        let reference = |blocking: bool| {
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "name": "owner",
+                "uid": owner["metadata"]["uid"],
+                "blockOwnerDeletion": blocking,
+            })
+        };
+        let create = |name: &str, blocking: bool| {
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": name, "ownerReferences": [reference(blocking)]},
+                "spec": {},
+            })
+        };
+
+        // The plain edge is fine: `use` is its price, and the caller holds it.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(PLAIN_USER),
+            create("plain", false),
+        )
+        .await
+        .expect("`use` carries an ordinary owner reference");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The same edge with the hold raised is not.
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(PLAIN_USER),
+            create("holding", true),
+        )
+        .await
+        .expect_err("holding the owner open needs `delete` on it");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(
+            err.message.contains("not authorized to delete"),
+            "{}",
+            err.message
+        );
+
+        // And an operator, who holds `delete`, may raise it.
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            create("held-by-operator", true),
+        )
+        .await
+        .expect("an operator holds delete on the owner");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// Detaching from an owner that is already gone is ungated. The store will
+    /// not accept the reference back, so gating its removal would leave the
+    /// dependent with no legal write at all — every unrelated field frozen
+    /// behind an owner nobody can revive.
+    #[sqlx::test]
+    async fn detaching_from_a_deleted_owner_is_ungated(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
+        let dependent = create_at(
+            &ctx,
+            "example.dev/v1/widgets",
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "ownerReferences": [{
+                        "apiVersion": "example.dev/v1",
+                        "kind": "Widget",
+                        "name": "owner",
+                        "uid": owner["metadata"]["uid"],
+                    }],
+                },
+                "spec": {},
+            }),
+        )
+        .await;
+        // Everything except `use` on the owner.
+        grant_authenticated(
+            &ctx,
+            "widget-admin",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list", "create", "update", "delete"],
+            }]),
+        )
+        .await;
+
+        // Remove the owner out from under the reference. The dependent is
+        // tombstoned by the cascade but not collected, so it is still writable.
+        ctx.store
+            .delete(uid_of(&owner))
+            .await
+            .expect("delete the owner");
+        // The cascade tombstoned the dependent, which bumped its revision.
+        let revision = ctx
+            .store
+            .get(uid_of(&dependent))
+            .await
+            .expect("read the dependent")
+            .expect("the dependent is tombstoned, not collected")
+            .revision;
+
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/dependent".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {
+                    "name": "dependent",
+                    "revision": revision,
+                    "ownerReferences": [],
+                },
+                "spec": {"size": "small"},
+            }),
+        )
+        .await
+        .expect("detaching from a dead owner confers nothing and is ungated");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// The blockers are a collection, so they are filtered per item — a caller
     /// holding the subresource but no `list` on the children below must not
     /// receive an inventory of them by name and UID. What is withheld is
@@ -3352,12 +3601,13 @@ mod dispatch_tests {
     // -------------------------------------------------------------------------
 
     #[sqlx::test]
-    async fn status_subresource_rejects_non_operator_user_with_403(pool: sqlx::PgPool) {
+    async fn status_subresource_rejects_a_user_holding_neither_grant(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &["controller.example.com"]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
-        // A non-operator user hitting a subresource path must be rejected with 403.
+        // Holding neither the subresource grant nor `get` on the resource, the
+        // subresource path is masked like the item path it hangs off.
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
@@ -3365,8 +3615,8 @@ mod dispatch_tests {
             json!({"status": {"phase": "Ready"}}),
         )
         .await
-        .expect_err("non-operator user must be rejected for status writes");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        .expect_err("a user without the subresource grant must be rejected");
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
 
         // Same for finalizers.
         let err = dispatch_put_inner(
@@ -3376,8 +3626,35 @@ mod dispatch_tests {
             json!({"add": ["x/y"], "remove": []}),
         )
         .await
-        .expect_err("non-operator user must be rejected for finalizer writes");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        .expect_err("a user without the subresource grant must be rejected");
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+
+        // A reader is told what they are short: they can already see the
+        // resource, so there is nothing left to mask.
+        grant_authenticated(
+            &ctx,
+            "widget-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/status".to_string(),
+            any_user(PLAIN_USER),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("a reader holds no status grant");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(
+            err.message.contains("not authorized to update"),
+            "{}",
+            err.message
+        );
     }
 
     #[sqlx::test]
@@ -4290,8 +4567,8 @@ mod dispatch_tests {
             PendingDeletionQuery::default(),
         )
         .await
-        .expect_err("non-operator must be rejected");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        .expect_err("a caller holding neither the subresource nor `get` is masked");
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
     }
 
     // -------------------------------------------------------------------------

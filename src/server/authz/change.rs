@@ -104,10 +104,11 @@ pub async fn change_for_create(
     let organization = organization_of(ctx, parent).await?;
     Ok(match kind {
         // A Role body's claims name every binding that references it — stored
-        // policy, in any organization.
+        // policy, in any organization. The tuples are the exception: they are
+        // the statements the caller just submitted.
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("creating {kind} '{name}'"),
-            disclosure: Disclosure::NONE,
+            disclosure: Disclosure::AUTHORED_TUPLES,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: name.to_owned(),
@@ -200,7 +201,7 @@ pub async fn change_for_update(
     Ok(match kind {
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
-            disclosure: Disclosure::NONE,
+            disclosure: Disclosure::AUTHORED_TUPLES,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: row.name.clone(),
@@ -210,10 +211,12 @@ pub async fn change_for_update(
             }),
         }],
         // The before-state is a stored row the caller may hold no `get` on, and
-        // a rejection cannot say which universe it came from.
+        // a rejection cannot say which universe it came from. What it may name
+        // is the authority the *new* state would confer, which arrives through
+        // the roleRef this request chose.
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
-            disclosure: Disclosure::NONE,
+            disclosure: Disclosure::AUTHORED_TUPLES,
             change: AuthorizationChange::Binding(BindingChange {
                 before: Some(Box::new(binding_state(
                     row.uid,
@@ -353,9 +356,14 @@ pub fn label_changes(
             ServerError::bad_request(format!("invalid label key '{key}': {error}"))
         })?;
         changes.push(GatedChange {
+            // A set names the key and value the caller just sent. A removal
+            // does not: the key comes from the stored label map, so naming it
+            // would let a caller holding `update` without `get` read back a
+            // resource's access-driving keys one refused write at a time. The
+            // full change is in the `resource.grant_gate` audit record.
             operation: match after_value {
                 Some(value) => format!("setting label '{key}' to '{value}'"),
-                None => format!("removing label '{key}'"),
+                None => "removing an access-driving label".to_owned(),
             },
             disclosure: label_disclosure(),
             change: AuthorizationChange::Label(LabelChange {
