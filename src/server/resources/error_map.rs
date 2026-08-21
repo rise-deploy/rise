@@ -7,9 +7,18 @@ use rise_resource_api::StoreError;
 
 use crate::server::error::ServerError;
 
+/// The one message every "the addressed resource is not available to you" answer
+/// carries, whether the resource is absent, an ancestor is absent, or the caller
+/// simply may not read it.
+///
+/// Item paths mask on `get` (ADR-0001 §4, and `AuthorizationContext::require_visible`),
+/// which only works if the masked answer is indistinguishable from the genuine
+/// one — status *and* body.
+pub const RESOURCE_NOT_FOUND: &str = "resource not found";
+
 pub fn store_error_to_server_error(err: StoreError) -> ServerError {
     match err {
-        StoreError::NotFound => ServerError::not_found("resource not found"),
+        StoreError::NotFound => ServerError::not_found(RESOURCE_NOT_FOUND),
         StoreError::RevisionConflict { expected, found } => ServerError::conflict(format!(
             "revision conflict: expected {expected}, found {found}"
         )),

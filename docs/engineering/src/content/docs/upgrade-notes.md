@@ -95,11 +95,18 @@ Merged to `develop`:
     `hiddenBlockers` count for those the caller cannot read. That count is a
     deliberate disclosure: it moves as resources the caller cannot see are
     created and deleted, so grant the subresource on that basis.
-  - A refused authorization-changing write says less than it did. Recipients,
-    domains, and the missing-authority tuples are named only when they came from
-    the request; anything read out of stored policy — including a label write's
-    entire witness list — is withheld. The full comparison is in the
+  - A refused authorization-changing write says less than it did. The recipient
+    and the domain are named only when they came from the request; what the
+    recipient would have gained is never named, because the gate compares their
+    whole effective policy over the domain and a witness can come from any
+    binding delivering policy to them. The full comparison is in the
     `rise::audit` `resource.grant_gate` record.
+  - Every `404` from these routes now carries the same body,
+    `{"error": "resource not found"}`. Clients that matched on the old wording
+    ("resource 'x' not found", "parent path segment not found") need updating.
+    Authorization also runs before the request body is inspected, so a `PUT`
+    with a malformed body against a resource the caller cannot read returns
+    `404` rather than `400`.
   - An item a caller can `list` but not `get` is returned projected onto
     `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
     `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,

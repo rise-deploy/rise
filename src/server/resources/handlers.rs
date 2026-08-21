@@ -33,7 +33,7 @@ use rise_resource_api::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::error_map::store_error_to_server_error;
+use super::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
 use super::models::{
     row_to_resource, row_to_resource_with_api_version, ControllerFinalizerUpdate,
     ControllerStatusUpdate, ResourceList,
@@ -540,17 +540,34 @@ async fn resolve_parent_row(
 }
 
 /// Resolve the leaf resource row for an item/subresource path.
+///
+/// Every 404 out of here carries the one body [`RESOURCE_NOT_FOUND`] carries,
+/// because this is the same answer a caller who may not read the resource gets
+/// from `require_visible`. Distinguishable wording would put the existence
+/// oracle straight back: the layers below have four ways of saying "no" — the
+/// leaf is missing, an ancestor is missing, the row is of another kind, the
+/// version is not declared — and each of those is itself a fact about a
+/// resource the caller may hold nothing on. One body, every time.
 async fn resolve_leaf(
     store: &Arc<dyn ResourceStore>,
     resolved: &ResolvedCollection,
     leaf: &LeafRef,
 ) -> Result<ResourceRow, ServerError> {
-    match leaf {
+    let row = match leaf {
         LeafRef::Named {
             ancestor_segs,
             name,
         } => resolve_item(store, ancestor_segs.clone(), &resolved.info, name).await,
         LeafRef::Uid(uid) => resolve_item_by_uid(store, resolved, *uid).await,
+    };
+    row.map_err(mask_not_found)
+}
+
+/// The single body every item-path 404 carries. See [`resolve_leaf`].
+fn mask_not_found(error: ServerError) -> ServerError {
+    match error.status {
+        StatusCode::NOT_FOUND => ServerError::not_found(RESOURCE_NOT_FOUND),
+        _ => error,
     }
 }
 
@@ -1008,12 +1025,16 @@ async fn dispatch_put_controller(
             leaf,
             subresource,
         } => {
-            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            // The allowlist decides before the row is resolved: a controller
+            // that is not on it must not learn whether the item it named
+            // exists. Collection existence it can already observe (see above),
+            // and that is the whole of what it learns here.
             enforce_controller_allowed(
                 &resolved.info,
                 &resolved.collection,
                 &controller.0.identity_id,
             )?;
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
             match subresource {
                 Subresource::Status => {
                     let body: ControllerStatusUpdate =
@@ -1418,8 +1439,13 @@ async fn create_resource(
         &body.metadata.name,
         &body.metadata.labels,
     )?;
-    let target = authz.tree_for_new(parent.map(|row| row.uid), leaf).await?;
-    authz.require(&target, Verb::Create, None).await?;
+    let parent_tree = match parent {
+        None => None,
+        Some(row) => Some(authz.tree(row.uid).await.map_err(mask_not_found)?),
+    };
+    let target =
+        ResourceTree::with_leaf(parent_tree.as_ref().map(|t| t.nodes()).unwrap_or(&[]), leaf);
+    authz.require_create(&target, parent_tree.as_ref()).await?;
 
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
@@ -1500,6 +1526,21 @@ async fn update_resource(
     leaf: &LeafRef,
     body: UpdateResourceRequest,
 ) -> Result<Json<serde_json::Value>, ServerError> {
+    // Authorization first, before a single word of the body is inspected.
+    //
+    // Everything below this line answers a question about the *stored* row —
+    // whether its version is the storage one, whether the body's name matches
+    // it, whether the body's finalizers match it — and each of those answers is
+    // a fact about a resource the caller may hold nothing on. A 400 or a 422
+    // reached before the decision confirms existence just as loudly as a 403
+    // would, and the finalizer comparison hands back stored content outright.
+    //
+    // The target also carries the resource's *stored* labels, which is what a
+    // §6.6 label diff has to be measured against: the world as it stands is the
+    // same world the writer's own authority is measured in.
+    let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
+    authz.require_visible(&target, Verb::Update, None).await?;
+
     // Reject writes to non-storage versions until version conversion is implemented.
     if resolved.info.api_version != resolved.info.storage_api_version {
         return Err(ServerError::new(
@@ -1549,12 +1590,6 @@ async fn update_resource(
              finalizers subresource, which is a separate grant",
         ));
     }
-
-    // The target carries the resource's *stored* labels: a label diff is
-    // measured against the world as it stands, which is also the world the
-    // writer's own authority is measured in (ADR-0001 §6.6).
-    let target = authz.tree(row.uid).await?;
-    authz.require_visible(&target, Verb::Update, None).await?;
 
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
@@ -2331,10 +2366,165 @@ mod dispatch_tests {
         .expect_err("no such resource");
         assert_eq!(refused.status, StatusCode::NOT_FOUND, "{}", refused.message);
         assert_eq!(absent.status, StatusCode::NOT_FOUND, "{}", absent.message);
+        // Byte for byte. A status code that matches while the body names the
+        // resource is not masking, it is a slower oracle.
+        assert_eq!(refused.message, absent.message);
         assert!(
             !refused.message.contains("authorized"),
             "{}",
             refused.message
+        );
+
+        // Every other way of addressing the same invisible resource answers the
+        // same: by UID, under a wrong-kind body, and on a write verb. The `uid:`
+        // form in particular has its own resolver with its own 404s.
+        let by_uid = dispatch_get_inner(
+            &ctx,
+            format!("example.dev/v1/widgets/uid:{}", Uuid::new_v4()),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("an unknown uid");
+        assert_eq!(by_uid.message, absent.message);
+
+        // A body that does not even name the right kind must not be inspected
+        // before the decision: a 400 here would confirm existence as loudly as
+        // a 403 would.
+        let wrong_kind = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/one".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Bogus",
+                "metadata": {"name": "one", "revision": 0},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("no update grant");
+        assert_eq!(
+            wrong_kind.status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            wrong_kind.message
+        );
+        assert_eq!(wrong_kind.message, absent.message);
+
+        let deleted = dispatch_delete_inner(
+            &ctx,
+            "example.dev/v1/widgets/one".to_string(),
+            auth(PLAIN_USER),
+        )
+        .await
+        .expect_err("no delete grant");
+        assert_eq!(deleted.status, StatusCode::NOT_FOUND, "{}", deleted.message);
+        assert_eq!(deleted.message, absent.message);
+    }
+
+    /// The finalizer screen compares against the *stored* list, so running it
+    /// before the authorization decision would let a caller read a resource's
+    /// finalizers off the difference between a 403 and a 404.
+    #[sqlx::test]
+    async fn a_stored_finalizer_is_not_reported_to_a_caller_who_cannot_read_it(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_at(
+            &ctx,
+            "example.dev/v1/widgets",
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "held", "finalizers": ["example.dev/cleanup"]},
+                "spec": {},
+            }),
+        )
+        .await;
+
+        // The body omits `finalizers`, which deserializes to an empty list and
+        // therefore differs from what is stored.
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/held".to_string(),
+            any_user(PLAIN_USER),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "held", "revision": 1},
+                "spec": {},
+            }),
+        )
+        .await
+        .expect_err("no update grant");
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+        assert!(!err.message.contains("finalizer"), "{}", err.message);
+    }
+
+    /// A create under a parent the caller cannot read is masked too. The leaf
+    /// does not exist yet, so there is nothing about *it* to conceal — but a
+    /// `403` for a real parent and a `404` for an absent one enumerates the
+    /// ancestor tree the list path masks.
+    #[sqlx::test]
+    async fn a_create_under_an_invisible_parent_is_masked(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_gadget_rd(&ctx, &[]).await;
+        create_org(&ctx, "acme").await;
+        let body = json!({
+            "apiVersion": "example.dev/v1",
+            "kind": "Gadget",
+            "metadata": {"name": "g1"},
+            "spec": {},
+        });
+
+        let under_real = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme".to_string(),
+            auth(PLAIN_USER),
+            body.clone(),
+        )
+        .await
+        .expect_err("no create grant");
+        let under_absent = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/no-such-org".to_string(),
+            auth(PLAIN_USER),
+            body.clone(),
+        )
+        .await
+        .expect_err("no such parent");
+        assert_eq!(
+            under_real.status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            under_real.message
+        );
+        assert_eq!(under_real.message, under_absent.message);
+
+        // A caller who can read the Organization is told what they are short.
+        grant_authenticated(
+            &ctx,
+            "org-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+        let visible = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/gadgets/acme".to_string(),
+            auth(PLAIN_USER),
+            body,
+        )
+        .await
+        .expect_err("still no create grant");
+        assert_eq!(visible.status, StatusCode::FORBIDDEN, "{}", visible.message);
+        assert!(
+            visible.message.contains("not authorized to create"),
+            "{}",
+            visible.message
         );
     }
 
@@ -4569,6 +4759,67 @@ mod dispatch_tests {
         .await
         .expect_err("a caller holding neither the subresource nor `get` is masked");
         assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+    }
+
+    /// The masking fallback is keyed on the *main-resource* read, not on the
+    /// verb: `(get, Kind, deletion-blockers)` is a different tuple from
+    /// `(get, Kind)`, so a caller holding full `get` still gets a refusal they
+    /// can act on rather than a 404 for a resource they can plainly see.
+    #[sqlx::test]
+    async fn a_reader_without_the_subresource_grant_is_refused_not_masked(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        grant_authenticated(
+            &ctx,
+            "org-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/deletion-blockers".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("the subresource is its own grant");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(err.message.contains("deletion-blockers"), "{}", err.message);
+    }
+
+    /// A controller that is not on the collection's allowlist must not learn
+    /// whether the item it named exists. The allowlist decides before the row
+    /// is resolved.
+    #[sqlx::test]
+    async fn an_unlisted_controller_cannot_probe_item_existence(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        create_widget(&ctx, "example.dev/v1", "real").await;
+
+        let present = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/real/status".to_string(),
+            any_controller("other.example.com"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("an unlisted controller is refused");
+        let absent = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/imaginary/status".to_string(),
+            any_controller("other.example.com"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("an unlisted controller is refused");
+        assert_eq!(present.status, StatusCode::FORBIDDEN, "{}", present.message);
+        assert_eq!(present.status, absent.status);
+        assert_eq!(present.message, absent.message);
     }
 
     // -------------------------------------------------------------------------

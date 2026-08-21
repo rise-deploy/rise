@@ -104,11 +104,10 @@ pub async fn change_for_create(
     let organization = organization_of(ctx, parent).await?;
     Ok(match kind {
         // A Role body's claims name every binding that references it — stored
-        // policy, in any organization. The tuples are the exception: they are
-        // the statements the caller just submitted.
+        // policy, in any organization.
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("creating {kind} '{name}'"),
-            disclosure: Disclosure::AUTHORED_TUPLES,
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: name.to_owned(),
@@ -201,7 +200,7 @@ pub async fn change_for_update(
     Ok(match kind {
         ROLE_KIND | PLATFORM_ROLE_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
-            disclosure: Disclosure::AUTHORED_TUPLES,
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::RoleBody(RoleBodyChange {
                 kind: role_ref_kind(kind),
                 name: row.name.clone(),
@@ -211,12 +210,10 @@ pub async fn change_for_update(
             }),
         }],
         // The before-state is a stored row the caller may hold no `get` on, and
-        // a rejection cannot say which universe it came from. What it may name
-        // is the authority the *new* state would confer, which arrives through
-        // the roleRef this request chose.
+        // a rejection cannot say which universe it came from.
         ROLE_BINDING_KIND | PLATFORM_ROLE_BINDING_KIND => vec![GatedChange {
             operation: format!("editing {kind} '{}'", row.name),
-            disclosure: Disclosure::AUTHORED_TUPLES,
+            disclosure: Disclosure::NONE,
             change: AuthorizationChange::Binding(BindingChange {
                 before: Some(Box::new(binding_state(
                     row.uid,

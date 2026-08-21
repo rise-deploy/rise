@@ -665,6 +665,64 @@ scope and avoiding dead-end compatibility layers.
     the role lookups fixes the first with no schema commitment and should come
     before any cross-request cache; the sequencing is tracked under `ROADMAP.md`
     § Unified identity and RBAC.
+- Sixth review — a fifth adversarial round, over the item-path masking and the
+  disclosure axis the fourth round added. Seven findings, all fixed here; the
+  first two show the masking was half-built and the third retracts a claim the
+  fourth round's commit message made:
+  - **The masked 404 and the genuine one had different bodies.** Status codes
+    matched — which is what the test asserted — while the messages read
+    `"rise.dev/Organization 'acme' not found"` versus `"resource not found"`.
+    The layers below have four ways of saying no (leaf missing, ancestor
+    missing, wrong kind, undeclared version) and each is itself a fact about a
+    resource the caller may hold nothing on. Every item-path 404 now carries one
+    constant body, funnelled through `resolve_leaf`, and the test compares the
+    two messages rather than just their status.
+  - **The update path answered four questions before authorizing.** The
+    non-storage-version 422, both name comparisons, and the finalizer screen all
+    ran ahead of the decision. Two were oracles on their own — a body naming the
+    wrong kind returned `400` for a resource that exists and `404` for one that
+    does not, on every collection — and the finalizer screen was worse than an
+    oracle: it compares against the *stored* list, so a caller with no grant at
+    all could read a resource's finalizers off the difference between a `403`
+    and a `404`. The `uid:` form's name comparison quoted the stored name
+    outright. Authorization now runs first, before a word of the body is
+    inspected, as the delete path already did.
+  - **`Disclosure`'s tuple axis rested on a false premise.** The fourth round
+    kept the witness list for Role and binding edits, reasoning that their
+    after-side is the caller's own submitted statements. It is not:
+    `claim.after` is `aggregate(...)`, the recipient's *whole* effective policy
+    over the domain with the written change overlaid onto the bindings it
+    touches. So removing a Deny from a Role you may edit but not read names the
+    kinds a different, unrelated Role was Allowing all along. No change shape
+    has request-provenance witnesses, so the axis is gone and the list is
+    withheld unconditionally. The refusal loses its actionable detail; the
+    `resource.grant_gate` audit record already carried the full comparison, and
+    narrowing the rendered list to tuples the request body itself enumerates
+    would restore some of it without the leak — recorded as a follow-up rather
+    than built here, because it is new logic in a renderer whose whole job is
+    not to say too much.
+  - **A create leaked the existence of a parent the caller cannot read.** The
+    leaf does not exist yet, so the fourth round left the create path on the
+    ordinary refusal — but the answer is a fact about the *parent*, and `403`
+    for a real parent against `404` for an absent one enumerates precisely the
+    ancestor tree the list path masks. A refused create under an unreadable
+    parent now reads as "no such path"; under a readable one it still names the
+    verb.
+  - **The masking fallback compared the verb instead of the tuple.** A caller
+    holding full `get` on a resource but not `(get, Kind, deletion-blockers)`
+    was masked, because the guard tested `verb != Get` and a subresource `get`
+    is still `Get`. Not a disclosure — just a `404` for a resource the caller
+    can plainly see. The guard compares `(verb, subresource)` now.
+  - **An unlisted controller could probe item existence.** The allowlist check
+    ran after the row lookup, so a controller token not on a collection's
+    `allowedStatusControllerIds` got `404` for an absent item and `403` for a
+    real one. The allowlist decides first; collection existence stays
+    observable, which it already was.
+  - Recorded rather than fixed: the `blockOwnerDeletion` refusal names the
+    owner's kind and name, unlike the `use` refusal beside it, which is masked
+    to a bare UID. It runs only after the `use` check has passed, so the caller
+    has already established they may reference that owner — but the asymmetry is
+    easy to widen by accident and is worth keeping in view.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are
@@ -1299,9 +1357,9 @@ idempotent when a read-modify-write client replays the stored spec.
     authority. That is a verb and a kind, never an identity or a path, and it is
     what makes a refusal actionable at all; if Role bodies are ever meant to be
     confidential, `Disclosure` needs a third axis rather than a special case.
-    The fifth review takes that option: for a change whose witness list is read
-    out of stored policy rather than authored in the request, the tuples are now
-    suppressed too.
+    The fifth and sixth reviews close this: the witness list is withheld
+    unconditionally, because it is drawn from the recipient's whole effective
+    policy rather than from anything the caller wrote.
   - Raised against increment 9a's algebra and deliberately not changed here:
     `aggregate` credits a recipient's `before` policy with org-tier bindings
     that §1's recipient boundary makes inert for a non-member, which shrinks the
@@ -1373,10 +1431,11 @@ idempotent when a read-modify-write client replays the stored spec.
     so the refusal reported the contents of a Role behind a binding the caller
     may not read — and paired with the writes that *succeed* (a key no binding
     selects on is not gated at all), it enumerates the install's access-driving
-    label keys and profiles the authority behind each. `Disclosure` gained a
-    third axis. It is not derivable from the other two: a `Role` body edit's
-    tuples come from the statements the caller just submitted, so that refusal
-    stays fully actionable while its recipient and domain stay hidden.
+    label keys and profiles the authority behind each. This round suppressed the
+    tuples for the derived shapes only, on the belief that a `Role` body edit's
+    witnesses are the statements the caller just submitted. The sixth review
+    shows that belief is false for every shape, and the tuples are now withheld
+    unconditionally.
   - **A refused label *removal* named a stored label key.** The operation string
     is prepended outside every `Disclosure` check, and for a removal the key
     comes from the stored label map rather than the request. A caller holding
@@ -1443,6 +1502,14 @@ idempotent when a read-modify-write client replays the stored spec.
     The name is now wrong for a non-operator writer; ADR-0002's subresource
     execution model owns the field separation and is where the naming is
     settled.
+  - A gate refusal no longer names what the recipient would have gained, which
+    costs a legitimate author the one detail that made it actionable. Narrowing
+    the rendered witness list to the intersection with the tuples the *request
+    body* enumerates would give that back with request provenance — but it is
+    new logic in the one renderer whose job is to say too little, and matching
+    algebra witnesses against a body's wildcard matchers is where it would go
+    wrong. Worth doing with the conformance suite in increment 11, which can
+    hold both halves.
   - Cross-request authorization caching stays measured rather than assumed, per
     `ROADMAP.md` §1: the request-local snapshot already removes the repeated
     cost inside one request.

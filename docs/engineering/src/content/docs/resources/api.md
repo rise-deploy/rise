@@ -68,6 +68,13 @@ Two read granularities exist, and they are independent grants:
   top-level field are absent, and so are `uid`, `revision`, and `discriminator`.
 - **`list` and `get`** returns the full stored object for that item.
 
+Every masked answer is byte-identical to the genuine one: status `404` and the
+body `{"error": "resource not found"}`, whether the resource is absent, an
+ancestor is absent, the row belongs to another collection, or the caller simply
+may not read it. Authorization runs before the request body is inspected, so a
+malformed body against an invisible resource is masked too rather than answered
+with a `400`.
+
 Items the caller cannot `list` are omitted, and their existence is masked: a
 caller with no applicable grant receives an empty collection, never a `403`
 confirming the scope is populated. Addressing one resource by name is masked the
@@ -115,15 +122,15 @@ authority the change would confer must already be held by the writer, over the
 same domain. Holding `create` on `PlatformRoleBinding` therefore does not let a
 caller bind a Role granting more than they have; the refusal is a `403`.
 
-How much that refusal says depends on where its parts came from. A recipient, a
-domain, or a witness tuple the caller supplied in this request is named; one read
-out of stored policy is not, because a refusal that echoes it is a read of policy
-the caller may hold nothing on. So a refused binding create names the subject and
-scope it asked for, a refused `Role` edit names the statements just submitted but
-not the bindings that reference the Role, and a refused access-driving label write
-names neither the subject that would have gained authority nor what it would have
-gained. The full comparison is in the `rise::audit` `resource.grant_gate` record
-either way.
+How much that refusal says depends on where its parts came from. A recipient or a
+domain the caller supplied in this request is named; one read out of stored policy
+is not, because a refusal that echoes it is a read of policy the caller may hold
+nothing on. So a refused binding create names the subject and scope it asked for,
+while a refused `Role` edit or label write names neither. What the recipient would
+have *gained* is never named: the gate compares their whole effective policy over
+the domain, so a witness tuple can come from any binding delivering policy to them
+— including ones the caller has never seen. The full comparison is in the
+`rise::audit` `resource.grant_gate` record.
 
 The check and the mutation are one `SERIALIZABLE` transaction with bounded
 retry, so a concurrent revocation either precedes the check or forces the write

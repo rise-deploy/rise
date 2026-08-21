@@ -44,7 +44,7 @@ use uuid::Uuid;
 use crate::db::models::User;
 use crate::server::auth::context::AuthContext;
 use crate::server::error::ServerError;
-use crate::server::resources::error_map::store_error_to_server_error;
+use crate::server::resources::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
 
 pub use change::{
     change_for_create, change_for_delete, change_for_update, label_changes, AuthorizationChangeSet,
@@ -299,21 +299,6 @@ impl AuthorizationContext {
             .map_err(authorization_error_to_server_error)
     }
 
-    /// The evaluation target for a resource that has no row yet: the parent's
-    /// ancestry plus the proposed leaf (ADR-0001 §4 — a create is authorized
-    /// against the resource it would produce, labels included).
-    pub async fn tree_for_new(
-        &self,
-        parent_uid: Option<Uuid>,
-        leaf: ResourceNode,
-    ) -> Result<ResourceTree, ServerError> {
-        let ancestors = match parent_uid {
-            None => Vec::new(),
-            Some(parent) => self.tree(parent).await?.nodes().to_vec(),
-        };
-        Ok(ResourceTree::with_leaf(&ancestors, leaf))
-    }
-
     /// Whether the caller may perform one tuple on one target.
     pub async fn allows(
         &self,
@@ -397,7 +382,12 @@ impl AuthorizationContext {
         if self.allows(target, verb, subresource).await? {
             return Ok(());
         }
-        if verb != Verb::Get && self.allows(target, Verb::Get, None).await? {
+        // The fallback is keyed on the main-resource read, so `(get, Kind, sub)`
+        // — a different tuple from `(get, Kind)` — still reaches it. Comparing
+        // the verb alone would mask a subresource refusal from a caller holding
+        // full `get` on the resource, which discloses nothing and is simply a
+        // worse answer.
+        if (verb, subresource) != (Verb::Get, None) && self.allows(target, Verb::Get, None).await? {
             return self.require(target, verb, subresource).await;
         }
         let leaf = target.leaf();
@@ -411,10 +401,45 @@ impl AuthorizationContext {
             subresource = subresource.map(|s| s.as_ref()),
             "resource.access_denied_masked"
         );
-        Err(ServerError::not_found(format!(
-            "{} '{}' not found",
-            leaf.kind, leaf.name
-        )))
+        Err(ServerError::not_found(RESOURCE_NOT_FOUND))
+    }
+
+    /// Require `create`, masking a parent the caller may not read.
+    ///
+    /// The leaf does not exist yet, so there is nothing about *it* to conceal —
+    /// but the answer is still a fact about its parent. The list path under an
+    /// ancestor that does not exist answers empty rather than 404 precisely so
+    /// the tree is not enumerable, and a create that answers 403 for a real
+    /// parent and 404 for an absent one puts that back. So a refused create
+    /// under a parent the caller cannot read reads as "no such path"; one under
+    /// a parent they *can* read names the verb they are short.
+    ///
+    /// `parent` is `None` for a root-scoped kind, where there is no parent to
+    /// conceal and the ordinary refusal applies.
+    pub async fn require_create(
+        &self,
+        target: &ResourceTree,
+        parent: Option<&ResourceTree>,
+    ) -> Result<(), ServerError> {
+        if self.allows(target, Verb::Create, None).await? {
+            return Ok(());
+        }
+        if let Some(parent) = parent {
+            if !self.allows(parent, Verb::Get, None).await? {
+                let leaf = parent.leaf();
+                tracing::warn!(
+                    target: "rise::audit",
+                    actor = %self.actor,
+                    subject = %self.subject(),
+                    verb = "create",
+                    kind = %leaf.kind,
+                    name = %leaf.name,
+                    "resource.access_denied_masked"
+                );
+                return Err(ServerError::not_found(RESOURCE_NOT_FOUND));
+            }
+        }
+        self.require(target, Verb::Create, None).await
     }
 
     /// Per-item `list`/`get` granularity for a collection (ADR-0001 §4).
@@ -497,17 +522,6 @@ pub struct Disclosure {
     /// The domain is one the caller supplied, rather than one derived from
     /// stored policy or the resource tree.
     pub domain: bool,
-    /// The missing tuples were authored in this request, rather than read out
-    /// of a stored Role body the caller may hold no `get` on.
-    ///
-    /// This tracks separately from the other two because a rejection's *witness
-    /// list* has its own provenance: it names the tuples in the claim's `after`
-    /// side that the writer cannot justify. For a Role body edit that side is
-    /// the statements the caller just submitted, so naming them tells them
-    /// nothing they did not write. For a label write it is the body of whatever
-    /// stored Role the selecting binding points at, which is policy the caller
-    /// may not read at all.
-    pub tuples: bool,
 }
 
 impl Disclosure {
@@ -515,30 +529,18 @@ impl Disclosure {
     pub const FROM_REQUEST: Self = Self {
         recipient: true,
         domain: true,
-        tuples: true,
-    };
-    /// The recipient and the domains are derived, but the tuples are the
-    /// caller's own: a Role body edit, or a binding edit or delete whose
-    /// before-state the caller may hold no `get` on while its after-state is
-    /// the Role they just named.
-    pub const AUTHORED_TUPLES: Self = Self {
-        recipient: false,
-        domain: false,
-        tuples: true,
     };
     /// The recipient is the caller's own; nothing else is. A Group membership
-    /// write, whose domains and witness tuples both come from every stored
-    /// binding that names the Group.
+    /// write, whose domains come from every stored binding that names the
+    /// Group.
     pub const RECIPIENT_ONLY: Self = Self {
         recipient: true,
         domain: false,
-        tuples: false,
     };
     /// Everything is read out of stored policy.
     pub const NONE: Self = Self {
         recipient: false,
         domain: false,
-        tuples: false,
     };
 }
 
@@ -603,7 +605,7 @@ fn render_rejection(rejection: &GateRejection, disclosure: Disclosure) -> String
         RejectionReason::OperatorStandingRequired => {
             format!("{recipient} would gain operator standing, which only an operator may confer")
         }
-        RejectionReason::InsufficientAuthority(missing) => {
+        RejectionReason::InsufficientAuthority(_missing) => {
             let scope = rejection
                 .domain
                 .as_ref()
@@ -619,68 +621,20 @@ fn render_rejection(rejection: &GateRejection, disclosure: Disclosure) -> String
                     format!(" over {}{selector}", domain.domain.scope)
                 })
                 .unwrap_or_default();
-            // The witness list is the claim's after-side, which for a derived
-            // change is a stored Role body. Naming it turns a refusal into a
-            // read of policy the caller may hold nothing on — and, paired with
-            // the writes that succeed, into a probe for which label keys drive
-            // access and what the Roles behind them contain. The full list is
-            // in the `resource.grant_gate` audit record either way.
-            let gained = match disclosure.tuples {
-                true => render_tuples(missing),
-                false => "authority".to_owned(),
-            };
-            format!("{recipient} would gain {gained}{scope}, which you do not hold there")
+            // The witness list is never rendered, whatever the change shape.
+            // It is drawn from the claim's after-side, and that side is not the
+            // caller's submission but `aggregate(...)` — the recipient's *whole*
+            // effective policy over the domain, with the written change overlaid
+            // onto the bindings it touches. So a witness can come from any other
+            // binding delivering policy to the same recipient: removing a Deny
+            // from a Role you may edit but not read names the kinds that a
+            // different, unrelated Role was Allowing all along. Rendering that
+            // is a read of stored policy through a refusal, and paired with the
+            // writes that succeed it profiles the install. The full comparison
+            // is in the `resource.grant_gate` audit record.
+            format!("{recipient} would gain authority{scope} that you do not hold there")
         }
     }
-}
-
-/// The algebra enumerates equivalence classes, so a witness may be a synthetic
-/// probe kind or subresource meaning "any other". Rendering those verbatim would
-/// point a caller at a resource kind that does not exist.
-fn render_tuples(tuples: &[PermissionTuple]) -> String {
-    let mut rendered: Vec<String> = tuples
-        .iter()
-        .map(|tuple| {
-            let kind = if is_probe_kind(&tuple.kind) {
-                "any other resource kind".to_owned()
-            } else {
-                tuple.kind.to_string()
-            };
-            match &tuple.subresource {
-                None => format!("{} on {kind}", verb_name(tuple.verb)),
-                Some(name) if is_probe_subresource(name) => {
-                    format!(
-                        "{} on any other subresource of {kind}",
-                        verb_name(tuple.verb)
-                    )
-                }
-                Some(name) => format!("{} on {kind}/{name}", verb_name(tuple.verb)),
-            }
-        })
-        .collect();
-    rendered.sort();
-    rendered.dedup();
-    // A long witness list is a symptom, not information: the first few name the
-    // shape of what is missing and the rest repeat it across kinds.
-    const MAX_WITNESSES: usize = 4;
-    if rendered.len() > MAX_WITNESSES {
-        let remaining = rendered.len() - MAX_WITNESSES;
-        rendered.truncate(MAX_WITNESSES);
-        format!("{} (and {remaining} more)", rendered.join(", "))
-    } else {
-        rendered.join(", ")
-    }
-}
-
-const PROBE_GROUP_SUFFIX: &str = ".invalid";
-const PROBE_PREFIX: &str = "policy-subset-probe";
-
-fn is_probe_kind(kind: &ResourceKind) -> bool {
-    kind.group().starts_with(PROBE_PREFIX) && kind.group().ends_with(PROBE_GROUP_SUFFIX)
-}
-
-fn is_probe_subresource(name: &SubresourceName) -> bool {
-    name.as_ref().starts_with(PROBE_PREFIX)
 }
 
 /// Map an engine failure onto the response it deserves.
@@ -750,59 +704,6 @@ mod tests {
         }
     }
 
-    /// Tier 0 enumerates equivalence classes, so a witness can be a synthetic
-    /// kind or subresource standing for "any other". Echoing one at a caller
-    /// would point them at a resource kind that does not exist.
-    #[test]
-    fn probe_witnesses_render_as_any_other() {
-        let rendered = render_tuples(&[
-            tuple(
-                Verb::Get,
-                "policy-subset-probe.invalid/PolicySubsetProbe",
-                None,
-            ),
-            tuple(
-                Verb::Update,
-                "example.dev/Widget",
-                Some("policy-subset-probe"),
-            ),
-            tuple(Verb::Delete, "example.dev/Widget", None),
-        ]);
-        assert!(
-            rendered.contains("get on any other resource kind"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("update on any other subresource of example.dev/Widget"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains("delete on example.dev/Widget"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("PolicySubsetProbe"), "{rendered}");
-    }
-
-    /// A long witness list is a symptom rather than information: the first few
-    /// name the shape of what is missing and the rest repeat it across kinds.
-    #[test]
-    fn a_long_witness_list_is_truncated_with_a_count() {
-        let kinds = [
-            "a.example/One",
-            "b.example/Two",
-            "c.example/Three",
-            "d.example/Four",
-            "e.example/Five",
-            "f.example/Six",
-        ];
-        let tuples: Vec<_> = kinds
-            .iter()
-            .map(|kind| tuple(Verb::Delete, kind, None))
-            .collect();
-        let rendered = render_tuples(&tuples);
-        assert!(rendered.ends_with("(and 2 more)"), "{rendered}");
-    }
-
     /// A refusal names the operation, the recipient, the domain, and what is
     /// missing — not a `(scope, selector)` pair and a tuple list.
     #[test]
@@ -837,16 +738,19 @@ mod tests {
             .starts_with("creating RoleBinding 'x' would grant"));
         assert!(error.message.contains("group:acme/platform"));
         assert!(error.message.contains("rise.dev/Organization/acme"));
-        assert!(error.message.contains("delete on example.dev/Widget"));
+        // The subject and the scope came from the request, so both are named.
+        // What the subject would have *gained* did not — the witness list is
+        // drawn from their whole effective policy over that scope — so it is
+        // withheld even here.
+        assert!(!error.message.contains("example.dev"), "{}", error.message);
     }
 
     /// A rejection whose recipient and domain were read out of stored policy —
     /// a Role edit, a binding edit — says neither. Rendering them would let a
     /// refused write enumerate other organizations' subjects and the resource
-    /// tree beneath the target. The *tuples* are the caller's own submitted
-    /// statements there, so those are still named.
+    /// tree beneath the target.
     #[test]
-    fn a_stored_policy_rejection_discloses_only_the_authored_tuples() {
+    fn a_stored_policy_rejection_discloses_neither_recipient_nor_domain() {
         let outcome = GateOutcome {
             claims: Vec::new(),
             rejections: vec![GateRejection {
@@ -873,7 +777,7 @@ mod tests {
         let error = gate_rejection_to_server_error(
             "editing PlatformRole 'shared'",
             &outcome,
-            Disclosure::AUTHORED_TUPLES,
+            Disclosure::NONE,
         );
         assert!(!error.message.contains("other-org"), "{}", error.message);
         assert!(
@@ -887,36 +791,12 @@ mod tests {
             "{}",
             error.message
         );
-        // What is missing is still named: it is a verb and a kind, not an
-        // identity or a path — and here it is a verb and a kind out of the body
-        // the caller just submitted.
-        assert!(
-            error.message.contains("delete on example.dev/Widget"),
-            "{}",
-            error.message
-        );
-
-        // The same rejection under a disclosure that does not own its tuples —
-        // a label write, whose witness list is a stored Role body — names none
-        // of them.
-        let derived = gate_rejection_to_server_error(
-            "editing PlatformRole 'shared'",
-            &outcome,
-            change::label_disclosure(),
-        );
-        assert!(
-            !derived.message.contains("example.dev"),
-            "{}",
-            derived.message
-        );
-        assert!(!derived.message.contains("delete"), "{}", derived.message);
-        assert!(
-            derived
-                .message
-                .contains("another subject would gain authority"),
-            "{}",
-            derived.message
-        );
+        // Nor the witness tuples. They are drawn from the recipient's whole
+        // effective policy over the domain, not from the caller's submission,
+        // so any one of them can have come from a binding the caller has never
+        // seen.
+        assert!(!error.message.contains("example.dev"), "{}", error.message);
+        assert!(!error.message.contains("delete on"), "{}", error.message);
     }
 
     /// A label write discloses neither side. The gate resolves the recipient
