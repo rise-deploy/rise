@@ -61,7 +61,7 @@ Merged to `develop`:
     the path is classified before any per-resource decision. What a collection
     contains is authorized per item.
 
-  Three response-shape changes come with it, all additive:
+  Behaviour changes on the request/response surface:
 
   - `metadata.effectiveLabels` is present on every resource response, resolved
     live from the ancestor chain (nearest value wins per key).
