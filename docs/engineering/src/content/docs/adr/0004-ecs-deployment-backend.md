@@ -110,10 +110,25 @@ re-create a prior deployment's exact workload rather than roll a mutable service
 back through a task-definition revision.
 
 Cost: service churn per deploy, service-per-deployment pressure on the
-per-cluster service quota (soft, raisable — exact figure to confirm, see
-[Open questions](#open-questions)), and `DeleteService` draining time on GC.
-An in-place service update would avoid all three but would give up overlap,
-per-deployment observability, and clean rollback. We take the churn.
+per-cluster service quota — **5,000 services per cluster, not adjustable**
+(verified 2026-08) — and `DeleteService` draining time on GC. The quota bounds
+*concurrently existing* services (retired deployments are GC'd), so it caps an
+install at ~5,000 live (deployment × container) pairs per cluster; large
+installs shard across clusters. An in-place service update would avoid all
+three costs but would give up overlap, per-deployment observability, and clean
+rollback. We take the churn.
+
+ECS also natively expresses old/new overlap *within* one service: **task sets**
+under the `EXTERNAL` deployment controller (one task set per Rise deployment,
+each with its own task definition and scale). That would relieve the service
+quota entirely and is the documented reason the `ECS_TASK_SET_EXTERNAL_ID`
+Cloud Map attribute exists. It is not the primary design because the task-set
+API surface is markedly clunkier (per-task-set scale is percentage-based,
+several service features are unavailable under `EXTERNAL`, and per-task-set
+observability is weaker), but it is the designated fallback if
+service-per-deployment churn or the 5,000 cap proves painful in practice — the
+reconciler's diff layer should not bake in the service-per-deployment
+assumption more deeply than it must.
 
 ### D4. Naming and tagging
 
@@ -141,16 +156,46 @@ each container definition's `dockerLabels`. The label vocabulary is the same one
 service port, forwardAuth middleware, per-service health check — so the label
 builder is shared code, not a second implementation.
 
-**An AWS load balancer terminates the edge.** An ALB (or NLB) fronts the Traefik
-service: ACM certificates, AWS-native health checks and access logs, and a
-stable public DNS name for the install's wildcard record. Traefik performs no
-ACME — its file-based ACME store has no good multi-replica story on Fargate
-(see [Alternatives](#alternatives-considered)).
+**An NLB fronts Traefik; Traefik terminates TLS.** The default edge is a
+Network Load Balancer in TCP-passthrough mode (listeners 80/443 → the Traefik
+service), with **Traefik terminating TLS and running ACME HTTP-01** exactly as
+the Docker backend does — `acme.json` on an EFS volume mounted into the Traefik
+task, **one Traefik replica** (Traefik does not coordinate file-store ACME
+across replicas; ECS restarts the task on failure, the same availability story
+as the Docker backend's single Traefik container).
+
+This is a course-correction from the ALB+ACM edge originally drafted here, and
+custom domains are the reason: today a user adds a custom domain by CNAMEing to
+the install, and TLS follows automatically via HTTP-01 (cert-manager on K8s,
+Traefik ACME on Docker) with no further user action. ACM has no HTTP-01 — only
+DNS or email validation — so an ALB-terminated edge would turn every custom
+domain into a new user-visible step (a per-domain ACM validation CNAME), plus
+reconciler-managed certificate lifecycle and listener attachment against the
+25-certificates-per-listener default. That is a semantic parity regression on a
+shipped public surface, which the parity policy does not allow as a silent
+default.
+
+**ALB + ACM stays as a documented opt-in edge** for installs that want L7
+access logs, WAF, or a multi-replica Traefik and either use no custom domains
+or accept DNS-validated ACM certificates for them. Choosing it must not fork
+the access-class path (Traefik still routes; the ALB only terminates).
 
 **Access classes keep full parity.** `Authenticated` and `Member` are enforced by
 Traefik forwardAuth against the same `/api/v1/auth/ingress` handler both existing
 backends use, including the per-route `&access=<req>` the handler enforces. This
 is the decisive reason Traefik comes first.
+
+Provider facts that shape the implementation (verified against the Traefik ECS
+provider reference, 2026-08): the provider **polls** (`refreshSeconds`, default
+15 s — cutover reacts a poll slower than the event-driven Docker provider);
+`exposedByDefault` defaults to **true**, so the shipped Traefik configuration
+must set it to `false` and rely on the `traefik.enable=true` label Rise already
+stamps, or every task in the cluster gets a default router; `healthyTasksOnly`
+can additionally gate membership on ECS's own container health status. The
+`/.rise` catch-all (the priority-1000 `PathPrefix` router on `/.rise` that the
+Docker standalone stack carries as static labels on the Rise container) moves to
+the Traefik file provider — as a static router to the control-plane URL — so it
+works whether or not the control plane runs as a task in the same cluster.
 
 **ALB-native routing is deferred, deliberately.** Routing each container spec to
 its own ALB target group is attractive: weighted target groups would give a
@@ -204,8 +249,11 @@ rotation and cross-account features. Parameters are written per deployment and
 deleted when the deployment's services are GC'd, so a rollback never resurrects a
 stale value.
 
-The 4 KB Standard-tier parameter value limit and the per-task limit on `secrets`
-entries are real bounds — see [Open questions](#open-questions).
+Two verified bounds (2026-08): the SSM Standard-tier value limit is 4 KB, and
+the whole task definition — plain env values plus one ~120-character parameter
+ARN per secret — must fit ECS's **64 KiB task-definition size limit** (not
+adjustable). Both are far above typical use but must fail at deploy time with a
+clear error, not at `RegisterTaskDefinition`.
 
 ### D8. Workload identity: a sidecar writing the same file contract
 
@@ -266,9 +314,16 @@ at its DNS name.
 
 This is the decision with the largest unresolved risk: whether two ECS services
 (the outgoing and incoming deployments) may register into a single Cloud Map
-service is exactly the property the overlap model needs, and it must be verified
-before implementation. Fallbacks, in order of preference, are recorded in
-[Open questions](#open-questions).
+service is exactly the property the overlap model needs. The AWS documentation
+constrains the other direction (an ECS service may carry **one** service
+registry — "Multiple service registries for each service isn't supported") but
+is silent on sharing a registry across services, so this remains a phase-2
+verification item, not a settled fact. Fallbacks, in order of preference, are
+recorded in [Open questions](#open-questions); note also that AWS documents
+Cloud Map resources created via service discovery as requiring **manual
+cleanup**, so the reconciler's GC owns deregistration either way, and a
+discovery-registered ECS service is capped at **1,000 tasks** (a Route 53
+quota) — far above Rise's replica bounds.
 
 ### D11. Logs: CloudWatch by default
 
@@ -292,7 +347,10 @@ across both, and the outgoing deployment is retired only once the new servers ar
 fallback — the same rule and the same client the Docker backend uses).
 
 That makes ECS a **rolling overlap, not an atomic switch**, the same documented
-difference the Docker backend carries against Kubernetes' Service selector flip.
+difference the Docker backend carries against Kubernetes' Service selector flip
+— stretched further by the ECS provider's ~15 s poll (`refreshSeconds`): a new
+task enters Traefik's rotation only after the next poll observes it, where the
+Docker provider reacts to daemon events immediately.
 ECS's own `deploymentConfiguration` (`minimumHealthyPercent` /
 `maximumPercent`) governs replica-level rolling *within* a service; the
 deployment-level cutover is Rise's, not ECS's.
@@ -319,7 +377,11 @@ throttles per-account. The loop therefore:
   and `pod_status`,
 - defaults to a **longer tick than Docker's 5 s** (30 s proposed) with jitter,
 - treats `ThrottlingException` as retryable with exponential backoff and never
-  as deployment failure,
+  as deployment failure — the verified default buckets (2026-08) are tight:
+  service **modify** actions refill at 5/s (burst 50), task-definition
+  **modify** (i.e. `RegisterTaskDefinition`) at **1/s** (burst 20), service
+  reads at 20/s (burst 100), so a burst of concurrent deploys must serialize
+  registration through the reconciler rather than fan out,
 - keeps `DEPLOYING_TIMEOUT_MINUTES` under review: Fargate task start plus image
   pull can approach the current 5-minute budget for large images, and this
   backend may need its own configurable ceiling rather than the shared constant.
@@ -350,7 +412,7 @@ For completeness, the recommended install shape this backend assumes:
 | Rise database | **RDS for PostgreSQL** (Multi-AZ), private subnets |
 | Container registry | **ECR** (D6) |
 | Secret encryption | AWS **KMS** provider (already implemented) + SSM for injection (D7) |
-| Edge | ALB/NLB + **ACM**, fronting Traefik (D5) |
+| Edge | **NLB** (TCP passthrough) → Traefik + ACME on **EFS** (D5); ALB+ACM opt-in |
 | App logs | **CloudWatch Logs** (D11) |
 | Workload networking | private subnets, NAT or VPC endpoints for ECR/SSM/Logs |
 
@@ -380,7 +442,13 @@ describe.
 - Service-per-deployment churn against soft ECS quotas, and slow `DeleteService`
   draining on GC.
 - An extra sidecar container per task for identity (D8).
-- Traefik on ECS is another operator-run component; the backend is not "ECS only".
+- Traefik on ECS is another operator-run component; the backend is not "ECS
+  only" — and in the default edge it is a **single replica** with EFS-persisted
+  ACME state (the same availability story as the Docker backend's Traefik, but
+  worth stating on a platform whose point is managed HA).
+- Verified quota realities: a fresh account's Fargate vCPU quota (6) needs
+  raising before first use, and `RegisterTaskDefinition`'s 1/s sustained rate
+  serializes deploy bursts.
 - ECS API throttling becomes a real failure mode the reconciler must absorb.
 
 **Operator impact:** new install topology, new IAM, new settings variant, new logs
@@ -413,10 +481,19 @@ enforced, and `authenticate-oidc` covers only authentication while replacing
 Rise's session model. Retained as a future opt-in mode for `None`-only installs
 (D5), where weighted target groups would beat every current backend's cutover.
 
-**Traefik doing ACME on ECS.** Rejected: Traefik's ACME store is a file. Multiple
-Traefik tasks need either a single-replica constraint or an EFS mount, both of
-which trade availability or complexity for something ACM does natively behind the
-load balancer.
+**ALB + ACM as the default edge.** Originally drafted as the decision; reversed
+on review. ACM cannot do HTTP-01, so every custom domain would need a
+user-created DNS-validation record plus reconciler-managed certificate and
+listener lifecycle — a silent parity regression against the automatic HTTP-01
+flow both shipping backends give custom domains today. Retained as the
+documented opt-in edge (L7 access logs, WAF, multi-replica Traefik) per D5.
+
+**Blue/green via task sets (`EXTERNAL` deployment controller).** The native
+in-one-service overlap primitive, and the designated fallback for D3's
+service-per-deployment model and D10's discovery overlap. Not primary: the
+task-set API is clunkier, several service-level features are unavailable under
+`EXTERNAL`, and per-task-set observability is weaker — but unlike CodeDeploy it
+keeps the cutover decision in Rise, so it stays on the table.
 
 **ECS Service Connect instead of Cloud Map** for cross-container discovery.
 Attractive (client aliases, built-in retries/telemetry) but it injects an Envoy
@@ -484,7 +561,7 @@ traffic":
 |---|---|---|---|---|
 | 1. Contract | Fake ECS/SSM/Cloud Map API (`moto` server or an in-crate stub) | Every PR | The reconciler emits the intended task definitions, services, tags, Traefik labels, SSM parameters; drift detection and GC converge | Free, seconds |
 | 2. Emulated | LocalStack ECS (runs tasks as local Docker containers) | Every PR, if viable | The above **plus** Traefik discovering real containers and routing to them — most existing scenarios run unchanged | Paid license; minutes |
-| 3. Real | AWS sandbox account, GitHub OIDC → IAM role | Nightly / pre-release | Fargate sizing and cold start, IAM and `PassRole` scoping, ECS `secrets` injection, Cloud Map DNS, ALB/ACM, API throttling | Real AWS spend; slow |
+| 3. Real | AWS sandbox account, GitHub OIDC → IAM role | Nightly / pre-release | Fargate sizing and cold start, IAM and `PassRole` scoping, ECS `secrets` injection, Cloud Map DNS, the NLB/EFS edge, API throttling | Real AWS spend; slow |
 
 Tier 1 is an ordinary workspace integration test in `rise-backend-ecs`, not an e2e
 scenario: `moto` implements the ECS surface this backend uses
@@ -496,7 +573,8 @@ thing", and this catches them on every PR for free.
 
 Tier 3 is gated exactly like the existing `E2E / Docker` and `E2E / Minikube`
 jobs — `push` to `develop` or a trusted PR — which is also what makes federated
-AWS credentials safe to expose. Cost is managed by keeping the expensive standing
+AWS credentials safe to expose. The sandbox account needs its Fargate vCPU
+quota raised up front (the default is 6 concurrent vCPUs on fresh accounts). Cost is managed by keeping the expensive standing
 pieces (VPC, NAT, ALB, Traefik service) long-lived in the sandbox account and
 churning only ECS services, task definitions and SSM parameters per run, with a
 tag-scoped sweeper that deletes anything the harness left behind.
@@ -515,20 +593,35 @@ Each must be resolved before this ADR moves to **Proposed**; the first three are
 verification against AWS, not choices.
 
 1. **Cloud Map multi-registration (D10).** Can two ECS services register into one
-   Cloud Map service simultaneously? If not, the fallbacks are, in order:
-   (a) per-deployment Cloud Map services plus a stable alias repointed at
-   cutover; (b) route internal traffic through Traefik on an internal
-   entrypoint (uniform with external routing, at a latency cost);
-   (c) accept a discovery-name switch at cutover rather than an overlap, and
-   document it as a parity note.
+   Cloud Map service simultaneously? AWS docs constrain only the reverse
+   direction (one registry per ECS service) and are silent on sharing; a
+   two-service spike against a real account settles it. If sharing fails, the
+   fallbacks are, in order: (a) the **reconciler registers instances itself**
+   via the Cloud Map `RegisterInstance` API into the shared per-(project,
+   group, container) service — it already observes task IPs each tick via
+   `DescribeTasks`, ECS-managed `serviceRegistries` simply drop out, and AWS
+   already assigns Rise the manual-cleanup burden; (b) task sets under the
+   `EXTERNAL` deployment controller (see D3), whose registration into one
+   registry is the documented purpose of `ECS_TASK_SET_EXTERNAL_ID`; (c) route
+   internal traffic through Traefik on an internal entrypoint (uniform with
+   external routing, at a latency cost).
 2. **Traefik ECS provider fidelity.** Confirm the ECS provider consumes the full
    label set the Docker provider does — specifically per-service health-check
    labels and forwardAuth middleware — and confirm its refresh interval and IAM
    requirements.
-3. **Quotas and limits.** Services per cluster, task-definition revisions,
-   `secrets` entries per container, SSM Standard-tier value size, ALB listener
-   rules and certificates per listener — the exact current figures, and which are
-   raisable.
+3. **Quotas and limits — largely resolved** (verified 2026-08): services per
+   cluster 5,000 (not adjustable); task-definition revisions per family
+   1,000,000 (not adjustable, **deregistered revisions still count** — one
+   revision per deploy per family is fine); containers per task definition 10
+   (app + identity sidecar = 2); task-definition size 64 KiB; tags per
+   resource 50 (Rise stamps ~12; Traefik config rides `dockerLabels`, bounded
+   by the 64 KiB, not by 50); SSM Standard value 4 KB; 1,000 tasks per
+   discovery-registered service; **Fargate on-demand vCPU default quota is 6
+   concurrent vCPUs** on a fresh account (auto-raises with usage, adjustable) —
+   low enough that operator docs and the e2e sandbox setup must both call for
+   an increase up front. Still open: whether the 300 services-per-namespace
+   quota applies to `serviceRegistries`-style discovery or only to Service
+   Connect.
 4. **Reconcile interval and `DEPLOYING_TIMEOUT_MINUTES`.** Is the shared
    5-minute constant adequate for Fargate cold start + large image pull, or does
    this backend need its own configurable ceiling in `rise-backend-core`?
@@ -536,11 +629,13 @@ verification against AWS, not choices.
    per deployment? Per-project is the useful unit for app-level AWS access, but
    it multiplies IAM objects and complicates `iam:PassRole` scoping (D14).
 6. **LocalStack viability for tier 2 (see [Testing](#testing)).** Two blockers,
-   both cheap to spike: (a) does Traefik's ECS provider work against a LocalStack
-   endpoint (`AWS_ENDPOINT_URL`), and are the task IPs LocalStack reports in
-   `DescribeTasks` reachable from the Traefik container? (b) ECS is in
-   LocalStack's paid plans — the free Hobby plan is non-commercial — so tier 2
-   needs a licensing answer before it can run in CI.
+   both cheap to spike: (a) Traefik's ECS provider exposes **no custom-endpoint
+   option** (verified against its reference, 2026-08), so LocalStack reach
+   depends entirely on the AWS SDK honoring `AWS_ENDPOINT_URL` inside Traefik —
+   and on the task IPs LocalStack reports in `DescribeTasks` being reachable
+   from the Traefik container; (b) ECS is in LocalStack's paid plans — the free
+   Hobby plan is non-commercial — so tier 2 needs a licensing answer before it
+   can run in CI.
 7. **Shared-logic promotion.** Which of `rise-backend-docker`'s modules
    (`labels`, `pod_status`, `diff`, `rolling`) move to `rise-backend-core` versus
    staying Docker-specific — decided per module during phase 3, not up front.
