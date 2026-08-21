@@ -111,7 +111,10 @@ where
 }
 
 /// Find team by ID
-pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Team>> {
+pub async fn find_by_id<'a, E>(executor: E, id: Uuid) -> Result<Option<Team>>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let team = sqlx::query_as!(
         Team,
         r#"
@@ -121,7 +124,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Team>> {
         "#,
         id
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .context("Failed to find team by ID")?;
 

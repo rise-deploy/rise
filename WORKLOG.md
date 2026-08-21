@@ -1019,13 +1019,17 @@ scope and avoiding dead-end compatibility layers.
     function, `lock_and_guard_team`, called by both handlers and by the test, so
     the coupling is structural rather than asserted. Verified by weakening the
     lock *inside that function* and watching the test fail.
-  - Raised and not taken here: the same pool-read-inside-a-transaction shape
-    exists in `create_project` / `update_project`, once per caller-supplied
-    `app_users` / `app_teams` entry, and `create_team` does not apply the
-    service-account guard that `update_team` enforces. Both are pre-existing,
-    both are outside this increment, and both are now cheap because the executor
-    plumbing exists — but widening a resource-API increment into the project
-    handlers on a review's say-so is the author's call, not the reviewer's.
+  - Raised, and then taken on the author's instruction: the same
+    pool-read-inside-a-transaction shape existed in `create_project` /
+    `update_project`, once per caller-supplied `app_users` / `app_teams` entry,
+    and `create_team` did not apply the service-account guard `update_team`
+    enforces. Both are pre-existing and outside this increment; both are fixed
+    here because the executor plumbing this increment added makes them small.
+    The identifier resolvers now take an executor and run on the caller's
+    transaction, and the service-account rule is one function called by all three
+    sites that need it — `create_team` plus `update_team`'s two loops, which had
+    already drifted into duplicate inline copies of it. That drift is why
+    `create_team` was missing the rule at all.
 - Follow-ups this increment deliberately leaves open:
   - The centralized choke point replacing `require_operator`, the write-time
     grant gate, and seeded `system-admin`/`resource-owner`/`org-admin` data are

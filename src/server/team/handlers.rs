@@ -15,6 +15,32 @@ use axum::{
 };
 use uuid::Uuid;
 
+/// Refuse any service account among the given team principals.
+///
+/// A service account is never a team principal: team membership is what the
+/// `Member` access class and the team-scoped typed-API checks key on, so a
+/// long-lived CI credential holding it is exactly what this rule prevents.
+///
+/// One function rather than a check per loop, so `create_team` and
+/// `update_team` cannot drift apart on it — they already had, with `create_team`
+/// accepting what `update_team` refused.
+pub(crate) async fn reject_service_account_principals(
+    tx: &mut sqlx::PgConnection,
+    user_ids: impl IntoIterator<Item = Uuid>,
+) -> Result<(), ServerError> {
+    for user_id in user_ids {
+        let is_sa = service_accounts::is_service_account(&mut *tx, user_id)
+            .await
+            .internal_err("Failed to check service account status")?;
+        if is_sa {
+            return Err(ServerError::bad_request(
+                "Service accounts cannot be team members",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Take the team's row lock, re-read it, and apply the IdP-managed guard.
 ///
 /// Both `update_team` and `delete_team` decide on `idp_managed`, and an IdP
@@ -128,6 +154,12 @@ pub async fn create_team(
     )
     .await
     .internal_err("Failed to stamp default Organization on new team")?;
+
+    reject_service_account_principals(
+        &mut tx,
+        owner_ids.iter().copied().chain(member_ids.iter().copied()),
+    )
+    .await?;
 
     // Add owners
     for owner_id in owner_ids {
@@ -276,18 +308,7 @@ pub async fn update_team(
             }
         }
 
-        // Validate that none of the new members are service accounts
-        for member_id in &member_ids {
-            let is_sa = service_accounts::is_service_account(&mut *tx, *member_id)
-                .await
-                .internal_err("Failed to check service account status")?;
-
-            if is_sa {
-                return Err(ServerError::bad_request(
-                    "Service accounts cannot be team members",
-                ));
-            }
-        }
+        reject_service_account_principals(&mut tx, member_ids.iter().copied()).await?;
 
         // Add new members
         for member_id in member_ids {
@@ -323,18 +344,7 @@ pub async fn update_team(
             }
         }
 
-        // Validate that none of the new owners are service accounts
-        for owner_id in &owner_ids {
-            let is_sa = service_accounts::is_service_account(&mut *tx, *owner_id)
-                .await
-                .internal_err("Failed to check service account status")?;
-
-            if is_sa {
-                return Err(ServerError::bad_request(
-                    "Service accounts cannot be team members",
-                ));
-            }
-        }
+        reject_service_account_principals(&mut tx, owner_ids.iter().copied()).await?;
 
         // Add new owners. Someone already in `current_owner_ids` needs no write
         // at all — they hold the owner row this loop would create. Their

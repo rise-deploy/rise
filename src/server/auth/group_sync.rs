@@ -286,4 +286,54 @@ mod tests {
             "the squatter must not have slipped a membership through the window"
         );
     }
+
+    /// A service account must not become a team principal by the create door.
+    /// `update_team` has always refused one; `create_team` inserted whatever it
+    /// was given, reaching the state that rule exists to prevent — team
+    /// membership is what the `Member` access class keys on.
+    ///
+    /// Calls the guard the handlers call, so a handler that stops calling it
+    /// cannot leave this green.
+    #[sqlx::test]
+    async fn a_service_account_is_refused_as_a_team_principal(pool: PgPool) {
+        use crate::db::models::ProjectStatus;
+        use crate::db::{projects, service_accounts};
+        use crate::server::team::handlers::reject_service_account_principals;
+
+        let human = users::create(&pool, "human@example.com").await.unwrap();
+        let project = projects::create(
+            &pool,
+            "sa-guard",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(human.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let sa = service_accounts::create(
+            &pool,
+            project.id,
+            "https://gitlab.example",
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        reject_service_account_principals(&mut tx, [human.id])
+            .await
+            .expect("an ordinary user is a fine team principal");
+        let refused = reject_service_account_principals(&mut tx, [sa.user_id]).await;
+        tx.rollback().await.unwrap();
+
+        let err = refused.expect_err("a service account must be refused");
+        assert!(
+            err.message
+                .contains("Service accounts cannot be team members"),
+            "{}",
+            err.message
+        );
+    }
 }
