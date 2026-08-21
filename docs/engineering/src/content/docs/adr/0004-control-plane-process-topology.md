@@ -4,15 +4,12 @@ title: "ADR-0004: Control-Plane Process Topology"
 
 ## Status
 
-**Draft** (pre-decision working material). Date: 2026-08-21.
+**Proposed** (under review). Date: 2026-08-21.
 
 ADR-0001 fixes the authorization model and the crate structure that realizes
 it; ADR-0002 fixes the subresource execution seam. This decision changes
 neither. It decides *which process* each of them runs in, what protocol the
 components between them speak, and in what order the split happens.
-
-The open questions that must close before this becomes Proposed are listed at
-the end.
 
 ## Context
 
@@ -161,20 +158,20 @@ process first and the same bug needs a distributed answer instead.
   is the only path is a month of code written against storage semantics that a
   network boundary cannot preserve.
 
-## Draft decision
+## Decision
 
 ### 1. The target is an apiserver, not a database service
 
-A dedicated control-plane process — working name `rise-apiserver` — owns the
-generic resource API end to end:
+A dedicated control-plane process — `rise-apiserver` — owns the generic
+resource API end to end:
 
 | Inside the apiserver | Outside |
 |---|---|
 | Resource store and its Postgres schema | Product backend (projects, deployments, env vars, domains) |
 | Kind registry and `ResourceDefinition` projection | Deployment controllers (Kubernetes, Docker) |
 | Normalization and admission | Extension controllers (RDS, S3, Snowflake OAuth) |
-| Authorization (`rise-authz` engine, ADR-0001) | CLI and web UI |
-| Subresource execution (ADR-0002) | |
+| Authorization (`rise-authz` engine, ADR-0001) | CLI |
+| Subresource execution (ADR-0002) | Web UI |
 | Garbage collection | |
 | Watch fan-out | |
 
@@ -207,7 +204,7 @@ Normative, and enforceable long before any process splits:
 Rule 5 is the one that bites. `rise-runtime-sync` is the right tool for
 coordinating replicas of a single component and the wrong tool for coordinating
 two components; using it across the line reintroduces exactly the shared-database
-coupling this decision removes.
+coupling this decision removes. §5 makes that structural rather than advisory.
 
 ### 3. Split `ResourceStore` into an API surface and a store-internal surface
 
@@ -240,11 +237,64 @@ ADR-0001's choke point lands — `ROADMAP.md` §1 already commits to removing
 In-tree code outside `src/server/resources/` and the GC worker uses only the API
 surface. That single rule turns the whole question into a compile-time check: a
 caller that cannot be expressed on the API surface is a future distributed-systems
-bug, found today, for free. `ResourceApi` gets two implementations — a direct
-in-process one and an HTTP one in `rise-resource-client` — so moving a component
-across the boundary is a wiring change, not a rewrite.
+bug, found today, for free.
 
-### 4. The API proves itself before the process splits
+`ResourceApi` has two implementations, but only for the duration of the
+migration: a direct in-process one, and an HTTP one in `rise-resource-client`.
+Because there is no embedded mode (§6), the direct implementation is never a
+product topology — it is how callers are held to the API surface while the
+apiserver is still hosted in `rise backend server`, and it retires at G5. The
+resource-store contract tests run against both while both exist.
+
+### 4. Identity and transport
+
+Clients authenticate with **Rise-issued tokens over TLS**. There is no second
+trust root: principals are ADR-0001's `User`, `ServiceAccount`, and `Controller`
+identities carrying `rise_uid`, and every decision is live RBAC intersected with
+the token's `authorization_details` cap. mTLS is not part of the contract — a
+client certificate would model identity a second time, in a system that cannot
+express Rise's scopes, delegation, or revocation.
+
+Two consequences follow directly:
+
+- The apiserver verifies TLS wherever it is reachable. A plaintext listener is a
+  configuration error, not a deployment option.
+- Token lifetime becomes an availability parameter. A controller that cannot
+  refresh stops reconciling, so the platform-global maximum TTL
+  (`ROADMAP.md` §2) is now a control-plane tuning decision, not only a security
+  one.
+
+**Browsers are ordinary clients.** Once the typed-object migration (§4 of the
+roadmap) completes, the web UI addresses the apiserver directly rather than
+through the product backend. This is not a new identity kind: the UI already
+holds a Rise-issued JWT session cookie — the same credential the ingress-auth
+subrequest validates. It does move browser-facing concerns onto the apiserver
+that the product backend owns today: CORS, cookie scope and `SameSite`, CSRF on
+non-idempotent verbs, and per-item list filtering fast enough to be interactive.
+Until each kind migrates, the UI keeps reading it through the product backend;
+the switch happens per surface, not as one cutover.
+
+### 5. Availability and coordination
+
+**N stateless replicas.** Every replica serves reads and writes; PostgreSQL
+holds the consistency, so no replica is privileged for request handling. Only
+background sweeps are singleton — the GC worker runs under a `rise-runtime-sync`
+leader lease exactly as it does today.
+
+**Each component owns its own lease schema.** `rise-runtime-sync` gains a schema
+parameter: the apiserver migrates and holds credentials for its own lease
+tables, while the product backend keeps `runtime_sync` for its controllers and
+extension provisioners. Invariant 5 then holds by construction rather than by
+naming convention — a lease cannot be shared across the boundary because the
+table is not. The cost is one crate's migrations applied once per component, and
+one more place to look when leadership misbehaves.
+
+One existing use moves rather than splits: bootstrap's `GlobalLock` currently
+serializes default-Organization creation, which writes to the resource store
+*and* to typed tables. That write becomes an apiserver concern, and its
+coordination moves inside the apiserver with it.
+
+### 6. The API proves itself before the process splits
 
 Gates, in order. Each is independently valuable; none exists solely to unblock
 the next.
@@ -277,46 +327,51 @@ be a separate process while the apiserver is still hosted inside
 API's completeness a precondition of a change we want anyway (§5, multi-org),
 rather than a precondition of a change that is invisible to users.
 
-### 5. Packaging: one binary, several entrypoints
+### 7. Packaging, embedded mode, and version skew
 
-Process separation does not require crate separation. Ship one image and one
-binary with distinct entrypoints:
+**A separate `rise-apiserver` binary**, built from this workspace and shipped in
+the same image on the same release cadence. `rise` keeps the CLI and the product
+backend; `rise-apiserver` links neither. One extra build target buys a control
+plane that does not carry code it never runs, and a `--help` that means
+something. Each process gets its own Helm Deployment, its own scaling, and its
+own database role.
 
-```
-rise backend server       # product API
-rise backend apiserver    # resource API, admission, authz, GC, watch
-rise backend controller   # one controller class per process
-```
+**There is no embedded mode.** No supported configuration has the product
+backend hosting the apiserver in-process — not in production, not in
+`tests/e2e`, not in local development. Before G5 the apiserver is still hosted
+in `rise backend server`, but that is a transitional state rather than a
+configuration, and it ends at the cutover. Small installs therefore run two
+processes; the Compose development setup and the e2e harness gain a second one.
+This is the strict choice, taken because a supported dual topology means every
+feature must work in both, forever, and the cheaper one silently becomes the
+tested one.
 
-Each gets its own Helm Deployment, its own scaling, its own database role, and
-its own `rise-runtime-sync` lease namespace. This buys the isolation and the
-ownership clarity without a release-version matrix or skew between separately
-versioned crates. A crate split happens only where a client genuinely must not
-link the server — `rise-resource-client` is the planned instance.
+**Version skew: apiserver *n*, clients *n-1*.** Upgrade the apiserver first.
+Clients up to one minor version behind keep working, and every client tolerates
+a newer apiserver. Rolling upgrades then need no cross-component ordering beyond
+that first step, and a third-party controller has a defined window. CI holds the
+window honest by running the previous release's client against the current
+apiserver.
 
-An **interim enforcement step available immediately**: give the resource store
-its own `PgPool` under a database role that can reach only the `resource_store`
-schema, and revoke that schema from the backend's role. Since no cross-schema
-SQL exists today, this costs a configuration change and converts invariant 1
-from a convention into something Postgres enforces.
-
-## Consequences if adopted
+## Consequences
 
 - Authorization and admission become the apiserver's job by construction, which
   is the only place ADR-0001's transactional requirements can be met.
 - A controller's blast radius becomes its RBAC grants. Multi-org isolation
-  (§5) becomes demonstrable rather than asserted.
-- Third-party controllers get a supported contract with no Rust linkage.
+  (`ROADMAP.md` §5) becomes demonstrable rather than asserted.
+- Third-party controllers get a supported contract with no Rust linkage, and a
+  version window they can build against.
 - Every resource read from the product backend gains a network hop.
   Request-local `AuthorizationSnapshot` memoization (already shipped) absorbs
   much of it inside one request; the rest is the price of the boundary and
   should be measured at G4, not estimated now.
-- Two implementations of `ResourceApi` must stay semantically identical. The
-  resource-store contract tests (`crates/rise-resource-api/tests/`) run against
-  both, or the boundary rots silently.
-- Operators gain processes to run, scale, and upgrade. This is an operator-impact
-  change: it needs Upgrade Notes and a Rollout Tracker item when it lands, and a
-  supported single-process mode for small installs (see open questions).
+- The apiserver becomes browser-facing after the typed-object migration,
+  inheriting CORS, cookie, and CSRF handling that the product backend owns
+  today.
+- Operators run, scale, and upgrade more processes, with no single-process
+  escape hatch for small installs. This is an operator-impact change: it needs
+  Upgrade Notes and a Rollout Tracker item when it lands.
+- Local development and the e2e harness run two processes from G5 onward.
 - Debugging crosses a process boundary; request correlation IDs through the
   client become mandatory rather than nice.
 
@@ -344,6 +399,30 @@ so the apiserver's blast radius stays merged with the product backend's, and the
 strongest reason to have a boundary at all goes unrealized. It is, however,
 exactly where G4 leaves us, and stopping there for a while is safe.
 
+**A supported embedded mode** for small installs, with the split as an opt-in.
+Attractive: one process for single-tenant users, and both `ResourceApi`
+implementations stay continuously exercised. Rejected because two supported
+topologies means every feature, every failure mode, and every upgrade path must
+work in both — and the in-process path, being faster and easier to debug, would
+become the one that is really tested while the split path accumulates
+divergence.
+
+**mTLS for client identity**, either as the primary credential or alongside
+tokens. Rejected because it models identity a second time in a system that
+cannot express Rise's scopes, delegation chains, or revocation, and it makes
+certificate issuance and rotation an operator responsibility in every install.
+TLS still protects the transport; it just does not name the principal.
+
+**A shared `runtime_sync` schema with per-component key namespaces.** Zero code
+change, one migration path. Rejected because it leaves "no lease crosses the
+boundary" as a convention that a future PR can break silently, in a decision
+whose whole premise is making such rules enforced rather than conventional.
+
+**Lockstep versioning** — every component from one release, upgraded together.
+Simplest possible contract. Rejected because it forbids partial rollout, implies
+control-plane unavailability during upgrades, and leaves third-party controllers
+unable to version independently, which undercuts a main reason for the boundary.
+
 **gRPC or a purpose-built protocol between components.** Faster on paper.
 Rejected for now: the HTTP resource API is the contract clients already have and
 that discovery and OpenAPI already describe, and adding a second protocol is
@@ -352,33 +431,21 @@ a measurement, and only as an additional transport for the same contract.
 
 **An etcd-style key-value substrate under the apiserver.** Faithful to the
 Kubernetes design. Rejected because PostgreSQL already provides stronger
-primitives than the ones that shape would give up — real transactions,
-partial indexes, and the serializable semantics ADR-0001's grant gate needs.
+primitives than the ones that shape would give up — real transactions, partial
+indexes, and the serializable semantics ADR-0001's grant gate needs.
 
-## Open questions before Proposed
+## Deferred pending measurement
 
-1. **Transport and client authentication.** Rise-issued Controller tokens alone,
-   or mTLS as well for in-cluster clients? Does the apiserver terminate TLS
-   itself?
-2. **Does the web UI talk to the apiserver directly**, or only through the
-   product backend? The answer decides whether browser-originated CORS and
-   session handling become apiserver concerns.
-3. **Apiserver HA shape.** N stateless replicas with GC leader-elected as it is
-   today, or a single-writer design? Watch fan-out capacity and connection
-   limits (a `ROADMAP.md` §1 item) determine this.
-4. **`runtime_sync` ownership.** Does the apiserver own that schema too, or does
-   each process get its own lease namespace within it? Invariant 5 forbids
-   sharing a lease across components but not sharing the table.
-5. **Embedded mode.** Is a single-process deployment (`rise backend server`
-   hosting the apiserver in-process) a supported configuration or a development
-   convenience? A supported one keeps small installs simple and keeps both
-   `ResourceApi` implementations exercised — at the cost of two topologies to
-   test.
-6. **Version skew policy.** What compatibility window must the apiserver hold
-   for older clients and controllers during a rolling upgrade, and how is it
-   tested?
-7. **Naming.** `rise-apiserver` vs. `rise-resource-api` as the process name, and
-   whether the entrypoint is `rise backend apiserver` or a separate binary.
+These are not open decisions; they are numbers this decision needs and cannot
+guess.
+
+- **Watch fan-out capacity and connection limits** set the apiserver's practical
+  replica count. Measured when Watch lands (`ROADMAP.md` §1), before G5.
+- **Whether the product backend needs read caching** once it is a client.
+  `ROADMAP.md` §1 already refuses to decide cross-request authorization caching
+  ahead of measurement; the same discipline applies here, measured at G4.
+- **The per-surface order in which the web UI switches** to direct apiserver
+  access, which follows the typed-object migration kind by kind.
 
 ## References
 
@@ -390,8 +457,9 @@ partial indexes, and the serializable semantics ADR-0001's grant gate needs.
 - [ADR-0003: Resource Families](./0003-resource-families.md) — the extension-kind
   migration that makes an extension provisioner the natural first external
   controller.
-- `ROADMAP.md` §1 (resource API maturation), §4 (typed-object migration), §5
-  (external controllers and multi-org routing), §6 (codebase decomposition).
+- `ROADMAP.md` §1 (resource API maturation), §2 (token issuance and TTL), §4
+  (typed-object migration), §5 (external controllers and multi-org routing), §6
+  (codebase decomposition).
 - [Generic resource API](../generic-resource-api.md) — path grammar, parent
   chains, and discriminators.
 - [Deployment backends](../deployment-backends.md) — the controller topology
