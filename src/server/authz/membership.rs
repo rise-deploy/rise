@@ -137,10 +137,10 @@ impl RiseMembershipResolver {
     /// The group half reads through the request's own session, so the answer is
     /// consistent with everything else that transaction reads.
     ///
-    /// It is *not* serialized against a concurrent revocation, and the comment
-    /// here used to claim it was. PostgreSQL checks a serializable
-    /// transaction's predicate reads only against writers that are themselves
-    /// serializable, and every writer of `team_members` — the team API, the
+    /// It is *not* serialized against a concurrent revocation. PostgreSQL
+    /// checks a serializable transaction's predicate reads only against writers
+    /// that are themselves serializable, and every writer of `team_members` —
+    /// the team API, the
     /// login sync, the Entra sync — runs at `READ COMMITTED`. So a revocation
     /// committing alongside this read neither aborts the transaction nor is
     /// seen by it, and a just-revoked operator lands one more write. That is
