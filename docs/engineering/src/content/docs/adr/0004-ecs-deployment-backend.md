@@ -4,14 +4,15 @@ title: "ADR-0004: ECS Deployment Backend"
 
 ## Status
 
-**Draft** (design direction; open questions listed below are not yet closed).
-Date: 2026-08-18.
+**Proposed** (under review). Date: 2026-08-22 (drafted 2026-08-18).
 
 This ADR records how Rise's public feature surface maps onto Amazon ECS and the
 surrounding AWS services, so that the implementation PRs argue about code rather
-than about topology. It flips to **Proposed** once the open questions in
-[Open questions](#open-questions) are answered — several of them are quota and
-provider-capability facts that must be verified against AWS, not decided by us.
+than about topology. The design-gating facts it depended on — Cloud Map shared
+registration with clean drain, and Traefik ECS provider label/cutover fidelity —
+have been **verified against a real AWS account** via the runnable spikes in
+`scripts/spikes/` (see [Open questions](#open-questions) 1–2). The remaining
+open items are implementation-phase decisions, not design risks.
 
 ## Context
 
@@ -191,7 +192,15 @@ provider reference, 2026-08): the provider **polls** (`refreshSeconds`, default
 `exposedByDefault` defaults to **true**, so the shipped Traefik configuration
 must set it to `false` and rely on the `traefik.enable=true` label Rise already
 stamps, or every task in the cluster gets a default router; `healthyTasksOnly`
-can additionally gate membership on ECS's own container health status. The
+can additionally gate membership on ECS's own container health status. All of
+this is also **verified live** (spike run 2026-08-22, eu-central-1,
+`traefik:v3` — `scripts/spikes/adr-0004-traefik-ecs-provider.sh`): labels are
+consumed into router/middleware/service config, two ECS services carrying one
+Traefik service name merge into a single load balancer, the `healthcheck.*`
+labels yield per-server `serverStatus` in the Traefik API (the readiness signal
+D12 depends on), forwardAuth passes end-to-end with its address resolved over
+Cloud Map private DNS, and retiring one ECS service shrinks the merged balancer
+within a few polls. The
 `/.rise` catch-all (the priority-1000 `PathPrefix` router on `/.rise` that the
 Docker standalone stack carries as static labels on the Rise container) moves to
 the Traefik file provider — as a static router to the control-plane URL — so it
@@ -320,10 +329,9 @@ second association with the same `registryArn`, and both services' tasks
 co-appear as instances of the one Cloud Map service, distinguished by their
 `ECS_SERVICE_NAME` attribute. The AWS documentation constrains only the other
 direction (an ECS service may carry **one** service registry). The spike's
-second assertion — scaling the outgoing service to zero deregisters only its
-own instances — awaits confirmation from the same run's tail; the fallbacks in
-[Open questions](#open-questions) are retained until it lands, though no longer
-expected to be needed. Note also that AWS documents Cloud Map resources created
+second assertion also passed (`DRAIN_CLEAN`): scaling the outgoing service to
+zero deregistered only its own instances, which is exactly the cutover
+retirement property D12 needs. Note also that AWS documents Cloud Map resources created
 via service discovery as requiring **manual cleanup**, so the reconciler's GC
 owns deregistration either way, and a discovery-registered ECS service is
 capped at **1,000 tasks** (a Route 53 quota) — far above Rise's replica
@@ -593,18 +601,19 @@ tiers 1 and 2 are what keep it regression-tested afterwards.
 
 ## Open questions
 
-Each must be resolved before this ADR moves to **Proposed**; the first three are
-verification against AWS, not choices.
+Questions 1–3 were the AWS-facts verification gating the move to **Proposed**
+and are resolved below (kept for the evidence trail). Questions 4–7 are
+implementation-phase decisions, tracked here until the phase that owns each
+lands.
 
-1. **Cloud Map multi-registration (D10) — resolved: SUPPORTED.** The
-   `scripts/spikes/adr-0004-cloudmap-sharing.sh` spike (run 2026-08-22,
-   eu-central-1) confirmed two ECS services sharing one `registryArn`, with
-   both tasks listed as instances of the single Cloud Map service. Remaining
-   sub-item: the run's drain assertion (`DRAIN_CLEAN` — retiring one service
-   deregisters only its own instances) needs its verdict recorded from the
-   same run's output. The fallbacks below stay listed only until then:
-   (a) reconciler-driven `RegisterInstance`; (b) task sets under the
-   `EXTERNAL` deployment controller; (c) internal routing through Traefik. If sharing fails, the
+1. **Cloud Map multi-registration (D10) — resolved: SUPPORTED + DRAIN_CLEAN.**
+   The `scripts/spikes/adr-0004-cloudmap-sharing.sh` run (2026-08-22,
+   eu-central-1) confirmed two ECS services sharing one `registryArn` with both
+   tasks listed as instances of the single Cloud Map service, and that scaling
+   one service to zero deregisters only its own instances. D10 stands as
+   designed; the fallbacks recorded there (reconciler-driven
+   `RegisterInstance`; `EXTERNAL`-controller task sets; internal Traefik
+   routing) are contingencies only. If sharing fails, the
    fallbacks are, in order: (a) the **reconciler registers instances itself**
    via the Cloud Map `RegisterInstance` API into the shared per-(project,
    group, container) service — it already observes task IPs each tick via
@@ -614,15 +623,15 @@ verification against AWS, not choices.
    registry is the documented purpose of `ECS_TASK_SET_EXTERNAL_ID`; (c) route
    internal traffic through Traefik on an internal entrypoint (uniform with
    external routing, at a latency cost).
-2. **Traefik ECS provider fidelity.** Confirm the ECS provider consumes the full
-   label set the Docker provider does — specifically per-service health-check
-   labels and forwardAuth middleware — and the cutover properties on top: tasks
-   of two ECS services sharing one Traefik service name must merge into one
-   load balancer, `serverStatus` must be exposed per server, and retiring one
-   ECS service must shrink the merged LB. A runnable spike asserting each of
-   these separately lives at `scripts/spikes/adr-0004-traefik-ecs-provider.sh`
-   (verdicts: `LABELS_CONSUMED`, `MIDDLEWARE`, `MERGED_LB`, `SERVERSTATUS_UP`,
-   `FORWARDAUTH_E2E`, `DRAIN`; four Fargate tasks for ~10 minutes).
+2. **Traefik ECS provider fidelity — resolved: all six assertions PASS.** The
+   `scripts/spikes/adr-0004-traefik-ecs-provider.sh` run (2026-08-22,
+   eu-central-1, `traefik:v3`) returned `LABELS_CONSUMED`, `MIDDLEWARE`,
+   `MERGED_LB`, `SERVERSTATUS_UP`, `FORWARDAUTH_E2E`, and `DRAIN` all PASS:
+   the provider consumes the Docker-provider label vocabulary including
+   per-service health checks and forwardAuth middleware, merges two ECS
+   services into one load balancer with per-server `serverStatus`, routes
+   end-to-end through forwardAuth over Cloud Map private DNS, and drains a
+   retired service within a few polls. D5 and D12 stand as designed.
 3. **Quotas and limits — largely resolved** (verified 2026-08): services per
    cluster 5,000 (not adjustable); task-definition revisions per family
    1,000,000 (not adjustable, **deregistered revisions still count** — one
