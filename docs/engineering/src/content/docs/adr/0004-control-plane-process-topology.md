@@ -218,7 +218,12 @@ differently without them:
   tables it served. Building an enduring distributed-consistency layer for them
   would outlive its problem.
 
-### 2. The API contract is the only protocol across the boundary
+### 2. The API contract is the only protocol clients speak
+
+These rules govern the **inbound** direction — anything calling the apiserver.
+The apiserver's own outbound call to a Controller when forwarding a subresource
+is a second contract, governed by §4 rather than by these rules; it is the only
+sanctioned exception, and §4 states what constrains it instead.
 
 Normative, and enforceable long before any process splits:
 
@@ -316,6 +321,46 @@ is a registered `Controller` rather than an operator-supplied URL, and no
 platform handler's implementation may terminate at a Controller instead of in
 local code.
 
+**The forwarding leg needs its own trust model, because authorizing the request
+is not the same as trusting the hop.** Three rules:
+
+*The endpoint is operator-set, never controller-set.* A Controller's address
+lives in its `spec`, written by an operator, and never in `status`, which the
+controller itself writes. Without this rule a stolen controller credential
+steers where the apiserver opens connections and the control plane becomes an
+open proxy — "registered Controller rather than an operator-supplied URL" is an
+empty distinction if the controller registers its own URL. The apiserver
+requires HTTPS and does not follow redirects, so the endpoint cannot be
+re-pointed after the fact either.
+
+*The apiserver forwards its own identity, never the client's.* A user's bearer
+token must not reach a controller: authorization already happened at the
+apiserver, and forwarding the caller's credential hands every controller a
+usable user token. The apiserver presents a Rise-issued assertion of its own,
+audience-bound to that Controller and naming the target resource, the
+subresource, and — for the controller's audit trail, not for its authorization
+— the acting principal. ADR-0001's `act` attribution already models exactly
+this shape. The controller authorizes the apiserver, not the end user; that is
+a confused deputy by construction, contained by the audience binding and by the
+fact that the assertion names one resource.
+
+*Controllers acquire a serving surface, and that is accepted.* A controller
+that serves subresources is no longer a pure client: it listens, terminates
+TLS, and has liveness that the apiserver must handle as a distinct failure from
+an unauthorized request. This is a real topology change from "it just speaks
+HTTP to the apiserver", and it is the price of keeping runtime credentials out
+of the control plane.
+
+**The forwarding contract is versioned separately, in the opposite direction.**
+§8's rule covers clients calling the apiserver. Here the apiserver is the
+client and the controller is the server, so the compatibility burden inverts: a
+newer apiserver must keep working against a controller one minor behind, which
+is the ordinary state during a rolling upgrade and the permanent state for a
+third-party controller on its own release cadence. No legacy controllers exist
+— every controller on this seam is new — so the contract can be defined cleanly
+rather than retrofitted, and it should be, from the first one. CI covers this
+direction too: current apiserver against the previous release's controller.
+
 Consequences to design when the first one ships:
 
 - Streaming passthrough must carry cancellation and backpressure across two
@@ -398,13 +443,33 @@ keyed on the Org UID, taken in the resource-delete path *and* in every
 `set_team_organization` / `set_project_organization` / `ensure_user_membership`
 call site. Two transactions coordinating through a shared lock is not one
 transaction spanning the boundary, so the rule it breaks is invariant 5 — which
-names advisory locks between components — rather than invariant 3. The replacement is a finalizer: the product backend registers
-a finalizer on Organization and clears it only when no typed row references that
-UID, so the apiserver tombstones and waits instead of counting rows it cannot
-see. That has to land before an Organization can be deleted across the boundary
-— it is a G5 obligation, not an implementation detail. It is also a
-*transitional* one: the finalizer exists to guard typed rows, so it is deleted
-with them (§1). Build it to be removable, not to endure.
+names advisory locks between components — rather than invariant 3.
+
+Only *half* of that lock is illegal, though, and the distinction is the whole
+fix. Invariant 5 forbids a lock shared *between* components and explicitly
+permits one *within* a component. Both the count and every typed insert live in
+the product backend. So:
+
+- **Cross-boundary half — a finalizer.** The backend registers a finalizer on
+  Organization and clears it only when no typed row references that UID. The
+  apiserver tombstones and waits rather than counting rows it cannot see.
+- **Local half — the lock stays, inside the backend.** Every typed-insert path
+  and the finalizer-clearing transaction take the same backend-local advisory
+  lock keyed on the Org UID. That is precisely what the TODO asks for, minus
+  the participant that made it illegal.
+
+What that leaves is a much smaller window: an insert whose liveness check
+passed before the tombstone, committing after the finalizer cleared. The result
+is a typed row pointing at a deleted UID — in a column that carries no
+referential guarantee anyway (invariant 2), for an operation that is a rare
+admin action, in tables scheduled for deletion. **We accept that residue and
+detect it rather than closing it**, because closing it needs the backend to
+hold authoritative Organization state of its own, and a second copy of a
+resource the apiserver owns is exactly the coupling this ADR removes.
+
+It is a G5 obligation, not an implementation detail — and a *transitional* one:
+the finalizer and the local lock both exist to guard typed rows, so both are
+deleted with them (§1). Build them to be removable, not to endure.
 
 Bootstrap does not simply move. Its `GlobalLock` serializes default-Organization
 creation, but the work it guards writes typed tables too
@@ -465,7 +530,8 @@ match, with `rise-k8s-controller` second on the same seam.
 
 **Controllers externalize before the store does, not after.** A controller can
 be a separate process while the apiserver is still hosted inside
-`rise backend server`; it just speaks HTTP to it. Ordering it this way makes the
+`rise backend server`; it speaks HTTP to it, and — once it serves a product
+subresource — is spoken to in return (§4). Ordering it this way makes the
 API's completeness a precondition of a change we want anyway (`ROADMAP.md` §5,
 multi-org),
 rather than a precondition of a change that is invisible to users.
@@ -497,9 +563,12 @@ watch, patch, or discovery, and the project is pre-1.0 (`Cargo.toml`,
 `0.23.0-rc8`). From that point: upgrade the apiserver first.
 Clients up to one minor version behind keep working, and every client tolerates
 a newer apiserver. Rolling upgrades then need no cross-component ordering beyond
-that first step, and a third-party controller has a defined window. CI holds the
-window honest by running the previous release's client against the current
-apiserver.
+that first step. CI holds the window honest by running the previous release's
+client against the current apiserver.
+
+This rule covers the inbound direction only. On the forwarding leg (§4) the
+apiserver is the client and a Controller is the server, so the burden inverts
+and needs its own rule and its own CI job; §4 states it.
 
 ## Consequences
 
@@ -521,6 +590,15 @@ apiserver.
   it now.
 - A product subresource costs two hops and couples its availability to both
   processes (§4 above).
+- A controller that serves a subresource stops being a pure client: it listens,
+  terminates TLS, and needs an inbound identity check for the apiserver. That
+  is accepted, and it is what keeps runtime credentials out of the control
+  plane.
+- There are two versioned contracts, not one, running in opposite directions
+  (§4, §8) — so two compatibility windows and two CI jobs.
+- One orphan window stays open by choice: a typed row may outlive the
+  Organization it names (§6). It is detected, not prevented, and it closes when
+  the typed tables do.
 - The apiserver becomes browser-facing after the typed-object migration,
   inheriting CORS, cookie, and CSRF handling that the typed API owns today. The
   web UI is simply the first client to stop needing the shim, not a special
