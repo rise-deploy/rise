@@ -1,0 +1,121 @@
+# Rise backend configuration for the Amazon ECS deployment controller.
+#
+# Ships in the image at /etc/rise/ecs.yaml and is loaded when
+# RISE_CONFIG_RUN_MODE=ecs, layered over default.yaml. Values interpolate
+# ${VAR} / ${VAR:-default} in a single non-recursive pass, which is why the
+# ingress templates' {project_name} / {deployment_group} / {environment}
+# placeholders survive to the URL builder.
+#
+# See the ECS operator guide for the IAM policies the two roles need.
+
+server:
+  host: 0.0.0.0
+  port: 3000
+  public_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+  cookie_secure: "${RISE_COOKIE_SECURE:-false}"
+  jwt_signing_secret: "${RISE_JWT_SIGNING_SECRET:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+  jwt_claims:
+    - sub
+    - email
+    - name
+  static_dir: "${RISE_STATIC_DIR:-/app/static}"
+  docs_dir: "${RISE_DOCS_DIR:-/app/docs}"
+  ssrf:
+    allow_private_networks: "${RISE_SSRF_ALLOW_PRIVATE:-false}"
+    allow_http: "${RISE_SSRF_ALLOW_HTTP:-false}"
+
+database:
+  url: "${DATABASE_URL}"
+
+encryption:
+  type: aes-gcm-256
+  key: "${RISE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+
+auth:
+  issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
+  client_id: "${OIDC_CLIENT_ID:-rise-backend}"
+  client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
+  admin_users:
+    - "${ADMIN_EMAIL:-admin@example.com}"
+  allow_team_creation: true
+  allow_list_all_teams: true
+
+registry:
+  # ECR is the recommended registry for this backend: ECS pulls with the task
+  # execution role, so no pull secret is minted or stored anywhere.
+  type: "${RISE_REGISTRY_TYPE:-oci-client-auth}"
+  registry_url: "${RISE_REGISTRY_URL:-rise-registry:5000}"
+  namespace: "${RISE_REGISTRY_NAMESPACE:-rise-apps}"
+  client_registry_url: "${RISE_CLIENT_REGISTRY_URL:-localhost:5000}"
+  username: "${RISE_REGISTRY_USERNAME:-}"
+  password: "${RISE_REGISTRY_PASSWORD:-}"
+
+deployment_controller:
+  type: "ecs"
+
+  region: "${AWS_REGION:-eu-central-1}"
+  cluster: "${RISE_ECS_CLUSTER}"
+  # Comma-separated lists are not supported by the YAML loader, so these are
+  # real sequences. At least one subnet is required.
+  subnets: "${RISE_ECS_SUBNETS}"
+  security_groups: "${RISE_ECS_SECURITY_GROUPS}"
+  # Public subnets have no NAT gateway, and a Fargate task must reach ECR and
+  # CloudWatch to start at all — so it needs a public IP there.
+  assign_public_ip: "${RISE_ECS_ASSIGN_PUBLIC_IP:-false}"
+
+  # ECS assumes this role to pull images and resolve SSM secret parameters.
+  execution_role_arn: "${RISE_ECS_EXECUTION_ROLE_ARN:-}"
+  # The AWS identity the application containers themselves run as.
+  task_role_arn: "${RISE_ECS_TASK_ROLE_ARN:-}"
+
+  log_group: "${RISE_ECS_LOG_GROUP:-}"
+  resource_prefix: "${RISE_ECS_RESOURCE_PREFIX:-rise}"
+  ssm_parameter_prefix: "${RISE_ECS_SSM_PREFIX:-rise}"
+  ssm_kms_key_id: "${RISE_ECS_SSM_KMS_KEY_ID:-}"
+  cpu_architecture: "${RISE_ECS_CPU_ARCHITECTURE:-X86_64}"
+
+  production_ingress_url_template: "{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  staging_ingress_url_template: "{deployment_group}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  environment_ingress_url_template: "{environment}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
+  ingress_schema: "${RISE_INGRESS_SCHEME:-http}"
+
+  # ECS is a polled, throttled API — RegisterTaskDefinition sustains 1 req/s —
+  # so the loop ticks far less often than the Docker backend's 5s.
+  reconcile_interval_secs: "${RISE_ECS_RECONCILE_INTERVAL_SECS:-30}"
+  controller_class_name: "default"
+
+  deployment_constraints:
+    max_replicas: "${RISE_MAX_REPLICAS:-10}"
+
+  # MUST be reachable from inside the cluster — a Cloud Map name or an internal
+  # load balancer, never the public URL. Traefik calls it for every forwardAuth
+  # subrequest; if it is empty the backend refuses to start rather than serve
+  # authenticated projects publicly.
+  auth_backend_url: "${RISE_AUTH_BACKEND_URL:-}"
+  auth_signin_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
+
+  traefik_entrypoint: "${RISE_TRAEFIK_ENTRYPOINT:-web}"
+  traefik_certresolver: "${RISE_CERTRESOLVER:-}"
+  # REQUIRED for any project that sets a health_check: Traefik's serverStatus is
+  # the authoritative readiness signal with no fallback, so without a reachable
+  # API such a deployment never becomes Healthy.
+  traefik_api_url: "${RISE_TRAEFIK_API_URL:-}"
+
+  access_classes:
+    public:
+      display_name: Public
+      description: "Public — no authentication required."
+      ingress_class: traefik
+      access_requirement: None
+    private:
+      display_name: Private
+      description: "Requires project membership."
+      ingress_class: traefik
+      access_requirement: Member
+
+# No runtime log backend yet. Every other variant needs a runtime client the ECS
+# backend does not have, and the Kubernetes default would crash at startup.
+# Installs that run Loki can switch to `type: loki` — it is backend-agnostic.
+# A CloudWatch variant is the intended replacement (see ADR-0004).
+deployment_logs:
+  type: "none"

@@ -1480,7 +1480,7 @@ mod tests {
     fn private_access_class_without_backend_url_stamps_no_forward_auth() {
         // Member requirement but no auth_backend_url → forwardAuth disabled.
         // In a running backend this state is unreachable because startup fails
-        // closed (see settings::docker_access_classes_missing_auth_backend_url);
+        // closed (see settings::access_classes_missing_auth_backend_url);
         // the builder still refuses to stamp an auth-less middleware here.
         let mut map = HashMap::new();
         map.insert("private".to_string(), AccessRequirement::Member);

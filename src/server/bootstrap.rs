@@ -169,7 +169,15 @@ fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
             controller_class_name,
             ..
         }) => Some(controller_class_name.as_str()),
-        _ => None,
+        Some(DeploymentControllerSettings::Ecs {
+            controller_class_name,
+            ..
+        }) => Some(controller_class_name.as_str()),
+        // Deliberately exhaustive rather than a catch-all: an unhandled variant
+        // here leaves the default Organization's `deploymentControllerClass`
+        // unset, so every reconciler's ownership check fails and NOTHING is ever
+        // deployed — with no error anywhere. A compile error is far kinder.
+        None => None,
     }
 }
 
