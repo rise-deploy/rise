@@ -336,6 +336,10 @@ impl Scenario for LokiLogRetention {
             BackendKind::Docker => {
                 Applicability::Skip("the docker compose stack has no Loki log backend")
             }
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack has no runtime log backend yet (deployment_logs: none); a \
+                 CloudWatch backend is the intended replacement",
+            ),
         }
     }
 
@@ -466,6 +470,7 @@ impl Scenario for HelmIdempotency {
         match b.kind() {
             BackendKind::Minikube => Applicability::Run,
             BackendKind::Docker => Applicability::Skip("docker backend has no Helm release"),
+            BackendKind::Ecs => Applicability::Skip("ecs backend has no Helm release"),
         }
     }
 
@@ -684,8 +689,10 @@ impl Scenario for PrivateIngressAuth {
 
     fn applies_to(&self, _b: &dyn Backend) -> Applicability {
         // The ingress-auth contract — block unauthenticated, allow authenticated —
-        // holds on both backends; only the wiring + reach differ, behind the trait
-        // (Traefik forwardAuth labels on docker; nginx auth annotations on K8s).
+        // holds on every backend; only the wiring + reach differ, behind the trait
+        // (Traefik forwardAuth labels on docker and ECS; nginx auth annotations on
+        // K8s). Runs on ECS because the e2e stack puts the Rise control plane in
+        // the cluster, so Traefik can actually reach it for the subrequest.
         Applicability::Run
     }
 
@@ -776,8 +783,10 @@ impl Scenario for RouteAccessOverride {
     }
 
     fn applies_to(&self, _b: &dyn Backend) -> Applicability {
-        // Per-route access is enforced by proxy-native routing on both backends,
-        // so the loosen-one-path contract holds on each.
+        // Per-route access is enforced by proxy-native routing on every backend,
+        // so the loosen-one-path contract holds on each. As with
+        // `private-ingress-auth`, this needs Traefik to reach Rise — which the
+        // ECS stack arranges by running the control plane in the cluster.
         Applicability::Run
     }
 
@@ -910,8 +919,16 @@ impl Scenario for HealthRollingCutover {
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
         match b.kind() {
-            // Reads Traefik serverStatus + per-container env; Traefik/docker-specific.
+            // Reads Traefik serverStatus + per-container env; Traefik-specific.
             BackendKind::Docker => Applicability::Run,
+            // ECS is Traefik-fronted too and the driver implements both hooks,
+            // but each app task rounds up to 0.5 vCPU and this scenario asks for
+            // two replicas plus an overlapping cutover — enough to exhaust a
+            // fresh account's Fargate quota of 6. Enable once the quota is
+            // raised; the mechanism itself is exercised by the other scenarios.
+            BackendKind::Ecs => Applicability::Skip(
+                "needs ~2 extra vCPU of Fargate quota for a 2-replica overlapping cutover",
+            ),
             BackendKind::Minikube => {
                 Applicability::Skip("cutover probe reads the Traefik API (docker-specific)")
             }

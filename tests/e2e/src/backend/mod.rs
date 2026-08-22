@@ -13,6 +13,7 @@ use crate::http::HttpResponse;
 pub use crate::BackendKind;
 
 mod docker;
+mod ecs;
 mod minikube;
 
 /// Auth override for a single CLI invocation. Passing `None` to
@@ -244,5 +245,6 @@ pub fn create(kind: BackendKind) -> Result<Box<dyn Backend>> {
     Ok(match kind {
         BackendKind::Docker => Box::new(docker::DockerBackend::new()?),
         BackendKind::Minikube => Box::new(minikube::MinikubeBackend::new()?),
+        BackendKind::Ecs => Box::new(ecs::EcsBackend::new()?),
     })
 }

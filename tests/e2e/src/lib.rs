@@ -23,6 +23,7 @@ pub mod upgrade;
 pub enum BackendKind {
     Docker,
     Minikube,
+    Ecs,
 }
 
 impl BackendKind {
@@ -32,8 +33,9 @@ impl BackendKind {
         match std::env::var("RISE_E2E_BACKEND").ok().as_deref() {
             Some("docker") => Some(Self::Docker),
             Some("minikube") => Some(Self::Minikube),
+            Some("ecs") => Some(Self::Ecs),
             Some(other) if !other.is_empty() => {
-                panic!("RISE_E2E_BACKEND={other:?} is not a known backend (docker|minikube)")
+                panic!("RISE_E2E_BACKEND={other:?} is not a known backend (docker|minikube|ecs)")
             }
             _ => None,
         }
@@ -43,6 +45,7 @@ impl BackendKind {
         match self {
             Self::Docker => "docker",
             Self::Minikube => "minikube",
+            Self::Ecs => "ecs",
         }
     }
 }

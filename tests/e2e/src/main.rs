@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     let Some(kind) = BackendKind::from_env() else {
         eprintln!(
             "[e2e] RISE_E2E_BACKEND and RISE_E2E_SUITE unset — skipping the e2e harness \
-             (set RISE_E2E_BACKEND=docker|minikube or RISE_E2E_SUITE=compose to run it)"
+             (set RISE_E2E_BACKEND=docker|minikube|ecs or RISE_E2E_SUITE=compose to run it)"
         );
         return ExitCode::SUCCESS;
     };
