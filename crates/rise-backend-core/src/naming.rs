@@ -230,3 +230,68 @@ pub fn group_service_names(desired: &DesiredContainer) -> Vec<String> {
         .map(|(idx, _)| group_service_name(&base, idx, route_count))
         .collect()
 }
+
+/// Maximum length of an ECS resource name (service, task-definition family).
+pub const MAX_ECS_NAME_LEN: usize = 255;
+
+/// Sanitize a name for ECS, which accepts only `[a-zA-Z0-9_-]` and at most 255
+/// characters.
+///
+/// Separate from [`sanitize_and_cap`] because the charsets and caps genuinely
+/// differ: Docker permits `.` and caps container names far shorter. Sharing one
+/// function would mean either rejecting names ECS accepts or emitting names ECS
+/// rejects.
+///
+/// Over-long names keep a readable prefix and gain a stable 10-hex-character
+/// suffix derived from the full sanitized string, so truncation stays
+/// deterministic and two different long names cannot collapse onto one.
+pub fn sanitize_ecs_name(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // A leading hyphen is legal but ugly and complicates CLI use; trim both ends.
+    let sanitized = sanitized.trim_matches('-').to_string();
+    if sanitized.len() <= MAX_ECS_NAME_LEN {
+        return sanitized;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(sanitized.as_bytes());
+    let suffix: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let suffix = &suffix[..10];
+    let keep = MAX_ECS_NAME_LEN - suffix.len() - 1;
+    format!("{}-{}", &sanitized[..keep], suffix)
+}
+
+#[cfg(test)]
+mod ecs_name_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_ecs_name_keeps_the_legal_charset() {
+        assert_eq!(
+            sanitize_ecs_name("rise-myapp_default-app"),
+            "rise-myapp_default-app"
+        );
+        // Dots are legal in Docker names but not in ECS ones.
+        assert_eq!(sanitize_ecs_name("rise-my.app-app"), "rise-my-app-app");
+    }
+
+    #[test]
+    fn sanitize_ecs_name_caps_and_stays_injective() {
+        // A project name is user-controlled, so two long names must not truncate
+        // onto one ECS resource — that would pool two projects' workloads.
+        let a = sanitize_ecs_name(&format!("rise-{}-a", "x".repeat(300)));
+        let b = sanitize_ecs_name(&format!("rise-{}-b", "x".repeat(300)));
+        assert!(a.len() <= MAX_ECS_NAME_LEN);
+        assert!(b.len() <= MAX_ECS_NAME_LEN);
+        assert_ne!(a, b, "long names must not collide after truncation");
+        assert_eq!(a, sanitize_ecs_name(&format!("rise-{}-a", "x".repeat(300))));
+    }
+}

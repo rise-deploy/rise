@@ -1,0 +1,37 @@
+[package]
+name = "rise-backend-ecs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+description = "Amazon ECS deployment backend for Rise (in-process reconcile loop over the ECS API)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-ecs = { version = "1.80", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-ssm = { version = "1.80", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+chrono = { workspace = true }
+rise-backend-core = { path = "../rise-backend-core" }
+rise-deployment-spec = { path = "../rise-deployment-spec" }
+rise-resource-api = { path = "../rise-resource-api" }
+rise-runtime-sync = { path = "../rise-runtime-sync" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tokio-util = "0.7"
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -50,7 +50,8 @@ pub use env::{hash_env, merge_container_env, pin_system_env, upsert_env};
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use health_path::effective_health_path;
 pub use naming::{
-    container_name, group_app_name, group_service_base, group_service_name, stable_identity_name,
+    container_name, group_app_name, group_service_base, group_service_name, sanitize_ecs_name,
+    stable_identity_name,
 };
 pub use pod_status::{build_controller_metadata, build_pod_status};
 pub use providers::{
