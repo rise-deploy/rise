@@ -16,13 +16,20 @@ pub mod health;
 pub mod identity;
 pub mod reconciler;
 
-// The runtime-agnostic reconcile machinery now lives in `rise-backend-core` so
-// the ECS backend shares one implementation rather than a divergent copy. These
-// re-exports keep every existing `rise_backend_docker::{diff,env,labels,…}` path
-// resolving unchanged.
-pub use rise_backend_core::{
-    diff, env, labels, naming, pod_status, rolling, traefik_api, traefik_render,
-};
+// The runtime-agnostic reconcile machinery lives in `rise-backend-core`, and the
+// Traefik routing machinery in `rise-backend-traefik` — shared with the ECS
+// backend rather than duplicated. These re-exports keep every existing
+// `rise_backend_docker::{diff,env,labels,…}` path resolving unchanged.
+pub use rise_backend_core::{diff, env, naming, pod_status, rolling};
+pub use rise_backend_traefik::{api as traefik_api, readiness, render as traefik_render};
+
+/// The label vocabulary, from both homes: bookkeeping labels are backend-agnostic
+/// (`rise-backend-core`), the Traefik routing labels belong to the Traefik-fronted
+/// backends (`rise-backend-traefik`).
+pub mod labels {
+    pub use rise_backend_core::labels::*;
+    pub use rise_backend_traefik::labels::*;
+}
 
 use anyhow::Result;
 use async_trait::async_trait;

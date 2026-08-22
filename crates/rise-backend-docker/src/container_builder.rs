@@ -14,19 +14,19 @@ use super::labels::{self, BookkeepingLabels};
 use rise_backend_core::quantity::{
     parse_cpu_millicores, parse_cpu_request_limit, parse_memory_bytes, parse_memory_request_limit,
 };
-use rise_backend_core::traefik_render::TraefikRenderConfig;
 use rise_backend_core::AccessRequirement;
+use rise_backend_traefik::render::TraefikRenderConfig;
 
 // The desired-state shape, the name derivations and the Traefik label renderer
 // are backend-agnostic and now live in `rise-backend-core`, shared with the ECS
 // backend. Re-exported here so every existing `container_builder::…` path — in
 // this crate and in `rise-deploy` — resolves unchanged.
 pub use rise_backend_core::desired::{DesiredContainer, DesiredRoute};
-pub use rise_backend_core::naming::{
-    container_name, group_app_name, group_service_base, group_service_name, stable_identity_name,
-};
-pub use rise_backend_core::naming::{group_service_names, MAX_NAME_LEN, MAX_SERVICE_BASE_LEN};
-pub use rise_backend_core::traefik_render::{
+pub use rise_backend_core::naming::MAX_NAME_LEN;
+pub use rise_backend_core::naming::{container_name, group_app_name, stable_identity_name};
+pub use rise_backend_traefik::naming::{group_service_base, group_service_name};
+pub use rise_backend_traefik::naming::{group_service_names, MAX_SERVICE_BASE_LEN};
+pub use rise_backend_traefik::render::{
     render_traefik_labels_for, routes_withheld, TraefikRenderConfig as _TraefikRenderConfig,
 };
 
@@ -84,7 +84,7 @@ impl<'a> BuilderConfig<'a> {
 /// building the full create spec, folding in this backend's `publish_app_ports`
 /// binding (a create-time-only property Docker can't mutate in place).
 pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> String {
-    rise_backend_core::traefik_render::route_hash_for(
+    rise_backend_traefik::render::route_hash_for(
         desired,
         &cfg.render_config(),
         desired.port.is_some() && cfg.publish_app_ports,

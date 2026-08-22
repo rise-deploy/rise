@@ -21,6 +21,7 @@ aws-sdk-ssm = { version = "1.80", default-features = false, features = [
 ] }
 chrono = { workspace = true }
 rise-backend-core = { path = "../rise-backend-core" }
+rise-backend-traefik = { path = "../rise-backend-traefik" }
 rise-deployment-spec = { path = "../rise-deployment-spec" }
 rise-resource-api = { path = "../rise-resource-api" }
 rise-runtime-sync = { path = "../rise-runtime-sync" }

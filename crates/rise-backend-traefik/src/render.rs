@@ -11,8 +11,34 @@ use std::collections::HashMap;
 
 use rise_deployment_spec::AccessRequirement;
 
-use crate::desired::{DesiredContainer, RouteForwardAuth};
+use rise_backend_core::desired::DesiredContainer;
+use rise_backend_core::effective_access_requirement;
+
 use crate::labels::{self, ForwardAuth, TraefikRoute};
+
+/// Per-route forwardAuth outcome for a single Traefik router.
+enum RouteForwardAuth {
+    /// No auth requirement — emit the router with no forwardAuth middleware.
+    Open,
+    /// Auth required and wired — attach forwardAuth pointing at this address.
+    Gated(String),
+    /// Auth required but no `auth_backend_url` to wire it — withhold this router
+    /// (fail closed) rather than expose an unauthenticated public route.
+    Withheld,
+}
+
+/// Default Traefik health-check interval (Go duration `10s`) when the
+/// `health_check` spec sets no `period_seconds`.
+const DEFAULT_HEALTHCHECK_INTERVAL_SECS: i32 = 10;
+/// Default Traefik health-check timeout (Go duration `5s`) when the
+/// `health_check` spec sets no `timeout_seconds`. Matches the Kubernetes
+/// default (`HealthProbeConfig::timeout_seconds` = 5 in
+/// `resource_builder::create_http_probe_with_override`) so the same public
+/// input — a `health_check` with no explicit `timeout_seconds` — yields the
+/// same effective timeout on both backends (no Docker-stricter divergence
+/// that could mark a slow-but-healthy endpoint DOWN on Docker but UP on K8s).
+const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 5;
+
 use crate::naming::{group_service_base, group_service_name};
 
 /// Static configuration the Traefik label renderer needs, independent of any one
@@ -51,7 +77,7 @@ pub fn routes_withheld<'a>(
     }
     route_overrides.any(|route_override| {
         !matches!(
-            crate::effective_access_requirement(route_override, project_requirement),
+            effective_access_requirement(route_override, project_requirement),
             AccessRequirement::None
         )
     })
@@ -224,10 +250,10 @@ pub fn render_traefik_labels_for(
         if let Some(health_path) = desired.health_path.as_deref() {
             let interval = desired
                 .health_check_interval_secs
-                .unwrap_or(crate::desired::DEFAULT_HEALTHCHECK_INTERVAL_SECS);
+                .unwrap_or(DEFAULT_HEALTHCHECK_INTERVAL_SECS);
             let timeout = desired
                 .health_check_timeout_secs
-                .unwrap_or(crate::desired::DEFAULT_HEALTHCHECK_TIMEOUT_SECS);
+                .unwrap_or(DEFAULT_HEALTHCHECK_TIMEOUT_SECS);
             out.insert(
                 format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.path"),
                 health_path.to_string(),

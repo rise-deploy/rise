@@ -7,17 +7,6 @@
 
 use rise_deployment_spec::AccessRequirement;
 
-/// Per-route forwardAuth outcome for a single Traefik router.
-pub(crate) enum RouteForwardAuth {
-    /// No auth requirement — emit the router with no forwardAuth middleware.
-    Open,
-    /// Auth required and wired — attach forwardAuth pointing at this address.
-    Gated(String),
-    /// Auth required but no `auth_backend_url` to wire it — withhold this router
-    /// (fail closed) rather than expose an unauthenticated public route.
-    Withheld,
-}
-
 /// One ingress route attached to a routable container.
 #[derive(Debug, Clone)]
 pub struct DesiredRoute {
@@ -113,15 +102,3 @@ pub struct DesiredContainer {
     /// default.
     pub health_check_timeout_secs: Option<i32>,
 }
-
-/// Default Traefik health-check interval (Go duration `10s`) when the
-/// `health_check` spec sets no `period_seconds`.
-pub(crate) const DEFAULT_HEALTHCHECK_INTERVAL_SECS: i32 = 10;
-/// Default Traefik health-check timeout (Go duration `5s`) when the
-/// `health_check` spec sets no `timeout_seconds`. Matches the Kubernetes
-/// default (`HealthProbeConfig::timeout_seconds` = 5 in
-/// `resource_builder::create_http_probe_with_override`) so the same public
-/// input — a `health_check` with no explicit `timeout_seconds` — yields the
-/// same effective timeout on both backends (no Docker-stricter divergence
-/// that could mark a slow-but-healthy endpoint DOWN on Docker but UP on K8s).
-pub(crate) const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 5;

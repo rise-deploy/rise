@@ -25,11 +25,11 @@ use anyhow::{Context, Result};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use rise_backend_core::{
     build_controller_metadata, effective_health_path, hash_env, merge_container_env,
-    pin_system_env, replica_ready, resolve_deployment_env_vars, resolve_runtime_containers,
-    rise_system_env_vars, should_have_infrastructure, spec_key, DeploymentStore,
-    DeploymentUrlBuilder, DesiredContainer, DesiredRoute, EncryptionProvider, InspectedContainer,
-    ReadyVerdict, RegistryProvider, TraefikApiClient,
+    pin_system_env, resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
+    should_have_infrastructure, spec_key, DeploymentStore, DeploymentUrlBuilder, DesiredContainer,
+    DesiredRoute, EncryptionProvider, InspectedContainer, RegistryProvider,
 };
+use rise_backend_traefik::{replica_ready, ReadyVerdict, TraefikApiClient};
 use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
 use rise_runtime_sync::{
     with_leader_election, LeaderElection, LeaderStatus, LeaseError, LEASE_DURATION,
@@ -684,7 +684,7 @@ impl EcsReconciler {
             })
             .collect();
 
-        let routable = !rise_backend_core::routes_withheld(
+        let routable = !rise_backend_traefik::routes_withheld(
             &project.access_class,
             &self.config.access_classes,
             &self.config.auth_backend_url,
@@ -724,7 +724,7 @@ impl EcsReconciler {
         };
         // ECS has no `publish_app_ports` analogue, so the route hash folds in
         // `false` for that dimension.
-        desired_container.route_hash = rise_backend_core::route_hash_for(
+        desired_container.route_hash = rise_backend_traefik::route_hash_for(
             &desired_container,
             &self.traefik_render_config(),
             false,
@@ -1389,7 +1389,7 @@ impl EcsReconciler {
                 continue;
             };
 
-            let router_withheld = rise_backend_core::routes_withheld(
+            let router_withheld = rise_backend_traefik::routes_withheld(
                 &project.access_class,
                 &self.config.access_classes,
                 &self.config.auth_backend_url,
@@ -1400,7 +1400,7 @@ impl EcsReconciler {
             ) || primary_hosts.is_empty();
             let has_health_path = effective_health_path(spec, &self.config.health_path).is_some();
 
-            let service_names = rise_backend_core::rolling::service_names_for_spec(
+            let service_names = rise_backend_traefik::service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
                 spec,
@@ -1702,8 +1702,8 @@ impl EcsReconciler {
         Ok(())
     }
 
-    fn traefik_render_config(&self) -> rise_backend_core::TraefikRenderConfig<'_> {
-        rise_backend_core::TraefikRenderConfig {
+    fn traefik_render_config(&self) -> rise_backend_traefik::TraefikRenderConfig<'_> {
+        rise_backend_traefik::TraefikRenderConfig {
             label_namespace: &self.config.label_namespace,
             controller_class: &self.config.controller_class,
             traefik_entrypoint: &self.config.traefik_entrypoint,

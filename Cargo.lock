@@ -4345,6 +4345,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rise-backend-auth",
  "rise-backend-core",
+ "rise-backend-traefik",
  "rise-deployment-spec",
  "rise-resource-api",
  "rise-runtime-sync",
@@ -4372,6 +4373,7 @@ dependencies = [
  "aws-sdk-ssm",
  "chrono",
  "rise-backend-core",
+ "rise-backend-traefik",
  "rise-deployment-spec",
  "rise-resource-api",
  "rise-runtime-sync",
@@ -4383,6 +4385,23 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "rise-backend-traefik"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.13.4",
+ "rise-backend-core",
+ "rise-deployment-spec",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
 ]
 
 [[package]]
@@ -4427,6 +4446,7 @@ dependencies = [
  "rise-backend-core",
  "rise-backend-docker",
  "rise-backend-ecs",
+ "rise-backend-traefik",
  "rise-deployment-spec",
  "rise-resource-api",
  "rise-resource-store-postgres",

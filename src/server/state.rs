@@ -510,7 +510,7 @@ async fn init_ecs_backend(
             auth_backend_url: auth_backend_url.clone(),
             access_classes: access_requirements,
             traefik_entrypoint: traefik_entrypoint.clone(),
-            traefik_certresolver: rise_backend_core::labels::normalize_certresolver(
+            traefik_certresolver: rise_backend_traefik::normalize_certresolver(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
@@ -708,10 +708,9 @@ async fn init_docker_backend(
             container_prefix: container_prefix.clone(),
             traefik_network: traefik_network.clone(),
             traefik_entrypoint: traefik_entrypoint.clone(),
-            traefik_certresolver:
-                crate::server::deployment::controller::docker::labels::normalize_certresolver(
-                    traefik_certresolver.clone(),
-                ),
+            traefik_certresolver: rise_backend_traefik::normalize_certresolver(
+                traefik_certresolver.clone(),
+            ),
             reconcile_interval_secs: *reconcile_interval_secs,
             health_path,
             public_url: public_url.to_string(),

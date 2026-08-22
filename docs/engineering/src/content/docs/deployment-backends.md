@@ -46,6 +46,31 @@ during planning and review (see the contributor guideline in `CLAUDE.md`), and
 this matrix kept up to date as the source of truth for what each backend
 supports.
 
+## Where the shared code lives
+
+Two of the three backends front workloads with **Traefik** and configure it
+identically — label the workload, let the provider discover it, read
+`serverStatus` back for readiness. That machinery is one implementation in
+`rise-backend-traefik`, shared by Docker and ECS, rather than two copies that
+drift into a routing bug nobody notices until traffic stops.
+
+It is deliberately **not** in `rise-backend-core`. Core is the contract seam
+*every* backend shares — models, the `DeploymentBackend` and `DeploymentStore`
+traits, URL building, the state machine, and the runtime-agnostic reconcile
+helpers. Traefik is a routing choice two backends happen to make; Kubernetes
+routes with nginx ingress annotations and depends on none of it. Putting Traefik
+in core would have meant every backend depending on one backend-group's proxy.
+
+```
+rise-backend-core        ← the contract seam (all backends)
+   └── rise-backend-traefik   ← routing (Traefik-fronted backends only)
+          ├── rise-backend-docker
+          └── rise-backend-ecs
+```
+
+A future backend that fronts workloads differently — an ALB-native ECS mode, say
+— depends on core and skips the Traefik crate entirely.
+
 ## Feature matrix
 
 Legend: ✅ supported · ⚠️ partial / with caveats · ❌ not supported (see note).

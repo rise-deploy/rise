@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Result};
 use rise_backend_core::desired::DesiredContainer;
 use rise_backend_core::naming::sanitize_ecs_name;
-use rise_backend_core::traefik_render::{render_traefik_labels_for, TraefikRenderConfig};
+use rise_backend_traefik::render::{render_traefik_labels_for, TraefikRenderConfig};
 
 use crate::sizing::{self, FargateSize};
 

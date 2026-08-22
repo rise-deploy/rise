@@ -7,8 +7,12 @@
 //! `DeploymentStore` trait — the database boundary implemented in `rise-deploy`
 //! over SQLX — and the runtime-agnostic reconcile machinery every backend
 //! shares: desired-state shaping, env merging/hashing, deterministic naming,
-//! Traefik label rendering, drift diffing, rollout gating and pod-status
-//! reporting.
+//! bookkeeping labels, drift diffing, rollout gating and pod-status reporting.
+//!
+//! Routing is deliberately NOT here. Traefik's label machinery lives in
+//! `rise-backend-traefik`, shared by the backends that front workloads with
+//! Traefik (Docker, ECS); Kubernetes routes with nginx annotations and depends
+//! on none of it.
 //!
 //! It never opens a database connection or runs a query; `sqlx` is a dependency
 //! only for the `FromRow`/`Type` derives on the moved models.
@@ -33,8 +37,6 @@ pub mod state_machine;
 pub mod store;
 pub mod system_env;
 pub mod token_ttl;
-pub mod traefik_api;
-pub mod traefik_render;
 pub mod url_builder;
 
 pub mod test_helpers;
@@ -49,19 +51,13 @@ pub use diff::{
 pub use env::{hash_env, merge_container_env, pin_system_env, upsert_env};
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use health_path::effective_health_path;
-pub use naming::{
-    container_name, group_app_name, group_service_base, group_service_name, sanitize_ecs_name,
-    stable_identity_name,
-};
+pub use naming::{container_name, group_app_name, sanitize_ecs_name, stable_identity_name};
 pub use pod_status::{build_controller_metadata, build_pod_status};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
 };
 pub use rise_deployment_spec::AccessRequirement;
-pub use rolling::{
-    filter_rolling_actions, replica_ready, rolling_rotation_decision, ReadyVerdict,
-    RotationDecision,
-};
+pub use rolling::filter_rolling_actions;
 pub use runtime::{
     effective_access_requirement, resolve_deployment_env_vars, resolve_runtime_containers,
     should_have_infrastructure, ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES,
@@ -70,8 +66,4 @@ pub use runtime::{
 pub use store::DeploymentStore;
 pub use system_env::rise_system_env_vars;
 pub use token_ttl::{refresh_due_after_secs, remint_after_secs};
-pub use traefik_api::TraefikApiClient;
-pub use traefik_render::{
-    render_traefik_labels_for, route_hash_for, routes_withheld, TraefikRenderConfig,
-};
 pub use url_builder::{DeploymentUrlBuilder, IngressUrl};

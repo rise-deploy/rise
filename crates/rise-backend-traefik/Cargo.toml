@@ -1,0 +1,24 @@
+[package]
+name = "rise-backend-traefik"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+description = "Traefik routing machinery shared by Rise's Traefik-fronted deployment backends (Docker, ECS)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+reqwest = { version = "0.13.0", features = ["json"] }
+rise-backend-core = { path = "../rise-backend-core" }
+rise-deployment-spec = { path = "../rise-deployment-spec" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+urlencoding = "2.1"
+
+[dev-dependencies]
+tokio = { workspace = true }
