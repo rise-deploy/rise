@@ -258,7 +258,7 @@ impl DockerReconciler {
         let traefik_api = config
             .traefik_api_url
             .as_deref()
-            .and_then(super::traefik_api::TraefikApiClient::new);
+            .and_then(|url| super::traefik_api::TraefikApiClient::new(url, "docker"));
         Self {
             docker,
             store,
@@ -2863,7 +2863,7 @@ mod tests {
 
     #[test]
     fn identity_targets_are_the_create_and_recreate_deployment_uuids() {
-        use crate::test_helpers::{desired, identity_of};
+        use rise_backend_core::test_helpers::{desired, identity_of};
 
         // A Create targeting the desired slot resolves to that deployment's UUID;
         // a Remove never needs identity material. Resolving through `desired`

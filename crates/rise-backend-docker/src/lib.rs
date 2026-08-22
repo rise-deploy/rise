@@ -12,18 +12,17 @@
 
 pub mod client;
 pub mod container_builder;
-pub mod diff;
-pub mod env;
 pub mod health;
 pub mod identity;
-pub mod labels;
-pub mod pod_status;
 pub mod reconciler;
-pub mod rolling;
-pub mod traefik_api;
 
-#[cfg(test)]
-mod test_helpers;
+// The runtime-agnostic reconcile machinery now lives in `rise-backend-core` so
+// the ECS backend shares one implementation rather than a divergent copy. These
+// re-exports keep every existing `rise_backend_docker::{diff,env,labels,…}` path
+// resolving unchanged.
+pub use rise_backend_core::{
+    diff, env, labels, naming, pod_status, rolling, traefik_api, traefik_render,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;

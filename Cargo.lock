@@ -4267,13 +4267,17 @@ dependencies = [
  "async-trait",
  "chrono",
  "regex",
+ "reqwest 0.13.4",
  "rise-deployment-spec",
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
+ "url",
+ "urlencoding",
  "uuid",
 ]
 

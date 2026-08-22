@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 /// Merge env for one container in final precedence:
 /// base (plain + secret) → system env → per-container overrides. Later writes
 /// win on key conflict.
-pub(crate) fn merge_container_env(
+pub fn merge_container_env(
     base_env: &[(String, String)],
     system_env: &[(String, String)],
     injected_hosts: &[(String, String)],
@@ -46,18 +46,14 @@ pub(crate) fn merge_container_env(
 /// (always — the container's own name, a system identity var). Both overwrite
 /// any user-supplied value and fold into the `env_hash`. Mirrors the Kubernetes
 /// builder's `RISE_CONTAINER` injection in `resource_builder::build_container`.
-pub(crate) fn pin_system_env(
-    env: &mut Vec<(String, String)>,
-    container_name: &str,
-    port: Option<u16>,
-) {
+pub fn pin_system_env(env: &mut Vec<(String, String)>, container_name: &str, port: Option<u16>) {
     if let Some(port) = port {
         upsert_env(env, "PORT", &port.to_string());
     }
     upsert_env(env, "RISE_CONTAINER", container_name);
 }
 
-pub(crate) fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+pub fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     if let Some(existing) = env.iter_mut().find(|(k, _)| k == key) {
         existing.1 = value.to_string();
     } else {

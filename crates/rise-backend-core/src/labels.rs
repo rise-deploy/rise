@@ -201,8 +201,11 @@ pub struct TraefikRoute<'a> {
     pub port: u16,
     /// Traefik entrypoint name (e.g. `web`).
     pub entrypoint: &'a str,
-    /// Docker network shared with Traefik.
-    pub network: &'a str,
+    /// Value for `traefik.docker.network` — the Docker provider needs it to pick
+    /// the right endpoint when a container is on several networks. **`None` for
+    /// the ECS provider**, which resolves task ENIs itself and would mis-resolve
+    /// if handed a Docker network name; the label is then not emitted at all.
+    pub network: Option<&'a str>,
     /// Optional certresolver — when set the router gets TLS labels.
     pub certresolver: Option<&'a str>,
     /// Optional forwardAuth middleware — when set the router gets a
@@ -282,10 +285,9 @@ pub fn render_traefik_labels(route: &TraefikRoute<'_>) -> HashMap<String, String
     }
     let r = route.router_name;
     labels.insert("traefik.enable".to_string(), "true".to_string());
-    labels.insert(
-        "traefik.docker.network".to_string(),
-        route.network.to_string(),
-    );
+    if let Some(network) = route.network {
+        labels.insert("traefik.docker.network".to_string(), network.to_string());
+    }
     labels.insert(
         format!("traefik.http.routers.{r}.rule"),
         build_rule(route.hosts, route.path_prefix),
@@ -436,7 +438,7 @@ mod tests {
             path_prefix: None,
             port: 8080,
             entrypoint: "web",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: None,
             forward_auth: None,
         });
@@ -472,7 +474,7 @@ mod tests {
             path_prefix: None,
             port: 8080,
             entrypoint: "websecure",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: Some("le"),
             forward_auth: None,
         });
@@ -498,7 +500,7 @@ mod tests {
             path_prefix: None,
             port: 8080,
             entrypoint: "web",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: None,
             forward_auth: None,
         });
@@ -513,7 +515,7 @@ mod tests {
             path_prefix: None,
             port: 8080,
             entrypoint: "web",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: None,
             forward_auth: None,
         });
@@ -533,7 +535,7 @@ mod tests {
             path_prefix: Some("/api"),
             port: 8080,
             entrypoint: "web",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: None,
             forward_auth: None,
         });
@@ -554,7 +556,7 @@ mod tests {
             path_prefix: None,
             port: 8080,
             entrypoint: "web",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: None,
             forward_auth: Some(ForwardAuth {
                 address: "http://rise:3000/api/v1/auth/ingress?project=app&signin_redirect=1",
@@ -589,7 +591,7 @@ mod tests {
             path_prefix: None,
             port: 8080,
             entrypoint: "web",
-            network: "rise_default",
+            network: Some("rise_default"),
             certresolver: None,
             forward_auth: None,
         };

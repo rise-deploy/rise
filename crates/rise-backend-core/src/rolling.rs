@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::container_builder;
-use super::diff::{action_key, ActualContainer, ReconcileAction};
+use crate::diff::{action_key, ActualContainer, ReconcileAction};
+use crate::naming;
 
 /// Apply the ROLLING-RECREATE throttle to a diff's actions, run AFTER
 /// [`super::diff::diff_desired_vs_actual`] and BEFORE `apply_actions`. Enforces,
@@ -34,7 +34,7 @@ use super::diff::{action_key, ActualContainer, ReconcileAction};
 /// identity → its spec + replica index + run state). `healthy_by_identity` maps
 /// an `identity_key(...)` to whether that live replica passed the HTTP health
 /// probe this tick (absent → treated as NOT healthy).
-pub(crate) fn filter_rolling_actions(
+pub fn filter_rolling_actions(
     actions: Vec<ReconcileAction>,
     actual: &[ActualContainer],
     healthy_by_identity: &HashMap<String, bool>,
@@ -114,7 +114,7 @@ pub(crate) fn filter_rolling_actions(
 
 /// Group-scoped Traefik service name(s) a container spec's routes emit, used by
 /// the reconciler's `serverStatus` lookup so it queries the SAME service(s) the
-/// labels stamp. Mirrors [`container_builder::group_service_names`] but derives
+/// labels stamp. Mirrors [`naming::group_service_names`] but derives
 /// from the runtime [`rise_deployment_spec::request_spec::ContainerSpec`] +
 /// [`rise_deployment_spec::request_spec::RouteSpec`] set (what `reconcile_health`
 /// has on hand): a single-route container yields the bare base
@@ -131,7 +131,7 @@ pub(crate) fn filter_rolling_actions(
 ///
 /// A port-less worker has no routes/service → empty. Routability is implicit:
 /// every infra-bearing deployment is routable.
-pub(crate) fn service_names_for_spec(
+pub fn service_names_for_spec(
     project: &str,
     deployment_group: &str,
     spec: &rise_deployment_spec::request_spec::ContainerSpec,
@@ -144,7 +144,7 @@ pub(crate) fn service_names_for_spec(
     if spec.port.is_none() || primary_hosts.is_empty() {
         return Vec::new();
     }
-    let base = container_builder::group_service_base(project, deployment_group, &spec.name);
+    let base = naming::group_service_base(project, deployment_group, &spec.name);
     // Routes for this container, sorted longest-path-prefix-first — the SAME
     // ordering `render_traefik_labels_for` uses to index per-route services.
     let mut routes: Vec<&rise_deployment_spec::request_spec::RouteSpec> = route_specs
@@ -157,7 +157,7 @@ pub(crate) fn service_names_for_spec(
         return Vec::new();
     }
     (0..route_count)
-        .map(|idx| container_builder::group_service_name(&base, idx, route_count))
+        .map(|idx| naming::group_service_name(&base, idx, route_count))
         .collect()
 }
 
@@ -181,12 +181,12 @@ pub(crate) fn service_names_for_spec(
 /// wrapper over [`rolling_rotation_decision`]: in-rotation → `Ready`, everything
 /// else → `NotReady` with the rotation reason.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ReadyVerdict {
+pub enum ReadyVerdict {
     Ready,
     NotReady(String),
 }
 
-pub(crate) fn replica_ready(
+pub fn replica_ready(
     router_withheld: bool,
     has_health_path: bool,
     running: bool,
@@ -207,7 +207,7 @@ pub(crate) fn replica_ready(
 
 /// Outcome of the in-rotation decision for a single container.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum RotationDecision {
+pub enum RotationDecision {
     /// The container's server is in Traefik's rotation (or running, for a
     /// ready-when-running container) → counts toward deployment readiness.
     InRotation,
@@ -240,7 +240,7 @@ pub(crate) enum RotationDecision {
 ///   Traefik (no traffic) — which is exactly what an unregistered server is.
 ///
 /// Kept pure (no `self`, no I/O) so it can be unit-tested without a daemon.
-pub(crate) fn rolling_rotation_decision(
+pub fn rolling_rotation_decision(
     has_health_path: bool,
     running: bool,
     api_available: bool,
@@ -526,7 +526,7 @@ mod tests {
         // labels stamp (`group_service_names` over the matching DesiredContainer).
         // The base carries the injective hash suffix `group_service_base`
         // appends, so derive it the same way rather than hardcoding the hash.
-        let base = container_builder::group_service_base("myapp", "default", "app");
+        let base = naming::group_service_base("myapp", "default", "app");
         let hosts = ["myapp.rise.dev".to_string()];
         assert_eq!(
             service_names_for_spec("myapp", "default", &spec, &routes, &hosts),
@@ -570,13 +570,13 @@ mod tests {
         // container. The bare base is NOT queried (it 404s in the Traefik API).
         // The base carries the injective hash suffix, so derive the per-route
         // names via `group_service_name` rather than hardcoding the hash.
-        let base = container_builder::group_service_base("myapp", "default", "api");
+        let base = naming::group_service_base("myapp", "default", "api");
         let hosts = ["myapp.rise.dev".to_string()];
         assert_eq!(
             service_names_for_spec("myapp", "default", &spec, &routes, &hosts),
             vec![
-                container_builder::group_service_name(&base, 0, 2),
-                container_builder::group_service_name(&base, 1, 2),
+                naming::group_service_name(&base, 0, 2),
+                naming::group_service_name(&base, 1, 2),
             ]
         );
     }
@@ -586,7 +586,8 @@ mod tests {
         // The reconciler-side derivation must agree with the builder-side
         // `group_service_names` (the labels) for the same routes — single AND
         // multi-route — so the lookup never drifts from what's stamped.
-        use container_builder::{group_service_names, DesiredRoute};
+        use crate::desired::DesiredRoute;
+        use naming::group_service_names;
         use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
 
         let mk_desired = |container: &str, paths: &[&str]| {
