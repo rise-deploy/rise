@@ -4,11 +4,33 @@ title: "ADR-0004: ECS Deployment Backend"
 
 ## Status
 
-**Proposed** (under review). Date: 2026-08-22 (drafted 2026-08-18).
+**In Progress** — the v1 slice is implemented and `type: ecs` deploys. Date:
+2026-08-22 (drafted 2026-08-18).
+
+Shipped: the `rise-backend-ecs` crate on the `rise-backend-core` seam (D1),
+Fargate on `awsvpc` (D2), one ECS service per (deployment, container spec) with
+a task-definition family per workload (D3, D4), Traefik's ECS provider for
+routing with forwardAuth-backed access classes (D5), ECR pulls via the task
+execution role (D6), SSM `SecureString` secret env (D7), Fargate size round-up
+(D9), overlap-and-drain cutover gated on Traefik `serverStatus` (D12), and the
+tag-based, batched, hash-gated reconcile loop (D13).
+
+One decision changed under implementation. **D3's service-per-deployment model
+made the remove-then-create problem disappear rather than needing mitigation**:
+because an ECS service owns its replicas and rolls its own replacement when
+pointed at a new task-definition revision, within-deployment drift is a
+declarative `UpdateService` and nothing is destroyed. The replica dimension of
+the Docker backend's identity tuple therefore collapses here — the unit of state
+is the service, keyed by the existing replica-free `spec_key` — and the
+rolling-throttle machinery is not needed at all.
+
+Deliberately deferred, each **failing closed** with an actionable deploy-time
+error rather than half-working: workload identity (D8), Cloud Map
+cross-container discovery (D10), CloudWatch logs (D11), the Terraform module and
+ALB-native routing (D5, D14).
 
 This ADR records how Rise's public feature surface maps onto Amazon ECS and the
-surrounding AWS services, so that the implementation PRs argue about code rather
-than about topology. The design-gating facts it depended on — Cloud Map shared
+surrounding AWS services. The design-gating facts it depended on — Cloud Map shared
 registration with clean drain, and Traefik ECS provider label/cutover fidelity —
 have been **verified against a real AWS account** via the runnable spikes in
 `scripts/spikes/` (see [Open questions](#open-questions) 1–2). The remaining

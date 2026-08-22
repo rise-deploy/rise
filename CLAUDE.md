@@ -1,9 +1,9 @@
 # Rise
 
 Rise is a Rust project — a backend and an accompanying `rise` CLI — for deploying
-apps packaged as container images to a container runtime. Kubernetes and Docker are
-the supported runtimes today; the design deliberately leaves room for others (ECS,
-Lambda, DO Apps, …).
+apps packaged as container images to a container runtime. Kubernetes, Docker and
+Amazon ECS (Fargate) are the supported runtimes today; the design deliberately
+leaves room for others (Lambda, DO Apps, …).
 
 The CLI deploys from the most minimal of configurations. It builds the container
 image locally (Dockerfile, Cloud Native Buildpacks, or Railpack), pushes it to a
@@ -74,8 +74,9 @@ Focused support crates live under `crates/`:
 |---|---|---|
 | `rise-deployment-spec` | Shared deployment/project-config model — `AccessRequirement`, `RouteAccess`, request spec, validation | workspace dep (both CLI and backend) |
 | `rise-backend-auth` | Pure-core token signing, verification, and claim matching — the single home for auth-token logic (see `ROADMAP.md` § 2, "Rise-issued authentication and token issuance") | `backend` |
-| `rise-backend-core` | The deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine`/`runtime`/`url_builder`/`token_ttl`/`custom_domain` helpers, and the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore` | `backend` |
+| `rise-backend-core` | The deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine`/`runtime`/`url_builder`/`token_ttl`/`custom_domain` helpers, the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore` — and the runtime-agnostic reconcile machinery every backend shares (`desired`/`env`/`naming`/`labels`/`traefik_render`/`traefik_api`/`diff`/`rolling`/`pod_status`) | `backend` |
 | `rise-backend-docker` | The Docker deployment backend: `DockerBackend` + the in-process `DockerReconciler`, the first controller extracted onto the `rise-backend-core` seam. Re-exported under `crate::server::deployment::controller::docker`, so existing module paths keep resolving | `backend` |
+| `rise-backend-ecs` | The Amazon ECS deployment backend (Fargate): `EcsBackend` + the in-process `EcsReconciler`, plus the pure Fargate-sizing, tag, task-definition and service-diff modules | `backend` |
 | `rise-authz` | Authorization policy evaluation, in two tiers. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies. `engine` is Tier 1: the live ADR-0001 §4 algorithm over `ResourceStore` reads and one `MembershipResolver` seam — still free of HTTP, SQL, and product kinds | `backend` |
 | `rise-resource-api` | Generic resource API contract (resource kinds, scopes, owner references, identity, policy types) | `backend` |
 | `rise-resource-store-postgres` | PostgreSQL adapter for the resource API. Owns its own migrations in a `resource_store` schema and its own SQLX offline cache | `backend` |
@@ -172,6 +173,8 @@ cargo build --all-features     # Full build with CLI + backend
    - [x] Deployment backends:
      - [x] Kubernetes controller — K8s deployments with Ingress
      - [x] Docker backend — single-host Docker daemon with Traefik routing
+     - [x] Amazon ECS backend — Fargate services with Traefik's ECS provider,
+       SSM-injected secret env, and Fargate task sizing (see ADR-0004)
    - [x] Container registry integration: ECR, GitLab, JFrog, generic OCI basic-auth
    - [x] Encryption providers: Local AES-GCM and AWS KMS
    - [x] OCI client for image digest resolution
@@ -394,8 +397,8 @@ per-crate clippy sweep; `cargo fmt --all -- --check`; `mise sqlx:check`;
 
 ## Deployment Backend Parity (STRICT)
 
-Rise supports multiple deployment backends (currently **Kubernetes** and
-**Docker**). They are equal first-class citizens, and we aim for **semantic
+Rise supports multiple deployment backends (currently **Kubernetes**, **Docker**
+and **Amazon ECS**). They are equal first-class citizens, and we aim for **semantic
 feature parity and correctness across all of them**.
 
 **The rule:** any feature configurable through a public Rise API surface
