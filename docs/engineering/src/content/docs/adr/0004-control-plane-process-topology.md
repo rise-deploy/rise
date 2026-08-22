@@ -8,10 +8,17 @@ title: "ADR-0004: Control-Plane Process Topology"
 
 ADR-0001 fixes the authorization model and the crate structure that realizes
 it; ADR-0002 fixes the subresource execution seam. This decision changes
-neither. It decides *which process* each of them runs in, what protocol the
-components between them speak, and in what order the split happens.
+ADR-0001 not at all and ADR-0002 in one deliberate respect (§4). It decides
+*which process* each of them runs in, what protocol the components between them
+speak, and in what order the split happens.
 
 ## Context
+
+Every month the in-process path is the only path is a month of code written
+against storage semantics a network boundary cannot preserve. That is the
+motivating concern; multi-org isolation (`ROADMAP.md` §5), third-party
+controllers, and clear credential ownership are the reasons it is worth paying
+to fix.
 
 ### Today's topology
 
@@ -28,41 +35,33 @@ path = "src/main.rs"
 # helm/rise/templates/deployment.yaml
 # Single server container with all controllers running in the same process
 - name: server
-  args:
-    - "backend"
-    - "server"
+  args: ["backend", "server"]
 ```
 
-`rise backend server` hosts, in one `tokio` runtime sharing one `PgPool`:
+`rise backend server` hosts, in one `tokio` runtime sharing one `PgPool`: the
+whole HTTP API including `/api/v1/resources`; the project, ECR, resource-GC,
+workload-identity-refresh and Entra-sync loops, each `tokio::spawn`ed in
+`src/server/mod.rs` under a `rise-runtime-sync` leader election; the Docker
+reconciler (`src/server/state.rs`) under the same; and the Metacontroller
+sync/finalize webhook (`src/server/deployment/webhook.rs`).
 
-- the whole HTTP API, including the generic resource API at
-  `/api/v1/resources`;
-- the project controller, the ECR controller, the resource GC worker, the
-  workload-identity refresh controller, and the Entra active-sync loop, each
-  `tokio::spawn`ed in `src/server/mod.rs` and gated by a `rise-runtime-sync`
-  leader election;
-- the Docker reconciler (`rise-backend-docker`), spawned from
-  `src/server/state.rs` under the same leader election;
-- the Metacontroller sync/finalize webhook (`src/server/deployment/webhook.rs`).
-
-One detail is easy to miss and matters to the ordering below: the Kubernetes
-reconcile *loop* is already out of process. Metacontroller runs as its own
-Deployment and calls Rise's webhook. What lives in `rise backend server` is the
-decision function — and it reads typed tables directly, through
-`state.deployment_store`, not through any resource API.
+One detail matters to the ordering below: the Kubernetes reconcile *loop* is
+already out of process — Metacontroller runs as its own Deployment and calls
+Rise's webhook. What lives in `rise backend server` is the decision function,
+and it reads typed tables directly through `state.deployment_store`, not
+through any resource API.
 
 ### What the boundary already gets right
 
 Schema ownership is real, not aspirational:
 
 - `resource_store` belongs to `rise-resource-store-postgres`, which owns its
-  migrations and its own SQLX offline cache. `runtime_sync` belongs to
+  migrations and SQLX offline cache. `runtime_sync` belongs to
   `rise-runtime-sync` on the same terms.
 - No `rise-deploy` production query reaches into `resource_store`; `grep -rn
-  resource_store src/db/*.rs` is empty. One test fixture writes the schema
-  directly (`src/server/resources/gc.rs:741`, under `#[cfg(test)]`).
-- The typed-table linkage migration explicitly refuses a foreign key across the
-  line:
+  resource_store src/db/*.rs` is empty. One test fixture writes it directly
+  (`src/server/resources/gc.rs:741`, under `#[cfg(test)]`).
+- The linkage migration explicitly refuses a foreign key across the line:
 
   ```sql
   -- migrations/20260526000002_add_organization_linkage.sql
@@ -72,16 +71,16 @@ Schema ownership is real, not aspirational:
   -- Treat these columns as soft references to `resource_store.resources(uid)`.
   ```
 
-- The store contract itself is dependency-light and lives in
-  `rise-resource-api`, not in the server crate.
+- The store contract is dependency-light and lives in `rise-resource-api`, not
+  in the server crate.
 
 So the failure mode usually feared — a second component quietly growing SQL
 against someone else's tables — has not happened.
 
 ### What it does not get right
 
-**1. `ResourceStore` is a storage contract, not an API contract.** Four of its
-methods take the acting identity as a string parameter
+**1. `ResourceStore` is a storage contract, not an API contract.** Four methods
+take the acting identity as a string parameter
 (`crates/rise-resource-api/src/store.rs:293-325`):
 
 ```rust
@@ -91,25 +90,25 @@ async fn operator_update_status(&self, uid: Uuid, operator: &str, …);
 async fn operator_update_finalizers(&self, uid: Uuid, operator: &str, …);
 ```
 
-The trust boundary above them is already correct: the HTTP handlers pass
+The trust boundary above them is already correct — handlers pass
 `controller.0.identity_id` from the authenticated Controller
 (`src/server/resources/handlers.rs:1197`) and `user.email` after
-`require_operator` (`:1245`). The problem is not a live vulnerability — it is
-that the trait cannot express where identity comes from, so it cannot be the
-contract a remote client codes against. Other methods — `try_collect`,
-`list_pending_collection`, `resolve_path`, `ancestors`, `resolve_collection*`,
-`register_resource_definition` — are not API operations at all; they are the
+`require_operator` (`:1245`). The defect is expressive, not exploitable: the
+trait cannot say where identity comes from, so it cannot be the contract a
+remote client codes against. Others — `try_collect`, `list_pending_collection`,
+`resolve_path`, `ancestors`, `resolve_collection*`,
+`register_resource_definition` — are not API operations at all, but the
 internals of serving one.
 
-**2. Every in-tree consumer takes the whole surface.** `AppState` holds a single
-`Arc<dyn ResourceStore>` (`src/server/state.rs:75`) handed to the resource
+**2. Every in-tree consumer takes the whole surface.** One
+`Arc<dyn ResourceStore>` (`src/server/state.rs:75`) goes to the resource
 handlers, the GC worker, the deployment webhook, the organization helpers,
-bootstrap, and the Docker reconciler (`src/server/state.rs:1215` →
-`crates/rise-backend-docker/src/reconciler.rs:186`) alike. That last one is a
-*deployment controller* — the category §1 places outside the boundary — already
-holding a direct store handle. Nothing distinguishes a caller that could be remote from one
-that could not, so nothing tells us today which code the split would break. The field's own
-documentation states the intent plainly:
+bootstrap, and the Docker reconciler (`state.rs:1215` →
+`crates/rise-backend-docker/src/reconciler.rs:186`) alike — that last one a
+*deployment controller*, the category §1 places outside the boundary, already
+holding a direct handle. Nothing distinguishes a caller that could be remote
+from one that could not. The field's own documentation names the second
+protocol in advance:
 
 ```rust
 // src/server/state.rs
@@ -119,27 +118,12 @@ documentation states the intent plainly:
 pub resource_store: Arc<dyn rise_resource_api::ResourceStore>,
 ```
 
-That is the second protocol, named in advance: a privileged in-process path for
-components that are also expected to exist as external controllers. Whatever it
-is used for must be re-derivable from the API, or those components can never
-leave the process.
+A privileged in-process path, reserved for components that are also expected to
+become external controllers. Whatever it is used for must be re-derivable from
+the API, or those components can never leave the process.
 
-**3. The consistency model is still being decided.** ADR-0001's write-time grant
-gate requires serializable transactions spanning policy reads and policy writes;
-normalization and admission are specified as transaction-scoped;
-`ResourceStore::ancestors` exists precisely so `effectiveLabels` resolution
-(ADR-0001 §6.1) can be a pure function over a chain the store returns. All of
-that is inside-the-server work — and `rise-authz` is not yet a dependency of
-`rise-deploy` at all. Drawing a process boundary now means fixing the
-transaction boundary before the thing that needs it exists.
-
-**4. The HTTP API cannot yet be the only way in.** Pagination, label/field
-selectors, Watch, JSON Merge Patch, Server-Side Apply, and discovery are all
-open items under `ROADMAP.md` §1 "Resource API maturation". A component demoted
-to client-only today would poll unfiltered lists.
-
-**5. There is live cross-boundary state.** Typed rows carry
-`organization_resource_uid` soft references, and the guard that protects them
+**3. There is live cross-boundary state.** Typed rows carry
+`organization_resource_uid` soft references, and the guard protecting them
 documents its own race:
 
 ```rust
@@ -150,21 +134,14 @@ documents its own race:
 // *and* in every […] call site.
 ```
 
-That fix costs one advisory lock while both sides share a pool. Split the
-process first and the same bug needs a distributed answer instead.
+That costs one advisory lock while both sides share a pool. §6 says what
+replaces it when they do not.
 
-### Forces
-
-- **Ownership.** One process holding credentials for every schema makes "who may
-  write this table" a code-review question rather than an enforced one.
-- **Multi-org isolation** (`ROADMAP.md` §5) needs controllers that reconcile one
-  Organization into one cluster with no access to anything else. A controller
-  linked into the product backend cannot be constrained that way.
-- **Third-party and extension controllers** need a supported contract, which
-  means a network API with credentials, not a Rust trait.
-- **Protocol lock-in**, the motivating concern: every month the in-process path
-  is the only path is a month of code written against storage semantics that a
-  network boundary cannot preserve.
+**Not yet ready, either.** `rise-authz` is not a dependency of `rise-deploy` at
+all, so ADR-0001's transaction-scoped admission and grant gate do not exist to
+draw a boundary around; and pagination, selectors, Watch, Patch and discovery
+are all open under `ROADMAP.md` §1, so a client-only backend today would poll
+unfiltered lists. §7 turns both into gates.
 
 ## Decision
 
@@ -179,72 +156,61 @@ resource API end to end:
 | Kind registry and `ResourceDefinition` projection | Deployment controllers (Kubernetes, Docker) |
 | Normalization and admission | Extension controllers (RDS, S3, Snowflake OAuth) |
 | Authorization (`rise-authz` engine, ADR-0001) | CLI |
-| Subresource execution and forwarding (ADR-0002, §4 below) | Web UI |
-| Garbage collection | |
-| Watch fan-out | |
+| Subresource execution and forwarding (ADR-0002, §4) | Web UI |
+| Garbage collection · Watch fan-out | |
 
 The apiserver is the **sole holder of credentials for `resource_store`** and its
-only writer. Everything in the right-hand column is a client with a Rise-issued
-identity, addressing resources by path.
+only writer. Everything on the right is a client with a Rise-issued identity,
+addressing resources by path.
 
 This is deliberately the kube-apiserver shape: admission and authorization sit
-*inside* the process that owns storage, because both need to read and write in
-one transaction. Rise's storage engine happens to be PostgreSQL rather than
-etcd, which buys real transactions and costs nothing here.
+*inside* the process that owns storage, because both must read and write in one
+transaction. Rise's storage engine is PostgreSQL rather than etcd, which buys
+real transactions and costs nothing here.
 
-**The typed product API is a shrinking shim, not a fixture.** As
-`ROADMAP.md` §4 lands each kind, the typed routes stop owning storage and become
-a translation layer over the resource API — and `ROADMAP.md` §4's closing item
-already says typed tables are dropped "after [the] resource-backed path has
-baked and compatibility reads are no longer needed." The end state is a shim
-that exists only for clients not yet speaking the resource API, and quite
-possibly no typed surface at all. Three things follow, and this ADR reads
-differently without them:
+**The typed product API is a shrinking shim, not a fixture.** As `ROADMAP.md`
+§4 lands each kind, the typed routes stop owning storage and become a
+translation layer over the resource API; that section's closing item already
+drops typed tables once "compatibility reads are no longer needed". The end
+state is a shim serving only clients that do not yet speak the resource API,
+and quite possibly no typed surface at all. Three things follow:
 
-- **The right-hand column is not a peer architecture.** Deployment and extension
-  controllers are permanent; the typed API is a compatibility artifact with a
-  planned end. Do not invest in it as though it were durable, and do not add a
-  typed route for something the resource API can already express.
-- **The shim holds no storage and no credentials.** Once translation is all it
-  does, it is an ordinary client — so *where* it runs stops being an
-  architectural question and becomes a deployment one. It stays in `rise`
-  because that is where the CLI already is, not because it needs to be its own
-  tier.
-- **Several problems below are transitional, and should be solved
-  transitionally.** The cross-boundary Organization lock (§6), the bootstrap
-  split (§6), and the typed rows that soft-reference Organization UIDs all exist
-  *because* typed tables exist. They do not need permanent architecture — they
-  need a mechanism that carries the migration and is then deleted with the
-  tables it served. Building an enduring distributed-consistency layer for them
-  would outlive its problem.
+- **The right-hand column is not a peer architecture.** Controllers are
+  permanent; the typed API is a compatibility artifact with a planned end.
+  Do not add a typed route for anything the resource API can already express.
+- **The shim holds no storage and no credentials**, so where it runs is a
+  deployment question, not an architectural one. It stays in `rise` because the
+  CLI is already there.
+- **Several problems below are transitional and should be solved
+  transitionally.** The Organization lock and the bootstrap split (§6) exist
+  *because* typed tables exist. They need a mechanism that carries the migration
+  and is then deleted with the tables it served, not permanent architecture.
 
 ### 2. The API contract is the only protocol clients speak
 
-These rules govern the **inbound** direction — anything calling the apiserver.
-The apiserver's own outbound call to a Controller when forwarding a subresource
-is a second contract, governed by §4 rather than by these rules; it is the only
-sanctioned exception, and §4 states what constrains it instead.
+These rules govern the **inbound** direction. The apiserver's own outbound call
+to a Controller when forwarding a subresource is a second contract, governed by
+§4 — the only sanctioned exception.
 
 Normative, and enforceable long before any process splits:
 
 1. No component other than the apiserver opens a connection to `resource_store`.
 2. No SQL join, view, or foreign key crosses the boundary. Soft UID references
-   are permitted during the `ROADMAP.md` §4 migration; they carry no
-   referential guarantee.
-3. **No transaction spans the boundary.** Anything requiring atomicity with a
+   are permitted during the `ROADMAP.md` §4 migration and carry no referential
+   guarantee.
+3. **No transaction spans the boundary.** Anything needing atomicity with a
    resource write is implemented inside the apiserver — as admission, as a
    subresource, or as a store operation — never as a caller-side transaction.
 4. Every operation a client performs is expressible as one request against one
    resource path, with the acting identity taken from its credential.
-5. The only cross-boundary consistency primitives are the resource-level ones:
-   `resourceVersion` compare-and-swap, finalizers, owner references, and watch.
+5. The only cross-boundary consistency primitives are resource-level ones:
+   `resourceVersion` compare-and-swap, finalizers, owner references, watch.
    Advisory locks, `SELECT … FOR UPDATE`, and `rise-runtime-sync` leases are
    legitimate *within* one component and illegitimate *between* two.
 
-Rule 5 is the one that bites. `rise-runtime-sync` is the right tool for
-coordinating replicas of a single component and the wrong tool for coordinating
-two components; using it across the line reintroduces exactly the shared-database
-coupling this decision removes. §6 states how far that can actually be enforced.
+Rule 5 is the one that bites: `rise-runtime-sync` coordinates replicas of one
+component, and using it across the line reintroduces exactly the shared-database
+coupling this decision removes. §6 states how far that is actually enforceable.
 
 ### 3. Split `ResourceStore` into an API surface and a store-internal surface
 
@@ -264,229 +230,189 @@ ever be issued by a remote client.
 | Method | Why it stays in |
 |---|---|
 | `try_collect`, `list_pending_collection` | GC worker internals over tombstoned rows |
-| `list_deletion_blockers` | Backs the served `deletion-blockers` subresource (`src/server/resources/handlers.rs:665`); the subresource is remotable, this primitive is its implementation |
 | `resolve_path`, `ancestors` | Path resolution and `effectiveLabels` primitives feeding admission and authorization |
 | `resolve_collection`, `resolve_collection_version`, `resolve_collection_by_kind` | Registry lookups behind every request |
 | `register_resource_definition`, `update_resource_definition` | The atomic storage projection behind ordinary `ResourceDefinition` writes |
-| `operator_update_status`, `operator_update_finalizers` | Like `list_deletion_blockers`: the route is remotable — served today at `src/server/resources/handlers.rs:1245` after `require_operator` — and only the identity-bypassing primitive is internal. The route converges on `status`/`finalizers` under RBAC; the primitive dissolves |
+| `list_deletion_blockers` | Implementation of a served subresource (`handlers.rs:665`) — the route is remotable, the primitive is not |
+| `operator_update_status`, `operator_update_finalizers` | Same shape: the route is served today (`handlers.rs:1245`, after `require_operator`), and only the identity-bypassing primitive is internal. The route converges on `status`/`finalizers` under RBAC; the primitive dissolves |
 
-The four `controller_id: &str` / `operator: &str` parameters disappear when
-ADR-0001's choke point lands — `ROADMAP.md` §1 already commits to removing
+The four `controller_id` / `operator` parameters disappear when ADR-0001's
+choke point lands — `ROADMAP.md` §1 already commits to removing
 `ResourceDefinition.allowedStatusControllerIds` and authorizing `status` and
 `finalizers` through RBAC alone.
 
 In-tree code outside `src/server/resources/` and the GC worker uses only the API
-surface. That single rule turns the whole question into a compile-time check: a
-caller that cannot be expressed on the API surface is a future distributed-systems
-bug, found today, for free.
+surface. That one rule makes the whole question a compile-time check: a caller
+that cannot be expressed on the API surface is a future distributed-systems bug,
+found today, for free.
 
-`ResourceApi` has two implementations, but only for the duration of the
-migration: a direct in-process one, and an HTTP one in `rise-resource-client`.
-Because there is no embedded mode (§8), the direct implementation is never a
-product topology — it is how callers are held to the API surface while the
-apiserver is still hosted in `rise backend server`, and it retires at G5. The
-resource-store contract tests run against both while both exist.
+`ResourceApi` has two implementations, but only for the migration's duration: a
+direct in-process one and an HTTP one in `rise-resource-client`. Because there
+is no embedded mode (§8), the direct implementation is never a product topology
+— it is how callers are held to the API surface while the apiserver is still
+hosted in `rise backend server`, and it retires at G5. Contract tests run
+against both while both exist.
 
 ### 4. Product subresources execute where their capability lives
 
 The generic seam runs in the apiserver; the *capability* a product subresource
-needs often does not. `deployment-logs` is the case that decides the rule: the
-runtime log backend holds a live `kube::Client` or `bollard::Docker`
-(`src/server/deployment/logs.rs:189-190`, `:253`, `:312`). Compiling that
-handler into the apiserver would hand the control plane cluster and daemon
-credentials — exactly the merged blast radius this decision exists to separate —
-and would require it to know which cluster serves which Organization, which is
-controller state.
+needs often does not. `deployment-logs` decides the rule: the runtime log
+backend holds a live `kube::Client` or `bollard::Docker`
+(`src/server/deployment/logs.rs:189-190`, `:253`, `:312`). Compiling it into the
+apiserver would hand the control plane cluster and daemon credentials — the
+merged blast radius this decision exists to separate — and require it to know
+which cluster serves which Organization, which is controller state.
 
 So the apiserver **authorizes and forwards**. ADR-0002 §2's pipeline is
 unchanged — route, resolve the parent, evaluate RBAC, open the audit record —
 and only the leaf differs: instead of invoking a local handler, a platform-known
-forwarding strategy streams from the Controller that owns the resource. The
-client sees one path grammar and one authorization pipeline; the apiserver never
-holds a runtime credential.
+forwarding strategy streams from the Controller that owns the resource. One path
+grammar, one authorization pipeline, no runtime credential in the control plane.
 
-**This amends ADR-0002, deliberately — and it amends a prohibition rather than
-exercising a reservation.** That ADR requires a handler identifier to "exist in
-the process's code-backed registry" and rejects handlers naming "a URL,
-executable, dynamic library, or arbitrary Rust type", with no escape clause
-attached; the "unless a later ADR deliberately opens that boundary" it does
-carry governs *which kinds* a product handler may be registered for, not
-whether a handler may terminate remotely. This is therefore a change to
+**This amends ADR-0002, and amends a prohibition rather than exercising a
+reservation.** That ADR rejects handlers naming "a URL, executable, dynamic
+library, or arbitrary Rust type" with no escape clause; its "unless a later ADR
+deliberately opens that boundary" governs *which kinds* a product handler may be
+registered for, not whether one may terminate remotely. So this is a change to
 ADR-0002, not a door it left open — though its §3 shape table already
-contemplates a constrained reverse-proxy exchange, so the shape is not foreign
-to it. What survives unchanged is the reason for the prohibition: *arbitrary
-operator-defined* remote handlers stay rejected, because the forwarding strategy is platform-known and compiled in, the upstream
-is a registered `Controller` rather than an operator-supplied URL, and no
-`ResourceDefinition` can name a network endpoint. What changes is that a
-platform handler's implementation may terminate at a Controller instead of in
-local code.
+contemplates a constrained reverse-proxy exchange. The prohibition's *reason*
+survives intact: arbitrary operator-defined remote handlers stay rejected. The
+strategy is platform-known and compiled in, the upstream is a registered
+`Controller`, and no `ResourceDefinition` may name an endpoint.
 
-**The forwarding leg needs its own trust model, because authorizing the request
-is not the same as trusting the hop.** Three rules:
+**The forwarding leg needs its own trust model**, because authorizing a request
+is not the same as trusting the hop:
 
-*The endpoint is operator-set, never controller-set.* A Controller's address
-lives in its `spec`, written by an operator, and never in `status`, which the
-controller itself writes. Without this rule a stolen controller credential
-steers where the apiserver opens connections and the control plane becomes an
-open proxy — "registered Controller rather than an operator-supplied URL" is an
-empty distinction if the controller registers its own URL. The apiserver
-requires HTTPS and does not follow redirects, so the endpoint cannot be
-re-pointed after the fact either.
-
-*The apiserver forwards its own identity, never the client's.* A user's bearer
-token must not reach a controller: authorization already happened at the
-apiserver, and forwarding the caller's credential hands every controller a
-usable user token. The apiserver presents a Rise-issued assertion of its own,
-audience-bound to that Controller and naming the target resource, the
-subresource, and — for the controller's audit trail, not for its authorization
-— the acting principal. ADR-0001's `act` attribution already models exactly
-this shape. The controller authorizes the apiserver, not the end user; that is
-a confused deputy by construction, contained by the audience binding and by the
-fact that the assertion names one resource.
-
-*Controllers acquire a serving surface, and that is accepted.* A controller
-that serves subresources is no longer a pure client: it listens, terminates
-TLS, and has liveness that the apiserver must handle as a distinct failure from
-an unauthorized request. This is a real topology change from "it just speaks
-HTTP to the apiserver", and it is the price of keeping runtime credentials out
-of the control plane.
+- *The endpoint is operator-set, never controller-set.* A Controller's address
+  lives in its `spec`, written by an operator — never in `status`, which the
+  controller writes itself. Otherwise a stolen controller credential steers
+  where the apiserver opens connections and the control plane becomes an open
+  proxy; "registered Controller rather than operator-supplied URL" is an empty
+  distinction if the controller registers its own URL. HTTPS is required and
+  redirects are not followed.
+- *The apiserver forwards its own identity, never the client's.* A user's bearer
+  token must not reach a controller. The apiserver presents a Rise-issued
+  assertion audience-bound to that Controller, naming the target resource, the
+  subresource, and — for the controller's audit trail, not its authorization —
+  the acting principal; ADR-0001's `act` attribution already models the shape.
+  The controller authorizes the apiserver, not the end user: a confused deputy
+  by construction, contained by the audience binding and by naming one resource.
+- *Controllers acquire a serving surface, and that is accepted.* One that serves
+  subresources listens, terminates TLS, and has liveness the apiserver must
+  treat as a failure distinct from an unauthorized request. That is the price of
+  keeping runtime credentials out of the control plane.
 
 **The forwarding contract is versioned separately, in the opposite direction.**
-§8's rule covers clients calling the apiserver. Here the apiserver is the
-client and the controller is the server, so the compatibility burden inverts: a
-newer apiserver must keep working against a controller one minor behind, which
-is the ordinary state during a rolling upgrade and the permanent state for a
-third-party controller on its own release cadence. No legacy controllers exist
-— every controller on this seam is new — so the contract can be defined cleanly
-rather than retrofitted, and it should be, from the first one. CI covers this
-direction too: current apiserver against the previous release's controller.
+§8 covers clients calling the apiserver; here the apiserver is the client and a
+Controller is the server, so a newer apiserver must keep working against a
+controller one minor behind — the ordinary state mid-rollout and the permanent
+state for a third-party controller on its own cadence. No legacy controllers
+exist on this seam, so the contract can be defined cleanly from the first one
+rather than retrofitted. CI covers this direction too: current apiserver against
+the previous release's controller.
 
-Consequences to design when the first one ships:
+To design when the first one ships: streaming passthrough carrying cancellation
+and backpressure across two hops, with ADR-0002 §6's connection, idle and
+duration limits now applying at the apiserver rather than at the log source; a
+two-phase audit record spanning processes, its completion half needing the
+outcome, duration and byte count the forwarding leg observed; and endpoint
+liveness as a distinct failure mode. A subresource needing no runtime credential
+(the Loki log backend is an HTTP call to a log store) *could* execute locally —
+two execution shapes for one subresource is not worth the divergence, so
+forwarding is the rule.
 
-- Streaming passthrough must carry cancellation and backpressure across two
-  hops, and ADR-0002 §6's connection, idle, and duration limits now apply at
-  the apiserver, not at the process holding the log source.
-- Its two-phase audit record spans processes: the start record is the
-  apiserver's after authorization, the completion record needs the outcome,
-  duration, and byte count the forwarding leg observed.
-- Controller endpoint discovery becomes apiserver state — a Controller must
-  publish a reachable address, and an unreachable one is a distinct failure
-  from an unauthorized request.
-- A product subresource whose backend needs no runtime credential (the Loki log
-  backend is an HTTP call to a log store) *could* execute locally. Allowing two
-  execution shapes for one subresource is not worth the divergence; forwarding
-  is the rule.
-
-`status`, `finalizers`, and `token` are unaffected. They need no capability
-beyond the store and ADR-0001's signing keys, and execute in the apiserver.
+`status`, `finalizers`, and `token` are unaffected: they need nothing beyond the
+store and ADR-0001's signing keys, and execute in the apiserver.
 
 ### 5. Identity and transport
 
-Clients authenticate with **Rise-issued tokens over TLS**. There is no second
-trust root: principals are ADR-0001's `User`, `ServiceAccount`, and `Controller`
-identities carrying `rise_uid`, and every decision is live RBAC intersected with
-the token's `authorization_details` cap. mTLS is not part of the contract — a
-client certificate would model identity a second time, in a system that cannot
-express Rise's scopes, delegation, or revocation.
+Clients authenticate with **Rise-issued tokens over TLS**. No second trust root:
+principals are ADR-0001's `User`, `ServiceAccount`, and `Controller` identities
+carrying `rise_uid`, and every decision is live RBAC intersected with the
+token's `authorization_details` cap. mTLS is not part of the contract — a client
+certificate models identity a second time, in a system that cannot express
+Rise's scopes, delegation, or revocation. Two consequences follow: the apiserver
+verifies TLS wherever it is reachable, so a plaintext listener is a
+configuration error rather than a deployment option; and token lifetime becomes
+an availability parameter, since a controller that cannot refresh stops
+reconciling — making the platform-global maximum TTL (`ROADMAP.md` §2) a tuning
+decision as well as a security one.
 
-Two consequences follow directly:
-
-- The apiserver verifies TLS wherever it is reachable. A plaintext listener is a
-  configuration error, not a deployment option.
-- Token lifetime becomes an availability parameter. A controller that cannot
-  refresh stops reconciling, so the platform-global maximum TTL
-  (`ROADMAP.md` §2) is now a control-plane tuning decision, not only a security
-  one.
-
-**Browsers are ordinary clients.** Once the typed-object migration
-(`ROADMAP.md` §4) completes, the web UI addresses the apiserver directly rather than
-through the product backend. This is not a new identity kind: the UI already
-holds a Rise-issued JWT session cookie — the same credential the ingress-auth
-subrequest validates. It does move browser-facing concerns onto the apiserver
-that the product backend owns today: CORS, cookie scope and `SameSite`, CSRF on
-non-idempotent verbs, and per-item list filtering fast enough to be interactive.
-Until each kind migrates, the UI keeps reading it through the typed shim; the
-switch happens per surface, not as one cutover. Every client makes the same
-move eventually — the UI is just the one whose migration we control end to end,
-which is why it goes first.
+**Browsers are ordinary clients.** Once `ROADMAP.md` §4 completes, the web UI
+addresses the apiserver directly. This is not a new identity kind — the UI
+already holds a Rise-issued JWT session cookie, the same credential the
+ingress-auth subrequest validates. It does move browser-facing concerns onto the
+apiserver: CORS, cookie scope and `SameSite`, CSRF on non-idempotent verbs, and
+per-item list filtering fast enough to be interactive. Until each kind migrates
+the UI reads through the shim; the switch happens per surface, not as one
+cutover. Every client makes the same move eventually — the UI is simply the one
+whose migration we control end to end.
 
 ### 6. Availability and coordination
 
 **N stateless replicas.** Every replica serves reads and writes; PostgreSQL
-holds the consistency, so no replica is privileged for request handling. Only
+holds the consistency, so none is privileged for request handling. Only
 background sweeps are singleton — the GC worker runs under a `rise-runtime-sync`
-leader lease exactly as it does today.
+leader lease exactly as today.
 
 **Each component owns its own lease schema.** `rise-runtime-sync` gains a schema
 parameter: the apiserver migrates and holds credentials for its own lease
-tables, while the product backend keeps `runtime_sync` for its controllers and
-extension provisioners. That is not free — the crate's queries are compile-time
-`sqlx::query!` macros with `runtime_sync.` written into the SQL
+tables, the product backend keeps `runtime_sync`. Not free — the crate's queries
+are compile-time `sqlx::query!` macros with `runtime_sync.` written into the SQL
 (`crates/rise-runtime-sync/src/leader_leases.rs:377`) against a crate-local
-offline cache, so a runtime schema parameter means either dynamic queries or a
-`search_path` scheme, and the crate already treats `search_path` mutation as
-hazardous enough to sacrifice a connection over (`lib.rs`, `run_migrations`).
+offline cache, so a runtime parameter means dynamic queries or a `search_path`
+scheme, and the crate already treats `search_path` mutation as hazardous enough
+to sacrifice a connection over.
 
 **This isolates leases, not locks.** `LeaderElection` and `GlobalSchedule` are
 table-backed, so separate schemas separate them. `GlobalLock` is not: it hashes
-a name to an `i64` and takes `pg_advisory_lock` over a keyspace that is
-database-wide (`crates/rise-runtime-sync/src/global_lock.rs:47`), and the crate
-warns that "collisions would silently serialize unrelated callers". Two
-components against one database can therefore still collide. For `GlobalLock`,
-invariant 5 remains a convention, and the honest mitigation is that it has no
-cross-component use after the split — not that the schema split prevents one.
+a name to an `i64` and takes `pg_advisory_lock` over a database-wide keyspace
+(`crates/rise-runtime-sync/src/global_lock.rs:47`), and the crate warns that
+"collisions would silently serialize unrelated callers". For `GlobalLock`,
+invariant 5 stays a convention; the honest mitigation is that it has no
+cross-component use after the split, not that the schema split prevents one.
 
-That matters because the codebase's *documented* fix for the live
-Organization-delete race is a cross-boundary advisory lock:
-`src/server/resources/organization.rs:42-51` prescribes `pg_advisory_xact_lock`
-keyed on the Org UID, taken in the resource-delete path *and* in every
-`set_team_organization` / `set_project_organization` / `ensure_user_membership`
-call site. Two transactions coordinating through a shared lock is not one
-transaction spanning the boundary, so the rule it breaks is invariant 5 — which
-names advisory locks between components — rather than invariant 3.
-
-Only *half* of that lock is illegal, though, and the distinction is the whole
-fix. Invariant 5 forbids a lock shared *between* components and explicitly
-permits one *within* a component. Both the count and every typed insert live in
-the product backend. So:
+**The Organization delete race.** `organization.rs:42-51` prescribes
+`pg_advisory_xact_lock` on the Org UID in the resource-delete path *and* in
+every `set_team_organization` / `set_project_organization` /
+`ensure_user_membership` call site. Two transactions coordinating through a
+shared lock is not one transaction spanning the boundary, so it breaks invariant
+5, not 3 — and only *half* of it is illegal, which is the whole fix. Invariant 5
+forbids a lock shared *between* components and permits one *within* a component,
+and both the count and every typed insert live in the product backend:
 
 - **Cross-boundary half — a finalizer.** The backend registers a finalizer on
   Organization and clears it only when no typed row references that UID. The
   apiserver tombstones and waits rather than counting rows it cannot see.
 - **Local half — the lock stays, inside the backend.** Every typed-insert path
   and the finalizer-clearing transaction take the same backend-local advisory
-  lock keyed on the Org UID. That is precisely what the TODO asks for, minus
-  the participant that made it illegal.
+  lock keyed on the Org UID: what the TODO asks for, minus the participant that
+  made it illegal.
 
-What that leaves is a much smaller window: an insert whose liveness check
-passed before the tombstone, committing after the finalizer cleared. The result
-is a typed row pointing at a deleted UID — in a column that carries no
-referential guarantee anyway (invariant 2), for an operation that is a rare
-admin action, in tables scheduled for deletion. **We accept that residue and
-detect it rather than closing it**, because closing it needs the backend to
-hold authoritative Organization state of its own, and a second copy of a
-resource the apiserver owns is exactly the coupling this ADR removes.
+That leaves one window: an insert whose liveness check passed before the
+tombstone, committing after the finalizer cleared, producing a typed row naming
+a deleted UID — in a column carrying no referential guarantee anyway
+(invariant 2), for a rare admin action, in tables scheduled for deletion. **We
+accept and detect that residue rather than closing it**, because closing it
+needs the backend to hold authoritative Organization state of its own, and a
+second copy of a resource the apiserver owns is the coupling this ADR removes.
+Both mechanisms are G5 obligations and both are transitional: they guard typed
+rows, so they are deleted with them (§1). Build them to be removable.
 
-It is a G5 obligation, not an implementation detail — and a *transitional* one:
-the finalizer and the local lock both exist to guard typed rows, so both are
-deleted with them (§1). Build them to be removable, not to endure.
-
-Bootstrap does not simply move. Its `GlobalLock` serializes default-Organization
-creation, but the work it guards writes typed tables too
+**Bootstrap splits rather than moves.** Its `GlobalLock` serializes
+default-Organization creation, but the work it guards writes typed tables too
 (`backfill_user_organization_memberships`, `backfill_teams_organization`,
-`backfill_projects_organization` in `src/server/bootstrap.rs`). Moving it into
-the apiserver would hand the apiserver typed-table credentials. It splits
-instead: the apiserver creates the Organization resource, and the product
-backend does its own linkage pass afterwards, converging rather than
-transacting. Convergence is the right shape precisely because the problem is
-temporary — the backfills disappear entirely once those kinds are
-resource-backed, and nothing should be built here that would be missed.
+`backfill_projects_organization` in `src/server/bootstrap.rs`), and moving it
+inside would hand the apiserver typed-table credentials. Instead the apiserver
+creates the Organization and the backend runs its own linkage pass afterwards —
+converging rather than transacting. Convergence is right precisely because the
+problem is temporary: the backfills vanish once those kinds are resource-backed.
 
 ### 7. The API proves itself before the process splits
 
-Gates, in order. G1, G2, and G4 are independently valuable; G3 is a library
-with no consumer until G4, and is listed separately only because it is the
-seam's first real client.
+Gates, in order. G1, G2 and G4 are independently valuable; G3 is a library with
+no consumer until G4, listed separately only because it is the seam's first
+real client.
 
 - **G1 — Authorization inside the boundary.** `rise-authz` wired into the
   request path, `require_operator` replaced by the centralized choke point,
@@ -498,209 +424,181 @@ seam's first real client.
 - **G4 — One controller runs entirely on the API.** No typed-table reads, no
   in-process store handle, a Controller identity and RBAC grants of its own.
   Depends on resource families (ADR-0003) and the extension-kind migration if
-  the first controller is an extension provisioner, as recommended below.
+  the first controller is an extension provisioner, as below.
 - **G5 — Typed-object migration far enough** that (a) no remaining
   cross-boundary write needs a single transaction, *and* (b) the authorization
   engine's reads are inside the boundary. (b) is the one it is tempting to
   forget: ADR-0001's transitional `MembershipResolver` may read legacy
-  `team_members`, and admin/operator classification resolves against
-  IdP-managed teams in typed tables (`src/server/auth/roles.rs`). An apiserver
-  that owns authorization cannot reach either, so `User`, `Group`,
-  `GroupMembership`, and `UserIdentity` must be resource-backed before cutover.
+  `team_members`, and admin/operator classification resolves against IdP-managed
+  teams in typed tables (`src/server/auth/roles.rs`). An apiserver owning
+  authorization can reach neither, so `User`, `Group`, `GroupMembership` and
+  `UserIdentity` must be resource-backed before cutover.
 
 **G5 is most of `ROADMAP.md` §4, and this decision should not pretend
-otherwise.** Between the identity kinds above, the Organization finalizer in
-§6, and the typed rows that still soft-reference Organization UIDs, the honest
-statement is that the process split lands near the *end* of the typed-object
-migration rather than alongside it. That is a reason to sequence the split
-last, not a reason to doubt it — and the coupling runs the useful way: every
-kind that migrates deletes a straddle rather than relocating it, so the gate
-gets cheaper as §4 proceeds instead of more expensive.
-
-Only then does the apiserver move into its own process — at which point it is a
-packaging change, because every caller already speaks the API.
+otherwise.** The split lands near the *end* of the typed-object migration rather
+than alongside it. That is a reason to sequence it last, not to doubt it — and
+the coupling runs the useful way: every kind that migrates deletes a straddle
+rather than relocating it, so the gate gets cheaper as that migration
+proceeds. Only then
+does the apiserver move into its own process, at which point it is a packaging
+change, because every caller already speaks the API.
 
 **The first external controller should be an extension provisioner, not
-`rise-k8s-controller`.** It has the smallest blast radius, its kinds are already
-scheduled to become `ResourceDefinition`s under the `Extension` family
-(ADR-0003, `ROADMAP.md` §4), and it exercises the full seam — Watch, Controller
-tokens, `status` and `finalizers` subresources, RBAC — without putting production
-deployment reconciliation on an unproven path. `ROADMAP.md` §5 is ordered to
-match, with `rise-k8s-controller` second on the same seam.
+`rise-k8s-controller`** — smallest blast radius, kinds already scheduled to
+become `ResourceDefinition`s under the `Extension` family (ADR-0003), and it
+exercises the full seam (Watch, Controller tokens, `status`/`finalizers`, RBAC)
+without putting production deployment reconciliation on an unproven path.
+`ROADMAP.md` §5 is ordered to match, with `rise-k8s-controller` second.
 
 **Controllers externalize before the store does, not after.** A controller can
-be a separate process while the apiserver is still hosted inside
-`rise backend server`; it speaks HTTP to it, and — once it serves a product
-subresource — is spoken to in return (§4). Ordering it this way makes the
-API's completeness a precondition of a change we want anyway (`ROADMAP.md` §5,
-multi-org),
-rather than a precondition of a change that is invisible to users.
+be a separate process while the apiserver is still hosted in `rise backend
+server`; it speaks HTTP to it and — once it serves a product subresource — is
+spoken to in return (§4). Ordering it this way makes the API's completeness a
+precondition of a change we want anyway (`ROADMAP.md` §5, multi-org) rather than
+of one invisible to users.
 
 ### 8. Packaging, embedded mode, and version skew
 
-**A separate `rise-apiserver` binary**, built from this workspace and shipped in
-the same image on the same release cadence. `rise` keeps the CLI and whatever
-remains of the typed API; `rise-apiserver` links neither. The asymmetry is
-deliberate and grows over time: the apiserver's surface is the one that lasts,
-so it is the one kept clean. One extra build target buys a control
-plane that does not carry code it never runs, and a `--help` that means
-something. Each process gets its own Helm Deployment, its own scaling, and its
-own database role.
+**A separate `rise-apiserver` binary**, from this workspace and image on the
+same release cadence. `rise` keeps the CLI and whatever remains of the typed
+API; `rise-apiserver` links neither. The asymmetry is deliberate and grows: the
+apiserver's surface is the one that lasts, so it is the one kept clean. One
+extra build target buys a control plane that carries no code it never runs.
+Each process gets its own Helm Deployment, scaling, and database role.
 
 **There is no embedded mode.** No supported configuration has the product
 backend hosting the apiserver in-process — not in production, not in
 `tests/e2e`, not in local development. Before G5 the apiserver is still hosted
 in `rise backend server`, but that is a transitional state rather than a
-configuration, and it ends at the cutover. Small installs therefore run two
-processes; the Compose development setup and the e2e harness gain a second one.
-This is the strict choice, taken because a supported dual topology means every
-feature must work in both, forever, and the cheaper one silently becomes the
-tested one.
+configuration and it ends at the cutover. Small installs therefore run two
+processes, as do Compose development and the e2e harness. This is the strict
+choice, taken because a supported dual topology means every feature must work in
+both forever — and the cheaper path silently becomes the only tested one.
 
-**Version skew: apiserver *n*, clients *n-1*.** The window opens at the
-cutover, not today — the API it would cover does not yet have pagination,
-watch, patch, or discovery, and the project is pre-1.0 (`Cargo.toml`,
-`0.23.0-rc8`). From that point: upgrade the apiserver first.
-Clients up to one minor version behind keep working, and every client tolerates
-a newer apiserver. Rolling upgrades then need no cross-component ordering beyond
-that first step. CI holds the window honest by running the previous release's
-client against the current apiserver.
-
-This rule covers the inbound direction only. On the forwarding leg (§4) the
-apiserver is the client and a Controller is the server, so the burden inverts
-and needs its own rule and its own CI job; §4 states it.
+**Version skew: apiserver *n*, clients *n-1*.** The window opens at the cutover,
+not today: the API it would cover has no pagination, watch, patch or discovery
+yet, and the project is pre-1.0 (`Cargo.toml`, `0.23.0-rc8`). From then: upgrade
+the apiserver first; clients up to one minor behind keep working; every client
+tolerates a newer apiserver. CI runs the previous release's client against the
+current apiserver. This covers the inbound direction only — on the forwarding
+leg the burden inverts, and §4 states its rule and its CI job.
 
 ## Consequences
 
-- Authorization and admission become the apiserver's job by construction, which
-  is the only place ADR-0001's transactional requirements can be met.
-- A controller's blast radius becomes its RBAC grants. Multi-org isolation
-  (`ROADMAP.md` §5) becomes demonstrable rather than asserted.
-- Third-party controllers get a supported contract with no Rust linkage, and a
-  version window they can build against.
+- Authorization and admission become the apiserver's job by construction — the
+  only place ADR-0001's transactional requirements can be met.
+- A controller's blast radius becomes its RBAC grants, making multi-org
+  isolation (`ROADMAP.md` §5) demonstrable rather than asserted.
+- Third-party controllers get a supported contract with no Rust linkage and a
+  version window to build against.
 - Every resource read behind a typed route gains a network hop, with no
-  mitigation claimed. Request-local `AuthorizationSnapshot` memoization is not
-  one: it lives in `rise-authz`, which `rise-deploy` does not yet depend on, and
-  once authorization runs inside the apiserver it cannot absorb a cost paid on
-  the other side of the boundary. The cost is bounded in time as well as size —
-  it is paid on the compatibility path, and it retires with the shim (§1) — but
-  the shim's window is set by how fast *clients* migrate (fielded CLIs,
-  third-party API consumers), not by Rise's own schedule, so "bounded" means
-  "has an end", not "has a date". Measure at G4 rather than engineering against
-  it now.
+  mitigation claimed — `AuthorizationSnapshot` memoization is not one, since it
+  lives in a crate `rise-deploy` does not depend on and, once authorization runs
+  inside the apiserver, cannot absorb a cost paid on the other side. The cost
+  retires with the shim (§1), but the shim's window is set by how fast *clients*
+  migrate, not by Rise's schedule: "bounded" means has an end, not has a date.
+  Measure at G4.
 - A product subresource costs two hops and couples its availability to both
-  processes (§4 above).
-- A controller that serves a subresource stops being a pure client: it listens,
-  terminates TLS, and needs an inbound identity check for the apiserver. That
-  is accepted, and it is what keeps runtime credentials out of the control
-  plane.
-- There are two versioned contracts, not one, running in opposite directions
-  (§4, §8) — so two compatibility windows and two CI jobs.
-- One orphan window stays open by choice: a typed row may outlive the
-  Organization it names (§6). It is detected, not prevented, and it closes when
-  the typed tables do.
-- The apiserver becomes browser-facing after the typed-object migration,
-  inheriting CORS, cookie, and CSRF handling that the typed API owns today. The
-  web UI is simply the first client to stop needing the shim, not a special
-  case (§5).
-- Operators run, scale, and upgrade more processes, with no single-process
-  escape hatch for small installs. This is an operator-impact change: it needs
-  Upgrade Notes and a Rollout Tracker item when it lands.
-- Local development and the e2e harness run two processes from G5 onward.
+  processes (§4).
+- A controller serving a subresource stops being a pure client: it listens,
+  terminates TLS, and needs an inbound identity check. Accepted — it is what
+  keeps runtime credentials out of the control plane.
+- Two versioned contracts run in opposite directions (§4, §8): two compatibility
+  windows, two CI jobs.
+- One orphan window stays open by choice — a typed row may outlive the
+  Organization it names (§6), detected rather than prevented, closing when the
+  typed tables do.
+- The apiserver becomes browser-facing after `ROADMAP.md` §4, inheriting CORS,
+  cookie and CSRF handling the typed API owns today.
+- Operators run, scale and upgrade more processes with no single-process escape
+  hatch. This is an operator-impact change: it needs Upgrade Notes and a Rollout
+  Tracker item when it lands. Local development and the e2e harness run two
+  processes from G5 onward.
 - Debugging crosses a process boundary; request correlation IDs through the
   client become mandatory rather than nice.
 
 ## Alternatives considered
 
-**Split the resource store into its own process now**, ahead of the gates. This
-is the proposal as first stated and its motivation is sound. Rejected on
-sequencing, not direction: the transaction boundary it would fix is still being
-designed (G1), the API cannot yet serve a client-only backend (G2), and the `ROADMAP.md` §4
-migration window still contains cross-boundary writes whose only cheap fix is a
-shared pool (G5). Splitting first converts each of those from a local problem
-into a distributed one with no compensating mechanism.
+**Split the resource store into its own process now**, ahead of the gates — the
+proposal as first stated, and its motivation is sound. Rejected on sequencing,
+not direction: the transaction boundary it would fix is still being designed
+(G1), the API cannot yet serve a client-only backend (G2), and the `ROADMAP.md`
+§4 window still holds cross-boundary writes whose only cheap fix is a shared
+pool (G5). Splitting first converts each from a local problem into a distributed
+one with no compensating mechanism.
 
 **Keep the store an in-process library indefinitely.** Cheapest, and honest for
 a single-tenant install. Rejected because multi-org isolation and third-party
-controllers both require a network boundary with independent credentials, and
-because "the trait is the contract" gets less true every month it goes untested
-against a remote implementation.
+controllers both need a network boundary with independent credentials, and
+"the trait is the contract" gets less true every month it goes untested against
+a remote implementation.
 
 **Externalize controllers but never split the store.** Captures most of the
-multi-org benefit at a fraction of the cost, and is a legitimate stopping point.
-Not adopted as the target because the process holding `resource_store`
-credentials would still be the process holding every typed table's credentials —
-so the apiserver's blast radius stays merged with the product backend's, and the
-strongest reason to have a boundary at all goes unrealized. It is, however,
-exactly where G4 leaves us, and stopping there for a while is safe.
+multi-org benefit at a fraction of the cost, and is a legitimate stopping point
+— it is exactly where G4 leaves us, and staying there a while is safe. Not
+adopted as the *target* because the process holding `resource_store` credentials
+would still hold every typed table's credentials, so the apiserver's blast
+radius stays merged with the product backend's and the strongest reason for a
+boundary goes unrealized.
 
-**A supported embedded mode** for small installs, with the split as an opt-in.
+**A supported embedded mode** for small installs, with the split opt-in.
 Attractive: one process for single-tenant users, and both `ResourceApi`
-implementations stay continuously exercised. Rejected because two supported
-topologies means every feature, every failure mode, and every upgrade path must
-work in both — and the in-process path, being faster and easier to debug, would
-become the one that is really tested while the split path accumulates
-divergence.
+implementations stay exercised. Rejected because two supported topologies means
+every feature, failure mode and upgrade path must work in both — and the
+in-process path, being faster and easier to debug, becomes the one really
+tested while the split path accumulates divergence.
 
-**mTLS for client identity**, either as the primary credential or alongside
-tokens. Rejected because it models identity a second time in a system that
-cannot express Rise's scopes, delegation chains, or revocation, and it makes
-certificate issuance and rotation an operator responsibility in every install.
-TLS still protects the transport; it just does not name the principal.
+**mTLS for client identity**, primary or alongside tokens. Rejected because it
+models identity a second time in a system that cannot express Rise's scopes,
+delegation chains, or revocation, and makes certificate issuance and rotation an
+operator responsibility in every install. TLS still protects the transport; it
+just does not name the principal.
 
 **A shared `runtime_sync` schema with per-component key namespaces.** Zero code
 change, one migration path. Rejected because it leaves "no lease crosses the
-boundary" as a convention that a future PR can break silently, in a decision
-whose whole premise is making such rules enforced rather than conventional.
+boundary" a convention a future PR can break silently, in a decision whose
+premise is making such rules enforced instead.
 
 **Lockstep versioning** — every component from one release, upgraded together.
-Simplest possible contract. Rejected because it forbids partial rollout, implies
-control-plane unavailability during upgrades, and leaves third-party controllers
-unable to version independently, which undercuts a main reason for the boundary.
+Rejected because it forbids partial rollout, implies control-plane unavailability
+during upgrades, and leaves third-party controllers unable to version
+independently, undercutting a main reason for the boundary.
 
-**Linking the product handler code into the apiserver** so ADR-0002's
-code-backed registry stands unamended. Rejected because `deployment-logs` needs
-a `kube::Client` or `bollard::Docker` (`src/server/deployment/logs.rs:189-190`),
-so the apiserver would hold runtime credentials and per-Organization cluster
-configuration — the merged blast radius the boundary exists to end.
-
-**Serving product subresources from the product backend or the controller
-directly**, leaving only `status`, `finalizers`, and `token` on the apiserver.
-Honest about where the capability lives and needs no forwarding machinery.
-Rejected because it splits one resource's path grammar across hosts and gives up
-the single authorization and audit pipeline that ADR-0002 exists to protect —
-`.../deployments/x` and `.../deployments/x/logs` would answer from different
-places under different enforcement.
-
-**Deferring product-subresource execution entirely** and scoping this ADR to
-generic subresources. Tempting, and it would have left §8's packaging answer
-untouched. Rejected because the hole is not hypothetical: it is reached at G5,
-it constrains packaging, and leaving it open would mean the ADR silently
-contradicts ADR-0002 in the meantime.
+**Three ways to place product subresources other than forwarding.** *Linking the
+product handlers into the apiserver* leaves ADR-0002 unamended but hands the
+control plane a `kube::Client` and per-Organization cluster configuration — the
+merged blast radius the boundary exists to end. *Serving them from the product
+backend or controller directly* is honest about where the capability lives and
+needs no forwarding machinery, but splits one resource's path grammar across
+hosts and gives up the single authorization and audit pipeline ADR-0002 exists
+to protect. *Deferring the question* and scoping this ADR to generic
+subresources would have left §8's packaging answer untouched, but the hole is
+reached at G5, it constrains packaging, and leaving it open means silently
+contradicting ADR-0002 in the meantime.
 
 **gRPC or a purpose-built protocol between components.** Faster on paper.
 Rejected for now: the HTTP resource API is the contract clients already have and
-that discovery and OpenAPI already describe, and adding a second protocol is
-precisely the untanglement debt this decision exists to avoid. Revisit only with
-a measurement, and only as an additional transport for the same contract.
+that discovery and OpenAPI already describe, and a second protocol is precisely
+the untanglement debt this decision exists to avoid. Revisit only with a
+measurement, and only as another transport for the same contract.
 
 **An etcd-style key-value substrate under the apiserver.** Faithful to the
 Kubernetes design. Rejected because PostgreSQL already provides stronger
-primitives than the ones that shape would give up — real transactions, partial
-indexes, and the serializable semantics ADR-0001's grant gate needs.
+primitives than that shape would give up — real transactions, partial indexes,
+and the serializable semantics ADR-0001's grant gate needs.
 
 ## Deferred pending measurement
 
-The first two are numbers this decision needs and cannot guess. The third is
-sequencing that follows from work already scheduled elsewhere.
+The first two are numbers this decision needs and cannot guess; the third is
+sequencing that follows work scheduled elsewhere.
 
 - **Watch fan-out capacity and connection limits** set the apiserver's practical
   replica count. Measured when Watch lands (`ROADMAP.md` §1), before G5.
 - **Whether the product backend needs read caching** once it is a client.
   `ROADMAP.md` §1 already refuses to decide cross-request authorization caching
-  ahead of measurement; the same discipline applies here, measured at G4.
+  ahead of measurement; same discipline, measured at G4.
 - **The per-surface order in which the web UI switches** to direct apiserver
-  access, which follows the typed-object migration kind by kind.
+  access, following the typed-object migration kind by kind.
 
 ## References
 
@@ -708,9 +606,9 @@ sequencing that follows from work already scheduled elsewhere.
   the authorization engine, transaction-scoped admission, and the
   `effectiveLabels` resolution this decision places inside the boundary.
 - [ADR-0002: Generic Resource Subresource Execution Model](./0002-generic-resource-subresource-execution-model.md)
-  — the execution seam that `status`, `finalizers`, and `token` run on, and
-  whose code-backed handler boundary §4 above deliberately opens for forwarding
-  to a registered Controller.
+  — the execution seam `status`, `finalizers` and `token` run on, and whose
+  code-backed handler boundary §4 deliberately opens for forwarding to a
+  registered Controller.
 - [ADR-0003: Resource Families](./0003-resource-families.md) — the extension-kind
   migration that makes an extension provisioner the natural first external
   controller.
