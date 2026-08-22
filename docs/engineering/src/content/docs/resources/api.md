@@ -153,12 +153,21 @@ same reason. In both cases removing a `Deny` is a grant, and routing it through
 a cascade must not be cheaper than asking for it directly. A write that keeps losing that race returns
 `503` with a retryable message rather than committing on stale assumptions.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - An unbound `Role` body confers nothing, so authoring one is ungated. Binding it
   is what the gate weighs.
 - Deleting a binding or narrowing a `Role` is also a grant when it removes a
   `Deny`, and passes the same check.
+- Removing a membership is not gated — ADR-0001 §4 puts it outside — and a
+  platform-tier `Deny` subjected to `org:<name>` or `group:<org>/<name>` stops
+  matching a caller who drops that affiliation. So granting `delete` on
+  `GroupMembership` lets those users shed such a cap along with the membership.
+  Shipped policy grants it to nobody: the seeded owner binding is label-selected,
+  so leaving is an explicit per-organization grant. Grant it where self-service
+  exit is wanted, not where a subject-scoped platform `Deny` is load-bearing.
+  Re-entry stays gated, so a caller who leaves cannot readmit themselves to
+  recover what the affiliation carried.
 
 ### Seeded baseline policy
 

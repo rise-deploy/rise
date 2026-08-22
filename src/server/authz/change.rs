@@ -326,17 +326,18 @@ pub async fn change_for_delete(
     // than a resource's protection, and ADR-0001 §4 puts membership removal
     // outside the gate deliberately.
     //
-    // With one caveat worth stating rather than hiding: a platform-tier `Deny`
-    // whose subject is `org:<name>` or `group:<org>/<name>` stops matching a
-    // caller who drops the affiliation, because subject matching consults live
-    // standing. So dropping your own membership can lift such a cap while
-    // leaving your grants in *other* organizations intact. §4's own wording —
-    // "escaping an org ceiling while retaining a platform grant is an explicit
-    // operator-governance case" — reads as though it should not be reachable
-    // without an operator. Closing it means either gating a membership removal
-    // against platform Denies delivered through those subjects, or confining
-    // `org:`-subject bindings the way `group:` ones are confined; both change
-    // the permission model rather than its wiring, so neither is done here.
+    // One consequence of that is deliberate and documented rather than hidden: a
+    // platform-tier `Deny` whose subject is `org:<name>` or `group:<org>/<name>`
+    // stops matching a caller who drops the affiliation, because subject
+    // matching consults live standing. So dropping your own membership can lift
+    // such a cap while leaving grants in *other* organizations intact. Leaving
+    // is governed by policy instead: shipped policy grants nobody `delete` on
+    // their own GroupMembership, so self-exit is an explicit per-organization
+    // grant, and re-entry is gated (`change_for_create`'s membership arm) — a
+    // caller who leaves cannot readmit themselves to recover what the
+    // affiliation carried. Operators granting that `delete` are told, in the
+    // operator docs for GroupMembership, that it also sheds subject-scoped
+    // platform Denies.
     if row.api_version == API_VERSION_V1ALPHA1 && row.kind == ORGANIZATION_KIND {
         return cascaded_policy_deletions(ctx, row).await;
     }
