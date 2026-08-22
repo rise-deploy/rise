@@ -2,6 +2,7 @@ mod admission;
 pub mod builtin;
 mod lookup;
 pub mod pg_store;
+pub mod session;
 pub mod validation;
 
 mod discriminator;
@@ -11,9 +12,13 @@ pub use builtin::{BuiltInRegistration, BuiltInRegistry};
 pub use lookup::{
     GroupMembershipFact, IdentityLookup, MembershipLookup, TrustPolicyFact, TrustPolicyLookup,
     UserIdentityFact, CONTROLLER_TRUST_POLICIES_SQL, GROUPS_FOR_USER_SQL,
-    SERVICE_ACCOUNT_TRUST_POLICIES_SQL, USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
+    GROUP_TIES_BY_USER_NAME_SQL, SERVICE_ACCOUNT_TRUST_POLICIES_SQL,
+    USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
 };
 pub use pg_store::PgResourceStore;
+pub use session::{
+    is_serialization_failure, PgSession, PgSessionConnection, SerializableTransaction,
+};
 pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
 
 /// Run resource-store migrations in their own Postgres schema (`resource_store`),

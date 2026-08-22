@@ -47,6 +47,16 @@ pub enum StoreError {
     EmptyPath,
     #[error("validation error: {0}")]
     Validation(String),
+    /// A `SERIALIZABLE` transaction lost a race and must be retried from the
+    /// beginning (ADR-0001 §5).
+    ///
+    /// Its own variant rather than a backend error because the caller's correct
+    /// response is mechanical — replay the whole unit of work, re-reading every
+    /// fact — and because a retry loop must never guess at that from an opaque
+    /// error string. Nothing the transaction observed before this point can be
+    /// reused: the snapshot it read never existed as a serial state.
+    #[error("transaction serialization failure; retry the operation")]
+    Serialization,
     #[error("resource store backend error")]
     Backend {
         #[source]

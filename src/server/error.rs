@@ -50,6 +50,15 @@ pub struct ServerError {
     pub suggestions: Option<Vec<String>>,
     /// If true, skip error-level logging (for expected transient conditions)
     pub expected: bool,
+    /// If true, the operation lost a `SERIALIZABLE` race and the caller may
+    /// replay it from the beginning (ADR-0001 §5).
+    ///
+    /// This rides on the error rather than on a separate result type because a
+    /// serialization failure surfaces from deep inside the write path — a store
+    /// call several helpers down — and every layer between there and the retry
+    /// loop already speaks `ServerError`. A retry loop that guessed from the
+    /// status code would replay writes that merely happened to return 503.
+    pub retryable: bool,
 }
 
 impl ServerError {
@@ -62,6 +71,7 @@ impl ServerError {
             context: Vec::new(),
             suggestions: None,
             expected: false,
+            retryable: false,
         }
     }
 
@@ -78,6 +88,7 @@ impl ServerError {
             context: Vec::new(),
             suggestions: None,
             expected: false,
+            retryable: false,
         }
     }
 
@@ -90,6 +101,12 @@ impl ServerError {
     /// Add suggestions to the error response (chainable)
     pub fn with_suggestions(mut self, suggestions: Option<Vec<String>>) -> Self {
         self.suggestions = suggestions;
+        self
+    }
+
+    /// Mark this error as replayable by a bounded retry loop (chainable).
+    pub fn retryable(mut self) -> Self {
+        self.retryable = true;
         self
     }
 

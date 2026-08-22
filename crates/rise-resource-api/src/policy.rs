@@ -77,11 +77,17 @@ pub const IMMUTABLE_POLICY_SEEDS: [(&str, &str); 2] = [
 /// Whether a root-parented policy row is one of the immutable seeds.
 ///
 /// Placement is part of the identity: only the root rows are reserved, so an
-/// organization's own `Role` named `system-admin` is ordinary data.
-pub fn is_immutable_policy_seed(kind: &str, name: &str) -> bool {
-    IMMUTABLE_POLICY_SEEDS
-        .iter()
-        .any(|(seed_kind, seed_name)| *seed_kind == kind && *seed_name == name)
+/// organization's own `Role` named `system-admin` is ordinary data. So is the
+/// API group — the seeds are shipped under [`API_VERSION_V1ALPHA1`], and a
+/// custom kind registered under another group is not made reserved by borrowing
+/// the name. The cascade's SQL exemption pins the same three fields; they have
+/// to agree, or a row one of them treats as a seed is collectable through the
+/// other.
+pub fn is_immutable_policy_seed(api_version: &str, kind: &str, name: &str) -> bool {
+    api_version == API_VERSION_V1ALPHA1
+        && IMMUTABLE_POLICY_SEEDS
+            .iter()
+            .any(|(seed_kind, seed_name)| *seed_kind == kind && *seed_name == name)
 }
 
 /// Build a shipped default from its literal declaration.

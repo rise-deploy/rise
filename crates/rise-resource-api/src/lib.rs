@@ -136,6 +136,16 @@ pub struct ResourceMetadata {
     /// carries authorization meaning on its own.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// Every label key in force on this resource, resolved nearest-wins down its
+    /// ancestry (ADR-0001 §6.1).
+    ///
+    /// Computed on read from the ancestor chain, never stored: this is the same
+    /// walk authorization performs, so the value a client sees and the value a
+    /// `labelSelector` matches can never disagree. Responses built without an
+    /// ancestor chain leave it empty rather than repeating `labels`, which would
+    /// claim an inheritance answer nobody resolved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effective_labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]

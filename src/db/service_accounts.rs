@@ -176,7 +176,10 @@ pub async fn get_claims(
 }
 
 /// Check if a user is a service account
-pub async fn is_service_account(pool: &PgPool, user_id: Uuid) -> Result<bool> {
+pub async fn is_service_account<'a, E>(executor: E, user_id: Uuid) -> Result<bool>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let exists = sqlx::query_scalar!(
         r#"
         SELECT EXISTS(
@@ -187,7 +190,7 @@ pub async fn is_service_account(pool: &PgPool, user_id: Uuid) -> Result<bool> {
         "#,
         user_id
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .context("Failed to check if user is a service account")?;
 

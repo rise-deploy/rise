@@ -64,9 +64,12 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing
-  `require_operator`. Once Controller writes use that path, remove
-  `ResourceDefinition.allowedStatusControllerIds` and authorize `status` and
-  `finalizers` exclusively through RBAC.
+  `require_operator`. The choke point is live on the generic resource API, with
+  per-item list filtering, the allowlisted list-only projection, and
+  `metadata.effectiveLabels` on every response. Remaining: Controller writes
+  still go through `ResourceDefinition.allowedStatusControllerIds` rather than
+  RBAC, because a Controller is not a principal until its identity resource
+  exists; remove that allowlist once it is.
 - [~] Add Role/policy audit and explain diagnostics for semantically inert
   configuration: no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
@@ -86,12 +89,14 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   token-cap hash, epoch, and resource identity. A write path that forgets to
   bump the epoch is a stale-authorization bug no test will surface, which is
   why the measurement comes first.
-- [~] Implement the write-time grant gate for Roles, bindings, membership,
+- [x] Implement the write-time grant gate for Roles, bindings, membership,
   identity mappings, and access-driving labels. All authorization-changing
-  writes use serializable transactions with bounded retry. The gate itself is
-  in place as `rise-authz::engine::gate`, including §6.6's label diff over the
-  K-inheriting subtree and the credential-ceiling intersection; the serializable
-  write path arrives with the choke point that opens a transaction around it.
+  writes use serializable transactions with bounded retry. The gate is
+  `rise-authz::engine::gate`, including §6.6's label diff over the K-inheriting
+  subtree and the credential-ceiling intersection; the resource API's write
+  paths run it inside the `SERIALIZABLE` transaction that performs the mutation,
+  replaying the whole operation on a serialization failure. A cascading delete's
+  effect on policy resources beneath the deleted resource is not yet diffed.
 - [~] Seed immutable/healable `system-admin` and platform `resource-owner`
   Roles, plus an operator-editable global `PlatformRole/org-admin` baseline.
   Organization creation atomically creates an exact org-root, scope-only

@@ -1411,7 +1411,7 @@ tagged `§9 deferred` or `product-operation deferred`.
 - `ROADMAP.md` §§1–4 — owns live delivery status for the unified RBAC,
   authentication, subresource, and typed-object migration work this model
   informs.
-- [Generic resource HTTP API](../resources/api) — the shipped, operator-only
-  surface this model will govern.
+- [Generic resource HTTP API](../resources/api) — the shipped surface this
+  model governs.
 - `crates/rise-resource-api`, `crates/rise-resource-store-postgres` — the envelope types
   and the `ResourceStore` trait/impl the Implementation structure builds on.
