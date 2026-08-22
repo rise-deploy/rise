@@ -312,18 +312,22 @@ Decision: a private DNS namespace per install; a Cloud Map service per
 by the ECS service via `serviceRegistries`, with `RISE_CONTAINER_HOST__*` pointing
 at its DNS name.
 
-This is the decision with the largest unresolved risk: whether two ECS services
-(the outgoing and incoming deployments) may register into a single Cloud Map
-service is exactly the property the overlap model needs. The AWS documentation
-constrains the other direction (an ECS service may carry **one** service
-registry — "Multiple service registries for each service isn't supported") but
-is silent on sharing a registry across services, so this remains a phase-2
-verification item, not a settled fact. Fallbacks, in order of preference, are
-recorded in [Open questions](#open-questions); note also that AWS documents
-Cloud Map resources created via service discovery as requiring **manual
-cleanup**, so the reconciler's GC owns deregistration either way, and a
-discovery-registered ECS service is capped at **1,000 tasks** (a Route 53
-quota) — far above Rise's replica bounds.
+The core property this design needs — two ECS services registering into a
+single Cloud Map service simultaneously — is **verified against a real account**
+(spike run 2026-08-22, eu-central-1, via
+`scripts/spikes/adr-0004-cloudmap-sharing.sh`): `CreateService` accepts the
+second association with the same `registryArn`, and both services' tasks
+co-appear as instances of the one Cloud Map service, distinguished by their
+`ECS_SERVICE_NAME` attribute. The AWS documentation constrains only the other
+direction (an ECS service may carry **one** service registry). The spike's
+second assertion — scaling the outgoing service to zero deregisters only its
+own instances — awaits confirmation from the same run's tail; the fallbacks in
+[Open questions](#open-questions) are retained until it lands, though no longer
+expected to be needed. Note also that AWS documents Cloud Map resources created
+via service discovery as requiring **manual cleanup**, so the reconciler's GC
+owns deregistration either way, and a discovery-registered ECS service is
+capped at **1,000 tasks** (a Route 53 quota) — far above Rise's replica
+bounds.
 
 ### D11. Logs: CloudWatch by default
 
@@ -592,13 +596,15 @@ tiers 1 and 2 are what keep it regression-tested afterwards.
 Each must be resolved before this ADR moves to **Proposed**; the first three are
 verification against AWS, not choices.
 
-1. **Cloud Map multi-registration (D10).** Can two ECS services register into one
-   Cloud Map service simultaneously? AWS docs constrain only the reverse
-   direction (one registry per ECS service) and are silent on sharing; a
-   two-service spike against a real account settles it — a runnable,
-   self-cleaning version lives at `scripts/spikes/adr-0004-cloudmap-sharing.sh`
-   (verdicts: `SHARED_REGISTRATION_SUPPORTED`/`_REJECTED`, plus a drain
-   assertion; cents of Fargate spend, ~10 minutes). If sharing fails, the
+1. **Cloud Map multi-registration (D10) — resolved: SUPPORTED.** The
+   `scripts/spikes/adr-0004-cloudmap-sharing.sh` spike (run 2026-08-22,
+   eu-central-1) confirmed two ECS services sharing one `registryArn`, with
+   both tasks listed as instances of the single Cloud Map service. Remaining
+   sub-item: the run's drain assertion (`DRAIN_CLEAN` — retiring one service
+   deregisters only its own instances) needs its verdict recorded from the
+   same run's output. The fallbacks below stay listed only until then:
+   (a) reconciler-driven `RegisterInstance`; (b) task sets under the
+   `EXTERNAL` deployment controller; (c) internal routing through Traefik. If sharing fails, the
    fallbacks are, in order: (a) the **reconciler registers instances itself**
    via the Cloud Map `RegisterInstance` API into the shared per-(project,
    group, container) service — it already observes task IPs each tick via
@@ -610,8 +616,13 @@ verification against AWS, not choices.
    external routing, at a latency cost).
 2. **Traefik ECS provider fidelity.** Confirm the ECS provider consumes the full
    label set the Docker provider does — specifically per-service health-check
-   labels and forwardAuth middleware — and confirm its refresh interval and IAM
-   requirements.
+   labels and forwardAuth middleware — and the cutover properties on top: tasks
+   of two ECS services sharing one Traefik service name must merge into one
+   load balancer, `serverStatus` must be exposed per server, and retiring one
+   ECS service must shrink the merged LB. A runnable spike asserting each of
+   these separately lives at `scripts/spikes/adr-0004-traefik-ecs-provider.sh`
+   (verdicts: `LABELS_CONSUMED`, `MIDDLEWARE`, `MERGED_LB`, `SERVERSTATUS_UP`,
+   `FORWARDAUTH_E2E`, `DRAIN`; four Fargate tasks for ~10 minutes).
 3. **Quotas and limits — largely resolved** (verified 2026-08): services per
    cluster 5,000 (not adjustable); task-definition revisions per family
    1,000,000 (not adjustable, **deregistered revisions still count** — one
