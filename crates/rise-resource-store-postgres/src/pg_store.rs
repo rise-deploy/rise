@@ -5,10 +5,10 @@ use uuid::Uuid;
 use rise_resource_api::{
     validate_controller_id, validate_labels, validate_resource_name, CollectionInfo,
     CreateResourceParams, DeleteOutcome, DeletionBlocker, DeletionBlockerRelationship,
-    DeletionBlockerReport, NoOpValidator, OwnerReference, PathSegment, ResourceDefinitionSpec,
-    ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError, UpdateResourceParams,
-    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND,
-    RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
+    DeletionBlockerReport, NoOpValidator, OwnerReference, PathSegment, ResourceApi,
+    ResourceDefinitionSpec, ResourceKind, ResourceRow, ResourceStore, SpecValidator, StoreError,
+    UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
+    ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND, SYSTEM_FINALIZER_PREFIX,
 };
 use sqlx::{PgPool, Row};
 
@@ -847,7 +847,7 @@ impl PgResourceStore {
 }
 
 #[async_trait::async_trait]
-impl ResourceStore for PgResourceStore {
+impl ResourceApi for PgResourceStore {
     async fn create(&self, mut params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
         if params.kind == RESOURCE_DEFINITION_KIND {
             return Err(StoreError::Validation(
@@ -1344,6 +1344,108 @@ impl ResourceStore for PgResourceStore {
         Ok(DeleteOutcome::Deleted)
     }
 
+    async fn update_controller_status(
+        &self,
+        uid: Uuid,
+        controller_id: &str,
+        status_value: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError> {
+        validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
+
+        let row = sqlx::query_as::<_, PgResourceRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET status = status || jsonb_build_object(
+                    'controllers',
+                    COALESCE(status->'controllers', '{}'::jsonb)
+                    || jsonb_build_object($2::text, $3::jsonb)
+                ),
+                revision   = revision + 1,
+                updated_at = NOW()
+            WHERE uid = $1
+            RETURNING *
+            "#,
+        )
+        .bind(uid)
+        .bind(controller_id)
+        .bind(status_value)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Self::db_error)?
+        .ok_or(StoreError::NotFound)?;
+
+        Ok(row.into())
+    }
+
+    async fn update_controller_finalizers(
+        &self,
+        uid: Uuid,
+        controller_id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<ResourceRow, StoreError> {
+        validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
+
+        // Store-managed finalizers (system.rise.dev/*) cannot be added or removed by controllers.
+        for f in add.iter().chain(remove.iter()) {
+            if f.starts_with(SYSTEM_FINALIZER_PREFIX) {
+                return Err(StoreError::ReservedFinalizer(f.clone()));
+            }
+            if !is_controller_finalizer(f, controller_id) {
+                return Err(StoreError::Validation(format!(
+                    "finalizer '{f}' is not owned by controller '{controller_id}'"
+                )));
+            }
+        }
+
+        // Use SELECT FOR UPDATE inside a transaction to serialise concurrent finalizer
+        // mutations from different controllers on the same resource, preventing lost updates.
+        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
+
+        let current = sqlx::query_as::<_, PgResourceRow>(
+            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
+        )
+        .bind(uid)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Self::db_error)?
+        .ok_or(StoreError::NotFound)?;
+
+        let remove_set: std::collections::HashSet<&str> =
+            remove.iter().map(String::as_str).collect();
+        let mut new_finalizers: Vec<String> = current
+            .finalizers
+            .into_iter()
+            .filter(|f| !remove_set.contains(f.as_str()))
+            .collect();
+        for f in add {
+            if !new_finalizers.contains(f) {
+                new_finalizers.push(f.clone());
+            }
+        }
+
+        let row = sqlx::query_as::<_, PgResourceRow>(
+            r#"
+            UPDATE resource_store.resources
+            SET finalizers = $1, revision = revision + 1, updated_at = NOW()
+            WHERE uid = $2
+            RETURNING *
+            "#,
+        )
+        .bind(&new_finalizers)
+        .bind(uid)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(Self::db_error)?;
+
+        tx.commit().await.map_err(Self::db_error)?;
+
+        Ok(row.into())
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceStore for PgResourceStore {
     async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
         let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
 
@@ -1639,105 +1741,6 @@ impl ResourceStore for PgResourceStore {
 
         tx.commit().await.map_err(Self::db_error)?;
         Ok(chain)
-    }
-
-    async fn update_controller_status(
-        &self,
-        uid: Uuid,
-        controller_id: &str,
-        status_value: serde_json::Value,
-    ) -> Result<ResourceRow, StoreError> {
-        validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
-
-        let row = sqlx::query_as::<_, PgResourceRow>(
-            r#"
-            UPDATE resource_store.resources
-            SET status = status || jsonb_build_object(
-                    'controllers',
-                    COALESCE(status->'controllers', '{}'::jsonb)
-                    || jsonb_build_object($2::text, $3::jsonb)
-                ),
-                revision   = revision + 1,
-                updated_at = NOW()
-            WHERE uid = $1
-            RETURNING *
-            "#,
-        )
-        .bind(uid)
-        .bind(controller_id)
-        .bind(status_value)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(Self::db_error)?
-        .ok_or(StoreError::NotFound)?;
-
-        Ok(row.into())
-    }
-
-    async fn update_controller_finalizers(
-        &self,
-        uid: Uuid,
-        controller_id: &str,
-        add: &[String],
-        remove: &[String],
-    ) -> Result<ResourceRow, StoreError> {
-        validate_controller_id(controller_id).map_err(|e| StoreError::Validation(e.to_string()))?;
-
-        // Store-managed finalizers (system.rise.dev/*) cannot be added or removed by controllers.
-        for f in add.iter().chain(remove.iter()) {
-            if f.starts_with(SYSTEM_FINALIZER_PREFIX) {
-                return Err(StoreError::ReservedFinalizer(f.clone()));
-            }
-            if !is_controller_finalizer(f, controller_id) {
-                return Err(StoreError::Validation(format!(
-                    "finalizer '{f}' is not owned by controller '{controller_id}'"
-                )));
-            }
-        }
-
-        // Use SELECT FOR UPDATE inside a transaction to serialise concurrent finalizer
-        // mutations from different controllers on the same resource, preventing lost updates.
-        let mut tx = self.pool.begin().await.map_err(Self::db_error)?;
-
-        let current = sqlx::query_as::<_, PgResourceRow>(
-            "SELECT * FROM resource_store.resources WHERE uid = $1 FOR UPDATE",
-        )
-        .bind(uid)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(Self::db_error)?
-        .ok_or(StoreError::NotFound)?;
-
-        let remove_set: std::collections::HashSet<&str> =
-            remove.iter().map(String::as_str).collect();
-        let mut new_finalizers: Vec<String> = current
-            .finalizers
-            .into_iter()
-            .filter(|f| !remove_set.contains(f.as_str()))
-            .collect();
-        for f in add {
-            if !new_finalizers.contains(f) {
-                new_finalizers.push(f.clone());
-            }
-        }
-
-        let row = sqlx::query_as::<_, PgResourceRow>(
-            r#"
-            UPDATE resource_store.resources
-            SET finalizers = $1, revision = revision + 1, updated_at = NOW()
-            WHERE uid = $2
-            RETURNING *
-            "#,
-        )
-        .bind(&new_finalizers)
-        .bind(uid)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(Self::db_error)?;
-
-        tx.commit().await.map_err(Self::db_error)?;
-
-        Ok(row.into())
     }
 
     async fn operator_update_status(

@@ -1123,7 +1123,7 @@ async fn delete_resource(
     // are never orphaned. See `super::organization` module docs.
     let outcome = if row.kind == rise_resource_api::ORGANIZATION_KIND {
         use super::organization::{delete_organization_guarded, OrganizationDeleteError};
-        match delete_organization_guarded(&ctx.store, &ctx.db_pool, row.uid).await {
+        match delete_organization_guarded(ctx.store.as_ref(), &ctx.db_pool, row.uid).await {
             Ok(outcome) => outcome,
             Err(OrganizationDeleteError::HasChildren { count }) => {
                 return Err(ServerError::new(

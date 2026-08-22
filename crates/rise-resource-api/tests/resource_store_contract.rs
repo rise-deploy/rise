@@ -2,15 +2,15 @@ use std::error::Error as _;
 use std::sync::Arc;
 
 use rise_resource_api::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore,
-    StoreError, UpdateResourceParams, ValidationError,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceApi, ResourceRow,
+    ResourceStore, StoreError, UpdateResourceParams, ValidationError,
 };
 use uuid::Uuid;
 
 struct FakeStore;
 
 #[async_trait::async_trait]
-impl ResourceStore for FakeStore {
+impl ResourceApi for FakeStore {
     async fn create(&self, _: CreateResourceParams) -> Result<ResourceRow, StoreError> {
         Err(StoreError::NotFound)
     }
@@ -48,6 +48,27 @@ impl ResourceStore for FakeStore {
     async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         Err(StoreError::NotFound)
     }
+    async fn update_controller_status(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError> {
+        Err(StoreError::NotFound)
+    }
+    async fn update_controller_finalizers(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: &[String],
+        _: &[String],
+    ) -> Result<ResourceRow, StoreError> {
+        Err(StoreError::NotFound)
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceStore for FakeStore {
     async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         Err(StoreError::NotFound)
     }
@@ -69,23 +90,6 @@ impl ResourceStore for FakeStore {
     }
     async fn ancestors(&self, _: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
         Ok(vec![])
-    }
-    async fn update_controller_status(
-        &self,
-        _: Uuid,
-        _: &str,
-        _: serde_json::Value,
-    ) -> Result<ResourceRow, StoreError> {
-        Err(StoreError::NotFound)
-    }
-    async fn update_controller_finalizers(
-        &self,
-        _: Uuid,
-        _: &str,
-        _: &[String],
-        _: &[String],
-    ) -> Result<ResourceRow, StoreError> {
-        Err(StoreError::NotFound)
     }
     async fn operator_update_status(
         &self,

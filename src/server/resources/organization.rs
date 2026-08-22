@@ -10,9 +10,7 @@
 //! every linked row. This module is the canonical entry point for code that
 //! needs to delete an Organization.
 
-use std::sync::Arc;
-
-use rise_resource_api::{DeleteOutcome, ResourceStore, StoreError};
+use rise_resource_api::{DeleteOutcome, ResourceApi, StoreError};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -50,7 +48,7 @@ pub(crate) enum OrganizationDeleteError {
 /// *and* in every `set_team_organization` / `set_project_organization` /
 /// `ensure_user_membership` call site.
 pub(crate) async fn delete_organization_guarded(
-    store: &Arc<dyn ResourceStore>,
+    store: &dyn ResourceApi,
     pool: &PgPool,
     uid: Uuid,
 ) -> Result<DeleteOutcome, OrganizationDeleteError> {

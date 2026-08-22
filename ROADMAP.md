@@ -261,9 +261,12 @@ and secret handling remain kind-specific prerequisites.
 - [ ] Complete remaining backend extraction work only where it supports the
   resource/controller migration above; avoid parallel abstractions that bypass
   the generic resource API or unified authorization engine.
-- [ ] Split `ResourceStore` into the remotable `ResourceApi` surface and the
+- [x] Split `ResourceStore` into the remotable `ResourceApi` surface and the
   apiserver-internal one (ADR-0004 §3), and hold in-tree callers to the former.
-  Independent of the process split and worth doing first.
+  Only the handlers, GC worker, authorization engine, and composition root name
+  the wide trait; the Docker reconciler, the Metacontroller webhook's
+  Organization view, the Organization delete guard, and bootstrap moved to
+  `ResourceApi`.
 - [ ] Extract `rise-apiserver` as its own binary and process (ADR-0004 §§1, 8)
   once that ADR's gates are met. The gates are §1 and §4 work, so this lands
   near the end of the typed-object migration rather than beside it.

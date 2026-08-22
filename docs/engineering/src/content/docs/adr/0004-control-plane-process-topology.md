@@ -241,10 +241,14 @@ choke point lands — `ROADMAP.md` §1 already commits to removing
 `ResourceDefinition.allowedStatusControllerIds` and authorizing `status` and
 `finalizers` through RBAC alone.
 
-In-tree code outside `src/server/resources/` and the GC worker uses only the API
-surface. That one rule makes the whole question a compile-time check: a caller
-that cannot be expressed on the API surface is a future distributed-systems bug,
-found today, for free.
+Only code that runs *inside* the apiserver may name `ResourceStore`: the
+resource handlers, the GC worker, the authorization engine (which needs
+`ancestors` for `effectiveLabels`), and the composition root that constructs
+it. Everything else takes `ResourceApi`. That one rule makes the whole question
+a compile-time check: a caller that cannot be expressed on the API surface is a
+future distributed-systems bug, found today, for free — and applying it moved
+exactly the callers this ADR predicts sit outside, the Docker reconciler and the
+Metacontroller webhook's Organization view among them.
 
 `ResourceApi` has two implementations, but only for the migration's duration: a
 direct in-process one and an HTTP one in `rise-resource-client`. Because there

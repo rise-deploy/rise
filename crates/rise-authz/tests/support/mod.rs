@@ -13,7 +13,8 @@ use rise_authz::engine::{
 };
 use rise_resource_api::{
     CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlockerReport, PathSegment,
-    ResourceRow, ResourceStore, StoreError, UpdateResourceParams, API_VERSION_V1ALPHA1,
+    ResourceApi, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
+    API_VERSION_V1ALPHA1,
 };
 use uuid::Uuid;
 
@@ -157,7 +158,7 @@ impl FakeStore {
 }
 
 #[async_trait::async_trait]
-impl ResourceStore for FakeStore {
+impl ResourceApi for FakeStore {
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
         Ok(self.find(uid).cloned())
     }
@@ -192,23 +193,6 @@ impl ResourceStore for FakeStore {
             .collect())
     }
 
-    async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
-        let mut chain = Vec::new();
-        let mut cursor = Some(uid);
-        while let Some(current) = cursor {
-            let Some(row) = self.find(current) else {
-                return Ok(Vec::new());
-            };
-            cursor = row.parent_uid;
-            chain.push(row.clone());
-            if self.ancestor_depth == Some(chain.len()) {
-                break;
-            }
-        }
-        chain.reverse();
-        Ok(chain)
-    }
-
     async fn create(&self, _: CreateResourceParams) -> Result<ResourceRow, StoreError> {
         unimplemented!("authorization never writes")
     }
@@ -226,18 +210,6 @@ impl ResourceStore for FakeStore {
     async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         unimplemented!("authorization never writes")
     }
-    async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
-        unimplemented!("authorization never writes")
-    }
-    async fn list_pending_collection(&self, _: i64) -> Result<Vec<ResourceRow>, StoreError> {
-        unimplemented!("unused by the engine")
-    }
-    async fn list_deletion_blockers(&self, _: Uuid) -> Result<DeletionBlockerReport, StoreError> {
-        unimplemented!("unused by the engine")
-    }
-    async fn resolve_path(&self, _: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
-        unimplemented!("unused by the engine")
-    }
     async fn update_controller_status(
         &self,
         _: Uuid,
@@ -254,6 +226,38 @@ impl ResourceStore for FakeStore {
         _: &[String],
     ) -> Result<ResourceRow, StoreError> {
         unimplemented!("authorization never writes")
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceStore for FakeStore {
+    async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(uid);
+        while let Some(current) = cursor {
+            let Some(row) = self.find(current) else {
+                return Ok(Vec::new());
+            };
+            cursor = row.parent_uid;
+            chain.push(row.clone());
+            if self.ancestor_depth == Some(chain.len()) {
+                break;
+            }
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+    async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
+        unimplemented!("authorization never writes")
+    }
+    async fn list_pending_collection(&self, _: i64) -> Result<Vec<ResourceRow>, StoreError> {
+        unimplemented!("unused by the engine")
+    }
+    async fn list_deletion_blockers(&self, _: Uuid) -> Result<DeletionBlockerReport, StoreError> {
+        unimplemented!("unused by the engine")
+    }
+    async fn resolve_path(&self, _: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
+        unimplemented!("unused by the engine")
     }
     async fn operator_update_status(
         &self,

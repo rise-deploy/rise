@@ -643,9 +643,10 @@ impl AppState {
         // controllers begin processing typed projects, so we await it before
         // the rest of AppState comes up.
         #[cfg(feature = "backend")]
-        let bootstrap_outcome = crate::server::bootstrap::run(&db_pool, &resource_store, settings)
-            .await
-            .context("Default-Organization bootstrap failed")?;
+        let bootstrap_outcome =
+            crate::server::bootstrap::run(&db_pool, resource_store.as_ref(), settings)
+                .await
+                .context("Default-Organization bootstrap failed")?;
         #[cfg(feature = "backend")]
         let default_organization_uid = bootstrap_outcome.default_organization_uid;
 
