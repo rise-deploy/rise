@@ -455,9 +455,8 @@ packaging change, because every caller already speaks the API.
 scheduled to become `ResourceDefinition`s under the `Extension` family
 (ADR-0003, `ROADMAP.md` §4), and it exercises the full seam — Watch, Controller
 tokens, `status` and `finalizers` subresources, RBAC — without putting production
-deployment reconciliation on an unproven path. `ROADMAP.md` §5 currently lists
-`rise-k8s-controller` as the first item of that workstream; accepting this ADR
-means reordering it, which the roadmap should be edited to reflect.
+deployment reconciliation on an unproven path. `ROADMAP.md` §5 is ordered to
+match, with `rise-k8s-controller` second on the same seam.
 
 **Controllers externalize before the store does, not after.** A controller can
 be a separate process while the apiserver is still hosted inside

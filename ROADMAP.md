@@ -16,6 +16,10 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ADR-0003: Resource Families](docs/engineering/src/content/docs/adr/0003-resource-families.md)
   groups kinds that share a name pool and list as a unit; it gates the
   extension-kind migration in §4.
+- [ADR-0004: Control-Plane Process Topology](docs/engineering/src/content/docs/adr/0004-control-plane-process-topology.md)
+  makes the resource API its own process with every other component a client,
+  and sets the gates that ordering must satisfy. It governs the sequencing in
+  §5 and §6.
 - Where shipped compatibility behavior differs from an ADR, it is transitional;
   new work converges on the ADR rather than extending the old shape.
 
@@ -235,9 +239,13 @@ and secret handling remain kind-specific prerequisites.
 
 ## 5. External controllers and multi-org routing
 
-- [ ] Build `rise-k8s-controller` against `rise-resource-client`, using a
-  Rise-issued Controller token and Watch rather than a raw controller JWT or
-  typed-table polling.
+- [ ] Build an **extension provisioner** as the first external controller,
+  against `rise-resource-client` with a Rise-issued Controller token and Watch.
+  It goes first for blast radius, per ADR-0004 §7; it depends on resource
+  families and the extension-kind migration (§4).
+- [ ] Build `rise-k8s-controller` on the same seam, using a Rise-issued
+  Controller token and Watch rather than a raw controller JWT or typed-table
+  polling. Second, once the seam has carried a lower-risk controller.
 - [ ] Store org-agnostic Controller identities separately from per-org
   selection/configuration. Organizations reference an available controller
   class through ordinary governed resource data; credentials stay in trust
@@ -253,6 +261,12 @@ and secret handling remain kind-specific prerequisites.
 - [ ] Complete remaining backend extraction work only where it supports the
   resource/controller migration above; avoid parallel abstractions that bypass
   the generic resource API or unified authorization engine.
+- [ ] Split `ResourceStore` into the remotable `ResourceApi` surface and the
+  apiserver-internal one (ADR-0004 §3), and hold in-tree callers to the former.
+  Independent of the process split and worth doing first.
+- [ ] Extract `rise-apiserver` as its own binary and process (ADR-0004 §§1, 8)
+  once that ADR's gates are met. The gates are §1 and §4 work, so this lands
+  near the end of the typed-object migration rather than beside it.
 
 ## Verification gates
 
