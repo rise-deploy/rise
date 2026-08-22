@@ -263,7 +263,7 @@ ever be issued by a remote client.
 | `resolve_path`, `ancestors` | Path resolution and `effectiveLabels` primitives feeding admission and authorization |
 | `resolve_collection`, `resolve_collection_version`, `resolve_collection_by_kind` | Registry lookups behind every request |
 | `register_resource_definition`, `update_resource_definition` | The atomic storage projection behind ordinary `ResourceDefinition` writes |
-| `operator_update_status`, `operator_update_finalizers` | Transitional operator bypass; dissolves into RBAC |
+| `operator_update_status`, `operator_update_finalizers` | Like `list_deletion_blockers`: the route is remotable — served today at `src/server/resources/handlers.rs:1245` after `require_operator` — and only the identity-bypassing primitive is internal. The route converges on `status`/`finalizers` under RBAC; the primitive dissolves |
 
 The four `controller_id: &str` / `operator: &str` parameters disappear when
 ADR-0001's choke point lands — `ROADMAP.md` §1 already commits to removing
@@ -300,13 +300,17 @@ forwarding strategy streams from the Controller that owns the resource. The
 client sees one path grammar and one authorization pipeline; the apiserver never
 holds a runtime credential.
 
-**This amends ADR-0002, deliberately.** That ADR requires a handler identifier
-to "exist in the process's code-backed registry" and rejects handlers naming "a
-URL, executable, dynamic library, or arbitrary Rust type" — but its §1 reserves
-the boundary for "a later ADR [to] deliberately open", and its §3 shape table
-already contemplates a constrained reverse-proxy exchange. The rejection it
-makes is of *arbitrary operator-defined* remote handlers, and that rejection
-stands: the forwarding strategy is platform-known and compiled in, the upstream
+**This amends ADR-0002, deliberately — and it amends a prohibition rather than
+exercising a reservation.** That ADR requires a handler identifier to "exist in
+the process's code-backed registry" and rejects handlers naming "a URL,
+executable, dynamic library, or arbitrary Rust type", with no escape clause
+attached; the "unless a later ADR deliberately opens that boundary" it does
+carry governs *which kinds* a product handler may be registered for, not
+whether a handler may terminate remotely. This is therefore a change to
+ADR-0002, not a door it left open — though its §3 shape table already
+contemplates a constrained reverse-proxy exchange, so the shape is not foreign
+to it. What survives unchanged is the reason for the prohibition: *arbitrary
+operator-defined* remote handlers stay rejected, because the forwarding strategy is platform-known and compiled in, the upstream
 is a registered `Controller` rather than an operator-supplied URL, and no
 `ResourceDefinition` can name a network endpoint. What changes is that a
 platform handler's implementation may terminate at a Controller instead of in
@@ -392,8 +396,9 @@ Organization-delete race is a cross-boundary advisory lock:
 `src/server/resources/organization.rs:42-51` prescribes `pg_advisory_xact_lock`
 keyed on the Org UID, taken in the resource-delete path *and* in every
 `set_team_organization` / `set_project_organization` / `ensure_user_membership`
-call site. Invariant 3 forbids exactly that once those call sites are in a
-different process. The replacement is a finalizer: the product backend registers
+call site. Two transactions coordinating through a shared lock is not one
+transaction spanning the boundary, so the rule it breaks is invariant 5 — which
+names advisory locks between components — rather than invariant 3. The replacement is a finalizer: the product backend registers
 a finalizer on Organization and clears it only when no typed row references that
 UID, so the apiserver tombstones and waits instead of counting rows it cannot
 see. That has to land before an Organization can be deleted across the boundary
@@ -509,8 +514,11 @@ apiserver.
   one: it lives in `rise-authz`, which `rise-deploy` does not yet depend on, and
   once authorization runs inside the apiserver it cannot absorb a cost paid on
   the other side of the boundary. The cost is bounded in time as well as size —
-  it is paid on the compatibility path, and it retires with the shim (§1). That
-  is a reason to measure it at G4 rather than to engineer against it now.
+  it is paid on the compatibility path, and it retires with the shim (§1) — but
+  the shim's window is set by how fast *clients* migrate (fielded CLIs,
+  third-party API consumers), not by Rise's own schedule, so "bounded" means
+  "has an end", not "has a date". Measure at G4 rather than engineering against
+  it now.
 - A product subresource costs two hops and couples its availability to both
   processes (§4 above).
 - The apiserver becomes browser-facing after the typed-object migration,
