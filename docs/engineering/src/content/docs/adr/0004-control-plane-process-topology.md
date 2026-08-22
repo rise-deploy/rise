@@ -175,7 +175,7 @@ resource API end to end:
 
 | Inside the apiserver | Outside |
 |---|---|
-| Resource store and its Postgres schema | Product backend (projects, deployments, env vars, domains) |
+| Resource store and its Postgres schema | Typed product API — shrinking (below) |
 | Kind registry and `ResourceDefinition` projection | Deployment controllers (Kubernetes, Docker) |
 | Normalization and admission | Extension controllers (RDS, S3, Snowflake OAuth) |
 | Authorization (`rise-authz` engine, ADR-0001) | CLI |
@@ -191,6 +191,32 @@ This is deliberately the kube-apiserver shape: admission and authorization sit
 *inside* the process that owns storage, because both need to read and write in
 one transaction. Rise's storage engine happens to be PostgreSQL rather than
 etcd, which buys real transactions and costs nothing here.
+
+**The typed product API is a shrinking shim, not a fixture.** As
+`ROADMAP.md` §4 lands each kind, the typed routes stop owning storage and become
+a translation layer over the resource API — and `ROADMAP.md` §4's closing item
+already says typed tables are dropped "after [the] resource-backed path has
+baked and compatibility reads are no longer needed." The end state is a shim
+that exists only for clients not yet speaking the resource API, and quite
+possibly no typed surface at all. Three things follow, and this ADR reads
+differently without them:
+
+- **The right-hand column is not a peer architecture.** Deployment and extension
+  controllers are permanent; the typed API is a compatibility artifact with a
+  planned end. Do not invest in it as though it were durable, and do not add a
+  typed route for something the resource API can already express.
+- **The shim holds no storage and no credentials.** Once translation is all it
+  does, it is an ordinary client — so *where* it runs stops being an
+  architectural question and becomes a deployment one. It stays in `rise`
+  because that is where the CLI already is, not because it needs to be its own
+  tier.
+- **Several problems below are transitional, and should be solved
+  transitionally.** The cross-boundary Organization lock (§6), the bootstrap
+  split (§6), and the typed rows that soft-reference Organization UIDs all exist
+  *because* typed tables exist. They do not need permanent architecture — they
+  need a mechanism that carries the migration and is then deleted with the
+  tables it served. Building an enduring distributed-consistency layer for them
+  would outlive its problem.
 
 ### 2. The API contract is the only protocol across the boundary
 
@@ -330,8 +356,10 @@ holds a Rise-issued JWT session cookie — the same credential the ingress-auth
 subrequest validates. It does move browser-facing concerns onto the apiserver
 that the product backend owns today: CORS, cookie scope and `SameSite`, CSRF on
 non-idempotent verbs, and per-item list filtering fast enough to be interactive.
-Until each kind migrates, the UI keeps reading it through the product backend;
-the switch happens per surface, not as one cutover.
+Until each kind migrates, the UI keeps reading it through the typed shim; the
+switch happens per surface, not as one cutover. Every client makes the same
+move eventually — the UI is just the one whose migration we control end to end,
+which is why it goes first.
 
 ### 6. Availability and coordination
 
@@ -369,7 +397,9 @@ different process. The replacement is a finalizer: the product backend registers
 a finalizer on Organization and clears it only when no typed row references that
 UID, so the apiserver tombstones and waits instead of counting rows it cannot
 see. That has to land before an Organization can be deleted across the boundary
-— it is a G5 obligation, not an implementation detail.
+— it is a G5 obligation, not an implementation detail. It is also a
+*transitional* one: the finalizer exists to guard typed rows, so it is deleted
+with them (§1). Build it to be removable, not to endure.
 
 Bootstrap does not simply move. Its `GlobalLock` serializes default-Organization
 creation, but the work it guards writes typed tables too
@@ -378,8 +408,9 @@ creation, but the work it guards writes typed tables too
 the apiserver would hand the apiserver typed-table credentials. It splits
 instead: the apiserver creates the Organization resource, and the product
 backend does its own linkage pass afterwards, converging rather than
-transacting — and the backfills disappear entirely once those kinds are
-resource-backed.
+transacting. Convergence is the right shape precisely because the problem is
+temporary — the backfills disappear entirely once those kinds are
+resource-backed, and nothing should be built here that would be missed.
 
 ### 7. The API proves itself before the process splits
 
@@ -412,7 +443,9 @@ otherwise.** Between the identity kinds above, the Organization finalizer in
 §6, and the typed rows that still soft-reference Organization UIDs, the honest
 statement is that the process split lands near the *end* of the typed-object
 migration rather than alongside it. That is a reason to sequence the split
-last, not a reason to doubt it.
+last, not a reason to doubt it — and the coupling runs the useful way: every
+kind that migrates deletes a straddle rather than relocating it, so the gate
+gets cheaper as §4 proceeds instead of more expensive.
 
 Only then does the apiserver move into its own process — at which point it is a
 packaging change, because every caller already speaks the API.
@@ -436,8 +469,10 @@ rather than a precondition of a change that is invisible to users.
 ### 8. Packaging, embedded mode, and version skew
 
 **A separate `rise-apiserver` binary**, built from this workspace and shipped in
-the same image on the same release cadence. `rise` keeps the CLI and the product
-backend; `rise-apiserver` links neither. One extra build target buys a control
+the same image on the same release cadence. `rise` keeps the CLI and whatever
+remains of the typed API; `rise-apiserver` links neither. The asymmetry is
+deliberate and grows over time: the apiserver's surface is the one that lasts,
+so it is the one kept clean. One extra build target buys a control
 plane that does not carry code it never runs, and a `--help` that means
 something. Each process gets its own Helm Deployment, its own scaling, and its
 own database role.
@@ -470,16 +505,19 @@ apiserver.
   (`ROADMAP.md` §5) becomes demonstrable rather than asserted.
 - Third-party controllers get a supported contract with no Rust linkage, and a
   version window they can build against.
-- Every resource read from the product backend gains a network hop, with no
+- Every resource read behind a typed route gains a network hop, with no
   mitigation claimed. Request-local `AuthorizationSnapshot` memoization is not
   one: it lives in `rise-authz`, which `rise-deploy` does not yet depend on, and
   once authorization runs inside the apiserver it cannot absorb a cost paid on
-  the other side of the boundary. Measure at G4.
+  the other side of the boundary. The cost is bounded in time as well as size —
+  it is paid on the compatibility path, and it retires with the shim (§1). That
+  is a reason to measure it at G4 rather than to engineer against it now.
 - A product subresource costs two hops and couples its availability to both
   processes (§4 above).
 - The apiserver becomes browser-facing after the typed-object migration,
-  inheriting CORS, cookie, and CSRF handling that the product backend owns
-  today.
+  inheriting CORS, cookie, and CSRF handling that the typed API owns today. The
+  web UI is simply the first client to stop needing the shim, not a special
+  case (§5).
 - Operators run, scale, and upgrade more processes, with no single-process
   escape hatch for small installs. This is an operator-impact change: it needs
   Upgrade Notes and a Rollout Tracker item when it lands.
