@@ -1126,9 +1126,20 @@ impl EcsReconciler {
             .memory(&spec.memory)
             .runtime_platform(
                 ecs_types::RuntimePlatform::builder()
-                    .cpu_architecture(ecs_types::CpuArchitecture::from(
-                        spec.cpu_architecture.as_str(),
-                    ))
+                    .cpu_architecture(match spec.cpu_architecture.as_str() {
+                        "X86_64" => ecs_types::CpuArchitecture::X8664,
+                        "ARM64" => ecs_types::CpuArchitecture::Arm64,
+                        // `CpuArchitecture::from` would hand back an `Unknown`
+                        // variant here and ship the bad string to AWS. The
+                        // builder canonicalises, so reaching this arm means the
+                        // two have drifted — say so instead of guessing.
+                        other => anyhow::bail!(
+                            "task definition for family {:?} carries CPU architecture {other:?}, \
+                             which is not one of {}",
+                            spec.family,
+                            task_definition::FARGATE_CPU_ARCHITECTURES.join(" or ")
+                        ),
+                    })
                     .operating_system_family(ecs_types::OsFamily::Linux)
                     .build(),
             )

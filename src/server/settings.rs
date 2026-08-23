@@ -885,6 +885,25 @@ fn default_cpu_architecture() -> String {
     "X86_64".to_string()
 }
 
+/// Canonicalise the configured Fargate CPU architecture at load, so everything
+/// downstream — the task definition, the CLI's platform hint — sees exactly one
+/// of the two tokens ECS accepts.
+///
+/// Rejecting here is the whole point: an architecture we can neither recognise
+/// nor normalise has no safe default. Guessing `X86_64` would hand ARM64
+/// operators images their tasks cannot execute, and passing the string through
+/// would surface as an AWS error on every deploy instead of once at startup.
+#[cfg(feature = "backend")]
+fn deserialize_fargate_cpu_architecture<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    rise_backend_ecs::task_definition::canonical_cpu_architecture(&raw)
+        .map(str::to_string)
+        .map_err(|e| serde::de::Error::custom(format!("deployment_controller.{e}")))
+}
+
 /// Mirrors [`default_docker_access_classes`]: a permissive `public` class so an
 /// install works before an operator defines their own.
 #[cfg(feature = "backend")]
@@ -1653,7 +1672,10 @@ pub enum DeploymentControllerSettings {
         ssm_kms_key_id: Option<String>,
 
         /// Fargate CPU architecture: `X86_64` or `ARM64`. Defaults to `X86_64`.
-        #[serde(default = "default_cpu_architecture")]
+        #[serde(
+            default = "default_cpu_architecture",
+            deserialize_with = "deserialize_fargate_cpu_architecture"
+        )]
         cpu_architecture: String,
 
         /// Ingress URL template for the production (default) deployment group.
@@ -2345,7 +2367,6 @@ impl Settings {
             ref cluster,
             ref subnets,
             ref security_groups,
-            ref cpu_architecture,
             ref execution_role_arn,
             ref repository_credentials_secret_arn,
             ..
@@ -2418,13 +2439,6 @@ impl Settings {
                     MAX_SECURITY_GROUPS_PER_AWSVPC
                 )));
             }
-            if !matches!(cpu_architecture.as_str(), "X86_64" | "ARM64") {
-                return Err(ConfigError::Message(format!(
-                    "deployment_controller.cpu_architecture must be X86_64 or ARM64, got {:?}",
-                    cpu_architecture
-                )));
-            }
-
             // ECS authenticates every image pull itself, at every task start —
             // scale-out, task replacement, AZ rebalance. It never receives a
             // credential Rise minted, so a registry whose only pull mechanism is
@@ -3429,6 +3443,33 @@ auth:
         };
         assert_eq!(account_id, "123456789012");
         assert_eq!(repo_prefix, "rise/");
+    }
+
+    #[test]
+    fn cpu_architecture_is_canonicalised_at_load_and_a_bad_one_is_rejected() {
+        // `RISE_ECS_CPU_ARCHITECTURE` is an env var, so lower case and the
+        // Docker/OCI spelling are what operators actually type. Canonicalising
+        // at load is what lets the rest of the system assume one of two tokens.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CPU_ARCHITECTURE", "aarch64");
+        let settings = load_shipped_ecs_config(&env).expect("aarch64 must be accepted");
+        let Some(DeploymentControllerSettings::Ecs {
+            cpu_architecture, ..
+        }) = settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(cpu_architecture, "ARM64");
+
+        // An architecture we can neither recognise nor normalise has no safe
+        // default: guessing would build images the tasks cannot execute.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CPU_ARCHITECTURE", "riscv64");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("X86_64 or ARM64"),
+            "should name the valid values: {err}"
+        );
     }
 
     #[test]

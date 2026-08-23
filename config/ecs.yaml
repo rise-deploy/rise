@@ -95,6 +95,9 @@ deployment_controller:
   resource_prefix: "${RISE_ECS_RESOURCE_PREFIX:-rise}"
   ssm_parameter_prefix: "${RISE_ECS_SSM_PREFIX:-rise}"
   ssm_kms_key_id: "${RISE_ECS_SSM_KMS_KEY_ID:-}"
+  # X86_64 or ARM64. Common spellings (amd64, aarch64, any case) are
+  # normalised; anything else is refused at startup rather than defaulted,
+  # since a wrong guess builds images the tasks cannot execute.
   cpu_architecture: "${RISE_ECS_CPU_ARCHITECTURE:-X86_64}"
 
   production_ingress_url_template: "{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"

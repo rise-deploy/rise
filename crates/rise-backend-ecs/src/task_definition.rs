@@ -180,6 +180,32 @@ pub struct TaskDefinitionConfig<'a> {
     pub traefik: TraefikRenderConfig<'a>,
 }
 
+/// The two CPU architectures Fargate accepts, in the exact spelling ECS's
+/// `runtimePlatform` expects.
+pub const FARGATE_CPU_ARCHITECTURES: [&str; 2] = ["X86_64", "ARM64"];
+
+/// Canonicalise a configured CPU architecture to the token ECS expects.
+///
+/// Operators reach for whichever spelling their toolchain uses — `amd64` from
+/// Docker and OCI, `aarch64` from `uname`, lower case from a shell variable —
+/// and all of them mean one of exactly two things to Fargate. Accept them, and
+/// **fail on anything else rather than passing it through**: the AWS SDK's
+/// `CpuArchitecture::from` maps an unrecognised string to an `Unknown` variant
+/// that serialises verbatim, so a typo would survive all the way to
+/// `RegisterTaskDefinition` and come back as an AWS-shaped error, per
+/// deployment, long after the operator who made it stopped looking.
+pub fn canonical_cpu_architecture(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "x86-64" | "amd64" | "x64" => Ok("X86_64"),
+        "arm64" | "aarch64" => Ok("ARM64"),
+        other => bail!(
+            "cpu_architecture {other:?} is not a Fargate CPU architecture. Use {} \
+             (or a common spelling of one: amd64, x86_64, arm64, aarch64).",
+            FARGATE_CPU_ARCHITECTURES.join(" or ")
+        ),
+    }
+}
+
 /// Task-definition family for a container spec.
 ///
 /// Deliberately **deployment-id free**: a family accumulates one revision per
@@ -238,7 +264,7 @@ pub fn build(
         ),
         cpu: size.cpu_string(),
         memory: size.memory_string(),
-        cpu_architecture: cfg.cpu_architecture.to_string(),
+        cpu_architecture: canonical_cpu_architecture(cfg.cpu_architecture)?.to_string(),
         execution_role_arn: cfg.execution_role_arn.map(str::to_string),
         task_role_arn: cfg.task_role_arn.map(str::to_string),
         containers: vec![ContainerDefinitionSpec {
@@ -458,6 +484,49 @@ mod tests {
             base.content_hash(),
             build(&new_env, &[], &c).expect("builds").content_hash()
         );
+    }
+
+    #[test]
+    fn cpu_architecture_normalises_or_fails_but_never_guesses() {
+        // Operators type whichever spelling their toolchain uses; all of these
+        // mean one of exactly two things to Fargate.
+        for raw in ["x86_64", "X86_64", "amd64", "x86-64", "x64", " AMD64 "] {
+            assert_eq!(canonical_cpu_architecture(raw).expect("accepts"), "X86_64");
+        }
+        for raw in ["arm64", "ARM64", "aarch64"] {
+            assert_eq!(canonical_cpu_architecture(raw).expect("accepts"), "ARM64");
+        }
+
+        // Anything else must fail here. Defaulting to X86_64 would hand an ARM64
+        // cluster images its tasks cannot execute, and passing the string
+        // through becomes an `Unknown` SDK variant AWS rejects per deploy.
+        for raw in ["", "x86", "riscv64", "arm/v7", "X86_65"] {
+            let err = canonical_cpu_architecture(raw).expect_err("must reject");
+            assert!(
+                err.to_string().contains("X86_64 or ARM64"),
+                "should name the valid values: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_builder_rejects_an_architecture_it_cannot_canonicalise() {
+        // The builder is the last pure checkpoint before the value becomes an
+        // SDK enum, where an unrecognised string stops being an error and starts
+        // being an `Unknown` variant shipped to AWS.
+        let classes = access_classes();
+        let mut c = cfg(&classes);
+        c.cpu_architecture = "amd64";
+        assert_eq!(
+            build(&desired(), &[], &c)
+                .expect("normalises")
+                .cpu_architecture,
+            "X86_64"
+        );
+
+        c.cpu_architecture = "riscv64";
+        let err = build(&desired(), &[], &c).expect_err("must reject");
+        assert!(err.to_string().contains("riscv64"), "unhelpful: {err}");
     }
 
     #[test]

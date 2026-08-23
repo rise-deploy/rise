@@ -153,7 +153,7 @@ credentials inside it needs no redeploy.
 | `repository_credentials_secret_arn` | Secrets Manager secret for a private non-ECR registry |
 | `log_group` | `awslogs` destination; omit for no container logging |
 | `ssm_parameter_prefix`, `ssm_kms_key_id` | where secret env vars live |
-| `cpu_architecture` | `X86_64` or `ARM64` — also the CLI's platform hint |
+| `cpu_architecture` | `X86_64` or `ARM64` — also the CLI's platform hint. Common spellings (`amd64`, `aarch64`, any case) are normalised; anything else is **refused at startup**, since defaulting would build images the tasks cannot execute |
 | `auth_backend_url` | **must be reachable from inside the cluster** (a Cloud Map name or internal load balancer), never the public URL |
 | `traefik_api_url` | required for projects using `health_check` |
 | `reconcile_interval_secs` | defaults to 30; ECS is a throttled API |

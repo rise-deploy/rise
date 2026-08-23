@@ -1512,16 +1512,21 @@ impl AppState {
             // Fargate's architecture is chosen by configuration, not detected:
             // the task definition declares it. Surfacing it here is what gives
             // the CLI its `--platform` hint, so an ARM64 cluster doesn't receive
-            // silently-unrunnable amd64 images.
-            let arch = crate::server::platform::models::normalize_runtime_arch(cpu_architecture);
-            if arch.is_none() {
-                tracing::warn!(
-                    configured = %cpu_architecture,
-                    "Could not normalize the configured ECS cpu_architecture; the CLI will \
-                     receive no platform hint"
-                );
-            }
-            arch
+            // silently-unrunnable amd64 images — which is exactly why an
+            // architecture that will not normalise must stop startup rather
+            // than quietly withdraw the hint. Settings canonicalise the value at
+            // load, so reaching the error means the two have drifted.
+            Some(
+                crate::server::platform::models::normalize_runtime_arch(cpu_architecture)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ECS deployment backend: could not normalize \
+                             `deployment_controller.cpu_architecture` ({cpu_architecture:?}) to an \
+                             OCI platform name, so the CLI would build images with no platform \
+                             hint and Fargate could refuse to run them"
+                        )
+                    })?,
+            )
         } else {
             None
         };
