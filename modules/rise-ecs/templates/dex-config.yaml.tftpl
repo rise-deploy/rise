@@ -1,0 +1,28 @@
+issuer: ${issuer}
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  skipApprovalScreen: true
+
+staticClients:
+  - id: ${client_id}
+    name: Rise
+    secret: ${client_secret}
+    redirectURIs:
+      - ${public_url}/api/v1/auth/callback
+      # The CLI's browser login binds a loopback listener on one of these.
+      - http://localhost:8765/callback
+      - http://localhost:8766/callback
+      - http://localhost:8767/callback
+
+enablePasswordDB: true
+staticPasswords:
+  - email: ${admin_email}
+    hash: ${admin_password_bcrypt}
+    username: ${admin_username}
+    userID: "00000000-0000-0000-0000-000000000001"

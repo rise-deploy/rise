@@ -134,7 +134,7 @@ resource "aws_efs_file_system" "acme" {
 }
 
 resource "aws_efs_mount_target" "acme" {
-  for_each = local.acme_enabled ? toset(local.private_subnet_ids) : toset([])
+  for_each = local.acme_enabled ? local.private_subnets_by_key : {}
 
   file_system_id  = aws_efs_file_system.acme[0].id
   subnet_id       = each.value

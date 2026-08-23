@@ -191,3 +191,49 @@ resource "aws_vpc_security_group_ingress_rule" "vpc_endpoints_from_tasks" {
   ip_protocol                  = "tcp"
   description                  = "HTTPS from ${each.key}"
 }
+
+resource "aws_security_group" "dex" {
+  count = var.deploy_dex ? 1 : 0
+
+  name        = "${local.name}-dex"
+  description = "Demo identity provider"
+  vpc_id      = local.vpc_id
+  tags        = merge(local.tags, { Name = "${local.name}-dex" })
+}
+
+resource "aws_vpc_security_group_ingress_rule" "dex_from_traefik" {
+  count = var.deploy_dex ? 1 : 0
+
+  security_group_id            = aws_security_group.dex[0].id
+  referenced_security_group_id = aws_security_group.traefik.id
+  from_port                    = 5556
+  to_port                      = 5556
+  ip_protocol                  = "tcp"
+  description                  = "Routed traffic"
+}
+
+resource "aws_vpc_security_group_egress_rule" "dex_all" {
+  count = var.deploy_dex ? 1 : 0
+
+  security_group_id = aws_security_group.dex[0].id
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+
+# The demo IdP's issuer is public, so the control plane discovers it by going
+# out through the NAT and back in at the edge. If ingress_cidr_blocks has been
+# narrowed to an office range, that hairpin is blocked and Rise fails to start
+# with an OIDC discovery error that points nowhere near the cause -- so admit
+# the NAT addresses explicitly.
+resource "aws_vpc_security_group_ingress_rule" "edge_from_nat" {
+  for_each = var.deploy_dex ? {
+    for idx, eip in aws_eip.nat : idx => eip
+  } : {}
+
+  security_group_id = aws_security_group.edge.id
+  cidr_ipv4         = "${each.value.public_ip}/32"
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  description       = "Control-plane OIDC discovery against the demo Dex"
+}

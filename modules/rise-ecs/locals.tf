@@ -26,6 +26,16 @@ locals {
     length(var.vpc.database_subnet_ids) > 0 ? var.vpc.database_subnet_ids : var.vpc.private_subnet_ids
   )
 
+  # Keyed by something statically known in both modes -- AZ name when the module
+  # creates the subnets, subnet id when they are brought. for_each cannot take
+  # keys that are only known after apply, and in create mode the ids are exactly
+  # that.
+  private_subnets_by_key = local.create_vpc ? {
+    for az in local.azs : az => aws_subnet.private[az].id
+    } : {
+    for id in var.vpc.private_subnet_ids : id => id
+  }
+
   nat_gateway_count = local.create_vpc ? (
     var.nat_gateway_mode == "per_az" ? var.availability_zone_count :
     var.nat_gateway_mode == "single" ? 1 : 0
@@ -104,7 +114,7 @@ locals {
       RISE_ECS_LOG_GROUP               = local.log_group_name
       RISE_ECS_RESOURCE_PREFIX         = var.resource_prefix
       RISE_ECS_SSM_PREFIX              = var.ssm_parameter_prefix
-      RISE_ECS_SSM_KMS_KEY_ID          = coalesce(var.ssm_kms_key_arn, "")
+      RISE_ECS_SSM_KMS_KEY_ID          = var.ssm_kms_key_arn != null ? var.ssm_kms_key_arn : ""
       RISE_ECS_CPU_ARCHITECTURE        = var.cpu_architecture
       RISE_ECS_RECONCILE_INTERVAL_SECS = tostring(var.reconcile_interval_secs)
 
