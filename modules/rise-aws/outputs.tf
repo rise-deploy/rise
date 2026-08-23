@@ -89,6 +89,29 @@ output "kms_key_id" {
 # Configuration outputs (for Rise backend config)
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# ECS
+# -----------------------------------------------------------------------------
+
+output "ecs_execution_role_arn" {
+  description = "ARN of the ECS task execution role. Feed to deployment_controller.execution_role_arn."
+  value       = var.enable_ecs ? aws_iam_role.ecs_execution[0].arn : null
+}
+
+output "ecs_execution_role_name" {
+  description = "Name of the ECS task execution role."
+  value       = var.enable_ecs ? aws_iam_role.ecs_execution[0].name : null
+}
+
+output "ecs_task_role_arn" {
+  description = <<-EOT
+    ARN of the role deployed workloads run as. This is the backend role: on ECS
+    the control plane and the workloads it launches share one identity, since
+    per-project task roles are not implemented (ADR-0004 D14).
+  EOT
+  value       = var.enable_ecs ? aws_iam_role.backend.arn : null
+}
+
 output "rise_config" {
   description = "Configuration values for the Rise backend"
   sensitive   = true
@@ -121,6 +144,17 @@ output "rise_config" {
       rds = {
         vpc_security_group_ids = [aws_security_group.rds[0].id]
         db_subnet_group_name   = aws_db_subnet_group.rds[0].name
+      }
+    } : {},
+    # ECS deployment controller (if enabled)
+    var.enable_ecs ? {
+      ecs = {
+        cluster              = local.ecs_cluster_name
+        region               = local.region
+        execution_role_arn   = aws_iam_role.ecs_execution[0].arn
+        task_role_arn        = aws_iam_role.backend.arn
+        ssm_parameter_prefix = local.ssm_prefix
+        ssm_kms_key_id       = var.ssm_kms_key_arn
       }
     } : {},
     # S3 configuration (if enabled)
