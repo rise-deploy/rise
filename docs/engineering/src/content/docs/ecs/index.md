@@ -61,6 +61,11 @@ secrets:
 
 - `AmazonECSTaskExecutionRolePolicy` (ECR pull + CloudWatch Logs)
 - `ssm:GetParameters` and `kms:Decrypt` on `/{ssm_parameter_prefix}/*`
+- `secretsmanager:GetSecretValue` on `repository_credentials_secret_arn`, if set
+
+See [Container registry](#container-registry) for what the pull path needs in
+detail — it is the execution role that authenticates it, so a missing permission
+there surfaces as a task that cannot start rather than as an API error.
 
 **Control-plane role** — the identity Rise runs as:
 
@@ -74,6 +79,66 @@ secrets:
 That last scoping matters: an unscoped `iam:PassRole` would let anyone who can
 create a Rise deployment run a task as any role in the account.
 
+## Container registry
+
+ECS authenticates every image pull **itself**, using the task execution role,
+and it re-authenticates at every task start — scale-out, task replacement, AZ
+rebalance. Rise never mints a pull credential for this backend and never hands
+ECS one. That shapes which registries can work here:
+
+| `registry.type` | Supported | What it needs |
+|---|---|---|
+| `ecr` | ✅ recommended | `execution_role_arn`, in the **same AWS account** as the cluster |
+| `oci-client-auth`, anonymous | ✅ | the registry reachable from the task subnets |
+| `oci-client-auth` with credentials | ✅ | `repository_credentials_secret_arn` |
+| `gitlab`, `jfrog` | ❌ | nothing — see below |
+
+GitLab and JFrog issue short-lived scoped pull tokens that Rise refreshes on the
+puller's behalf; on Kubernetes it re-mints the pull Secret every six hours. ECS
+gives it no equivalent hook, so a deploy would succeed and then fail hours later
+when the token expired. Configuring one alongside the ECS controller is refused
+at startup rather than left to fail at 3am.
+
+### ECR
+
+Nothing extra is stored: the execution role *is* the credential.
+
+- **Execution role**: `AmazonECSTaskExecutionRolePolicy`, or explicitly
+  `ecr:GetAuthorizationToken` on `*` plus `ecr:BatchGetImage`,
+  `ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability` on
+  `arn:aws:ecr:{region}:{account}:repository/{repo_prefix}*`.
+- **Control-plane role**: `sts:AssumeRole` on `registry.push_role_arn` (the role
+  Rise assumes to mint the CLI's scoped push credentials), plus
+  `ecr:CreateRepository`, `ecr:DescribeRepositories`, `ecr:DeleteRepository` and
+  `ecr:TagResource` — repository lifecycle uses the control plane's own identity,
+  not the push role.
+- **Network path**: a task must reach ECR before it can start. Either a public IP
+  or a NAT gateway, or the `com.amazonaws.{region}.ecr.api` and
+  `com.amazonaws.{region}.ecr.dkr` interface endpoints **plus the S3 gateway
+  endpoint** — layer blobs come from S3, and a setup with only the two ECR
+  endpoints fails on the pull rather than on the API call.
+
+**The registry must live in the cluster's account.** Rise creates repositories
+with tags and image scanning only and writes no repository policy, which
+cross-account ECR requires; identity-based permissions on the execution role are
+not sufficient on their own. A mismatch is refused at startup, because it is
+otherwise invisible — `registry.account_id` only formats image references, so
+repositories would be created in one account while every deployment pointed at
+another.
+
+Repositories are provisioned by a background controller on a 10-second poll, not
+at project-create time. A create-then-deploy within that window mints
+credentials against a repository that does not exist yet.
+
+### A private registry that is not ECR
+
+Store the username and password in a Secrets Manager secret, set
+`repository_credentials_secret_arn` to its ARN, and grant the execution role
+`secretsmanager:GetSecretValue` on it (plus `kms:Decrypt` if the secret uses a
+customer-managed key). The ARN is stamped on every container definition as
+`repositoryCredentials`; ECS reads the secret at task start, so rotating the
+credentials inside it needs no redeploy.
+
 ## Configuration
 
 `config/ecs.yaml` ships in the image and is selected with
@@ -84,7 +149,8 @@ create a Rise deployment run a task as any role in the account.
 | `cluster`, `region` | which cluster to reconcile |
 | `subnets`, `security_groups` | accept a YAML list **or a comma-separated string**, so they can come straight from a Terraform output via an env var |
 | `assign_public_ip` | required on public subnets |
-| `execution_role_arn`, `task_role_arn` | see IAM above |
+| `execution_role_arn`, `task_role_arn` | see IAM above; the execution role is also what pulls from ECR |
+| `repository_credentials_secret_arn` | Secrets Manager secret for a private non-ECR registry |
 | `log_group` | `awslogs` destination; omit for no container logging |
 | `ssm_parameter_prefix`, `ssm_kms_key_id` | where secret env vars live |
 | `cpu_architecture` | `X86_64` or `ARM64` — also the CLI's platform hint |
@@ -121,6 +187,12 @@ startup when the URL is unset.
 the right cluster and that `exposedByDefault` is `false`. Rise stamps
 `traefik.enable=true` itself; the routing configuration is in the container
 definition's `dockerLabels`, which is the only place the provider reads it.
+
+**`CannotPullContainerError` on every task.** The execution role is the whole
+pull credential on this backend. Check it has the ECR read actions above, that
+the task can reach ECR at all (public IP, NAT, or all three VPC endpoints), and
+— for a private non-ECR registry — that `repository_credentials_secret_arn` is
+set and readable by that role.
 
 **Memory is higher than requested.** Expected — see the CPU/memory row of the
 [feature matrix](/operator-docs/deployment-backends/). Fargate accepts only a

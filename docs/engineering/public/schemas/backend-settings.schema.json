@@ -904,6 +904,14 @@
               "description": "AWS region hosting the cluster.",
               "type": "string"
             },
+            "repository_credentials_secret_arn": {
+              "default": null,
+              "description": "ARN of a Secrets Manager secret holding `{\"username\": …, \"password\": …}`\nfor a private registry that is not ECR.\n\nECS re-authenticates on every task start and cannot take inline\ncredentials, so a static-credential registry needs the credentials\nparked somewhere ECS can read them itself. The ARN is stamped onto\neach container definition as `repositoryCredentials`; the execution\nrole needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`\nwhen the secret uses a customer-managed key).\n\nLeave unset for ECR (the execution role authenticates the pull) and\nfor anonymous registries.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "resource_prefix": {
               "default": "rise",
               "description": "Prefix for generated ECS resource names. Defaults to `rise`.",

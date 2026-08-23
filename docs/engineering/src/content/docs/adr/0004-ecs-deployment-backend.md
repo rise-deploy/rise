@@ -256,10 +256,32 @@ Pulls need no Rise-managed credential at all: the **task execution role** carrie
 authenticates the pull itself. `RegistryProvider::requires_pull_secret()` is a
 Kubernetes-only concept and is simply not consulted by this backend.
 
-Non-ECR registries remain usable: private ones need a Secrets Manager secret
-referenced as `repositoryCredentials` on the container definition. That is
-supported but not the recommended path, and an ECS-specific setting names the
-secret ARN.
+Non-ECR registries remain usable, within limits that follow from ECS
+re-authenticating at **every** task start — scale-out, task replacement, AZ
+rebalance — with no hook for Rise to refresh anything:
+
+- **Anonymous** OCI registries work unchanged.
+- **Static-credential** registries need a Secrets Manager secret referenced as
+  `repositoryCredentials` on the container definition;
+  `deployment_controller.repository_credentials_secret_arn` names it. Supported,
+  but not the recommended path.
+- **GitLab and JFrog cannot work.** Their pull credentials are short-lived
+  scoped tokens that Rise re-mints on the puller's behalf (the Kubernetes
+  webhook rewrites the pull Secret every six hours). ECS offers no equivalent,
+  so a deploy would succeed and fail once the token expired. Configuring one
+  alongside this controller is rejected at startup.
+
+Two further consequences of Rise never being in the pull path:
+
+- **ECR must live in the cluster's own account.** Repositories are created with
+  tags and image scanning only — no repository policy, which is what
+  cross-account ECR requires — and no ECR call names a `registryId`. A mismatch
+  between `registry.account_id` and the ECS credentials' account is otherwise
+  invisible (the field only formats image references), so it is checked at
+  startup with `sts:GetCallerIdentity`.
+- **`execution_role_arn` becomes mandatory with ECR.** Without it every task
+  fails with `CannotPullContainerError`, which names neither cause nor fix, so
+  the combination is rejected at startup instead.
 
 ### D7. Secret environment variables: injected by ECS, not flattened into env
 
@@ -444,7 +466,7 @@ For completeness, the recommended install shape this backend assumes:
 |---|---|
 | Rise control plane | ECS service in the same cluster (or anywhere with API reach) |
 | Rise database | **RDS for PostgreSQL** (Multi-AZ), private subnets |
-| Container registry | **ECR** (D6) |
+| Container registry | **ECR**, same account as the cluster (D6) |
 | Secret encryption | AWS **KMS** provider (already implemented) + SSM for injection (D7) |
 | Edge | **NLB** (TCP passthrough) → Traefik + ACME on **EFS** (D5); ALB+ACM opt-in |
 | App logs | **CloudWatch Logs** (D11) |
