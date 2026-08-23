@@ -120,9 +120,12 @@ cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
-cargo test --package rise-authz --all-targets
-cargo test --package rise-backend-auth --all-targets
-cargo test --package rise-backend-core --all-targets
+# Every crate whose tests need no database. Expressed as exclusions so a new
+# crate is covered by default; only the three that require Postgres opt out.
+cargo test --workspace --all-features \
+  --exclude rise-deploy \
+  --exclude rise-resource-store-postgres \
+  --exclude rise-runtime-sync
 """
 env.SQLX_OFFLINE = true
 

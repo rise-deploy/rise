@@ -389,9 +389,10 @@ cargo test --workspace --all-features  # Unit tests (all workspace crates)
 combinations (`cli`, `backend`, both); the same two workspace-wide
 (`--workspace --all-features --all-targets`), which cover every support crate
 and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`;
-`mise resource:schema:check`; `helm lint helm/rise`; and `cargo test` for
-`rise-authz`, `rise-backend-auth`, and `rise-backend-core` — the crates whose
-tests need no database. It does **not** cover
+`mise resource:schema:check`; `helm lint helm/rise`; and a workspace `cargo
+test` excluding the three crates that need Postgres (`rise-deploy`,
+`rise-resource-store-postgres`, `rise-runtime-sync`) — so every other crate's
+tests run, and a new crate is covered without editing the list. It does **not** cover
 `config:schema:check`, `rise-toml:schema:check`, `crd:check`, `cargo audit`, or
 `tests/e2e` — CI does, so run those separately.
 
