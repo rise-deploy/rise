@@ -18,6 +18,18 @@ variable "create_iam_user" {
   default     = false
 }
 
+variable "assume_role_services" {
+  description = <<-EOT
+    AWS service principals allowed to assume the backend role, e.g.
+    ["ecs-tasks.amazonaws.com"] when Rise runs as an ECS task and takes its
+    credentials from the task role. Empty means only the account root may
+    assume it. Ignored when irsa_oidc_provider_arn is set, which selects the
+    EKS federated trust policy instead.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "irsa_oidc_provider_arn" {
   description = "OIDC provider ARN for IRSA (IAM Roles for Service Accounts). Required if using EKS."
   type        = string

@@ -303,6 +303,30 @@ data "aws_iam_policy_document" "assume_role_default" {
     }
     actions = ["sts:AssumeRole"]
   }
+
+  # Service principals, for runtimes that hand the role to a workload directly
+  # rather than through a federated identity. ECS is the case that needs it: the
+  # control plane takes its AWS credentials from the task role named on its own
+  # task definition, so without ecs-tasks.amazonaws.com here the role cannot be
+  # used as a taskRoleArn at all.
+  dynamic "statement" {
+    for_each = length(var.assume_role_services) > 0 ? [1] : []
+    content {
+      effect = "Allow"
+      principals {
+        type        = "Service"
+        identifiers = var.assume_role_services
+      }
+      actions = ["sts:AssumeRole"]
+      # Confused-deputy guard: the service may assume this role only on behalf
+      # of this account, never for a resource someone else owns.
+      condition {
+        test     = "StringEquals"
+        variable = "aws:SourceAccount"
+        values   = [local.account_id]
+      }
+    }
+  }
 }
 
 # IRSA assume role policy - for EKS service accounts
