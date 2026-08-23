@@ -346,9 +346,6 @@ jobs:
           cache: true
           experimental: true
 
-      - name: Install mise tools
-        run: mise use -g terraform
-
       # `validate` and `test` only; `plan` against real infrastructure would
       # need credentials, and these run on untrusted pull requests. The module
       # tests override the identity data sources for the same reason.
