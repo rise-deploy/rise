@@ -19,6 +19,11 @@ aws-sdk-ssm = { version = "1.80", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
+aws-sdk-sts = { version = "1.80", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+    "sigv4a",
+] }
 chrono = { workspace = true }
 rise-backend-core = { path = "../rise-backend-core" }
 rise-backend-traefik = { path = "../rise-backend-traefik" }

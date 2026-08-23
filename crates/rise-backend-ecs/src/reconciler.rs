@@ -73,6 +73,10 @@ pub struct ReconcilerConfig {
     pub assign_public_ip: bool,
     pub execution_role_arn: Option<String>,
     pub task_role_arn: Option<String>,
+    /// Secrets Manager secret ECS reads to authenticate pulls from a private
+    /// non-ECR registry. Unset for ECR, whose pulls the execution role
+    /// authenticates directly.
+    pub repository_credentials_secret_arn: Option<String>,
     pub log_group: Option<String>,
     pub resource_prefix: String,
     pub ssm_parameter_prefix: String,
@@ -755,6 +759,10 @@ impl EcsReconciler {
                 resource_prefix: &self.config.resource_prefix,
                 cpu_architecture: &self.config.cpu_architecture,
                 execution_role_arn: self.config.execution_role_arn.as_deref(),
+                repository_credentials_secret_arn: self
+                    .config
+                    .repository_credentials_secret_arn
+                    .as_deref(),
                 task_role_arn: self.config.task_role_arn.as_deref(),
                 log_group: self.config.log_group.as_deref(),
                 region: &self.config.region,
@@ -1078,6 +1086,14 @@ impl EcsReconciler {
         }
         for (k, v) in &container.docker_labels {
             cd = cd.docker_labels(k, v);
+        }
+        if let Some(arn) = &container.repository_credentials_secret_arn {
+            cd = cd.repository_credentials(
+                ecs_types::RepositoryCredentials::builder()
+                    .credentials_parameter(arn)
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("invalid repository credentials: {e}"))?,
+            );
         }
         if let Some(port) = container.port {
             cd = cd.port_mappings(

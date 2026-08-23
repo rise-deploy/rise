@@ -47,3 +47,9 @@ pub fn ecs(config: &aws_config::SdkConfig) -> aws_sdk_ecs::Client {
 pub fn ssm(config: &aws_config::SdkConfig) -> aws_sdk_ssm::Client {
     aws_sdk_ssm::Client::new(config)
 }
+
+/// Build an STS client. Used only to establish which account the ECS
+/// credentials belong to; see [`crate::verify_ecr_same_account`].
+pub fn sts(config: &aws_config::SdkConfig) -> aws_sdk_sts::Client {
+    aws_sdk_sts::Client::new(config)
+}

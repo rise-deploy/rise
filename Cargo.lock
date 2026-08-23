@@ -4371,6 +4371,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-ecs",
  "aws-sdk-ssm",
+ "aws-sdk-sts",
  "chrono",
  "rise-backend-core",
  "rise-backend-traefik",

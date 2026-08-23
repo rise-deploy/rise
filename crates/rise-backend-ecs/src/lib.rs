@@ -97,6 +97,49 @@ impl EcsBackend {
     }
 }
 
+/// Fail startup when the ECR registry lives in a different AWS account from
+/// the ECS cluster.
+///
+/// Rise creates ECR repositories with tags and scan-on-push only — it writes no
+/// repository policy, and no ECR call names a `registryId`. Identity-based
+/// permissions on the execution role are not sufficient for a cross-account
+/// pull, so a mismatch here means every task fails with
+/// `CannotPullContainerError` and there is no configuration that fixes it.
+/// Worse, `registry.account_id` is used purely for string formatting, so the
+/// mismatch is otherwise invisible: repositories get created in whichever
+/// account the credentials belong to while every image reference points at the
+/// configured one.
+pub async fn verify_ecr_same_account(
+    sts: &aws_sdk_sts::Client,
+    registry_account_id: &str,
+) -> Result<()> {
+    let identity = sts.get_caller_identity().send().await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to resolve the ECS credentials' AWS account via sts:GetCallerIdentity, \
+             needed to check that registry.account_id ({registry_account_id}) matches: {}",
+            aws_error_detail(&e)
+        )
+    })?;
+
+    let Some(account) = identity.account() else {
+        anyhow::bail!(
+            "sts:GetCallerIdentity returned no account, so the ECS credentials' account \
+             could not be compared against registry.account_id ({registry_account_id})"
+        );
+    };
+
+    if account != registry_account_id {
+        anyhow::bail!(
+            "registry.account_id is {registry_account_id} but the ECS deployment \
+             controller's credentials belong to account {account}. Cross-account ECR is \
+             not supported: Rise writes no ECR repository policy, so the task execution \
+             role in {account} cannot be granted a pull. Point both at the same account, \
+             or host the registry where the cluster runs."
+        );
+    }
+    Ok(())
+}
+
 /// Concise detail for an AWS SDK error: prefer the service's own message
 /// (`ProvideErrorMetadata`) over the SDK's wrapper text, which otherwise reads
 /// "service error" and buries the actual cause — the AWS equivalent of the

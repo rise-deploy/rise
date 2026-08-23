@@ -68,6 +68,13 @@ pub struct ContainerDefinitionSpec {
     /// Traefik dynamic configuration. Empty for a non-routable container.
     pub docker_labels: BTreeMap<String, String>,
     pub log_config: Option<LogConfig>,
+    /// Secrets Manager secret ARN ECS reads to authenticate the image pull.
+    ///
+    /// Only for a private registry that is not ECR: ECR pulls are authenticated
+    /// by the execution role itself. ECS re-reads this at every task start, so
+    /// rotating the secret's contents needs no redeploy — but pointing at a
+    /// different secret does, which is why the ARN is part of `content_hash`.
+    pub repository_credentials_secret_arn: Option<String>,
 }
 
 /// A complete Fargate task definition, ready to convert to SDK input.
@@ -99,6 +106,10 @@ impl TaskDefinitionSpec {
             for s in &c.secrets {
                 n += s.name.len() + s.value_from.len() + 28;
             }
+            n += c
+                .repository_credentials_secret_arn
+                .as_deref()
+                .map_or(0, |a| a.len() + 32);
             for (k, v) in &c.docker_labels {
                 n += k.len() + v.len() + 12;
             }
@@ -140,6 +151,12 @@ impl TaskDefinitionSpec {
                 field(k.as_bytes());
                 field(v.as_bytes());
             }
+            field(
+                c.repository_credentials_secret_arn
+                    .as_deref()
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
         }
         hasher
             .finalize()
@@ -155,6 +172,9 @@ pub struct TaskDefinitionConfig<'a> {
     pub cpu_architecture: &'a str,
     pub execution_role_arn: Option<&'a str>,
     pub task_role_arn: Option<&'a str>,
+    /// Secrets Manager secret ARN for a private non-ECR registry; see
+    /// [`ContainerDefinitionSpec::repository_credentials_secret_arn`].
+    pub repository_credentials_secret_arn: Option<&'a str>,
     pub log_group: Option<&'a str>,
     pub region: &'a str,
     pub traefik: TraefikRenderConfig<'a>,
@@ -229,6 +249,9 @@ pub fn build(
             secrets: secrets.to_vec(),
             docker_labels,
             log_config,
+            repository_credentials_secret_arn: cfg
+                .repository_credentials_secret_arn
+                .map(str::to_string),
         }],
         size,
     };
@@ -270,6 +293,7 @@ mod tests {
             cpu_architecture: "X86_64",
             execution_role_arn: Some("arn:aws:iam::1:role/exec"),
             task_role_arn: None,
+            repository_credentials_secret_arn: None,
             log_group: Some("/rise/myapp"),
             region: "eu-central-1",
             traefik: TraefikRenderConfig {
@@ -434,6 +458,36 @@ mod tests {
             base.content_hash(),
             build(&new_env, &[], &c).expect("builds").content_hash()
         );
+    }
+
+    #[test]
+    fn repository_credentials_reach_the_container_and_the_hash() {
+        // The ARN is how a private non-ECR registry works at all on ECS: without
+        // it on the container definition the pull is anonymous and fails. And
+        // pointing at a *different* secret has to roll the service, since ECS
+        // only re-reads the secret when a task starts.
+        let classes = access_classes();
+        let mut c = cfg(&classes);
+        let anonymous = build(&desired(), &[], &c).expect("builds");
+        assert!(anonymous.containers[0]
+            .repository_credentials_secret_arn
+            .is_none());
+
+        c.repository_credentials_secret_arn =
+            Some("arn:aws:secretsmanager:eu-central-1:1:secret:reg-a");
+        let with_creds = build(&desired(), &[], &c).expect("builds");
+        assert_eq!(
+            with_creds.containers[0]
+                .repository_credentials_secret_arn
+                .as_deref(),
+            Some("arn:aws:secretsmanager:eu-central-1:1:secret:reg-a")
+        );
+        assert_ne!(anonymous.content_hash(), with_creds.content_hash());
+
+        c.repository_credentials_secret_arn =
+            Some("arn:aws:secretsmanager:eu-central-1:1:secret:reg-b");
+        let rotated = build(&desired(), &[], &c).expect("builds");
+        assert_ne!(with_creds.content_hash(), rotated.content_hash());
     }
 
     #[test]

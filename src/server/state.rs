@@ -361,6 +361,9 @@ async fn resolve_backend_ip(auth_backend_url: &str) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 async fn init_ecs_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
+    // AWS account of the configured ECR registry, when the install uses one.
+    // Checked against the ECS credentials' own account at startup.
+    ecr_account_id: Option<&str>,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     resource_store: Arc<dyn rise_resource_api::ResourceStore>,
@@ -385,6 +388,7 @@ async fn init_ecs_backend(
         assign_public_ip,
         execution_role_arn,
         task_role_arn,
+        repository_credentials_secret_arn,
         log_group,
         resource_prefix,
         ssm_parameter_prefix,
@@ -436,6 +440,10 @@ async fn init_ecs_backend(
         store.clone(),
     );
     backend.test_connection().await?;
+    if let Some(account_id) = ecr_account_id {
+        rise_backend_ecs::verify_ecr_same_account(&ecs_client::sts(&aws_config), account_id)
+            .await?;
+    }
     tracing::info!(cluster = %cluster, region = %region, "ECS deployment backend initialized");
 
     let health_path = health_probes
@@ -497,6 +505,7 @@ async fn init_ecs_backend(
             assign_public_ip: *assign_public_ip,
             execution_role_arn: execution_role_arn.clone(),
             task_role_arn: task_role_arn.clone(),
+            repository_credentials_secret_arn: repository_credentials_secret_arn.clone(),
             log_group: log_group.clone(),
             resource_prefix: resource_prefix.clone(),
             ssm_parameter_prefix: ssm_parameter_prefix.clone(),
@@ -1420,8 +1429,15 @@ impl AppState {
                     (backend, Some(docker), Some(reconciler_handle))
                 }
                 Some(ecs_settings @ DeploymentControllerSettings::Ecs { .. }) => {
+                    let ecr_account_id = match &settings.registry {
+                        Some(crate::server::settings::RegistrySettings::Ecr {
+                            account_id, ..
+                        }) => Some(account_id.as_str()),
+                        _ => None,
+                    };
                     let (backend, reconciler_handle) = init_ecs_backend(
                         ecs_settings,
+                        ecr_account_id,
                         registry_provider.clone(),
                         encryption_provider.clone(),
                         resource_store.clone(),
