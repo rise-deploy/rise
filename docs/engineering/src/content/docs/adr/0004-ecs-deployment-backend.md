@@ -24,10 +24,28 @@ the Docker backend's identity tuple therefore collapses here — the unit of sta
 is the service, keyed by the existing replica-free `spec_key` — and the
 rolling-throttle machinery is not needed at all.
 
+The operator surface (D14) has since shipped too, as **two** modules rather than
+the single `rise-aws` section this ADR sketched: `rise-aws` keeps IAM — gaining
+the ECS controller statements, the `iam:PassRole` scoping, the task execution
+role and an `ecs-tasks` trust on the controller role — and a new
+`modules/rise-ecs` carries D15's runtime topology. They are split because they
+have different lifetimes (`rise-aws` is account-global and already applied at
+existing installs; `rise-ecs` is per-environment) and because the split is what
+makes the dependency edge one-directional: `rise-aws` scopes by interpolating
+ARNs from names, never by referencing a resource in the other module.
+
+Implementation narrowed D14's permission list. The controller needs no `ec2`,
+`logs` or `servicediscovery` access — task IPs come from `DescribeTasks`
+attachment details, workload logs are written by the ECS agent under the
+execution role, and Cloud Map registration is part of the unimplemented D10 — so
+those grants are omitted rather than reserved, with tests asserting they stay
+out.
+
 Deliberately deferred, each **failing closed** with an actionable deploy-time
 error rather than half-working: workload identity (D8), Cloud Map
-cross-container discovery (D10), CloudWatch logs (D11), the Terraform module and
-ALB-native routing (D5, D14).
+cross-container discovery (D10), CloudWatch logs (D11), and ALB-*native* routing
+(D5) — distinct from the ALB+ACM *edge*, which `modules/rise-ecs` implements as
+a documented opt-in.
 
 This ADR records how Rise's public feature surface maps onto Amazon ECS and the
 surrounding AWS services. The design-gating facts it depended on — Cloud Map shared
@@ -448,15 +466,30 @@ The backend uses the standard AWS credential chain, so the Rise task's own **tas
 role** is the production path (no static keys), with explicit key settings for
 non-AWS-hosted control planes, matching how the ECR provider is configured today.
 
-`modules/rise-aws` gains an optional ECS section: cluster, execution role,
-per-workload task role, the Traefik service's role and security groups, Cloud Map
-namespace, SSM parameter path + KMS grants, CloudWatch log group policy, and the
-control-plane role statements the reconciler needs (`ecs:*` scoped to the
-cluster, `iam:PassRole` scoped to the execution/task roles, `ssm:PutParameter` on
-the Rise path, `servicediscovery:*` on the namespace). `iam:PassRole` scoping is
-the security-sensitive one: the reconciler must be able to pass only the roles
-Rise created, never an arbitrary role ARN, and the task-role ARN must not be
-operator-overridable per project without a corresponding policy condition.
+`modules/rise-aws` gains an optional ECS section, and a second module carries
+the infrastructure. The dividing line: **`rise-aws` owns every IAM identity Rise
+uses or passes, and every policy about a Rise-owned AWS resource; `rise-ecs`
+owns everything that runs.** So the control-plane policy, the `iam:PassRole`
+scoping and the task execution role live in `rise-aws`, while the cluster, Cloud
+Map namespace, log group, Traefik's own role and the security groups live in
+`rise-ecs`.
+
+The execution role is the case that fixes the boundary rather than merely
+following it: it has to appear verbatim in the `PassRole` statement, so a module
+that consumed its ARN from the module consuming `rise-aws`'s role ARNs would be
+a cycle Terraform cannot plan. `rise-aws` scopes everything by interpolating
+ARNs from *names*, which keeps that edge one-directional.
+
+`iam:PassRole` scoping is the security-sensitive one: the reconciler must be
+able to pass only the roles Rise created, never an arbitrary role ARN, and the
+task-role ARN must not be operator-overridable per project without a
+corresponding policy condition. It additionally carries an
+`iam:PassedToService` condition of `ecs-tasks.amazonaws.com`, so the grant
+cannot be redirected at another service.
+
+The controller role must also **trust `ecs-tasks.amazonaws.com`**: on ECS it is
+the task role Rise itself runs as, so without that trust the control-plane task
+cannot start at all.
 
 ### D15. Reference AWS topology (operator guidance, not backend logic)
 
@@ -473,8 +506,14 @@ For completeness, the recommended install shape this backend assumes:
 | Workload networking | private subnets, NAT or VPC endpoints for ECR/SSM/Logs |
 
 None of this is enforced by the backend — Rise's database configuration is
-runtime-agnostic — but it is what the Terraform module and operator docs will
-describe.
+runtime-agnostic — but it is what `modules/rise-ecs` provisions and the
+[Terraform page](/operator-docs/ecs/terraform/) describes.
+
+One caveat against the KMS row: `config/ecs.yaml` hardcodes
+`encryption.type: aes-gcm-256`, so the AWS KMS provider is not reachable from the
+shipped ECS config. `rise-aws`'s `enable_kms` covers ECR and the SSM
+SecureStrings, not Rise's application-level encryption. Making that row true
+needs `encryption.type` to become env-driven the way `registry.type` already is.
 
 ## Consequences
 

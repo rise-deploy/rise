@@ -31,6 +31,23 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Config change — Terraform modules for Amazon ECS**. A new
+  `modules/rise-ecs` provisions a working ECS install (VPC, cluster, Cloud Map,
+  RDS, Secrets Manager, NLB, Traefik and the Rise service), and
+  `modules/rise-aws` gains `enable_ecs` for the control-plane IAM it needs — the
+  task execution role, the scoped ECS statements, and `iam:PassRole` limited to
+  those two roles. Both the VPC and the cluster are optional, so it deploys into
+  infrastructure you already run. Purely additive: nothing changes for an
+  existing install that does not set `enable_ecs`. See
+  [Terraform](/operator-docs/ecs/terraform/).
+
+- **Action required if you pin the AWS provider below 5.0 —
+  `modules/rise-aws`**. Its `required_providers` constraint moves from
+  `>= 4.0` to `>= 5.0`. The module has used `aws_vpc_security_group_ingress_rule`
+  in its RDS section since that section was written, and the resource does not
+  exist before provider 5.0, so the old constraint only ever worked because
+  nothing pinned an older provider. If you pin 4.x, move to 5.x.
+
 - **No action required — generic resource labels**. Resources in the generic
   resource API carry `metadata.labels` alongside `metadata.annotations`. The
   migration adds a column with an empty default, so existing rows and clients

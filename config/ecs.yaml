@@ -74,8 +74,10 @@ deployment_controller:
 
   region: "${AWS_REGION:-eu-central-1}"
   cluster: "${RISE_ECS_CLUSTER}"
-  # Comma-separated lists are not supported by the YAML loader, so these are
-  # real sequences. At least one subnet is required.
+  # Scalars, not sequences: the settings loader accepts a YAML list or a
+  # comma-separated string, which is what lets these come straight from a
+  # Terraform output through one environment variable. At least one subnet is
+  # required.
   subnets: "${RISE_ECS_SUBNETS}"
   security_groups: "${RISE_ECS_SECURITY_GROUPS}"
   # Public subnets have no NAT gateway, and a Fargate task must reach ECR and

@@ -48,9 +48,14 @@ Two consequences are worth internalising before you operate it:
   signal with no fallback, so without it such a deployment never becomes
   Healthy.
 
-`tests/e2e/aws/ecs-stack.sh` stands up a complete working example of all of
-this — cluster, security group, IAM roles, Cloud Map namespace, Traefik,
-Postgres, Dex and Rise — and is the fastest way to see the wiring end to end.
+The [Terraform modules](/operator-docs/ecs/terraform/) provision all of it —
+against a cluster and VPC they create, or ones you already run — and refuse the
+configurations the backend rejects at startup. Start there.
+
+`tests/e2e/aws/ecs-stack.sh` stands up the same shape in bash and is the fastest
+way to *read* the wiring end to end, but it is a disposable test harness rather
+than a template: public subnets, secrets in plain environment variables, and a
+static-password Dex.
 
 ## IAM
 
@@ -69,15 +74,29 @@ there surfaces as a task that cannot start rather than as an API error.
 
 **Control-plane role** — the identity Rise runs as:
 
-- `ecs:*` on the cluster
-- `ec2:DescribeNetworkInterfaces` (task IPs, for readiness)
-- `logs:*` on the configured log group
-- `ssm:PutParameter` / `DeleteParameter(s)` / `GetParametersByPath` on
-  `/{ssm_parameter_prefix}/*`
-- `iam:PassRole` **scoped to exactly the execution and task roles above**
+- `ecs:CreateService` / `UpdateService` / `DeleteService` / `DescribeServices` /
+  `DescribeTasks` / `TagResource`, on the cluster's services and tasks
+- `ecs:DescribeClusters` (the startup connectivity check), `ecs:ListServices`
+  and `ecs:ListTasks`
+- `ecs:RegisterTaskDefinition` — the one action that supports neither
+  resource-level permissions nor the `ecs:cluster` condition key
+- `ssm:PutParameter` / `DeleteParameter(s)` / `GetParametersByPath` /
+  `AddTagsToResource` on `/{ssm_parameter_prefix}/*`, plus `kms` on the CMK if
+  the parameters use one
+- `iam:PassRole` **scoped to exactly the execution and task roles above**, with
+  an `iam:PassedToService` condition of `ecs-tasks.amazonaws.com`
 
 That last scoping matters: an unscoped `iam:PassRole` would let anyone who can
 create a Rise deployment run a task as any role in the account.
+
+The control plane needs **no** `ec2`, `logs` or `servicediscovery` access. Task
+addresses come from `DescribeTasks` attachment details rather than
+`DescribeNetworkInterfaces`, workload logs are written by the ECS agent under the
+execution role, and Cloud Map registration for workloads is not implemented.
+`modules/rise-aws` grants none of them.
+
+The control-plane role must also trust `ecs-tasks.amazonaws.com`: on ECS it *is*
+the task role Rise runs as, so without that trust the task cannot start.
 
 ## Container registry
 

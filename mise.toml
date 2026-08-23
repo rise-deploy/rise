@@ -127,11 +127,27 @@ cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
+mise terraform:check
 cargo test --package rise-authz --all-targets
 cargo test --package rise-backend-auth --all-targets
 cargo test --package rise-backend-core --all-targets
 """
 env.SQLX_OFFLINE = true
+
+[tasks."terraform:check"]
+description = "Format-check, validate and unit-test the Terraform modules."
+run = """
+terraform fmt -check -recursive modules/
+for dir in modules/*/; do
+  terraform -chdir="$dir" init -backend=false -input=false >/dev/null
+  terraform -chdir="$dir" validate
+  terraform -chdir="$dir" test
+done
+"""
+
+[tasks."terraform:fmt"]
+description = "Format the Terraform modules in place."
+run = "terraform fmt -recursive modules/"
 
 [tasks."helm:deps"]
 description = "Refresh vendored Helm chart dependencies under helm/rise/charts."
