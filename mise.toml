@@ -109,20 +109,13 @@ run = "cargo sqlx prepare --check -- --all-targets"
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
+# `cargo all-features` covers rise-deploy's feature combinations (cli, backend,
+# both); `--workspace` covers every crate and every test target. Neither alone
+# is enough: the first is package-scoped, the second only builds all-features.
 cargo all-features check --all-targets
-cargo check --package rise-authz --all-targets
-cargo check --package rise-resource-api --all-targets
-cargo check --package rise-resource-store-postgres --all-targets
-cargo check --package rise-backend-auth --all-targets
-cargo check --package rise-backend-core --all-targets
-cargo check --package rise-runtime-sync --all-targets
+cargo check --workspace --all-features --all-targets
 cargo all-features clippy --all-targets -- -D warnings
-cargo clippy --package rise-authz --all-targets -- -D warnings
-cargo clippy --package rise-resource-api --all-targets -- -D warnings
-cargo clippy --package rise-resource-store-postgres --all-targets -- -D warnings
-cargo clippy --package rise-backend-auth --all-targets -- -D warnings
-cargo clippy --package rise-backend-core --all-targets -- -D warnings
-cargo clippy --package rise-runtime-sync --all-targets -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
