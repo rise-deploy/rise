@@ -6,7 +6,7 @@
 //! `organization_resource_uid` or the `user_organization_memberships` join
 //! table). Those typed rows are not in `resource_store.resources`, so the
 //! store's generic child-detection cannot see them — calling
-//! `ResourceStore::delete` on an Organization UID directly would orphan
+//! `ResourceApi::delete` on an Organization UID directly would orphan
 //! every linked row. This module is the canonical entry point for code that
 //! needs to delete an Organization.
 
@@ -33,7 +33,7 @@ pub(crate) enum OrganizationDeleteError {
 
 /// Delete an Organization resource only after confirming no typed children
 /// reference it. The single canonical entry point — direct
-/// `ResourceStore::delete` calls on an Organization UID bypass this guard
+/// `ResourceApi::delete` calls on an Organization UID bypass this guard
 /// and will orphan rows in `user_organization_memberships`, `teams`, and
 /// `projects`.
 ///
