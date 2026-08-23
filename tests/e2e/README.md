@@ -31,6 +31,12 @@ RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
+# ECS backend (self-provisions the whole AWS-side stack — see "ECS Backend"
+# below for what the account and the caller need first).
+AWS_PROFILE=<sandbox> AWS_REGION=eu-central-1 \
+RISE_E2E_BACKEND=ecs RISE_IMAGE_TAG=<published-tag> \
+  cargo run --manifest-path tests/e2e/Cargo.toml
+
 # Local compose suite (no Rise backend; needs Docker and a rise CLI).
 RISE_E2E_SUITE=compose \
 RISE_BIN=./target/debug/rise \
@@ -52,13 +58,92 @@ cargo test --manifest-path tests/e2e/Cargo.toml
 Backend scenarios run in-order as one suite (they share the single backend
 bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
 
+## ECS Backend
+
+Unlike the other two backends this one runs against **real AWS** — LocalStack
+puts ECS behind a paid plan, Cloud Map behind its top one, and publishes task
+ports randomly enough that the Traefik ECS provider cannot discover them. There
+is setup to do once per account before the first run.
+
+### On the machine
+
+`aws` (v2), `jq`, `curl`, and a working **Docker daemon** — the harness extracts
+the `rise` CLI out of the image with `docker cp`, and the
+`registry-build-push-pull` scenario builds a fixture image locally and pushes it
+to ECR.
+
+Your public IP must be stable for the run: the security group admits ports 80
+and 8080 from `<your-ip>/32` only, resolved once at bring-up. A VPN that
+reconnects mid-run will look like a hung scenario.
+
+### In the account
+
+Use a **sandbox account**. The stack creates IAM roles that carry `ecs:*`, so
+the caller needs IAM write permissions; that is not a credential to hold in an
+account you care about.
+
+1. **A default VPC with at least one subnet** in the region. The script takes
+   `Vpcs[?is-default]` and the first subnet under it, and fails if there is
+   none — a region where the default VPC has been deleted needs one recreated
+   (`aws ec2 create-default-vpc`).
+2. **Fargate on-demand vCPU quota raised.** A fresh account gets **6**. The
+   control plane alone takes 1.5 (Traefik 0.25 + Postgres 0.5 + Dex 0.25 +
+   Rise 0.5), and every app task rounds up to 0.5 — with five scenarios leaving
+   their deployments running, a full suite peaks around 4 vCPU on top of that.
+   Ask for **16** (Service Quotas → Amazon ECS → *Fargate On-Demand vCPU
+   resource count*); at the default the later scenarios fail as tasks that never
+   leave `PROVISIONING`.
+3. **A published `RISE_IMAGE_TAG`.** ECS pulls the control-plane image from
+   GHCR, so a local build is not visible to it. Same constraint the Docker
+   driver already has.
+
+Nothing else is pre-created: cluster, security group, IAM roles (execution,
+task, and the ECR push role), Cloud Map namespace, log group and ECR
+repositories are all made at bring-up and removed on exit.
+
+### Caller permissions
+
+`ecs:*`, `ecr:*`, `ec2:*` (describe, plus security-group create/authorize/
+delete), `logs:*`, `servicediscovery:*`, `sts:GetCallerIdentity`, and on IAM:
+`CreateRole`, `DeleteRole`, `PutRolePolicy`, `DeleteRolePolicy`,
+`AttachRolePolicy`, `DetachRolePolicy`, `ListRolePolicies`,
+`ListAttachedRolePolicies`, `PassRole`.
+
+### Registry
+
+The stack runs with `registry: ecr` under a run-scoped repository prefix
+(`rise-e2e/`), so the suite exercises the real path: Rise provisions a
+repository per project, the CLI pushes with the STS-scoped credentials Rise
+mints, and the task execution role pulls. Repositories are deleted on teardown
+— including their images, which are otherwise billed.
+
+### Cost, and what teardown does not cover
+
+A run is a handful of 0.25–0.5 vCPU tasks for roughly 20 minutes, no load
+balancer and no NAT gateway: cents. Everything is tagged `rise-e2e` and torn
+down on exit, and `tests/e2e/aws/ecs-stack.sh down` is idempotent if a run is
+killed. **`KEEP=1` deliberately leaves the stack up** for inspection (the
+Traefik dashboard is on `:8080`) — that one you pay for until you tear it down.
+
+You can drive the AWS side on its own, without the harness:
+
+```bash
+AWS_PROFILE=<sandbox> AWS_REGION=eu-central-1 RISE_IMAGE_TAG=<tag> \
+  tests/e2e/aws/ecs-stack.sh up      # writes /tmp/rise-e2e-stack.env
+tests/e2e/aws/ecs-stack.sh down
+```
+
 ## Layout
 
 - `src/backend/` — the `Backend` driver seam. Both backends self-provision their
   own stack: `DockerBackend` via `docker compose` (CLI extraction via `docker cp`,
   Traefik reach); `MinikubeBackend` via `minikube start` + `helm upgrade --install`
   + the JFrog/Vault registry stack + background `kubectl port-forward`s (server,
-  Dex, per-app reach).
+  Dex, per-app reach); `EcsBackend` by shelling out to `aws/ecs-stack.sh`, which
+  runs Traefik, Postgres, Dex and Rise as ECS services in the cluster under test
+  (CLI extraction via `docker cp`, reach via Traefik's public IP and `nip.io`).
+- `aws/ecs-stack.sh` — the ECS backend's AWS-side bring-up and teardown. Also
+  runnable on its own; see "ECS Backend" above.
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
   `Scenario::applies_to(backend)` returns `Run` or `Skip(reason)`.
 - `src/compose.rs` — standalone `rise compose` suite. It runs the CLI directly

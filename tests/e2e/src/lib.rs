@@ -4,7 +4,8 @@
 //! run against either backend, so a parity gap shows up as a *declared skip*
 //! (printed with a reason) rather than silent drift.
 //!
-//! The harness is gated on the `RISE_E2E_BACKEND` env var (`docker` | `minikube`).
+//! The harness is gated on the `RISE_E2E_BACKEND` env var
+//! (`docker` | `minikube` | `ecs`).
 //! When it is unset, every test returns immediately, so the crate never tries to
 //! stand up a backend it wasn't asked to.
 
