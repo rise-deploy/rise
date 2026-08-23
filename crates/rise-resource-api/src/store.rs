@@ -229,14 +229,18 @@ pub struct CollectionInfo {
     pub allowed_status_controller_ids: Vec<String>,
 }
 
-/// Storage-neutral persistence contract for the generic resource API.
-/// The remotable half of the resource contract: every operation a client can
-/// issue as one HTTP request against one resource path.
+/// The remotable half of the resource contract (ADR-0004 §3): the operations a
+/// client outside the apiserver may depend on, and the only ones
+/// `rise-resource-client` will implement over HTTP.
 ///
-/// This is the surface `rise-resource-client` implements over HTTP and the
-/// only one components outside the apiserver may depend on (ADR-0004 §3). A
-/// caller that cannot be expressed here would not survive the process split,
-/// so requiring it here turns that into a compile-time check.
+/// These take UIDs and typed parameters, not paths. Path addressing belongs to
+/// the HTTP layer: the apiserver resolves `/api/v1/resources/{*path}` to a
+/// resource with [`ResourceStore::resolve_path`] — an internal primitive a
+/// remote client never calls — and then invokes one of these. So each method
+/// here backs one request, without itself being path-shaped.
+///
+/// A caller that cannot be expressed on this surface would not survive the
+/// process split, which is what makes requiring it a compile-time check.
 #[async_trait::async_trait]
 pub trait ResourceApi: Send + Sync {
     async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError>;

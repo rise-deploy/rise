@@ -1742,9 +1742,12 @@ async fn delete_resource(
 
     // Organization deletes route through the canonical guard so the typed
     // soft-links (users via `user_organization_memberships`, teams, projects)
-    // are never orphaned. See `super::organization` module docs. Both halves run
-    // on this request's transaction, so a typed insert racing the count cannot
-    // slip between the check and the delete.
+    // are not orphaned. See `super::organization` module docs. Both halves run
+    // on this request's transaction, so the count and the delete see one
+    // consistent snapshot — but that is not mutual exclusion against the typed
+    // writers, which run at `READ COMMITTED`. A typed insert committing after
+    // this snapshot is invisible to the count and still orphans its row; see
+    // the TODO(multi-org) in that module.
     let outcome = if row.kind == rise_resource_api::ORGANIZATION_KIND {
         use super::organization::{delete_organization_guarded, OrganizationDeleteError};
         match delete_organization_guarded(authz.store().as_ref(), authz.session(), row.uid).await {

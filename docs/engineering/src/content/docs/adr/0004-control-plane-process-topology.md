@@ -233,7 +233,7 @@ ever be issued by a remote client.
 | Method | Why it stays in |
 |---|---|
 | `try_collect`, `list_pending_collection` | GC worker internals over tombstoned rows |
-| `resolve_path`, `ancestors`, `label_inheriting_descendants` | Path, ancestry and label-subtree primitives feeding admission and ADR-0001 §6.6's write gate |
+| `resolve_path`, `ancestors`, `label_inheriting_descendants` | Path, ancestry and label-subtree primitives feeding admission and ADR-0001 §6.6's write gate. `resolve_path` is also how the HTTP layer turns a request path into the UID a `ResourceApi` call takes — the reason clients address resources by path while the trait takes UIDs |
 | `resolve_collection`, `resolve_collection_version`, `resolve_collection_by_kind` | Registry lookups behind every request |
 | `register_resource_definition`, `update_resource_definition` | The atomic storage projection behind ordinary `ResourceDefinition` writes |
 | `list_deletion_blockers` | Implementation of a served subresource (`handlers.rs:772`) — the route is remotable, the primitive is not |
