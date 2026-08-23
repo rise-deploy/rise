@@ -19,7 +19,7 @@ use rise_authz::engine::{
 };
 use rise_resource_api::{
     CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlockerReport, NoOpValidator,
-    PathSegment, ResourceParentRef, ResourceRow, ResourceStore, StoreError, SubjectId,
+    PathSegment, ResourceApi, ResourceParentRef, ResourceRow, ResourceStore, StoreError, SubjectId,
     UpdateResourceParams, API_VERSION_V1ALPHA1,
 };
 use uuid::Uuid;
@@ -190,7 +190,7 @@ impl FakeStore {
 }
 
 #[async_trait::async_trait]
-impl ResourceStore for FakeStore {
+impl ResourceApi for FakeStore {
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
         Ok(self.find(uid).cloned())
     }
@@ -225,6 +225,44 @@ impl ResourceStore for FakeStore {
             .collect())
     }
 
+    async fn create(&self, _: CreateResourceParams) -> Result<ResourceRow, StoreError> {
+        unimplemented!("authorization never writes")
+    }
+    async fn list_versions(
+        &self,
+        _: &[String],
+        _: &str,
+        _: Option<Uuid>,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        unimplemented!("unused by the engine")
+    }
+    async fn update(&self, _: Uuid, _: UpdateResourceParams) -> Result<ResourceRow, StoreError> {
+        unimplemented!("authorization never writes")
+    }
+    async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
+        unimplemented!("authorization never writes")
+    }
+    async fn update_controller_status(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError> {
+        unimplemented!("authorization never writes")
+    }
+    async fn update_controller_finalizers(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: &[String],
+        _: &[String],
+    ) -> Result<ResourceRow, StoreError> {
+        unimplemented!("authorization never writes")
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceStore for FakeStore {
     async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
         let mut chain = Vec::new();
         let mut cursor = Some(uid);
@@ -264,24 +302,6 @@ impl ResourceStore for FakeStore {
         }
         Ok(descendants)
     }
-
-    async fn create(&self, _: CreateResourceParams) -> Result<ResourceRow, StoreError> {
-        unimplemented!("authorization never writes")
-    }
-    async fn list_versions(
-        &self,
-        _: &[String],
-        _: &str,
-        _: Option<Uuid>,
-    ) -> Result<Vec<ResourceRow>, StoreError> {
-        unimplemented!("unused by the engine")
-    }
-    async fn update(&self, _: Uuid, _: UpdateResourceParams) -> Result<ResourceRow, StoreError> {
-        unimplemented!("authorization never writes")
-    }
-    async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
-        unimplemented!("authorization never writes")
-    }
     async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         unimplemented!("authorization never writes")
     }
@@ -293,23 +313,6 @@ impl ResourceStore for FakeStore {
     }
     async fn resolve_path(&self, _: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
         unimplemented!("unused by the engine")
-    }
-    async fn update_controller_status(
-        &self,
-        _: Uuid,
-        _: &str,
-        _: serde_json::Value,
-    ) -> Result<ResourceRow, StoreError> {
-        unimplemented!("authorization never writes")
-    }
-    async fn update_controller_finalizers(
-        &self,
-        _: Uuid,
-        _: &str,
-        _: &[String],
-        _: &[String],
-    ) -> Result<ResourceRow, StoreError> {
-        unimplemented!("authorization never writes")
     }
     async fn operator_update_status(
         &self,

@@ -67,6 +67,13 @@ enabled by custom kinds. Product handlers such as `deployment-logs` are
 registered only for compatible built-in kinds unless a later ADR deliberately
 opens that boundary.
 
+[ADR-0004](./0004-control-plane-process-topology.md) §4 opens it for one case:
+once the resource API runs in its own process, a platform-known forwarding
+strategy may terminate at a registered `Controller` rather than in local code,
+because handlers such as `deployment-logs` need runtime credentials the control
+plane must not hold. The registry stays code-backed and no `ResourceDefinition`
+may name an endpoint; operator-defined remote handlers remain unsupported.
+
 ### 2. One shared request pipeline surrounds every handler
 
 The generic resource API owns this sequence:

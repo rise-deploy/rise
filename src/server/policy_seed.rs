@@ -21,14 +21,12 @@
 //! Seeding is idempotent, and safe to run on every startup: a present row of the
 //! right identity is left exactly as it is.
 
-use std::sync::Arc;
-
 use anyhow::{anyhow, bail, Context, Result};
 use rise_resource_api::{org_admin_role_spec, StoreError};
 use rise_resource_api::{
     resource_owner_binding_spec, resource_owner_role_spec, system_admin_binding_spec,
-    system_admin_role_spec, CreateResourceParams, PlatformRoleBindingSpec, ResourceRow,
-    ResourceStore, RoleSpec, API_VERSION_V1ALPHA1, ORG_ADMIN_PLATFORM_ROLE,
+    system_admin_role_spec, CreateResourceParams, PlatformRoleBindingSpec, ResourceApi,
+    ResourceRow, RoleSpec, API_VERSION_V1ALPHA1, ORG_ADMIN_PLATFORM_ROLE,
     PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, RESOURCE_OWNER_PLATFORM_ROLE,
     SYSTEM_ADMIN_PLATFORM_ROLE,
 };
@@ -56,7 +54,7 @@ struct Seed {
 ///
 /// Returns the number of rows created, which is zero on every boot after the
 /// first unless an operator has deleted an editable default.
-pub async fn run(store: &Arc<dyn ResourceStore>) -> Result<u64> {
+pub async fn run(store: &dyn ResourceApi) -> Result<u64> {
     let mut created = 0;
     for seed in seeds()? {
         if apply(store, &seed).await? {
@@ -130,7 +128,7 @@ fn binding_seed(name: &'static str, reseed: Reseed, spec: PlatformRoleBindingSpe
 }
 
 /// Apply one seed. Returns whether a row was created.
-async fn apply(store: &Arc<dyn ResourceStore>, seed: &Seed) -> Result<bool> {
+async fn apply(store: &dyn ResourceApi, seed: &Seed) -> Result<bool> {
     if let Some(existing) = find(store, seed).await? {
         verify(seed, &existing)?;
         return Ok(false);
@@ -170,7 +168,7 @@ async fn apply(store: &Arc<dyn ResourceStore>, seed: &Seed) -> Result<bool> {
     }
 }
 
-async fn find(store: &Arc<dyn ResourceStore>, seed: &Seed) -> Result<Option<ResourceRow>> {
+async fn find(store: &dyn ResourceApi, seed: &Seed) -> Result<Option<ResourceRow>> {
     store
         .get_by_name(API_VERSION_V1ALPHA1, seed.kind, seed.name, None)
         .await

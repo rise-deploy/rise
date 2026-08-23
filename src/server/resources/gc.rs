@@ -436,7 +436,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use rise_resource_api::{
-        CollectionInfo, CreateResourceParams, PathSegment, StoreError, UpdateResourceParams,
+        CollectionInfo, CreateResourceParams, PathSegment, ResourceApi, StoreError,
+        UpdateResourceParams,
     };
     use rise_resource_api::{API_VERSION_V1ALPHA1, ORGANIZATION_KIND, RESOURCE_DEFINITION_KIND};
     use rise_resource_store_postgres::PgResourceStore;
@@ -920,27 +921,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl ResourceStore for FailingStore {
+    impl ResourceApi for FailingStore {
         async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
             self.inner.create(params).await
         }
 
         async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
             self.inner.get(uid).await
-        }
-
-        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
-            self.inner.ancestors(uid).await
-        }
-
-        async fn label_inheriting_descendants(
-            &self,
-            uid: Uuid,
-            label_key: &str,
-        ) -> Result<Vec<ResourceRow>, StoreError> {
-            self.inner
-                .label_inheriting_descendants(uid, label_key)
-                .await
         }
 
         async fn get_by_name(
@@ -987,6 +974,46 @@ mod tests {
             self.inner.delete(uid).await
         }
 
+        async fn update_controller_status(
+            &self,
+            uid: Uuid,
+            controller_id: &str,
+            status_value: serde_json::Value,
+        ) -> Result<ResourceRow, StoreError> {
+            self.inner
+                .update_controller_status(uid, controller_id, status_value)
+                .await
+        }
+
+        async fn update_controller_finalizers(
+            &self,
+            uid: Uuid,
+            controller_id: &str,
+            add: &[String],
+            remove: &[String],
+        ) -> Result<ResourceRow, StoreError> {
+            self.inner
+                .update_controller_finalizers(uid, controller_id, add, remove)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceStore for FailingStore {
+        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner.ancestors(uid).await
+        }
+
+        async fn label_inheriting_descendants(
+            &self,
+            uid: Uuid,
+            label_key: &str,
+        ) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner
+                .label_inheriting_descendants(uid, label_key)
+                .await
+        }
+
         async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             if uid == self.fail_for {
                 return Err(StoreError::Validation("injected".to_string()));
@@ -1013,29 +1040,6 @@ mod tests {
             segments: &[PathSegment],
         ) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.resolve_path(segments).await
-        }
-
-        async fn update_controller_status(
-            &self,
-            uid: Uuid,
-            controller_id: &str,
-            status_value: serde_json::Value,
-        ) -> Result<ResourceRow, StoreError> {
-            self.inner
-                .update_controller_status(uid, controller_id, status_value)
-                .await
-        }
-
-        async fn update_controller_finalizers(
-            &self,
-            uid: Uuid,
-            controller_id: &str,
-            add: &[String],
-            remove: &[String],
-        ) -> Result<ResourceRow, StoreError> {
-            self.inner
-                .update_controller_finalizers(uid, controller_id, add, remove)
-                .await
         }
 
         async fn operator_update_status(
@@ -1113,27 +1117,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl ResourceStore for NotFoundStore {
+    impl ResourceApi for NotFoundStore {
         async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError> {
             self.inner.create(params).await
         }
 
         async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError> {
             self.inner.get(uid).await
-        }
-
-        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
-            self.inner.ancestors(uid).await
-        }
-
-        async fn label_inheriting_descendants(
-            &self,
-            uid: Uuid,
-            label_key: &str,
-        ) -> Result<Vec<ResourceRow>, StoreError> {
-            self.inner
-                .label_inheriting_descendants(uid, label_key)
-                .await
         }
 
         async fn get_by_name(
@@ -1180,6 +1170,46 @@ mod tests {
             self.inner.delete(uid).await
         }
 
+        async fn update_controller_status(
+            &self,
+            uid: Uuid,
+            controller_id: &str,
+            status_value: serde_json::Value,
+        ) -> Result<ResourceRow, StoreError> {
+            self.inner
+                .update_controller_status(uid, controller_id, status_value)
+                .await
+        }
+
+        async fn update_controller_finalizers(
+            &self,
+            uid: Uuid,
+            controller_id: &str,
+            add: &[String],
+            remove: &[String],
+        ) -> Result<ResourceRow, StoreError> {
+            self.inner
+                .update_controller_finalizers(uid, controller_id, add, remove)
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceStore for NotFoundStore {
+        async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner.ancestors(uid).await
+        }
+
+        async fn label_inheriting_descendants(
+            &self,
+            uid: Uuid,
+            label_key: &str,
+        ) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner
+                .label_inheriting_descendants(uid, label_key)
+                .await
+        }
+
         async fn try_collect(&self, _uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             Err(StoreError::NotFound)
         }
@@ -1203,29 +1233,6 @@ mod tests {
             segments: &[PathSegment],
         ) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.resolve_path(segments).await
-        }
-
-        async fn update_controller_status(
-            &self,
-            uid: Uuid,
-            controller_id: &str,
-            status_value: serde_json::Value,
-        ) -> Result<ResourceRow, StoreError> {
-            self.inner
-                .update_controller_status(uid, controller_id, status_value)
-                .await
-        }
-
-        async fn update_controller_finalizers(
-            &self,
-            uid: Uuid,
-            controller_id: &str,
-            add: &[String],
-            remove: &[String],
-        ) -> Result<ResourceRow, StoreError> {
-            self.inner
-                .update_controller_finalizers(uid, controller_id, add, remove)
-                .await
         }
 
         async fn operator_update_status(

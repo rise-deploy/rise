@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rise_resource_api::{
-    CreateResourceParams, OrganizationSpec, ResourceRow, ResourceStore, UpdateResourceParams,
+    CreateResourceParams, OrganizationSpec, ResourceApi, ResourceRow, UpdateResourceParams,
     API_VERSION_V1ALPHA1, ORGANIZATION_KIND,
 };
 use rise_resource_store_postgres::OrganizationValidator;
@@ -77,7 +77,7 @@ pub struct BootstrapOutcome {
 /// pass) that every existing typed row is linked.
 pub async fn run(
     pool: &PgPool,
-    store: &Arc<dyn ResourceStore>,
+    store: &dyn ResourceApi,
     settings: &Settings,
 ) -> Result<BootstrapOutcome> {
     info!("Running default-Organization bootstrap");
@@ -93,7 +93,7 @@ pub async fn run(
 
 async fn run_inner(
     pool: &PgPool,
-    store: &Arc<dyn ResourceStore>,
+    store: &dyn ResourceApi,
     settings: &Settings,
 ) -> Result<BootstrapOutcome> {
     let default_org = &settings.default_organization;
@@ -195,7 +195,7 @@ fn controller_class_name_for_bootstrap(settings: &Settings) -> Option<&str> {
 /// fails rather than renaming an existing resource or guessing which one is
 /// the default.
 async fn upsert_default_organization(
-    store: &Arc<dyn ResourceStore>,
+    store: &dyn ResourceApi,
     default_org: &DefaultOrganizationSettings,
     controller_class_name: Option<&str>,
 ) -> Result<ResourceRow> {
@@ -288,7 +288,7 @@ async fn upsert_default_organization(
 ///   are immutable and bootstrap neither renames an existing Organization nor
 ///   creates a second candidate default.
 async fn find_default_organization(
-    store: &Arc<dyn ResourceStore>,
+    store: &dyn ResourceApi,
     configured_name: &str,
 ) -> Result<Option<ResourceRow>> {
     let existing = store
@@ -416,7 +416,7 @@ pub fn resolve_namespace_prefix(
 /// resource is absent (controllers should fail startup in that case).
 #[allow(dead_code)]
 pub async fn load_default_organization_view(
-    store: &Arc<dyn ResourceStore>,
+    store: &dyn ResourceApi,
     default_org: &DefaultOrganizationSettings,
 ) -> Result<Option<DefaultOrganizationView>> {
     let row = store
@@ -465,6 +465,7 @@ async fn validate_linkage(pool: &PgPool, organization_uid: uuid::Uuid) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rise_resource_api::ResourceStore;
 
     #[test]
     fn merge_annotations_overrides_collisions() {
@@ -586,7 +587,9 @@ mod tests {
 
         // 1. First run: creates the default Organization. No typed rows
         //    exist yet, so all backfill counts are zero.
-        let first = run(&pool, &store, &settings).await.expect("first run");
+        let first = run(&pool, store.as_ref(), &settings)
+            .await
+            .expect("first run");
         assert_eq!(first.memberships_backfilled, 0);
         assert_eq!(first.teams_backfilled, 0);
         assert_eq!(first.projects_backfilled, 0);
@@ -630,7 +633,9 @@ mod tests {
 
         // 3. Second run: backfill picks up the seed rows. The Organization
         //    UID must match the first run — no new Org is minted.
-        let second = run(&pool, &store, &settings).await.expect("second run");
+        let second = run(&pool, store.as_ref(), &settings)
+            .await
+            .expect("second run");
         assert_eq!(
             first.default_organization_uid,
             second.default_organization_uid
@@ -649,7 +654,9 @@ mod tests {
         assert_eq!(team_org, Some(second.default_organization_uid));
 
         // 4. Third run: nothing left to backfill, validation still passes.
-        let third = run(&pool, &store, &settings).await.expect("third run");
+        let third = run(&pool, store.as_ref(), &settings)
+            .await
+            .expect("third run");
         assert_eq!(
             third.default_organization_uid,
             second.default_organization_uid
@@ -672,12 +679,16 @@ mod tests {
         );
 
         // First boot mints the Org under the configured name.
-        let first = run(&pool, &store, &test_settings_with_org_name("default"))
-            .await
-            .expect("first run");
+        let first = run(
+            &pool,
+            store.as_ref(),
+            &test_settings_with_org_name("default"),
+        )
+        .await
+        .expect("first run");
 
         // Second boot with a different configured name must fail closed.
-        let error = run(&pool, &store, &test_settings_with_org_name("acme"))
+        let error = run(&pool, store.as_ref(), &test_settings_with_org_name("acme"))
             .await
             .expect_err("bootstrap must reject a nonmatching existing Organization");
         let message = format!("{error:#}");
@@ -711,9 +722,13 @@ mod tests {
         );
 
         // First boot mints the Org under the configured name.
-        let first = run(&pool, &store, &test_settings_with_org_name("default"))
-            .await
-            .expect("first run");
+        let first = run(
+            &pool,
+            store.as_ref(),
+            &test_settings_with_org_name("default"),
+        )
+        .await
+        .expect("first run");
         let uid = first.default_organization_uid;
 
         // Stamp an unrelated operator annotation directly on the row, mirroring
@@ -743,9 +758,13 @@ mod tests {
             .expect("stamp custom annotation");
 
         // A subsequent exact-name bootstrap reuses the same row.
-        let upserted = run(&pool, &store, &test_settings_with_org_name("default"))
-            .await
-            .expect("second exact-name run");
+        let upserted = run(
+            &pool,
+            store.as_ref(),
+            &test_settings_with_org_name("default"),
+        )
+        .await
+        .expect("second exact-name run");
         assert_eq!(
             upserted.default_organization_uid, uid,
             "exact-name upsert must preserve the Organization UID"
@@ -780,9 +799,13 @@ mod tests {
         );
 
         // Mint the first Org via bootstrap.
-        run(&pool, &store, &test_settings_with_org_name("default"))
-            .await
-            .expect("first run");
+        run(
+            &pool,
+            store.as_ref(),
+            &test_settings_with_org_name("default"),
+        )
+        .await
+        .expect("first run");
 
         // Mint a second Org directly through the store.
         store
@@ -802,9 +825,13 @@ mod tests {
             .expect("create second org");
 
         // Bootstrap with a configured name matching neither must error.
-        let err = run(&pool, &store, &test_settings_with_org_name("renamed"))
-            .await
-            .expect_err("bootstrap should refuse to guess");
+        let err = run(
+            &pool,
+            store.as_ref(),
+            &test_settings_with_org_name("renamed"),
+        )
+        .await
+        .expect_err("bootstrap should refuse to guess");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("Found 2 existing Organizations"),

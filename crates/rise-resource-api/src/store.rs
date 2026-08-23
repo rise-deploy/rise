@@ -229,9 +229,20 @@ pub struct CollectionInfo {
     pub allowed_status_controller_ids: Vec<String>,
 }
 
-/// Storage-neutral persistence contract for the generic resource API.
+/// The remotable half of the resource contract (ADR-0004 §3): the operations a
+/// client outside the apiserver may depend on, and the only ones
+/// `rise-resource-client` will implement over HTTP.
+///
+/// These take UIDs and typed parameters, not paths. Path addressing belongs to
+/// the HTTP layer: the apiserver resolves `/api/v1/resources/{*path}` to a
+/// resource with [`ResourceStore::resolve_path`] — an internal primitive a
+/// remote client never calls — and then invokes one of these. So each method
+/// here backs one request, without itself being path-shaped.
+///
+/// A caller that cannot be expressed on this surface would not survive the
+/// process split, which is what makes requiring it a compile-time check.
 #[async_trait::async_trait]
-pub trait ResourceStore: Send + Sync {
+pub trait ResourceApi: Send + Sync {
     async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError>;
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError>;
     /// Look up by name, matching the API group rather than the exact version so
@@ -273,6 +284,35 @@ pub trait ResourceStore: Send + Sync {
     /// retain the owner. A resource without blocking dependents or finalizers is
     /// deleted immediately.
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
+    /// Merge one allowed controller's value under `status.controllers`.
+    async fn update_controller_status(
+        &self,
+        uid: Uuid,
+        controller_id: &str,
+        status_value: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError>;
+    /// Atomically add/remove finalizers owned by an allowed controller while
+    /// rejecting the reserved system namespace and other controllers' keys.
+    async fn update_controller_finalizers(
+        &self,
+        uid: Uuid,
+        controller_id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<ResourceRow, StoreError>;
+}
+
+/// The apiserver-internal half: the machinery behind serving [`ResourceApi`],
+/// which no remote client ever names (ADR-0004 §3).
+///
+/// Garbage collection, path and ancestor resolution feeding admission and
+/// authorization, registry lookups, and the atomic `ResourceDefinition`
+/// storage projection. Two entries back routes that *are* served —
+/// `list_deletion_blockers` and the `operator_update_*` pair — but only as
+/// their implementation; the routes themselves belong to [`ResourceApi`] or
+/// converge onto it under RBAC.
+#[async_trait::async_trait]
+pub trait ResourceStore: ResourceApi {
     /// Idempotent garbage-collection sweep for one resource.
     ///
     /// A live row is returned unchanged as `MarkedForDeletion`. A tombstoned
@@ -319,22 +359,6 @@ pub trait ResourceStore: Send + Sync {
         uid: Uuid,
         label_key: &str,
     ) -> Result<Vec<ResourceRow>, StoreError>;
-    /// Merge one allowed controller's value under `status.controllers`.
-    async fn update_controller_status(
-        &self,
-        uid: Uuid,
-        controller_id: &str,
-        status_value: serde_json::Value,
-    ) -> Result<ResourceRow, StoreError>;
-    /// Atomically add/remove finalizers owned by an allowed controller while
-    /// rejecting the reserved system namespace and other controllers' keys.
-    async fn update_controller_finalizers(
-        &self,
-        uid: Uuid,
-        controller_id: &str,
-        add: &[String],
-        remove: &[String],
-    ) -> Result<ResourceRow, StoreError>;
     /// Force-update status as an operator, storing the value under
     /// `status.controllers.operator:<operator>`.
     async fn operator_update_status(

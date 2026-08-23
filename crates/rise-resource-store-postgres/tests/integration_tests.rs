@@ -1,6 +1,6 @@
 use rise_resource_api::{
     CreateResourceParams, DeleteOutcome, ExternalSubject, Issuer, NoOpValidator, OwnerReference,
-    PathSegment, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
+    PathSegment, ResourceApi, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
     API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, CONTROLLER_KIND,
     CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND, GROUP_MEMBERSHIP_KIND, IDENTITY_KIND_DEFINITIONS,
     ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, POLICY_KIND_DEFINITIONS,

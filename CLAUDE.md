@@ -348,11 +348,13 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 
 **MANDATORY**: You MUST run `cargo fmt --all` before every commit. Always. No exceptions. CI will reject unformatted code. Run it, stage any formatting changes, then commit. If you touched `tests/e2e`, that crate is a **separate workspace** — `--all` does not reach it, so also run `cargo fmt --manifest-path tests/e2e/Cargo.toml`.
 
-**Always run** (fast, catches most issues):
+**Always run** (fast, catches most issues). Note the `--workspace`: without it
+Cargo checks only the root package, so a change that breaks a support crate's
+*test* targets compiles clean here and fails in CI.
 
 ```bash
 cargo fmt --all                # Format code — MUST run before every commit
-cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached build artifacts)
+cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (uses cached build artifacts)
 ```
 
 **Run selectively** based on what changed:
@@ -382,13 +384,16 @@ cargo audit                         # Dependency advisories
 cargo test --workspace --all-features  # Unit tests (all workspace crates)
 ```
 
-`mise run lint` runs, in order: `cargo all-features check --all-targets`; a
-per-crate `cargo check` for `rise-authz`, `rise-resource-api`,
-`rise-resource-store-postgres`, `rise-backend-auth`, `rise-backend-core`, and
-`rise-runtime-sync`; `cargo all-features clippy -- -D warnings` plus the same
-per-crate clippy sweep; `cargo fmt --all -- --check`; `mise sqlx:check`;
-`mise resource:schema:check`; `helm lint helm/rise`; and `cargo test` for
-`rise-authz`, `rise-backend-auth`, and `rise-backend-core`. It does **not** cover
+`mise run lint` runs, in order: `cargo all-features check --all-targets` and
+`cargo all-features clippy -- -D warnings`, which cover `rise-deploy`'s feature
+combinations — `cli` and `cli,backend`, since `always_include_features` pins
+`cli` on; the same two workspace-wide
+(`--workspace --all-features --all-targets`), which cover every support crate
+and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`;
+`mise resource:schema:check`; `helm lint helm/rise`; and a workspace `cargo
+test` excluding the three crates that need Postgres (`rise-deploy`,
+`rise-resource-store-postgres`, `rise-runtime-sync`) — so every other crate's
+tests run, and a new crate is covered without editing the list. It does **not** cover
 `config:schema:check`, `rise-toml:schema:check`, `crd:check`, `cargo audit`, or
 `tests/e2e` — CI does, so run those separately.
 
