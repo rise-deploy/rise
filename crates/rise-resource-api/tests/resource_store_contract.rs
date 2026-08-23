@@ -159,6 +159,15 @@ async fn separate_consumer_can_implement_and_type_erase_the_api_store_contract()
         store.resolve_path(&[]).await,
         Err(StoreError::EmptyPath)
     ));
+
+    // The split (ADR-0004 §3) is only usable because a wide handle narrows to
+    // the remotable one without re-wrapping: production upcasts both by value
+    // and by reference. Pin both here, since losing either would break every
+    // caller held to `ResourceApi` and nothing else in this file would notice.
+    let api: Arc<dyn ResourceApi> = store.clone();
+    assert!(api.get(Uuid::nil()).await.unwrap().is_none());
+    let api_ref: &dyn ResourceApi = store.as_ref();
+    assert!(api_ref.get(Uuid::nil()).await.unwrap().is_none());
 }
 
 #[test]

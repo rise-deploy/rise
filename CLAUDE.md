@@ -386,7 +386,8 @@ cargo test --workspace --all-features  # Unit tests (all workspace crates)
 
 `mise run lint` runs, in order: `cargo all-features check --all-targets` and
 `cargo all-features clippy -- -D warnings`, which cover `rise-deploy`'s feature
-combinations (`cli`, `backend`, both); the same two workspace-wide
+combinations — `cli` and `cli,backend`, since `always_include_features` pins
+`cli` on; the same two workspace-wide
 (`--workspace --all-features --all-targets`), which cover every support crate
 and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`;
 `mise resource:schema:check`; `helm lint helm/rise`; and a workspace `cargo

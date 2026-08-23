@@ -362,7 +362,7 @@ async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceApi>,
     jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
