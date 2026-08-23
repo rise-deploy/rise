@@ -45,6 +45,128 @@ pub const POLICY_KIND_DEFINITIONS: [BuiltInKindDefinition; 4] = [
     },
 ];
 
+/// The `PlatformRole` whose authority the evaluator guarantees operators
+/// unconditionally, seeded together with its `system:operators` binding.
+///
+/// Both are immutable through the resource API (ADR-0001 §5): the guarantee has
+/// to survive a bad restore or a direct database write, so it is hardcoded in the
+/// evaluator and these rows exist to make the same fact inspectable, never to be
+/// the source of it.
+pub const SYSTEM_ADMIN_PLATFORM_ROLE: &str = "system-admin";
+/// The shipped `PlatformRole` ADR-0001 §6.2's ownership binding delivers.
+/// Operator-editable: changing it changes what ownership means platform-wide.
+pub const RESOURCE_OWNER_PLATFORM_ROLE: &str = "resource-owner";
+/// The shipped `PlatformRole` whose exact org-root binding confers org-admin
+/// standing (ADR-0001 §5). Operator-editable: changing it changes the global
+/// admin baseline for every organization, but never *who* is an admin.
+pub const ORG_ADMIN_PLATFORM_ROLE: &str = "org-admin";
+/// The reserved attribution label key (ADR-0001 §6.1). It carries no
+/// authorization semantics of its own; the seeded ownership binding's
+/// `labelSelector` is what makes it access-relevant.
+pub const OWNER_LABEL_KEY: &str = "rise.dev/owner";
+/// The virtual subject reserved for the seeded bootstrap binding.
+pub const OPERATORS_SUBJECT: &str = "system:operators";
+
+/// The root-parented policy rows that must not be edited or deleted through the
+/// resource API, as `(kind, name)` pairs.
+pub const IMMUTABLE_POLICY_SEEDS: [(&str, &str); 2] = [
+    (PLATFORM_ROLE_KIND, SYSTEM_ADMIN_PLATFORM_ROLE),
+    (PLATFORM_ROLE_BINDING_KIND, SYSTEM_ADMIN_PLATFORM_ROLE),
+];
+
+/// Whether a root-parented policy row is one of the immutable seeds.
+///
+/// Placement is part of the identity: only the root rows are reserved, so an
+/// organization's own `Role` named `system-admin` is ordinary data. So is the
+/// API group — the seeds are shipped under [`API_VERSION_V1ALPHA1`], and a
+/// custom kind registered under another group is not made reserved by borrowing
+/// the name. The cascade's SQL exemption pins the same three fields; they have
+/// to agree, or a row one of them treats as a seed is collectable through the
+/// other.
+pub fn is_immutable_policy_seed(api_version: &str, kind: &str, name: &str) -> bool {
+    api_version == API_VERSION_V1ALPHA1
+        && IMMUTABLE_POLICY_SEEDS
+            .iter()
+            .any(|(seed_kind, seed_name)| *seed_kind == kind && *seed_name == name)
+}
+
+/// Build a shipped default from its literal declaration.
+///
+/// The seeds are written as the JSON an operator would see, then parsed through
+/// the same closed contract every caller uses. That keeps the shipped policy and
+/// the accepted grammar from drifting: a default that no longer parses fails
+/// here, at startup, rather than becoming a row nothing can read back.
+fn shipped<T: for<'de> Deserialize<'de>>(value: serde_json::Value) -> T {
+    serde_json::from_value(value).expect("shipped policy default parses")
+}
+
+/// `{ Allow: * on * }`, main resources and subresources alike.
+///
+/// Two statements, because `kinds: "*"` covers the main resource only: a Role
+/// that needs both writes both (ADR-0001 §3).
+fn allow_everything() -> serde_json::Value {
+    serde_json::json!([
+        { "effect": "Allow", "kinds": "*", "verbs": "*" },
+        { "effect": "Allow", "kinds": "*", "verbs": "*", "subresources": "*" }
+    ])
+}
+
+/// `PlatformRole/system-admin` — the complete permission, immutable.
+pub fn system_admin_role_spec() -> RoleSpec {
+    shipped(serde_json::json!({ "statements": allow_everything() }))
+}
+
+/// `PlatformRole/org-admin` — the shipped global admin baseline (ADR-0001 §5).
+///
+/// Allow-only as shipped, but an ordinary Role body: an operator may edit it, and
+/// a Deny added here is org-tier when delivered through a qualifying org binding
+/// and is therefore ignored by the very admin it establishes. Per-org and
+/// instance-wide admin ceilings are operator-authored platform Denies instead.
+pub fn org_admin_role_spec() -> RoleSpec {
+    shipped(serde_json::json!({ "statements": allow_everything() }))
+}
+
+/// `PlatformRole/resource-owner` — ADR-0001 §6.2's shipped ownership role.
+///
+/// Deliberately excludes `create` and every subresource: ownership alone never
+/// grants the ability to update `/status` or `/finalizers`, mint a token for an
+/// owned ServiceAccount, or create child resources.
+pub fn resource_owner_role_spec() -> RoleSpec {
+    shipped(serde_json::json!({
+        "statements": [{
+            "effect": "Allow",
+            "kinds": "*",
+            "verbs": ["get", "list", "update", "delete"]
+        }]
+    }))
+}
+
+/// The seeded `system:operators` → `system-admin` binding, immutable.
+pub fn system_admin_binding_spec() -> PlatformRoleBindingSpec {
+    shipped(serde_json::json!({
+        "subject": OPERATORS_SUBJECT,
+        "subjectMembership": "Any",
+        "scope": "*",
+        "roleRef": { "kind": "PlatformRole", "name": SYSTEM_ADMIN_PLATFORM_ROLE }
+    }))
+}
+
+/// ADR-0001 §6.2's default ownership rule, as one seeded dynamic binding.
+///
+/// `subjectMembership: ResourceOrganization` keeps the grant live only while the
+/// named User remains affiliated with the resource's organization, and the
+/// wildcard scope is what lets an organization *replace* the default for itself
+/// under §1's wildcard-replacement rule (§6.5) rather than merely union with it.
+pub fn resource_owner_binding_spec() -> PlatformRoleBindingSpec {
+    shipped(serde_json::json!({
+        "subject": "${ref.subject}",
+        "subjectMembership": "ResourceOrganization",
+        "scope": "*",
+        "labelSelector": { "key": OWNER_LABEL_KEY },
+        "roleRef": { "kind": "PlatformRole", "name": RESOURCE_OWNER_PLATFORM_ROLE }
+    }))
+}
+
 macro_rules! string_serde {
     ($type:ty) => {
         impl Serialize for $type {
@@ -519,6 +641,91 @@ impl JsonSchema for BindingSubject {
     }
 }
 
+/// The `subject` of an org `RoleBinding` as authored, before normalization.
+///
+/// An org `RoleBinding` already sits inside exactly one Organization, so
+/// `group:platform` is unambiguous there and spelling the organization twice is
+/// the common way to typo a binding into permanent inertness. This type accepts
+/// the short form and [`Self::resolve`] expands it against the parent
+/// Organization, so the row still stores a canonical [`BindingSubject`].
+///
+/// Following §6.1's precedent, the relative form is a distinct type rather than
+/// an overload of [`SubjectId`]: parsing a subject never becomes
+/// context-sensitive, and only the one field where an organization is implied
+/// accepts the short spelling.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoleBindingSubject {
+    /// Already canonical, or one of the closed subject templates.
+    Absolute(BindingSubject),
+    /// `group:<name>`, naming a Group in the binding's own Organization.
+    RelativeGroup(String),
+}
+
+impl RoleBindingSubject {
+    /// Expand the relative form against the Organization the binding hangs under.
+    pub fn resolve(self, parent_organization: &str) -> Result<BindingSubject, ValidationError> {
+        match self {
+            Self::Absolute(subject) => Ok(subject),
+            Self::RelativeGroup(name) => {
+                validate_resource_name(parent_organization)?;
+                Ok(BindingSubject::Literal(
+                    format!("group:{parent_organization}/{name}").parse()?,
+                ))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for RoleBindingSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RoleBindingSubject")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl fmt::Display for RoleBindingSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absolute(subject) => subject.fmt(f),
+            Self::RelativeGroup(name) => write!(f, "group:{name}"),
+        }
+    }
+}
+
+impl FromStr for RoleBindingSubject {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Templates carry `${…}` and belong to `BindingSubject`; an absolute
+        // Group carries the `/` separator. What is left is the relative form.
+        if let Some(name) = value.strip_prefix("group:") {
+            if !name.contains('/') && !name.contains("${") {
+                validate_resource_name(name)?;
+                return Ok(Self::RelativeGroup(name.to_owned()));
+            }
+        }
+        Ok(Self::Absolute(value.parse()?))
+    }
+}
+
+string_serde!(RoleBindingSubject);
+
+impl JsonSchema for RoleBindingSubject {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "RoleBindingSubject".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "oneOf": [
+                BindingSubject::json_schema(generator),
+                { "pattern": "^group:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", "maxLength": 69 }
+            ]
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum SubjectMembership {
     #[default]
@@ -558,7 +765,7 @@ pub enum PlatformRoleRefKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoleBindingSpec {
-    pub subject: BindingSubject,
+    pub subject: RoleBindingSubject,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -678,7 +885,8 @@ impl RoleBindingSpec {
         parent_organization: &str,
     ) -> Result<LocallyNormalizedRoleBindingSpec, ValidationError> {
         validate_resource_name(parent_organization)?;
-        validate_subject_selector(&self.subject, self.label_selector.as_ref())?;
+        let subject = self.subject.resolve(parent_organization)?;
+        validate_subject_selector(&subject, self.label_selector.as_ref())?;
         let scope = match self.scope {
             Some(scope) if scope.is_wildcard() => {
                 return Err(ValidationError::new(
@@ -689,7 +897,7 @@ impl RoleBindingSpec {
             None => format!("rise.dev/Organization/{parent_organization}").parse()?,
         };
         Ok(LocallyNormalizedRoleBindingSpec {
-            subject: self.subject,
+            subject,
             scope,
             label_selector: self.label_selector,
             role_ref: self.role_ref,
@@ -727,18 +935,18 @@ impl PlatformRoleBindingSpec {
     }
 }
 
+/// Syntax-level subject/selector agreement.
+///
+/// `system:operators` is deliberately *not* rejected here. It is reserved for the
+/// seeded bootstrap binding, but enforcing that needs the resource's name and
+/// placement — facts this context-free parse cannot see — so the reservation
+/// lives in transaction-scoped admission, which is authoritative for direct store
+/// calls too. Rejecting it here as well would make the seed unwritable through
+/// its own contract.
 fn validate_subject_selector(
     subject: &BindingSubject,
     selector: Option<&LabelSelector>,
 ) -> Result<(), ValidationError> {
-    if subject
-        .literal()
-        .is_some_and(|subject| subject.as_ref() == "system:operators")
-    {
-        return Err(ValidationError::new(
-            "system:operators is reserved for the seeded bootstrap binding",
-        ));
-    }
     match (subject.is_dynamic(), selector) {
         (true, None) => Err(ValidationError::new(
             "a dynamic subject requires labelSelector",

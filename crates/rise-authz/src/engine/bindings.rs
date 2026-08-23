@@ -201,6 +201,17 @@ fn is_live(row: &ResourceRow) -> bool {
     row.deletion_timestamp.is_none()
 }
 
+/// Read a stored `Role`/`PlatformRole` body's statements.
+///
+/// Shared with the grant gate, which resolves a `roleRef` outside binding
+/// collection but must interpret the row identically — a second parse with
+/// different failure behaviour is how a Deny gets silently dropped.
+pub(crate) fn parse_role_statements(
+    row: &ResourceRow,
+) -> Result<Vec<PolicyStatement>, AuthorizationError> {
+    Ok(parse_spec::<RoleSpec>(row)?.statements)
+}
+
 /// Stored policy that no longer parses is an error, never a skipped row.
 ///
 /// Skipping would silently drop the row's `Deny` statements, turning corrupt

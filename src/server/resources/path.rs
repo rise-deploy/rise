@@ -50,6 +50,16 @@ pub enum Subresource {
 impl Subresource {
     pub const KEYWORDS: &str = "status, finalizers, deletion-blockers";
 
+    /// The canonical keyword for this subresource — the same name policy
+    /// statements and authorization details use (ADR-0001 §2).
+    pub fn keyword(&self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Finalizers => "finalizers",
+            Self::DeletionBlockers => "deletion-blockers",
+        }
+    }
+
     /// Parse a reserved subresource keyword. Returns `None` for any other value.
     pub fn from_keyword(value: &str) -> Option<Self> {
         match value {

@@ -5,7 +5,10 @@ use uuid::Uuid;
 use crate::db::models::User;
 
 /// Find user by email address
-pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
+pub async fn find_by_email<'a, E>(executor: E, email: &str) -> Result<Option<User>>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let user = sqlx::query_as!(
         User,
         r#"
@@ -15,7 +18,7 @@ pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>> {
         "#,
         email
     )
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .context("Failed to find user by email")?;
 

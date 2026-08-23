@@ -470,12 +470,15 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<()> {
 }
 
 /// Count projects owned by a team
-pub async fn count_owned_by_team(pool: &PgPool, team_id: Uuid) -> Result<i64> {
+pub async fn count_owned_by_team<'a, E>(executor: E, team_id: Uuid) -> Result<i64>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let result = sqlx::query!(
         r#"SELECT COUNT(*) as "count!" FROM projects WHERE owner_team_id = $1"#,
         team_id
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .context("Failed to count projects owned by team")?;
 

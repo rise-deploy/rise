@@ -91,6 +91,13 @@ impl ResourceStore for FakeStore {
     async fn ancestors(&self, _: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
         Ok(vec![])
     }
+    async fn label_inheriting_descendants(
+        &self,
+        _: Uuid,
+        _: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(vec![])
+    }
     async fn operator_update_status(
         &self,
         _: Uuid,

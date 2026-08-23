@@ -7,9 +7,18 @@ use rise_resource_api::StoreError;
 
 use crate::server::error::ServerError;
 
+/// The one message every "the addressed resource is not available to you" answer
+/// carries, whether the resource is absent, an ancestor is absent, or the caller
+/// simply may not read it.
+///
+/// Item paths mask on `get` (ADR-0001 §4, and `AuthorizationContext::require_visible`),
+/// which only works if the masked answer is indistinguishable from the genuine
+/// one — status *and* body.
+pub const RESOURCE_NOT_FOUND: &str = "resource not found";
+
 pub fn store_error_to_server_error(err: StoreError) -> ServerError {
     match err {
-        StoreError::NotFound => ServerError::not_found("resource not found"),
+        StoreError::NotFound => ServerError::not_found(RESOURCE_NOT_FOUND),
         StoreError::RevisionConflict { expected, found } => ServerError::conflict(format!(
             "revision conflict: expected {expected}, found {found}"
         )),
@@ -34,6 +43,13 @@ pub fn store_error_to_server_error(err: StoreError) -> ServerError {
             ServerError::bad_request("path resolution requires at least one segment")
         }
         StoreError::Validation(msg) => ServerError::bad_request(msg),
+        // The write path's retry loop replays this; it only reaches a client if
+        // every attempt lost the race, which is a genuine "try again".
+        StoreError::Serialization => ServerError::service_unavailable(
+            "the write lost a concurrent-update race; please retry",
+        )
+        .retryable()
+        .expected(),
         StoreError::Backend { source } => ServerError::internal_anyhow(
             anyhow::Error::from_boxed(source),
             "resource store backend error",
@@ -106,6 +122,22 @@ mod tests {
             got: "Widget".into(),
         });
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    /// A serialization failure must arrive as retryable, and must not be
+    /// confused with any other 503: the write path replays on this flag alone.
+    #[test]
+    fn maps_serialization_failure_to_a_retryable_service_unavailable() {
+        let err = store_error_to_server_error(StoreError::Serialization);
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(err.retryable);
+        assert!(err.expected);
+
+        // Nothing else is replayable — a discriminator exhaustion is also a 503
+        // and must not be replayed as if it were a lost race.
+        let other = store_error_to_server_error(StoreError::DiscriminatorExhausted);
+        assert_eq!(other.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!other.retryable);
     }
 
     #[test]

@@ -1004,6 +1004,16 @@ mod tests {
             self.inner.ancestors(uid).await
         }
 
+        async fn label_inheriting_descendants(
+            &self,
+            uid: Uuid,
+            label_key: &str,
+        ) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner
+                .label_inheriting_descendants(uid, label_key)
+                .await
+        }
+
         async fn try_collect(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError> {
             if uid == self.fail_for {
                 return Err(StoreError::Validation("injected".to_string()));
@@ -1188,6 +1198,16 @@ mod tests {
     impl ResourceStore for NotFoundStore {
         async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
             self.inner.ancestors(uid).await
+        }
+
+        async fn label_inheriting_descendants(
+            &self,
+            uid: Uuid,
+            label_key: &str,
+        ) -> Result<Vec<ResourceRow>, StoreError> {
+            self.inner
+                .label_inheriting_descendants(uid, label_key)
+                .await
         }
 
         async fn try_collect(&self, _uid: Uuid) -> Result<DeleteOutcome, StoreError> {

@@ -92,8 +92,8 @@ async fn operator_update_finalizers(&self, uid: Uuid, operator: &str, …);
 
 The trust boundary above them is already correct — handlers pass
 `controller.0.identity_id` from the authenticated Controller
-(`src/server/resources/handlers.rs:1197`) and `user.email` after
-`require_operator` (`:1245`). The defect is expressive, not exploitable: the
+(`src/server/resources/handlers.rs:1820`) and `authz.subject()` from the
+authorization choke point (`:1879`). The defect is expressive, not exploitable: the
 trait cannot say where identity comes from, so it cannot be the contract a
 remote client codes against. Others — `try_collect`, `list_pending_collection`,
 `resolve_path`, `ancestors`, `resolve_collection*`,
@@ -137,11 +137,14 @@ documents its own race:
 That costs one advisory lock while both sides share a pool. §6 says what
 replaces it when they do not.
 
-**Not yet ready, either.** `rise-authz` is not a dependency of `rise-deploy` at
-all, so ADR-0001's transaction-scoped admission and grant gate do not exist to
-draw a boundary around; and pagination, selectors, Watch, Patch and discovery
-are all open under `ROADMAP.md` §1, so a client-only backend today would poll
-unfiltered lists. §7 turns both into gates.
+**Half-ready.** The authorization side has landed: `rise-authz` is wired into
+`rise-deploy` behind `src/server/authz/`, `require_operator` is gone in favour
+of a centralized choke point, and writes replay under `SERIALIZABLE` with
+`StoreError::Serialization` driving bounded retry. So there is now something
+real to draw a boundary around. What is still open is reach: pagination,
+selectors, Watch, Patch and discovery remain `ROADMAP.md` §1 items, so a
+client-only backend today would poll unfiltered lists. §7 keeps both as gates,
+G1 satisfied and G2 not.
 
 ## Decision
 
@@ -230,11 +233,11 @@ ever be issued by a remote client.
 | Method | Why it stays in |
 |---|---|
 | `try_collect`, `list_pending_collection` | GC worker internals over tombstoned rows |
-| `resolve_path`, `ancestors` | Path resolution and `effectiveLabels` primitives feeding admission and authorization |
+| `resolve_path`, `ancestors`, `label_inheriting_descendants` | Path, ancestry and label-subtree primitives feeding admission and ADR-0001 §6.6's write gate |
 | `resolve_collection`, `resolve_collection_version`, `resolve_collection_by_kind` | Registry lookups behind every request |
 | `register_resource_definition`, `update_resource_definition` | The atomic storage projection behind ordinary `ResourceDefinition` writes |
-| `list_deletion_blockers` | Implementation of a served subresource (`handlers.rs:665`) — the route is remotable, the primitive is not |
-| `operator_update_status`, `operator_update_finalizers` | Same shape: the route is served today (`handlers.rs:1245`, after `require_operator`), and only the identity-bypassing primitive is internal. The route converges on `status`/`finalizers` under RBAC; the primitive dissolves |
+| `list_deletion_blockers` | Implementation of a served subresource (`handlers.rs:772`) — the route is remotable, the primitive is not |
+| `operator_update_status`, `operator_update_finalizers` | Same shape: the route is served today (`handlers.rs:1879`, taking `authz.subject()`), and only the identity-bypassing primitive is internal. The route converges on `status`/`finalizers` under RBAC; the primitive dissolves |
 
 The four `controller_id` / `operator` parameters disappear when ADR-0001's
 choke point lands — `ROADMAP.md` §1 already commits to removing
@@ -376,12 +379,17 @@ a name to an `i64` and takes `pg_advisory_lock` over a database-wide keyspace
 invariant 5 stays a convention; the honest mitigation is that it has no
 cross-component use after the split, not that the schema split prevents one.
 
-**The Organization delete race.** `organization.rs:42-51` prescribes
-`pg_advisory_xact_lock` on the Org UID in the resource-delete path *and* in
-every `set_team_organization` / `set_project_organization` /
-`ensure_user_membership` call site. Two transactions coordinating through a
-shared lock is not one transaction spanning the boundary, so it breaks invariant
-5, not 3 — and only *half* of it is illegal, which is the whole fix. Invariant 5
+**The Organization delete race.** The count and the delete now share one
+session (`organization.rs:40-42`), but that is not mutual exclusion against the
+typed writers: PostgreSQL checks a serializable transaction's predicate reads
+only against writers that are themselves serializable, and every typed link
+write runs at `READ COMMITTED`, so an insert committing after the snapshot is
+invisible to the count and aborts nothing. The file's remedy is
+`pg_advisory_xact_lock` on the Org UID in the delete path *and* in every
+`set_team_organization` / `set_project_organization` / `ensure_user_membership`
+call site. Two transactions coordinating through a shared lock is not one
+transaction spanning the boundary, so it breaks invariant 5, not 3 — and only
+*half* of it is illegal, which is the whole fix. Invariant 5
 forbids a lock shared *between* components and permits one *within* a component,
 and both the count and every typed insert live in the product backend:
 
@@ -418,9 +426,10 @@ Gates, in order. G1, G2 and G4 are independently valuable; G3 is a library with
 no consumer until G4, listed separately only because it is the seam's first
 real client.
 
-- **G1 — Authorization inside the boundary.** `rise-authz` wired into the
-  request path, `require_operator` replaced by the centralized choke point,
-  admission and the write-time grant gate transaction-scoped.
+- **G1 — Authorization inside the boundary.** *Landed.* `rise-authz` is wired
+  into the request path, `require_operator` is replaced by the centralized
+  choke point, and the write-time grant gate runs under `SERIALIZABLE` with
+  bounded retry.
 - **G2 — API completeness.** Pagination and selectors, Watch, Patch, discovery.
   Until these exist, "client-only" means "polls everything".
 - **G3 — `rise-resource-client`** with Rise-issued credential providers, watch
@@ -496,9 +505,10 @@ leg the burden inverts, and §4 states its rule and its CI job.
 - Third-party controllers get a supported contract with no Rust linkage and a
   version window to build against.
 - Every resource read behind a typed route gains a network hop, with no
-  mitigation claimed — `AuthorizationSnapshot` memoization is not one, since it
-  lives in a crate `rise-deploy` does not depend on and, once authorization runs
-  inside the apiserver, cannot absorb a cost paid on the other side. The cost
+  mitigation claimed. Request-local `AuthorizationSnapshot` memoization is now
+  live in the request path, but it is not a mitigation for this: once
+  authorization runs inside the apiserver, it cannot absorb a cost paid on the
+  other side of the boundary. The cost
   retires with the shim (§1), but the shim's window is set by how fast *clients*
   migrate, not by Rise's schedule: "bounded" means has an end, not has a date.
   Measure at G4.
@@ -619,7 +629,7 @@ sequencing that follows work scheduled elsewhere.
 - `ROADMAP.md` §1 (resource API maturation), §2 (token issuance and TTL), §4
   (typed-object migration), §5 (external controllers and multi-org routing), §6
   (codebase decomposition).
-- [Generic resource API](../generic-resource-api.md) — path grammar, parent
+- [Generic resource API: HTTP API](../resources/api.md) — path grammar, parent
   chains, and discriminators.
 - [Deployment backends](../deployment-backends.md) — the controller topology
   this decision changes.

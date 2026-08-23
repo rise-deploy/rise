@@ -1,7 +1,13 @@
 //! An in-memory resource graph and membership resolver.
 //!
 //! The engine's payoff is that its whole algorithm runs against fakes: these
-//! tests exercise ADR-0001 §4 end to end with no Postgres and no HTTP.
+//! tests exercise ADR-0001 §4 and §5 end to end with no Postgres and no HTTP.
+//!
+//! This module is compiled into every integration-test binary that declares it,
+//! and each exercises a different slice — evaluation needs the tombstone and
+//! chain-truncation controls, the grant gate needs other-User membership. Any
+//! given binary therefore leaves some builders unused.
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -12,9 +18,9 @@ use rise_authz::engine::{
     ResourceNode,
 };
 use rise_resource_api::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlockerReport, PathSegment,
-    ResourceApi, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
-    API_VERSION_V1ALPHA1,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlockerReport, NoOpValidator,
+    PathSegment, ResourceApi, ResourceParentRef, ResourceRow, ResourceStore, StoreError, SubjectId,
+    UpdateResourceParams, API_VERSION_V1ALPHA1,
 };
 use uuid::Uuid;
 
@@ -133,13 +139,39 @@ impl StoreBuilder {
         Arc::new(FakeStore {
             rows: self.rows,
             ancestor_depth: self.ancestor_depth,
+            kind_parents: default_kind_parents(),
         })
     }
+}
+
+/// The built-in placement ADR-0001 fixes, plus the product kinds these tests
+/// build trees from.
+///
+/// The grant gate resolves scope containment through this registry: deciding
+/// that `rise.dev/Organization/acme` covers `rise.dev/Project/acme/web` requires
+/// knowing `Project` hangs under `Organization`, which a scope string does not
+/// say.
+fn default_kind_parents() -> BTreeMap<String, Option<String>> {
+    [
+        ("Organization", None),
+        ("PlatformRole", None),
+        ("PlatformRoleBinding", None),
+        ("Role", Some("Organization")),
+        ("RoleBinding", Some("Organization")),
+        ("Group", Some("Organization")),
+        ("Project", Some("Organization")),
+        ("Environment", Some("Project")),
+        ("Deployment", Some("Project")),
+    ]
+    .into_iter()
+    .map(|(kind, parent)| (kind.to_owned(), parent.map(str::to_owned)))
+    .collect()
 }
 
 pub struct FakeStore {
     rows: Vec<ResourceRow>,
     ancestor_depth: Option<usize>,
+    kind_parents: BTreeMap<String, Option<String>>,
 }
 
 impl FakeStore {
@@ -247,6 +279,29 @@ impl ResourceStore for FakeStore {
         chain.reverse();
         Ok(chain)
     }
+
+    /// Breadth-first, pruning at any node that sets the key — the same
+    /// nearest-wins stop condition the Postgres recursion encodes.
+    async fn label_inheriting_descendants(
+        &self,
+        uid: Uuid,
+        label_key: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        let mut descendants = Vec::new();
+        let mut frontier = vec![uid];
+        while let Some(current) = frontier.pop() {
+            for row in self
+                .rows
+                .iter()
+                .filter(|row| row.parent_uid == Some(current))
+                .filter(|row| !row.labels.contains_key(label_key))
+            {
+                frontier.push(row.uid);
+                descendants.push(row.clone());
+            }
+        }
+        Ok(descendants)
+    }
     async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         unimplemented!("authorization never writes")
     }
@@ -289,10 +344,28 @@ impl ResourceStore for FakeStore {
     }
     async fn resolve_collection_by_kind(
         &self,
-        _: &str,
-        _: &str,
+        group: &str,
+        kind: &str,
     ) -> Result<Option<CollectionInfo>, StoreError> {
-        unimplemented!("unused by the engine")
+        if group != rise_resource_api::API_GROUP {
+            return Ok(None);
+        }
+        let Some(parent) = self.kind_parents.get(kind) else {
+            return Ok(None);
+        };
+        Ok(Some(CollectionInfo {
+            api_version: V1ALPHA1.to_owned(),
+            storage_api_version: V1ALPHA1.to_owned(),
+            served_api_versions: vec![V1ALPHA1.to_owned()],
+            declared_api_versions: vec![V1ALPHA1.to_owned()],
+            kind: kind.to_owned(),
+            parent: parent.as_ref().map(|parent| ResourceParentRef {
+                api_version: V1ALPHA1.to_owned(),
+                kind: parent.clone(),
+            }),
+            spec_validator: Arc::new(NoOpValidator),
+            allowed_status_controller_ids: Vec::new(),
+        }))
     }
     async fn register_resource_definition(
         &self,
@@ -313,35 +386,57 @@ impl ResourceStore for FakeStore {
 /// `GroupMembership` reads and the configured operator selector set.
 pub struct FakeMemberships {
     membership: PrincipalMembership,
+    /// Ties for Users who are not the caller, which only the grant gate's
+    /// identity-mapping path consults.
+    others: BTreeMap<SubjectId, BTreeSet<SubjectId>>,
 }
 
 impl FakeMemberships {
     pub fn none() -> Arc<Self> {
-        Arc::new(Self {
-            membership: PrincipalMembership::default(),
-        })
+        Self::from(PrincipalMembership::default())
     }
 
     pub fn groups(groups: &[&str]) -> Arc<Self> {
-        Arc::new(Self {
-            membership: PrincipalMembership {
-                groups: groups
-                    .iter()
-                    .map(|group| group.parse().expect("valid group subject"))
-                    .collect::<BTreeSet<_>>(),
-                is_operator: false,
-            },
+        Self::from(PrincipalMembership {
+            groups: parse_subjects(groups),
+            is_operator: false,
         })
     }
 
     pub fn operator() -> Arc<Self> {
-        Arc::new(Self {
-            membership: PrincipalMembership {
-                groups: BTreeSet::new(),
-                is_operator: true,
-            },
+        Self::from(PrincipalMembership {
+            groups: BTreeSet::new(),
+            is_operator: true,
         })
     }
+
+    /// State the live Group ties of some other User, as `GroupMembership` rows
+    /// would.
+    pub fn with_user_groups(self: Arc<Self>, user: &str, groups: &[&str]) -> Arc<Self> {
+        let mut others = self.others.clone();
+        others.insert(
+            user.parse().expect("valid user subject"),
+            parse_subjects(groups),
+        );
+        Arc::new(Self {
+            membership: self.membership.clone(),
+            others,
+        })
+    }
+
+    fn from(membership: PrincipalMembership) -> Arc<Self> {
+        Arc::new(Self {
+            membership,
+            others: BTreeMap::new(),
+        })
+    }
+}
+
+fn parse_subjects(subjects: &[&str]) -> BTreeSet<SubjectId> {
+    subjects
+        .iter()
+        .map(|subject| subject.parse().expect("valid subject"))
+        .collect()
 }
 
 #[async_trait::async_trait]
@@ -351,5 +446,12 @@ impl MembershipResolver for FakeMemberships {
         _principal: &AuthenticatedPrincipal,
     ) -> Result<PrincipalMembership, AuthorizationError> {
         Ok(self.membership.clone())
+    }
+
+    async fn groups_for_user(
+        &self,
+        user: &SubjectId,
+    ) -> Result<BTreeSet<SubjectId>, AuthorizationError> {
+        Ok(self.others.get(user).cloned().unwrap_or_default())
     }
 }
