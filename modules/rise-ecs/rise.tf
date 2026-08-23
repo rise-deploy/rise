@@ -48,30 +48,8 @@ resource "aws_ecs_task_definition" "rise" {
         startPeriod = 60
       }
 
-      # Routing for the control plane itself. Traefik reads these from the
-      # container definition -- the only place its ECS provider looks.
-      dockerLabels = merge(
-        {
-          "traefik.enable"                                         = "true"
-          "traefik.http.routers.rise-cp.rule"                      = "Host(`rise.${var.ingress_domain}`)"
-          "traefik.http.routers.rise-cp.entrypoints"               = local.traefik_entrypoint
-          "traefik.http.routers.rise-cp.service"                   = "rise-cp"
-          "traefik.http.services.rise-cp.loadbalancer.server.port" = "3000"
-
-          # The OAuth and ingress-auth endpoints have to answer on every project
-          # hostname, not just rise.<domain>, because Traefik redirects there
-          # from whichever host the user was on. A high priority keeps it ahead
-          # of the project routers that match the same host.
-          "traefik.http.routers.rise-dotrise.rule"        = "PathPrefix(`/.rise`)"
-          "traefik.http.routers.rise-dotrise.entrypoints" = local.traefik_entrypoint
-          "traefik.http.routers.rise-dotrise.priority"    = "1000"
-          "traefik.http.routers.rise-dotrise.service"     = "rise-cp"
-        },
-        local.acme_enabled ? {
-          "traefik.http.routers.rise-cp.tls.certresolver"      = "letsencrypt"
-          "traefik.http.routers.rise-dotrise.tls.certresolver" = "letsencrypt"
-        } : {}
-      )
+      # Routing for the control plane itself, from the shared submodule.
+      dockerLabels = module.control_plane_env.docker_labels
 
       logConfiguration = {
         logDriver = "awslogs"

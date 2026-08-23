@@ -45,6 +45,17 @@ variable "workload_task_role_arn" {
 # Registry
 # -----------------------------------------------------------------------------
 
+variable "traefik_task_role_arn" {
+  description = <<-EOT
+    Pre-created task role for Traefik. Leave null and the module creates one.
+
+    Set it where the applying identity has no IAM-write -- the e2e harness runs
+    that way, with IAM pre-created in a bootstrap apply.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "registry_type" {
   description = <<-EOT
     Container registry Rise deploys from.

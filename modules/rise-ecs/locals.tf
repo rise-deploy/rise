@@ -75,68 +75,65 @@ locals {
   oidc_issuer = var.deploy_dex ? "https://dex.${var.ingress_domain}/dex" : var.oidc_issuer
 
   workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
+  traefik_task_role_arn  = coalesce(var.traefik_task_role_arn, try(aws_iam_role.traefik[0].arn, null))
 
   log_group_name = "/${local.name}"
 
   # --- Control-plane environment -------------------------------------------
-  # The module's whole job on the Rise side: the shipped config/ecs.yaml is
-  # selected with RISE_CONFIG_RUN_MODE=ecs and every value below fills one of
-  # its ${...} interpolations. Exposed as an output too, so an operator running
-  # the control plane outside this module gets the same map rather than
-  # reconstructing it.
-  rise_environment = merge(
-    {
-      RISE_CONFIG_RUN_MODE = "ecs"
-      PUBLIC_URL           = local.public_url
-      RISE_COOKIE_SECURE   = "true"
-      RISE_INGRESS_DOMAIN  = var.ingress_domain
-      RISE_INGRESS_SCHEME  = local.ingress_scheme
-      AWS_REGION           = local.region
-      ADMIN_EMAIL          = var.admin_email
+  # Built by modules/control-plane-env, which the e2e test root also consumes so
+  # the two cannot drift on the one contract that matters: what the control
+  # plane's environment and Traefik labels look like on ECS.
+  rise_environment = module.control_plane_env.environment
+}
 
-      DEX_ISSUER     = local.oidc_issuer
-      OIDC_CLIENT_ID = var.oidc_client_id
+module "control_plane_env" {
+  source = "./modules/control-plane-env"
 
-      RISE_AUTH_BACKEND_URL   = local.auth_backend_url
-      RISE_TRAEFIK_API_URL    = local.traefik_api_url
-      RISE_TRAEFIK_ENTRYPOINT = local.traefik_entrypoint
-      RISE_CERTRESOLVER       = local.acme_enabled ? "letsencrypt" : ""
+  ingress_domain = var.ingress_domain
+  ingress_scheme = local.ingress_scheme
+  region         = local.region
+  admin_email    = var.admin_email
 
-      RISE_ECS_CLUSTER = local.cluster_name
-      # Comma-joined on purpose: the settings loader accepts a list or a
-      # comma-separated string precisely so a Terraform output can feed it
-      # through a single environment variable.
-      RISE_ECS_SUBNETS                 = join(",", local.private_subnet_ids)
-      RISE_ECS_SECURITY_GROUPS         = aws_security_group.apps.id
-      RISE_ECS_ASSIGN_PUBLIC_IP        = "false"
-      RISE_ECS_EXECUTION_ROLE_ARN      = var.execution_role_arn
-      RISE_ECS_TASK_ROLE_ARN           = local.workload_task_role_arn
-      RISE_ECS_LOG_GROUP               = local.log_group_name
-      RISE_ECS_RESOURCE_PREFIX         = var.resource_prefix
-      RISE_ECS_SSM_PREFIX              = var.ssm_parameter_prefix
-      RISE_ECS_SSM_KMS_KEY_ID          = var.ssm_kms_key_arn != null ? var.ssm_kms_key_arn : ""
-      RISE_ECS_CPU_ARCHITECTURE        = var.cpu_architecture
-      RISE_ECS_RECONCILE_INTERVAL_SECS = tostring(var.reconcile_interval_secs)
+  cluster_name           = local.cluster_name
+  subnet_ids             = local.private_subnet_ids
+  security_group_ids     = [aws_security_group.apps.id]
+  assign_public_ip       = false
+  execution_role_arn     = var.execution_role_arn
+  workload_task_role_arn = local.workload_task_role_arn
+  log_group_name         = aws_cloudwatch_log_group.this.name
 
-      RISE_MAX_REPLICAS  = tostring(var.max_replicas)
-      RISE_REGISTRY_TYPE = var.registry_type
-    },
-    var.repository_credentials_secret_arn != null ? {
-      RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN = var.repository_credentials_secret_arn
-    } : {},
-    var.registry_type == "ecr" ? {
-      # Never a variable: the backend asserts at startup that the registry
-      # account equals the ECS credentials' account, because Rise writes no ECR
-      # repository policy and cross-account pulls cannot work. Making this
-      # settable could only produce an install that refuses to start.
-      RISE_ECR_ACCOUNT_ID    = local.account_id
-      RISE_ECR_PUSH_ROLE_ARN = var.ecr_push_role_arn
-      RISE_ECR_REPO_PREFIX   = var.ecr_repo_prefix
-      RISE_ECR_AUTO_REMOVE   = tostring(var.ecr_auto_remove)
-    } : {},
-    var.registry_type == "oci-client-auth" ? {
-      RISE_REGISTRY_URL       = var.oci_registry_url
-      RISE_REGISTRY_NAMESPACE = var.oci_registry_namespace
-    } : {}
-  )
+  auth_backend_url     = local.auth_backend_url
+  traefik_api_url      = local.traefik_api_url
+  traefik_entrypoint   = local.traefik_entrypoint
+  traefik_certresolver = local.acme_enabled ? "letsencrypt" : null
+
+  oidc_issuer    = local.oidc_issuer
+  oidc_client_id = var.oidc_client_id
+  # The issuer is public here (Traefik-fronted, or an operator's own IdP), so
+  # the SSRF defaults stay closed.
+  allow_private_ssrf = false
+
+  resource_prefix         = var.resource_prefix
+  ssm_parameter_prefix    = var.ssm_parameter_prefix
+  ssm_kms_key_arn         = var.ssm_kms_key_arn
+  cpu_architecture        = var.cpu_architecture
+  reconcile_interval_secs = var.reconcile_interval_secs
+  max_replicas            = var.max_replicas
+
+  registry = var.registry_type == "ecr" ? {
+    type = "ecr"
+    # Never a variable: the backend asserts at startup that the registry account
+    # equals the ECS credentials' account, because Rise writes no ECR repository
+    # policy and cross-account pulls cannot work.
+    account_id    = local.account_id
+    push_role_arn = var.ecr_push_role_arn
+    repo_prefix   = var.ecr_repo_prefix
+    auto_remove   = var.ecr_auto_remove
+    } : {
+    type         = "oci-client-auth"
+    registry_url = var.oci_registry_url
+    namespace    = var.oci_registry_namespace
+  }
+
+  repository_credentials_secret_arn = var.repository_credentials_secret_arn
 }

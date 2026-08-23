@@ -4,6 +4,8 @@
 # behind an unauthenticated dashboard.
 
 data "aws_iam_policy_document" "traefik_assume" {
+  count = var.traefik_task_role_arn == null ? 1 : 0
+
   statement {
     effect = "Allow"
     principals {
@@ -20,13 +22,17 @@ data "aws_iam_policy_document" "traefik_assume" {
 }
 
 resource "aws_iam_role" "traefik" {
+  count = var.traefik_task_role_arn == null ? 1 : 0
+
   name               = "${local.name}-traefik"
   description        = "Traefik ECS provider discovery"
-  assume_role_policy = data.aws_iam_policy_document.traefik_assume.json
+  assume_role_policy = data.aws_iam_policy_document.traefik_assume[0].json
   tags               = local.tags
 }
 
 data "aws_iam_policy_document" "traefik" {
+  count = var.traefik_task_role_arn == null ? 1 : 0
+
   statement {
     sid    = "DiscoverTasks"
     effect = "Allow"
@@ -56,9 +62,11 @@ data "aws_iam_policy_document" "traefik" {
 }
 
 resource "aws_iam_role_policy" "traefik" {
+  count = var.traefik_task_role_arn == null ? 1 : 0
+
   name   = "discovery"
-  role   = aws_iam_role.traefik.id
-  policy = data.aws_iam_policy_document.traefik.json
+  role   = aws_iam_role.traefik[0].id
+  policy = data.aws_iam_policy_document.traefik[0].json
 }
 
 locals {
@@ -102,7 +110,7 @@ resource "aws_ecs_task_definition" "traefik" {
   cpu                      = "512"
   memory                   = "1024"
   execution_role_arn       = var.execution_role_arn
-  task_role_arn            = aws_iam_role.traefik.arn
+  task_role_arn            = local.traefik_task_role_arn
 
   runtime_platform {
     cpu_architecture        = var.cpu_architecture
