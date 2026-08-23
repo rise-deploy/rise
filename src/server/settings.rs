@@ -1619,6 +1619,21 @@ pub enum DeploymentControllerSettings {
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
         task_role_arn: Option<String>,
 
+        /// ARN of a Secrets Manager secret holding `{"username": …, "password": …}`
+        /// for a private registry that is not ECR.
+        ///
+        /// ECS re-authenticates on every task start and cannot take inline
+        /// credentials, so a static-credential registry needs the credentials
+        /// parked somewhere ECS can read them itself. The ARN is stamped onto
+        /// each container definition as `repositoryCredentials`; the execution
+        /// role needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`
+        /// when the secret uses a customer-managed key).
+        ///
+        /// Leave unset for ECR (the execution role authenticates the pull) and
+        /// for anonymous registries.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        repository_credentials_secret_arn: Option<String>,
+
         /// CloudWatch log group for app containers (`awslogs` driver). When
         /// unset, containers get no log driver and runtime logs are unavailable.
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
@@ -1751,7 +1766,14 @@ pub enum RegistrySettings {
         #[allow(dead_code)]
         push_role_arn: String,
         /// Whether to automatically delete ECR repos when projects are deleted
-        #[serde(default)]
+        // Env-drivable: the loader interpolates `${VAR}` into a string before
+        // deserialization, so a config value of "${RISE_ECR_AUTO_REMOVE:-false}"
+        // reaches serde as the string "false", not a bool.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
         #[allow(dead_code)]
         auto_remove: bool,
         #[serde(default)]
@@ -2137,6 +2159,43 @@ impl Settings {
             }
         }
 
+        // `account_id` and `push_role_arn` are string-formatted into every image
+        // reference and into the STS AssumeRole call. Neither can be blank in a
+        // working install, so catching them here turns a first-deploy failure
+        // into a startup error.
+        if let Some(RegistrySettings::Ecr {
+            account_id,
+            push_role_arn,
+            repo_prefix,
+            ..
+        }) = &settings.registry
+        {
+            if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ConfigError::Message(format!(
+                    "registry.account_id must be a 12-digit AWS account ID, got {account_id:?}"
+                )));
+            }
+            if push_role_arn.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "registry.push_role_arn must name the IAM role Rise assumes to mint \
+                     scoped ECR credentials"
+                        .to_string(),
+                ));
+            }
+            // The prefix is concatenated literally, so `rise` yields repositories
+            // named `risemyapp`. That is a working configuration for an install
+            // already running on it, so warn rather than refuse to start.
+            if !repo_prefix.is_empty() && !repo_prefix.ends_with('/') {
+                tracing::warn!(
+                    "registry.repo_prefix {:?} does not end in '/': repositories will be \
+                     named {}<project> rather than {}/<project>",
+                    repo_prefix,
+                    repo_prefix,
+                    repo_prefix
+                );
+            }
+        }
+
         // Validate deployment controller settings if configured
         if let Some(DeploymentControllerSettings::Kubernetes {
             ref production_ingress_url_template,
@@ -2287,6 +2346,8 @@ impl Settings {
             ref subnets,
             ref security_groups,
             ref cpu_architecture,
+            ref execution_role_arn,
+            ref repository_credentials_secret_arn,
             ..
         }) = settings.deployment_controller
         {
@@ -2362,6 +2423,56 @@ impl Settings {
                     "deployment_controller.cpu_architecture must be X86_64 or ARM64, got {:?}",
                     cpu_architecture
                 )));
+            }
+
+            // ECS authenticates every image pull itself, at every task start —
+            // scale-out, task replacement, AZ rebalance. It never receives a
+            // credential Rise minted, so a registry whose only pull mechanism is
+            // a short-lived Rise-issued token cannot work here, and one that
+            // needs static credentials must park them where ECS can read them.
+            // Deciding that at startup is the difference between a clear error
+            // and an opaque `CannotPullContainerError` on the first deploy.
+            match &settings.registry {
+                Some(RegistrySettings::Ecr { .. }) => {
+                    if execution_role_arn.is_none() {
+                        return Err(ConfigError::Message(
+                            "registry.type is 'ecr' but deployment_controller.execution_role_arn \
+                             is unset: ECS pulls from ECR with the task execution role, so \
+                             without one every task fails with CannotPullContainerError. Create \
+                             a role ECS can assume (trust principal ecs-tasks.amazonaws.com) \
+                             with the AmazonECSTaskExecutionRolePolicy managed policy attached, \
+                             and set its ARN here."
+                                .to_string(),
+                        ));
+                    }
+                }
+                Some(RegistrySettings::OciClientAuth {
+                    username, password, ..
+                }) => {
+                    let anonymous = username.is_empty() && password.is_empty();
+                    if !anonymous && repository_credentials_secret_arn.is_none() {
+                        return Err(ConfigError::Message(
+                            "registry.type is 'oci-client-auth' with static credentials, but \
+                             deployment_controller.repository_credentials_secret_arn is unset: \
+                             ECS cannot be handed inline registry credentials. Store the \
+                             username/password in a Secrets Manager secret, set its ARN here, \
+                             and grant the execution role secretsmanager:GetSecretValue on it."
+                                .to_string(),
+                        ));
+                    }
+                }
+                Some(RegistrySettings::GitLab { .. }) | Some(RegistrySettings::Jfrog { .. }) => {
+                    return Err(ConfigError::Message(
+                        "registry.type is not supported by the ECS deployment controller: \
+                         GitLab and JFrog pull credentials are short-lived scoped tokens that \
+                         Rise refreshes on the puller's behalf, which ECS gives it no way to \
+                         do — deploys would succeed and then fail once the token expired. Use \
+                         'ecr', or an 'oci-client-auth' registry that is either anonymous or \
+                         reachable through repository_credentials_secret_arn."
+                            .to_string(),
+                    ));
+                }
+                None => {}
             }
         }
 
@@ -3186,6 +3297,16 @@ auth:
     fn load_shipped_ecs_config(
         env: &std::collections::HashMap<&'static str, &'static str>,
     ) -> Result<Settings, ConfigError> {
+        load_shipped_ecs_config_with_overlay(env, None)
+    }
+
+    /// As above, with an optional `local.yaml` layered over the shipped file —
+    /// the way an operator overrides a section they cannot express through the
+    /// file's env vars (a different registry type, say).
+    fn load_shipped_ecs_config_with_overlay(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+        overlay: Option<&str>,
+    ) -> Result<Settings, ConfigError> {
         use std::fs;
         use tempfile::TempDir;
 
@@ -3196,6 +3317,9 @@ auth:
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
         fs::write(temp_dir.path().join("ecs.yaml"), ecs_yaml).unwrap();
+        if let Some(overlay) = overlay {
+            fs::write(temp_dir.path().join("local.yaml"), overlay).unwrap();
+        }
 
         let owned: std::collections::HashMap<String, String> = env
             .iter()
@@ -3264,6 +3388,123 @@ auth:
         assert!(
             err.to_string().contains("at least one subnet"),
             "unhelpful message: {err}"
+        );
+    }
+
+    /// The env every ECS-mode load needs before it can get as far as the
+    /// registry checks these tests are about.
+    fn ecs_base_env() -> std::collections::HashMap<&'static str, &'static str> {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert("RISE_ECS_SUBNETS", "subnet-abc");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+        env
+    }
+
+    #[test]
+    fn shipped_ecs_config_selects_ecr_from_one_env_flip() {
+        // The file's own comment recommends ECR; if switching to it needed the
+        // file edited, that recommendation would be advice nobody can take.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+        env.insert(
+            "RISE_ECS_EXECUTION_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-exec",
+        );
+
+        let settings = load_shipped_ecs_config(&env).expect("ecr mode must load");
+        let Some(RegistrySettings::Ecr {
+            account_id,
+            repo_prefix,
+            ..
+        }) = settings.registry
+        else {
+            panic!("RISE_REGISTRY_TYPE=ecr must select the ECR registry");
+        };
+        assert_eq!(account_id, "123456789012");
+        assert_eq!(repo_prefix, "rise/");
+    }
+
+    #[test]
+    fn ecr_on_ecs_without_an_execution_role_is_rejected() {
+        // ECS pulls from ECR with the execution role and nothing else. Without
+        // one every task dies with CannotPullContainerError, which names neither
+        // the cause nor the fix.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("execution_role_arn"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("AmazonECSTaskExecutionRolePolicy"),
+            "should name the policy that fixes it: {msg}"
+        );
+    }
+
+    #[test]
+    fn static_credential_oci_on_ecs_needs_a_secrets_manager_secret() {
+        // Anonymous is fine; static credentials are not, because ECS cannot be
+        // handed them inline and would fail at task start instead.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_USERNAME", "u");
+        env.insert("RISE_REGISTRY_PASSWORD", "p");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("repository_credentials_secret_arn"),
+            "unhelpful: {err}"
+        );
+
+        // With the ARN supplied it loads.
+        let mut env = env.clone();
+        env.insert(
+            "RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN",
+            "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise-registry",
+        );
+        load_shipped_ecs_config(&env).expect("static creds plus a secret ARN must load");
+    }
+
+    #[test]
+    fn anonymous_oci_on_ecs_is_accepted() {
+        // The shipped defaults leave username/password empty, so this is also a
+        // guard that the static-credential check does not fire on them.
+        load_shipped_ecs_config(&ecs_base_env()).expect("anonymous OCI must load");
+    }
+
+    #[test]
+    fn short_lived_token_registries_are_rejected_on_ecs() {
+        // GitLab and JFrog pull credentials expire and are refreshed by Rise on
+        // Kubernetes. ECS re-authenticates at every task start with no refresh
+        // path, so these deploy successfully and break hours later.
+        let overlay = "\
+registry:
+  type: gitlab
+  gitlab_url: https://gitlab.example.com
+  registry_url: registry.gitlab.example.com
+  namespace: org/project
+  username: rise
+  token: glpat-xxx
+";
+        let err = load_shipped_ecs_config_with_overlay(&ecs_base_env(), Some(overlay))
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("not supported"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("ecr"),
+            "should name a supported alternative: {msg}"
         );
     }
 

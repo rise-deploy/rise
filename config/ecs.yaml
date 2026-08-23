@@ -42,13 +42,32 @@ auth:
 
 registry:
   # ECR is the recommended registry for this backend: ECS pulls with the task
-  # execution role, so no pull secret is minted or stored anywhere.
+  # execution role, so no pull secret is minted or stored anywhere. Switch to it
+  # with RISE_REGISTRY_TYPE=ecr plus the RISE_ECR_* values below. The default is
+  # a plain OCI registry so this file loads without AWS-specific values — but
+  # note that a Fargate task must be able to reach whatever it names, which
+  # rules out an in-cluster registry address like the one below.
+  #
+  # Both key sets live here because the tagged enum ignores the keys belonging
+  # to the variant that is not selected; only `type` decides which apply.
   type: "${RISE_REGISTRY_TYPE:-oci-client-auth}"
+
+  # type: oci-client-auth
   registry_url: "${RISE_REGISTRY_URL:-rise-registry:5000}"
   namespace: "${RISE_REGISTRY_NAMESPACE:-rise-apps}"
   client_registry_url: "${RISE_CLIENT_REGISTRY_URL:-localhost:5000}"
+  # Static credentials additionally require
+  # deployment_controller.repository_credentials_secret_arn: ECS re-authenticates
+  # at every task start and cannot be handed inline credentials.
   username: "${RISE_REGISTRY_USERNAME:-}"
   password: "${RISE_REGISTRY_PASSWORD:-}"
+
+  # type: ecr — `region` is shared with the deployment controller below.
+  region: "${AWS_REGION:-eu-central-1}"
+  account_id: "${RISE_ECR_ACCOUNT_ID:-}"
+  push_role_arn: "${RISE_ECR_PUSH_ROLE_ARN:-}"
+  repo_prefix: "${RISE_ECR_REPO_PREFIX:-rise/}"
+  auto_remove: "${RISE_ECR_AUTO_REMOVE:-false}"
 
 deployment_controller:
   type: "ecs"
@@ -67,6 +86,10 @@ deployment_controller:
   execution_role_arn: "${RISE_ECS_EXECUTION_ROLE_ARN:-}"
   # The AWS identity the application containers themselves run as.
   task_role_arn: "${RISE_ECS_TASK_ROLE_ARN:-}"
+
+  # Secrets Manager secret holding {"username", "password"} for a private
+  # non-ECR registry. Leave unset for ECR and for anonymous registries.
+  repository_credentials_secret_arn: "${RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN:-}"
 
   log_group: "${RISE_ECS_LOG_GROUP:-}"
   resource_prefix: "${RISE_ECS_RESOURCE_PREFIX:-rise}"
