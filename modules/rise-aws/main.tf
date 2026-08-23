@@ -34,7 +34,7 @@ data "aws_region" "current" {}
 data "aws_partition" "current" {}
 
 locals {
-  region           = data.aws_region.current.id
+  region           = data.aws_region.current.region
   account_id       = data.aws_caller_identity.current.account_id
   partition        = data.aws_partition.current.partition
   s3_bucket_prefix = var.s3_bucket_prefix != null ? var.s3_bucket_prefix : var.name
