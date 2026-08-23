@@ -50,6 +50,11 @@ struct StackState {
     traefik_api: String,
     cluster: String,
     region: String,
+    /// `<account>.dkr.ecr.<region>.amazonaws.com` — the ECR registry Rise
+    /// pushes to and the task execution role pulls from.
+    ecr_registry: String,
+    /// Literal repository-name prefix, trailing slash included.
+    ecr_repo_prefix: String,
 }
 
 impl EcsBackend {
@@ -122,6 +127,8 @@ impl EcsBackend {
             traefik_api: get("RISE_E2E_TRAEFIK_API")?,
             cluster: get("RISE_E2E_CLUSTER")?,
             region: get("RISE_E2E_REGION")?,
+            ecr_registry: get("RISE_E2E_ECR_REGISTRY")?,
+            ecr_repo_prefix: get("RISE_E2E_ECR_REPO_PREFIX")?,
         })
     }
 
@@ -310,6 +317,71 @@ impl Backend for EcsBackend {
         }
         c.args(args);
         cli::run(c)
+    }
+
+    fn wait_registry_ready(&self, project: &str) -> Result<()> {
+        let repo = format!("{}{project}", self.stack().ecr_repo_prefix);
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        loop {
+            if self
+                .aws(&["ecr", "describe-repositories", "--repository-names", &repo])
+                .is_ok()
+            {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "ECR repository {repo:?} was not provisioned within 90s. Rise's ECR \
+                 controller creates it on a 10s poll under a leader lease — check the \
+                 control plane's logs for AssumeRole or ecr:CreateRepository denials."
+            );
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    fn deployed_image(&self, project: &str) -> Result<Option<String>> {
+        let services = self.project_services(project)?;
+        let Some(service) = services.first() else {
+            anyhow::bail!("no live ECS service tagged for project {project:?}");
+        };
+        let td = self
+            .aws(&[
+                "ecs",
+                "describe-services",
+                "--cluster",
+                &self.stack().cluster,
+                "--services",
+                service,
+                "--query",
+                "services[0].taskDefinition",
+                "--output",
+                "text",
+            ])?
+            .trim()
+            .to_string();
+        let image = self
+            .aws(&[
+                "ecs",
+                "describe-task-definition",
+                "--task-definition",
+                &td,
+                "--query",
+                "taskDefinition.containerDefinitions[0].image",
+                "--output",
+                "text",
+            ])?
+            .trim()
+            .to_string();
+        // Stack invariant: this install is configured with ECR, so anything the
+        // task definition names outside that registry means Rise resolved the
+        // image from somewhere the pull was never meant to come from.
+        anyhow::ensure!(
+            image.starts_with(&self.stack().ecr_registry),
+            "task definition for {project:?} runs {image:?}, which is not on the \
+             configured ECR registry {}",
+            self.stack().ecr_registry
+        );
+        Ok(Some(image))
     }
 
     fn cli_visible_path(&self, rel: &str) -> String {

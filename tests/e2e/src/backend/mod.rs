@@ -87,6 +87,29 @@ pub trait Backend {
     /// A small HTTP app to deploy for the public-deploy scenario.
     fn sample_app(&self) -> SampleApp;
 
+    /// Block until the registry has a repository ready for `project`, for
+    /// backends whose registry provisions them asynchronously.
+    ///
+    /// Default: nothing to wait for. ECS with an ECR registry overrides it —
+    /// repositories are created by a leader-elected controller on a 10-second
+    /// poll, not at project-create time, so a create-then-deploy inside that
+    /// window pushes against a repository that does not exist yet.
+    fn wait_registry_ready(&self, project: &str) -> Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// The image reference the runtime was actually told to run for `project`.
+    ///
+    /// `Ok(None)` means the backend does not expose it — a declared gap, never a
+    /// silent pass. ECS reads it back off the running service's task definition,
+    /// which is the only evidence that the pull went through the configured
+    /// registry rather than somewhere else.
+    fn deployed_image(&self, project: &str) -> Result<Option<String>> {
+        let _ = project;
+        Ok(None)
+    }
+
     /// Whether this backend can build & deploy an app from source
     /// (`deploy --backend docker:build`) — i.e. it has a registry the runtime can
     /// pull from. Only minikube's jfrog-vault mode does, in the harness.

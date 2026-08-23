@@ -58,6 +58,10 @@ command -v jq  >/dev/null || die "jq not found"
 CLUSTER="$PREFIX"
 ROLE_EXEC="$PREFIX-exec-role"
 ROLE_TASK="$PREFIX-task-role"
+ROLE_PUSH="$PREFIX-push-role"
+# Trailing slash required: the prefix is concatenated literally onto the project
+# name, so "rise-e2e" would yield repositories named "rise-e2eapp".
+ECR_REPO_PREFIX="$PREFIX/"
 LOG_GROUP="/$PREFIX"
 
 # ── teardown ────────────────────────────────────────────────────────────────
@@ -114,6 +118,17 @@ teardown() {
   aws ecs delete-cluster --cluster "$CLUSTER" >/dev/null 2>&1
   aws logs delete-log-group --log-group-name "$LOG_GROUP" >/dev/null 2>&1
 
+  # Rise deletes its own repositories when a project is deleted
+  # (RISE_ECR_AUTO_REMOVE), but an aborted run leaves them behind, and an ECR
+  # repository still holding images is billed. --force deletes the images too.
+  local repos
+  repos=$(aws ecr describe-repositories \
+    --query "repositories[?starts_with(repositoryName, '$ECR_REPO_PREFIX')].repositoryName" \
+    --output text 2>/dev/null || true)
+  for repo in $repos; do
+    aws ecr delete-repository --repository-name "$repo" --force >/dev/null 2>&1
+  done
+
   local sg_id
   sg_id=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$PREFIX-sg" \
     --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
@@ -125,7 +140,7 @@ teardown() {
     done
   fi
 
-  for role in "$ROLE_EXEC" "$ROLE_TASK"; do
+  for role in "$ROLE_EXEC" "$ROLE_TASK" "$ROLE_PUSH"; do
     local policies
     policies=$(aws iam list-role-policies --role-name "$role" --query 'PolicyNames[]' --output text 2>/dev/null || true)
     for pol in $policies; do
@@ -217,6 +232,44 @@ aws iam put-role-policy --role-name "$ROLE_TASK" --policy-name rise-controller -
 }" >/dev/null
 EXEC_ROLE_ARN="arn:aws:iam::$ACCOUNT:role/$ROLE_EXEC"
 TASK_ROLE_ARN="arn:aws:iam::$ACCOUNT:role/$ROLE_TASK"
+PUSH_ROLE_ARN="arn:aws:iam::$ACCOUNT:role/$ROLE_PUSH"
+
+# The registry push role. Rise assumes it (narrowed further by an inline session
+# policy) to mint the per-project credentials the CLI pushes with, so its trust
+# policy names the Rise task role rather than a service principal.
+aws iam create-role --role-name "$ROLE_PUSH" --assume-role-policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [{
+    \"Effect\": \"Allow\",
+    \"Principal\": {\"AWS\": \"$TASK_ROLE_ARN\"},
+    \"Action\": \"sts:AssumeRole\"
+  }]
+}" --tags "Key=$TAG_KEY,Value=$TAG_VALUE" >/dev/null 2>&1
+aws iam put-role-policy --role-name "$ROLE_PUSH" --policy-name ecr-data-plane --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": \"ecr:GetAuthorizationToken\", \"Resource\": \"*\"},
+    {\"Effect\": \"Allow\", \"Action\": [
+        \"ecr:BatchCheckLayerAvailability\", \"ecr:InitiateLayerUpload\",
+        \"ecr:UploadLayerPart\", \"ecr:CompleteLayerUpload\", \"ecr:PutImage\",
+        \"ecr:BatchGetImage\", \"ecr:GetDownloadUrlForLayer\"
+      ], \"Resource\": \"arn:aws:ecr:$REGION:$ACCOUNT:repository/$ECR_REPO_PREFIX*\"}
+  ]
+}" >/dev/null
+
+# Repository lifecycle runs as the control plane's own identity, not the push
+# role, so those permissions belong on the task role.
+aws iam put-role-policy --role-name "$ROLE_TASK" --policy-name rise-ecr --policy-document "{
+  \"Version\": \"2012-10-17\",
+  \"Statement\": [
+    {\"Effect\": \"Allow\", \"Action\": \"sts:AssumeRole\", \"Resource\": \"$PUSH_ROLE_ARN\"},
+    {\"Effect\": \"Allow\", \"Action\": [
+        \"ecr:CreateRepository\", \"ecr:DescribeRepositories\", \"ecr:DeleteRepository\",
+        \"ecr:TagResource\", \"ecr:ListTagsForResource\", \"ecr:PutImageScanningConfiguration\"
+      ], \"Resource\": \"*\"}
+  ]
+}" >/dev/null
+
 sleep 10  # IAM propagation before PassRole at task launch
 
 log "Creating cluster, log group and Cloud Map namespace"
@@ -396,7 +449,8 @@ TD_RISE=$(register_td "$(jq -n --arg img "$RISE_IMAGE" --arg family "$PREFIX-ris
   --arg region "$REGION" --arg lg "$LOG_GROUP" --arg secret "$JWT_SECRET" \
   --arg pw "$POSTGRES_PASSWORD" --arg issuer "$DEX_ISSUER" \
   --arg auth_backend "$AUTH_BACKEND_URL" --arg exec_arn "$EXEC_ROLE_ARN" \
-  --arg task_arn "$TASK_ROLE_ARN" '{
+  --arg task_arn "$TASK_ROLE_ARN" --arg account "$ACCOUNT" \
+  --arg push_role "$PUSH_ROLE_ARN" --arg repo_prefix "$ECR_REPO_PREFIX" '{
   family: $family, networkMode: "awsvpc", requiresCompatibilities: ["FARGATE"],
   cpu: "512", memory: "1024", executionRoleArn: $exec_role, taskRoleArn: $task_role,
   containerDefinitions: [{
@@ -422,6 +476,11 @@ TD_RISE=$(register_td "$(jq -n --arg img "$RISE_IMAGE" --arg family "$PREFIX-ris
       {name: "RISE_ECS_TASK_ROLE_ARN", value: $task_arn},
       {name: "RISE_ECS_LOG_GROUP", value: $lg},
       {name: "AWS_REGION", value: $region},
+      {name: "RISE_REGISTRY_TYPE", value: "ecr"},
+      {name: "RISE_ECR_ACCOUNT_ID", value: $account},
+      {name: "RISE_ECR_PUSH_ROLE_ARN", value: $push_role},
+      {name: "RISE_ECR_REPO_PREFIX", value: $repo_prefix},
+      {name: "RISE_ECR_AUTO_REMOVE", value: "true"},
       {name: "RISE_MAX_REPLICAS", value: "10"},
       {name: "RISE_SSRF_ALLOW_PRIVATE", value: "true"},
       {name: "RISE_SSRF_ALLOW_HTTP", value: "true"}
@@ -466,6 +525,8 @@ export RISE_E2E_DEX_ISSUER="$DEX_ISSUER"
 export RISE_E2E_TRAEFIK_API="http://$TIP:8080"
 export RISE_E2E_CLUSTER="$CLUSTER"
 export RISE_E2E_REGION="$REGION"
+export RISE_E2E_ECR_REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+export RISE_E2E_ECR_REPO_PREFIX="$ECR_REPO_PREFIX"
 EOF
 
 log "Stack is up"

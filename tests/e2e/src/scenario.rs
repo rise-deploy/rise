@@ -29,6 +29,7 @@ pub trait Scenario {
 pub fn all() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(PublicDeploy),
+        Box::new(RegistryBuildPushPull),
         Box::new(SaTokenExchange),
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
@@ -217,6 +218,88 @@ impl Scenario for PublicDeploy {
         create_public_project(b, &project)?;
         deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
+        assert_app_reachable(b, &app, &project, self.id())?;
+        Ok(())
+    }
+}
+
+// ---- (a2) build -> push -> pull through the configured registry ------------
+
+struct RegistryBuildPushPull;
+
+impl Scenario for RegistryBuildPushPull {
+    fn id(&self) -> &'static str {
+        "registry-build-push-pull"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            // ECS is the backend where the registry path is load-bearing and
+            // unlike the others: the runtime authenticates the pull itself with
+            // the task execution role, so nothing Rise does at deploy time
+            // proves the pull will work. Only a real push and a real pull does.
+            BackendKind::Ecs => Applicability::Run,
+            BackendKind::Docker => {
+                Applicability::Skip("docker pulls with credentials Rise hands the daemon")
+            }
+            BackendKind::Minikube => {
+                Applicability::Skip("covered by workload-identity in jfrog-vault mode")
+            }
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-reg");
+        create_public_project(b, &project)?;
+        // Repository provisioning is asynchronous on ECR; pushing before it
+        // lands fails with a repository-not-found that reads like a permissions
+        // problem.
+        b.wait_registry_ready(&project)?;
+
+        // Build locally and push with the credentials Rise mints for this
+        // project, then let the runtime pull it back.
+        expect_ok(
+            b.rise_cli_build(
+                &[
+                    "deploy",
+                    "--project",
+                    &project,
+                    "--backend",
+                    "docker:build",
+                    "--container-cli",
+                    "docker",
+                    "--http-port",
+                    "8000",
+                    "--replicas",
+                    "1",
+                    "tests/e2e-build/fixture",
+                ],
+                None,
+            )?,
+            "build and deploy from source",
+        )?;
+        b.wait_healthy(&project)?;
+
+        // Healthy means the runtime pulled the image. Confirm it pulled the one
+        // we pushed: a fallback to some other reference would otherwise pass.
+        match b.deployed_image(&project)? {
+            Some(image) => anyhow::ensure!(
+                image.contains(&project),
+                "{}: deployed image {image:?} is not this project's pushed image",
+                self.id()
+            ),
+            None => eprintln!(
+                "[e2e] {}: deployed-image readback not wired for {} — asserted via Healthy only",
+                self.id(),
+                b.name()
+            ),
+        }
+
+        let app = SampleApp {
+            image: "",
+            http_port: "8000",
+            body_marker: Some("rise-e2e-ok"),
+        };
         assert_app_reachable(b, &app, &project, self.id())?;
         Ok(())
     }
