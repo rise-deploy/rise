@@ -28,9 +28,10 @@
 #     tests/e2e/aws/ecs-stack.sh up      # prints shell-eval'able exports
 #   … tests/e2e/aws/ecs-stack.sh down
 #
-# Requirements: aws CLI v2, jq, curl. The account needs its Fargate on-demand
-# vCPU quota raised above the fresh-account default of 6 — the control plane
-# alone uses ~1.5 vCPU and every app task rounds up to 0.5.
+# Requirements: aws CLI v2, jq, curl. Watch the account's Fargate on-demand vCPU
+# quota: the control plane here is ~1.5 vCPU and every app task the suite leaves
+# running adds 0.5, which lands a clean run near 3.5 against a fresh account's
+# default of 6. It fits, but with no room for a second run or a leftover stack.
 set -uo pipefail
 
 PREFIX="${RISE_E2E_PREFIX:-rise-e2e}"

@@ -86,13 +86,18 @@ account you care about.
    `Vpcs[?is-default]` and the first subnet under it, and fails if there is
    none — a region where the default VPC has been deleted needs one recreated
    (`aws ec2 create-default-vpc`).
-2. **Fargate on-demand vCPU quota raised.** A fresh account gets **6**. The
-   control plane alone takes 1.5 (Traefik 0.25 + Postgres 0.5 + Dex 0.25 +
-   Rise 0.5), and every app task rounds up to 0.5 — with five scenarios leaving
-   their deployments running, a full suite peaks around 4 vCPU on top of that.
-   Ask for **16** (Service Quotas → Amazon ECS → *Fargate On-Demand vCPU
-   resource count*); at the default the later scenarios fail as tasks that never
-   leave `PROVISIONING`.
+2. **Fargate on-demand vCPU headroom.** A fresh account's quota is **6**. The
+   control plane takes 1.5 (Traefik 0.25 + Postgres 0.5 + Dex 0.25 + Rise 0.5)
+   and each app task resolves to 0.5 — Rise's `500m` default rounds up to a
+   Fargate 512-unit size. **No scenario stops its deployment or deletes its
+   project**, so app tasks accumulate for the whole run: four scenarios deploy
+   one each (`public-deploy`, `registry-build-push-pull`, `private-ingress-auth`,
+   `route-access-override`; `sa-token-exchange` deploys none), for **~3.5 vCPU
+   at the end of a clean run**. That fits the default, but by one task — a stuck
+   task, a second concurrent run, or a stack a previous `KEEP=1` left up spends
+   the margin. Ask for **16** (Service Quotas → Amazon ECS → *Fargate On-Demand
+   vCPU resource count*), and suspect the quota first when a task will not leave
+   `PROVISIONING`.
 3. **A published `RISE_IMAGE_TAG`.** ECS pulls the control-plane image from
    GHCR, so a local build is not visible to it. Same constraint the Docker
    driver already has.

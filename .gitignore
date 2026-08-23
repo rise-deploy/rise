@@ -42,3 +42,14 @@ buildpack-samples/
 tmp/
 .playwright-mcp/
 .worktrees
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+# Reusable modules (no backend) do not pin a lock file; root modules that
+# consume them do.
+modules/**/.terraform.lock.hcl
+crash.log

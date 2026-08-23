@@ -235,9 +235,9 @@ data "aws_iam_policy_document" "backend" {
   dynamic "statement" {
     for_each = var.enable_s3 ? [1] : []
     content {
-      sid    = "DenyRemoveS3UserBoundary"
-      effect = "Deny"
-      actions = ["iam:DeleteUserPermissionsBoundary"]
+      sid       = "DenyRemoveS3UserBoundary"
+      effect    = "Deny"
+      actions   = ["iam:DeleteUserPermissionsBoundary"]
       resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
     }
   }
@@ -518,9 +518,9 @@ resource "aws_iam_policy" "s3_user_boundary" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "S3BucketAccess"
-        Effect   = "Allow"
-        Action   = ["s3:*"]
+        Sid    = "S3BucketAccess"
+        Effect = "Allow"
+        Action = ["s3:*"]
         Resource = [
           "arn:aws:s3:::${local.s3_bucket_prefix}-*",
           "arn:aws:s3:::${local.s3_bucket_prefix}-*/*",
