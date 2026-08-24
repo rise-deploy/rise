@@ -748,7 +748,7 @@
           "type": "object"
         },
         {
-          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service and lets Traefik's ECS\nprovider route to the tasks via labels Rise stamps on the container\ndefinition. No Kubernetes, no Metacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0004 for the design and its deliberate v1 limitations.",
+          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service and lets Traefik's ECS\nprovider route to the tasks via labels Rise stamps on the container\ndefinition. No Kubernetes, no Metacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0005 for the design and its deliberate v1 limitations.",
           "properties": {
             "access_classes": {
               "additionalProperties": {
@@ -1062,7 +1062,7 @@
           "type": "object"
         },
         {
-          "description": "No runtime log backend.\n\nEvery other variant needs a runtime client the ECS backend does not have\n(a kube client, a bollard handle), so without this an ECS install would\nfall through to the `Kubernetes` default and **crash at startup** with\n\"Kubernetes log backend requires kube client\". This makes \"no runtime\nlogs\" an explicit, working choice: the API answers with a clear\n`historical_backend_not_configured` status instead of an error, and the\nUI renders its empty state.\n\nECS installs that want runtime logs today can use the `loki` variant,\nwhich is backend-agnostic (it queries by stream labels, not a runtime\nclient). A CloudWatch variant is the intended replacement — see ADR-0004.",
+          "description": "No runtime log backend.\n\nEvery other variant needs a runtime client the ECS backend does not have\n(a kube client, a bollard handle), so without this an ECS install would\nfall through to the `Kubernetes` default and **crash at startup** with\n\"Kubernetes log backend requires kube client\". This makes \"no runtime\nlogs\" an explicit, working choice: the API answers with a clear\n`historical_backend_not_configured` status instead of an error, and the\nUI renders its empty state.\n\nECS installs that want runtime logs today can use the `loki` variant,\nwhich is backend-agnostic (it queries by stream labels, not a runtime\nclient). A CloudWatch variant is the intended replacement — see ADR-0005.",
           "properties": {
             "type": {
               "const": "none",
