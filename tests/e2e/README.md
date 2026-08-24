@@ -139,7 +139,7 @@ a crashed or cancelled run never reaches teardown.
 and leaves the edge open until you destroy it:
 
 ```bash
-terraform -chdir=tests/e2e/aws/run destroy -auto-approve
+terraform -chdir=tests/e2e/run destroy -auto-approve
 ```
 
 ## Layout

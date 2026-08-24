@@ -102,3 +102,57 @@ run "ci_role_can_pass_roles_but_not_write_iam" {
     error_message = "the CI role has an IAM action beyond PassRole"
   }
 }
+
+run "the_bootstrap_apply_role_is_off_by_default" {
+  command = plan
+
+  # It can write IAM, and a principal that can create roles and attach policies
+  # can escalate. Nobody should acquire it by applying this module.
+  assert {
+    condition     = length(aws_iam_role.ci_bootstrap) == 0
+    error_message = "the IAM-writing role is created without being asked for"
+  }
+}
+
+run "the_bootstrap_apply_role_is_narrowly_trusted_and_scoped" {
+  command = plan
+
+  variables {
+    enable_ci_bootstrap_role = true
+  }
+
+  # Not repo:<repo>:* like the run role: a pull request, or a branch anyone can
+  # push, must not reach an identity that can write IAM.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(data.aws_iam_policy_document.ci_bootstrap_assume[0].json).Statement :
+      !contains(
+        flatten([try(s.Condition.StringLike["token.actions.githubusercontent.com:sub"], [])]),
+        "repo:rise-deploy/rise:*"
+      )
+    ])
+    error_message = "the bootstrap role trusts every ref in the repository"
+  }
+
+  assert {
+    condition     = strcontains(data.aws_iam_policy_document.ci_bootstrap_assume[0].json, "refs/heads/develop")
+    error_message = "the default trust subject is not the develop branch"
+  }
+
+  # The escalation-capable actions must not reach roles this workspace does not
+  # own.
+  assert {
+    condition = alltrue([
+      for s in jsondecode(data.aws_iam_policy_document.ci_bootstrap[0].json).Statement :
+      s.Sid != "ManageEnvironmentIAM" || !contains(flatten([s.Resource]), "*")
+    ])
+    error_message = "IAM writes are granted on every role in the account"
+  }
+
+  # Recreating the account-global OIDC provider would break every other workflow
+  # that trusts it.
+  assert {
+    condition     = !strcontains(data.aws_iam_policy_document.ci_bootstrap[0].json, "iam:CreateOpenIDConnectProvider")
+    error_message = "the bootstrap role can replace the shared OIDC provider"
+  }
+}

@@ -43,7 +43,7 @@ locals {
 }
 
 module "control_plane_env" {
-  source = "../../../../modules/rise-ecs/modules/control-plane-env"
+  source = "../../../modules/rise-ecs/modules/control-plane-env"
 
   ingress_domain = var.ingress_domain
   # Plain HTTP. There is no load balancer to terminate at and no ACME, and the

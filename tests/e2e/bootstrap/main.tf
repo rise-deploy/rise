@@ -35,7 +35,7 @@ locals {
 # -----------------------------------------------------------------------------
 
 module "rise_aws" {
-  source = "../../../../modules/rise-aws"
+  source = "../../../modules/rise-aws"
 
   name       = var.name
   enable_ecr = true
@@ -113,9 +113,16 @@ resource "aws_iam_role_policy" "traefik" {
 # -----------------------------------------------------------------------------
 
 resource "aws_s3_bucket" "state" {
-  bucket        = local.state_bucket
-  force_destroy = true
-  tags          = local.tags
+  bucket = local.state_bucket
+  tags   = local.tags
+
+  lifecycle {
+    # This bucket holds this workspace's own state. Without the guard a
+    # `terraform destroy` would delete the state file it is reading from,
+    # halfway through, leaving every other resource orphaned and unmanageable.
+    # Emptying and removing it is a deliberate manual act -- see the README.
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "state" {

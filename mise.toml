@@ -146,10 +146,13 @@ cargo test --package rise-backend-ecs --all-targets
 env.SQLX_OFFLINE = true
 
 [tasks."terraform:check"]
-description = "Format-check, validate and unit-test the Terraform modules."
+description = "Format-check, validate and unit-test the Terraform modules and e2e workspaces."
 run = """
-terraform fmt -check -recursive modules/
-for dir in modules/*/; do
+terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run
+# -backend=false so the e2e workspaces, which declare an S3 backend, check
+# without credentials or a bucket.
+for dir in modules/*/ tests/e2e/bootstrap tests/e2e/run; do
+  echo "==> $dir"
   terraform -chdir="$dir" init -backend=false -input=false >/dev/null
   terraform -chdir="$dir" validate
   terraform -chdir="$dir" test

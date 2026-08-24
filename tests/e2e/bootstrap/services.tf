@@ -169,7 +169,7 @@ locals {
   # the static user it defines (tests/e2e/src/scenario.rs:345,367). A
   # hand-written template here would diverge from it silently.
   dex_config = replace(
-    file("${path.module}/../../../../dev/dex/config.yaml"),
+    file("${path.module}/../../../dev/dex/config.yaml"),
     "/(?m)^issuer:.*$/",
     "issuer: ${local.dex_issuer}"
   )

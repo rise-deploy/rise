@@ -124,3 +124,17 @@ resource "aws_ssm_parameter" "bootstrap" {
 
   tags = local.tags
 }
+
+output "ci_bootstrap_role_arn" {
+  description = "Role that applies this workspace from CI. Null unless enable_ci_bootstrap_role is set."
+  value       = var.enable_ci_bootstrap_role ? aws_iam_role.ci_bootstrap[0].arn : null
+}
+
+output "backend_config" {
+  description = "The `terraform init -backend-config=...` arguments for this workspace."
+  value = {
+    bucket = aws_s3_bucket.state.id
+    key    = "bootstrap/terraform.tfstate"
+    region = var.region
+  }
+}

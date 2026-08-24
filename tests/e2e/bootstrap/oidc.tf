@@ -8,11 +8,6 @@
 # ever creates ECS, CloudWatch and Cloud Map resources. The two IAM-adjacent
 # actions it does need are called out below.
 
-data "aws_iam_openid_connect_provider" "github" {
-  count = var.create_github_oidc_provider ? 0 : 1
-  url   = "https://token.actions.githubusercontent.com"
-}
-
 resource "aws_iam_openid_connect_provider" "github" {
   count = var.create_github_oidc_provider ? 1 : 0
 
@@ -24,9 +19,11 @@ resource "aws_iam_openid_connect_provider" "github" {
 }
 
 locals {
-  github_oidc_provider_arn = var.create_github_oidc_provider ? (
-    aws_iam_openid_connect_provider.github[0].arn
-  ) : data.aws_iam_openid_connect_provider.github[0].arn
+  # Interpolated rather than referenced: the ARN is deterministic, and building
+  # it keeps both trust policies known at `terraform plan`. Who may assume a
+  # role that can write IAM should be readable in a diff, not "(known after
+  # apply)".
+  github_oidc_provider_arn = "arn:${local.partition}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"
 }
 
 data "aws_iam_policy_document" "ci_assume" {
@@ -211,4 +208,183 @@ resource "aws_iam_role_policy" "ci" {
   name   = "e2e"
   role   = aws_iam_role.ci.id
   policy = data.aws_iam_policy_document.ci.json
+}
+
+# -----------------------------------------------------------------------------
+# The identity that manages *this* workspace from CI
+#
+# Separate from the run role, and deliberately harder to reach.
+#
+# **This role can write IAM, and a principal that can create roles and attach
+# policies can grant itself anything.** In an account that holds nothing else
+# that is an acceptable trade for not applying the bootstrap by hand forever; in
+# any account that matters it is not. Two things narrow it:
+#
+#   - it is opt-in (`enable_ci_bootstrap_role`, default off), so nobody acquires
+#     it by applying this module, and
+#   - its trust names specific refs (`ci_bootstrap_subjects`, default the
+#     develop branch) rather than the run role's `repo:<repo>:*`, so a pull
+#     request from a fork -- or from a branch anyone can push -- cannot assume
+#     it.
+#
+# Point it at a GitHub Environment with required reviewers
+# (`repo:<repo>:environment:<name>`) if you want a human in the loop.
+# -----------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ci_bootstrap_assume" {
+  count = var.enable_ci_bootstrap_role ? 1 : 0
+
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Federated"
+      identifiers = [local.github_oidc_provider_arn]
+    }
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:sub"
+      values = length(var.ci_bootstrap_subjects) > 0 ? var.ci_bootstrap_subjects : [
+        "repo:${var.github_repository}:ref:refs/heads/develop"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "ci_bootstrap" {
+  count = var.enable_ci_bootstrap_role ? 1 : 0
+
+  name                 = "${var.name}-ci-bootstrap"
+  description          = "GitHub Actions identity that applies the Rise e2e bootstrap workspace"
+  assume_role_policy   = data.aws_iam_policy_document.ci_bootstrap_assume[0].json
+  max_session_duration = 3600
+  tags                 = local.tags
+}
+
+data "aws_iam_policy_document" "ci_bootstrap" {
+  count = var.enable_ci_bootstrap_role ? 1 : 0
+
+  # Everything this workspace creates. Scoped by resource where the service
+  # supports it and the names are ours to predict; `*` where it does not.
+  statement {
+    sid    = "ManageEnvironmentInfrastructure"
+    effect = "Allow"
+    actions = [
+      "ecs:*",
+      "ec2:*",
+      "logs:*",
+      "servicediscovery:*",
+      "route53:*",
+      "ecr:*",
+      "ssm:*",
+      "kms:DescribeKey",
+      "kms:CreateGrant",
+      "sts:GetCallerIdentity",
+    ]
+    resources = ["*"]
+  }
+
+  # The escalation-capable part, confined to the role and policy names this
+  # workspace owns. It cannot touch an unrelated role in the account.
+  statement {
+    sid    = "ManageEnvironmentIAM"
+    effect = "Allow"
+    actions = [
+      "iam:CreateRole",
+      "iam:DeleteRole",
+      "iam:GetRole",
+      "iam:UpdateRole",
+      "iam:UpdateAssumeRolePolicy",
+      "iam:PutRolePolicy",
+      "iam:DeleteRolePolicy",
+      "iam:GetRolePolicy",
+      "iam:ListRolePolicies",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:ListAttachedRolePolicies",
+      "iam:TagRole",
+      "iam:UntagRole",
+      "iam:ListRoleTags",
+      "iam:PassRole",
+    ]
+    resources = [
+      "arn:${local.partition}:iam::${local.account_id}:role/${var.name}",
+      "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-*",
+    ]
+  }
+
+  statement {
+    sid    = "ManageEnvironmentPolicies"
+    effect = "Allow"
+    actions = [
+      "iam:CreatePolicy",
+      "iam:DeletePolicy",
+      "iam:GetPolicy",
+      "iam:GetPolicyVersion",
+      "iam:ListPolicyVersions",
+      "iam:CreatePolicyVersion",
+      "iam:DeletePolicyVersion",
+      "iam:TagPolicy",
+      "iam:ListEntitiesForPolicy",
+    ]
+    resources = [
+      "arn:${local.partition}:iam::${local.account_id}:policy/${var.name}",
+      "arn:${local.partition}:iam::${local.account_id}:policy/${var.name}-*",
+    ]
+  }
+
+  # The OIDC provider is account-global and shared, so it is readable but not
+  # writable: recreating it would break every other workflow that trusts it.
+  statement {
+    sid       = "ReadOIDCProvider"
+    effect    = "Allow"
+    actions   = ["iam:GetOpenIDConnectProvider", "iam:ListOpenIDConnectProviders"]
+    resources = ["*"]
+  }
+
+  # Its own state, and the run workspace's alongside it.
+  statement {
+    sid    = "ManageWorkspaceState"
+    effect = "Allow"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:ListBucket",
+      "s3:GetBucketVersioning",
+      "s3:GetBucketPublicAccessBlock",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetBucketTagging",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketAcl",
+      "s3:GetBucketLocation",
+      "s3:GetLifecycleConfiguration",
+      "s3:GetReplicationConfiguration",
+      "s3:GetAccelerateConfiguration",
+      "s3:GetBucketRequestPayment",
+      "s3:GetBucketLogging",
+      "s3:GetBucketWebsite",
+      "s3:GetBucketCORS",
+      "s3:GetBucketObjectLockConfiguration",
+    ]
+    resources = [
+      "arn:${local.partition}:s3:::${local.state_bucket}",
+      "arn:${local.partition}:s3:::${local.state_bucket}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "ci_bootstrap" {
+  count = var.enable_ci_bootstrap_role ? 1 : 0
+
+  name   = "bootstrap"
+  role   = aws_iam_role.ci_bootstrap[0].id
+  policy = data.aws_iam_policy_document.ci_bootstrap[0].json
 }

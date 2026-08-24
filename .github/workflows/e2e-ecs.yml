@@ -1,7 +1,7 @@
 name: E2E / ECS
 
 # Runs the cross-backend harness against the persistent Amazon ECS environment
-# in the scratch account (see tests/e2e/aws/bootstrap, applied once by hand).
+# in the scratch account (see tests/e2e/bootstrap, applied once by hand).
 #
 # Not part of ci.yml: it needs AWS credentials, it takes appreciably longer than
 # the other backends, and it drives a shared environment that only one run may
@@ -109,4 +109,4 @@ jobs:
         env:
           AWS_REGION: ${{ vars.AWS_E2E_REGION }}
         run: |
-          terraform -chdir=tests/e2e/aws/run destroy -auto-approve -input=false || true
+          terraform -chdir=tests/e2e/run destroy -auto-approve -input=false || true

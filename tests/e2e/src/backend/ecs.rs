@@ -3,10 +3,10 @@
 //! Like the other two drivers, this one owns its environment's lifecycle — but
 //! it owns only half of it. The AWS side is split:
 //!
-//! - **`tests/e2e/aws/bootstrap`** is applied once, by hand, and never touched
+//! - **`tests/e2e/bootstrap`** is applied once, by hand, and never touched
 //!   here: VPC, cluster, Cloud Map, Traefik, Dex, a Route 53 zone, and all the
 //!   IAM. It is separate because CI runs under a role with no IAM-write.
-//! - **`tests/e2e/aws/run`** is applied and destroyed around every suite:
+//! - **`tests/e2e/run`** is applied and destroyed around every suite:
 //!   Postgres and the Rise control plane, so each run starts on a fresh database
 //!   and the image under test.
 //!
@@ -141,11 +141,7 @@ impl EcsBackend {
     }
 
     fn run_dir(&self) -> PathBuf {
-        self.repo_root
-            .join("tests")
-            .join("e2e")
-            .join("aws")
-            .join("run")
+        self.repo_root.join("tests").join("e2e").join("run")
     }
 
     fn aws(&self, args: &[&str]) -> Result<String> {
@@ -182,7 +178,7 @@ impl EcsBackend {
             ])
             .with_context(|| {
                 format!(
-                    "read /{}/e2e/bootstrap. Has tests/e2e/aws/bootstrap been applied \
+                    "read /{}/e2e/bootstrap. Has tests/e2e/bootstrap been applied \
                      to this account and region?",
                     self.env_name
                 )

@@ -68,3 +68,30 @@ variable "create_github_oidc_provider" {
   type        = bool
   default     = true
 }
+
+variable "enable_ci_bootstrap_role" {
+  description = <<-EOT
+    Create a second OIDC role that can apply this workspace from CI.
+
+    Off by default because it can write IAM, and a principal that can create
+    roles and attach policies can escalate to whatever the account allows. Turn
+    it on only where that is an acceptable trade -- and narrow
+    `ci_bootstrap_subjects` when you do.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "ci_bootstrap_subjects" {
+  description = <<-EOT
+    GitHub OIDC subjects allowed to assume the bootstrap-apply role. Empty
+    defaults to the repository's develop branch.
+
+    Unlike the run role this is not `repo:<repo>:*`: a branch anyone can push,
+    or a pull request, must not reach an identity that can write IAM. A GitHub
+    Environment with required reviewers -- `repo:<repo>:environment:<name>` --
+    puts a human in the loop.
+  EOT
+  type        = list(string)
+  default     = []
+}
