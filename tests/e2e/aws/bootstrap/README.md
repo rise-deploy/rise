@@ -30,8 +30,40 @@ terraform init
 terraform apply -var 'dns_zone_name=e2e.example.com' -var 'github_repository=rise-deploy/rise'
 ```
 
-Then delegate `dns_zone_name` to the name servers in the `dns_name_servers`
-output, once. Everything after that is automatic.
+Two things to do once, afterwards.
+
+**Delegate the zone.** Point `dns_zone_name` at the name servers in the
+`dns_name_servers` output from whatever holds the parent domain. Without this the
+`rise` CLI cannot resolve the environment — it is the only component that needs
+DNS, since the harness reaches apps through Traefik with explicit `Host` headers.
+
+**Wire CI.** `.github/workflows/e2e-ecs.yml` assumes the role this module creates,
+via three repository variables (Settings → Secrets and variables → Actions →
+Variables). They are variables, not secrets: none is sensitive, and the whole
+point of the OIDC role is that no long-lived credential is stored.
+
+| Variable | Value |
+|---|---|
+| `AWS_E2E_ROLE_ARN` | the `ci_role_arn` output |
+| `AWS_E2E_REGION` | the `region` output |
+| `AWS_E2E_ENV_NAME` | the `name` you applied with — only needed if you changed it from `rise-e2e` |
+
+The harness itself needs no other configuration: `RISE_E2E_ENV` plus the region
+is enough for it to read `/<name>/e2e/bootstrap` from Parameter Store and learn
+everything else.
+
+## Running the suite against it
+
+```bash
+AWS_PROFILE=<scratch> AWS_REGION=<region> \
+RISE_E2E_BACKEND=ecs RISE_E2E_ENV=rise-e2e RISE_IMAGE_TAG=<published-tag> \
+  cargo run --manifest-path tests/e2e/Cargo.toml
+```
+
+The harness applies `../run` (Postgres and the control plane), runs the
+scenarios, and destroys it again. It also sweeps leaked workloads at **bring-up**,
+not only teardown, because a crashed run never reaches teardown — and what it
+leaves behind holds Fargate quota that a later run needs.
 
 ## Why a Route 53 zone
 
