@@ -76,6 +76,34 @@ run "creates_a_whole_install" {
   }
 }
 
+# A cluster shared by two installs is only safe if each Traefik discovers just
+# its own containers. The constraint is what enforces that, and it must stay off
+# by default so a single-install cluster keeps routing everything Rise labels.
+run "traefik_discovery_is_unconstrained_by_default" {
+  command = plan
+
+  assert {
+    condition     = length([for c in local.traefik_command : c if strcontains(c, "constraints")]) == 0
+    error_message = "an unset traefik_constraints must add no constraint flag"
+  }
+}
+
+run "traefik_discovery_can_be_confined_to_one_install" {
+  command = plan
+
+  variables {
+    traefik_constraints = "Label(`rise.dev/controller-class`, `pr-457`)"
+  }
+
+  assert {
+    condition = contains(
+      local.traefik_command,
+      "--providers.ecs.constraints=Label(`rise.dev/controller-class`, `pr-457`)"
+    )
+    error_message = "traefik_constraints must reach Traefik as a provider flag"
+  }
+}
+
 run "brings_an_existing_vpc_and_cluster" {
   command = plan
 

@@ -345,6 +345,25 @@ parameter version**, which `PutParameter` returns and which changes exactly when
 a value is rewritten. Tracked as follow-up work; it reorders secret writes ahead
 of desired-state computation, so it is a change worth making on its own.
 
+**Several installs, one cluster.** The controller class is the isolation token,
+and it does two jobs. The orphan collector already scopes to its own class, so
+distinct classes stop one install collecting another's services. Routing needs
+the same separation, and Traefik's ECS provider cannot see ECS resource tags —
+it matches its `constraints` expression against container labels only, and
+reserves `traefik.*` for its own configuration. So the task-definition builder
+stamps the controller class into `dockerLabels` under Rise's own namespace, and
+`modules/rise-ecs` exposes `traefik_constraints` to match on it:
+
+```hcl
+deployment_controller_class = "my-install"
+traefik_constraints         = "Label(`rise.dev/controller-class`, `my-install`)"
+```
+
+Unset, the constraint is absent and Traefik discovers every Rise-labelled
+container in the cluster — correct for a cluster hosting one install, which is
+the common case. Anything Traefik should route needs the label, including
+non-Rise containers placed in the cluster by hand.
+
 ### D8. Workload identity: a sidecar writing the same file contract
 
 Rise's workload identity contract is a set of files at fixed in-container paths:
@@ -512,7 +531,9 @@ resolve (a project can be renamed); it only considers services carrying both our
 the cluster is never touched **provided it runs a different controller class** —
 two installs with separate databases, the same class and the same label
 namespace would each resolve the other's live services as absent and delete
-them, so one cluster must never be shared by two installs of the same class; a failed lookup leaves the service alone, so a
+them. Sharing a cluster is therefore supported, but only between installs whose
+controller classes differ, and it takes two things: distinct classes, and a
+Traefik confined to each (below); a failed lookup leaves the service alone, so a
 transient database error cannot escalate into deleting a live workload; and it
 skips projects this tick already reconciled (governed by the diff) or whose
 ownership could not be resolved (nothing about their state is trustworthy).

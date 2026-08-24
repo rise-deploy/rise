@@ -80,6 +80,16 @@ locals {
       "--providers.ecs.exposedByDefault=false",
       "--providers.ecs.refreshSeconds=${var.traefik_refresh_seconds}",
       "--providers.ecs.healthyTasksOnly=true",
+    ],
+    # Confine discovery to one Rise install. Without it a cluster shared by two
+    # installs gives each Traefik the other's containers -- both would answer for
+    # the same hosts. Rise stamps its controller class into `dockerLabels`
+    # precisely so this can match; `traefik.*` is reserved by Traefik and cannot
+    # be used as a constraint key.
+    var.traefik_constraints == "" ? [] : [
+      "--providers.ecs.constraints=${var.traefik_constraints}",
+    ],
+    [
       "--entrypoints.web.address=:80",
       "--entrypoints.websecure.address=:443",
       # A dedicated entrypoint for the load balancer's health check, so it does

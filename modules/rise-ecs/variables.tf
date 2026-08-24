@@ -513,3 +513,20 @@ variable "enable_execute_command" {
   type        = bool
   default     = false
 }
+
+variable "traefik_constraints" {
+  description = <<-EOT
+    Traefik discovery constraint, confining this Traefik to one Rise install's
+    containers. Empty (the default) discovers every Rise-labelled container in
+    the cluster, which is correct when the cluster hosts a single install.
+
+    Set it when several installs share a cluster -- each must then also run a
+    distinct `deployment_controller_class`, both so Traefik can tell the
+    containers apart and so one install's orphan collector does not delete
+    another's services:
+
+        traefik_constraints = "Label(`rise.dev/controller-class`, `my-install`)"
+  EOT
+  type        = string
+  default     = ""
+}

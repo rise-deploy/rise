@@ -1055,6 +1055,8 @@ impl EcsReconciler {
                 log_group: self.config.log_group.as_deref(),
                 region: &self.config.region,
                 traefik: self.traefik_render_config(),
+                label_namespace: &self.config.label_namespace,
+                controller_class: &self.config.controller_class,
             },
         ))?;
 

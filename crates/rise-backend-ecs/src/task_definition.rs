@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use rise_backend_core::desired::DesiredContainer;
+use rise_backend_core::labels::{ns_key, SUFFIX_CONTROLLER_CLASS};
 use rise_backend_core::naming::sanitize_ecs_name;
 use rise_backend_traefik::render::{render_traefik_labels_for, TraefikRenderConfig};
 
@@ -178,6 +179,11 @@ pub struct TaskDefinitionConfig<'a> {
     pub log_group: Option<&'a str>,
     pub region: &'a str,
     pub traefik: TraefikRenderConfig<'a>,
+    /// Namespace for Rise's own label keys, e.g. `rise.dev`.
+    pub label_namespace: &'a str,
+    /// Stamped into `dockerLabels` so a Traefik constrained to one controller
+    /// class routes only that install's containers. See [`build`].
+    pub controller_class: &'a str,
 }
 
 /// The two CPU architectures Fargate accepts, in the exact spelling ECS's
@@ -245,9 +251,21 @@ pub fn build(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let docker_labels: BTreeMap<String, String> = render_traefik_labels_for(desired, &cfg.traefik)
-        .into_iter()
-        .collect();
+    let mut docker_labels: BTreeMap<String, String> =
+        render_traefik_labels_for(desired, &cfg.traefik)
+            .into_iter()
+            .collect();
+    // Rise's bookkeeping otherwise lives in ECS resource tags, which Traefik's
+    // ECS provider never reads -- it matches `constraints` against container
+    // labels only. Emitting the controller class here is what lets several Rise
+    // installs share one cluster: each Traefik is constrained to its own class
+    // and ignores the others' containers. The key cannot sit under `traefik.*`,
+    // which Traefik reserves for its own configuration and rejects as a
+    // constraint key.
+    docker_labels.insert(
+        ns_key(cfg.label_namespace, SUFFIX_CONTROLLER_CLASS),
+        cfg.controller_class.to_string(),
+    );
 
     let log_config = cfg.log_group.map(|group| LogConfig {
         log_group: group.to_string(),
@@ -322,6 +340,8 @@ mod tests {
             repository_credentials_secret_arn: None,
             log_group: Some("/rise/myapp"),
             region: "eu-central-1",
+            label_namespace: "rise.dev",
+            controller_class: "default",
             traefik: TraefikRenderConfig {
                 label_namespace: "rise.dev",
                 controller_class: "default",
@@ -401,6 +421,30 @@ mod tests {
         );
     }
 
+    /// Traefik's ECS provider matches `constraints` against container labels
+    /// and nothing else, and it rejects `traefik.*` as a constraint key. Without
+    /// a Rise-namespaced label here, two installs sharing a cluster cannot be
+    /// told apart by their Traefiks and each would route the other's containers.
+    #[test]
+    fn the_controller_class_is_emitted_as_a_constrainable_docker_label() {
+        let classes = access_classes();
+        let mut cfg = cfg(&classes);
+        cfg.controller_class = "pr-457";
+        cfg.traefik.controller_class = "pr-457";
+        let spec = build(&desired(), &[], &cfg).expect("build");
+        let labels = &spec.containers[0].docker_labels;
+
+        assert_eq!(
+            labels.get("rise.dev/controller-class").map(String::as_str),
+            Some("pr-457"),
+            "no constrainable scope label: {labels:?}"
+        );
+        assert!(
+            !"rise.dev/controller-class".starts_with("traefik."),
+            "the key must stay outside the namespace Traefik reserves"
+        );
+    }
+
     #[test]
     fn traefik_config_lands_in_docker_labels() {
         // Traefik's ECS provider reads container dockerLabels and nothing else.
@@ -450,7 +494,17 @@ mod tests {
         worker.port = None;
         worker.routes = vec![];
         let spec = build(&worker, &[], &cfg(&classes)).expect("builds");
-        assert!(spec.containers[0].docker_labels.is_empty());
+        // The scope label is about ownership, not routing, so it is still here;
+        // what must be absent is anything Traefik would act on. Without
+        // `traefik.enable=true` the container stays undiscovered either way.
+        assert!(
+            !spec.containers[0]
+                .docker_labels
+                .keys()
+                .any(|k| k.starts_with("traefik.")),
+            "a port-less container must get no Traefik labels: {:?}",
+            spec.containers[0].docker_labels
+        );
     }
 
     #[test]
