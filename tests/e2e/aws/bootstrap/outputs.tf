@@ -89,3 +89,38 @@ output "ci_role_arn" {
   description = "Role the GitHub Actions workflow assumes."
   value       = aws_iam_role.ci.arn
 }
+
+# -----------------------------------------------------------------------------
+# The harness's entry point into all of the above.
+#
+# It needs several of these values *before* the per-run apply -- to find
+# Traefik's current address, point DNS at it and open the edge -- so it cannot
+# get them from the per-run outputs, and reading bootstrap's own state would
+# mean either a second backend or a pile of environment variables. One parameter
+# keeps the contract to: know the environment name, read one thing.
+# -----------------------------------------------------------------------------
+
+resource "aws_ssm_parameter" "bootstrap" {
+  name        = "/${var.name}/e2e/bootstrap"
+  description = "Outputs of the Rise ECS e2e bootstrap, for the test harness"
+  type        = "String"
+
+  value = jsonencode({
+    region                     = var.region
+    cluster_name               = aws_ecs_cluster.this.name
+    cluster_arn                = aws_ecs_cluster.this.arn
+    subnet_ids                 = [for s in aws_subnet.public : s.id]
+    internal_security_group_id = aws_security_group.internal.id
+    edge_security_group_id     = aws_security_group.edge.id
+    cloud_map_namespace_name   = aws_service_discovery_private_dns_namespace.this.name
+    log_group_name             = aws_cloudwatch_log_group.this.name
+    traefik_service_name       = aws_ecs_service.traefik.name
+    dex_issuer                 = local.dex_issuer
+    ecr_repo_prefix            = "${var.name}/"
+    dns_zone_id                = aws_route53_zone.this.zone_id
+    dns_zone_name              = trimsuffix(aws_route53_zone.this.name, ".")
+    state_bucket               = aws_s3_bucket.state.id
+  })
+
+  tags = local.tags
+}

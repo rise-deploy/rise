@@ -172,6 +172,10 @@ data "aws_iam_policy_document" "ci" {
     sid    = "SweepSecretParameters"
     effect = "Allow"
     actions = [
+      # GetParameter is how the harness bootstraps itself: one read of
+      # /<name>/e2e/bootstrap tells it everything about the environment.
+      "ssm:GetParameter",
+      "ssm:GetParameters",
       "ssm:DescribeParameters",
       "ssm:GetParametersByPath",
       "ssm:DeleteParameter",
