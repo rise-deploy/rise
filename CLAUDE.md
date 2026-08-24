@@ -105,7 +105,7 @@ The codebase is organized into functional modules:
    - **Custom Domains** (`custom_domains/`): Custom domain registration, verification, TLS wiring
    - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
    - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
-   - **Generic Resources** (`resources/`): The operator-gated generic resource API (`/api/v1/resources`) and its garbage collector
+   - **Generic Resources** (`resources/`): The generic resource API (`/api/v1/resources`) and its garbage collector, authorized through `authz/`
    - **Platform** (`platform/`): Platform/organization-level concerns
    - **Quickstart** (`quickstart/`): Catalog of ready-to-deploy templates (see `config/default.yaml`)
    - **Extensions** (`extensions/`): Extension registry and providers
@@ -175,7 +175,7 @@ cargo build --all-features     # Full build with CLI + backend
      - [x] Kubernetes controller — K8s deployments with Ingress
      - [x] Docker backend — single-host Docker daemon with Traefik routing
      - [x] Amazon ECS backend — Fargate services with Traefik's ECS provider,
-       SSM-injected secret env, and Fargate task sizing (see ADR-0004)
+       SSM-injected secret env, and Fargate task sizing (see ADR-0005)
    - [x] Container registry integration: ECR, GitLab, JFrog, generic OCI basic-auth
    - [x] Encryption providers: Local AES-GCM and AWS KMS
    - [x] OCI client for image digest resolution
@@ -231,7 +231,7 @@ Documentation lives in two Astro Starlight sites under [`/docs`](./docs):
   - Architecture and process design: [development.md](docs/engineering/src/content/docs/development.md)
   - Backend configuration: [configuration.md](docs/engineering/src/content/docs/configuration.md)
   - Deployment backends and the feature matrix: [deployment-backends.md](docs/engineering/src/content/docs/deployment-backends.md)
-  - Generic resource API: [generic-resource-api.md](docs/engineering/src/content/docs/generic-resource-api.md)
+  - Generic resource API: [resources/](docs/engineering/src/content/docs/resources/) — HTTP API, storage model, custom resources, schemas
   - Architecture decision records: [adr/](docs/engineering/src/content/docs/adr/)
 
 Serve them locally with `mise run docs:serve` / `mise run docs:engineering:serve`.
@@ -328,7 +328,7 @@ Keep it current as work merges:
 - When removing a feature, do a comprehensive check on the codebase to ensure any remaining references to that feature are removed or updated. This includes documentation files/READMEs, config files, code comments, etc.
 - Don't reference previous versions of the code in comments, docs, or commit-independent artifacts (e.g. "the previous design did X", "vs the old tick counter", "this used to be Y"). Comments must describe what the code does *now* and why — a reader has no access to the version you're contrasting against, and such notes rot. Git history is the place for that context. (Referring to runtime/domain concepts like "the previous leader replica" is fine — that's not code history.)
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
-- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is operator-gated (`auth.operator_users`): admins are not operators and do not bypass its checks. Granting admins access to the resource API is intentionally deferred (see `ROADMAP.md`).
+- Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is authorized by the ADR-0001 engine through `src/server/authz/`: every request is one `(verb, ResourceKind, subresource?)` decision against the resource's own ancestry and effective labels, and authorization-changing writes additionally pass the write-time grant gate inside a `SERIALIZABLE` transaction. Operators reach everything through the seeded `system-admin` binding; admins are granted nothing there unless a binding says so. Do not add an `is_admin` shortcut — grant access with a `RoleBinding`.
 - Both roles can also be granted by IdP group (`auth.admin_idp_groups`, `auth.operator_idp_groups`), as can platform access (`auth.platform_access.allowed_idp_groups`). Group matching resolves against the user's **IdP-managed** teams — the ones `sync_user_groups`/the Entra sync mirror from the IdP's `groups` claim — never against teams users create themselves. `src/server/auth/roles.rs` owns that resolution; role checks go through `AppState::is_admin`/`is_operator`, which are async because a configured group list means a DB lookup.
 - In `rise-deploy`, all SQLX queries must be wrapped by helper functions in the `src/db/` module — no SQLX queries elsewhere in the crate's production code. The support crates that own their own schema and migrations (`rise-resource-store-postgres`, `rise-runtime-sync`) are the exception: their queries live in the crate that owns the tables, alongside its own migrations and offline query cache.
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
@@ -352,11 +352,13 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 
 **MANDATORY**: You MUST run `cargo fmt --all` before every commit. Always. No exceptions. CI will reject unformatted code. Run it, stage any formatting changes, then commit. If you touched `tests/e2e`, that crate is a **separate workspace** — `--all` does not reach it, so also run `cargo fmt --manifest-path tests/e2e/Cargo.toml`.
 
-**Always run** (fast, catches most issues):
+**Always run** (fast, catches most issues). Note the `--workspace`: without it
+Cargo checks only the root package, so a change that breaks a support crate's
+*test* targets compiles clean here and fails in CI.
 
 ```bash
 cargo fmt --all                # Format code — MUST run before every commit
-cargo clippy --all-features --all-targets -- -D warnings  # Lint (uses cached build artifacts)
+cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (uses cached build artifacts)
 ```
 
 **Run selectively** based on what changed:
@@ -386,13 +388,16 @@ cargo audit                         # Dependency advisories
 cargo test --workspace --all-features  # Unit tests (all workspace crates)
 ```
 
-`mise run lint` runs, in order: `cargo all-features check --all-targets`; a
-per-crate `cargo check` for `rise-authz`, `rise-resource-api`,
-`rise-resource-store-postgres`, `rise-backend-auth`, `rise-backend-core`, and
-`rise-runtime-sync`; `cargo all-features clippy -- -D warnings` plus the same
-per-crate clippy sweep; `cargo fmt --all -- --check`; `mise sqlx:check`;
-`mise resource:schema:check`; `helm lint helm/rise`; and `cargo test` for
-`rise-authz`, `rise-backend-auth`, and `rise-backend-core`. It does **not** cover
+`mise run lint` runs, in order: `cargo all-features check --all-targets` and
+`cargo all-features clippy -- -D warnings`, which cover `rise-deploy`'s feature
+combinations — `cli` and `cli,backend`, since `always_include_features` pins
+`cli` on; the same two workspace-wide
+(`--workspace --all-features --all-targets`), which cover every support crate
+and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`;
+`mise resource:schema:check`; `helm lint helm/rise`; and a workspace `cargo
+test` excluding the three crates that need Postgres (`rise-deploy`,
+`rise-resource-store-postgres`, `rise-runtime-sync`) — so every other crate's
+tests run, and a new crate is covered without editing the list. It does **not** cover
 `config:schema:check`, `rise-toml:schema:check`, `crd:check`, `cargo audit`, or
 `tests/e2e` — CI does, so run those separately.
 

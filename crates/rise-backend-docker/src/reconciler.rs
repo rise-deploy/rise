@@ -184,7 +184,7 @@ pub struct DockerReconciler {
     /// Resource store used to read each project's owning Organization so the
     /// reconciler only ever touches projects whose `deploymentControllerClass`
     /// matches `config.controller_class` (mirrors the K8s webhook).
-    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceApi>,
     /// HTTP client reused across health probes (built once, not per-probe).
     http_client: reqwest::Client,
     /// Traefik API client for the authoritative in-rotation signal. `None` when
@@ -237,7 +237,7 @@ impl DockerReconciler {
         url_builder: Arc<DeploymentUrlBuilder>,
         registry_provider: Arc<dyn RegistryProvider>,
         encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-        resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+        resource_store: Arc<dyn rise_resource_api::ResourceApi>,
         jwt_signer: Arc<RiseTokenSigner>,
         identity_token_ttl_seconds: u64,
         config: ReconcilerConfig,

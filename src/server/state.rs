@@ -73,6 +73,12 @@ pub struct AppState {
     /// without a network round-trip.
     #[cfg(feature = "backend")]
     pub resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    /// The authorization choke point for the generic resource API (ADR-0001 §4,
+    /// §5). It holds the same Postgres store as `resource_store`, kept concrete
+    /// so an authorization-changing write can rebuild it over its own
+    /// `SERIALIZABLE` transaction.
+    #[cfg(feature = "backend")]
+    pub resource_authorizer: crate::server::authz::ResourceAuthorizer,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
@@ -539,7 +545,7 @@ async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceApi>,
     jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
@@ -817,17 +823,20 @@ impl AppState {
         // store is cheap to construct (it caches compiled JSON schemas lazily),
         // so we instantiate it once and clone the Arc into every handler.
         #[cfg(feature = "backend")]
-        let resource_store: Arc<dyn rise_resource_api::ResourceStore> = Arc::new(
-            rise_resource_store_postgres::PgResourceStore::new(db_pool.clone()),
-        );
+        let pg_resource_store = Arc::new(rise_resource_store_postgres::PgResourceStore::new(
+            db_pool.clone(),
+        ));
+        #[cfg(feature = "backend")]
+        let resource_store: Arc<dyn rise_resource_api::ResourceStore> = pg_resource_store.clone();
 
         // Run default-Organization bootstrap. Must complete before
         // controllers begin processing typed projects, so we await it before
         // the rest of AppState comes up.
         #[cfg(feature = "backend")]
-        let bootstrap_outcome = crate::server::bootstrap::run(&db_pool, &resource_store, settings)
-            .await
-            .context("Default-Organization bootstrap failed")?;
+        let bootstrap_outcome =
+            crate::server::bootstrap::run(&db_pool, resource_store.as_ref(), settings)
+                .await
+                .context("Default-Organization bootstrap failed")?;
         #[cfg(feature = "backend")]
         let default_organization_uid = bootstrap_outcome.default_organization_uid;
 
@@ -1107,6 +1116,19 @@ impl AppState {
                 operator_idp_groups.len()
             );
         }
+
+        // The generic resource API's choke point. It carries the same operator
+        // selectors: operator standing is one subject in the authorization model
+        // (ADR-0001 §1), not a check in front of the API.
+        #[cfg(feature = "backend")]
+        let resource_authorizer = crate::server::authz::ResourceAuthorizer::new(
+            pg_resource_store.clone(),
+            db_pool.clone(),
+            crate::server::authz::OperatorSelectors {
+                users: operator_users.clone(),
+                idp_groups: operator_idp_groups.clone(),
+            },
+        );
 
         // Validate and index configured controller identities
         let controller_indexes =
@@ -1939,6 +1961,8 @@ impl AppState {
             controllers_by_issuer,
             #[cfg(feature = "backend")]
             resource_store,
+            #[cfg(feature = "backend")]
+            resource_authorizer,
             #[cfg(feature = "backend")]
             default_organization_uid,
             #[cfg(feature = "backend")]

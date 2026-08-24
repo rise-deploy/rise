@@ -60,6 +60,7 @@ impl ResourceRow {
                 revision: Some(self.revision),
                 discriminator: Some(self.discriminator.clone()),
                 labels: self.labels.clone(),
+                effective_labels: BTreeMap::new(),
                 annotations,
                 finalizers: self.finalizers.clone(),
                 owner_references: self.owner_references.clone(),

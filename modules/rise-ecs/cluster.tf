@@ -36,7 +36,7 @@ resource "aws_cloudwatch_log_group" "this" {
 # --- Cloud Map ---------------------------------------------------------------
 #
 # Used for the services *this module* runs, not by the reconciler: Cloud Map
-# registration for deployed workloads (ADR-0004 D10, cross-container discovery)
+# registration for deployed workloads (ADR-0005 D10, cross-container discovery)
 # is not implemented, and multi-container deployments fail closed at deploy
 # time. It exists here because two internal URLs depend on stable names —
 # without it there is no address Traefik can call Rise at for forwardAuth.

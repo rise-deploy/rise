@@ -1,4 +1,4 @@
-# ADR-0004 D5: an NLB in TCP passthrough fronts Traefik, and Traefik terminates
+# ADR-0005 D5: an NLB in TCP passthrough fronts Traefik, and Traefik terminates
 # TLS with ACME HTTP-01. The alternative -- ACM on the load balancer -- would
 # cost every custom domain its automatic certificate, since ACM has no HTTP-01
 # and each domain would gain a DNS validation step the user has to complete.

@@ -107,7 +107,7 @@ output "ecs_task_role_arn" {
   description = <<-EOT
     ARN of the role deployed workloads run as. This is the backend role: on ECS
     the control plane and the workloads it launches share one identity, since
-    per-project task roles are not implemented (ADR-0004 D14).
+    per-project task roles are not implemented (ADR-0005 D14).
   EOT
   value       = var.enable_ecs ? aws_iam_role.backend.arn : null
 }

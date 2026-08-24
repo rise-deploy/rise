@@ -31,6 +31,210 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Action required if you granted generic resource API access by adding people
+  to `auth.operator_users` — the API is now authorized, not operator-gated.**
+  `/api/v1/resources` no longer refuses everyone but operators. Every request is
+  authorized by the ADR-0001 engine against the resource it names, and
+  authorization-changing writes additionally pass the write-time grant gate
+  inside a `SERIALIZABLE` transaction.
+
+  **Operators are unaffected**: an operator expands to `system:operators`, whose
+  seeded `system-admin` binding allows every verb on every kind and subresource,
+  and an operator's request ignores every `Deny`. Nothing an operator could do
+  before is refused now.
+
+  What changed for everyone else is that they are *evaluated* rather than
+  refused outright. Shipped policy grants a non-operator nothing, so an install
+  that has authored no bindings sees no access change — but if you were relying
+  on "non-operator ⇒ 403" as the whole authorization story, that is no longer
+  what the code says. Who reaches the evaluation at all is unchanged: the
+  resource routes still sit behind the platform-access middleware, so
+  `auth.platform_access.policy: restrictive` keeps its allowlist in front of
+  everything below. Under the default `allow_all` that is every authenticated
+  user. Two visible differences even without any binding:
+
+  - A collection listing by a caller with no `list` grant returns an **empty
+    `200`**, not a `403`. This is deliberate existence masking: a `403` would
+    confirm the scope is populated. Naming one resource exactly is masked the
+    same way: a caller with no `get` on it receives a **`404`**, on every verb.
+    A caller who *can* read the resource still gets a `403` naming the verb they
+    are short.
+  - Which *collections* exist is now visible to any authenticated caller, since
+    the path is classified before any per-resource decision. What a collection
+    contains is authorized per item.
+
+  Behaviour changes on the request/response surface:
+
+  - `metadata.effectiveLabels` is present on every resource response, resolved
+    live from the ancestor chain (nearest value wins per key).
+  - A write returns the object at the granularity the caller may *read*. A
+    caller holding `(update, Kind, status)` but not `get` gets the projected
+    metadata shape back, not the `spec` — a write verb is not a read grant.
+  - A main-resource `PUT` may no longer change `metadata.finalizers`; carrying
+    the stored list back unchanged is fine, and changing them is the
+    `finalizers` subresource's separate grant. A create carrying a reserved
+    `system.rise.dev/*` finalizer is rejected.
+  - Changing a `ResourceDefinition`'s `allowedStatusControllerIds` now requires
+    operator standing: it grants controllers status and finalizer writes
+    outside the authorization model, so it is not something an ordinary
+    `update` on the definition should confer.
+  - A listing under an ancestor that does not exist returns an empty collection
+    rather than `404`, so the ancestor path is not enumerable by name. Item
+    paths and creates under a missing ancestor still fail.
+  - Changing the `metadata.ownerReferences` set is now authorized. Attaching or
+    removing a reference requires `use` on the owner; attaching additionally
+    requires `delete` on the dependent when it already exists, and setting
+    `blockOwnerDeletion: true` requires `delete` on the owner, since that flag
+    holds the owner's own deletion open. Removing a reference whose owner is
+    already gone or draining is ungated, so a dependent is never frozen behind
+    an owner nobody can revive. Re-sending already-stored references is
+    unaffected. Note that the shipped `resource-owner` role does **not** include
+    `use`, so owning a resource does not by itself let you make it the owner of
+    another — author a binding that grants `use` where you need that.
+  - `deletion-blockers` filters its blockers per item on `get` and reports a
+    `hiddenBlockers` count for those the caller cannot read. That count is a
+    deliberate disclosure: it moves as resources the caller cannot see are
+    created and deleted, so grant the subresource on that basis.
+  - A refused authorization-changing write says less than it did. The recipient
+    and the domain are named only when they came from the request; what the
+    recipient would have gained is never named, because the gate compares their
+    whole effective policy over the domain and a witness can come from any
+    binding delivering policy to them. The full comparison is in the
+    `rise::audit` `resource.grant_gate` record.
+  - Attaching a `metadata.ownerReferences` entry to a `Role`, `RoleBinding`,
+    `PlatformRole`, or `PlatformRoleBinding` now passes the grant gate as
+    though the row were being deleted, and deleting an `Organization` passes it
+    for every `Role` and `RoleBinding` beneath it. Both were routes around the
+    gate: the cascade tombstones the row, and a tombstoned binding stops
+    applying immediately, so removing a `Deny` this way was ungated. An
+    operator is unaffected; a non-operator who could delete an Organization
+    containing policy they cannot lift is now refused.
+  - Creating a `rise.dev/User` with `spec.active` true (the default) passes the
+    grant gate as an activation, matching the existing gate on flipping
+    `active` from false to true. Policy binds to the User *name*, so recreating
+    a name that stale bindings or `GroupMembership` markers still refer to makes
+    that policy reachable again. Both gates now measure the name's Group ties as
+    well as the bindings naming it directly, so reactivating an offboarded
+    identity requires holding whatever its Groups grant.
+  - **Security fix, outside the resource API.** When the IdP takes over a team
+    that already existed in Rise — `sync_user_groups` on login, and the Entra
+    sync — every pre-existing membership is now removed, not just the owners.
+    An IdP-managed team's membership grants operator, admin, and platform access
+    by group (`auth.operator_idp_groups` and friends), and team names are
+    first-come, first-served while `auth.allow_team_creation` is on (the
+    default): a user who created a team named after a privileged IdP group and
+    listed themselves in it kept that membership through the takeover and
+    inherited the group's authority. **Operator impact:** if you pre-created
+    teams that later became IdP-managed and relied on their Rise-side
+    memberships, those members lose their group-derived roles until their next
+    login, when the IdP re-asserts them. Members the IdP does not assert are
+    not restored — that is the point. The takeover and the team-membership API
+    now take a row lock on the team, so a membership write cannot slip into the
+    window between the purge and its commit.
+  - Deleting an `Organization` with more than 64 `Role`/`RoleBinding` resources
+    beneath it is refused with `409` for a non-operator: each one has to be
+    weighed against the writer's authority, and more than that cannot be done in
+    one transaction. Remove them first, or have an operator perform the delete.
+  - A write response for a caller holding a write verb and neither `get` nor
+    `list` is now `apiVersion`, `kind`, and `metadata.name` only — previously it
+    carried labels and inherited `effectiveLabels`, which are org-wide and are
+    what a `list` grant pays for.
+  - Every `404` from these routes now carries the same body,
+    `{"error": "resource not found"}`. Clients that matched on the old wording
+    ("resource 'x' not found", "parent path segment not found") need updating.
+    Authorization also runs before the request body is inspected, so a `PUT`
+    with a malformed body against a resource the caller cannot read returns
+    `404` rather than `400`.
+  - An item a caller can `list` but not `get` is returned projected onto
+    `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
+    `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,
+    `revision`, or `discriminator`. Operators always hold `get`, so their list
+    responses are unchanged apart from `effectiveLabels`.
+  - A write that loses a serialization race after three attempts returns `503`
+    with a retryable message instead of committing on stale facts.
+
+  **A restriction must name a subject that resolves today.** A principal's own
+  Group ties are read through a live, active `User` resource of their name, and
+  no login path writes one yet, so every principal currently has an empty tie
+  set. A group-targeted binding therefore grants nothing — harmless — but a
+  *cap* expressed as a group-targeted `Deny` is equally never collected, so it
+  does not restrict anyone either. Until identity resolution lands, express a
+  restriction against `system:authenticated`, `org:<name>`, or the principal
+  itself.
+
+  A `GroupMembership` you write now is not inert in one respect: the grant gate
+  resolves a name's ties without requiring the `User` row, so the marker is
+  weighed against whoever later tries to create or activate that name. That is
+  deliberate — it is what stops a deleted-and-recreated identity from silently
+  reclaiming its old groups.
+
+  Two audit record names changed: `resource.operator_status_updated` and
+  `resource.operator_finalizers_updated` are now `resource.user_status_updated`
+  and `resource.user_finalizers_updated`, because the caller need not be an
+  operator. Two records are new: `resource.access_denied` and
+  `resource.grant_gate`. Update any log-based alerting that matches the old
+  names.
+
+  No migration and no backfill runs, and no configuration changes.
+  `auth.operator_users` and `auth.operator_idp_groups` keep their meaning.
+
+- **Action required if you author org `RoleBinding`s — subject bounded to its own
+  Organization**. An org `RoleBinding` whose `subject` names a *different*
+  organization — `group:<other>/x`, `serviceaccount:<other>/x`, `org:<other>` —
+  is now refused at write time. Such a binding never granted anything: ADR-0001
+  §1's recipient boundary already required the subject to belong to the binding's
+  own Organization, so the row read as a cross-org grant while being permanently
+  dead. Only the generic resource API is affected, and only for callers who may
+  write policy resources there.
+
+  Existing rows keep being readable and keep granting exactly what they granted
+  before (nothing), but **an update to such a row now fails**. To find them:
+
+  ```sql
+  SELECT parent.name AS organization, r.name, r.spec->>'subject' AS subject
+  FROM resource_store.resources r
+  JOIN resource_store.resources parent ON parent.uid = r.parent_uid
+  WHERE r.kind = 'RoleBinding'
+    AND r.deletion_timestamp IS NULL
+    AND r.spec->>'subject' ~ '^((group|serviceaccount):[a-z0-9-]+/[a-z0-9-]+|org:[a-z0-9-]+)$'
+    AND CASE
+          WHEN r.spec->>'subject' LIKE 'org:%'
+            THEN split_part(r.spec->>'subject', ':', 2)
+          ELSE split_part(split_part(r.spec->>'subject', ':', 2), '/', 1)
+        END <> parent.name;
+  ```
+
+  Delete what it returns, or re-point each subject at a Group in the binding's
+  own Organization. `user:` and `system:authenticated` subjects are unaffected —
+  their affiliation is a live membership question, not a property of the
+  identifier — as are `controller:` subjects.
+
+  The same field now also accepts the relative form `group:<name>`, expanded
+  against the parent Organization before storage, so `group:platform` under
+  `acme` stores `group:acme/platform`. Absolute subjects are unchanged, and
+  `PlatformRoleBinding` still takes absolute subjects only.
+
+- **No action required — seeded baseline authorization policy**. Startup now
+  creates five root policy resources described by ADR-0001:
+  `PlatformRole/system-admin` with its `system:operators` binding, and the
+  editable `PlatformRole/org-admin`, `PlatformRole/resource-owner`, and
+  `PlatformRoleBinding/resource-owner` defaults. Seeding is idempotent and never
+  overwrites the three editable rows, so an operator edit survives every restart
+  and a deleted one is re-created on the next.
+
+  These are the whole of the shipped policy: with the choke point live (above),
+  an install that authors no bindings of its own grants nothing to anyone but
+  operators and the subjects a `rise.dev/owner` label names.
+
+  Two of the five are immutable through the API: the
+  resource store refuses to update or delete `PlatformRole/system-admin` or its
+  binding, because they are the inspectable record of operator authority rather
+  than its source (the evaluator hardcodes that, so it survives a bad restore).
+  If startup ever reports one of those two as diverging from its shipped
+  definition, something wrote to `resource_store.resources` directly; the error
+  names the row and the fix is to delete it and restart. No migration and no
+  backfill runs.
+
 - **Config change — Terraform modules for Amazon ECS**. A new
   `modules/rise-ecs` provisions a working ECS install (VPC, cluster, Cloud Map,
   RDS, Secrets Manager, NLB, Traefik and the Rise service), and
@@ -53,9 +257,8 @@ Merged to `develop`:
   migration adds a column with an empty default, so existing rows and clients
   are unaffected and no backfill runs. Label keys use the Kubernetes-shaped
   grammar that policy `labelSelector` keys already use; values are capped at 63
-  bytes. Nothing consults labels for access yet — a key becomes access-relevant
-  only once a policy binding selects on it, and the write-time gate for such
-  keys lands with the authorization choke point.
+  bytes. A key becomes access-relevant only once a policy binding selects on it,
+  and writing such a key then passes the write-time grant gate.
 - **Action required if conflicts exist — identity resource activation** ([#421](https://github.com/rise-deploy/rise/pull/421)).
   Rise now activates the eight reserved `rise.dev/v1alpha1` identity resource
   kinds in the PostgreSQL resource store. Before upgrading, remove any legacy
@@ -111,9 +314,8 @@ Merged to `develop`:
   database unchanged, so clean up under the previous Rise version and retry.
   Installations with no reported conflicts require no action.
 
-  Nothing yet consults these resources: writing a `RoleBinding` grants no
-  access, and `/api/v1/resources` remains operator-gated. Bindings are
-  validated at write time, so creating one requires its `roleRef` target, its
+  These resources are what the choke point (above) evaluates: writing a
+  `RoleBinding` now grants access. Bindings are validated at write time, so creating one requires its `roleRef` target, its
   `scope` target, and any literal `subject` it names to already exist — create
   the Role before the RoleBinding that references it.
 

@@ -16,6 +16,10 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ADR-0003: Resource Families](docs/engineering/src/content/docs/adr/0003-resource-families.md)
   groups kinds that share a name pool and list as a unit; it gates the
   extension-kind migration in §4.
+- [ADR-0004: Control-Plane Process Topology](docs/engineering/src/content/docs/adr/0004-control-plane-process-topology.md)
+  makes the resource API its own process with every other component a client,
+  and sets the gates that ordering must satisfy. It governs the sequencing in
+  §5 and §6.
 - Where shipped compatibility behavior differs from an ADR, it is transitional;
   new work converges on the ADR rather than extending the old shape.
 
@@ -64,9 +68,12 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing
-  `require_operator`. Once Controller writes use that path, remove
-  `ResourceDefinition.allowedStatusControllerIds` and authorize `status` and
-  `finalizers` exclusively through RBAC.
+  `require_operator`. The choke point is live on the generic resource API, with
+  per-item list filtering, the allowlisted list-only projection, and
+  `metadata.effectiveLabels` on every response. Remaining: Controller writes
+  still go through `ResourceDefinition.allowedStatusControllerIds` rather than
+  RBAC, because a Controller is not a principal until its identity resource
+  exists; remove that allowlist once it is.
 - [~] Add Role/policy audit and explain diagnostics for semantically inert
   configuration: no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
@@ -86,15 +93,23 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   token-cap hash, epoch, and resource identity. A write path that forgets to
   bump the epoch is a stale-authorization bug no test will surface, which is
   why the measurement comes first.
-- [ ] Implement the write-time grant gate for Roles, bindings, membership,
+- [x] Implement the write-time grant gate for Roles, bindings, membership,
   identity mappings, and access-driving labels. All authorization-changing
-  writes use serializable transactions with bounded retry.
-- [ ] Seed immutable/healable `system-admin` and platform `resource-owner`
+  writes use serializable transactions with bounded retry. The gate is
+  `rise-authz::engine::gate`, including §6.6's label diff over the K-inheriting
+  subtree and the credential-ceiling intersection; the resource API's write
+  paths run it inside the `SERIALIZABLE` transaction that performs the mutation,
+  replaying the whole operation on a serialization failure. A cascading delete's
+  effect on policy resources beneath the deleted resource is not yet diffed.
+- [~] Seed immutable/healable `system-admin` and platform `resource-owner`
   Roles, plus an operator-editable global `PlatformRole/org-admin` baseline.
   Organization creation atomically creates an exact org-root, scope-only
   `RoleBinding` from that role to an operator-selected existing User. That
   direct binding is the first admin's bootstrap affiliation; no pre-existing
-  Group is required and no Group name has implicit authorization meaning.
+  Group is required and no Group name has implicit authorization meaning. The
+  five baseline resources are seeded at startup and the operator pair is
+  immutable through the store; atomic Organization-plus-admin-binding creation
+  remains open.
 - [ ] Add conformance coverage for every applicable ADR-0001 acceptance
   scenario, including multi-org admins, membership removal, UID-bound token
   invalidation, token caps, and grant/revocation races.
@@ -235,9 +250,13 @@ and secret handling remain kind-specific prerequisites.
 
 ## 5. External controllers and multi-org routing
 
-- [ ] Build `rise-k8s-controller` against `rise-resource-client`, using a
-  Rise-issued Controller token and Watch rather than a raw controller JWT or
-  typed-table polling.
+- [ ] Build an **extension provisioner** as the first external controller,
+  against `rise-resource-client` with a Rise-issued Controller token and Watch.
+  It goes first for blast radius, per ADR-0004 §7; it depends on resource
+  families and the extension-kind migration (§4).
+- [ ] Build `rise-k8s-controller` on the same seam, using a Rise-issued
+  Controller token and Watch rather than a raw controller JWT or typed-table
+  polling. Second, once the seam has carried a lower-risk controller.
 - [ ] Store org-agnostic Controller identities separately from per-org
   selection/configuration. Organizations reference an available controller
   class through ordinary governed resource data; credentials stay in trust
@@ -253,6 +272,15 @@ and secret handling remain kind-specific prerequisites.
 - [ ] Complete remaining backend extraction work only where it supports the
   resource/controller migration above; avoid parallel abstractions that bypass
   the generic resource API or unified authorization engine.
+- [x] Split `ResourceStore` into the remotable `ResourceApi` surface and the
+  apiserver-internal one (ADR-0004 §3), and hold in-tree callers to the former.
+  Only the handlers, GC worker, authorization engine, and composition root name
+  the wide trait; the Docker reconciler, the Metacontroller webhook's
+  Organization view, the Organization delete guard, and bootstrap moved to
+  `ResourceApi`.
+- [ ] Extract `rise-apiserver` as its own binary and process (ADR-0004 §§1, 8)
+  once that ADR's gates are met. The gates are §1 and §4 work, so this lands
+  near the end of the typed-object migration rather than beside it.
 
 ## Verification gates
 

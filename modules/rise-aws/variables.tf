@@ -138,7 +138,7 @@ variable "max_image_count" {
 }
 
 # -----------------------------------------------------------------------------
-# ECS deployment controller (ADR-0004 D14)
+# ECS deployment controller (ADR-0005 D14)
 #
 # This module makes IAM, not infrastructure: the cluster, namespace and log group
 # are created elsewhere (modules/rise-ecs, or by hand). It scopes its policies by

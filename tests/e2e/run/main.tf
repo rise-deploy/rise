@@ -1,7 +1,7 @@
 # The per-run half of the ECS e2e environment, applied and destroyed by the
 # harness around each suite.
 #
-# Deliberately NOT modules/rise-ecs. That module builds ADR-0004 D15's
+# Deliberately NOT modules/rise-ecs. That module builds ADR-0005 D15's
 # production topology -- NLB, private subnets, RDS, ACME -- and bending it to
 # this shape would take a set of test-only knobs that would leave it with two
 # personalities while still not exercising what operators run. The one contract

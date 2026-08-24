@@ -15,6 +15,65 @@ use axum::{
 };
 use uuid::Uuid;
 
+/// Refuse any service account among the given team principals.
+///
+/// A service account is never a team principal: team membership is what the
+/// `Member` access class and the team-scoped typed-API checks key on, so a
+/// long-lived CI credential holding it is exactly what this rule prevents.
+///
+/// One function rather than a check per loop, so `create_team` and
+/// `update_team` cannot drift apart on it — they already had, with `create_team`
+/// accepting what `update_team` refused.
+pub(crate) async fn reject_service_account_principals(
+    tx: &mut sqlx::PgConnection,
+    user_ids: impl IntoIterator<Item = Uuid>,
+) -> Result<(), ServerError> {
+    for user_id in user_ids {
+        let is_sa = service_accounts::is_service_account(&mut *tx, user_id)
+            .await
+            .internal_err("Failed to check service account status")?;
+        if is_sa {
+            return Err(ServerError::bad_request(
+                "Service accounts cannot be team members",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Take the team's row lock, re-read it, and apply the IdP-managed guard.
+///
+/// Both `update_team` and `delete_team` decide on `idp_managed`, and an IdP
+/// takeover is three statements long (purge, flag, commit). Read without the
+/// lock, either guard passes against the pre-takeover row while the takeover is
+/// still uncommitted, and the write that follows lands on a row the takeover has
+/// already changed — an insert PostgreSQL takes no gap lock against, or a delete
+/// that re-evaluates its predicate against the updated tuple.
+///
+/// It lives here, called by both handlers *and* by the race test, so that a
+/// change to the locking rule cannot leave a test asserting a copy of the old
+/// one — which is exactly what happened when the test hand-rolled this sequence.
+pub(crate) async fn lock_and_guard_team(
+    tx: &mut sqlx::PgConnection,
+    team_id: Uuid,
+    is_admin: bool,
+    verb: &str,
+) -> Result<crate::db::models::Team, ServerError> {
+    let team = db_teams::find_by_id_for_update(&mut *tx, team_id)
+        .await
+        .internal_err("Failed to lock team")?
+        .ok_or_else(|| ServerError::not_found("Team not found"))?;
+
+    if team.idp_managed && !is_admin {
+        return Err(ServerError::forbidden(format!(
+            "This team is managed by your Identity Provider. Only administrators can {verb} \
+             IdP-managed teams."
+        )));
+    }
+
+    Ok(team)
+}
+
 pub async fn create_team(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -95,6 +154,12 @@ pub async fn create_team(
     )
     .await
     .internal_err("Failed to stamp default Organization on new team")?;
+
+    reject_service_account_principals(
+        &mut tx,
+        owner_ids.iter().copied().chain(member_ids.iter().copied()),
+    )
+    .await?;
 
     // Add owners
     for owner_id in owner_ids {
@@ -185,12 +250,30 @@ pub async fn update_team(
         ));
     }
 
-    // Check if team is IdP-managed (only admins can modify)
-    if team.idp_managed && !is_admin {
-        return Err(ServerError::forbidden(
-            "This team is managed by your Identity Provider. Only administrators can modify IdP-managed teams.",
-        ));
-    }
+    // From here the team row is locked and every membership read *and* write
+    // runs on this one transaction.
+    //
+    // The reads matter as much as the writes, for a different reason: the pool
+    // is capped, so a handler that holds a transaction's connection and then
+    // asks the pool for a second one deadlocks against itself once enough
+    // requests do it at once — and with an `is_service_account` call per member
+    // in the payload, "enough" is a handful of ordinary team edits. Every read
+    // below therefore goes through `tx`.
+    //
+    // The `idp_managed` guard below and the writes it guards used to be separate
+    // autocommit statements, which let an IdP takeover interleave: the guard
+    // read `false` while `sync_user_groups` was mid-transaction, and the insert
+    // landed on a row the takeover had already purged. Postgres takes no gap
+    // lock, so the membership survived — and on a team named after
+    // `auth.operator_idp_groups`, a membership is operator standing. Both sides
+    // now lock the row, so whichever arrives second reads the other's committed
+    // state.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .internal_err("Failed to start transaction")?;
+    let team = lock_and_guard_team(&mut tx, team.id, is_admin, "modify").await?;
 
     // Update name if provided
     let updated_team = if let Some(_name) = payload.name {
@@ -210,7 +293,7 @@ pub async fn update_team(
             .server_err(StatusCode::BAD_REQUEST, "Invalid member ID")?;
 
         // Get current members
-        let current_members = db_teams::get_members(&state.db_pool, team.id)
+        let current_members = db_teams::get_members(&mut *tx, team.id)
             .await
             .internal_err("Failed to get current members")?;
 
@@ -219,34 +302,18 @@ pub async fn update_team(
         // Remove members that are no longer in the list
         for current_member_id in &current_member_ids {
             if !member_ids.contains(current_member_id) {
-                db_teams::remove_member(
-                    &state.db_pool,
-                    team.id,
-                    *current_member_id,
-                    TeamRole::Member,
-                )
-                .await
-                .internal_err("Failed to remove member")?;
+                db_teams::remove_member(&mut *tx, team.id, *current_member_id, TeamRole::Member)
+                    .await
+                    .internal_err("Failed to remove member")?;
             }
         }
 
-        // Validate that none of the new members are service accounts
-        for member_id in &member_ids {
-            let is_sa = service_accounts::is_service_account(&state.db_pool, *member_id)
-                .await
-                .internal_err("Failed to check service account status")?;
-
-            if is_sa {
-                return Err(ServerError::bad_request(
-                    "Service accounts cannot be team members",
-                ));
-            }
-        }
+        reject_service_account_principals(&mut tx, member_ids.iter().copied()).await?;
 
         // Add new members
         for member_id in member_ids {
             if !current_member_ids.contains(&member_id) {
-                db_teams::add_member(&state.db_pool, team.id, member_id, TeamRole::Member)
+                db_teams::add_member(&mut *tx, team.id, member_id, TeamRole::Member)
                     .await
                     .internal_err("Failed to add member")?;
             }
@@ -262,7 +329,7 @@ pub async fn update_team(
             .server_err(StatusCode::BAD_REQUEST, "Invalid owner ID")?;
 
         // Get current owners
-        let current_owners = db_teams::get_owners(&state.db_pool, team.id)
+        let current_owners = db_teams::get_owners(&mut *tx, team.id)
             .await
             .internal_err("Failed to get current owners")?;
 
@@ -271,46 +338,33 @@ pub async fn update_team(
         // Remove owners that are no longer in the list
         for current_owner_id in &current_owner_ids {
             if !owner_ids.contains(current_owner_id) {
-                db_teams::remove_member(
-                    &state.db_pool,
-                    team.id,
-                    *current_owner_id,
-                    TeamRole::Owner,
-                )
-                .await
-                .internal_err("Failed to remove owner")?;
+                db_teams::remove_member(&mut *tx, team.id, *current_owner_id, TeamRole::Owner)
+                    .await
+                    .internal_err("Failed to remove owner")?;
             }
         }
 
-        // Validate that none of the new owners are service accounts
-        for owner_id in &owner_ids {
-            let is_sa = service_accounts::is_service_account(&state.db_pool, *owner_id)
-                .await
-                .internal_err("Failed to check service account status")?;
+        reject_service_account_principals(&mut tx, owner_ids.iter().copied()).await?;
 
-            if is_sa {
-                return Err(ServerError::bad_request(
-                    "Service accounts cannot be team members",
-                ));
-            }
-        }
-
-        // Add new owners
+        // Add new owners. Someone already in `current_owner_ids` needs no write
+        // at all — they hold the owner row this loop would create. Their
+        // *member* row, if they also have one, belongs to the members block
+        // above: the roles are separate rows under the
+        // `(team_id, user_id, role)` key, and a user may deliberately hold both.
         for owner_id in owner_ids {
             if !current_owner_ids.contains(&owner_id) {
-                db_teams::add_member(&state.db_pool, team.id, owner_id, TeamRole::Owner)
+                db_teams::add_member(&mut *tx, team.id, owner_id, TeamRole::Owner)
                     .await
                     .internal_err("Failed to add owner")?;
-            } else {
-                // Update role if already a member but not an owner
-                db_teams::update_member_role(&state.db_pool, team.id, owner_id, TeamRole::Owner)
-                    .await
-                    .internal_err("Failed to update member role")?;
             }
         }
     }
 
     // Fetch updated members and owners
+    tx.commit()
+        .await
+        .internal_err("Failed to commit team update")?;
+
     let members = db_teams::get_members(&state.db_pool, updated_team.id)
         .await
         .internal_err("Failed to get team members")?;
@@ -353,15 +407,24 @@ pub async fn delete_team(
         ));
     }
 
-    // Check if team is IdP-managed (only admins can delete)
-    if team.idp_managed && !is_admin {
-        return Err(ServerError::forbidden(
-            "This team is managed by your Identity Provider. Only administrators can delete IdP-managed teams.",
-        ));
-    }
+    // Locked and re-read, for the same reason `update_team` is: the guard below
+    // reads `idp_managed`, and an IdP takeover is three statements long. On the
+    // unlocked read this guard passed against the pre-takeover row while the
+    // takeover was mid-transaction, and the DELETE then blocked on the row lock
+    // and re-evaluated `id = $1` against the *updated* tuple — deleting the
+    // now-IdP-managed team and cascading its members. No standing was gained,
+    // but every genuine member of that group lost their group-derived admin or
+    // operator role until the next sync. Both handlers behind this guard have
+    // to take the lock; fixing only one of them fixed only one of them.
+    let mut tx = state
+        .db_pool
+        .begin()
+        .await
+        .internal_err("Failed to start transaction")?;
+    let team = lock_and_guard_team(&mut tx, team.id, is_admin, "delete").await?;
 
     // Check if team owns any projects
-    let owned_project_count = db_projects::count_owned_by_team(&state.db_pool, team.id)
+    let owned_project_count = db_projects::count_owned_by_team(&mut *tx, team.id)
         .await
         .internal_err("Failed to check projects owned by team")?;
     if owned_project_count > 0 {
@@ -371,9 +434,13 @@ pub async fn delete_team(
         )));
     }
 
-    db_teams::delete(&state.db_pool, team.id)
+    db_teams::delete(&mut *tx, team.id)
         .await
         .internal_err("Failed to delete team")?;
+
+    tx.commit()
+        .await
+        .internal_err("Failed to commit team deletion")?;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -27,12 +27,17 @@ pub struct ControllerFinalizerUpdate {
 }
 
 /// Wrapper for the generic-resource list endpoint response.
+///
+/// Items are already-projected JSON values rather than `Resource` envelopes:
+/// ADR-0001 §4 gives `list` and `get` independent granularities, so an item the
+/// caller may see the existence of but not the contents of is a strictly
+/// smaller object built from an allowlist (`crate::server::authz::projection`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourceList {
     pub api_version: String,
     pub kind: String,
-    pub items: Vec<Resource>,
+    pub items: Vec<serde_json::Value>,
 }
 
 /// Convert a stored row into the wire envelope.

@@ -47,6 +47,16 @@ pub enum StoreError {
     EmptyPath,
     #[error("validation error: {0}")]
     Validation(String),
+    /// A `SERIALIZABLE` transaction lost a race and must be retried from the
+    /// beginning (ADR-0001 §5).
+    ///
+    /// Its own variant rather than a backend error because the caller's correct
+    /// response is mechanical — replay the whole unit of work, re-reading every
+    /// fact — and because a retry loop must never guess at that from an opaque
+    /// error string. Nothing the transaction observed before this point can be
+    /// reused: the snapshot it read never existed as a serial state.
+    #[error("transaction serialization failure; retry the operation")]
+    Serialization,
     #[error("resource store backend error")]
     Backend {
         #[source]
@@ -219,9 +229,20 @@ pub struct CollectionInfo {
     pub allowed_status_controller_ids: Vec<String>,
 }
 
-/// Storage-neutral persistence contract for the generic resource API.
+/// The remotable half of the resource contract (ADR-0004 §3): the operations a
+/// client outside the apiserver may depend on, and the only ones
+/// `rise-resource-client` will implement over HTTP.
+///
+/// These take UIDs and typed parameters, not paths. Path addressing belongs to
+/// the HTTP layer: the apiserver resolves `/api/v1/resources/{*path}` to a
+/// resource with [`ResourceStore::resolve_path`] — an internal primitive a
+/// remote client never calls — and then invokes one of these. So each method
+/// here backs one request, without itself being path-shaped.
+///
+/// A caller that cannot be expressed on this surface would not survive the
+/// process split, which is what makes requiring it a compile-time check.
 #[async_trait::async_trait]
-pub trait ResourceStore: Send + Sync {
+pub trait ResourceApi: Send + Sync {
     async fn create(&self, params: CreateResourceParams) -> Result<ResourceRow, StoreError>;
     async fn get(&self, uid: Uuid) -> Result<Option<ResourceRow>, StoreError>;
     /// Look up by name, matching the API group rather than the exact version so
@@ -263,6 +284,35 @@ pub trait ResourceStore: Send + Sync {
     /// retain the owner. A resource without blocking dependents or finalizers is
     /// deleted immediately.
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
+    /// Merge one allowed controller's value under `status.controllers`.
+    async fn update_controller_status(
+        &self,
+        uid: Uuid,
+        controller_id: &str,
+        status_value: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError>;
+    /// Atomically add/remove finalizers owned by an allowed controller while
+    /// rejecting the reserved system namespace and other controllers' keys.
+    async fn update_controller_finalizers(
+        &self,
+        uid: Uuid,
+        controller_id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Result<ResourceRow, StoreError>;
+}
+
+/// The apiserver-internal half: the machinery behind serving [`ResourceApi`],
+/// which no remote client ever names (ADR-0004 §3).
+///
+/// Garbage collection, path and ancestor resolution feeding admission and
+/// authorization, registry lookups, and the atomic `ResourceDefinition`
+/// storage projection. Two entries back routes that *are* served —
+/// `list_deletion_blockers` and the `operator_update_*` pair — but only as
+/// their implementation; the routes themselves belong to [`ResourceApi`] or
+/// converge onto it under RBAC.
+#[async_trait::async_trait]
+pub trait ResourceStore: ResourceApi {
     /// Idempotent garbage-collection sweep for one resource.
     ///
     /// A live row is returned unchanged as `MarkedForDeletion`. A tombstoned
@@ -289,22 +339,26 @@ pub trait ResourceStore: Send + Sync {
     /// [`Self::resolve_path`], tombstoned rows are returned for the caller to
     /// interpret.
     async fn ancestors(&self, uid: Uuid) -> Result<Vec<ResourceRow>, StoreError>;
-    /// Merge one allowed controller's value under `status.controllers`.
-    async fn update_controller_status(
+    /// Resolve the strict descendants of `uid` that inherit its effective value
+    /// for one label key — the resource's *K-inheriting subtree*.
+    ///
+    /// A descendant that sets `label_key` itself supplies its own value under
+    /// nearest-wins resolution (ADR-0001 §6.1), so it and everything beneath it
+    /// are excluded: the walk stops at the first node that shadows the key.
+    /// `uid` itself is never included.
+    ///
+    /// This is the surface ADR-0001 §6.6's write gate needs. Relabelling a
+    /// resource changes the effective value on exactly this set, so the gate's
+    /// before/after authority diff has to span it rather than the written
+    /// resource alone. Rows come back parent-before-child and include
+    /// tombstoned resources, matching [`Self::ancestors`]: a resource still
+    /// draining is still addressable, and omitting it would under-report the
+    /// delta.
+    async fn label_inheriting_descendants(
         &self,
         uid: Uuid,
-        controller_id: &str,
-        status_value: serde_json::Value,
-    ) -> Result<ResourceRow, StoreError>;
-    /// Atomically add/remove finalizers owned by an allowed controller while
-    /// rejecting the reserved system namespace and other controllers' keys.
-    async fn update_controller_finalizers(
-        &self,
-        uid: Uuid,
-        controller_id: &str,
-        add: &[String],
-        remove: &[String],
-    ) -> Result<ResourceRow, StoreError>;
+        label_key: &str,
+    ) -> Result<Vec<ResourceRow>, StoreError>;
     /// Force-update status as an operator, storing the value under
     /// `status.controllers.operator:<operator>`.
     async fn operator_update_status(

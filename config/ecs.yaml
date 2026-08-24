@@ -148,6 +148,6 @@ deployment_controller:
 # No runtime log backend yet. Every other variant needs a runtime client the ECS
 # backend does not have, and the Kubernetes default would crash at startup.
 # Installs that run Loki can switch to `type: loki` — it is backend-agnostic.
-# A CloudWatch variant is the intended replacement (see ADR-0004).
+# A CloudWatch variant is the intended replacement (see ADR-0005).
 deployment_logs:
   type: "none"

@@ -492,5 +492,5 @@ is a silent user-visible regression rather than a deferred feature.
   — the execution seam a family list is *not* part of.
 - `ROADMAP.md` §4, Typed-object migration — the extension-kind migration this
   decision must precede.
-- [Generic resource API](../generic-resource-api.md) — path grammar, parent
-  chains, and discriminators.
+- [Generic resource HTTP API](../resources/api) — path grammar and parent
+  chains; [Storage Model](../resources/storage) for discriminators.

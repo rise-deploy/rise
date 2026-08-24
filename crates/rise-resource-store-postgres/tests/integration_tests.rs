@@ -1,15 +1,15 @@
 use rise_resource_api::{
     CreateResourceParams, DeleteOutcome, ExternalSubject, Issuer, NoOpValidator, OwnerReference,
-    PathSegment, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
+    PathSegment, ResourceApi, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
     API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, CONTROLLER_KIND,
     CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND, GROUP_MEMBERSHIP_KIND, IDENTITY_KIND_DEFINITIONS,
     ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, POLICY_KIND_DEFINITIONS,
     RESOURCE_DEFINITION_KIND, ROLE_BINDING_KIND, ROLE_KIND, SERVICE_ACCOUNT_KIND,
-    SERVICE_ACCOUNT_TRUST_POLICY_KIND, USER_IDENTITY_KIND, USER_KIND,
+    SERVICE_ACCOUNT_TRUST_POLICY_KIND, SYSTEM_ADMIN_PLATFORM_ROLE, USER_IDENTITY_KIND, USER_KIND,
 };
 use rise_resource_store_postgres::{
     BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
-    PgResourceStore, TrustPolicyLookup,
+    PgResourceStore, SerializableTransaction, TrustPolicyLookup,
 };
 use serde_json::json;
 use sqlx::Executor;
@@ -4109,6 +4109,26 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     assert!(membership_plan
         .join("\n")
         .contains("group_memberships_user_name"));
+
+    // The by-name form the grant gate uses. It matches the same partial index,
+    // and only because it repeats the index predicate's `split_part` expression
+    // verbatim: PostgreSQL cannot derive that from `api_version = '...'`, so
+    // dropping the seemingly-redundant line de-indexes the lookup entirely and
+    // puts a relation-wide `SIReadLock` on every gated identity write.
+    let by_name_plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::GROUP_TIES_BY_USER_NAME_SQL
+    ))
+    .bind("member")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        by_name_plan
+            .join("\n")
+            .contains("group_memberships_user_name"),
+        "{}",
+        by_name_plan.join("\n")
+    );
     Ok(())
 }
 
@@ -4388,7 +4408,9 @@ async fn policy_admission_normalizes_bindings_and_is_unbypassable(
         );
     }
 
-    // `system:operators` is reserved for the seeded bootstrap binding.
+    // `system:operators` is reserved for the seeded bootstrap binding, and the
+    // reservation is name- and placement-aware: any *other* root binding naming
+    // it is refused.
     let reserved = create_binding(
         &store,
         PLATFORM_ROLE_BINDING_KIND,
@@ -4402,7 +4424,8 @@ async fn policy_admission_normalizes_bindings_and_is_unbypassable(
     .await
     .unwrap_err();
     assert!(
-        matches!(reserved, StoreError::Validation(message) if message.contains("system:operators"))
+        matches!(reserved, StoreError::Validation(message) if message.contains("system:operators")),
+        "expected the reserved-subject rejection"
     );
 
     // A dynamic subject needs a selector to resolve against; a static one
@@ -5495,4 +5518,652 @@ async fn policy_binding_collection_uses_the_parent_scoped_indexes(
         "platform binding collection must be index-served; got:\n{platform_plan}"
     );
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// ADR-0001 §6.6 — the K-inheriting subtree
+// -----------------------------------------------------------------------------
+
+/// The grant gate's subtree read must match nearest-wins label resolution: a
+/// descendant that sets the key supplies its own value, so it and everything
+/// beneath it are unaffected by a write to the ancestor. The recursion has to
+/// *prune* at that node rather than merely skip it.
+#[sqlx::test]
+async fn label_inheriting_descendants_prune_at_a_shadowing_node(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_org_widget_rd(&store).await;
+
+    let org = create_labeled(&store, ORGANIZATION_KIND, "acme", None, &[]).await;
+    // Two children: one inherits, one shadows.
+    let inheriting = create_labeled(&store, "OrgWidget", "inheriting", Some(org.uid), &[]).await;
+    let shadowing = create_labeled(
+        &store,
+        "OrgWidget",
+        "shadowing",
+        Some(org.uid),
+        &[("rise.dev/owner", "group:other")],
+    )
+    .await;
+    // A grandchild under each. Only the one below `inheriting` inherits the org's
+    // value; the one below `shadowing` inherits *its* value instead.
+    let deep_inheriting =
+        create_labeled(&store, "OrgWidget", "deep-a", Some(inheriting.uid), &[]).await;
+    let below_shadow =
+        create_labeled(&store, "OrgWidget", "deep-b", Some(shadowing.uid), &[]).await;
+    // A descendant carrying an unrelated key is not shadowing this one.
+    let unrelated_key = create_labeled(
+        &store,
+        "OrgWidget",
+        "unrelated",
+        Some(inheriting.uid),
+        &[("rise.dev/team", "group:x")],
+    )
+    .await;
+
+    let found = store
+        .label_inheriting_descendants(org.uid, "rise.dev/owner")
+        .await
+        .unwrap();
+    let uids: Vec<Uuid> = found.iter().map(|row| row.uid).collect();
+
+    assert!(uids.contains(&inheriting.uid));
+    assert!(uids.contains(&deep_inheriting.uid));
+    assert!(
+        uids.contains(&unrelated_key.uid),
+        "a different label key does not shadow this one"
+    );
+    assert!(
+        !uids.contains(&shadowing.uid),
+        "a node with its own value is excluded"
+    );
+    assert!(
+        !uids.contains(&below_shadow.uid),
+        "the walk prunes at the shadowing node, so its subtree is excluded too"
+    );
+    assert!(
+        !uids.contains(&org.uid),
+        "the written resource itself is never returned"
+    );
+
+    // Rows arrive parent-before-child, which is what lets the caller stitch each
+    // descendant's own ancestry from its parent's.
+    let position = |uid: Uuid| uids.iter().position(|found| *found == uid).unwrap();
+    assert!(position(inheriting.uid) < position(deep_inheriting.uid));
+
+    // Labels ride along, so the caller can resolve each descendant's effective
+    // value without a second read.
+    let carried = found
+        .iter()
+        .find(|row| row.uid == unrelated_key.uid)
+        .unwrap();
+    assert_eq!(
+        carried.labels.get("rise.dev/team").map(String::as_str),
+        Some("group:x")
+    );
+
+    Ok(())
+}
+
+/// A resource still draining is still addressable, so its authority still
+/// matters: omitting tombstoned descendants would under-report the delta, which
+/// on a gate is the unsafe direction.
+#[sqlx::test]
+async fn label_inheriting_descendants_include_tombstoned_rows(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_org_widget_rd(&store).await;
+
+    let org = create_labeled(&store, ORGANIZATION_KIND, "acme", None, &[]).await;
+    let child = create_labeled(&store, "OrgWidget", "draining", Some(org.uid), &[]).await;
+    // A finalizer keeps the row present as a tombstone rather than hard-deleting.
+    store
+        .operator_update_finalizers(child.uid, "test", &["example.dev/hold".to_string()], &[])
+        .await
+        .unwrap();
+    store.delete(child.uid).await.unwrap();
+    let tombstoned = store.get(child.uid).await.unwrap().unwrap();
+    assert!(tombstoned.deletion_timestamp.is_some());
+
+    let found = store
+        .label_inheriting_descendants(org.uid, "rise.dev/owner")
+        .await
+        .unwrap();
+    assert!(found.iter().any(|row| row.uid == child.uid));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn label_inheriting_descendants_of_an_unknown_uid_are_empty(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    assert!(store
+        .label_inheriting_descendants(Uuid::new_v4(), "rise.dev/owner")
+        .await
+        .unwrap()
+        .is_empty());
+    Ok(())
+}
+
+/// A no-op update: every mutable field carried over from the current row, so a
+/// test can isolate the one field it means to change.
+fn update_params(row: &ResourceRow) -> UpdateResourceParams {
+    UpdateResourceParams {
+        api_version: None,
+        revision: row.revision,
+        labels: row.labels.clone(),
+        annotations: Default::default(),
+        finalizers: row.finalizers.clone(),
+        owner_references: row.owner_references.clone(),
+        spec: row.spec.clone(),
+        validator: None,
+    }
+}
+
+async fn create_labeled(
+    store: &PgResourceStore,
+    kind: &str,
+    name: &str,
+    parent_uid: Option<Uuid>,
+    labels: &[(&str, &str)],
+) -> ResourceRow {
+    let api_version = if kind == "OrgWidget" {
+        "example.dev/v1"
+    } else {
+        API_VERSION_V1ALPHA1
+    };
+    store
+        .create(CreateResourceParams {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            parent_uid,
+            labels: labels
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            spec: if kind == ORGANIZATION_KIND {
+                json!({"displayName": name})
+            } else {
+                json!({})
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("create {kind} '{name}': {error}"))
+}
+
+// -----------------------------------------------------------------------------
+// ADR-0001 §5 — the immutable seeded operator policy
+// -----------------------------------------------------------------------------
+
+/// The seeded pair can be written exactly once, with exactly its shipped body,
+/// and then neither edited nor deleted. The rows are not the source of operator
+/// authority — the evaluator hardcodes that — they are its only inspectable
+/// record, which is what the reservation protects.
+#[sqlx::test]
+async fn seeded_operator_policy_is_immutable(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+
+    // A body other than the shipped one is refused outright.
+    let wrong_body = create_builtin_resource(
+        &store,
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        None,
+        json!({"statements": [{"effect": "Allow", "kinds": "*", "verbs": ["get"]}]}),
+        vec![],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&wrong_body, StoreError::Validation(message) if message.contains("immutable")),
+        "a drifted seed body must be refused, got {wrong_body:?}"
+    );
+
+    let role = create_builtin_resource(
+        &store,
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        None,
+        serde_json::to_value(rise_resource_api::system_admin_role_spec()).unwrap(),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let binding = create_binding(
+        &store,
+        PLATFORM_ROLE_BINDING_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        None,
+        serde_json::to_value(rise_resource_api::system_admin_binding_spec()).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Neither can be updated, even to its own current content.
+    for row in [&role, &binding] {
+        let error = store.update(row.uid, update_params(row)).await.unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("immutable")),
+            "{} must reject updates, got {error:?}",
+            row.kind
+        );
+    }
+
+    // Nor deleted.
+    for row in [&role, &binding] {
+        let error = store.delete(row.uid).await.unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message) if message.contains("immutable")),
+            "{} must reject deletes, got {error:?}",
+            row.kind
+        );
+        assert!(store.get(row.uid).await.unwrap().is_some(), "row survives");
+    }
+
+    Ok(())
+}
+
+/// The reservation is placement-scoped: an organization's own `Role` named
+/// `system-admin` is ordinary data, because only the root rows are reserved.
+#[sqlx::test]
+async fn an_organization_role_may_be_named_system_admin(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_builtin_resource(
+        &store,
+        ORGANIZATION_KIND,
+        "acme",
+        None,
+        json!({"displayName": "Acme"}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let role = create_builtin_resource(
+        &store,
+        ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+        Some(org.uid),
+        json!({"statements": [{"effect": "Allow", "kinds": "*", "verbs": ["get"]}]}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // And it stays editable and deletable.
+    store
+        .update(
+            role.uid,
+            UpdateResourceParams {
+                spec: json!({"statements": []}),
+                ..update_params(&role)
+            },
+        )
+        .await
+        .unwrap();
+    store.delete(role.uid).await.unwrap();
+
+    Ok(())
+}
+
+/// The `system:operators` reservation covers *both* binding kinds. An org
+/// `RoleBinding` naming it is refused for the same reason a stray platform one
+/// is: the recovery tier is hardcoded in the evaluator, so a second row naming
+/// it would look like the source of that authority without being it.
+#[sqlx::test]
+async fn an_org_role_binding_cannot_name_the_operators_subject(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let org = create_builtin_resource(
+        &store,
+        ORGANIZATION_KIND,
+        "acme",
+        None,
+        json!({"displayName": "Acme"}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        ROLE_KIND,
+        "viewer",
+        Some(org.uid),
+        json!({"statements": [{"effect": "Allow", "kinds": "*", "verbs": ["get"]}]}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let error = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "operators",
+        Some(org.uid),
+        json!({
+            "subject": "system:operators",
+            "roleRef": {"kind": "Role", "name": "viewer"}
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Validation(message) if message.contains("system:operators")),
+        "an org RoleBinding must not name the operators subject, got {error:?}"
+    );
+
+    Ok(())
+}
+
+/// An org `RoleBinding`'s subject is bounded to its own Organization, and a
+/// relative Group subject is expanded against it.
+///
+/// The rejected shapes are exactly the ones ADR-0001 §1's recipient boundary
+/// decides from the identifier alone: both organizations are frozen at write
+/// time, so the binding would be inert on every resource forever. The accepted
+/// shapes are the contingent ones §6.7 protects — `user:` and
+/// `system:authenticated` are live precisely while the caller is affiliated.
+#[sqlx::test]
+async fn an_org_role_binding_subject_is_bounded_to_its_own_organization(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let acme = create_org(&store, "acme").await;
+    let beta = create_org(&store, "beta").await;
+    create_role(&store, acme.uid, "viewer").await;
+    create_role(&store, beta.uid, "viewer").await;
+    create_builtin_resource(&store, USER_KIND, "alice", None, json!({}), vec![])
+        .await
+        .unwrap();
+    for (kind, parent) in [
+        (GROUP_KIND, acme.uid),
+        (GROUP_KIND, beta.uid),
+        (SERVICE_ACCOUNT_KIND, beta.uid),
+    ] {
+        create_builtin_resource(&store, kind, "team-leads", Some(parent), json!({}), vec![])
+            .await
+            .unwrap();
+    }
+
+    let with_subject = |subject: &str| {
+        json!({
+            "subject": subject,
+            "roleRef": {"kind": "Role", "name": "viewer"}
+        })
+    };
+
+    for subject in [
+        "group:beta/team-leads",
+        "serviceaccount:beta/team-leads",
+        "org:beta",
+    ] {
+        let error = create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            "foreign",
+            Some(acme.uid),
+            with_subject(subject),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, StoreError::Validation(message)
+                if message.contains("belongs to Organization 'beta', not 'acme'")),
+            "{subject} should be refused, got {error:?}"
+        );
+    }
+
+    // Root-absolute subjects stay admissible: their affiliation is a live
+    // membership question, not a property of the identifier.
+    for (index, subject) in ["user:alice", "system:authenticated"]
+        .into_iter()
+        .enumerate()
+    {
+        create_binding(
+            &store,
+            ROLE_BINDING_KIND,
+            &format!("contingent-{index}"),
+            Some(acme.uid),
+            with_subject(subject),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{subject}: {error:?}"));
+    }
+
+    // The relative form names a Group in the binding's own Organization, and
+    // the row stores the expanded, canonical subject.
+    let relative = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "relative",
+        Some(acme.uid),
+        with_subject("group:team-leads"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(relative.spec["subject"], json!("group:acme/team-leads"));
+
+    // It resolves against the parent, not against whatever org happens to own
+    // a Group of that name — `beta/team-leads` exists and is not reachable.
+    let absent = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "relative-absent",
+        Some(beta.uid),
+        with_subject("group:platform"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&absent, StoreError::Validation(message)
+            if message.contains("subject 'group:beta/platform'")),
+        "a relative subject must resolve against its own org, got {absent:?}"
+    );
+
+    Ok(())
+}
+
+/// The update path, which is what an install holding a pre-existing foreign
+/// subject actually meets.
+///
+/// Admission runs on create and update alike, so the boundary is not a
+/// create-time gate a later edit slips past. The two remediations the operator
+/// upgrade note offers — re-point the subject, or delete the row — both have to
+/// keep working on a row the check itself would now refuse, which is why this
+/// plants one directly rather than through the store.
+#[sqlx::test]
+async fn a_foreign_subject_survives_reads_and_blocks_only_its_own_replay(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let acme = create_org(&store, "acme").await;
+    create_org(&store, "beta").await;
+    create_role(&store, acme.uid, "viewer").await;
+    create_builtin_resource(
+        &store,
+        GROUP_KIND,
+        "platform",
+        Some(acme.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let spec = |subject: &str| {
+        json!({
+            "subject": subject,
+            "roleRef": {"kind": "Role", "name": "viewer"}
+        })
+    };
+
+    // The relative form is expanded once and stays put when the stored spec is
+    // replayed, which is the shape a read-modify-write client sends back.
+    let relative = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "relative",
+        Some(acme.uid),
+        spec("group:platform"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(relative.spec["subject"], json!("group:acme/platform"));
+    let replayed = store
+        .update(relative.uid, update_spec(relative.revision, relative.spec))
+        .await
+        .unwrap();
+    assert_eq!(replayed.spec["subject"], json!("group:acme/platform"));
+
+    // A row from before the check exists only by direct write.
+    let legacy = create_binding(
+        &store,
+        ROLE_BINDING_KIND,
+        "legacy",
+        Some(acme.uid),
+        spec("group:acme/platform"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE resource_store.resources SET spec = $1 WHERE uid = $2")
+        .bind(spec("group:beta/team-leads"))
+        .bind(legacy.uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let legacy = store.get(legacy.uid).await.unwrap().unwrap();
+    assert_eq!(legacy.spec["subject"], json!("group:beta/team-leads"));
+
+    // Reading it back is unaffected; only an update carrying that subject fails.
+    let replay = store
+        .update(legacy.uid, update_spec(legacy.revision, legacy.spec))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&replay, StoreError::Validation(message)
+            if message.contains("belongs to Organization 'beta', not 'acme'")),
+        "replaying a foreign subject should fail, got {replay:?}"
+    );
+
+    // Re-pointing it is the documented fix, and the subject is not immutable.
+    let fixed = store
+        .update(
+            legacy.uid,
+            update_spec(legacy.revision, spec("group:platform")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixed.spec["subject"], json!("group:acme/platform"));
+
+    // Deleting is the other documented fix, and works while the row is foreign.
+    sqlx::query("UPDATE resource_store.resources SET spec = $1 WHERE uid = $2")
+        .bind(spec("org:beta"))
+        .bind(fixed.uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.delete(fixed.uid).await.unwrap();
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// The serializable transaction seam (ADR-0001 §5)
+// -----------------------------------------------------------------------------
+
+fn organization(name: &str) -> CreateResourceParams {
+    CreateResourceParams {
+        labels: Default::default(),
+        api_version: API_VERSION_V1ALPHA1.to_string(),
+        kind: ORGANIZATION_KIND.to_string(),
+        name: name.to_string(),
+        parent_uid: None,
+        annotations: BTreeMap::new(),
+        finalizers: vec![],
+        owner_references: vec![],
+        spec: json!({"displayName": name}),
+        validator: None,
+    }
+}
+
+/// A store bound to a transaction reads and writes inside it: the row is
+/// invisible outside until the commit, and visible to the transaction's own
+/// reads immediately. This is what makes the grant gate's simulated delta and
+/// the committed row agree.
+#[sqlx::test]
+async fn a_transaction_scoped_store_reads_its_own_uncommitted_write(pool: sqlx::PgPool) {
+    let store = PgResourceStore::new(pool.clone());
+    let transaction = SerializableTransaction::begin(&pool).await.unwrap();
+    let scoped = store.in_session(transaction.session());
+
+    let row = scoped.create(organization("in-flight")).await.unwrap();
+    assert!(scoped.get(row.uid).await.unwrap().is_some());
+    assert!(
+        store.get(row.uid).await.unwrap().is_none(),
+        "an uncommitted write must not be visible outside its transaction"
+    );
+
+    transaction.commit().await.unwrap();
+    assert!(store.get(row.uid).await.unwrap().is_some());
+}
+
+/// Dropping without committing rolls back, which is how a refused write leaves
+/// nothing behind.
+#[sqlx::test]
+async fn dropping_a_transaction_rolls_its_writes_back(pool: sqlx::PgPool) {
+    let store = PgResourceStore::new(pool.clone());
+    let uid = {
+        let transaction = SerializableTransaction::begin(&pool).await.unwrap();
+        let scoped = store.in_session(transaction.session());
+        scoped.create(organization("abandoned")).await.unwrap().uid
+    };
+    assert!(store.get(uid).await.unwrap().is_none());
+}
+
+/// Two transactions that each read a predicate the other then writes into have
+/// no serial order, and PostgreSQL refuses one of the commits. The refusal
+/// arrives as `StoreError::Serialization` rather than an opaque backend error,
+/// because the caller's correct response is to replay the whole unit of work
+/// (ADR-0001 §5, scenario 33).
+#[sqlx::test]
+async fn a_serialization_conflict_is_reported_as_retryable(pool: sqlx::PgPool) {
+    let store = PgResourceStore::new(pool.clone());
+    let first = SerializableTransaction::begin(&pool).await.unwrap();
+    let second = SerializableTransaction::begin(&pool).await.unwrap();
+    let first_store = store.in_session(first.session());
+    let second_store = store.in_session(second.session());
+
+    // Both read the same predicate — every Organization — before writing into
+    // it. Each write invalidates the other's read.
+    first_store
+        .list(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, None)
+        .await
+        .unwrap();
+    second_store
+        .list(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, None)
+        .await
+        .unwrap();
+    first_store
+        .create(organization("from-first"))
+        .await
+        .unwrap();
+    second_store
+        .create(organization("from-second"))
+        .await
+        .unwrap();
+
+    first.commit().await.expect("the first commit wins");
+    let outcome = second.commit().await;
+    assert!(
+        matches!(outcome, Err(StoreError::Serialization)),
+        "expected a serialization failure, got {outcome:?}"
+    );
 }

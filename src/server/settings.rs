@@ -231,7 +231,7 @@ pub enum DeploymentLogsSettings {
     ///
     /// ECS installs that want runtime logs today can use the `loki` variant,
     /// which is backend-agnostic (it queries by stream labels, not a runtime
-    /// client). A CloudWatch variant is the intended replacement — see ADR-0004.
+    /// client). A CloudWatch variant is the intended replacement — see ADR-0005.
     None {},
     Loki {
         url: String,
@@ -1583,7 +1583,7 @@ pub enum DeploymentControllerSettings {
     /// definition. No Kubernetes, no Metacontroller — reconciliation runs
     /// in-process (see `rise_backend_ecs::reconciler::EcsReconciler`).
     ///
-    /// See ADR-0004 for the design and its deliberate v1 limitations.
+    /// See ADR-0005 for the design and its deliberate v1 limitations.
     #[cfg(feature = "backend")]
     Ecs {
         /// AWS region hosting the cluster.

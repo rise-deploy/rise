@@ -23,19 +23,23 @@ pub use identity::{
 };
 pub use owner_reference::OwnerReference;
 pub use policy::{
-    BindingSubject, Effect, KindMatcher, LabelKey, LabelSelector,
-    LocallyNormalizedPlatformRoleBindingSpec, LocallyNormalizedRoleBindingSpec,
-    PlatformRoleBindingSpec, PlatformRoleRef, PlatformRoleRefKind, PolicyStatement,
-    ResourceKindPattern, RoleBindingSpec, RoleRef, RoleRefKind, RoleSpec, SubjectMembership,
-    SubresourceMatcher, SubresourceName, Verb, VerbMatcher, POLICY_KIND_DEFINITIONS,
+    is_immutable_policy_seed, org_admin_role_spec, resource_owner_binding_spec,
+    resource_owner_role_spec, system_admin_binding_spec, system_admin_role_spec, BindingSubject,
+    Effect, KindMatcher, LabelKey, LabelSelector, LocallyNormalizedPlatformRoleBindingSpec,
+    LocallyNormalizedRoleBindingSpec, PlatformRoleBindingSpec, PlatformRoleRef,
+    PlatformRoleRefKind, PolicyStatement, ResourceKindPattern, RoleBindingSpec, RoleBindingSubject,
+    RoleRef, RoleRefKind, RoleSpec, SubjectMembership, SubresourceMatcher, SubresourceName, Verb,
+    VerbMatcher, IMMUTABLE_POLICY_SEEDS, OPERATORS_SUBJECT, ORG_ADMIN_PLATFORM_ROLE,
+    OWNER_LABEL_KEY, POLICY_KIND_DEFINITIONS, RESOURCE_OWNER_PLATFORM_ROLE,
+    SYSTEM_ADMIN_PLATFORM_ROLE,
 };
 pub use resource_kind::ResourceKind;
 pub use resource_row::ResourceRow;
 pub use scope::Scope;
 pub use store::{
     CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlocker,
-    DeletionBlockerRelationship, DeletionBlockerReport, NoOpValidator, PathSegment, ResourceStore,
-    SpecValidator, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
+    DeletionBlockerRelationship, DeletionBlockerReport, NoOpValidator, PathSegment, ResourceApi,
+    ResourceStore, SpecValidator, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
     MAX_PARENT_CHAIN_DEPTH, SYSTEM_FINALIZER_PREFIX,
 };
 pub use subject_id::SubjectId;
@@ -132,6 +136,16 @@ pub struct ResourceMetadata {
     /// carries authorization meaning on its own.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// Every label key in force on this resource, resolved nearest-wins down its
+    /// ancestry (ADR-0001 §6.1).
+    ///
+    /// Computed on read from the ancestor chain, never stored: this is the same
+    /// walk authorization performs, so the value a client sees and the value a
+    /// `labelSelector` matches can never disagree. Responses built without an
+    /// ancestor chain leave it empty rather than repeating `labels`, which would
+    /// claim an inheritance answer nobody resolved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effective_labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]

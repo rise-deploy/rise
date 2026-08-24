@@ -342,7 +342,7 @@ variable "db_allocated_storage" {
 }
 
 variable "db_multi_az" {
-  description = "Multi-AZ database. ADR-0004 D15's reference topology; roughly doubles the instance cost."
+  description = "Multi-AZ database. ADR-0005 D15's reference topology; roughly doubles the instance cost."
   type        = bool
   default     = false
 }

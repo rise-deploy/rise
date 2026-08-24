@@ -84,6 +84,7 @@ cli = [
 ]
 backend = [
     # Server core (former "server" feature)
+    "dep:rise-authz",
     "dep:rise-backend-auth",
     "dep:rise-backend-core",
     "dep:rise-backend-docker",
@@ -138,6 +139,7 @@ backend = [
 
 [dependencies]
 # Workspace crates (backend only)
+rise-authz = { path = "crates/rise-authz", optional = true }
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
 rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }

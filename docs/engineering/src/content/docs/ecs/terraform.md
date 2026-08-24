@@ -4,7 +4,7 @@ description: "Standing up a Rise install on Amazon ECS with the rise-aws and ris
 ---
 
 Two modules under [`modules/`](https://github.com/rise-deploy/rise/tree/develop/modules)
-stand up the topology [ADR-0004](/operator-docs/adr/0004-ecs-deployment-backend/)
+stand up the topology [ADR-0005](/operator-docs/adr/0005-ecs-deployment-backend/)
 describes.
 
 | Module | Owns |

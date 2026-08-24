@@ -112,36 +112,26 @@ run = "cargo sqlx prepare --check -- --all-targets"
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
+# `cargo all-features` covers rise-deploy's feature combinations — `cli` and
+# `cli,backend`, since `always_include_features = ["cli"]` means backend-alone
+# is never built; `--workspace` covers every crate and every test target.
+# Neither alone is enough: the first is package-scoped, the second only ever
+# builds the all-features combination.
 cargo all-features check --all-targets
-cargo check --package rise-authz --all-targets
-cargo check --package rise-resource-api --all-targets
-cargo check --package rise-resource-store-postgres --all-targets
-cargo check --package rise-backend-auth --all-targets
-cargo check --package rise-backend-core --all-targets
-cargo check --package rise-runtime-sync --all-targets
-cargo check --package rise-backend-traefik --all-targets
-cargo check --package rise-backend-docker --all-targets
-cargo check --package rise-backend-ecs --all-targets
+cargo check --workspace --all-features --all-targets
 cargo all-features clippy --all-targets -- -D warnings
-cargo clippy --package rise-authz --all-targets -- -D warnings
-cargo clippy --package rise-resource-api --all-targets -- -D warnings
-cargo clippy --package rise-resource-store-postgres --all-targets -- -D warnings
-cargo clippy --package rise-backend-auth --all-targets -- -D warnings
-cargo clippy --package rise-backend-core --all-targets -- -D warnings
-cargo clippy --package rise-runtime-sync --all-targets -- -D warnings
-cargo clippy --package rise-backend-traefik --all-targets -- -D warnings
-cargo clippy --package rise-backend-docker --all-targets -- -D warnings
-cargo clippy --package rise-backend-ecs --all-targets -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
 mise terraform:check
-cargo test --package rise-authz --all-targets
-cargo test --package rise-backend-auth --all-targets
-cargo test --package rise-backend-core --all-targets
-cargo test --package rise-backend-traefik --all-targets
-cargo test --package rise-backend-ecs --all-targets
+# Every crate whose tests need no database. Expressed as exclusions so a new
+# crate is covered by default; only the three that require Postgres opt out.
+cargo test --workspace --all-features \
+  --exclude rise-deploy \
+  --exclude rise-resource-store-postgres \
+  --exclude rise-runtime-sync
 """
 env.SQLX_OFFLINE = true
 

@@ -1,7 +1,7 @@
 # `rise-ecs`
 
 Terraform for a working Rise install on Amazon ECS (Fargate), in the shape
-[ADR-0004](../../docs/engineering/src/content/docs/adr/0004-ecs-deployment-backend.md)
+[ADR-0005](../../docs/engineering/src/content/docs/adr/0005-ecs-deployment-backend.md)
 describes: an NLB fronting Traefik, Traefik terminating TLS with ACME, the Rise
 control plane and every deployed workload in private subnets, RDS for the
 control-plane store, and ECR for images.

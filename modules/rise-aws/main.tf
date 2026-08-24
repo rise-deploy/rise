@@ -301,7 +301,7 @@ data "aws_iam_policy_document" "backend" {
   }
 
   # ---------------------------------------------------------------------------
-  # ECS deployment controller (ADR-0004 D14)
+  # ECS deployment controller (ADR-0005 D14)
   #
   # Scoped to what crates/rise-backend-ecs actually calls, which is a short list:
   # the crate depends on aws-sdk-ecs, aws-sdk-ssm and aws-sdk-sts and nothing

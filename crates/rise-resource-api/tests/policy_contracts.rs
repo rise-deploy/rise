@@ -207,16 +207,86 @@ fn binding_normalization_is_contextual_and_fail_closed() {
     .unwrap();
     assert!(static_exists_selector.normalize().is_err());
 
+    // `system:operators` parses and normalizes on both binding kinds: it is the
+    // subject of the seeded bootstrap binding, which has to be writable through
+    // this same contract. Reserving it to that one root `PlatformRoleBinding`
+    // needs the resource's name and placement, which this context-free step
+    // cannot see, so the reservation lives in transaction-scoped admission — and
+    // covers *both* kinds there, which the store's integration suite pins.
     let reserved_platform: PlatformRoleBindingSpec =
         serde_json::from_value(platform_binding("system:operators")).unwrap();
-    assert!(reserved_platform.normalize().is_err());
+    let normalized = reserved_platform
+        .normalize()
+        .expect("parses and normalizes");
+    assert_eq!(normalized.subject().to_string(), "system:operators");
 
     let reserved_org: RoleBindingSpec = serde_json::from_value(json!({
         "subject": "system:operators",
         "roleRef": { "kind": "PlatformRole", "name": "system-admin" }
     }))
     .unwrap();
-    assert!(reserved_org.normalize("acme").is_err());
+    assert!(reserved_org.normalize("acme").is_ok());
+}
+
+/// The shipped defaults must round-trip through the closed contracts they are
+/// written against, so a default that drifts out of the grammar fails here
+/// rather than becoming a row nothing can read back.
+#[test]
+fn shipped_policy_defaults_parse_and_normalize() {
+    use rise_resource_api::{
+        is_immutable_policy_seed, org_admin_role_spec, resource_owner_binding_spec,
+        resource_owner_role_spec, system_admin_binding_spec, system_admin_role_spec,
+        PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, RESOURCE_OWNER_PLATFORM_ROLE,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+    };
+
+    // Both bindings normalize, which is the form the store persists.
+    let system_admin = system_admin_binding_spec().normalize().unwrap();
+    assert_eq!(system_admin.scope().as_ref(), "*");
+    assert_eq!(system_admin.role_ref().name, SYSTEM_ADMIN_PLATFORM_ROLE);
+
+    let owner = resource_owner_binding_spec().normalize().unwrap();
+    assert_eq!(owner.scope().as_ref(), "*");
+    assert_eq!(
+        owner
+            .label_selector()
+            .map(|selector| selector.key.to_string()),
+        Some("rise.dev/owner".to_owned())
+    );
+    assert_eq!(owner.role_ref().name, RESOURCE_OWNER_PLATFORM_ROLE);
+
+    // The Role bodies are non-empty, or the seeds would grant nothing.
+    for spec in [
+        system_admin_role_spec(),
+        org_admin_role_spec(),
+        resource_owner_role_spec(),
+    ] {
+        assert!(!spec.statements.is_empty());
+    }
+
+    // Only the operator pair is reserved.
+    assert!(is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+    assert!(is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
+        PLATFORM_ROLE_BINDING_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+    assert!(!is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
+        PLATFORM_ROLE_KIND,
+        RESOURCE_OWNER_PLATFORM_ROLE
+    ));
+    // The API group is part of the identity, and the cascade's SQL exemption
+    // pins it too. A kind registered under another group is ordinary data.
+    assert!(!is_immutable_policy_seed(
+        "example.dev/v1",
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
 }
 
 #[test]
@@ -236,6 +306,102 @@ fn generated_binding_schemas_match_omission_and_null_rules() {
         "roleRef": { "kind": "Role", "name": "viewer" }
     });
     assert!(!schema_accepts::<RoleBindingSpec>(null_scope));
+
+    // The relative Group form is org-`RoleBinding`-only, so the two subject
+    // grammars must differ in exactly that one spelling.
+    let relative = json!({
+        "subject": "group:platform",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    });
+    assert!(schema_accepts::<RoleBindingSpec>(relative));
+    assert!(!schema_accepts::<PlatformRoleBindingSpec>(
+        platform_binding("group:platform")
+    ));
+}
+
+/// An org `RoleBinding` already sits in exactly one Organization, so its subject
+/// may name a Group relatively. Resolution happens at normalization, where the
+/// parent is known — parsing a subject never becomes context-sensitive.
+#[test]
+fn a_relative_group_subject_resolves_against_the_parent_organization() {
+    let relative: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "group:platform",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        relative.normalize("acme").unwrap().subject().to_string(),
+        "group:acme/platform"
+    );
+
+    // Absolute subjects and the closed templates pass through untouched, so the
+    // short form is an addition to the grammar rather than a reinterpretation.
+    for subject in [
+        "group:beta/platform",
+        "user:alice",
+        "serviceaccount:acme/ci",
+        "org:acme",
+        "system:authenticated",
+        "controller:builder",
+    ] {
+        let spec: RoleBindingSpec = serde_json::from_value(json!({
+            "subject": subject,
+            "roleRef": { "kind": "Role", "name": "viewer" }
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.normalize("acme").unwrap().subject().to_string(),
+            subject
+        );
+    }
+
+    let template: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "group:${ref.name}",
+        "labelSelector": { "key": "rise.dev/owner", "value": "x" },
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        template.normalize("acme").unwrap().subject().to_string(),
+        "group:${ref.name}"
+    );
+
+    // The relative form is still a resource name, and the platform binding's
+    // subject grammar is unchanged.
+    assert!(serde_json::from_value::<RoleBindingSpec>(json!({
+        "subject": "group:Not A Name",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .is_err());
+    assert!(
+        serde_json::from_value::<PlatformRoleBindingSpec>(platform_binding("group:platform"))
+            .is_err()
+    );
+}
+
+/// The write-time half of ADR-0001 §1's recipient boundary: a subject that names
+/// its own organization decides membership from the identifier alone, so a
+/// mismatch is permanent. Every other kind stays contingent and admissible.
+#[test]
+fn subject_organization_membership_is_decidable_only_when_the_subject_names_one() {
+    use rise_resource_api::SubjectId;
+
+    for subject in ["group:acme/platform", "serviceaccount:acme/ci", "org:acme"] {
+        let subject: SubjectId = subject.parse().unwrap();
+        assert!(subject.may_belong_to("acme"));
+        assert!(!subject.may_belong_to("beta"));
+    }
+
+    for subject in [
+        "user:alice",
+        "system:authenticated",
+        "system:operators",
+        "controller:builder",
+    ] {
+        let subject: SubjectId = subject.parse().unwrap();
+        assert!(subject.may_belong_to("acme"));
+        assert!(subject.may_belong_to("beta"));
+    }
 }
 
 #[test]

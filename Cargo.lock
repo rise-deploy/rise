@@ -4443,6 +4443,7 @@ dependencies = [
  "rand 0.10.2",
  "regex",
  "reqwest 0.13.4",
+ "rise-authz",
  "rise-backend-auth",
  "rise-backend-core",
  "rise-backend-docker",

@@ -10,7 +10,7 @@
 //! 1. **Secrets never appear in `environment`.** They are written to SSM and
 //!    referenced by ARN in `secrets`, so `DescribeTaskDefinition` — readable by
 //!    anyone with `ecs:DescribeTaskDefinition` — reveals a parameter name and
-//!    nothing else. This is the whole point of ADR-0004 D7 and the one place
+//!    nothing else. This is the whole point of ADR-0005 D7 and the one place
 //!    the Docker backend's documented plaintext gap is closed rather than
 //!    inherited.
 //! 2. **Traefik configuration rides in `dockerLabels`.** Traefik's ECS provider

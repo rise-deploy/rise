@@ -9,7 +9,7 @@ plane talks to the ECS API, and AWS schedules the workloads.
 
 The design, its rationale, and the two AWS behaviours it depends on (both
 verified against a real account) are recorded in
-[ADR-0004](/operator-docs/adr/0004-ecs-deployment-backend/).
+[ADR-0005](/operator-docs/adr/0005-ecs-deployment-backend/).
 
 ## How it maps
 

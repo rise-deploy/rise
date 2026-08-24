@@ -86,52 +86,50 @@ pub async fn list_access_classes(
     Ok(Json(ListAccessClassesResponse { access_classes }))
 }
 
-/// Resolve user identifier (UUID or email) to user ID
-async fn resolve_user_identifier(
-    pool: &sqlx::PgPool,
+/// Resolve user identifier (UUID or email) to user ID.
+///
+/// Takes an executor rather than the pool so a caller that already holds a
+/// transaction resolves on *its* connection. Asking the pool for a second
+/// connection while holding one deadlocks the pool against itself once enough
+/// requests do it at once — and these resolvers are called once per entry in a
+/// caller-supplied `app_users` / `app_teams` list, so "enough" is not many.
+async fn resolve_user_identifier<'a, E>(
+    executor: E,
     identifier: &str,
-) -> Result<uuid::Uuid, ServerError> {
+) -> Result<uuid::Uuid, ServerError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     use crate::server::error::ServerErrorExt;
 
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        // Valid UUID - verify user exists
-        db_users::find_by_id(pool, uuid)
-            .await
-            .internal_err("Failed to lookup user")?
-            .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
-            .map(|u| u.id)
-    } else {
-        // Treat as email - look up user
-        db_users::find_by_email(pool, identifier)
-            .await
-            .internal_err("Failed to lookup user")?
-            .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
-            .map(|u| u.id)
-    }
+    let found = match uuid::Uuid::parse_str(identifier) {
+        Ok(uuid) => db_users::find_by_id(executor, uuid).await,
+        Err(_) => db_users::find_by_email(executor, identifier).await,
+    };
+    found
+        .internal_err("Failed to lookup user")?
+        .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
+        .map(|u| u.id)
 }
 
 /// Resolve team identifier (UUID or name) to team ID
-async fn resolve_team_identifier(
-    pool: &sqlx::PgPool,
+async fn resolve_team_identifier<'a, E>(
+    executor: E,
     identifier: &str,
-) -> Result<uuid::Uuid, ServerError> {
+) -> Result<uuid::Uuid, ServerError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     use crate::server::error::ServerErrorExt;
 
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        // Valid UUID - verify team exists
-        db_teams::find_by_id(pool, uuid)
-            .await
-            .internal_err("Failed to lookup team")?
-            .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
-            .map(|t| t.id)
-    } else {
-        // Treat as team name - look up team
-        db_teams::find_by_name(pool, identifier)
-            .await
-            .internal_err("Failed to lookup team")?
-            .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
-            .map(|t| t.id)
-    }
+    let found = match uuid::Uuid::parse_str(identifier) {
+        Ok(uuid) => db_teams::find_by_id(executor, uuid).await,
+        Err(_) => db_teams::find_by_name(executor, identifier).await,
+    };
+    found
+        .internal_err("Failed to lookup team")?
+        .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
+        .map(|t| t.id)
 }
 
 pub async fn create_project(
@@ -272,7 +270,7 @@ pub async fn create_project(
 
     // Add app users if provided
     for user_identifier in &payload.app_users {
-        let user_id = resolve_user_identifier(&state.db_pool, user_identifier).await?;
+        let user_id = resolve_user_identifier(&mut *tx, user_identifier).await?;
         crate::db::project_app_users::add_user(&mut *tx, project.id, user_id)
             .await
             .internal_err("Failed to add app user")?;
@@ -280,7 +278,7 @@ pub async fn create_project(
 
     // Add app teams if provided
     for team_identifier in &payload.app_teams {
-        let team_id = resolve_team_identifier(&state.db_pool, team_identifier).await?;
+        let team_id = resolve_team_identifier(&mut *tx, team_identifier).await?;
         crate::db::project_app_users::add_team(&mut *tx, project.id, team_id)
             .await
             .internal_err("Failed to add app team")?;
@@ -788,7 +786,7 @@ pub async fn update_project(
 
         // Add new app users
         for user_identifier in &app_users {
-            let user_id = resolve_user_identifier(&state.db_pool, user_identifier).await?;
+            let user_id = resolve_user_identifier(&mut *tx, user_identifier).await?;
 
             crate::db::project_app_users::add_user(&mut *tx, updated_project.id, user_id)
                 .await
@@ -821,7 +819,7 @@ pub async fn update_project(
 
         // Add new app teams
         for team_identifier in &app_teams {
-            let team_id = resolve_team_identifier(&state.db_pool, team_identifier).await?;
+            let team_id = resolve_team_identifier(&mut *tx, team_identifier).await?;
 
             crate::db::project_app_users::add_team(&mut *tx, updated_project.id, team_id)
                 .await

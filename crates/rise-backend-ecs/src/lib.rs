@@ -8,7 +8,7 @@
 //! cleanup (the reconciler collects a deleted environment's services on its next
 //! tick).
 //!
-//! The design is ADR-0004. The shape worth knowing before reading further:
+//! The design is ADR-0005. The shape worth knowing before reading further:
 //!
 //! - **One ECS service per (deployment, container spec)**, one task-definition
 //!   family per (project, group, container) with a revision per deploy. Two

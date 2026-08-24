@@ -159,11 +159,12 @@ jobs:
         env:
           SQLX_OFFLINE: true
 
-      - name: Run Clippy (resource API crate)
-        run: cargo clippy --package rise-resource-api --all-targets -- -D warnings
-
-      - name: Run Clippy (authorization crate)
-        run: cargo clippy --package rise-authz --all-targets -- -D warnings
+      # Workspace-wide, so support crates and their test targets are covered
+      # without a hand-maintained package list that drifts as crates are added.
+      - name: Run Clippy (workspace)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        env:
+          SQLX_OFFLINE: true
 
       - name: Run cargo audit
         run: cargo audit
