@@ -41,8 +41,9 @@ execution role, and Cloud Map registration is part of the unimplemented D10 — 
 those grants are omitted rather than reserved, with tests asserting they stay
 out.
 
-Deliberately deferred, each **failing closed** with an actionable deploy-time
-error rather than half-working: workload identity (D8), Cloud Map
+Deliberately deferred, each **failing closed**: the deployment is marked Failed
+on its first reconcile, carrying the reason as its failure message rather than
+running half-working or timing out with a generic one. The features: workload identity (D8), Cloud Map
 cross-container discovery (D10), CloudWatch logs (D11), and ALB-*native* routing
 (D5) — distinct from the ALB+ACM *edge*, which `modules/rise-ecs` implements as
 a documented opt-in.

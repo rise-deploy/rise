@@ -95,6 +95,23 @@ pub struct ReconcilerConfig {
 }
 
 /// Background reconciler converging the ECS cluster with the database.
+/// Attached as context to an error a deployment can never recover from.
+///
+/// `reconcile_project` looks for it to decide whether to fail the deployment
+/// with the message the operator needs, or protect it and retry.
+#[derive(Debug, Clone, Copy)]
+pub struct PermanentDeployError;
+
+impl std::fmt::Display for PermanentDeployError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately empty of its own text: the message the user sees is the
+        // one the rejection wrote, not this marker.
+        f.write_str("")
+    }
+}
+
+impl std::error::Error for PermanentDeployError {}
+
 pub struct EcsReconciler {
     ecs: aws_sdk_ecs::Client,
     ssm: aws_sdk_ssm::Client,
@@ -337,6 +354,23 @@ impl EcsReconciler {
                 .await
             {
                 Ok(mut entries) => desired.append(&mut entries),
+                Err(e) if e.downcast_ref::<PermanentDeployError>().is_some() => {
+                    // Retrying would fail identically forever, and the deploying
+                    // timeout would eventually replace this message with
+                    // "timed out after 300 seconds" -- burying the one piece of
+                    // text that tells the user what to change.
+                    let message = format!("{:#}", e);
+                    warn!(
+                        deployment = %deployment.deployment_id,
+                        "Rejecting deployment: {}", message
+                    );
+                    self.store
+                        .mark_deployment_failed(deployment.id, &message)
+                        .await?;
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
                 Err(e) => {
                     warn!(
                         deployment = %deployment.deployment_id,
@@ -509,6 +543,19 @@ impl EcsReconciler {
     /// differences: secrets stay *out* of the plain environment (they go to SSM),
     /// and there is no per-replica fan-out — the replica count becomes the
     /// service's `desiredCount`.
+    /// Wrap an error the deployment can never recover from by retrying.
+    ///
+    /// The distinction matters because the two need opposite handling: a
+    /// transient failure (a store read, a KMS decrypt) should protect the
+    /// deployment's services from GC and be retried next tick, while a
+    /// permanent one — an unsupported feature, an unsatisfiable size, a name
+    /// ECS will not accept — will fail identically forever. Retrying it just
+    /// buries the actionable message in a log until the deploying timeout
+    /// replaces it with "timed out after 300 seconds".
+    fn permanent<T>(result: Result<T>) -> Result<T> {
+        result.map_err(|e| e.context(PermanentDeployError))
+    }
+
     async fn compute_desired_for_deployment(
         &self,
         project: &Project,
@@ -518,7 +565,7 @@ impl EcsReconciler {
 
         // Fail closed on the features v1 does not implement, rather than
         // deploying something that looks fine and is quietly broken.
-        self.reject_unsupported(deployment, &container_specs)?;
+        Self::permanent(self.reject_unsupported(deployment, &container_specs))?;
 
         let environment = if let Some(env_id) = deployment.environment_id {
             self.store.find_environment(env_id).await?
@@ -749,10 +796,15 @@ impl EcsReconciler {
             })
             .collect();
         for (key, value) in secret_plaintext {
-            ssm::validate(key, value)?;
+            // A name ECS will not accept is a property of the spec, not of the
+            // moment.
+            Self::permanent(ssm::validate(key, value))?;
         }
 
-        let task_def = task_definition::build(
+        // Everything build() rejects -- an unsatisfiable Fargate size, an
+        // environment past the task-definition limit -- is a property of the
+        // spec and will be rejected identically forever.
+        let task_def = Self::permanent(task_definition::build(
             &desired_container,
             &secrets,
             &TaskDefinitionConfig {
@@ -768,7 +820,7 @@ impl EcsReconciler {
                 region: &self.config.region,
                 traefik: self.traefik_render_config(),
             },
-        )?;
+        ))?;
 
         if task_def.size.rounded_up {
             info!(
@@ -1822,6 +1874,39 @@ pub(crate) fn clamp_replicas(requested: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// The classification is the whole mechanism: a permanent error must be
+    /// recognisable as one after travelling through `?`, and must keep the text
+    /// that tells the user what to change. If either half breaks, the deployment
+    /// silently reverts to failing with "timed out after 300 seconds".
+    #[test]
+    fn a_permanent_error_survives_the_error_chain_with_its_message() {
+        fn rejects() -> Result<()> {
+            anyhow::bail!("multi-container deployments are not supported on ECS")
+        }
+        fn wraps() -> Result<()> {
+            EcsReconciler::permanent(rejects())?;
+            Ok(())
+        }
+
+        let err = wraps().expect_err("must fail");
+        assert!(
+            err.downcast_ref::<PermanentDeployError>().is_some(),
+            "the marker did not survive `?`"
+        );
+        assert!(
+            format!("{:#}", err).contains("multi-container deployments are not supported"),
+            "the actionable message was lost: {err:#}"
+        );
+    }
+
+    /// A store read that failed once should be retried, not turned into a
+    /// permanent failure the user has to redeploy past.
+    #[test]
+    fn an_untagged_error_is_not_treated_as_permanent() {
+        let err: anyhow::Error = anyhow::anyhow!("connection reset by peer");
+        assert!(err.downcast_ref::<PermanentDeployError>().is_none());
+    }
+
     use super::*;
 
     #[test]
