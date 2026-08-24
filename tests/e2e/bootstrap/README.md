@@ -13,14 +13,16 @@ everything requiring an IAM write is created here, and the per-run apply
 |---|---|
 | GitHub OIDC | provider + the role CI assumes (`repo:rise-deploy/rise:*`) |
 | IAM for Rise | `modules/rise-aws` with `enable_ecs` — controller role, execution role, ECR push role — plus Traefik's task role |
-| Runtime | VPC with public subnets, ECS cluster, Cloud Map namespace, log group, security groups |
-| Edge | the long-running **Traefik** service, and **Dex** |
-| Addressing | a Route 53 zone; the harness UPSERTs records into it at run start |
+| Runtime | VPC with public subnets, ECS cluster, Cloud Map namespace, log group |
+| Addressing | a Route 53 zone; each run UPSERTs its own subtree into it |
 | State | the S3 bucket both workspaces keep their state in |
 
-Traefik and Dex are persistent because they are slow to start and carry no
-per-run state. Postgres and the Rise control plane are not — they are per-run,
-so every run gets a fresh database and the image under test.
+**Nothing runs here.** This is an empty cluster and the IAM the per-run identity
+cannot create for itself. Traefik, Dex, Postgres and the Rise control plane are
+all stood up per run and destroyed again, so every run exercises the whole thing
+coming up — including the routing layer, which is what an operator actually
+does — and an idle environment costs a hosted zone rather than two Fargate
+tasks.
 
 ## Applying, the first time
 
@@ -35,22 +37,24 @@ REGION=eu-central-1
 
 # 1. Local state, just far enough to create the bucket.
 terraform init -backend=false
-terraform apply -target=aws_s3_bucket.state \
-  -var "dns_zone_name=e2e.example.com" -var "region=$REGION"
+terraform apply -target=aws_s3_bucket.state -var "region=$REGION"
 
 # 2. Move that state into the bucket, and finish.
 terraform init -migrate-state \
   -backend-config="bucket=${NAME}-tfstate-${ACCOUNT}" \
   -backend-config="region=$REGION"
-terraform apply -var "dns_zone_name=e2e.example.com" -var "region=$REGION"
+terraform apply -var "region=$REGION"
 ```
 
 From then on:
 
 ```bash
 terraform init -backend-config="bucket=${NAME}-tfstate-${ACCOUNT}" -backend-config="region=$REGION"
-terraform apply -var "dns_zone_name=e2e.example.com"
+terraform apply
 ```
+
+`dns_zone_name` defaults to `rise-deploy.click`. Delegate it from the registrar
+once, using the `dns_name_servers` output.
 
 The `backend_config` output prints those arguments if you forget them.
 
@@ -83,7 +87,7 @@ for that reason, and two things narrow it when on:
 | | |
 |---|---|
 | `tests/e2e/bootstrap` | this one — long-lived, applied rarely |
-| `tests/e2e/run` | Postgres and the control plane, applied and destroyed by the harness around every suite |
+| `tests/e2e/run` | Traefik, Dex, Postgres and the control plane — applied and destroyed by the harness around every suite |
 
 Both keep state in the same bucket under different keys. `run` reads this
 workspace's outputs through `terraform_remote_state`, which is why this one's
@@ -93,21 +97,38 @@ The directory is not `aws/` because the environment is not necessarily only AWS:
 if the suite later needs something hosted elsewhere, it belongs in this
 workspace alongside the rest, not in a third place.
 
-## Why a Route 53 zone
+## Why a Route 53 zone, and why runs are scoped
 
-Fargate tasks cannot hold an Elastic IP, so Traefik's public address changes
-whenever its task is replaced. A zone makes the *domain* stable instead: the
-harness resolves Traefik's current IP at run start and UPSERTs the apex and
-wildcard records. Without it the environment's identity would change under it,
-and a persistent Dex would be stranded by the first task replacement — its
-Traefik router encodes the domain.
+Fargate tasks cannot hold an Elastic IP, and Traefik is per-run, so its address
+is new every run. The zone makes the *name* stable instead.
+
+Each run owns a scope — `pr-457`, `nightly`, `dev-<user>` — and everything it
+creates is named after it: the Terraform state key, the DNS subtree, Rise's
+controller class, the security groups, its Cloud Map entries. At bring-up it
+UPSERTs `<scope>.<zone>` and `*.<scope>.<zone>` at the Traefik it just created,
+and deletes both at teardown. So `rise.pr-457.rise-deploy.click` is one run's
+control plane and `myapp.pr-457.rise-deploy.click` an app deployed into it.
+
+The wildcard is required, and one label is enough: projects are served at
+`<project>.<scope>.<zone>`, and groups and environments join the project name
+with a dash rather than a dot.
+
+Scoping is what lets runs overlap. A shared apex would have each run repointing
+the other's traffic; a shared controller class would have each run's orphan
+collector deleting the other's services; a shared Traefik would answer for both.
+The scope closes all three — the last via
+`--providers.ecs.constraints`, matched against the controller class Rise stamps
+into `dockerLabels`.
 
 `route53:ChangeResourceRecordSets` is not an IAM write, so the harness can do
 this under the no-IAM-write role.
 
 ## Cost
 
-Idle, this is a NAT-free public-subnet VPC plus two small Fargate tasks
-(Traefik 0.5 vCPU, Dex 0.25) and a hosted zone: roughly **$20/month**. There is
-no NAT gateway, no load balancer and no RDS instance — the per-run stack uses
-public IPs and a Postgres task, which is why.
+Idle, this is a NAT-free public-subnet VPC, an empty ECS cluster and a hosted
+zone — roughly **$1/month**, the zone being nearly all of it. An empty cluster
+and a VPC without a NAT gateway are free.
+
+A run adds four small Fargate tasks (Traefik 0.5 vCPU, Dex, Postgres and Rise at
+0.25–0.5 each) for as long as it lasts. Overlapping runs multiply that, and
+share the account's Fargate quota.

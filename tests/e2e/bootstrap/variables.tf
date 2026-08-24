@@ -23,11 +23,12 @@ variable "github_repository" {
 
 variable "dns_zone_name" {
   description = <<-EOT
-    Public hosted zone for the environment, e.g. e2e.example.com. Delegate it
-    once from the parent domain; the harness UPSERTs the apex and wildcard
-    records at every run start.
+    Public hosted zone for the environment. Delegate it once from the registrar;
+    the harness UPSERTs a per-run scope beneath it (`*.<scope>.<zone>`) at every
+    run start, so runs never collide over one name.
   EOT
   type        = string
+  default     = "rise-deploy.click"
 }
 
 variable "vpc_cidr" {
@@ -38,16 +39,6 @@ variable "vpc_cidr" {
 variable "availability_zone_count" {
   type    = number
   default = 2
-}
-
-variable "traefik_image" {
-  type    = string
-  default = "traefik:v3.7.10"
-}
-
-variable "dex_image" {
-  type    = string
-  default = "dexidp/dex:v2.45.1"
 }
 
 variable "log_retention_days" {

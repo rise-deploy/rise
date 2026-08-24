@@ -18,16 +18,6 @@ output "subnet_ids" {
   value       = [for s in aws_subnet.public : s.id]
 }
 
-output "internal_security_group_id" {
-  description = "Group for Rise, Postgres and deployed workloads."
-  value       = aws_security_group.internal.id
-}
-
-output "edge_security_group_id" {
-  description = "Traefik's group. The harness opens port 80 here for the length of a run."
-  value       = aws_security_group.edge.id
-}
-
 output "cloud_map_namespace_id" {
   value = aws_service_discovery_private_dns_namespace.this.id
 }
@@ -40,14 +30,13 @@ output "log_group_name" {
   value = aws_cloudwatch_log_group.this.name
 }
 
-output "traefik_service_name" {
-  description = "The harness resolves this service's task address at run start."
-  value       = aws_ecs_service.traefik.name
+output "traefik_task_role_arn" {
+  description = "Pre-created here because the per-run identity cannot write IAM."
+  value       = aws_iam_role.traefik.arn
 }
 
-output "dex_issuer" {
-  description = "Cloud Map address. Never publicly resolvable, and it does not need to be: the harness uses the password grant, so no browser redirect is involved."
-  value       = local.dex_issuer
+output "vpc_id" {
+  value = aws_vpc.this.id
 }
 
 output "controller_role_arn" {
@@ -93,11 +82,11 @@ output "ci_role_arn" {
 # -----------------------------------------------------------------------------
 # The harness's entry point into all of the above.
 #
-# It needs several of these values *before* the per-run apply -- to find
-# Traefik's current address, point DNS at it and open the edge -- so it cannot
-# get them from the per-run outputs, and reading bootstrap's own state would
-# mean either a second backend or a pile of environment variables. One parameter
-# keeps the contract to: know the environment name, read one thing.
+# It needs several of these values *before* the per-run apply -- the zone to
+# scope DNS under, the bucket holding remote state -- so it cannot get them from
+# the per-run outputs, and reading bootstrap's own state would mean either a
+# second backend or a pile of environment variables. One parameter keeps the
+# contract to: know the environment name, read one thing.
 # -----------------------------------------------------------------------------
 
 resource "aws_ssm_parameter" "bootstrap" {
@@ -106,20 +95,19 @@ resource "aws_ssm_parameter" "bootstrap" {
   type        = "String"
 
   value = jsonencode({
-    region                     = var.region
-    cluster_name               = aws_ecs_cluster.this.name
-    cluster_arn                = aws_ecs_cluster.this.arn
-    subnet_ids                 = [for s in aws_subnet.public : s.id]
-    internal_security_group_id = aws_security_group.internal.id
-    edge_security_group_id     = aws_security_group.edge.id
-    cloud_map_namespace_name   = aws_service_discovery_private_dns_namespace.this.name
-    log_group_name             = aws_cloudwatch_log_group.this.name
-    traefik_service_name       = aws_ecs_service.traefik.name
-    dex_issuer                 = local.dex_issuer
-    ecr_repo_prefix            = "${var.name}/"
-    dns_zone_id                = aws_route53_zone.this.zone_id
-    dns_zone_name              = trimsuffix(aws_route53_zone.this.name, ".")
-    state_bucket               = aws_s3_bucket.state.id
+    region                   = var.region
+    cluster_name             = aws_ecs_cluster.this.name
+    cluster_arn              = aws_ecs_cluster.this.arn
+    subnet_ids               = [for s in aws_subnet.public : s.id]
+    vpc_id                   = aws_vpc.this.id
+    cloud_map_namespace_id   = aws_service_discovery_private_dns_namespace.this.id
+    cloud_map_namespace_name = aws_service_discovery_private_dns_namespace.this.name
+    log_group_name           = aws_cloudwatch_log_group.this.name
+    traefik_task_role_arn    = aws_iam_role.traefik.arn
+    ecr_repo_prefix          = "${var.name}/"
+    dns_zone_id              = aws_route53_zone.this.zone_id
+    dns_zone_name            = trimsuffix(aws_route53_zone.this.name, ".")
+    state_bucket             = aws_s3_bucket.state.id
   })
 
   tags = local.tags

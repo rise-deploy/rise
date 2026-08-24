@@ -87,6 +87,37 @@ Either can be brought independently. Brought subnets are checked against the VPC
 you named and a brought cluster is checked for `ACTIVE`, so a mismatch surfaces
 in `terraform plan` rather than several minutes into an apply.
 
+## Several installs in one cluster
+
+Supported, and it takes two settings rather than one. Give each install its own
+controller class, and confine each Traefik to it:
+
+```hcl
+module "rise_ecs" {
+  # …
+  controller_class_name = "team-a"
+  traefik_constraints   = "Label(`rise.dev/controller-class`, `team-a`)"
+}
+```
+
+Both are load-bearing, for different reasons. The class scopes Rise's orphan
+collector, which deletes any managed service whose deployment it cannot find in
+*its* database — so two installs sharing a class each treat the other's services
+as orphans and delete them. The constraint scopes Traefik, which otherwise
+discovers every Rise-labelled container in the cluster and answers for another
+install's hosts.
+
+Rise stamps the class into each container's `dockerLabels` so the constraint has
+something to match; ECS resource tags are invisible to Traefik's ECS provider,
+and `traefik.*` is reserved by Traefik and rejected as a constraint key.
+Anything else you expect that Traefik to route needs the same label.
+
+Leave both at their defaults for the ordinary case of one install per cluster.
+
+`tests/e2e/bootstrap` is a worked example: every end-to-end run stands a whole
+install up in a shared cluster under a scope like `pr-457`, and several runs
+coexist.
+
 ## What it configures
 
 The Rise container runs the `config/ecs.yaml` that ships in the image

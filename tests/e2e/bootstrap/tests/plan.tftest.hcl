@@ -46,35 +46,8 @@ override_data {
 variables {
   name              = "rise-e2e"
   region            = "eu-central-1"
-  dns_zone_name     = "e2e.example.com"
+  dns_zone_name     = "rise-deploy.click"
   github_repository = "rise-deploy/rise"
-}
-
-run "dex_config_is_the_dev_one_with_a_patched_issuer" {
-  command = plan
-
-  # The harness mints tokens with the resource-owner password grant against the
-  # static user dev/dex/config.yaml defines. If the patch broke the file, or the
-  # grant went missing, sa-token-exchange fails with an opaque 401.
-  assert {
-    condition     = strcontains(local.dex_config, "issuer: http://dex.rise-e2e.internal:5556/dex")
-    error_message = "the issuer was not patched into the dev Dex config"
-  }
-
-  assert {
-    condition     = !strcontains(local.dex_config, "issuer: http://rise-dex:5556/dex")
-    error_message = "the original dev issuer survived the patch"
-  }
-
-  assert {
-    condition     = strcontains(local.dex_config, "- password")
-    error_message = "the password grant is missing; the harness cannot mint id_tokens"
-  }
-
-  assert {
-    condition     = strcontains(local.dex_config, "user@example.com")
-    error_message = "the static user sa-token-exchange authenticates as is missing"
-  }
 }
 
 run "ci_role_can_pass_roles_but_not_write_iam" {

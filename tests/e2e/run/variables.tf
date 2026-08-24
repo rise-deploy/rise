@@ -24,8 +24,29 @@ variable "rise_image_tag" {
   type        = string
 }
 
-variable "ingress_domain" {
-  description = "Bootstrap's zone name. Records are pointed at Traefik's current address by the harness before this applies."
+variable "scope" {
+  description = <<-EOT
+    Identifier isolating this run from every other one sharing the cluster, e.g.
+    `pr-457`. It is one token doing three jobs:
+
+      * the DNS subtree, `*.<scope>.<dns_zone_name>`;
+      * Rise's `deployment_controller_class`, which scopes its orphan collector
+        so one run never deletes another's services;
+      * the Traefik discovery constraint, so this run's Traefik routes only
+        containers carrying that class.
+
+    Must be a single DNS label.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", var.scope))
+    error_message = "scope must be a single lowercase DNS label."
+  }
+}
+
+variable "dns_zone_name" {
+  description = "Bootstrap's zone. This run is served under `<scope>.<dns_zone_name>`."
   type        = string
 }
 
@@ -66,4 +87,25 @@ variable "cpu_architecture" {
     condition     = contains(["X86_64", "ARM64"], var.cpu_architecture)
     error_message = "cpu_architecture must be X86_64 or ARM64."
   }
+}
+
+variable "traefik_image" {
+  type    = string
+  default = "traefik:v3.7.10"
+}
+
+variable "dex_image" {
+  type    = string
+  default = "dexidp/dex:v2.45.1"
+}
+
+variable "authorized_cidrs" {
+  description = <<-EOT
+    Addresses allowed to reach Traefik on port 80 for the length of this run --
+    in practice the single address the harness is driven from. Empty leaves the
+    edge closed, which is the correct default: nothing but the run itself has
+    any business reaching it.
+  EOT
+  type        = list(string)
+  default     = []
 }

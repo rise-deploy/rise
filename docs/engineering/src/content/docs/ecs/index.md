@@ -42,7 +42,10 @@ Two consequences are worth internalising before you operate it:
   This is the single most common cause of tasks that never leave `PROVISIONING`.
 - A Traefik service in the cluster running the ECS provider with
   `--providers.ecs.exposedByDefault=false` (it defaults to **true**, which would
-  give every task in the cluster a default router).
+  give every task in the cluster a default router). If the cluster hosts more
+  than one Rise install, each also needs a distinct `controller_class_name` and
+  a `--providers.ecs.constraints` matching it — see
+  [Terraform](/operator-docs/ecs/terraform/).
 - `traefik_api_url` reachable from the control plane if any project uses a
   `health_check` — Traefik's `serverStatus` is the authoritative readiness
   signal with no fallback, so without it such a deployment never becomes
@@ -52,9 +55,11 @@ The [Terraform modules](/operator-docs/ecs/terraform/) provision all of it —
 against a cluster and VPC they create, or ones you already run — and refuse the
 configurations the backend rejects at startup. Start there.
 
-`tests/e2e/bootstrap` and `tests/e2e/run` stand up a deliberately smaller shape for the end-to-end suite
-— public subnets, no load balancer, Postgres in a task — which is useful to read
-but is a test environment, not a template.
+`tests/e2e/bootstrap` and `tests/e2e/run` stand up a deliberately smaller shape
+for the end-to-end suite — public subnets, no load balancer, Postgres in a task,
+and every component per run under its own scope so several runs share one
+cluster. Useful to read, and the clearest worked example of the multi-install
+scoping above, but a test environment rather than a template.
 
 ## IAM
 

@@ -32,20 +32,46 @@ locals {
   tags = {
     "rise.dev/managed-by" = "terraform"
     "rise.dev/purpose"    = "e2e"
-    "rise.dev/scope"      = "per-run"
+    "rise.dev/scope"      = var.scope
   }
 
-  postgres_password = "rise123"
-  database_url      = "postgres://rise:${local.postgres_password}@postgres.${local.env.cloud_map_namespace_name}:5432/rise"
+  # Everything this run answers for lives under its own label, so concurrent
+  # runs never contend for a name.
+  domain = "${var.scope}.${var.dns_zone_name}"
 
-  auth_backend_url = "http://rise.${local.env.cloud_map_namespace_name}:3000"
-  traefik_api_url  = "http://traefik.${local.env.cloud_map_namespace_name}:8080"
+  # The controller class is what keeps runs from destroying each other: the
+  # orphan collector only considers services carrying its own class, and
+  # Traefik is constrained to the same value below.
+  controller_class = var.scope
+
+  # Cloud Map is shared, so per-run services need distinct names within it.
+  postgres_host = "postgres-${var.scope}.${local.env.cloud_map_namespace_name}"
+  rise_host     = "rise-${var.scope}.${local.env.cloud_map_namespace_name}"
+  traefik_host  = "traefik-${var.scope}.${local.env.cloud_map_namespace_name}"
+  dex_host      = "dex-${var.scope}.${local.env.cloud_map_namespace_name}"
+
+  postgres_password = "rise123"
+  database_url      = "postgres://rise:${local.postgres_password}@${local.postgres_host}:5432/rise"
+
+  auth_backend_url = "http://${local.rise_host}:3000"
+  traefik_api_url  = "http://${local.traefik_host}:8080"
+
+  # In-VPC and never publicly resolvable, which is fine: Rise fetches discovery
+  # and JWKS over private DNS, and the harness uses the password grant, so no
+  # browser redirect is involved.
+  dex_issuer = "http://${local.dex_host}:5556/dex"
+
+  dex_config = replace(
+    file("${path.module}/../../../dev/dex/config.yaml"),
+    "/(?m)^issuer:.*$/",
+    "issuer: ${local.dex_issuer}"
+  )
 }
 
 module "control_plane_env" {
   source = "../../../modules/rise-ecs/modules/control-plane-env"
 
-  ingress_domain = var.ingress_domain
+  ingress_domain = local.domain
   # Plain HTTP. There is no load balancer to terminate at and no ACME, and the
   # harness drives the API with explicit headers rather than a browser, so
   # nothing here depends on transport security.
@@ -58,7 +84,7 @@ module "control_plane_env" {
   # Deployed workloads share the environment's internal group; a test
   # environment does not need the per-role segmentation the production module
   # builds.
-  security_group_ids = [local.env.internal_security_group_id]
+  security_group_ids = [aws_security_group.internal.id]
   # No NAT here, so a task without a public IP cannot reach ECR and would fail
   # to start.
   assign_public_ip = true
@@ -71,7 +97,7 @@ module "control_plane_env" {
   traefik_api_url    = local.traefik_api_url
   traefik_entrypoint = "web"
 
-  oidc_issuer    = local.env.dex_issuer
+  oidc_issuer    = local.dex_issuer
   oidc_client_id = "rise-backend"
   # The issuer is a Cloud Map address over http, so discovery is an in-VPC
   # plaintext fetch that the SSRF defaults would otherwise refuse.
@@ -83,6 +109,9 @@ module "control_plane_env" {
   reconcile_interval_secs = 10
   resource_prefix         = var.name
   ssm_parameter_prefix    = var.name
+
+  # See `local.controller_class`: this is what isolates one run from another.
+  controller_class_name = local.controller_class
 
   registry = {
     type          = "ecr"

@@ -154,10 +154,15 @@ resource "aws_s3_bucket_public_access_block" "state" {
 # -----------------------------------------------------------------------------
 # DNS
 #
-# Fargate cannot hold an Elastic IP, so Traefik's address changes when its task
-# is replaced. A zone makes the domain stable instead: the harness UPSERTs the
-# apex and wildcard at run start. The wildcard is required -- projects are served
-# at <project>.<domain>, and groups and environments add another label.
+# Fargate cannot hold an Elastic IP, and Traefik is per-run, so its address is
+# new every run. The zone makes the *name* stable instead: each run UPSERTs its
+# own scope, `<scope>.<zone>` and `*.<scope>.<zone>`, at the Traefik it just
+# created, and deletes both at teardown. Scoping is what lets runs overlap --
+# one shared apex would have them fighting over the same record.
+#
+# The wildcard is required: projects are served at `<project>.<scope>.<zone>`.
+# One wildcard label is enough because groups and environments join the project
+# with a dash rather than a dot.
 # -----------------------------------------------------------------------------
 
 resource "aws_route53_zone" "this" {

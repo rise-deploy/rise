@@ -2,8 +2,9 @@
 # what removes the need for a NAT gateway ($32/month idle) and a load balancer:
 # Traefik is reached directly on its task's address.
 #
-# Acceptable here because this is a disposable test account and the security
-# group admits only the IP the harness authorizes for the duration of a run.
+# Acceptable here because this is a disposable test account, and the security
+# groups -- created per run alongside Traefik -- admit only the address the run
+# is driven from.
 
 resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
@@ -55,64 +56,4 @@ resource "aws_vpc_endpoint" "s3" {
   route_table_ids   = [aws_route_table.public.id]
 
   tags = merge(local.tags, { Name = "${var.name}-s3" })
-}
-
-# -----------------------------------------------------------------------------
-# Security groups
-#
-# The edge group starts closed. The harness authorizes its own address at run
-# start and revokes it at teardown, so between runs nothing is reachable -- which
-# is what keeps a persistent, publicly-addressed control plane defensible.
-# -----------------------------------------------------------------------------
-
-resource "aws_security_group" "edge" {
-  name        = "${var.name}-edge"
-  description = "Traefik. Ingress is opened per run by the e2e harness."
-  vpc_id      = aws_vpc.this.id
-  tags        = merge(local.tags, { Name = "${var.name}-edge" })
-}
-
-resource "aws_vpc_security_group_egress_rule" "edge_all" {
-  security_group_id = aws_security_group.edge.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-  description       = "Backends, and the ECS API for the provider"
-}
-
-resource "aws_security_group" "internal" {
-  name        = "${var.name}-internal"
-  description = "Rise control plane, Postgres, Dex and deployed workloads"
-  vpc_id      = aws_vpc.this.id
-  tags        = merge(local.tags, { Name = "${var.name}-internal" })
-}
-
-# One group for everything inside, mutually open. A test environment does not
-# need the per-role segmentation the production module builds, and collapsing it
-# keeps the per-run apply from needing to touch security groups at all.
-resource "aws_vpc_security_group_ingress_rule" "internal_self" {
-  security_group_id            = aws_security_group.internal.id
-  referenced_security_group_id = aws_security_group.internal.id
-  ip_protocol                  = "-1"
-  description                  = "Anything in the environment may reach anything else"
-}
-
-resource "aws_vpc_security_group_ingress_rule" "internal_from_edge" {
-  security_group_id            = aws_security_group.internal.id
-  referenced_security_group_id = aws_security_group.edge.id
-  ip_protocol                  = "-1"
-  description                  = "Traefik to Rise, Dex and deployed workloads"
-}
-
-resource "aws_vpc_security_group_egress_rule" "internal_all" {
-  security_group_id = aws_security_group.internal.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-}
-
-# Traefik reaches Rise for forwardAuth, and Rise reads Traefik's serverStatus.
-resource "aws_vpc_security_group_ingress_rule" "edge_from_internal" {
-  security_group_id            = aws_security_group.edge.id
-  referenced_security_group_id = aws_security_group.internal.id
-  ip_protocol                  = "-1"
-  description                  = "Rise polls the Traefik API for readiness"
 }

@@ -44,6 +44,8 @@ use crate::{report, token};
 
 /// Tag every Rise-created resource carries. The sweep keys on it.
 const MANAGED_BY_TAG: &str = "rise.dev/managed-by";
+/// Carries the controller class, which for this harness is the run scope.
+const CONTROLLER_CLASS_TAG: &str = "rise.dev/controller-class";
 
 pub struct EcsBackend {
     repo_root: PathBuf,
@@ -64,17 +66,35 @@ pub struct EcsBackend {
     dex: Option<DexEndpoint>,
     cli_bin: Option<PathBuf>,
     extract_container: String,
-    /// The address authorized on the edge group for this run, revoked at
-    /// teardown.
-    authorized_cidr: Option<String>,
+    /// Isolates this run from every other one sharing the cluster: the DNS
+    /// subtree, Rise's controller class and this run's Traefik constraint are
+    /// all derived from it.
+    scope: String,
+}
+
+/// Lowercase, and anything not `[a-z0-9-]` folded to `-`, so a login name can
+/// be used as a DNS label.
+fn sanitize_label(raw: &str) -> String {
+    let s: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    s.trim_matches('-').chars().take(40).collect()
+}
+
+fn is_dns_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// The persistent environment, read from the SSM parameter the bootstrap writes.
 struct BootstrapEnv {
     cluster_name: String,
-    edge_security_group_id: String,
-    traefik_service_name: String,
-    dex_issuer: String,
     ecr_repo_prefix: String,
     dns_zone_id: String,
     dns_zone_name: String,
@@ -105,6 +125,22 @@ impl EcsBackend {
         let image_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the ecs backend (ECS pulls it from GHCR)")?;
         let env_name = std::env::var("RISE_E2E_ENV").unwrap_or_else(|_| "rise-e2e".to_string());
+        // CI sets this per run -- `pr-<number>` on a pull request, `nightly-<id>`
+        // on a schedule. Locally it defaults to one stable label per user, so
+        // repeated local runs reuse a subtree instead of littering the zone.
+        let scope = match std::env::var("RISE_E2E_SCOPE") {
+            Ok(s) => s,
+            Err(_) => {
+                let who = std::env::var("USER")
+                    .or_else(|_| std::env::var("USERNAME"))
+                    .unwrap_or_else(|_| "local".to_string());
+                format!("dev-{}", sanitize_label(&who))
+            }
+        };
+        anyhow::ensure!(
+            is_dns_label(&scope),
+            "RISE_E2E_SCOPE must be a single lowercase DNS label, got {scope:?}"
+        );
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .context("AWS_REGION must be set for the ecs backend")?;
@@ -122,7 +158,7 @@ impl EcsBackend {
             dex: None,
             cli_bin: None,
             extract_container: format!("rise-e2e-ecs-cli-{}", std::process::id()),
-            authorized_cidr: None,
+            scope,
         })
     }
 
@@ -165,6 +201,17 @@ impl EcsBackend {
         c
     }
 
+    /// One output of the per-run stack.
+    ///
+    /// The values that describe *this run* -- its Dex issuer and token URL --
+    /// are derived from the scope inside Terraform, so reading them back is
+    /// better than recomputing the same string here and letting the two drift.
+    fn run_output(&self, name: &str) -> Result<String> {
+        let out = cli::run_checked(self.terraform(&["output", "-raw", name]))
+            .with_context(|| format!("terraform output -raw {name}"))?;
+        Ok(out.stdout.trim().to_string())
+    }
+
     /// Read the environment description the bootstrap publishes.
     fn read_bootstrap_env(&self) -> Result<BootstrapEnv> {
         let raw = self
@@ -197,9 +244,6 @@ impl EcsBackend {
 
         Ok(BootstrapEnv {
             cluster_name: get("cluster_name")?,
-            edge_security_group_id: get("edge_security_group_id")?,
-            traefik_service_name: get("traefik_service_name")?,
-            dex_issuer: get("dex_issuer")?,
             ecr_repo_prefix: get("ecr_repo_prefix")?,
             dns_zone_id: get("dns_zone_id")?,
             dns_zone_name: get("dns_zone_name")?,
@@ -319,19 +363,24 @@ impl EcsBackend {
         Ok(ip)
     }
 
-    /// Point the apex and wildcard at Traefik's current address.
+    /// Point this run's scope at its Traefik, or remove it again.
     ///
-    /// The wildcard is not optional: projects are served at `<project>.<domain>`,
-    /// and groups and environments add another label.
-    fn upsert_dns(&self, ip: &str) -> Result<()> {
+    /// Both records are scoped: `<scope>.<zone>` and `*.<scope>.<zone>`. Runs
+    /// therefore never contend for a name, which is what lets them overlap --
+    /// a shared apex would have each run repointing the other's traffic.
+    ///
+    /// The wildcard is required: projects are served at
+    /// `<project>.<scope>.<zone>`. One wildcard label is enough because groups
+    /// and environments join the project name with a dash, not a dot.
+    fn change_dns(&self, action: &str, ip: &str) -> Result<()> {
         let env = self.env();
         let records: Vec<serde_json::Value> = ["", "*."]
             .iter()
             .map(|prefix| {
                 serde_json::json!({
-                    "Action": "UPSERT",
+                    "Action": action,
                     "ResourceRecordSet": {
-                        "Name": format!("{prefix}{}", env.dns_zone_name),
+                        "Name": format!("{prefix}{}.{}", self.scope, env.dns_zone_name),
                         "Type": "A",
                         "TTL": 60,
                         "ResourceRecords": [{ "Value": ip }],
@@ -340,7 +389,7 @@ impl EcsBackend {
             })
             .collect();
         let changes = serde_json::json!({
-            "Comment": "rise e2e run",
+            "Comment": format!("rise e2e {}", self.scope),
             "Changes": records,
         });
 
@@ -348,69 +397,46 @@ impl EcsBackend {
         std::fs::write(&path, serde_json::to_vec(&changes)?)
             .context("write the DNS change batch")?;
 
-        self.aws(&[
+        let out = self.aws(&[
             "route53",
             "change-resource-record-sets",
             "--hosted-zone-id",
             &env.dns_zone_id,
             "--change-batch",
             &format!("file://{}", path.display()),
-        ])?;
+        ]);
         let _ = std::fs::remove_file(&path);
-        Ok(())
+        out.map(|_| ()).with_context(|| {
+            format!(
+                "{action} {}.{} in {}",
+                self.scope, env.dns_zone_name, env.dns_zone_id
+            )
+        })
     }
 
-    /// Open the edge for this run only. The group is closed between runs, which
-    /// is what keeps a persistent, publicly addressed control plane defensible.
-    fn authorize_edge(&mut self) -> Result<()> {
+    /// This machine's address, as the single CIDR the run's edge admits.
+    ///
+    /// The group is created with the run and destroyed with it, so there is no
+    /// rule to revoke afterwards and nothing a crashed run can leave open.
+    fn client_cidr(&self) -> Result<String> {
         let ip = http::get("https://checkip.amazonaws.com", None)
             .context("determine this machine's public address")?
             .body
             .trim()
             .to_string();
-        let cidr = format!("{ip}/32");
-
-        // Idempotent by intent: a rule left behind by a crashed run makes this a
-        // duplicate, which is not an error worth failing the suite over.
-        let _ = self.aws(&[
-            "ec2",
-            "authorize-security-group-ingress",
-            "--group-id",
-            &self.env().edge_security_group_id,
-            "--protocol",
-            "tcp",
-            "--port",
-            "80",
-            "--cidr",
-            &cidr,
-        ]);
-        self.authorized_cidr = Some(cidr);
-        Ok(())
+        Ok(format!("{ip}/32"))
     }
 
-    fn revoke_edge(&self) {
-        let Some(cidr) = self.authorized_cidr.as_deref() else {
-            return;
-        };
-        let _ = self.aws(&[
-            "ec2",
-            "revoke-security-group-ingress",
-            "--group-id",
-            &self.env().edge_security_group_id,
-            "--protocol",
-            "tcp",
-            "--port",
-            "80",
-            "--cidr",
-            cidr,
-        ]);
-    }
-
-    /// Remove what a previous run's Rise created and its teardown could not.
+    /// Remove what an earlier run *of this scope* left behind.
     ///
     /// Rise owns these, not Terraform, and the reconciler only visits services
     /// whose project is in its database — so once the per-run stack is
     /// destroyed, nothing else will ever collect them.
+    ///
+    /// Scoped deliberately. The cluster is shared with every other run, and
+    /// their services carry the same `managed-by` tag; sweeping on that alone
+    /// would delete a concurrent run's live workloads. The controller-class tag
+    /// is the same token Rise's own orphan collector scopes to.
     fn sweep(&self) -> Result<()> {
         let cluster = &self.env().cluster_name;
 
@@ -444,14 +470,16 @@ impl EcsBackend {
                 serde_json::from_str(&self.aws(&refs)?).unwrap_or_default();
 
             for svc in parsed["services"].as_array().unwrap_or(&vec![]) {
-                let managed = svc["tags"]
-                    .as_array()
-                    .is_some_and(|tags| tags.iter().any(|t| t["key"] == MANAGED_BY_TAG));
+                let tag = |key: &str| -> Option<&str> {
+                    svc["tags"].as_array()?.iter().find(|t| t["key"] == key)?["value"].as_str()
+                };
+                let managed = tag(MANAGED_BY_TAG).is_some();
+                let ours = tag(CONTROLLER_CLASS_TAG) == Some(self.scope.as_str());
                 let live = svc["status"] != serde_json::json!("INACTIVE");
                 let Some(name) = svc["serviceName"].as_str() else {
                     continue;
                 };
-                if !managed || !live {
+                if !managed || !ours || !live {
                     continue;
                 }
                 let _ = self.aws(&[
@@ -605,6 +633,27 @@ impl EcsBackend {
         Ok(())
     }
 
+    /// Wait until Dex answers its discovery document through this run's Traefik.
+    ///
+    /// Rise itself needs no such wait: it fetches discovery lazily, on the first
+    /// token it validates, so its task can start alongside Dex. The harness is
+    /// the one that cannot proceed -- it mints a token before anything else.
+    fn wait_dex_ready(&self) -> Result<()> {
+        let issuer_host = format!("dex.{}", self.stack().domain);
+        let url = format!("http://{issuer_host}/dex/.well-known/openid-configuration");
+        http::poll(
+            Duration::from_secs(300),
+            Duration::from_secs(5),
+            "dex discovery through Traefik",
+            || {
+                Ok(http::get(&url, None)
+                    .map(|r| r.status == 200)
+                    .unwrap_or(false))
+            },
+        )?;
+        Ok(())
+    }
+
     fn app_host(&self, project: &str) -> String {
         format!("{}.{}", project, self.stack().domain)
     }
@@ -651,7 +700,9 @@ impl Backend for EcsBackend {
                 "-input=false",
                 "-reconfigure",
                 &format!("-backend-config=bucket={}", self.env().state_bucket),
-                "-backend-config=key=run/terraform.tfstate",
+                // Per scope: concurrent runs would otherwise overwrite each
+                // other's state and destroy resources they do not own.
+                &format!("-backend-config=key=run/{}/terraform.tfstate", self.scope),
                 &format!("-backend-config=region={}", self.region),
             ]))
         })?;
@@ -661,18 +712,11 @@ impl Backend for EcsBackend {
             Ok(())
         })?;
 
-        let traefik_ip = report::step_value("resolve Traefik's address", || {
-            self.service_public_ip(&self.env().traefik_service_name.clone())
-        })?;
+        let client_cidr =
+            report::step_value("determine this run's client address", || self.client_cidr())?;
 
-        report::step("point the environment's DNS at Traefik", || {
-            self.upsert_dns(&traefik_ip)
-        })?;
-
-        report::step("open the edge for this run", || self.authorize_edge())?;
-
-        let domain = self.env().dns_zone_name.clone();
-        report::step("terraform apply (postgres, rise)", || {
+        let domain = format!("{}.{}", self.scope, self.env().dns_zone_name);
+        report::step("terraform apply (traefik, dex, postgres, rise)", || {
             cli::run_checked(self.terraform(&[
                 "apply",
                 "-auto-approve",
@@ -682,14 +726,29 @@ impl Backend for EcsBackend {
                 &format!("-var=state_bucket={}", self.env().state_bucket),
                 &format!("-var=rise_image={}", self.image_repository),
                 &format!("-var=rise_image_tag={}", self.image_tag),
-                &format!("-var=ingress_domain={domain}"),
+                &format!("-var=scope={}", self.scope),
+                &format!("-var=dns_zone_name={}", self.env().dns_zone_name),
+                &format!("-var=authorized_cidrs=[\"{client_cidr}\"]"),
                 &format!("-var=jwt_signing_secret={}", self.jwt_secret_b64),
                 &format!("-var=encryption_key={}", self.jwt_secret_b64),
             ]))
         })?;
 
+        // Traefik belongs to this run, so its address exists only now.
+        let traefik_service = format!("{}-{}-traefik", self.env_name, self.scope);
+        let traefik_ip = report::step_value("resolve this run's Traefik address", || {
+            self.service_public_ip(&traefik_service)
+        })?;
+
+        report::step("point this run's DNS at its Traefik", || {
+            self.change_dns("UPSERT", &traefik_ip)
+        })?;
+
         let rise_url = format!("http://rise.{domain}");
-        report::note(&format!("traefik={traefik_ip} domain={domain}"));
+        report::note(&format!(
+            "scope={} traefik={traefik_ip} domain={domain}",
+            self.scope
+        ));
 
         self.stack = Some(StackState {
             traefik_api: format!("http://{traefik_ip}:8080"),
@@ -702,13 +761,24 @@ impl Backend for EcsBackend {
         // must be the one the per-run stack was just given.
         self.ci_token = token::mint_ci_token(&self.jwt_secret_b64, &rise_url)?;
         self.dex = Some(DexEndpoint {
-            token_url: format!("http://dex.{}/dex/token", self.stack().domain),
+            // Public, through this run's Traefik: the harness runs outside the
+            // VPC and mints tokens with the password grant.
+            token_url: self.run_output("dex_token_url")?,
             client_id: "rise-backend".to_string(),
             client_secret: "rise-backend-secret".to_string(),
             // Dex stamps its Cloud Map address in `iss`; Rise validates against
-            // exactly that and fetches JWKS over the cluster's private DNS.
-            issuer: self.env().dex_issuer.clone(),
+            // exactly that and fetches JWKS over the cluster's private DNS. It
+            // is never publicly resolvable, and does not need to be.
+            issuer: self.run_output("dex_issuer")?,
         });
+
+        // Dex is per-run now, so it is not already up. Waiting on the public
+        // token endpoint checks the whole path the harness depends on at once:
+        // the scoped DNS record, this run's Traefik discovering a container
+        // through its controller-class constraint, and Dex itself serving.
+        report::step("wait for Dex through this run's Traefik", || {
+            self.wait_dex_ready()
+        })?;
 
         self.wait_rise_healthy("rise /health")?;
         report::step("extract rise CLI from image", || self.extract_cli())
@@ -717,8 +787,8 @@ impl Backend for EcsBackend {
     fn tear_down(&mut self) {
         if std::env::var("KEEP").is_ok() {
             report::note(
-                "KEEP set — leaving the per-run stack up. The edge stays open and its \
-                 workloads keep consuming quota until you destroy it.",
+                "KEEP set — leaving the per-run stack up. Its DNS scope stays pointed at \
+                 Traefik and its workloads keep consuming quota until you destroy it.",
             );
             return;
         }
@@ -732,7 +802,16 @@ impl Backend for EcsBackend {
 
         // Belt and braces: anything project deletion missed.
         let _ = self.sweep();
-        self.revoke_edge();
+
+        // The security group went with the stack, so there is no rule to
+        // revoke -- but the DNS records live in the persistent zone and would
+        // otherwise accumulate one dead subtree per run. Route 53 matches a
+        // DELETE on the record's exact value, which is why this uses the
+        // address recorded at bring-up rather than re-resolving a service that
+        // no longer exists.
+        if let Some(ip) = self.stack.as_ref().map(|s| s.traefik_ip.clone()) {
+            let _ = self.change_dns("DELETE", &ip);
+        }
 
         let mut rm = Command::new("docker");
         rm.args(["rm", "-f", &self.extract_container]);

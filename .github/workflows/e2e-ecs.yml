@@ -3,10 +3,11 @@ name: E2E / ECS
 # Runs the cross-backend harness against the persistent Amazon ECS environment
 # in the scratch account (see tests/e2e/bootstrap, applied once by hand).
 #
-# Not part of ci.yml: it needs AWS credentials, it takes appreciably longer than
-# the other backends, and it drives a shared environment that only one run may
-# hold at a time. Nightly on develop, or opt in on a pull request with the
-# `ecs-e2e` label.
+# Not part of ci.yml: it needs AWS credentials and takes appreciably longer than
+# the other backends. Nightly on develop, or opt in on a pull request with the
+# `ecs-e2e` label. Each run stands its whole stack up under its own scope --
+# `pr-<number>` -- and tears it down again, so runs of different pull requests
+# are independent.
 
 on:
   schedule:
@@ -22,12 +23,17 @@ on:
         required: false
         type: string
 
-# One run at a time, across every trigger. The environment is shared and its
-# resource names are fixed, so two runs would collide on the per-run Terraform
-# state, fight over the same project names, and exceed the account's Fargate
-# quota between them.
+# One run at a time *per scope*, not per workflow. Everything a run creates is
+# named after its scope -- Terraform state key, DNS subtree, controller class,
+# security groups, Cloud Map entries -- so different pull requests no longer
+# collide and may overlap. Two runs of the *same* PR still would, hence the
+# group.
+#
+# Overlapping runs do share the account's Fargate quota, so a burst of labelled
+# PRs can exhaust it; the failure is a task that will not start, and the fix is
+# a quota increase rather than re-serializing.
 concurrency:
-  group: e2e-ecs
+  group: e2e-ecs-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -95,15 +101,20 @@ jobs:
         env:
           RISE_E2E_BACKEND: ecs
           RISE_E2E_ENV: ${{ vars.AWS_E2E_ENV_NAME || 'rise-e2e' }}
+          # The run's identity: `pr-<number>` on a pull request, `nightly` on the
+          # schedule. Read straight off a preview URL.
+          RISE_E2E_SCOPE: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
           AWS_REGION: ${{ vars.AWS_E2E_REGION }}
           RISE_IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
           RISE_IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
         run: ./tests/e2e/target/release/rise-e2e
 
       # The harness sweeps and destroys in tear_down, but a cancelled job never
-      # gets there -- and what it would leave behind holds Fargate quota and an
-      # open ingress rule. The next run's bring-up sweep is the real backstop;
-      # this narrows the window.
+      # gets there -- and what it would leave behind holds Fargate quota. The
+      # next run of this scope sweeps it as a backstop; this narrows the window.
+      #
+      # No -backend-config: the harness already init'd this working copy against
+      # the scope's state key, and .terraform/ still holds it.
       - name: Destroy the per-run stack
         if: always()
         env:
