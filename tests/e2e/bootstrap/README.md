@@ -82,6 +82,41 @@ for that reason, and two things narrow it when on:
   `repo:<repo>:environment:<name>` for a GitHub Environment with required
   reviewers if you want a human in the loop.
 
+## Wiring the suite into CI
+
+Applying this workspace is not enough on its own; the workflow
+(`.github/workflows/e2e-ecs.yml`) needs three repository **variables** and one
+label.
+
+Under *Settings → Secrets and variables → Actions → Variables*:
+
+| Variable | Value |
+|---|---|
+| `AWS_E2E_ROLE_ARN` | `terraform output ci_role_arn` |
+| `AWS_E2E_REGION` | the region this was applied to |
+| `AWS_E2E_ENV_NAME` | only if `name` is not `rise-e2e` |
+
+Variables rather than secrets on purpose: a role ARN and a region are not
+sensitive, and a masked value that is simply *unset* fails as an empty string
+with no hint of why.
+
+Then create the **`ecs-e2e` label** once. The pull-request trigger fires on
+`labeled` and matches that exact name, so without the label existing there is no
+way to opt a pull request in.
+
+Three ways to run it:
+
+- **Label a pull request `ecs-e2e`.** Runs against that PR's image, under scope
+  `pr-<number>`.
+- **Nightly**, 03:17 UTC, against `develop`.
+- **`workflow_dispatch`.** Pass `image_tag` explicitly — the default is
+  `develop-<short-sha>`, which only exists for a commit that was pushed to
+  `develop`.
+
+The workflow does **not** build the image. It deploys one `ci.yml` already
+published to GHCR for the same commit, so the run is only possible once that
+commit's `Build / Image manifest` job has passed.
+
 ## Two workspaces, one environment
 
 | | |
