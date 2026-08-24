@@ -2447,19 +2447,19 @@ impl Settings {
             // Deciding that at startup is the difference between a clear error
             // and an opaque `CannotPullContainerError` on the first deploy.
             match &settings.registry {
-                Some(RegistrySettings::Ecr { .. }) => {
-                    if execution_role_arn.is_none() {
-                        return Err(ConfigError::Message(
-                            "registry.type is 'ecr' but deployment_controller.execution_role_arn \
-                             is unset: ECS pulls from ECR with the task execution role, so \
-                             without one every task fails with CannotPullContainerError. Create \
-                             a role ECS can assume (trust principal ecs-tasks.amazonaws.com) \
-                             with the AmazonECSTaskExecutionRolePolicy managed policy attached, \
-                             and set its ARN here."
-                                .to_string(),
-                        ));
-                    }
+                Some(RegistrySettings::Ecr { .. }) if execution_role_arn.is_none() => {
+                    return Err(ConfigError::Message(
+                        "registry.type is 'ecr' but deployment_controller.execution_role_arn \
+                         is unset: ECS pulls from ECR with the task execution role, so \
+                         without one every task fails with CannotPullContainerError. Create \
+                         a role ECS can assume (trust principal ecs-tasks.amazonaws.com) \
+                         with the AmazonECSTaskExecutionRolePolicy managed policy attached, \
+                         and set its ARN here."
+                            .to_string(),
+                    ));
                 }
+                // ECR with an execution role: exactly the supported shape.
+                Some(RegistrySettings::Ecr { .. }) => {}
                 Some(RegistrySettings::OciClientAuth {
                     username, password, ..
                 }) => {

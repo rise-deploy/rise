@@ -142,22 +142,48 @@ fn is_orphaned(status: Option<&DeploymentStatus>) -> bool {
     }
 }
 
-/// Whether any live ECS service in the tick's snapshot still belongs to
-/// `deployment`.
+/// Whether a permanent rejection should fail `status` outright, or only
+/// protect its services and retry.
 ///
-/// Reads the snapshot rather than the API: the snapshot either describes the
-/// whole cluster or the tick already aborted, so there is no partial view here
-/// in which a running service could look absent.
-fn deployment_services_remain(actual: &[ActualService], deployment_id: &str) -> bool {
-    actual
-        .iter()
-        .any(|s| s.deployment_id.as_deref() == Some(deployment_id))
+/// Fail-fast exists for a deployment still on its way up: the message names
+/// what the user must change, and without it the deploying timeout would
+/// overwrite it with "timed out after 300 seconds".
+///
+/// A deployment that already reached `Healthy`/`Unhealthy` is *serving traffic*
+/// and must never be failed on this path. Nothing about it changed -- its env
+/// vars are an immutable snapshot -- so a permanent rejection appearing against
+/// it means the *rules* changed underneath it: an Organization moved onto this
+/// controller class with a live deployment whose sizing, container count or
+/// identity block this backend does not support. Failing it would mark it
+/// terminal, drop it from the desired set, and delete a running app's services
+/// within the same tick, with no user action and no way back. Protect and retry
+/// instead: the operator sees the warning, and the app keeps serving until a
+/// deploy replaces it.
+fn rejection_fails_deployment(status: &DeploymentStatus) -> bool {
+    matches!(
+        status,
+        DeploymentStatus::Pushed | DeploymentStatus::Deploying
+    )
 }
 
-/// How long a deployment may sit in `Terminating` waiting for its ECS services
-/// to disappear before the reconciler stops waiting and lets the orphan sweep
-/// finish the job.
-const TERMINATING_GRACE_MINUTES: i64 = 10;
+/// The user-facing text of a permanent rejection.
+///
+/// [`PermanentDeployError`] is a marker with an empty `Display`, and anyhow's
+/// alternate form joins the chain with `": "` -- so formatting the error
+/// directly yields a message with a leading `": "`. This renders the chain
+/// without the marker's empty link.
+fn rejection_message(err: &anyhow::Error) -> String {
+    let parts: Vec<String> = err
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if parts.is_empty() {
+        "the deployment was rejected by the ECS backend".to_string()
+    } else {
+        parts.join(": ")
+    }
+}
 
 /// Attached as context to an error a deployment can never recover from.
 ///
@@ -514,10 +540,7 @@ impl EcsReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         for deployment in &non_terminal {
-            if let Err(e) = self
-                .perform_status_transition(project, deployment, &actual)
-                .await
-            {
+            if let Err(e) = self.perform_status_transition(project, deployment).await {
                 warn!(
                     deployment = %deployment.deployment_id,
                     "Status transition failed: {:?}", e
@@ -546,21 +569,34 @@ impl EcsReconciler {
             {
                 Ok(mut entries) => desired.append(&mut entries),
                 Err(e) if e.downcast_ref::<PermanentDeployError>().is_some() => {
-                    // Retrying would fail identically forever, and the deploying
-                    // timeout would eventually replace this message with
-                    // "timed out after 300 seconds" -- burying the one piece of
-                    // text that tells the user what to change.
-                    let message = format!("{:#}", e);
-                    warn!(
-                        deployment = %deployment.deployment_id,
-                        "Rejecting deployment: {}", message
-                    );
-                    self.store
-                        .mark_deployment_failed(deployment.id, &message)
-                        .await?;
-                    self.store
-                        .update_project_calculated_status(project.id)
-                        .await?;
+                    let message = rejection_message(&e);
+                    if rejection_fails_deployment(&deployment.status) {
+                        // Retrying would fail identically forever, and the
+                        // deploying timeout would eventually replace this
+                        // message with "timed out after 300 seconds" -- burying
+                        // the one piece of text that tells the user what to
+                        // change.
+                        warn!(
+                            deployment = %deployment.deployment_id,
+                            "Rejecting deployment: {}", message
+                        );
+                        self.store
+                            .mark_deployment_failed(deployment.id, &message)
+                            .await?;
+                        self.store
+                            .update_project_calculated_status(project.id)
+                            .await?;
+                    } else {
+                        // Already serving, or on its way down. See
+                        // `rejection_fails_deployment`.
+                        warn!(
+                            deployment = %deployment.deployment_id,
+                            status = ?deployment.status,
+                            "This backend cannot express the running deployment, but it is \
+                             not failed on that account; protecting its services: {}", message
+                        );
+                        protected_deployment_ids.insert(deployment.deployment_id.clone());
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -615,27 +651,25 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
-        actual: &[ActualService],
     ) -> Result<()> {
         use rise_backend_core::{DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES};
         let now = chrono::Utc::now();
 
         match deployment.status {
-            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing => {
+            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing
                 if now - deployment.created_at
-                    > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES)
-                {
-                    self.store
-                        .mark_deployment_failed(
-                            deployment.id,
-                            "Deployment timed out before the image was pushed — the CLI was \
-                             most likely interrupted during build or push.",
-                        )
-                        .await?;
-                    self.store
-                        .update_project_calculated_status(project.id)
-                        .await?;
-                }
+                    > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES) =>
+            {
+                self.store
+                    .mark_deployment_failed(
+                        deployment.id,
+                        "Deployment timed out before the image was pushed — the CLI was \
+                         most likely interrupted during build or push.",
+                    )
+                    .await?;
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
             DeploymentStatus::Cancelling => {
                 self.store.mark_deployment_cancelled(deployment.id).await?;
@@ -644,36 +678,18 @@ impl EcsReconciler {
                     .await?;
             }
             DeploymentStatus::Terminating => {
-                // Only once the services are actually gone. Marking terminal
-                // first lets the project-deletion controller -- which deletes a
-                // project as soon as all its deployments are terminal, on a 5s
-                // poll against this loop's 30s -- remove the project row while
-                // a service still exists. After that no tick can reach it
-                // through its project, and it survives on the cluster until the
-                // orphan sweep finds it.
-                let stuck = now - deployment.updated_at
-                    > chrono::Duration::minutes(TERMINATING_GRACE_MINUTES);
-                if !stuck && deployment_services_remain(actual, &deployment.deployment_id) {
-                    debug!(
-                        deployment = %deployment.deployment_id,
-                        "Still terminating: services have not gone away yet"
-                    );
-                } else {
-                    if stuck {
-                        // Bounded on purpose. Waiting forever on a delete that
-                        // keeps failing would hang the deployment -- and the
-                        // project deletion behind it -- indefinitely. Completing
-                        // hands the service to the orphan sweep, which is
-                        // exactly the case it exists for.
-                        warn!(
-                            deployment = %deployment.deployment_id,
-                            "Services still present after {}m in Terminating; completing \
-                             anyway and leaving them to the orphan sweep",
-                            TERMINATING_GRACE_MINUTES
-                        );
-                    }
-                    self.complete_termination(project, deployment).await?;
-                }
+                // Complete immediately. The services are retired by the diff on
+                // the next tick -- `should_have_infrastructure` keeps them in
+                // the desired set while the deployment is still Terminating, so
+                // they are only dropped once it reaches a terminal status.
+                //
+                // That ordering means the project-deletion controller (5s poll,
+                // against this loop's 30s) can delete the project row before the
+                // services are gone, putting them out of reach of every future
+                // per-project pass. Waiting here cannot fix it: the very diff
+                // that removes them will not run until this transition happens.
+                // The cluster-wide sweep is what closes it.
+                self.complete_termination(project, deployment).await?;
             }
             DeploymentStatus::Pushed => {
                 self.store
@@ -2161,22 +2177,6 @@ mod tests {
         assert!(cluster.for_project("nope").is_empty());
     }
 
-    /// A deployment leaves `Terminating` only once nothing of it is left
-    /// running. Matching is on the deployment id, not the project: two
-    /// deployments of one project coexist during a rollout, and the outgoing
-    /// one must not be held open by the incoming one's services.
-    #[test]
-    fn termination_waits_only_on_this_deployment_s_services() {
-        let cluster = super::ClusterServices {
-            services: vec![managed("app", "d-old"), managed("app", "d-new")],
-        };
-        let actual = cluster.for_project("app");
-
-        assert!(super::deployment_services_remain(&actual, "d-old"));
-        assert!(!super::deployment_services_remain(&actual, "d-gone"));
-        assert!(!super::deployment_services_remain(&[], "d-old"));
-    }
-
     /// The orphan rule decides whether to delete something that is running.
     /// A wrong "yes" destroys a live workload, so both directions are pinned.
     #[test]
@@ -2213,6 +2213,53 @@ mod tests {
                 "{live:?} still belongs to a reconcile pass"
             );
         }
+    }
+
+    /// Fail-fast must reach a deployment on its way up and stop at one that is
+    /// already serving. Failing a Healthy deployment marks it terminal, which
+    /// drops it from the desired set and deletes a running app's services in
+    /// the same tick.
+    #[test]
+    fn only_a_deployment_still_coming_up_is_failed_by_a_permanent_rejection() {
+        use rise_backend_core::models::DeploymentStatus;
+
+        for coming_up in [DeploymentStatus::Pushed, DeploymentStatus::Deploying] {
+            assert!(
+                super::rejection_fails_deployment(&coming_up),
+                "{coming_up:?} has never served traffic; the user needs the message"
+            );
+        }
+
+        for live in [
+            DeploymentStatus::Healthy,
+            DeploymentStatus::Unhealthy,
+            DeploymentStatus::Terminating,
+        ] {
+            assert!(
+                !super::rejection_fails_deployment(&live),
+                "{live:?} must not be failed -- its services would be deleted under it"
+            );
+        }
+    }
+
+    /// The rejection text is what `rise deploy` shows the user. The marker in
+    /// the chain has an empty `Display`, so formatting the error directly
+    /// produces a message that starts with a stray ": ".
+    #[test]
+    fn the_rejection_message_has_no_empty_leading_chain_link() {
+        fn rejects() -> Result<()> {
+            anyhow::bail!("multi-container deployments are not supported on ECS")
+        }
+        let err = EcsReconciler::permanent(rejects()).expect_err("must fail");
+
+        assert_eq!(
+            super::rejection_message(&err),
+            "multi-container deployments are not supported on ECS"
+        );
+        assert!(
+            format!("{err:#}").starts_with(": "),
+            "if anyhow stops emitting the empty link, this helper can go away"
+        );
     }
 
     /// The classification is the whole mechanism: a permanent error must be

@@ -450,15 +450,24 @@ throttles per-account. The loop therefore:
   controller's service for ours would mean deleting it,
 - reads the cluster **once per tick**, not once per project: one paginated
   `ListServices` (100 ARNs per page) plus batched `DescribeServices` (10 per
-  call), and every consumer — drift detection, readiness, `pod_status`, the
-  termination check and the orphan sweep — works off that single snapshot.
+  call), and every service-level consumer — drift detection, readiness and the
+  orphan sweep — works off that single snapshot.
   Scoping the read per project would cost `(projects + deployments)` passes
   against a fixed 20 reads/second budget, and would structurally hide the
   orphans D-GC exists to collect,
-- batches `DescribeTasks` at 100 per call,
-- defaults to a **longer tick than Docker's 5 s** (30 s proposed) with jitter,
-- treats `ThrottlingException` as retryable with exponential backoff and never
-  as deployment failure — the verified default buckets (2026-08) are tight:
+- batches `DescribeTasks` at 100 per call. Note that `pod_status` is **not**
+  covered by the snapshot: it issues a `ListTasks` + `DescribeTasks` per service
+  per tick, so task-level read volume still grows linearly with the number of
+  active deployments. Folding it into one cluster-wide task read is open work,
+- defaults to a **longer tick than Docker's 5 s** (30 s, `reconcile_interval_secs`).
+  Jitter is not implemented: replicas that start together poll together, which
+  matters only once several replicas share a cluster,
+- relies on the AWS SDK's default retry policy for `ThrottlingException` and
+  never treats it as deployment failure. There is no throttling-specific backoff
+  of Rise's own, and a throttled cluster read aborts the whole tick rather than
+  degrading per project — deliberate, since a partial view of what is running is
+  a view in which live services look orphaned. The verified default buckets
+  (2026-08) are tight:
   service **modify** actions refill at 5/s (burst 50), task-definition
   **modify** (i.e. `RegisterTaskDefinition`) at **1/s** (burst 20), service
   reads at 20/s (burst 100), so a burst of concurrent deploys must serialize
@@ -482,7 +491,10 @@ whose deployment the database resolves as **terminal or absent**. It is keyed on
 the deployment **UUID** tag, the one tag that maps to a row we can definitively
 resolve (a project can be renamed); it only considers services carrying both our
 `managed-by` and `controller-class` markers, so a second Rise controller sharing
-the cluster is never touched; a failed lookup leaves the service alone, so a
+the cluster is never touched **provided it runs a different controller class** —
+two installs with separate databases, the same class and the same label
+namespace would each resolve the other's live services as absent and delete
+them, so one cluster must never be shared by two installs of the same class; a failed lookup leaves the service alone, so a
 transient database error cannot escalate into deleting a live workload; and it
 skips projects this tick already reconciled (governed by the diff) or whose
 ownership could not be resolved (nothing about their state is trustworthy).
@@ -490,12 +502,15 @@ A project resolved as *not* ours is deliberately **not** skipped: services
 carrying our own controller-class tag were created by us, and no other
 controller will ever collect them.
 
-The same snapshot gates termination: a deployment leaves `Terminating` only once
-no service of it remains, so the project-deletion controller (5 s poll) cannot
-delete the project row out from under a service the reconciler (30 s tick) has
-not finished removing. That wait is bounded — after ten minutes the deployment
-completes regardless and the sweep becomes the backstop, because hanging a
-deployment forever on a delete that keeps failing is worse than a late GC.
+The sweep is also what closes the termination race, and it has to be: a
+`Terminating` deployment still counts as `should_have_infrastructure`, so its
+services stay in the desired set and the diff retires them only *after* it
+reaches a terminal status. Termination therefore cannot wait for its services to
+disappear — the very diff that removes them does not run until the transition
+happens. Meanwhile the project-deletion controller (5 s poll, against this
+loop's 30 s tick) can delete the project row first, putting those services
+beyond the reach of every future per-project pass. The cluster-wide sweep
+collects them on a later tick.
 
 ### D14. AWS credentials and Terraform
 
