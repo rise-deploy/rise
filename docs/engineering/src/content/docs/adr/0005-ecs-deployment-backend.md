@@ -445,11 +445,17 @@ backend does it.
 Unlike a Docker socket, every observation costs a rate-limited API call, and ECS
 throttles per-account. The loop therefore:
 
-- discovers Rise-managed services by **tag** (Resource Groups Tagging API) rather
-  than enumerating the cluster,
-- batches `DescribeServices` (10 services per call) and `DescribeTasks` (100 per
-  call), and reuses one describe pass per tick across drift detection, readiness,
-  and `pod_status`,
+- identifies Rise-managed services by **tag**, never by parsing service names —
+  a name is truncated and hashed for long projects, and mistaking another
+  controller's service for ours would mean deleting it,
+- reads the cluster **once per tick**, not once per project: one paginated
+  `ListServices` (100 ARNs per page) plus batched `DescribeServices` (10 per
+  call), and every consumer — drift detection, readiness, `pod_status`, the
+  termination check and the orphan sweep — works off that single snapshot.
+  Scoping the read per project would cost `(projects + deployments)` passes
+  against a fixed 20 reads/second budget, and would structurally hide the
+  orphans D-GC exists to collect,
+- batches `DescribeTasks` at 100 per call,
 - defaults to a **longer tick than Docker's 5 s** (30 s proposed) with jitter,
 - treats `ThrottlingException` as retryable with exponential backoff and never
   as deployment failure — the verified default buckets (2026-08) are tight:
@@ -460,6 +466,36 @@ throttles per-account. The loop therefore:
 - keeps `DEPLOYING_TIMEOUT_MINUTES` under review: Fargate task start plus image
   pull can approach the current 5-minute budget for large images, and this
   backend may need its own configurable ceiling rather than the shared constant.
+
+### D13a. Orphan collection is cluster-wide, not per-project
+
+Per-project reconciliation converges the services of projects the database still
+holds. It structurally cannot reach a service whose **project row is gone or is
+no longer ours** — a `DeleteService` that failed once after the deployment was
+already marked terminal, an Organization's `deploymentControllerClass` changing,
+or a database restored to before the project existed. Such a service keeps
+running, keeps costing, and keeps being routed to, and no future tick will ever
+look at it.
+
+The tick therefore ends with a sweep over the whole snapshot, deleting services
+whose deployment the database resolves as **terminal or absent**. It is keyed on
+the deployment **UUID** tag, the one tag that maps to a row we can definitively
+resolve (a project can be renamed); it only considers services carrying both our
+`managed-by` and `controller-class` markers, so a second Rise controller sharing
+the cluster is never touched; a failed lookup leaves the service alone, so a
+transient database error cannot escalate into deleting a live workload; and it
+skips projects this tick already reconciled (governed by the diff) or whose
+ownership could not be resolved (nothing about their state is trustworthy).
+A project resolved as *not* ours is deliberately **not** skipped: services
+carrying our own controller-class tag were created by us, and no other
+controller will ever collect them.
+
+The same snapshot gates termination: a deployment leaves `Terminating` only once
+no service of it remains, so the project-deletion controller (5 s poll) cannot
+delete the project row out from under a service the reconciler (30 s tick) has
+not finished removing. That wait is bounded — after ten minutes the deployment
+completes regardless and the sweep becomes the backstop, because hanging a
+deployment forever on a delete that keeps failing is worse than a late GC.
 
 ### D14. AWS credentials and Terraform
 

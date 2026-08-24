@@ -17,11 +17,13 @@
 //! Two things this driver must do that the others do not:
 //!
 //! **Sweep before it starts.** Deployments the suite creates are ECS services
-//! Rise owns, not Terraform. Destroying the per-run stack removes Rise *and its
-//! database*, so the next run's Rise cannot collect them — the reconciler only
-//! visits services whose project it can see. Left alone they accumulate until
-//! the account's Fargate quota stops the suite mid-way. The sweep runs at
-//! bring-up as well as teardown, because a crashed run never reaches teardown.
+//! Rise owns, not Terraform, and destroying the per-run stack takes Rise and its
+//! database with them. The next run's control plane does collect them — its
+//! orphan sweep deletes any managed service whose deployment the database no
+//! longer knows — but only once it is up, which is after the apply that needs
+//! the Fargate quota those leftovers are holding. Sweeping first is what keeps a
+//! previous run's debris from failing this one's apply, and it runs at bring-up
+//! rather than only at teardown because a crashed run never reaches teardown.
 //!
 //! **Point DNS at Traefik.** Fargate tasks cannot hold an Elastic IP, so
 //! Traefik's address changes whenever its task is replaced. The zone makes the

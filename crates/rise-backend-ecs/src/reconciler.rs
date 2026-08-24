@@ -58,6 +58,40 @@ const MAX_REPLICAS: u32 = 100;
 /// `DescribeServices` accepts at most 10 services per call.
 const DESCRIBE_SERVICES_BATCH: usize = 10;
 
+/// `ListServices` returns 10 ARNs per page by default and accepts up to 100.
+/// The default would cost ten times the calls for the same result.
+const LIST_SERVICES_PAGE: i32 = 100;
+
+/// A Rise-managed ECS service as the cluster currently reports it, paired with
+/// the tags that identify what it is meant to be running.
+struct ManagedService {
+    service: ActualService,
+    tags: ServiceTags,
+}
+
+/// Every Rise-managed service in the cluster, read once per tick.
+///
+/// Holding the whole cluster rather than one project's slice is what lets the
+/// orphan sweep see services whose project row is gone — the case per-project
+/// scoping structurally cannot reach.
+struct ClusterServices {
+    services: Vec<ManagedService>,
+}
+
+impl ClusterServices {
+    /// The services tagged as belonging to `project`.
+    ///
+    /// Matching on the tag rather than the name because the name is truncated
+    /// and hashed for long projects, so it does not round-trip.
+    fn for_project(&self, project: &str) -> Vec<ActualService> {
+        self.services
+            .iter()
+            .filter(|m| m.tags.project == project)
+            .map(|m| m.service.clone())
+            .collect()
+    }
+}
+
 /// Tag suffix carrying the content hash of the task definition a service runs.
 /// Stamped alongside the bookkeeping tags so drift detection is a tag comparison
 /// rather than a `DescribeTaskDefinition` per service per tick.
@@ -94,7 +128,37 @@ pub struct ReconcilerConfig {
     pub traefik_api_url: Option<String>,
 }
 
-/// Background reconciler converging the ECS cluster with the database.
+/// Whether a service whose deployment resolved to `status` should be collected.
+///
+/// `None` means the database has no such deployment at all -- deleted project,
+/// restored backup -- and the service is unambiguously abandoned. A terminal
+/// status means the deployment is finished and nothing will recreate its
+/// services. Anything else belongs to some project's reconcile pass, even one
+/// this tick did not visit, and must be left alone.
+fn is_orphaned(status: Option<&DeploymentStatus>) -> bool {
+    match status {
+        Some(s) => rise_backend_core::state_machine::is_terminal(s),
+        None => true,
+    }
+}
+
+/// Whether any live ECS service in the tick's snapshot still belongs to
+/// `deployment`.
+///
+/// Reads the snapshot rather than the API: the snapshot either describes the
+/// whole cluster or the tick already aborted, so there is no partial view here
+/// in which a running service could look absent.
+fn deployment_services_remain(actual: &[ActualService], deployment_id: &str) -> bool {
+    actual
+        .iter()
+        .any(|s| s.deployment_id.as_deref() == Some(deployment_id))
+}
+
+/// How long a deployment may sit in `Terminating` waiting for its ECS services
+/// to disappear before the reconciler stops waiting and lets the orphan sweep
+/// finish the job.
+const TERMINATING_GRACE_MINUTES: i64 = 10;
+
 /// Attached as context to an error a deployment can never recover from.
 ///
 /// `reconcile_project` looks for it to decide whether to fail the deployment
@@ -112,6 +176,7 @@ impl std::fmt::Display for PermanentDeployError {
 
 impl std::error::Error for PermanentDeployError {}
 
+/// Background reconciler converging the ECS cluster with the database.
 pub struct EcsReconciler {
     ecs: aws_sdk_ecs::Client,
     ssm: aws_sdk_ssm::Client,
@@ -254,22 +319,138 @@ impl EcsReconciler {
         let projects = self.store.list_projects(None).await?;
         let mut org_class_cache: HashMap<Uuid, Option<String>> = HashMap::new();
 
+        // One read of the cluster for the whole tick. Everything below works
+        // off this snapshot: the per-project diff, readiness, the termination
+        // check and the orphan sweep. A failure here aborts the tick rather
+        // than degrading to a partial view, because a partial view of what is
+        // running is a view in which live services look orphaned.
+        let cluster = self.list_managed_services().await?;
+
+        // Projects the orphan sweep must not touch this tick. Two reasons land
+        // a project here, and they are different reasons:
+        //
+        //   - the per-project pass already handled it, and `diff_services`
+        //     knows things the sweep does not (in-flight deployments, the
+        //     protected set). Re-deleting behind it is at best duplicate calls;
+        //   - its ownership could not be resolved at all, so nothing about its
+        //     state is trustworthy this tick.
+        //
+        // A project we resolved as *not ours* is deliberately absent: its
+        // services still carry our own controller-class tag, so we created
+        // them and no other controller will ever clean them up.
+        let mut sweep_exempt: HashSet<String> = HashSet::new();
+
         for project in projects {
             match self.owns_project(&project, &mut org_class_cache).await {
                 Ok(true) => {}
+                // Not ours to converge — but anything of ours left behind on
+                // the cluster is still ours to collect, so the sweep sees it.
                 Ok(false) => continue,
+                // Ownership unknown. Shield it: a transient Organization read
+                // must never escalate into deleting a running workload.
                 Err(e) => {
                     warn!(project = %project.name, "Failed to resolve ownership: {:?}", e);
+                    sweep_exempt.insert(project.name.clone());
                     continue;
                 }
             }
+            sweep_exempt.insert(project.name.clone());
             // The lease is global, so losing it aborts the whole tick rather
             // than just this project.
             if !self.confirm_leadership(election).await {
                 return Ok(());
             }
-            if let Err(e) = self.reconcile_project(&project, election).await {
+            if let Err(e) = self.reconcile_project(&project, &cluster, election).await {
                 error!(project = %project.name, "Failed to reconcile project: {:?}", e);
+            }
+        }
+
+        if let Err(e) = self
+            .collect_orphans(&cluster, &sweep_exempt, election)
+            .await
+        {
+            error!("Cluster-wide orphan sweep failed: {:?}", e);
+        }
+        Ok(())
+    }
+
+    /// Delete services whose deployment the database no longer knows.
+    ///
+    /// Per-project reconciliation cannot do this. It only ever visits services
+    /// whose project tag matches a project row it is currently reconciling, so
+    /// the moment a project row disappears — or stops being ours — its services
+    /// become unreachable by every future tick. They keep running, keep costing,
+    /// and keep being routed to. Three ways in:
+    ///
+    ///   - a `DeleteService` that failed once, after the deployment was already
+    ///     marked terminal and the project row was deleted;
+    ///   - an Organization's `deploymentControllerClass` changing, so
+    ///     `owns_project` stops returning true for projects we built services
+    ///     for — the new controller only ever sees its own tags, so the
+    ///     services we left behind are ours alone to collect;
+    ///   - a database restored to a point before the project existed.
+    ///
+    /// Keyed on the deployment UUID rather than the project name: it is the tag
+    /// that maps to a row we can definitively resolve, and a project can be
+    /// renamed. Only services carrying our own `managed-by` *and*
+    /// `controller-class` markers are considered, so a second Rise controller
+    /// on the same cluster is never touched.
+    async fn collect_orphans(
+        &self,
+        cluster: &ClusterServices,
+        sweep_exempt: &HashSet<String>,
+        election: &LeaderElection,
+    ) -> Result<()> {
+        for managed in &cluster.services {
+            let (name, tags) = (&managed.service.name, &managed.tags);
+            if sweep_exempt.contains(&tags.project) {
+                continue;
+            }
+            // Resolve the deployment this service claims to serve. Anything we
+            // cannot parse or cannot look up is left alone: deleting on a
+            // failed lookup would turn a transient database error into data
+            // loss.
+            let Ok(uuid) = Uuid::parse_str(&tags.deployment_uuid) else {
+                continue;
+            };
+            let deployment = match self.store.find_deployment(uuid).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        service = %name,
+                        "Could not resolve deployment {uuid} while sweeping orphans; \
+                         leaving the service alone: {:?}", e
+                    );
+                    continue;
+                }
+            };
+
+            if !is_orphaned(deployment.as_ref().map(|d| &d.status)) {
+                continue;
+            }
+
+            if !self.confirm_leadership(election).await {
+                return Ok(());
+            }
+
+            warn!(
+                service = %name,
+                deployment = %tags.deployment_uuid,
+                project = %tags.project,
+                "Deleting orphaned ECS service: its deployment is {}",
+                match &deployment {
+                    Some(d) => format!("{:?}", d.status),
+                    None => "absent from the database".to_string(),
+                }
+            );
+            if let Err(e) = self.delete_service(name).await {
+                warn!(service = %name, "Failed to delete orphaned service: {:?}", e);
+                continue;
+            }
+            // The service is gone; its secrets would otherwise outlive it in
+            // Parameter Store forever.
+            if let Err(e) = self.delete_secrets_for(tags).await {
+                warn!(service = %name, "Failed to delete the orphan's secrets: {:?}", e);
             }
         }
         Ok(())
@@ -319,14 +500,24 @@ impl EcsReconciler {
         Ok(class)
     }
 
-    async fn reconcile_project(&self, project: &Project, election: &LeaderElection) -> Result<()> {
+    async fn reconcile_project(
+        &self,
+        project: &Project,
+        cluster: &ClusterServices,
+        election: &LeaderElection,
+    ) -> Result<()> {
+        let actual = cluster.for_project(&project.name);
+
         // 1. Status transitions, isolated per deployment.
         let non_terminal = self
             .store
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         for deployment in &non_terminal {
-            if let Err(e) = self.perform_status_transition(project, deployment).await {
+            if let Err(e) = self
+                .perform_status_transition(project, deployment, &actual)
+                .await
+            {
                 warn!(
                     deployment = %deployment.deployment_id,
                     "Status transition failed: {:?}", e
@@ -381,8 +572,7 @@ impl EcsReconciler {
             }
         }
 
-        // 3. Observe, diff, apply.
-        let actual = self.list_actual_services(project).await?;
+        // 3. Diff and apply against the snapshot taken at the top of the tick.
         let desired_services: Vec<DesiredService> =
             desired.iter().map(|(d, _, _)| d.clone()).collect();
         let actions = service::diff_services(&desired_services, &actual, &protected_deployment_ids);
@@ -405,7 +595,7 @@ impl EcsReconciler {
                 continue;
             }
             if let Err(e) = self
-                .reconcile_health(project, deployment, &mut server_status_cache)
+                .reconcile_health(project, deployment, &actual, &mut server_status_cache)
                 .await
             {
                 warn!(
@@ -425,6 +615,7 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
+        actual: &[ActualService],
     ) -> Result<()> {
         use rise_backend_core::{DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES};
         let now = chrono::Utc::now();
@@ -453,7 +644,36 @@ impl EcsReconciler {
                     .await?;
             }
             DeploymentStatus::Terminating => {
-                self.complete_termination(project, deployment).await?;
+                // Only once the services are actually gone. Marking terminal
+                // first lets the project-deletion controller -- which deletes a
+                // project as soon as all its deployments are terminal, on a 5s
+                // poll against this loop's 30s -- remove the project row while
+                // a service still exists. After that no tick can reach it
+                // through its project, and it survives on the cluster until the
+                // orphan sweep finds it.
+                let stuck = now - deployment.updated_at
+                    > chrono::Duration::minutes(TERMINATING_GRACE_MINUTES);
+                if !stuck && deployment_services_remain(actual, &deployment.deployment_id) {
+                    debug!(
+                        deployment = %deployment.deployment_id,
+                        "Still terminating: services have not gone away yet"
+                    );
+                } else {
+                    if stuck {
+                        // Bounded on purpose. Waiting forever on a delete that
+                        // keeps failing would hang the deployment -- and the
+                        // project deletion behind it -- indefinitely. Completing
+                        // hands the service to the orphan sweep, which is
+                        // exactly the case it exists for.
+                        warn!(
+                            deployment = %deployment.deployment_id,
+                            "Services still present after {}m in Terminating; completing \
+                             anyway and leaving them to the orphan sweep",
+                            TERMINATING_GRACE_MINUTES
+                        );
+                    }
+                    self.complete_termination(project, deployment).await?;
+                }
             }
             DeploymentStatus::Pushed => {
                 self.store
@@ -868,21 +1088,30 @@ impl EcsReconciler {
 
     // ── observing the cluster ─────────────────────────────────────────────
 
-    /// List this project's Rise-managed services.
+    /// Read every Rise-managed service in the cluster, once.
     ///
     /// Discovery is by **tag**, never by parsing names: a name is lossy (long
     /// project names are truncated with a hash suffix) while tags are exact, and
     /// mistaking another controller's service for ours would mean deleting it.
     ///
-    /// One `ListServices` plus batched `DescribeServices` (10 per call, the API
-    /// maximum) per project per tick — the result is shared with readiness and
-    /// `pod_status` rather than re-fetched, because service reads sustain only
-    /// 20 requests/second.
-    async fn list_actual_services(&self, project: &Project) -> Result<Vec<ActualService>> {
+    /// Called exactly once per tick, and the resulting [`ClusterServices`] is
+    /// threaded through the diff, readiness, the termination check and the
+    /// orphan sweep. Service reads sustain only 20 requests/second and this is
+    /// the only unbounded-by-project read the reconciler makes, so re-listing
+    /// per project — let alone per deployment — turns installs with many
+    /// projects into a throttling problem: the cost would grow as
+    /// `(projects + deployments) x services/page`, against a fixed budget.
+    /// One pass costs `1 + services/100` list calls plus `services/10`
+    /// describes, no matter how many projects there are.
+    async fn list_managed_services(&self) -> Result<ClusterServices> {
         let mut arns: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;
         loop {
-            let mut req = self.ecs.list_services().cluster(&self.config.cluster);
+            let mut req = self
+                .ecs
+                .list_services()
+                .cluster(&self.config.cluster)
+                .max_results(LIST_SERVICES_PAGE);
             if let Some(token) = &next_token {
                 req = req.next_token(token);
             }
@@ -927,42 +1156,43 @@ impl EcsReconciler {
                 let Some(parsed) = ServiceTags::parse(&tags, &self.config.label_namespace) else {
                     continue;
                 };
-                if parsed.project != project.name {
-                    continue;
-                }
                 // A service being deleted still appears in DescribeServices for a
                 // while; treating it as live would make the diff think the
-                // desired state is already satisfied.
+                // desired state is already satisfied, and would make the orphan
+                // sweep re-issue a delete that is already in flight.
                 if svc
                     .status()
                     .is_some_and(|s| s == "INACTIVE" || s == "DRAINING")
                 {
                     continue;
                 }
-                services.push(ActualService {
-                    name: svc.service_name().unwrap_or_default().to_string(),
-                    arn: svc.service_arn().unwrap_or_default().to_string(),
-                    key: Some(spec_key(
-                        &parsed.project,
-                        &parsed.deployment_group,
-                        &parsed.deployment_id,
-                        &parsed.container,
-                    )),
-                    task_definition_arn: svc.task_definition().unwrap_or_default().to_string(),
-                    task_definition_hash: tags
-                        .get(&rise_backend_core::labels::ns_key(
-                            &self.config.label_namespace,
-                            TASK_DEFINITION_HASH_SUFFIX,
-                        ))
-                        .cloned()
-                        .unwrap_or_default(),
-                    desired_count: svc.desired_count(),
-                    running_count: svc.running_count(),
-                    deployment_id: Some(parsed.deployment_id),
+                services.push(ManagedService {
+                    service: ActualService {
+                        name: svc.service_name().unwrap_or_default().to_string(),
+                        arn: svc.service_arn().unwrap_or_default().to_string(),
+                        key: Some(spec_key(
+                            &parsed.project,
+                            &parsed.deployment_group,
+                            &parsed.deployment_id,
+                            &parsed.container,
+                        )),
+                        task_definition_arn: svc.task_definition().unwrap_or_default().to_string(),
+                        task_definition_hash: tags
+                            .get(&rise_backend_core::labels::ns_key(
+                                &self.config.label_namespace,
+                                TASK_DEFINITION_HASH_SUFFIX,
+                            ))
+                            .cloned()
+                            .unwrap_or_default(),
+                        desired_count: svc.desired_count(),
+                        running_count: svc.running_count(),
+                        deployment_id: Some(parsed.deployment_id.clone()),
+                    },
+                    tags: parsed,
                 });
             }
         }
-        Ok(services)
+        Ok(ClusterServices { services })
     }
 
     // ── applying ──────────────────────────────────────────────────────────
@@ -1447,6 +1677,7 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
+        services: &[ActualService],
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
     ) -> Result<()> {
         if !matches!(
@@ -1457,7 +1688,6 @@ impl EcsReconciler {
         }
 
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
-        let services = self.list_actual_services(project).await?;
         let by_key: HashMap<&str, &ActualService> = services
             .iter()
             .filter_map(|s| s.key.as_deref().map(|k| (k, s)))
@@ -1874,6 +2104,117 @@ pub(crate) fn clamp_replicas(requested: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// A cluster entry as `list_managed_services` would build it: the tags are
+    /// the identity, the `ActualService` is what the diff sees.
+    fn managed(project: &str, deployment_id: &str) -> super::ManagedService {
+        super::ManagedService {
+            service: crate::service::ActualService {
+                name: format!("rise-{project}-{deployment_id}-web"),
+                arn: format!("arn:aws:ecs:eu-west-1:1:service/c/{project}-{deployment_id}"),
+                key: None,
+                task_definition_arn: String::new(),
+                task_definition_hash: String::new(),
+                desired_count: 1,
+                running_count: 1,
+                deployment_id: Some(deployment_id.to_string()),
+            },
+            tags: crate::tags::ServiceTags {
+                project: project.to_string(),
+                deployment_group: "main".to_string(),
+                deployment_id: deployment_id.to_string(),
+                deployment_uuid: uuid::Uuid::nil().to_string(),
+                container: "web".to_string(),
+                environment: None,
+                env_hash: String::new(),
+                image: "img".to_string(),
+                route_hash: String::new(),
+            },
+        }
+    }
+
+    /// The tick reads the cluster once and projects per-project slices out of
+    /// it. If the projection matched loosely -- on the service name, say --
+    /// `rise-app` and `rise-app-staging` would leak into each other's diffs and
+    /// each would try to delete the other's services.
+    #[test]
+    fn a_project_slice_holds_only_that_project_s_services() {
+        let cluster = super::ClusterServices {
+            services: vec![
+                managed("app", "d-1"),
+                managed("app-staging", "d-2"),
+                managed("app", "d-3"),
+            ],
+        };
+
+        let slice = cluster.for_project("app");
+        assert_eq!(slice.len(), 2);
+        assert!(
+            slice
+                .iter()
+                .all(|s| s.deployment_id.as_deref() != Some("d-2")),
+            "a different project's service must not appear in this project's slice"
+        );
+        assert!(
+            cluster.for_project("app-stag").is_empty(),
+            "no prefix match"
+        );
+        assert!(cluster.for_project("nope").is_empty());
+    }
+
+    /// A deployment leaves `Terminating` only once nothing of it is left
+    /// running. Matching is on the deployment id, not the project: two
+    /// deployments of one project coexist during a rollout, and the outgoing
+    /// one must not be held open by the incoming one's services.
+    #[test]
+    fn termination_waits_only_on_this_deployment_s_services() {
+        let cluster = super::ClusterServices {
+            services: vec![managed("app", "d-old"), managed("app", "d-new")],
+        };
+        let actual = cluster.for_project("app");
+
+        assert!(super::deployment_services_remain(&actual, "d-old"));
+        assert!(!super::deployment_services_remain(&actual, "d-gone"));
+        assert!(!super::deployment_services_remain(&[], "d-old"));
+    }
+
+    /// The orphan rule decides whether to delete something that is running.
+    /// A wrong "yes" destroys a live workload, so both directions are pinned.
+    #[test]
+    fn only_finished_or_unknown_deployments_are_collected() {
+        use rise_backend_core::models::DeploymentStatus;
+
+        // No row at all: a deleted project, or a database restored past it.
+        assert!(super::is_orphaned(None));
+
+        for finished in [
+            DeploymentStatus::Stopped,
+            DeploymentStatus::Failed,
+            DeploymentStatus::Superseded,
+            DeploymentStatus::Cancelled,
+            DeploymentStatus::Expired,
+        ] {
+            assert!(
+                super::is_orphaned(Some(&finished)),
+                "{finished:?} is finished; nothing will recreate its services"
+            );
+        }
+
+        // Live, or on its way there. Deleting these would take down a running
+        // deployment the reconciler is mid-way through.
+        for live in [
+            DeploymentStatus::Pending,
+            DeploymentStatus::Pushed,
+            DeploymentStatus::Deploying,
+            DeploymentStatus::Healthy,
+            DeploymentStatus::Terminating,
+        ] {
+            assert!(
+                !super::is_orphaned(Some(&live)),
+                "{live:?} still belongs to a reconcile pass"
+            );
+        }
+    }
+
     /// The classification is the whole mechanism: a permanent error must be
     /// recognisable as one after travelling through `?`, and must keep the text
     /// that tells the user what to change. If either half breaks, the deployment
