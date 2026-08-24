@@ -11,8 +11,9 @@ buildkit = "0.28.0"
 "cargo:cargo-all-features" = "latest"
 helm = "latest"
 # Pinned, not "latest": the modules' `terraform test` files use override_data and
-# check blocks, whose behaviour is version-sensitive.
-terraform = "1.9.8"
+# check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
+# `mise run terraform:check` in the same change.
+terraform = "1.15.9"
 rust = { version = "1.95.0", profile = "default" }
 kubectl = "latest"
 k9s = "latest"

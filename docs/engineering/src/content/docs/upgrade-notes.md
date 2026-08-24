@@ -245,12 +245,26 @@ Merged to `develop`:
   existing install that does not set `enable_ecs`. See
   [Terraform](/operator-docs/ecs/terraform/).
 
-- **Action required if you pin the AWS provider below 5.0 —
-  `modules/rise-aws`**. Its `required_providers` constraint moves from
-  `>= 4.0` to `>= 5.0`. The module has used `aws_vpc_security_group_ingress_rule`
-  in its RDS section since that section was written, and the resource does not
-  exist before provider 5.0, so the old constraint only ever worked because
-  nothing pinned an older provider. If you pin 4.x, move to 5.x.
+- **Action required if you pin the AWS provider below 6.0 — the Terraform
+  modules**. `modules/rise-aws` moves its `required_providers` constraint from
+  `>= 4.0` to `>= 6.0`, and `modules/rise-ecs` ships with the same floor. Two
+  separate reasons, worth keeping apart:
+
+  The old `>= 4.0` was simply wrong — the module has used
+  `aws_vpc_security_group_ingress_rule` in its RDS section since that section was
+  written, and the resource does not exist before provider 5.0, so the constraint
+  only ever worked because nothing pinned an older provider.
+
+  The floor is 6.0 rather than 5.0 because 6.x is the only major the modules are
+  tested against: `mise run terraform:check` resolves the latest provider, and
+  provider majors change resource schemas. Stating a floor we do not verify
+  invites a confusing failure inside the module rather than a clear one at
+  `terraform init`. If you pin 4.x or 5.x, move to 6.x.
+
+- **No action required — Terraform pin.** The repo's toolchain pin moves from
+  1.9.8 to 1.15.9 (`mise.toml`). It affects contributors running
+  `mise run terraform:check`, not installs: the modules still declare
+  `required_version >= 1.5.0`, and all 18 module tests pass on the new version.
 
 - **No action required — generic resource labels**. Resources in the generic
   resource API carry `metadata.labels` alongside `metadata.annotations`. The
