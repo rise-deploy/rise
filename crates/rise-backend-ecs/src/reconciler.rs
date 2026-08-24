@@ -1300,8 +1300,20 @@ impl EcsReconciler {
             .collect();
 
         for secret in secrets {
+            // The task definition already references this parameter by ARN, so
+            // skipping the write would deploy a task that cannot start -- ECS
+            // reports only an opaque "unable to pull secrets or registry auth".
+            // The two lists are built from the same env split, so a mismatch is
+            // a bug in that construction, not a user error; surface it here
+            // rather than at task start.
             let Some(value) = by_name.get(secret.name.as_str()) else {
-                continue;
+                anyhow::bail!(
+                    "Secret {:?} is referenced by the task definition for project {} but has \
+                     no value in the resolved environment; refusing to register a task \
+                     definition whose secret cannot be read",
+                    secret.name,
+                    project.name
+                );
             };
             let mut req = self
                 .ssm
@@ -1649,11 +1661,21 @@ impl EcsReconciler {
         Ok(())
     }
 
-    /// Retire a service: scale to zero, then delete.
+    /// Retire a service: ask ECS to scale it to zero, then delete it.
     ///
-    /// `DeleteService` refuses a service with running tasks unless forced;
-    /// scaling to zero first lets ECS drain them, which is what keeps a cutover
-    /// from cutting live connections.
+    /// `DeleteService` refuses a service that still has running tasks unless
+    /// forced, and this does not wait for the scale-to-zero to take effect, so
+    /// the force is what actually removes the service. Tasks still get ECS's
+    /// normal stop sequence (SIGTERM, then `stopTimeout`), but this call does
+    /// **not** drain connections: Traefik discovers ECS tasks by polling, so a
+    /// task can stay in its routing table for up to one poll interval after it
+    /// begins stopping.
+    ///
+    /// What protects live requests at a cutover is the overlap (D12) -- the
+    /// outgoing deployment keeps serving alongside the incoming one until it is
+    /// retired -- not this function. Making the retirement itself drain-clean
+    /// would mean scaling to zero, waiting out Traefik's discovery interval,
+    /// and deleting on a later tick; see the tracked follow-up.
     async fn delete_service(&self, name: &str) -> Result<()> {
         if let Err(e) = self
             .ecs
