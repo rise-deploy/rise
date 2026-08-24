@@ -98,7 +98,9 @@ Under *Settings → Secrets and variables → Actions → Variables*:
 
 Variables rather than secrets on purpose: a role ARN and a region are not
 sensitive, and a masked value that is simply *unset* fails as an empty string
-with no hint of why.
+with no hint of why. Note the tab — `vars.*` does not see anything set under
+*Secrets*, so a value in the wrong place reads as empty. The workflow checks all
+three before assuming the role and names whichever is missing.
 
 Then create the **`ecs-e2e` label** once. The pull-request trigger fires on
 `labeled` and matches that exact name, so without the label existing there is no

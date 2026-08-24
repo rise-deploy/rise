@@ -1,4 +1,4 @@
-name: E2E / ECS
+name: E2E
 
 # Runs the cross-backend harness against the persistent Amazon ECS environment
 # in the scratch account (see tests/e2e/bootstrap, applied once by hand).
@@ -43,7 +43,7 @@ permissions:
 
 jobs:
   ecs:
-    name: E2E / ECS
+    name: ECS
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # A labelled PR only, and only one from this repository: a fork's head is
@@ -84,6 +84,27 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `vars.*` reads the repository's *Variables*, not its Secrets -- a value
+      # set in the wrong tab reads as empty here. Unset, the AWS action fails
+      # with "Input required and not supplied: aws-region", which names neither
+      # the variable nor the fact that the role ARN is missing too.
+      - name: Check the e2e variables are set
+        shell: bash
+        env:
+          ROLE_ARN: ${{ vars.AWS_E2E_ROLE_ARN }}
+          REGION: ${{ vars.AWS_E2E_REGION }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${ROLE_ARN}" ]] || missing+=("AWS_E2E_ROLE_ARN — terraform -chdir=tests/e2e/bootstrap output ci_role_arn")
+          [[ -n "${REGION}" ]] || missing+=("AWS_E2E_REGION — the region the bootstrap was applied to")
+          if (( ${#missing[@]} )); then
+            echo "::error::Missing repository variables. Set them under Settings → Secrets and variables → Actions → Variables (not Secrets):"
+            printf '::error::  %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "role=${ROLE_ARN} region=${REGION}"
 
       - name: Assume the e2e role
         uses: aws-actions/configure-aws-credentials@v4
