@@ -31,10 +31,10 @@ RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
-# ECS backend (self-provisions the whole AWS-side stack — see "ECS Backend"
-# below for what the account and the caller need first).
-AWS_PROFILE=<sandbox> AWS_REGION=eu-central-1 \
-RISE_E2E_BACKEND=ecs RISE_IMAGE_TAG=<published-tag> \
+# ECS backend (runs against the persistent environment — see "ECS Backend"
+# below, and apply aws/bootstrap once first).
+AWS_PROFILE=<scratch> AWS_REGION=eu-central-1 \
+RISE_E2E_BACKEND=ecs RISE_E2E_ENV=rise-e2e RISE_IMAGE_TAG=<published-tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
 # Local compose suite (no Rise backend; needs Docker and a rise CLI).
@@ -67,14 +67,15 @@ is setup to do once per account before the first run.
 
 ### On the machine
 
-`aws` (v2), `jq`, `curl`, and a working **Docker daemon** — the harness extracts
-the `rise` CLI out of the image with `docker cp`, and the
+`aws` (v2), `terraform` (pinned in `mise.toml`), and a working **Docker daemon**
+— the harness extracts the `rise` CLI out of the image with `docker cp`, and the
 `registry-build-push-pull` scenario builds a fixture image locally and pushes it
 to ECR.
 
-Your public IP must be stable for the run: the security group admits ports 80
-and 8080 from `<your-ip>/32` only, resolved once at bring-up. A VPN that
-reconnects mid-run will look like a hung scenario.
+Your public address must be stable for the run: the harness authorizes it on the
+edge security group at bring-up and revokes it at teardown, and the group is
+closed the rest of the time. A VPN that reconnects mid-run will look like a hung
+scenario.
 
 ### In the account
 
@@ -102,40 +103,43 @@ account you care about.
    GHCR, so a local build is not visible to it. Same constraint the Docker
    driver already has.
 
-Nothing else is pre-created: cluster, security group, IAM roles (execution,
-task, and the ECR push role), Cloud Map namespace, log group and ECR
-repositories are all made at bring-up and removed on exit.
+The environment is **persistent** — applied once by hand, not per run. See
+[`aws/bootstrap/README.md`](aws/bootstrap/README.md) for what it creates and how
+to wire CI to it. Per run the harness applies `aws/run` (Postgres and the control
+plane), so every run starts on a fresh database and the image under test, and
+destroys it afterwards.
 
 ### Caller permissions
 
-`ecs:*`, `ecr:*`, `ec2:*` (describe, plus security-group create/authorize/
-delete), `logs:*`, `servicediscovery:*`, `sts:GetCallerIdentity`, and on IAM:
-`CreateRole`, `DeleteRole`, `PutRolePolicy`, `DeleteRolePolicy`,
-`AttachRolePolicy`, `DetachRolePolicy`, `ListRolePolicies`,
-`ListAttachedRolePolicies`, `PassRole`.
+Applying the bootstrap needs IAM write, which is why it is done by hand. Running
+the suite does not: `aws/bootstrap` creates a GitHub OIDC role holding only what
+a run needs — ECS, the EC2 describes plus edge security-group rules, Route 53
+record changes on the environment's zone, ECR and SSM for the sweep, S3 for the
+per-run state, and `iam:PassRole` on exactly the three pre-created roles. Nothing
+in the per-run path writes IAM.
 
 ### Registry
 
-The stack runs with `registry: ecr` under a run-scoped repository prefix
-(`rise-e2e/`), so the suite exercises the real path: Rise provisions a
-repository per project, the CLI pushes with the STS-scoped credentials Rise
-mints, and the task execution role pulls. Repositories are deleted on teardown
-— including their images, which are otherwise billed.
+The environment runs with `registry: ecr` under a repository prefix, so the suite
+exercises the real path: Rise provisions a repository per project, the CLI pushes
+with the STS-scoped credentials Rise mints, and the task execution role pulls.
 
-### Cost, and what teardown does not cover
+### Cleanup, and why the sweep runs at bring-up
 
-A run is a handful of 0.25–0.5 vCPU tasks for roughly 20 minutes, no load
-balancer and no NAT gateway: cents. Everything is tagged `rise-e2e` and torn
-down on exit, and `tests/e2e/aws/ecs-stack.sh down` is idempotent if a run is
-killed. **`KEEP=1` deliberately leaves the stack up** for inspection (the
-Traefik dashboard is on `:8080`) — that one you pay for until you tear it down.
+Deployments the suite creates are ECS services **Rise** owns, not Terraform.
+Destroying the per-run stack removes Rise *and its database*, after which nothing
+collects them — the reconciler only visits services whose project it can still
+see. Left alone they hold Fargate quota until a later run fails mid-suite.
 
-You can drive the AWS side on its own, without the harness:
+So teardown deletes projects through the API first (which also exercises project
+delete and ECR auto-removal), and bring-up sweeps by tag before anything else —
+a crashed or cancelled run never reaches teardown.
+
+**`KEEP=1` leaves the per-run stack up** for inspection. It keeps consuming quota
+and leaves the edge open until you destroy it:
 
 ```bash
-AWS_PROFILE=<sandbox> AWS_REGION=eu-central-1 RISE_IMAGE_TAG=<tag> \
-  tests/e2e/aws/ecs-stack.sh up      # writes /tmp/rise-e2e-stack.env
-tests/e2e/aws/ecs-stack.sh down
+terraform -chdir=tests/e2e/aws/run destroy -auto-approve
 ```
 
 ## Layout
@@ -144,11 +148,12 @@ tests/e2e/aws/ecs-stack.sh down
   own stack: `DockerBackend` via `docker compose` (CLI extraction via `docker cp`,
   Traefik reach); `MinikubeBackend` via `minikube start` + `helm upgrade --install`
   + the JFrog/Vault registry stack + background `kubectl port-forward`s (server,
-  Dex, per-app reach); `EcsBackend` by shelling out to `aws/ecs-stack.sh`, which
-  runs Traefik, Postgres, Dex and Rise as ECS services in the cluster under test
-  (CLI extraction via `docker cp`, reach via Traefik's public IP and `nip.io`).
-- `aws/ecs-stack.sh` — the ECS backend's AWS-side bring-up and teardown. Also
-  runnable on its own; see "ECS Backend" above.
+  Dex, per-app reach); `EcsBackend` by driving `terraform` against `aws/run` in a
+  persistent cluster, where Traefik, Postgres, Dex and Rise all run as ECS
+  services (CLI extraction via `docker cp`, reach via Traefik's address with an
+  explicit `Host` header).
+- `aws/bootstrap/` — the persistent environment and its IAM, applied by hand.
+- `aws/run/` — Postgres and the control plane, applied and destroyed per run.
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
   `Scenario::applies_to(backend)` returns `Run` or `Skip(reason)`.
 - `src/compose.rs` — standalone `rise compose` suite. It runs the CLI directly

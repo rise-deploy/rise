@@ -52,10 +52,9 @@ The [Terraform modules](/operator-docs/ecs/terraform/) provision all of it —
 against a cluster and VPC they create, or ones you already run — and refuse the
 configurations the backend rejects at startup. Start there.
 
-`tests/e2e/aws/ecs-stack.sh` stands up the same shape in bash and is the fastest
-way to *read* the wiring end to end, but it is a disposable test harness rather
-than a template: public subnets, secrets in plain environment variables, and a
-static-password Dex.
+`tests/e2e/aws/` stands up a deliberately smaller shape for the end-to-end suite
+— public subnets, no load balancer, Postgres in a task — which is useful to read
+but is a test environment, not a template.
 
 ## IAM
 
