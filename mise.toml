@@ -119,6 +119,9 @@ cargo check --package rise-resource-store-postgres --all-targets
 cargo check --package rise-backend-auth --all-targets
 cargo check --package rise-backend-core --all-targets
 cargo check --package rise-runtime-sync --all-targets
+cargo check --package rise-backend-traefik --all-targets
+cargo check --package rise-backend-docker --all-targets
+cargo check --package rise-backend-ecs --all-targets
 cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --package rise-authz --all-targets -- -D warnings
 cargo clippy --package rise-resource-api --all-targets -- -D warnings
@@ -126,6 +129,9 @@ cargo clippy --package rise-resource-store-postgres --all-targets -- -D warnings
 cargo clippy --package rise-backend-auth --all-targets -- -D warnings
 cargo clippy --package rise-backend-core --all-targets -- -D warnings
 cargo clippy --package rise-runtime-sync --all-targets -- -D warnings
+cargo clippy --package rise-backend-traefik --all-targets -- -D warnings
+cargo clippy --package rise-backend-docker --all-targets -- -D warnings
+cargo clippy --package rise-backend-ecs --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
@@ -134,6 +140,8 @@ mise terraform:check
 cargo test --package rise-authz --all-targets
 cargo test --package rise-backend-auth --all-targets
 cargo test --package rise-backend-core --all-targets
+cargo test --package rise-backend-traefik --all-targets
+cargo test --package rise-backend-ecs --all-targets
 """
 env.SQLX_OFFLINE = true
 

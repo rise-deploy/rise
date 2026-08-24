@@ -178,7 +178,7 @@ pub fn rolling_rotation_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rise_backend_core::desired::{DesiredContainer, DesiredRoute};
+    use rise_backend_core::desired::DesiredRoute;
     use rise_backend_core::test_helpers::desired;
 
     #[test]

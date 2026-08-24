@@ -39,6 +39,12 @@ pub struct DesiredService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActualService {
     pub name: String,
+    /// The service's own ARN, as `DescribeServices` reports it.
+    ///
+    /// Carried rather than reconstructed because `ecs:TagResource` takes a real
+    /// ARN and there is no way to build one from a cluster *name* -- which is
+    /// what `deployment_controller.cluster` holds.
+    pub arn: String,
     /// Identity recovered from tags. `None` when the tags are incomplete — such
     /// a service can never be matched, only (potentially) GC'd.
     pub key: Option<String>,
@@ -200,6 +206,10 @@ mod tests {
     fn actual_for(d: &DesiredService, hash: &str, count: i32) -> ActualService {
         ActualService {
             name: d.name.clone(),
+            arn: format!(
+                "arn:aws:ecs:eu-central-1:123456789012:service/rise/{}",
+                d.name
+            ),
             key: Some(d.key.clone()),
             task_definition_arn: format!("arn:aws:ecs:::task-definition/{}:1", d.family),
             task_definition_hash: hash.to_string(),
@@ -212,7 +222,7 @@ mod tests {
     #[test]
     fn missing_service_is_created() {
         let d = desired("dep-a", "h1", 1);
-        let actions = diff_services(&[d.clone()], &[], &HashSet::new());
+        let actions = diff_services(std::slice::from_ref(&d), &[], &HashSet::new());
         assert_eq!(
             actions,
             vec![ServiceAction::Create {
@@ -238,7 +248,7 @@ mod tests {
         // itself, so a changed image or env never destroys the running service.
         let d = desired("dep-a", "h2", 1);
         let a = actual_for(&d, "h1", 1);
-        let actions = diff_services(&[d.clone()], &[a], &HashSet::new());
+        let actions = diff_services(std::slice::from_ref(&d), &[a], &HashSet::new());
         assert_eq!(
             actions,
             vec![ServiceAction::UpdateTaskDefinition {
@@ -254,7 +264,7 @@ mod tests {
         // 1 request/second, so needless revisions throttle real deploys.
         let d = desired("dep-a", "h1", 3);
         let a = actual_for(&d, "h1", 1);
-        let actions = diff_services(&[d.clone()], &[a], &HashSet::new());
+        let actions = diff_services(std::slice::from_ref(&d), &[a], &HashSet::new());
         assert_eq!(
             actions,
             vec![ServiceAction::UpdateDesiredCount {
@@ -286,7 +296,7 @@ mod tests {
         let old = desired("dep-a", "h1", 1);
         let new = desired("dep-b", "h1", 1);
         let actions = diff_services(
-            &[new.clone()],
+            std::slice::from_ref(&new),
             &[actual_for(&old, "h1", 1)],
             &HashSet::new(),
         );
@@ -344,7 +354,11 @@ mod tests {
         let mut untagged = actual_for(&d, "h1", 1);
         untagged.key = None;
         untagged.deployment_id = None;
-        let actions = diff_services(&[d.clone()], &[untagged.clone()], &HashSet::new());
+        let actions = diff_services(
+            std::slice::from_ref(&d),
+            &[untagged.clone()],
+            &HashSet::new(),
+        );
         assert_eq!(
             actions,
             vec![

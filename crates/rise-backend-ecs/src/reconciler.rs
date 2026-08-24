@@ -356,7 +356,7 @@ impl EcsReconciler {
         if !actions.is_empty() && !self.confirm_leadership(election).await {
             return Ok(());
         }
-        self.apply_actions(project, &desired, &actions, election)
+        self.apply_actions(project, &desired, &actual, &actions, election)
             .await;
 
         // 4. Health and status, from a fresh read of the deployment rows.
@@ -889,6 +889,7 @@ impl EcsReconciler {
                 }
                 services.push(ActualService {
                     name: svc.service_name().unwrap_or_default().to_string(),
+                    arn: svc.service_arn().unwrap_or_default().to_string(),
                     key: Some(spec_key(
                         &parsed.project,
                         &parsed.deployment_group,
@@ -921,11 +922,17 @@ impl EcsReconciler {
         &self,
         project: &Project,
         desired: &[(DesiredService, TaskDefinitionSpec, DesiredContainer)],
+        actual: &[ActualService],
         actions: &[ServiceAction],
         election: &LeaderElection,
     ) {
         let by_key: HashMap<&str, &(DesiredService, TaskDefinitionSpec, DesiredContainer)> =
             desired.iter().map(|e| (e.0.key.as_str(), e)).collect();
+        // Tagging needs the service's real ARN, and only DescribeServices has it.
+        let arn_by_name: HashMap<&str, &str> = actual
+            .iter()
+            .map(|a| (a.name.as_str(), a.arn.as_str()))
+            .collect();
 
         for action in actions {
             if !self.confirm_leadership(election).await {
@@ -938,7 +945,15 @@ impl EcsReconciler {
                 },
                 ServiceAction::UpdateTaskDefinition { key, name } => {
                     match by_key.get(key.as_str()) {
-                        Some(entry) => self.update_service(project, entry, name).await,
+                        Some(entry) => {
+                            self.update_service(
+                                project,
+                                entry,
+                                name,
+                                arn_by_name.get(name.as_str()).copied(),
+                            )
+                            .await
+                        }
                         None => continue,
                     }
                 }
@@ -1032,33 +1047,52 @@ impl EcsReconciler {
             &tags.deployment_group,
             &tags.deployment_id,
         );
-        let out = self
-            .ssm
-            .get_parameters_by_path()
-            .path(&prefix)
-            .recursive(true)
-            .send()
-            .await;
-        let names: Vec<String> = match out {
-            Ok(out) => out
-                .parameters()
-                .iter()
-                .filter_map(|p| p.name().map(str::to_string))
-                .collect(),
-            Err(e) => {
-                debug!(path = %prefix, "Could not list SSM parameters: {}", aws_error_detail(&e));
-                return Ok(());
+        // Paginated: GetParametersByPath returns 10 per page by default, so a
+        // deployment with more secrets than that would leave the rest behind.
+        let mut names: Vec<String> = Vec::new();
+        let mut next: Option<String> = None;
+        loop {
+            let mut req = self
+                .ssm
+                .get_parameters_by_path()
+                .path(&prefix)
+                .recursive(true)
+                .max_results(10);
+            if let Some(token) = next.as_deref() {
+                req = req.next_token(token);
             }
-        };
+            match req.send().await {
+                Ok(out) => {
+                    names.extend(
+                        out.parameters()
+                            .iter()
+                            .filter_map(|p| p.name().map(str::to_string)),
+                    );
+                    next = out.next_token().map(str::to_string);
+                    if next.is_none() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!(path = %prefix, "Could not list SSM parameters: {}", aws_error_detail(&e));
+                    return Ok(());
+                }
+            }
+        }
         if names.is_empty() {
             return Ok(());
         }
-        let mut req = self.ssm.delete_parameters();
-        for name in &names {
-            req = req.names(name);
-        }
-        if let Err(e) = req.send().await {
-            warn!(path = %prefix, "Failed to delete SSM parameters: {}", aws_error_detail(&e));
+
+        // DeleteParameters takes at most 10 names; passing more fails the whole
+        // request, so a deployment with 11 secrets would clean up none of them.
+        for chunk in names.chunks(10) {
+            let mut req = self.ssm.delete_parameters();
+            for name in chunk {
+                req = req.names(name);
+            }
+            if let Err(e) = req.send().await {
+                warn!(path = %prefix, "Failed to delete SSM parameters: {}", aws_error_detail(&e));
+            }
         }
         Ok(())
     }
@@ -1254,6 +1288,7 @@ impl EcsReconciler {
         project: &Project,
         entry: &(DesiredService, TaskDefinitionSpec, DesiredContainer),
         name: &str,
+        service_arn: Option<&str>,
     ) -> Result<()> {
         let task_definition_arn = self.prepare_task_definition(project, entry).await?;
         let (desired, _, _) = entry;
@@ -1272,20 +1307,26 @@ impl EcsReconciler {
             })?;
 
         // Re-tag so the next tick sees the new content hash and converges.
-        // Without this the service would look permanently drifted and we would
-        // register a revision every tick.
-        let mut req = self.ecs.tag_resource().resource_arn(self.service_arn(name));
+        // Without this the service looks permanently drifted and we register a
+        // revision every tick -- which is why a failure here is an error rather
+        // than a warning: the loop would otherwise be silent and unbounded.
+        let Some(service_arn) = service_arn else {
+            anyhow::bail!(
+                "no ARN observed for service {name:?}; cannot stamp its content-hash tag, \
+                 and without that the next tick would register another task-definition \
+                 revision for the same content"
+            );
+        };
+        let mut req = self.ecs.tag_resource().resource_arn(service_arn);
         for tag in self.service_tag_list(desired) {
             req = req.tags(tag);
         }
-        if let Err(e) = req.send().await {
-            warn!(
-                service = %name,
-                "Failed to update service tags; the next tick will re-register the task \
-                 definition until this succeeds: {}",
-                aws_error_detail(&e)
-            );
-        }
+        req.send().await.with_context(|| {
+            format!(
+                "tag ECS service {name:?} after updating it. Until this succeeds every \
+                 tick re-registers a task definition for unchanged content"
+            )
+        })?;
 
         info!(project = %project.name, service = %name, "Updated ECS service task definition");
         Ok(())
@@ -1339,13 +1380,6 @@ impl EcsReconciler {
             })?;
         info!(service = %name, "Deleted ECS service");
         Ok(())
-    }
-
-    fn service_arn(&self, name: &str) -> String {
-        // `TagResource` accepts a service ARN; the short form is not enough. The
-        // cluster ARN prefix is not known here, so use the name-qualified form
-        // ECS accepts for services in the configured cluster.
-        format!("{}/{}", self.config.cluster, name)
     }
 
     // ── health and status ─────────────────────────────────────────────────
