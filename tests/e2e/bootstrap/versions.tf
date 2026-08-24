@@ -13,6 +13,10 @@ terraform {
   # supplies it -- see the README's first-apply sequence, which is the one time
   # the chicken-and-egg has to be worked around by hand.
   backend "s3" {
-    key = "bootstrap/terraform.tfstate"
+    region       = "eu-central-1"
+    bucket       = "rise-e2e-tfstate-806938668647"
+    key          = "bootstrap/terraform.tfstate"
+    encrypt      = true
+    use_lockfile = true
   }
 }
