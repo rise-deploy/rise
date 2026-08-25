@@ -106,6 +106,21 @@ run "traefik_discovery_is_unconstrained_by_default" {
   }
 }
 
+# Confining Traefik to one class is what lets two installs share a cluster --
+# and it applies to every container Traefik considers, the control plane
+# included. An unlabelled Rise is invisible to the proxy meant to publish it,
+# which takes the whole install down rather than degrading.
+run "the_control_plane_carries_the_label_its_own_traefik_constrains_on" {
+  command = plan
+
+  # Asserted on the label map rather than on the rendered container definition,
+  # which carries generated secrets and so is unknown at plan time.
+  assert {
+    condition     = module.control_plane_env.docker_labels["rise.dev/controller-class"] == "default"
+    error_message = "the control plane would be filtered out by its own Traefik constraint"
+  }
+}
+
 run "traefik_discovery_can_be_confined_to_one_install" {
   command = plan
 

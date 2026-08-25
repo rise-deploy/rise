@@ -67,6 +67,12 @@ locals {
   } : {}
 
   docker_labels = merge({
+    # Traefik's constraint applies to every container it considers, the control
+    # plane included. Without this label an install that confines its Traefik to
+    # one class -- the whole point of sharing a cluster -- makes Rise itself
+    # invisible to the proxy that is meant to publish it.
+    "${var.label_namespace}/controller-class" = var.controller_class_name
+
     "traefik.enable"                                         = "true"
     "traefik.http.routers.rise-cp.rule"                      = "Host(`rise.${var.ingress_domain}`)"
     "traefik.http.routers.rise-cp.entrypoints"               = var.traefik_entrypoint

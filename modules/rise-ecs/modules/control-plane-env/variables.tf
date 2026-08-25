@@ -109,6 +109,16 @@ variable "controller_class_name" {
   default     = "default"
 }
 
+variable "label_namespace" {
+  description = <<-EOT
+    Prefix for the Rise-owned labels and tags, matching the backend's
+    `deployment.label_namespace`. Only change it in step with that setting: a
+    Traefik constraint written against the old prefix stops matching.
+  EOT
+  type        = string
+  default     = "rise.dev"
+}
+
 variable "resource_prefix" {
   type    = string
   default = "rise"

@@ -126,6 +126,16 @@ run "the_scope_isolates_dns_routing_and_collection" {
     error_message = "Dex must be routed under this run's scope, not the zone apex"
   }
 
+  # And so does Rise. It is the container the whole run is waiting on: without
+  # the label its own Traefik filters it out, /health never answers through the
+  # proxy, and the run times out with no clue that routing was the problem.
+  # Asserted on the label map rather than on the rendered container definition,
+  # which carries generated secrets and so is unknown at plan time.
+  assert {
+    condition     = module.control_plane_env.docker_labels["rise.dev/controller-class"] == "pr-457"
+    error_message = "the control plane would be filtered out by the run's own Traefik constraint"
+  }
+
   # Cloud Map is shared across runs, so per-run services need distinct names.
   assert {
     condition     = aws_service_discovery_service.traefik.name == "traefik-pr-457"
