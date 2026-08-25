@@ -163,12 +163,20 @@ So teardown deletes projects through the API first (which also exercises project
 delete and ECR auto-removal), and bring-up sweeps by tag before anything else —
 a crashed or cancelled run never reaches teardown.
 
-The sweep is same-scope only, and so is Rise's own orphan collector, so **a scope
-that never runs again is never reaped**. A pull request whose last run was
-cancelled mid-suite leaves its workload services, ECR repositories, SSM
-parameters and DNS records behind for good — the workflow's backstop destroys the
-Terraform stack, but not what Rise created inside it. Watch for it after a burst
-of cancelled runs; a cross-scope reaper is the fix and is not written yet.
+The sweep is same-scope only, and so is Rise's own orphan collector, so a scope
+that never runs again would keep its leftovers for good — a pull request whose
+last run was cancelled mid-suite, or one merged and never re-labelled. The
+workflow's backstop destroys the Terraform stack, but nothing Rise created
+inside it.
+
+Bring-up therefore also **reaps scopes whose control plane is gone**. That is
+the condition that makes leftovers uncollectable in the first place: Rise is
+what would have retired them, and once its service is destroyed nothing will.
+It needs no clock and no notion of which pull requests are still open, and a
+scope mid-run counts as live from the moment its stack applies — before Rise
+has created anything to reap. It collects ECR repositories and SSM parameters;
+workload services of a dead scope still need the same-scope sweep, because
+identifying them cluster-wide means trusting a tag rather than a name.
 
 **`KEEP=1` leaves the per-run stack up** for inspection. It keeps consuming quota
 and leaves the edge open until you destroy it:

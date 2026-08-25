@@ -42,6 +42,28 @@ use crate::dex::DexEndpoint;
 use crate::http::{self, HttpResponse};
 use crate::{report, token};
 
+/// The scope a per-run control-plane service belongs to, or `None` if the name
+/// is not one. `{env}-{scope}-rise`, where the scope may itself contain dashes.
+fn scope_of_control_plane(service: &str, env_name: &str) -> Option<String> {
+    let rest = service.strip_prefix(env_name)?.strip_prefix('-')?;
+    let scope = rest.strip_suffix("-rise")?;
+    (!scope.is_empty()).then(|| scope.to_string())
+}
+
+/// The scope an ECR repository belongs to: `{prefix}{scope}/{project}`.
+fn scope_of_repository(repo: &str, bootstrap_prefix: &str) -> Option<String> {
+    let rest = repo.strip_prefix(bootstrap_prefix)?;
+    let scope = rest.split('/').next()?;
+    (!scope.is_empty() && rest.contains('/')).then(|| scope.to_string())
+}
+
+/// The scope an SSM parameter belongs to: `/{env}/{scope}/...`.
+fn scope_of_parameter(path: &str, env_name: &str) -> Option<String> {
+    let rest = path.strip_prefix(&format!("/{env_name}/"))?;
+    let scope = rest.split('/').next()?;
+    (!scope.is_empty() && rest.contains('/')).then(|| scope.to_string())
+}
+
 /// Tag every Rise-created resource carries. The sweep keys on it.
 const MANAGED_BY_TAG: &str = "rise.dev/managed-by";
 /// Carries the controller class, which for this harness is the run scope.
@@ -643,6 +665,119 @@ impl EcsBackend {
         }
     }
 
+    /// Collect what a scope that will never run again left behind.
+    ///
+    /// [`Self::sweep`] only ever touches this run's own scope, and its
+    /// bring-up pass is what collects a crashed run -- but only when that scope
+    /// runs again. A scope that never does (a runner lost mid-job, a merged
+    /// pull request) keeps its repositories, secrets and workloads forever, and
+    /// the workflow's teardown backstop does not reach them either: none of it
+    /// is Terraform-managed.
+    ///
+    /// A scope is dead when its control plane is gone, which is exactly the
+    /// condition that leaves its leftovers uncollectable -- Rise is what would
+    /// have retired them. That needs no clock, and a scope mid-run is live from
+    /// the moment its stack applies, before Rise creates anything to reap.
+    fn reap_dead_scopes(&self) {
+        let env = self.env();
+        let cluster = &env.cluster_name;
+
+        let services: Vec<serde_json::Value> = self
+            .aws(&[
+                "ecs",
+                "list-services",
+                "--cluster",
+                cluster,
+                "--query",
+                "serviceArns[]",
+                "--output",
+                "json",
+            ])
+            .ok()
+            .and_then(|out| serde_json::from_str::<Vec<String>>(&out).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+
+        // Names are enough to find the control planes; the ARN's last segment
+        // is `{cluster}/{service}`.
+        let live: std::collections::HashSet<String> = services
+            .iter()
+            .filter_map(|arn| arn.as_str()?.rsplit('/').next())
+            .filter_map(|name| scope_of_control_plane(name, &self.env_name))
+            .collect();
+
+        // This run's own scope is live by construction, and `sweep` owns it.
+        let dead = |scope: &String| !live.contains(scope) && scope != &self.scope;
+
+        let repos: Vec<String> = self
+            .aws(&[
+                "ecr",
+                "describe-repositories",
+                "--query",
+                &format!(
+                    "repositories[?starts_with(repositoryName, '{}')].repositoryName",
+                    env.ecr_repo_prefix
+                ),
+                "--output",
+                "json",
+            ])
+            .ok()
+            .and_then(|out| serde_json::from_str(&out).ok())
+            .unwrap_or_default();
+        let orphaned: Vec<&String> = repos
+            .iter()
+            .filter(|r| scope_of_repository(r, &env.ecr_repo_prefix).is_some_and(|s| dead(&s)))
+            .collect();
+        for repo in &orphaned {
+            let _ = self.aws(&[
+                "ecr",
+                "delete-repository",
+                "--repository-name",
+                repo,
+                "--force",
+            ]);
+        }
+
+        let params: Vec<String> = self
+            .aws(&[
+                "ssm",
+                "get-parameters-by-path",
+                "--path",
+                &format!("/{}/", self.env_name),
+                "--recursive",
+                "--query",
+                "Parameters[].Name",
+                "--output",
+                "json",
+            ])
+            .ok()
+            .and_then(|out| serde_json::from_str(&out).ok())
+            .unwrap_or_default();
+        let stale: Vec<&str> = params
+            .iter()
+            .map(String::as_str)
+            // The bootstrap's own description of the environment is not a
+            // scope's, and deleting it strands every run.
+            .filter(|n| !n.ends_with("/e2e/bootstrap"))
+            .filter(|n| scope_of_parameter(n, &self.env_name).is_some_and(|s| dead(&s)))
+            .collect();
+        for chunk in stale.chunks(10) {
+            let mut args = vec!["ssm", "delete-parameters", "--names"];
+            args.extend(chunk);
+            let _ = self.aws(&args);
+        }
+
+        if !orphaned.is_empty() || !stale.is_empty() {
+            report::note(&format!(
+                "reaped {} repositor(ies) and {} parameter(s) from scopes whose control plane is gone",
+                orphaned.len(),
+                stale.len()
+            ));
+        }
+    }
+
     /// Remove what an earlier run *of this scope* left behind.
     ///
     /// Rise owns these, not Terraform, and the reconciler only visits services
@@ -941,6 +1076,10 @@ impl Backend for EcsBackend {
         // Before anything else: a crashed run leaves workloads no later run can
         // collect, and they consume the account's Fargate quota until removed.
         report::step("sweep leaked workloads from earlier runs", || self.sweep())?;
+        report::step("reap scopes that will not run again", || {
+            self.reap_dead_scopes();
+            Ok(())
+        })?;
 
         report::step("terraform init", || {
             cli::run_checked(self.terraform(&[
@@ -1498,6 +1637,48 @@ mod tests {
 
         let b = random_secret_b64().expect("generate");
         assert_ne!(a, b, "every run must mint its own key");
+    }
+
+    #[test]
+    fn a_control_plane_service_yields_its_scope() {
+        assert_eq!(
+            scope_of_control_plane("rise-e2e-pr-457-rise", "rise-e2e").as_deref(),
+            Some("pr-457")
+        );
+        assert_eq!(
+            scope_of_control_plane("rise-e2e-nightly-rise", "rise-e2e").as_deref(),
+            Some("nightly")
+        );
+        // A workload service is not a control plane, and must not be read as
+        // one: doing so would mark a dead scope live and skip reaping it.
+        assert_eq!(
+            scope_of_control_plane("rise-e2e-pr-457-myapp-default-app", "rise-e2e"),
+            None
+        );
+        assert_eq!(scope_of_control_plane("rise-e2e-traefik", "rise-e2e"), None);
+        assert_eq!(scope_of_control_plane("other-pr-1-rise", "rise-e2e"), None);
+    }
+
+    #[test]
+    fn a_repository_yields_the_scope_segment_of_its_prefix() {
+        assert_eq!(
+            scope_of_repository("rise-e2e/pr-457/myapp", "rise-e2e/").as_deref(),
+            Some("pr-457")
+        );
+        // Directly under the bootstrap prefix, so belonging to no scope. Left
+        // alone rather than attributed to a scope named after the project.
+        assert_eq!(scope_of_repository("rise-e2e/myapp", "rise-e2e/"), None);
+        assert_eq!(scope_of_repository("other/pr-457/myapp", "rise-e2e/"), None);
+    }
+
+    #[test]
+    fn a_parameter_yields_the_scope_segment_of_its_path() {
+        assert_eq!(
+            scope_of_parameter("/rise-e2e/pr-457/myapp/SECRET", "rise-e2e").as_deref(),
+            Some("pr-457")
+        );
+        assert_eq!(scope_of_parameter("/rise-e2e/bootstrap", "rise-e2e"), None);
+        assert_eq!(scope_of_parameter("/other/pr-457/x", "rise-e2e"), None);
     }
 
     #[test]
