@@ -464,24 +464,31 @@ impl EcsBackend {
         );
         if resolves.is_err() {
             let env = self.env();
+            // The apex NS records are the zone's delegation set, and reading
+            // them needs only ListResourceRecordSets -- which the CI role
+            // already holds for the record writes above. GetHostedZone would
+            // say the same thing and require widening the role.
             let ns = self
                 .aws(&[
                     "route53",
-                    "get-hosted-zone",
-                    "--id",
+                    "list-resource-record-sets",
+                    "--hosted-zone-id",
                     &env.dns_zone_id,
                     "--query",
-                    "DelegationSet.NameServers",
+                    &format!(
+                        "ResourceRecordSets[?Type=='NS' && Name=='{}.'].ResourceRecords[].Value",
+                        env.dns_zone_name
+                    ),
                     "--output",
                     "text",
                 ])
-                .unwrap_or_else(|_| "<could not read them>".to_string());
+                .map(|out| out.split_whitespace().collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|e| format!("could not be read: {e}"));
             anyhow::bail!(
                 "{host} does not resolve, though the record was written to zone {}. \
-                 That zone's nameservers are [{}]; {} must be delegated to exactly \
-                 those at the registrar for anything under it to resolve.",
+                 That zone is delegated to [{ns}]; {} must name exactly those \
+                 nameservers at the registrar for anything under it to resolve.",
                 env.dns_zone_id,
-                ns.split_whitespace().collect::<Vec<_>>().join(", "),
                 env.dns_zone_name,
             );
         }
