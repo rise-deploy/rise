@@ -35,7 +35,7 @@ resource "aws_vpc_security_group_ingress_rule" "edge_api_from_client" {
   ip_protocol       = "tcp"
   from_port         = 8080
   to_port           = 8080
-  description       = "Traefik's API, read by the harness for diagnostics"
+  description       = "Traefik API, read by the harness for diagnostics"
 }
 
 resource "aws_vpc_security_group_egress_rule" "edge_all" {
@@ -72,6 +72,7 @@ resource "aws_vpc_security_group_egress_rule" "internal_all" {
   security_group_id = aws_security_group.internal.id
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
+  description       = "Registry pulls, the ECS API and whatever a deployed app calls out to"
 }
 
 # Rise reads Traefik's serverStatus for readiness, so the API port must admit

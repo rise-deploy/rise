@@ -173,6 +173,37 @@ run "the_scope_isolates_dns_routing_and_collection" {
 }
 
 # Empty by default: nothing but the run itself has business reaching the edge.
+# EC2 accepts only a restricted character set in a rule description, and
+# rejects the whole AuthorizeSecurityGroupIngress call otherwise -- an
+# apostrophe in a sentence is enough to fail the apply after the rest of the
+# stack is already up. Nothing local catches it, so it is pinned here.
+run "security_group_rule_descriptions_use_only_what_ec2_accepts" {
+  command = plan
+
+  # Both client-facing rules are per-address, so without one authorized there
+  # are no instances of them to check and the assertion passes vacuously.
+  variables {
+    authorized_cidrs = ["203.0.113.7/32"]
+  }
+
+  assert {
+    condition = alltrue([
+      for d in concat(
+        [for r in values(aws_vpc_security_group_ingress_rule.edge_from_client) : r.description],
+        [for r in values(aws_vpc_security_group_ingress_rule.edge_api_from_client) : r.description],
+        [
+          aws_vpc_security_group_ingress_rule.edge_from_internal.description,
+          aws_vpc_security_group_ingress_rule.internal_from_edge.description,
+          aws_vpc_security_group_ingress_rule.internal_self.description,
+          aws_vpc_security_group_egress_rule.edge_all.description,
+          aws_vpc_security_group_egress_rule.internal_all.description,
+        ],
+      ) : d != null && length(regexall("[^a-zA-Z0-9. _:/()#,@\\[\\]+=&;{}!$*-]", d == null ? "" : d)) == 0
+    ])
+    error_message = "a security group rule description is missing or uses a character EC2 rejects"
+  }
+}
+
 run "the_edge_is_closed_unless_an_address_is_authorized" {
   command = plan
 
