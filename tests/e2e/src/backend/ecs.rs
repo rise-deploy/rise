@@ -95,6 +95,7 @@ fn is_dns_label(s: &str) -> bool {
 /// The persistent environment, read from the SSM parameter the bootstrap writes.
 struct BootstrapEnv {
     cluster_name: String,
+    log_group_name: String,
     ecr_repo_prefix: String,
     dns_zone_id: String,
     dns_zone_name: String,
@@ -244,6 +245,7 @@ impl EcsBackend {
 
         Ok(BootstrapEnv {
             cluster_name: get("cluster_name")?,
+            log_group_name: get("log_group_name")?,
             ecr_repo_prefix: get("ecr_repo_prefix")?,
             dns_zone_id: get("dns_zone_id")?,
             dns_zone_name: get("dns_zone_name")?,
@@ -693,7 +695,7 @@ impl EcsBackend {
     fn wait_dex_ready(&self) -> Result<()> {
         let issuer_host = format!("dex.{}", self.stack().domain);
         let url = format!("http://{issuer_host}/dex/.well-known/openid-configuration");
-        http::poll(
+        let outcome = http::poll(
             Duration::from_secs(300),
             Duration::from_secs(5),
             "dex discovery through Traefik",
@@ -702,8 +704,50 @@ impl EcsBackend {
                     .map(|r| r.status == 200)
                     .unwrap_or(false))
             },
-        )?;
+        );
+        if outcome.is_err() {
+            // Three layers can fail this and the poll cannot tell them apart:
+            // the scoped DNS record, Traefik discovering Dex, and Dex itself.
+            // Ask each directly so the log says which.
+            self.explain_unreachable(&issuer_host, "/dex/.well-known/openid-configuration");
+        }
+        outcome?;
         Ok(())
+    }
+
+    /// Say which layer is broken when a host behind Traefik will not answer.
+    ///
+    /// Bypassing DNS with an explicit `Host` header against Traefik's address
+    /// separates "the name does not resolve" from "Traefik has not discovered
+    /// this container", and Traefik's own router list separates that from "the
+    /// container is not running".
+    fn explain_unreachable(&self, host: &str, path: &str) {
+        eprintln!("\n--- why {host} is unreachable ---");
+
+        match std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)) {
+            Ok(addrs) => {
+                let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
+                eprintln!(
+                    "DNS: {host} resolves to {ips:?} (expected {})",
+                    self.stack().traefik_ip
+                );
+            }
+            Err(e) => eprintln!(
+                "DNS: {host} does not resolve ({e}). Is the zone delegated from the \
+                 registrar to this Route 53 zone? Nothing under it resolves until it is."
+            ),
+        }
+
+        let direct = format!("http://{}{path}", self.stack().traefik_ip);
+        match http::get(&direct, Some(host)) {
+            Ok(r) => eprintln!(
+                "Traefik (by IP, Host: {host}): HTTP {} -- so Traefik is up; a 404 here \
+                 means it has not discovered the container, and a 502/503 means it has \
+                 a router but no healthy server behind it.",
+                r.status
+            ),
+            Err(e) => eprintln!("Traefik (by IP, Host: {host}): unreachable ({e})"),
+        }
     }
 
     fn app_host(&self, project: &str) -> String {
@@ -984,6 +1028,104 @@ impl Backend for EcsBackend {
 
     fn ci_bearer(&self) -> &str {
         &self.ci_token
+    }
+
+    /// The ECS backend had none, so a failed run in the one environment you
+    /// cannot look at directly captured nothing at all. These four answer the
+    /// questions a failure actually raises: did the services place tasks, why
+    /// did a task stop, what did the containers say, and did Traefik discover
+    /// them.
+    fn dump_diagnostics(&self) {
+        let Some(env) = self.env.as_ref() else {
+            return;
+        };
+        let cluster = env.cluster_name.clone();
+        let services: Vec<String> = ["traefik", "dex", "postgres", "rise"]
+            .iter()
+            .map(|c| format!("{}-{}-{c}", self.env_name, self.scope))
+            .collect();
+
+        // Placement failures -- an unpullable image, an exhausted quota, a
+        // subnet with no route out -- surface here and nowhere else.
+        let mut ev = Command::new("aws");
+        ev.args([
+            "ecs",
+            "describe-services",
+            "--cluster",
+            &cluster,
+            "--services",
+        ]);
+        ev.args(&services);
+        ev.args([
+            "--query",
+            "services[].{name:serviceName,running:runningCount,desired:desiredCount,events:events[:8].message}",
+            "--output",
+            "yaml",
+        ]);
+        cli::dump("ECS service events", ev);
+
+        for service in &services {
+            let arns = self
+                .aws(&[
+                    "ecs",
+                    "list-tasks",
+                    "--cluster",
+                    &cluster,
+                    "--service-name",
+                    service,
+                    "--desired-status",
+                    "STOPPED",
+                    "--query",
+                    "taskArns[:3]",
+                    "--output",
+                    "text",
+                ])
+                .unwrap_or_default();
+            let arns: Vec<String> = arns
+                .split_whitespace()
+                .filter(|a| !a.is_empty() && *a != "None")
+                .map(str::to_string)
+                .collect();
+            if arns.is_empty() {
+                continue;
+            }
+            let mut why = Command::new("aws");
+            why.args(["ecs", "describe-tasks", "--cluster", &cluster, "--tasks"]);
+            why.args(&arns);
+            why.args([
+                "--query",
+                "tasks[].{stopped:stoppedReason,containers:containers[].{name:name,reason:reason,exit:exitCode}}",
+                "--output",
+                "yaml",
+            ]);
+            cli::dump(&format!("why {service} tasks stopped"), why);
+        }
+
+        for container in ["traefik", "dex", "rise"] {
+            let mut logs = Command::new("aws");
+            logs.args([
+                "logs",
+                "tail",
+                &env.log_group_name,
+                "--log-stream-name-prefix",
+                &format!("{container}-{}", self.scope),
+                "--since",
+                "20m",
+                "--format",
+                "short",
+            ]);
+            cli::dump(&format!("{container} logs"), logs);
+        }
+
+        // The routing question, answered directly: if Dex is missing from this
+        // list, Traefik never discovered it -- most likely the constraint and
+        // the container's controller-class label disagree.
+        if let Some(stack) = self.stack.as_ref() {
+            match http::get(&format!("{}/api/http/routers", stack.traefik_api), None) {
+                Ok(r) => eprintln!("\n--- Traefik routers ---\n{}", r.body),
+                Err(e) => eprintln!("\n--- Traefik routers ---\n(unreachable: {e})"),
+            }
+        }
     }
 
     fn dex(&self) -> Option<&DexEndpoint> {
