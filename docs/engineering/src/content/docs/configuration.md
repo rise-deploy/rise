@@ -579,6 +579,23 @@ Run with `RUST_LOG=debug` to see configuration loading details:
 RUST_LOG=debug cargo run --bin rise -- backend server
 ```
 
+### Log colour
+
+Log output is coloured only when stderr is a terminal. Anything that collects
+the stream verbatim — a CloudWatch log group behind an ECS task, `docker logs`,
+a CI job, a pipe — would otherwise show ANSI escape codes as literal text.
+
+Override it with `RISE_LOG_COLOR`:
+
+| Value | Effect |
+|---|---|
+| `always` (`1`, `true`, `yes`) | Always colour, even when redirected |
+| `never` (`0`, `false`, `no`) | Never colour, even on a terminal |
+| `auto` (default, or unset) | Colour only a terminal |
+
+`NO_COLOR` set to anything non-empty also disables colour
+([no-color.org](https://no-color.org)); `RISE_LOG_COLOR` wins over it.
+
 ## Debugging Authentication and Token Claims
 
 When a deploy or login is rejected with a permission or "claims do not match"

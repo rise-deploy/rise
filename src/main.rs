@@ -1083,14 +1083,48 @@ where
     Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
 }
 
+/// Whether to colour log output.
+///
+/// Defaults to colouring only a terminal. Anything collecting the stream
+/// verbatim -- a CloudWatch log group behind an ECS task, `docker logs`, a CI
+/// job, a pipe -- shows escape codes as literal text otherwise, which is how
+/// this reads in the ECS console. That covers every such collector rather than
+/// detecting one of them.
+///
+/// `RISE_LOG_COLOR` overrides: `always`/`never` (`1`/`0`, `true`/`false`), or
+/// `auto` for the default. `NO_COLOR` disables when set to anything non-empty,
+/// per <https://no-color.org>.
+fn ansi_enabled(rise_log_color: Option<&str>, no_color: Option<&str>, is_terminal: bool) -> bool {
+    match rise_log_color.map(str::trim) {
+        Some("always" | "1" | "true" | "yes") => return true,
+        Some("never" | "0" | "false" | "no") => return false,
+        // Anything else, "auto" included, falls through: an unrecognised value
+        // must not be louder than NO_COLOR or quieter than the default.
+        _ => {}
+    }
+    if no_color.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    is_terminal
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for all commands
+    let ansi = ansi_enabled(
+        std::env::var("RISE_LOG_COLOR").ok().as_deref(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    );
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(ansi),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -2138,4 +2172,35 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod log_color_tests {
+    use super::ansi_enabled;
+
+    #[test]
+    fn a_terminal_is_coloured_and_a_pipe_is_not() {
+        assert!(ansi_enabled(None, None, true));
+        assert!(!ansi_enabled(None, None, false));
+    }
+
+    #[test]
+    fn rise_log_color_overrides_both_the_terminal_and_no_color() {
+        assert!(ansi_enabled(Some("always"), Some("1"), false));
+        assert!(!ansi_enabled(Some("never"), None, true));
+    }
+
+    #[test]
+    fn no_color_disables_colour_on_a_terminal() {
+        assert!(!ansi_enabled(None, Some("1"), true));
+        // Set but empty is not "set", per the convention.
+        assert!(ansi_enabled(None, Some(""), true));
+    }
+
+    #[test]
+    fn an_unrecognised_override_defers_rather_than_forcing() {
+        assert!(ansi_enabled(Some("auto"), None, true));
+        assert!(!ansi_enabled(Some("auto"), None, false));
+        assert!(!ansi_enabled(Some("banana"), Some("1"), true));
+    }
 }
