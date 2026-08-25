@@ -147,10 +147,17 @@ jobs:
       # next run of this scope sweeps it as a backstop; this narrows the window.
       #
       # No -backend-config: the harness already init'd this working copy against
-      # the scope's state key, and .terraform/ still holds it.
+      # the scope's state key, and .terraform/ still holds it. Which is also why
+      # this has to check -- the workspace declares an S3 backend, so without
+      # that init `destroy` fails with "Backend initialization required" rather
+      # than doing nothing, and every early failure ends in a spurious error.
       - name: Destroy the per-run stack
         if: always()
         env:
           AWS_REGION: ${{ vars.AWS_E2E_REGION }}
         run: |
-          terraform -chdir=tests/e2e/run destroy -auto-approve -input=false || true
+          if [[ -d tests/e2e/run/.terraform ]]; then
+            terraform -chdir=tests/e2e/run destroy -auto-approve -input=false || true
+          else
+            echo "The run workspace was never initialized, so nothing was created to destroy."
+          fi
