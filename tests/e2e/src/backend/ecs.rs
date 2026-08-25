@@ -661,20 +661,20 @@ impl EcsBackend {
 
 /// 32 random bytes, base64. `/dev/urandom` rather than a crate: the harness has
 /// no `rand` dependency and this is the only place it would need one.
+/// 32 random bytes, base64.
+///
+/// Opened and read to a fixed buffer rather than with `fs::read`, which reads to
+/// EOF -- and `/dev/urandom` has no EOF. That call never returns; it allocates
+/// at the device's throughput until the machine dies, which on a CI runner
+/// looks like the whole job being killed about a minute in with no output.
 fn random_secret_b64() -> Result<String> {
     use base64::Engine;
-    let bytes = std::fs::read("/dev/urandom")
-        .map(|b| b.into_iter().take(32).collect::<Vec<u8>>())
-        .or_else(|_| -> Result<Vec<u8>> {
-            let mut f = std::fs::File::open("/dev/urandom")?;
-            use std::io::Read;
-            let mut buf = [0u8; 32];
-            f.read_exact(&mut buf)?;
-            Ok(buf.to_vec())
-        })
-        .context("read random bytes")?;
-    anyhow::ensure!(bytes.len() == 32, "short read from /dev/urandom");
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    use std::io::Read;
+
+    let mut f = std::fs::File::open("/dev/urandom").context("open /dev/urandom")?;
+    let mut buf = [0u8; 32];
+    f.read_exact(&mut buf).context("read random bytes")?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(buf))
 }
 
 impl Backend for EcsBackend {
@@ -1054,5 +1054,49 @@ impl Backend for EcsBackend {
                     .unwrap_or(false))
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the shape, not just the output. The previous version reached for
+    /// `fs::read("/dev/urandom")`, which reads to an EOF the device never sends:
+    /// it allocated at ~370 MB/s until the machine died, so a CI job vanished
+    /// about a minute in with nothing but its banner printed. A bounded read
+    /// returns immediately, which is what the timeout here checks.
+    #[test]
+    fn a_secret_is_32_bytes_and_returns_promptly() {
+        let started = std::time::Instant::now();
+        let a = random_secret_b64().expect("generate");
+        let elapsed = started.elapsed();
+
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&a)
+            .expect("valid base64");
+        assert_eq!(raw.len(), 32, "the signing key must be 32 bytes");
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "reading 32 random bytes took {elapsed:?} -- an unbounded read of an \
+             endless device is back"
+        );
+
+        let b = random_secret_b64().expect("generate");
+        assert_ne!(a, b, "every run must mint its own key");
+    }
+
+    #[test]
+    fn a_scope_must_be_a_single_dns_label() {
+        assert!(is_dns_label("pr-457"));
+        assert!(is_dns_label("nightly"));
+        // A dot would silently widen the wildcard record a run writes.
+        assert!(!is_dns_label("pr.457"));
+        assert!(!is_dns_label("PR-457"));
+        assert!(!is_dns_label("-pr"));
+        assert!(!is_dns_label(""));
+        assert_eq!(sanitize_label("Niklas R"), "niklas-r");
     }
 }
