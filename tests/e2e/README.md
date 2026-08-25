@@ -102,6 +102,15 @@ account you care about.
 3. **A published `RISE_IMAGE_TAG`.** ECS pulls the control-plane image from
    GHCR, so a local build is not visible to it. Same constraint the Docker
    driver already has.
+4. **The domain delegated to the bootstrap's hosted zone.** `bootstrap/` creates
+   a *public* zone for `dns_zone_name`, but only the registrar can point the
+   domain at it. Take the zone's four nameservers
+   (`aws route53 get-hosted-zone --id <dns_zone_id> --query
+   DelegationSet.NameServers`) and set them as the domain's nameservers.
+   Nothing under the domain resolves until they match, and **recreating the
+   bootstrap issues a new set** — destroying and re-applying it silently breaks
+   resolution until the registrar is updated again. The harness checks this at
+   bring-up and names both sets when they disagree.
 
 The environment is **persistent** — applied once by hand, not per run. See
 [`bootstrap/README.md`](bootstrap/README.md) for what it creates and how to wire

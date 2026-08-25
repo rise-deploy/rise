@@ -446,6 +446,48 @@ impl EcsBackend {
         })
     }
 
+    /// Confirm the records just written are visible to a public resolver.
+    ///
+    /// `change-resource-record-sets` succeeding means only that the API
+    /// accepted the batch for that zone id. If the registrar delegates the
+    /// domain to a *different* zone, the write lands where nothing queries and
+    /// every later step fails looking like a broken service rather than a name
+    /// that does not resolve. Recreating the bootstrap is enough to cause it: a
+    /// new hosted zone gets a new nameserver set, and the delegation at the
+    /// registrar still points at the old one.
+    fn verify_dns_visible(&self, host: &str) -> Result<()> {
+        let resolves = http::poll(
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+            "the run's DNS record to resolve",
+            || Ok(std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)).is_ok()),
+        );
+        if resolves.is_err() {
+            let env = self.env();
+            let ns = self
+                .aws(&[
+                    "route53",
+                    "get-hosted-zone",
+                    "--id",
+                    &env.dns_zone_id,
+                    "--query",
+                    "DelegationSet.NameServers",
+                    "--output",
+                    "text",
+                ])
+                .unwrap_or_else(|_| "<could not read them>".to_string());
+            anyhow::bail!(
+                "{host} does not resolve, though the record was written to zone {}. \
+                 That zone's nameservers are [{}]; {} must be delegated to exactly \
+                 those at the registrar for anything under it to resolve.",
+                env.dns_zone_id,
+                ns.split_whitespace().collect::<Vec<_>>().join(", "),
+                env.dns_zone_name,
+            );
+        }
+        Ok(())
+    }
+
     /// Put this run's variables where Terraform finds them unprompted.
     ///
     /// `*.auto.tfvars` is loaded for every command in the workspace, and that is
@@ -935,6 +977,9 @@ impl Backend for EcsBackend {
 
         report::step("point this run's DNS at its Traefik", || {
             self.change_dns("UPSERT", &traefik_ip)
+        })?;
+        report::step("confirm the record resolves", || {
+            self.verify_dns_visible(&format!("dex.{domain}"))
         })?;
 
         let rise_url = format!("http://rise.{domain}");
