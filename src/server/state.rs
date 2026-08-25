@@ -500,7 +500,6 @@ async fn init_ecs_backend(
         store.clone(),
         db_pool,
         url_builder,
-        registry_provider,
         encryption_provider,
         resource_store,
         ReconcilerConfig {

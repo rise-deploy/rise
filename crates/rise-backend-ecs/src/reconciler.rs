@@ -27,7 +27,7 @@ use rise_backend_core::{
     build_controller_metadata, effective_health_path, hash_env, merge_container_env,
     pin_system_env, resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
     should_have_infrastructure, spec_key, DeploymentStore, DeploymentUrlBuilder, DesiredContainer,
-    DesiredRoute, EncryptionProvider, InspectedContainer, RegistryProvider,
+    DesiredRoute, EncryptionProvider, InspectedContainer,
 };
 use rise_backend_traefik::{replica_ready, ReadyVerdict, TraefikApiClient};
 use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
@@ -264,8 +264,6 @@ pub struct EcsReconciler {
     /// [`Self::store`].
     db_pool: PgPool,
     url_builder: Arc<DeploymentUrlBuilder>,
-    #[allow(dead_code)]
-    registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
     resource_store: Arc<dyn rise_resource_api::ResourceStore>,
     /// Traefik API client for the authoritative readiness signal. `None` when no
@@ -284,7 +282,6 @@ impl EcsReconciler {
         store: Arc<dyn DeploymentStore>,
         db_pool: PgPool,
         url_builder: Arc<DeploymentUrlBuilder>,
-        registry_provider: Arc<dyn RegistryProvider>,
         encryption_provider: Option<Arc<dyn EncryptionProvider>>,
         resource_store: Arc<dyn rise_resource_api::ResourceStore>,
         config: ReconcilerConfig,
@@ -301,7 +298,6 @@ impl EcsReconciler {
             store,
             db_pool,
             url_builder,
-            registry_provider,
             encryption_provider,
             resource_store,
             traefik_api,
