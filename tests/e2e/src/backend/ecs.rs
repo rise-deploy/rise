@@ -781,13 +781,15 @@ impl EcsBackend {
                     .unwrap_or(false))
             },
         );
-        if outcome.is_err() {
+        if let Err(e) = outcome {
             // Three layers can fail this and the poll cannot tell them apart:
             // the scoped DNS record, Traefik discovering Dex, and Dex itself.
-            // Ask each directly so the log says which.
-            self.explain_unreachable(&issuer_host, "/dex/.well-known/openid-configuration");
+            // Ask each directly, and carry the verdict on the error itself --
+            // the detail below scrolls past in CI, but the failure line does not.
+            let verdict =
+                self.explain_unreachable(&issuer_host, "/dex/.well-known/openid-configuration");
+            anyhow::bail!("{e} — {verdict}");
         }
-        outcome?;
         Ok(())
     }
 
@@ -797,33 +799,50 @@ impl EcsBackend {
     /// separates "the name does not resolve" from "Traefik has not discovered
     /// this container", and Traefik's own router list separates that from "the
     /// container is not running".
-    fn explain_unreachable(&self, host: &str, path: &str) {
+    ///
+    /// Returns a one-line verdict for the caller to attach to its error, so the
+    /// answer survives in the failure line even when the detail here scrolls by.
+    fn explain_unreachable(&self, host: &str, path: &str) -> String {
         eprintln!("\n--- why {host} is unreachable ---");
+        let expected = self.stack().traefik_ip.clone();
 
-        match std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)) {
+        let dns = match std::net::ToSocketAddrs::to_socket_addrs(&(host, 80)) {
             Ok(addrs) => {
                 let ips: Vec<String> = addrs.map(|a| a.ip().to_string()).collect();
-                eprintln!(
-                    "DNS: {host} resolves to {ips:?} (expected {})",
-                    self.stack().traefik_ip
-                );
+                eprintln!("DNS: {host} resolves to {ips:?} (expected {expected})");
+                if ips.contains(&expected) {
+                    format!("DNS ok ({expected})")
+                } else {
+                    format!("DNS resolves to {ips:?}, not Traefik at {expected}")
+                }
             }
-            Err(e) => eprintln!(
-                "DNS: {host} does not resolve ({e}). Is the zone delegated from the \
-                 registrar to this Route 53 zone? Nothing under it resolves until it is."
-            ),
-        }
+            Err(e) => {
+                eprintln!(
+                    "DNS: {host} does not resolve ({e}). Is the zone delegated from the \
+                     registrar to this Route 53 zone? Nothing under it resolves until it is."
+                );
+                format!("DNS does not resolve ({e})")
+            }
+        };
 
-        let direct = format!("http://{}{path}", self.stack().traefik_ip);
-        match http::get(&direct, Some(host)) {
-            Ok(r) => eprintln!(
-                "Traefik (by IP, Host: {host}): HTTP {} -- so Traefik is up; a 404 here \
-                 means it has not discovered the container, and a 502/503 means it has \
-                 a router but no healthy server behind it.",
-                r.status
-            ),
-            Err(e) => eprintln!("Traefik (by IP, Host: {host}): unreachable ({e})"),
-        }
+        let direct = format!("http://{expected}{path}");
+        let proxy = match http::get(&direct, Some(host)) {
+            Ok(r) => {
+                eprintln!(
+                    "Traefik (by IP, Host: {host}): HTTP {} -- so Traefik is up; a 404 here \
+                     means it has not discovered the container, and a 502/503 means it has \
+                     a router but no healthy server behind it.",
+                    r.status
+                );
+                format!("Traefik by IP answered HTTP {}", r.status)
+            }
+            Err(e) => {
+                eprintln!("Traefik (by IP, Host: {host}): unreachable ({e})");
+                format!("Traefik by IP unreachable ({e})")
+            }
+        };
+
+        format!("{dns}; {proxy}")
     }
 
     fn app_host(&self, project: &str) -> String {
