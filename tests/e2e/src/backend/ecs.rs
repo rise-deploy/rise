@@ -306,48 +306,65 @@ impl EcsBackend {
     }
 
     /// The public address of the single task behind `service`.
+    /// This run's Traefik address, waited for rather than sampled.
+    ///
+    /// Every stage of the lookup can legitimately be "not yet": the service was
+    /// created seconds ago by the apply, a Fargate task takes tens of seconds to
+    /// place and pull, its ENI is attached only once it leaves PROVISIONING, and
+    /// the public IP is associated a moment after that. So the whole chain sits
+    /// inside the poll, and any stage coming back empty just means try again.
+    ///
+    /// Note `--desired-status RUNNING` filters on *desired* status, which a
+    /// PENDING task already satisfies -- listing on that alone returns a task
+    /// whose ENI does not exist yet, and the lookup then fails on the literal
+    /// string "None". The `lastStatus` check below is the one that matters.
     fn service_public_ip(&self, service: &str) -> Result<String> {
-        let cluster = &self.env().cluster_name;
-
-        // Wait, rather than ask once. This service was created by the apply that
-        // finished seconds ago, and a Fargate task takes tens of seconds to
-        // reach RUNNING -- longer when it has an image to pull. Asking once
-        // reliably found nothing and failed the run before the environment had
-        // finished coming up.
         let deadline = std::time::Instant::now() + Duration::from_secs(300);
-        let task = loop {
-            let found = self
-                .aws(&[
-                    "ecs",
-                    "list-tasks",
-                    "--cluster",
-                    cluster,
-                    "--service-name",
-                    service,
-                    "--desired-status",
-                    "RUNNING",
-                    "--query",
-                    "taskArns[0]",
-                    "--output",
-                    "text",
-                ])
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            if !found.is_empty() && found != "None" {
-                break found;
+        loop {
+            match self.try_service_public_ip(service) {
+                Some(ip) => return Ok(ip),
+                None => {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "{service} had no running task with a public address within 5 \
+                         minutes. Its events and stopped-task reasons are dumped above -- \
+                         a task that never starts is usually an image it cannot pull or an \
+                         exhausted Fargate quota."
+                    );
+                    std::thread::sleep(Duration::from_secs(5));
+                }
             }
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "no task reached RUNNING for {service} within 5 minutes. Check the \
-                 service's events in the ECS console -- a task that cannot start \
-                 usually means an image it cannot pull or an exhausted Fargate quota."
-            );
-            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    /// One attempt at the chain. `None` means "not yet", not "broken".
+    fn try_service_public_ip(&self, service: &str) -> Option<String> {
+        let cluster = &self.env().cluster_name;
+        let value = |v: String| -> Option<String> {
+            let v = v.trim().to_string();
+            (!v.is_empty() && v != "None").then_some(v)
         };
 
-        let eni = self
-            .aws(&[
+        let task = value(
+            self.aws(&[
+                "ecs",
+                "list-tasks",
+                "--cluster",
+                cluster,
+                "--service-name",
+                service,
+                "--desired-status",
+                "RUNNING",
+                "--query",
+                "taskArns[0]",
+                "--output",
+                "text",
+            ])
+            .ok()?,
+        )?;
+
+        let eni = value(
+            self.aws(&[
                 "ecs",
                 "describe-tasks",
                 "--cluster",
@@ -355,15 +372,15 @@ impl EcsBackend {
                 "--tasks",
                 &task,
                 "--query",
-                "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value | [0]",
+                "tasks[?lastStatus=='RUNNING'] | [0].attachments[0].details[?name=='networkInterfaceId'].value | [0]",
                 "--output",
                 "text",
-            ])?
-            .trim()
-            .to_string();
+            ])
+            .ok()?,
+        )?;
 
-        let ip = self
-            .aws(&[
+        value(
+            self.aws(&[
                 "ec2",
                 "describe-network-interfaces",
                 "--network-interface-ids",
@@ -372,14 +389,9 @@ impl EcsBackend {
                 "NetworkInterfaces[0].Association.PublicIp",
                 "--output",
                 "text",
-            ])?
-            .trim()
-            .to_string();
-        anyhow::ensure!(
-            !ip.is_empty() && ip != "None",
-            "{service}'s task has no public address"
-        );
-        Ok(ip)
+            ])
+            .ok()?,
+        )
     }
 
     /// Point this run's scope at its Traefik, or remove it again.
