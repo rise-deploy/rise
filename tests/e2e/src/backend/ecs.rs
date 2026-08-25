@@ -306,26 +306,43 @@ impl EcsBackend {
     /// The public address of the single task behind `service`.
     fn service_public_ip(&self, service: &str) -> Result<String> {
         let cluster = &self.env().cluster_name;
-        let task = self
-            .aws(&[
-                "ecs",
-                "list-tasks",
-                "--cluster",
-                cluster,
-                "--service-name",
-                service,
-                "--query",
-                "taskArns[0]",
-                "--output",
-                "text",
-            ])?
-            .trim()
-            .to_string();
-        anyhow::ensure!(
-            !task.is_empty() && task != "None",
-            "no running task for {service}. The persistent environment may be down; \
-             check the service in the ECS console."
-        );
+
+        // Wait, rather than ask once. This service was created by the apply that
+        // finished seconds ago, and a Fargate task takes tens of seconds to
+        // reach RUNNING -- longer when it has an image to pull. Asking once
+        // reliably found nothing and failed the run before the environment had
+        // finished coming up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        let task = loop {
+            let found = self
+                .aws(&[
+                    "ecs",
+                    "list-tasks",
+                    "--cluster",
+                    cluster,
+                    "--service-name",
+                    service,
+                    "--desired-status",
+                    "RUNNING",
+                    "--query",
+                    "taskArns[0]",
+                    "--output",
+                    "text",
+                ])
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if !found.is_empty() && found != "None" {
+                break found;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "no task reached RUNNING for {service} within 5 minutes. Check the \
+                 service's events in the ECS console -- a task that cannot start \
+                 usually means an image it cannot pull or an exhausted Fargate quota."
+            );
+            std::thread::sleep(Duration::from_secs(5));
+        };
 
         let eni = self
             .aws(&[
