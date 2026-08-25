@@ -83,9 +83,11 @@ enum Ownership {
     /// collect them, and until they are gone the project is served by two
     /// independent deployments at once.
     Migrated,
-    /// The project has no organization linkage, so no class can be resolved.
-    /// Not evidence of a migration, so its live services stay untouched; a
-    /// terminal deployment still lets the ordinary orphan sweep reach them.
+    /// No class could be resolved: the project has no organization linkage, or
+    /// its organization names no `deploymentControllerClass`. Neither is
+    /// evidence that anyone else is serving the project, so its live services
+    /// stay untouched; a terminal deployment still lets the ordinary orphan
+    /// sweep reach them.
     Unlinked,
 }
 
@@ -586,13 +588,10 @@ impl EcsReconciler {
         let org_class = self
             .resolve_org_controller_class(org_uid, org_class_cache)
             .await?;
-        Ok(
-            if controller_class_matches(&self.config.controller_class, org_class.as_deref()) {
-                Ownership::Ours
-            } else {
-                Ownership::Migrated
-            },
-        )
+        Ok(ownership_from_class(
+            &self.config.controller_class,
+            org_class.as_deref(),
+        ))
     }
 
     async fn resolve_org_controller_class(
@@ -2168,7 +2167,13 @@ impl EcsReconciler {
             if other.id == deployment.id {
                 continue;
             }
-            if other.is_active && !rise_backend_core::state_machine::is_terminal(&other.status) {
+            // On the status, not on `is_active`: the flag is set in the write
+            // just below this loop, so a replica that died between marking a
+            // deployment healthy and flagging it active leaves a sibling that
+            // is serving traffic and would never be retired.
+            if rise_backend_core::state_machine::is_active(&other.status)
+                && !rise_backend_core::state_machine::is_terminal(&other.status)
+            {
                 self.store
                     .mark_deployment_terminating(other.id, TerminationReason::Superseded)
                     .await?;
@@ -2234,6 +2239,24 @@ pub(crate) fn ecs_status_to_container_state(last_status: &str) -> &'static str {
 /// An empty configured class matches everything (a legacy or unconfigured
 /// install); otherwise the Organization must name this class exactly. An
 /// Organization with no class set belongs to no controller.
+/// Where a project stands, from the two class values alone.
+///
+/// The distinction that matters is between an Organization naming a *different*
+/// class and one naming *none*. `Migrated` retires live services on the
+/// strength of a replacement controller already serving the project; an
+/// Organization with no class has no such replacement, so retiring there would
+/// be pure downtime — and a class can be absent for reasons as ordinary as a
+/// two-step spec edit that clears it before setting it.
+fn ownership_from_class(configured: &str, org_class: Option<&str>) -> Ownership {
+    if controller_class_matches(configured, org_class) {
+        Ownership::Ours
+    } else if org_class.is_none() {
+        Ownership::Unlinked
+    } else {
+        Ownership::Migrated
+    }
+}
+
 pub(crate) fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bool {
     if configured.is_empty() {
         return true;
@@ -2304,6 +2327,35 @@ mod tests {
             "no prefix match"
         );
         assert!(cluster.for_project("nope").is_empty());
+    }
+
+    /// The three-way split exists because the two non-owning answers want
+    /// opposite handling, and getting `None` wrong is the expensive direction:
+    /// it deletes live services with nothing standing by to replace them.
+    #[test]
+    fn an_organization_with_no_class_is_unlinked_not_migrated() {
+        use super::Ownership;
+
+        assert_eq!(
+            super::ownership_from_class("prod", Some("prod")),
+            Ownership::Ours
+        );
+        assert_eq!(
+            super::ownership_from_class("prod", Some("staging")),
+            Ownership::Migrated,
+            "an affirmatively different class means someone else serves it now"
+        );
+        assert_eq!(
+            super::ownership_from_class("prod", None),
+            Ownership::Unlinked,
+            "no class names no controller -- retiring here is downtime, not a handover"
+        );
+        // An unconfigured install owns everything, including the classless.
+        assert_eq!(super::ownership_from_class("", None), Ownership::Ours);
+        assert_eq!(
+            super::ownership_from_class("", Some("staging")),
+            Ownership::Ours
+        );
     }
 
     /// A project that moved to another controller class keeps running under our

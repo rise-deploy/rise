@@ -101,6 +101,14 @@ impl ServiceTags {
     /// `None` when a required tag is missing — such a service is not one we can
     /// attribute, and the reconciler must treat it as unknown rather than guess
     /// (guessing here would mean deleting someone else's workload).
+    ///
+    /// **The required set is frozen.** A service that fails to parse but carries
+    /// our markers is retired unconditionally by the orphan sweep, so adding a
+    /// sixth `?` here would make every service the previous version created
+    /// unparseable on the first tick after an upgrade — a fleet-wide
+    /// simultaneous retirement, on an install that changed nothing. New tags
+    /// must be lenient (`unwrap_or_default`, as the drift-only fields below
+    /// are) or backfilled onto existing services before the field is required.
     pub fn parse(tags: &HashMap<String, String>, label_namespace: &str) -> Option<Self> {
         let get = |suffix: &str| tags.get(&ns_key(label_namespace, suffix)).cloned();
         Some(Self {
@@ -150,6 +158,44 @@ mod tests {
             env_hash: "abc123".to_string(),
             image: "registry/myapp:20260101-120000".to_string(),
             route_hash: "rh-active".to_string(),
+        }
+    }
+
+    /// Pins the frozen set from `parse`'s doc comment. This test failing means
+    /// the upgrade contract is being changed: every service created by the
+    /// previous version becomes unattributable, and unattributable services are
+    /// retired unconditionally.
+    #[test]
+    fn only_the_five_identity_tags_are_required_to_attribute_a_service() {
+        let rendered = sample().render("rise.dev", "default");
+        let required = [
+            "rise.dev/project",
+            "rise.dev/deployment-group",
+            "rise.dev/deployment-id",
+            "rise.dev/deployment-uuid",
+            "rise.dev/container",
+        ];
+
+        for key in required {
+            let mut without = rendered.clone();
+            without.remove(key);
+            assert!(
+                ServiceTags::parse(&without, "rise.dev").is_none(),
+                "{key} must be required to attribute a service"
+            );
+        }
+
+        for key in rendered.keys() {
+            if required.contains(&key.as_str()) {
+                continue;
+            }
+            let mut without = rendered.clone();
+            without.remove(key);
+            assert!(
+                ServiceTags::parse(&without, "rise.dev").is_some(),
+                "{key} must not be required -- making it so retires every \
+                 service the previous version created"
+            );
         }
     }
 
