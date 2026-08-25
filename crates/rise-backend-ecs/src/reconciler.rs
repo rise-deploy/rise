@@ -69,6 +69,26 @@ struct ManagedService {
     tags: ServiceTags,
 }
 
+/// Where a project stands relative to this controller, for one tick.
+///
+/// Three states rather than a boolean because the two non-owning ones call for
+/// opposite handling of the services we already built for that project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// The project's organization names our controller class. Converge it.
+    Ours,
+    /// The organization names a different class: another controller owns this
+    /// project now. The services still running under our tags are ours alone to
+    /// retire -- the new controller sees only its own class and will never
+    /// collect them, and until they are gone the project is served by two
+    /// independent deployments at once.
+    Migrated,
+    /// The project has no organization linkage, so no class can be resolved.
+    /// Not evidence of a migration, so its live services stay untouched; a
+    /// terminal deployment still lets the ordinary orphan sweep reach them.
+    Unlinked,
+}
+
 /// Every Rise-managed service in the cluster, read once per tick.
 ///
 /// Holding the whole cluster rather than one project's slice is what lets the
@@ -76,6 +96,14 @@ struct ManagedService {
 /// scoping structurally cannot reach.
 struct ClusterServices {
     services: Vec<ManagedService>,
+    /// Services carrying our `managed-by` and `controller-class` markers but
+    /// missing one of the identity tags `ServiceTags::parse` requires.
+    ///
+    /// They are ours -- nothing else stamps both markers -- but they name no
+    /// deployment, so no desired entry can ever match them and no tick can
+    /// converge them. Kept apart from `services` because every consumer there
+    /// reads `tags`, and retired wholesale by the orphan sweep.
+    unattributable: Vec<ActualService>,
 }
 
 impl ClusterServices {
@@ -140,6 +168,29 @@ fn is_orphaned(status: Option<&DeploymentStatus>) -> bool {
         Some(s) => rise_backend_core::state_machine::is_terminal(s),
         None => true,
     }
+}
+
+/// Why a managed service should be retired, or `None` to leave it running.
+///
+/// `project_migrated` outranks the deployment status deliberately. A project
+/// whose organization now names a different controller class has a live
+/// deployment on *both* controllers, and a proxy that is not class-constrained
+/// routes to both -- so a `Healthy` status is the case that most needs
+/// retiring, not the case that exempts it.
+fn retirement_reason(
+    project_migrated: bool,
+    deployment: Option<&DeploymentStatus>,
+) -> Option<String> {
+    if project_migrated {
+        return Some("its project moved to another deployment controller class".to_string());
+    }
+    if !is_orphaned(deployment) {
+        return None;
+    }
+    Some(match deployment {
+        Some(status) => format!("its deployment is {status:?}"),
+        None => "its deployment is absent from the database".to_string(),
+    })
 }
 
 /// Whether a permanent rejection should fail `status` outright, or only
@@ -365,13 +416,21 @@ impl EcsReconciler {
         // services still carry our own controller-class tag, so we created
         // them and no other controller will ever clean them up.
         let mut sweep_exempt: HashSet<String> = HashSet::new();
+        // Projects that moved to another controller class. The sweep retires
+        // their services whatever state their deployment is in.
+        let mut migrated: HashSet<String> = HashSet::new();
 
         for project in projects {
-            match self.owns_project(&project, &mut org_class_cache).await {
-                Ok(true) => {}
-                // Not ours to converge — but anything of ours left behind on
-                // the cluster is still ours to collect, so the sweep sees it.
-                Ok(false) => continue,
+            match self.ownership_of(&project, &mut org_class_cache).await {
+                Ok(Ownership::Ours) => {}
+                Ok(Ownership::Migrated) => {
+                    migrated.insert(project.name.clone());
+                    continue;
+                }
+                // Not ours to converge, and not evidence that anyone else's is
+                // either — the sweep sees it, but only retires what is orphaned
+                // on the ordinary deployment-status test.
+                Ok(Ownership::Unlinked) => continue,
                 // Ownership unknown. Shield it: a transient Organization read
                 // must never escalate into deleting a running workload.
                 Err(e) => {
@@ -392,7 +451,7 @@ impl EcsReconciler {
         }
 
         if let Err(e) = self
-            .collect_orphans(&cluster, &sweep_exempt, election)
+            .collect_orphans(&cluster, &sweep_exempt, &migrated, election)
             .await
         {
             error!("Cluster-wide orphan sweep failed: {:?}", e);
@@ -411,10 +470,14 @@ impl EcsReconciler {
     ///   - a `DeleteService` that failed once, after the deployment was already
     ///     marked terminal and the project row was deleted;
     ///   - an Organization's `deploymentControllerClass` changing, so
-    ///     `owns_project` stops returning true for projects we built services
+    ///     `ownership_of` stops returning `Ours` for projects we built services
     ///     for — the new controller only ever sees its own tags, so the
-    ///     services we left behind are ours alone to collect;
-    ///   - a database restored to a point before the project existed.
+    ///     services we left behind are ours alone to collect. These retire
+    ///     whatever state their deployment is in: the live ones are exactly the
+    ///     ones that would otherwise be served twice over;
+    ///   - a database restored to a point before the project existed;
+    ///   - a service of ours whose identity tags were lost, which names no
+    ///     deployment at all and so can never be converged.
     ///
     /// Keyed on the deployment UUID rather than the project name: it is the tag
     /// that maps to a row we can definitively resolve, and a project can be
@@ -425,35 +488,63 @@ impl EcsReconciler {
         &self,
         cluster: &ClusterServices,
         sweep_exempt: &HashSet<String>,
+        migrated: &HashSet<String>,
         election: &LeaderElection,
     ) -> Result<()> {
+        // Services of ours that name no deployment. Nothing can converge them
+        // and nothing else will collect them, so they go first and
+        // unconditionally -- there is no status to consult.
+        for service in &cluster.unattributable {
+            if !self.confirm_leadership(election).await {
+                return Ok(());
+            }
+            warn!(
+                service = %service.name,
+                "Deleting an ECS service tagged as ours but missing the identity tags \
+                 that say which deployment it serves"
+            );
+            if let Err(e) = self.delete_service(&service.name).await {
+                warn!(service = %service.name, "Failed to delete it: {:?}", e);
+            }
+        }
+
         for managed in &cluster.services {
             let (name, tags) = (&managed.service.name, &managed.tags);
             if sweep_exempt.contains(&tags.project) {
                 continue;
             }
-            // Resolve the deployment this service claims to serve. Anything we
-            // cannot parse or cannot look up is left alone: deleting on a
-            // failed lookup would turn a transient database error into data
-            // loss.
-            let Ok(uuid) = Uuid::parse_str(&tags.deployment_uuid) else {
-                continue;
-            };
-            let deployment = match self.store.find_deployment(uuid).await {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(
-                        service = %name,
-                        "Could not resolve deployment {uuid} while sweeping orphans; \
-                         leaving the service alone: {:?}", e
-                    );
+
+            let project_migrated = migrated.contains(&tags.project);
+            // A migrated project needs no status: it retires either way, and
+            // skipping the lookup keeps the sweep off the database for it.
+            let deployment = if project_migrated {
+                None
+            } else {
+                // Resolve the deployment this service claims to serve. Anything
+                // we cannot parse or cannot look up is left alone: deleting on a
+                // failed lookup would turn a transient database error into data
+                // loss.
+                let Ok(uuid) = Uuid::parse_str(&tags.deployment_uuid) else {
                     continue;
+                };
+                match self.store.find_deployment(uuid).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!(
+                            service = %name,
+                            "Could not resolve deployment {uuid} while sweeping orphans; \
+                             leaving the service alone: {:?}", e
+                        );
+                        continue;
+                    }
                 }
             };
 
-            if !is_orphaned(deployment.as_ref().map(|d| &d.status)) {
+            let Some(reason) =
+                retirement_reason(project_migrated, deployment.as_ref().map(|d| &d.status))
+            else {
                 continue;
-            }
+            };
 
             if !self.confirm_leadership(election).await {
                 return Ok(());
@@ -463,11 +554,7 @@ impl EcsReconciler {
                 service = %name,
                 deployment = %tags.deployment_uuid,
                 project = %tags.project,
-                "Deleting orphaned ECS service: its deployment is {}",
-                match &deployment {
-                    Some(d) => format!("{:?}", d.status),
-                    None => "absent from the database".to_string(),
-                }
+                "Deleting orphaned ECS service: {reason}"
             );
             if let Err(e) = self.delete_service(name).await {
                 warn!(service = %name, "Failed to delete orphaned service: {:?}", e);
@@ -482,27 +569,30 @@ impl EcsReconciler {
         Ok(())
     }
 
-    /// Whether this controller owns `project` — i.e. the project's Organization's
-    /// `deploymentControllerClass` matches ours.
-    async fn owns_project(
+    /// How this controller stands to `project` — i.e. whether the project's
+    /// Organization's `deploymentControllerClass` matches ours.
+    async fn ownership_of(
         &self,
         project: &Project,
         org_class_cache: &mut HashMap<Uuid, Option<String>>,
-    ) -> Result<bool> {
+    ) -> Result<Ownership> {
         let Some(org_uid) = self.store.organization_uid_for_project(project.id).await? else {
             warn!(
                 project = %project.name,
                 "Project has no organization linkage; skipping in ECS reconciler"
             );
-            return Ok(false);
+            return Ok(Ownership::Unlinked);
         };
         let org_class = self
             .resolve_org_controller_class(org_uid, org_class_cache)
             .await?;
-        Ok(controller_class_matches(
-            &self.config.controller_class,
-            org_class.as_deref(),
-        ))
+        Ok(
+            if controller_class_matches(&self.config.controller_class, org_class.as_deref()) {
+                Ownership::Ours
+            } else {
+                Ownership::Migrated
+            },
+        )
     }
 
     async fn resolve_org_controller_class(
@@ -1145,6 +1235,7 @@ impl EcsReconciler {
         }
 
         let mut services = Vec::new();
+        let mut unattributable = Vec::new();
         for chunk in arns.chunks(DESCRIBE_SERVICES_BATCH) {
             let mut req = self
                 .ecs
@@ -1171,9 +1262,6 @@ impl EcsReconciler {
                 ) {
                     continue;
                 }
-                let Some(parsed) = ServiceTags::parse(&tags, &self.config.label_namespace) else {
-                    continue;
-                };
                 // A service being deleted still appears in DescribeServices for a
                 // while; treating it as live would make the diff think the
                 // desired state is already satisfied, and would make the orphan
@@ -1184,6 +1272,19 @@ impl EcsReconciler {
                 {
                     continue;
                 }
+                let Some(parsed) = ServiceTags::parse(&tags, &self.config.label_namespace) else {
+                    unattributable.push(ActualService {
+                        name: svc.service_name().unwrap_or_default().to_string(),
+                        arn: svc.service_arn().unwrap_or_default().to_string(),
+                        key: None,
+                        task_definition_arn: svc.task_definition().unwrap_or_default().to_string(),
+                        task_definition_hash: String::new(),
+                        desired_count: svc.desired_count(),
+                        running_count: svc.running_count(),
+                        deployment_id: None,
+                    });
+                    continue;
+                };
                 services.push(ManagedService {
                     service: ActualService {
                         name: svc.service_name().unwrap_or_default().to_string(),
@@ -1210,7 +1311,10 @@ impl EcsReconciler {
                 });
             }
         }
-        Ok(ClusterServices { services })
+        Ok(ClusterServices {
+            services,
+            unattributable,
+        })
     }
 
     // ── applying ──────────────────────────────────────────────────────────
@@ -2184,6 +2288,7 @@ mod tests {
                 managed("app-staging", "d-2"),
                 managed("app", "d-3"),
             ],
+            unattributable: Vec::new(),
         };
 
         let slice = cluster.for_project("app");
@@ -2199,6 +2304,49 @@ mod tests {
             "no prefix match"
         );
         assert!(cluster.for_project("nope").is_empty());
+    }
+
+    /// A project that moved to another controller class keeps running under our
+    /// tags: the new controller sees only its own class, so nothing there will
+    /// ever collect ours. Until they go, an unconstrained proxy routes the
+    /// project to two independent deployments at once -- so the live ones are
+    /// precisely what must retire, and the deployment status must not veto it.
+    #[test]
+    fn a_migrated_project_retires_even_while_its_deployment_is_healthy() {
+        use rise_backend_core::models::DeploymentStatus;
+
+        for status in [
+            Some(&DeploymentStatus::Healthy),
+            Some(&DeploymentStatus::Unhealthy),
+            Some(&DeploymentStatus::Deploying),
+            None,
+        ] {
+            assert!(
+                super::retirement_reason(true, status).is_some(),
+                "a migrated project must retire whatever its deployment status"
+            );
+        }
+
+        // And the reason says which rule fired, because the two are diagnosed
+        // very differently by whoever reads the log.
+        let reason = super::retirement_reason(true, Some(&DeploymentStatus::Healthy))
+            .expect("migrated projects retire");
+        assert!(reason.contains("controller class"), "reason was {reason:?}");
+    }
+
+    /// The same call on a project that is still ours must defer entirely to the
+    /// orphan rule -- otherwise every tick would delete every live service.
+    #[test]
+    fn an_owned_project_retires_only_on_the_orphan_rule() {
+        use rise_backend_core::models::DeploymentStatus;
+
+        assert!(super::retirement_reason(false, Some(&DeploymentStatus::Healthy)).is_none());
+        assert!(super::retirement_reason(false, Some(&DeploymentStatus::Deploying)).is_none());
+        assert!(super::retirement_reason(false, Some(&DeploymentStatus::Stopped)).is_some());
+        assert!(
+            super::retirement_reason(false, None).is_some(),
+            "no row at all is the deleted-project case"
+        );
     }
 
     /// The orphan rule decides whether to delete something that is running.
