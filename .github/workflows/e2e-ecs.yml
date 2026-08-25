@@ -7,7 +7,7 @@ name: E2E
 # the other backends. Nightly on develop, or opt in on a pull request with the
 # `ecs-e2e` label. Each run stands its whole stack up under its own scope --
 # `pr-<number>` -- and tears it down again, so runs of different pull requests
-# are independent.
+# are independent. Once labelled, it re-runs on every push to that pull request.
 
 on:
   schedule:
@@ -15,7 +15,11 @@ on:
     # scheduled at :00.
     - cron: "17 3 * * *"
   pull_request:
-    types: [labeled]
+    # `labeled` opts a pull request in; `synchronize` re-runs it on every later
+    # push. Listing types REPLACES the default set (opened/synchronize/reopened),
+    # so without `synchronize` here the suite would run once at labelling time
+    # and then never again, however many times the branch was pushed.
+    types: [labeled, synchronize]
   workflow_dispatch:
     inputs:
       image_tag:
@@ -48,10 +52,18 @@ jobs:
     timeout-minutes: 60
     # A labelled PR only, and only one from this repository: a fork's head is
     # untrusted and this job holds credentials.
+    #
+    # The two activities need different questions asked. On `labeled`, only the
+    # label just added matters -- otherwise adding any unrelated label to an
+    # opted-in PR would spend an AWS run. On `synchronize` there is no label in
+    # the payload, so the question is whether the PR still carries it.
     if: >-
       github.event_name != 'pull_request' ||
-      (github.event.label.name == 'ecs-e2e' &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       ((github.event.action == 'labeled' &&
+         github.event.label.name == 'ecs-e2e') ||
+        (github.event.action == 'synchronize' &&
+         contains(github.event.pull_request.labels.*.name, 'ecs-e2e'))))
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

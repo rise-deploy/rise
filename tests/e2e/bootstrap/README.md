@@ -109,7 +109,7 @@ way to opt a pull request in.
 Three ways to run it:
 
 - **Label a pull request `ecs-e2e`.** Runs against that PR's image, under scope
-  `pr-<number>`.
+  `pr-<number>`, and again on every push afterwards while the label is on.
 - **Nightly**, 03:17 UTC, against `develop`.
 - **`workflow_dispatch`.** Pass `image_tag` explicitly — the default is
   `develop-<short-sha>`, which only exists for a commit that was pushed to
