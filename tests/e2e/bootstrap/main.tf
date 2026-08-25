@@ -169,6 +169,15 @@ resource "aws_s3_bucket_public_access_block" "state" {
 # with a dash rather than a dot.
 # -----------------------------------------------------------------------------
 
-# The zone is an input, not a resource here: see `dns_zone_id`. Nothing in this
-# file creates or reads it, which is deliberate -- a data source would be read
-# at plan time and needs credentials, and the plan tests run without any.
+# The zone is adopted, not created. Registering a domain through Route 53
+# Domains already creates a public zone for it and delegates the domain to that
+# zone's nameservers; a `resource` here would make a *second* zone for the same
+# name, equally valid and with its own nameservers, that nothing points at.
+# Records written there resolve for no one, and the failure misleads -- the
+# write succeeds, the proxy is healthy, and only the lookup fails. Reading the
+# zone also keeps `terraform destroy` from taking the delegation with it, and
+# fails loudly if a duplicate ever reappears rather than picking one.
+data "aws_route53_zone" "this" {
+  name         = var.dns_zone_name
+  private_zone = false
+}

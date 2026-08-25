@@ -57,11 +57,21 @@ output "ecr_repo_prefix" {
 }
 
 output "dns_zone_id" {
-  value = var.dns_zone_id
+  value = data.aws_route53_zone.this.zone_id
+}
+
+output "dns_name_servers" {
+  description = <<-EOT
+    The zone's nameservers. A domain registered through Route 53 Domains is
+    already delegated to these; for one registered elsewhere, set them as its
+    nameservers at the registrar. Nothing under the zone resolves until they
+    match.
+  EOT
+  value       = data.aws_route53_zone.this.name_servers
 }
 
 output "dns_zone_name" {
-  value = var.dns_zone_name
+  value = data.aws_route53_zone.this.name
 }
 
 output "state_bucket" {
@@ -100,8 +110,8 @@ resource "aws_ssm_parameter" "bootstrap" {
     log_group_name           = aws_cloudwatch_log_group.this.name
     traefik_task_role_arn    = aws_iam_role.traefik.arn
     ecr_repo_prefix          = "${var.name}/"
-    dns_zone_id              = var.dns_zone_id
-    dns_zone_name            = var.dns_zone_name
+    dns_zone_id              = data.aws_route53_zone.this.zone_id
+    dns_zone_name            = trimsuffix(data.aws_route53_zone.this.name, ".")
     state_bucket             = aws_s3_bucket.state.id
   })
 

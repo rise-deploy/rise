@@ -53,21 +53,18 @@ terraform init -backend-config="bucket=${NAME}-tfstate-${ACCOUNT}" -backend-conf
 terraform apply
 ```
 
-`dns_zone_name` defaults to `rise-deploy.click`. Its **public hosted zone must
-already exist**, and `dns_zone_id` names it — the bootstrap neither creates the
-zone nor looks it up. Registering the domain through Route 53 Domains gives you
-both halves at once: it creates the zone and delegates the domain to it. For a
-domain registered elsewhere, create the zone, then set its nameservers at the
-registrar:
+`dns_zone_name` defaults to `rise-deploy.click`, and its **public hosted zone
+must already exist** — the bootstrap reads that zone, it does not create one.
+Registering the domain through Route 53 Domains gives you both halves at once:
+it creates the zone and delegates the domain to it. For a domain registered
+elsewhere, create the zone by hand and set its nameservers (the
+`dns_name_servers` output) at the registrar.
 
-```bash
-aws route53 get-hosted-zone --id "$ZONE_ID" --query DelegationSet.NameServers
-```
-
-Never leave two zones for one domain. Both are valid and have different
+Never leave two public zones for one domain. Both are valid and have different
 nameservers, only one of which the domain points at; records written to the
 other resolve for nobody, and the harness then fails looking like a broken
-service rather than a name that does not resolve.
+service rather than a name that does not resolve. Reading the zone by name
+fails loudly on a duplicate rather than silently picking one.
 
 The `backend_config` output prints those arguments if you forget them.
 
