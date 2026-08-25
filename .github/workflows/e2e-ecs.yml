@@ -29,15 +29,21 @@ on:
 
 # One run at a time *per scope*, not per workflow. Everything a run creates is
 # named after its scope -- Terraform state key, DNS subtree, controller class,
-# security groups, Cloud Map entries -- so different pull requests no longer
-# collide and may overlap. Two runs of the *same* PR still would, hence the
-# group.
+# security groups, Cloud Map entries, Rise's own ECR and SSM prefixes -- so
+# different pull requests no longer collide and may overlap. Two runs of the
+# *same* scope still would, hence the group.
+#
+# Keyed on the scope itself rather than on the PR number or the ref, because the
+# scope is the thing that is actually shared: the schedule and every
+# workflow_dispatch both run as `nightly`, and keying on the ref would put a
+# dispatch from another branch in its own group while it used the same state
+# key, DNS names and controller class as the nightly run.
 #
 # Overlapping runs do share the account's Fargate quota, so a burst of labelled
 # PRs can exhaust it; the failure is a task that will not start, and the fix is
 # a quota increase rather than re-serializing.
 concurrency:
-  group: e2e-ecs-${{ github.event.pull_request.number || github.ref }}
+  group: e2e-ecs-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
   cancel-in-progress: false
 
 permissions:
@@ -106,6 +112,31 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Without this the run fails as a five-minute /health timeout and a
+      # circuit-breaker rollback, which reads as "Rise would not start" rather
+      # than "there was nothing to start". ci.yml builds this tag on the same
+      # push, so on a fresh commit the image legitimately does not exist yet.
+      - name: Wait for the image under test
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.image_tag }}
+        run: |
+          set -uo pipefail
+          for attempt in $(seq 1 40); do
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "Found $IMAGE"
+              exit 0
+            fi
+            echo "Attempt ${attempt}/40: $IMAGE not published yet; waiting 30s."
+            sleep 30
+          done
+          echo "::error::$IMAGE never appeared."
+          echo "ci.yml publishes it for this same commit, so either that build is"
+          echo "still running, or it failed, or this run resolved a tag it never"
+          echo "builds -- on a 'labeled' event GITHUB_SHA is a merge commit"
+          echo "recomputed at label time, so pushing to the branch (or re-running"
+          echo "after ci.yml finishes) gives both workflows the same commit."
+          exit 1
 
       - name: Assume the e2e role
         uses: aws-actions/configure-aws-credentials@v4

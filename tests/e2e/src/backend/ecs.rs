@@ -126,9 +126,10 @@ impl EcsBackend {
         let image_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the ecs backend (ECS pulls it from GHCR)")?;
         let env_name = std::env::var("RISE_E2E_ENV").unwrap_or_else(|_| "rise-e2e".to_string());
-        // CI sets this per run -- `pr-<number>` on a pull request, `nightly-<id>`
-        // on a schedule. Locally it defaults to one stable label per user, so
-        // repeated local runs reuse a subtree instead of littering the zone.
+        // CI sets this per run -- `pr-<number>` on a pull request, `nightly` on a
+        // schedule or a manual dispatch. Locally it defaults to one stable label
+        // per user, so repeated local runs reuse a subtree instead of littering
+        // the zone.
         let scope = match std::env::var("RISE_E2E_SCOPE") {
             Ok(s) => s,
             Err(_) => {
@@ -493,19 +494,15 @@ impl EcsBackend {
         Ok(format!("{ip}/32"))
     }
 
-    /// Remove what an earlier run *of this scope* left behind.
-    ///
-    /// Rise owns these, not Terraform, and the reconciler only visits services
-    /// whose project is in its database — so once the per-run stack is
-    /// destroyed, nothing else will ever collect them.
+    /// The live ECS services in the cluster that *Rise* created for this scope.
     ///
     /// Scoped deliberately. The cluster is shared with every other run, and
-    /// their services carry the same `managed-by` tag; sweeping on that alone
-    /// would delete a concurrent run's live workloads. The controller-class tag
-    /// is the same token Rise's own orphan collector scopes to.
-    fn sweep(&self) -> Result<()> {
+    /// their services carry the same `managed-by` tag; matching on that alone
+    /// would name a concurrent run's live workloads. The controller-class tag
+    /// is the same token Rise's own orphan collector scopes to, and the per-run
+    /// stack's own services never carry it — they are Terraform's, not Rise's.
+    fn workload_services(&self) -> Result<Vec<String>> {
         let cluster = &self.env().cluster_name;
-
         let arns: Vec<String> = serde_json::from_str(&self.aws(&[
             "ecs",
             "list-services",
@@ -518,7 +515,7 @@ impl EcsBackend {
         ])?)
         .unwrap_or_default();
 
-        let mut swept = 0u32;
+        let mut names = Vec::new();
         for chunk in arns.chunks(10) {
             let mut args: Vec<String> = vec![
                 "ecs".into(),
@@ -545,23 +542,78 @@ impl EcsBackend {
                 let Some(name) = svc["serviceName"].as_str() else {
                     continue;
                 };
-                if !managed || !ours || !live {
-                    continue;
+                if managed && ours && live {
+                    names.push(name.to_string());
                 }
-                match self.aws(&[
-                    "ecs",
-                    "delete-service",
-                    "--cluster",
-                    cluster,
-                    "--service",
-                    name,
-                    "--force",
-                ]) {
-                    Ok(_) => swept += 1,
-                    // Counting the attempt would report cleanups that did not
-                    // happen, and the run afterwards looks clean when it is not.
-                    Err(e) => report::note(&format!("could not sweep service {name}: {e:#}")),
+            }
+        }
+        Ok(names)
+    }
+
+    /// Wait for Rise to finish removing the workloads its project deletes
+    /// retired, bounded.
+    ///
+    /// Their ENIs sit in this run's security groups, and an attached ENI is a
+    /// `DependencyViolation` on `DeleteSecurityGroup` — so destroying the stack
+    /// while they are still up costs the provider's whole retry budget and then
+    /// fails, leaving the groups and everything destroy had not yet reached.
+    /// Bounded rather than blocking: the sweep after this force-deletes what is
+    /// left, and a teardown that hangs is worse than one that force-deletes.
+    fn wait_workloads_removed(&self, within: Duration) {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            match self.workload_services() {
+                Ok(names) if names.is_empty() => return,
+                Ok(names) => {
+                    if std::time::Instant::now() >= deadline {
+                        report::note(&format!(
+                            "{} workload service(s) still up after project deletion;                              force-deleting them",
+                            names.len()
+                        ));
+                        return;
+                    }
                 }
+                // Can't tell: fall through to the sweep rather than spin.
+                Err(e) => {
+                    report::note(&format!(
+                        "could not list workloads while tearing down: {e:#}"
+                    ));
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    }
+
+    /// Remove what an earlier run *of this scope* left behind.
+    ///
+    /// Rise owns these, not Terraform, and the reconciler only visits services
+    /// whose project is in its database — so once the per-run stack is
+    /// destroyed, nothing else will ever collect them.
+    ///
+    /// Scoped deliberately. The cluster is shared with every other run, and
+    /// their services carry the same `managed-by` tag; sweeping on that alone
+    /// would delete a concurrent run's live workloads. The controller-class tag
+    /// is the same token Rise's own orphan collector scopes to.
+    fn sweep(&self) -> Result<()> {
+        let cluster = &self.env().cluster_name;
+        let leaked = self.workload_services()?;
+
+        let mut swept = 0u32;
+        for name in &leaked {
+            match self.aws(&[
+                "ecs",
+                "delete-service",
+                "--cluster",
+                cluster,
+                "--service",
+                name,
+                "--force",
+            ]) {
+                Ok(_) => swept += 1,
+                // Counting the attempt would report cleanups that did not
+                // happen, and the run afterwards looks clean when it is not.
+                Err(e) => report::note(&format!("could not sweep service {name}: {e:#}")),
             }
         }
 
@@ -837,7 +889,17 @@ impl Backend for EcsBackend {
         })?;
 
         report::step("terraform destroy (stale per-run state)", || {
-            let _ = cli::run(self.terraform(&["destroy", "-auto-approve", "-input=false"]));
+            // Not fatal -- there is usually no stale state at all -- but a
+            // failure here resurfaces as an opaque "already exists" on the
+            // apply below, with the actual cause gone.
+            match cli::run(self.terraform(&["destroy", "-auto-approve", "-input=false"])) {
+                Ok(out) if !out.success() => report::note(&format!(
+                    "stale-state destroy failed; the apply may hit its leftovers:\n{}",
+                    out.stderr.trim()
+                )),
+                Ok(_) => {}
+                Err(e) => report::note(&format!("could not run the stale-state destroy: {e:#}")),
+            }
             Ok(())
         })?;
 
@@ -910,10 +972,27 @@ impl Backend for EcsBackend {
         // before the control plane that owns them goes away.
         self.delete_projects();
 
-        let _ = cli::run(self.terraform(&["destroy", "-auto-approve", "-input=false"]));
-
-        // Belt and braces: anything project deletion missed.
+        // Project deletion is asynchronous -- it marks deployments terminal and
+        // the reconciler retires the services a tick later. Destroying now
+        // would take the control plane away mid-retirement and leave workload
+        // ENIs pinning this run's security groups, so the order is: let Rise
+        // finish, force-delete the remainder, and only then destroy.
+        self.wait_workloads_removed(Duration::from_secs(120));
         let _ = self.sweep();
+
+        let destroy = cli::run(self.terraform(&["destroy", "-auto-approve", "-input=false"]));
+        match destroy {
+            Ok(out) if !out.success() => {
+                // Discarding this leaves Traefik and the tasks running and
+                // billing while teardown reports success and prints nothing.
+                eprintln!(
+                    "\n--- terraform destroy failed; the stack is still up ---\n{}\n{}",
+                    out.stdout, out.stderr
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("\n--- could not run terraform destroy ---\n{e:#}"),
+        }
 
         // The security group went with the stack, so there is no rule to
         // revoke -- but the DNS records live in the persistent zone and would

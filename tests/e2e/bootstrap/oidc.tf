@@ -178,6 +178,10 @@ data "aws_iam_policy_document" "ci" {
       "servicediscovery:CreateService",
       "servicediscovery:UpdateService",
       "servicediscovery:DeleteService",
+      # `force_destroy` on those services only needs this when a drain ended
+      # abnormally and left instances registered -- which is exactly the
+      # teardown that must not then fail on AccessDenied.
+      "servicediscovery:DeregisterInstance",
       "servicediscovery:TagResource",
       "servicediscovery:UntagResource",
     ]

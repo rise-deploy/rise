@@ -15,8 +15,14 @@ variable "state_bucket" {
 }
 
 variable "rise_image" {
-  type    = string
-  default = "ghcr.io/rise-deploy/rise"
+  description = <<-EOT
+    Pulled anonymously: Fargate's execution role has no registry credentials for
+    it, and the runner's own GHCR login does not reach the task. The package
+    must therefore be public. A private one needs a Secrets Manager secret and
+    `repositoryCredentials`, which is what the production module does.
+  EOT
+  type        = string
+  default     = "ghcr.io/rise-deploy/rise"
 }
 
 variable "rise_image_tag" {
