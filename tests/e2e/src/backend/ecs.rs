@@ -414,6 +414,41 @@ impl EcsBackend {
         })
     }
 
+    /// Put this run's variables where Terraform finds them unprompted.
+    ///
+    /// `*.auto.tfvars` is loaded for every command in the workspace, and that is
+    /// the point: `destroy` evaluates the configuration before it looks at
+    /// state, so a required variable with no value fails it outright. Passing
+    /// values only on the `apply` command line left all three teardown paths --
+    /// the stale-state destroy at bring-up, the harness's own teardown, and the
+    /// workflow's cancelled-job backstop -- unable to destroy anything, each
+    /// failing with "No value for required variable" and each ignoring it.
+    ///
+    /// The file also lets the workflow tear down a run whose harness died,
+    /// which it otherwise could not: it has no way to learn the bucket or the
+    /// zone. `*.tfvars` is gitignored, and the run is ephemeral.
+    fn write_run_vars(&self, client_cidr: &str) -> Result<()> {
+        let q = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string());
+        let env = self.env();
+        let body = [
+            format!("name               = {}", q(&self.env_name)),
+            format!("region             = {}", q(&self.region)),
+            format!("state_bucket       = {}", q(&env.state_bucket)),
+            format!("rise_image         = {}", q(&self.image_repository)),
+            format!("rise_image_tag     = {}", q(&self.image_tag)),
+            format!("scope              = {}", q(&self.scope)),
+            format!("dns_zone_name      = {}", q(&env.dns_zone_name)),
+            format!("jwt_signing_secret = {}", q(&self.jwt_secret_b64)),
+            format!("encryption_key     = {}", q(&self.jwt_secret_b64)),
+            format!("authorized_cidrs   = [{}]", q(client_cidr)),
+            String::new(),
+        ]
+        .join("\n");
+
+        let path = self.run_dir().join("run.auto.tfvars");
+        std::fs::write(&path, body).with_context(|| format!("write {}", path.display()))
+    }
+
     /// This machine's address, as the single CIDR the run's edge admits.
     ///
     /// The group is created with the run and destroyed with it, so there is no
@@ -707,31 +742,23 @@ impl Backend for EcsBackend {
             ]))
         })?;
 
+        let client_cidr =
+            report::step_value("determine this run's client address", || self.client_cidr())?;
+
+        // Before the destroy below, not just before the apply: destroy needs the
+        // variables too. See `write_run_vars`.
+        report::step("write this run's terraform variables", || {
+            self.write_run_vars(&client_cidr)
+        })?;
+
         report::step("terraform destroy (stale per-run state)", || {
             let _ = cli::run(self.terraform(&["destroy", "-auto-approve", "-input=false"]));
             Ok(())
         })?;
 
-        let client_cidr =
-            report::step_value("determine this run's client address", || self.client_cidr())?;
-
         let domain = format!("{}.{}", self.scope, self.env().dns_zone_name);
         report::step("terraform apply (traefik, dex, postgres, rise)", || {
-            cli::run_checked(self.terraform(&[
-                "apply",
-                "-auto-approve",
-                "-input=false",
-                &format!("-var=name={}", self.env_name),
-                &format!("-var=region={}", self.region),
-                &format!("-var=state_bucket={}", self.env().state_bucket),
-                &format!("-var=rise_image={}", self.image_repository),
-                &format!("-var=rise_image_tag={}", self.image_tag),
-                &format!("-var=scope={}", self.scope),
-                &format!("-var=dns_zone_name={}", self.env().dns_zone_name),
-                &format!("-var=authorized_cidrs=[\"{client_cidr}\"]"),
-                &format!("-var=jwt_signing_secret={}", self.jwt_secret_b64),
-                &format!("-var=encryption_key={}", self.jwt_secret_b64),
-            ]))
+            cli::run_checked(self.terraform(&["apply", "-auto-approve", "-input=false"]))
         })?;
 
         // Traefik belongs to this run, so its address exists only now.

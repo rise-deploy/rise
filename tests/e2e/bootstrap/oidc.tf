@@ -87,18 +87,42 @@ data "aws_iam_policy_document" "ci" {
     resources = ["*"]
   }
 
-  # Reading task addresses, and reaping the ingress rule a crashed run leaked.
+  # Reading task addresses, and managing the run's own security groups. The
+  # groups are per-run -- created with the stack and destroyed with it -- so this
+  # needs create and delete, not just the rule actions.
   statement {
-    sid    = "ReadAddressesAndManageEdgeIngress"
+    sid    = "ReadAddressesAndManageRunSecurityGroups"
     effect = "Allow"
     actions = [
       "ec2:DescribeNetworkInterfaces",
       "ec2:DescribeSecurityGroups",
       "ec2:DescribeSecurityGroupRules",
+      "ec2:DescribeVpcs",
+      "ec2:DescribeTags",
+      "ec2:CreateSecurityGroup",
+      "ec2:DeleteSecurityGroup",
       "ec2:AuthorizeSecurityGroupIngress",
       "ec2:RevokeSecurityGroupIngress",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupEgress",
     ]
     resources = ["*"]
+  }
+
+  # Terraform tags a security group in the same call that creates it, which EC2
+  # authorizes as a separate CreateTags. Confined to that moment: this does not
+  # allow retagging anything that already exists.
+  statement {
+    sid       = "TagSecurityGroupsAtCreation"
+    effect    = "Allow"
+    actions   = ["ec2:CreateTags"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["CreateSecurityGroup"]
+    }
   }
 
   # Registering a task definition that names a role requires passing it. This is
@@ -142,10 +166,21 @@ data "aws_iam_policy_document" "ci" {
     ]
   }
 
+  # Cloud Map entries are per-run too -- `traefik-<scope>`, `dex-<scope>`,
+  # `postgres-<scope>`, `rise-<scope>` -- so the run creates and deletes them.
+  # The namespace itself belongs to the bootstrap and is not writable here.
   statement {
-    sid       = "ReadCloudMap"
-    effect    = "Allow"
-    actions   = ["servicediscovery:Get*", "servicediscovery:List*"]
+    sid    = "ReadCloudMapAndManageRunServices"
+    effect = "Allow"
+    actions = [
+      "servicediscovery:Get*",
+      "servicediscovery:List*",
+      "servicediscovery:CreateService",
+      "servicediscovery:UpdateService",
+      "servicediscovery:DeleteService",
+      "servicediscovery:TagResource",
+      "servicediscovery:UntagResource",
+    ]
     resources = ["*"]
   }
 
