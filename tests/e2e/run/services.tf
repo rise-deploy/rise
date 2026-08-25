@@ -251,6 +251,10 @@ resource "aws_ecs_task_definition" "traefik" {
       essential = true
 
       command = [
+        # Traefik defaults to ERROR, at which a provider that discovers nothing
+        # logs nothing at all -- the failure this run is most likely to hit is
+        # exactly the one the default level hides.
+        "--log.level=INFO",
         "--providers.ecs=true",
         "--providers.ecs.clusters=${local.env.cluster_name}",
         "--providers.ecs.region=${var.region}",

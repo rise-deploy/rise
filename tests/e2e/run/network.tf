@@ -24,6 +24,20 @@ resource "aws_vpc_security_group_ingress_rule" "edge_from_client" {
   description       = "The address this run is driven from"
 }
 
+# The harness dumps Traefik's router list when something is unreachable, which
+# is the one diagnostic that says whether discovery worked. Same single address,
+# for the length of the run.
+resource "aws_vpc_security_group_ingress_rule" "edge_api_from_client" {
+  for_each = toset(var.authorized_cidrs)
+
+  security_group_id = aws_security_group.edge.id
+  cidr_ipv4         = each.value
+  ip_protocol       = "tcp"
+  from_port         = 8080
+  to_port           = 8080
+  description       = "Traefik's API, read by the harness for diagnostics"
+}
+
 resource "aws_vpc_security_group_egress_rule" "edge_all" {
   security_group_id = aws_security_group.edge.id
   cidr_ipv4         = "0.0.0.0/0"

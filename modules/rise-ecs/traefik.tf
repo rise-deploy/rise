@@ -30,20 +30,31 @@ resource "aws_iam_role" "traefik" {
   tags               = local.tags
 }
 
+locals {
+  # The action list Traefik's ECS provider actually calls, as published by its
+  # own documentation. It calls ec2:DescribeInstances and
+  # ssm:DescribeInstanceInformation even on Fargate, where neither has anything
+  # to return; denied either one, discovery yields nothing at all and Traefik
+  # 404s every host while looking perfectly healthy.
+  traefik_discovery_actions = [
+    "ecs:ListClusters",
+    "ecs:DescribeClusters",
+    "ecs:ListTasks",
+    "ecs:DescribeTasks",
+    "ecs:DescribeContainerInstances",
+    "ecs:DescribeTaskDefinition",
+    "ec2:DescribeInstances",
+    "ssm:DescribeInstanceInformation",
+  ]
+}
+
 data "aws_iam_policy_document" "traefik" {
   count = var.traefik_task_role_arn == null ? 1 : 0
 
   statement {
-    sid    = "DiscoverTasks"
-    effect = "Allow"
-    actions = [
-      "ecs:ListClusters",
-      "ecs:DescribeClusters",
-      "ecs:ListTasks",
-      "ecs:DescribeTasks",
-      "ecs:DescribeContainerInstances",
-      "ecs:DescribeTaskDefinition",
-    ]
+    sid       = "DiscoverTasks"
+    effect    = "Allow"
+    actions   = local.traefik_discovery_actions
     resources = ["*"]
   }
 

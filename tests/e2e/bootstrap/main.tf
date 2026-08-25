@@ -102,6 +102,10 @@ resource "aws_iam_role_policy" "traefik" {
         "ecs:DescribeTasks",
         "ecs:DescribeContainerInstances",
         "ecs:DescribeTaskDefinition",
+        # See modules/rise-ecs/traefik.tf: both are in Traefik's published
+        # policy, and without them its ECS provider discovers nothing.
+        "ec2:DescribeInstances",
+        "ssm:DescribeInstanceInformation",
       ]
       Resource = "*"
     }]

@@ -79,6 +79,24 @@ run "creates_a_whole_install" {
 # A cluster shared by two installs is only safe if each Traefik discovers just
 # its own containers. The constraint is what enforces that, and it must stay off
 # by default so a single-install cluster keeps routing everything Rise labels.
+# Traefik's ECS provider calls ec2:DescribeInstances and
+# ssm:DescribeInstanceInformation even on Fargate -- they are in the policy its
+# own documentation publishes. Missing either, discovery silently yields nothing
+# and Traefik 404s every host while looking perfectly healthy.
+run "the_traefik_role_grants_what_its_ecs_provider_actually_calls" {
+  command = plan
+
+  assert {
+    condition = setunion(toset(local.traefik_discovery_actions), toset([
+      "ecs:ListClusters", "ecs:DescribeClusters", "ecs:ListTasks",
+      "ecs:DescribeTasks", "ecs:DescribeContainerInstances",
+      "ecs:DescribeTaskDefinition", "ec2:DescribeInstances",
+      "ssm:DescribeInstanceInformation",
+    ])) == toset(local.traefik_discovery_actions)
+    error_message = "the Traefik task role is missing an action its ECS provider calls"
+  }
+}
+
 run "traefik_discovery_is_unconstrained_by_default" {
   command = plan
 
