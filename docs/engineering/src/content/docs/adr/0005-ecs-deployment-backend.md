@@ -463,6 +463,24 @@ difference the Docker backend carries against Kubernetes' Service selector flip
 — stretched further by the ECS provider's ~15 s poll (`refreshSeconds`): a new
 task enters Traefik's rotation only after the next poll observes it, where the
 Docker provider reacts to daemon events immediately.
+The poll cuts the other way at retirement, and this is the one place the ECS
+cutover is genuinely worse than Docker's rather than merely different. Retiring
+a service scales it to zero and deletes it; ECS stops the tasks with the usual
+SIGTERM and `stopTimeout`, but Traefik only learns they are gone at its next
+poll, so for up to `refreshSeconds` it may still send a request to an address
+that has stopped answering. On Docker the provider is reading daemon events, so
+the container leaves the routing table as it stops and the window does not
+exist.
+
+Waiting for the tasks to stop before issuing `DeleteService` would not close it:
+the tasks stop at the same moment either way, and the window is Traefik's view
+going stale, not the service object outliving it. What bounds it is
+`refreshSeconds` (and `healthyTasksOnly`, which drops a task from rotation as
+soon as a poll sees it unhealthy). Closing it properly needs the workload to
+keep serving for at least one poll after SIGTERM — a container concern, not a
+reconciler one. Until then it is an accepted, bounded window, and lowering
+`traefik_refresh_seconds` is the lever an operator has.
+
 ECS's own `deploymentConfiguration` (`minimumHealthyPercent` /
 `maximumPercent`) governs replica-level rolling *within* a service; the
 deployment-level cutover is Rise's, not ECS's.
