@@ -325,8 +325,7 @@ data "aws_iam_policy_document" "backend" {
         "ecs:UpdateService",
         "ecs:DeleteService",
         "ecs:DescribeServices",
-        "ecs:DescribeTasks",
-        "ecs:TagResource"
+        "ecs:DescribeTasks"
       ]
       resources = [
         "arn:${local.partition}:ecs:${local.region}:${local.account_id}:service/${local.ecs_cluster_name}/*",
@@ -337,6 +336,31 @@ data "aws_iam_policy_document" "backend" {
         variable = "ecs:cluster"
         values   = [local.ecs_cluster_arn]
       }
+    }
+  }
+
+  # TagResource is granted separately, without the cluster condition the
+  # statement above carries. It takes a resource ARN and tags, and no cluster
+  # parameter, so `ecs:cluster` is absent from the request context and an
+  # ArnEquals test on it can only fail -- including for the implicit tagging
+  # inside CreateService, which then fails with "no identity-based policy
+  # allows the ecs:TagResource action" however plainly the action is listed.
+  #
+  # Nothing is widened by dropping it: a service ARN embeds its cluster
+  # (`service/<cluster>/<name>`), so the resource list bounds this to the same
+  # cluster the condition did. Only service ARNs are tagged -- at creation, and
+  # again after an update to stamp the content hash -- but task ARNs stay in
+  # scope because tags propagate to tasks.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid     = "TagECSServices"
+      effect  = "Allow"
+      actions = ["ecs:TagResource"]
+      resources = [
+        "arn:${local.partition}:ecs:${local.region}:${local.account_id}:service/${local.ecs_cluster_name}/*",
+        "arn:${local.partition}:ecs:${local.region}:${local.account_id}:task/${local.ecs_cluster_name}/*"
+      ]
     }
   }
 

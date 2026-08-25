@@ -104,6 +104,36 @@ run "ecs_writes_are_confined_to_one_cluster" {
   }
 }
 
+# CreateService carries tags, so it needs ecs:TagResource -- and TagResource
+# takes no cluster parameter, so gating it on `ecs:cluster` denies every service
+# the reconciler tries to create. Confining it by ARN instead costs nothing,
+# since a service ARN embeds its cluster.
+run "tagging_is_granted_without_a_cluster_condition" {
+  command = plan
+
+  assert {
+    condition = anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.backend.json).Statement :
+      s.Sid == "TagECSServices"
+      && contains(tolist([s.Action]), "ecs:TagResource")
+      && !can(s.Condition)
+    ])
+    error_message = "ecs:TagResource must be granted unconditionally; an ecs:cluster condition can never match it"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in [
+        for st in jsondecode(data.aws_iam_policy_document.backend.json).Statement :
+        st if st.Sid == "TagECSServices"
+        ] : alltrue([
+          for r in s.Resource : strcontains(r, ":service/rise-backend/") || strcontains(r, ":task/rise-backend/")
+      ])
+    ])
+    error_message = "ecs:TagResource is not confined to one cluster's service and task ARNs"
+  }
+}
+
 run "disabling_ecs_emits_no_ecs_statements" {
   command = plan
 

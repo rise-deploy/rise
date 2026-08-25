@@ -602,6 +602,17 @@ The controller role must also **trust `ecs-tasks.amazonaws.com`**: on ECS it is
 the task role Rise itself runs as, so without that trust the control-plane task
 cannot start at all.
 
+One scoping exception is load-bearing. Service and task writes are confined by
+an `ArnEquals` condition on `ecs:cluster`, but **`ecs:TagResource` cannot be**:
+it takes a resource ARN and tags and no cluster parameter, so the key is absent
+from the request context and the condition can only fail. Since `CreateService`
+carries tags — and tags are how the reconciler recognises what it owns — gating
+it that way denies every service the backend tries to create, reported as
+"no identity-based policy allows the `ecs:TagResource` action" however plainly
+the action is listed. It is granted in its own unconditional statement instead,
+still confined to one cluster by resource ARN, because a service ARN embeds its
+cluster. A test pins this so the condition is not reinstated as a tightening.
+
 ### D15. Reference AWS topology (operator guidance, not backend logic)
 
 For completeness, the recommended install shape this backend assumes:
