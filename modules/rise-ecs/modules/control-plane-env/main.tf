@@ -5,6 +5,11 @@ locals {
     {
       RISE_CONFIG_RUN_MODE = "ecs"
       PUBLIC_URL           = local.public_url
+      # Rise colours its logs by default, which suits a reader that renders
+      # ANSI -- `kubectl logs` on the Kubernetes backend, or a terminal. These
+      # logs go to a CloudWatch log group, and its console prints the escape
+      # codes literally, so they are noise in front of every line here.
+      RISE_LOG_COLOR = "never"
       # Follows the scheme: a Secure cookie is never sent over plain HTTP, so
       # hardcoding it true would break login on an http install.
       RISE_COOKIE_SECURE  = tostring(var.ingress_scheme == "https")

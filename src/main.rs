@@ -1085,27 +1085,29 @@ where
 
 /// Whether to colour log output.
 ///
-/// Defaults to colouring only a terminal. Anything collecting the stream
-/// verbatim -- a CloudWatch log group behind an ECS task, `docker logs`, a CI
-/// job, a pipe -- shows escape codes as literal text otherwise, which is how
-/// this reads in the ECS console. That covers every such collector rather than
-/// detecting one of them.
+/// Colours by default, including when nothing is attached to a terminal:
+/// whether that renders depends on what reads the stream, not on this process.
+/// `kubectl logs` passes the bytes through to a terminal that renders them, so
+/// a Kubernetes install wants colour despite having no tty; the ECS console
+/// draws the same bytes literally, so an ECS install does not. Being
+/// non-terminal is what those two share, which is why it cannot decide this --
+/// `modules/rise-ecs` sets `never` for the console it knows it is logging to.
 ///
-/// `RISE_LOG_COLOR` overrides: `always`/`never` (`1`/`0`, `true`/`false`), or
-/// `auto` for the default. `NO_COLOR` disables when set to anything non-empty,
-/// per <https://no-color.org>.
+/// `RISE_LOG_COLOR` selects: `never` (`0`, `false`, `no`) never colours,
+/// `always` (`1`, `true`, `yes`) always does, and `auto` colours only a
+/// terminal, for a pipe or a file. `NO_COLOR` set to anything non-empty
+/// disables, per <https://no-color.org>.
 fn ansi_enabled(rise_log_color: Option<&str>, no_color: Option<&str>, is_terminal: bool) -> bool {
     match rise_log_color.map(str::trim) {
         Some("always" | "1" | "true" | "yes") => return true,
         Some("never" | "0" | "false" | "no") => return false,
-        // Anything else, "auto" included, falls through: an unrecognised value
-        // must not be louder than NO_COLOR or quieter than the default.
+        Some("auto") if no_color.is_none_or(str::is_empty) => return is_terminal,
+        // Anything else falls through to NO_COLOR and then the default: an
+        // unrecognised value must not be louder than NO_COLOR, and must not
+        // quietly drop colour that was on before it was misspelled.
         _ => {}
     }
-    if no_color.is_some_and(|v| !v.is_empty()) {
-        return false;
-    }
-    is_terminal
+    no_color.is_none_or(|v| v.is_empty())
 }
 
 #[tokio::main]
@@ -2179,9 +2181,17 @@ mod log_color_tests {
     use super::ansi_enabled;
 
     #[test]
-    fn a_terminal_is_coloured_and_a_pipe_is_not() {
+    fn colour_is_on_by_default_with_or_without_a_terminal() {
+        // A Kubernetes container has no tty and still wants colour, because
+        // `kubectl logs` hands the bytes to one.
         assert!(ansi_enabled(None, None, true));
-        assert!(!ansi_enabled(None, None, false));
+        assert!(ansi_enabled(None, None, false));
+    }
+
+    #[test]
+    fn auto_defers_to_the_terminal() {
+        assert!(ansi_enabled(Some("auto"), None, true));
+        assert!(!ansi_enabled(Some("auto"), None, false));
     }
 
     #[test]
@@ -2199,8 +2209,7 @@ mod log_color_tests {
 
     #[test]
     fn an_unrecognised_override_defers_rather_than_forcing() {
-        assert!(ansi_enabled(Some("auto"), None, true));
-        assert!(!ansi_enabled(Some("auto"), None, false));
         assert!(!ansi_enabled(Some("banana"), Some("1"), true));
+        assert!(ansi_enabled(Some("banana"), None, false));
     }
 }
