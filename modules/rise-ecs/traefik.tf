@@ -90,7 +90,18 @@ locals {
       # -- including ones Rise did not create.
       "--providers.ecs.exposedByDefault=false",
       "--providers.ecs.refreshSeconds=${var.traefik_refresh_seconds}",
-      "--providers.ecs.healthyTasksOnly=true",
+      # Traefik's own per-server health check is the readiness signal: the
+      # renderer emits loadbalancer.healthcheck.* for every container with an
+      # effective health path, and Rise reads the resulting serverStatus.
+      #
+      # `healthyTasksOnly=true` would gate that on ECS's task health instead,
+      # which only exists when the task definition carries a container
+      # healthCheck -- a command run *inside* the container, so it would mean
+      # requiring curl or wget in every user image. Tasks without one report
+      # UNKNOWN, never HEALTHY, and Traefik would drop them: nothing would ever
+      # be routed. Docker's provider has no equivalent gate, so this also keeps
+      # the two Traefik-fronted backends on the same readiness semantics.
+      "--providers.ecs.healthyTasksOnly=false",
     ],
     # Confine discovery to one Rise install. Without it a cluster shared by two
     # installs gives each Traefik the other's containers -- both would answer for

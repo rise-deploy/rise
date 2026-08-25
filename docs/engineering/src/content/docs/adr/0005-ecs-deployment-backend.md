@@ -233,7 +233,8 @@ provider reference, 2026-08): the provider **polls** (`refreshSeconds`, default
 `exposedByDefault` defaults to **true**, so the shipped Traefik configuration
 must set it to `false` and rely on the `traefik.enable=true` label Rise already
 stamps, or every task in the cluster gets a default router; `healthyTasksOnly`
-can additionally gate membership on ECS's own container health status. All of
+can additionally gate membership on ECS's own container health status, and the
+shipped configuration sets it to **false** (see D17). All of
 this is also **verified live** (spike run 2026-08-22, eu-central-1,
 `traefik:v3` — `scripts/spikes/adr-0004-traefik-ecs-provider.sh`): labels are
 consumed into router/middleware/service config, two ECS services carrying one
@@ -475,8 +476,9 @@ exist.
 Waiting for the tasks to stop before issuing `DeleteService` would not close it:
 the tasks stop at the same moment either way, and the window is Traefik's view
 going stale, not the service object outliving it. What bounds it is
-`refreshSeconds` (and `healthyTasksOnly`, which drops a task from rotation as
-soon as a poll sees it unhealthy). Closing it properly needs the workload to
+`refreshSeconds` — and, for a project that declares a `health_check`, Traefik's
+own per-server probe, which drops a server that stops answering without waiting
+for the task to disappear. Closing it properly needs the workload to
 keep serving for at least one poll after SIGTERM — a container concern, not a
 reconciler one. Until then it is an accepted, bounded window, and lowering
 `traefik_refresh_seconds` is the lever an operator has.
@@ -623,6 +625,31 @@ One caveat against the KMS row: `config/ecs.yaml` hardcodes
 shipped ECS config. `rise-aws`'s `enable_kms` covers ECR and the SSM
 SecureStrings, not Rise's application-level encryption. Making that row true
 needs `encryption.type` to become env-driven the way `registry.type` already is.
+
+### D17. Readiness is Traefik's probe, not ECS task health
+
+The shipped Traefik sets `providers.ecs.healthyTasksOnly=false`, and readiness
+comes from Traefik's own per-server health check — the
+`loadbalancer.healthcheck.*` labels the renderer emits for every container with
+an effective health path, whose result Rise reads back through `serverStatus`
+(D12).
+
+The alternative gates rotation on ECS's `healthStatus`, which sounds stricter
+and is unusable. ECS derives that status solely from a `healthCheck` in the task
+definition, and an ECS health check is a **command run inside the container** —
+requiring one would mean requiring `curl` or `wget` in every user image, which
+Rise does not build and cannot constrain. A task without one reports `UNKNOWN`,
+never `HEALTHY`. With `healthyTasksOnly=true` the two rules close a loop with
+nothing in it: Rise waits for Traefik to call the server ready, Traefik will not
+list a server whose task is not `HEALTHY`, and the task cannot become `HEALTHY`
+because no in-container check exists. Nothing is ever routed, and the proxy
+looks perfectly healthy while 404-ing every host.
+
+Setting it `false` also keeps the two Traefik-fronted backends aligned: Docker's
+provider has no equivalent gate, so it routes running containers and relies on
+the same healthcheck labels. Container health, where an image does supply a
+check, remains ECS's business — it restarts what it judges unhealthy — but it is
+not what decides routing.
 
 ## Consequences
 

@@ -1220,9 +1220,53 @@ impl Backend for EcsBackend {
             cli::dump(&format!("{container} logs"), logs);
         }
 
-        // The routing question, answered directly: if Dex is missing from this
-        // list, Traefik never discovered it -- most likely the constraint and
-        // the container's controller-class label disagree.
+        // Whether a running task is eligible for routing at all. A task with no
+        // container healthCheck reports UNKNOWN rather than HEALTHY, so a
+        // Traefik configured with healthyTasksOnly would drop it -- which looks
+        // identical, in the router list below, to never having discovered it.
+        let mut health = Command::new("aws");
+        health.args(["ecs", "describe-tasks", "--cluster", &cluster, "--tasks"]);
+        let running: Vec<String> = services
+            .iter()
+            .filter_map(|service| {
+                self.aws(&[
+                    "ecs",
+                    "list-tasks",
+                    "--cluster",
+                    &cluster,
+                    "--service-name",
+                    service,
+                    "--desired-status",
+                    "RUNNING",
+                    "--query",
+                    "taskArns[:3]",
+                    "--output",
+                    "text",
+                ])
+                .ok()
+            })
+            .flat_map(|arns| {
+                arns.split_whitespace()
+                    .filter(|a| !a.is_empty() && *a != "None")
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if !running.is_empty() {
+            health.args(&running);
+            health.args([
+                "--query",
+                "tasks[].{group:group,last:lastStatus,health:healthStatus,containers:containers[].{name:name,health:healthStatus}}",
+                "--output",
+                "yaml",
+            ]);
+            cli::dump("running task health", health);
+        }
+
+        // The routing question, answered directly. Read it with the health dump
+        // above: a task absent here but HEALTHY there was discovered and
+        // filtered on a label or constraint; absent in both is a task Traefik
+        // was never eligible to see.
         if let Some(stack) = self.stack.as_ref() {
             match http::get(&format!("{}/api/http/routers", stack.traefik_api), None) {
                 Ok(r) => eprintln!("\n--- Traefik routers ---\n{}", r.body),

@@ -267,7 +267,10 @@ resource "aws_ecs_task_definition" "traefik" {
         # controller class into dockerLabels for exactly this.
         "--providers.ecs.constraints=Label(`rise.dev/controller-class`, `${local.controller_class}`)",
         "--providers.ecs.refreshSeconds=5",
-        "--providers.ecs.healthyTasksOnly=true",
+        # See modules/rise-ecs/traefik.tf: gating on ECS task health would
+        # drop every task that carries no container healthCheck, which is all
+        # of them.
+        "--providers.ecs.healthyTasksOnly=false",
         "--entrypoints.web.address=:80",
         "--entrypoints.ping.address=:8082",
         "--ping=true",
