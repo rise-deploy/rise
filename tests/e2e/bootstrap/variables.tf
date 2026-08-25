@@ -23,9 +23,11 @@ variable "github_repository" {
 
 variable "dns_zone_name" {
   description = <<-EOT
-    Public hosted zone for the environment. Delegate it once from the registrar;
-    the harness UPSERTs a per-run scope beneath it (`*.<scope>.<zone>`) at every
-    run start, so runs never collide over one name.
+    Public hosted zone for the environment. It must already exist and the domain
+    must be delegated to it -- the bootstrap adopts the zone rather than
+    creating one, so that a second zone for the same name cannot appear. The
+    harness UPSERTs a per-run scope beneath it (`*.<scope>.<zone>`) at every run
+    start, so runs never collide over one name.
   EOT
   type        = string
   default     = "rise-deploy.click"

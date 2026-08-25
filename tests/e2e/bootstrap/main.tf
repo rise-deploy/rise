@@ -169,8 +169,15 @@ resource "aws_s3_bucket_public_access_block" "state" {
 # with a dash rather than a dot.
 # -----------------------------------------------------------------------------
 
-resource "aws_route53_zone" "this" {
-  name    = var.dns_zone_name
-  comment = "Rise ECS e2e environment"
-  tags    = local.tags
+# The zone is adopted, not created. Registering a domain through Route 53
+# Domains already creates a public zone for it and delegates the domain to that
+# zone's nameservers; creating a second zone for the same name yields a second,
+# equally valid set that nothing on the internet points at. Records written
+# there resolve for no one, and the failure looks like a broken service rather
+# than a name -- the write succeeds, the proxy is healthy, and only the lookup
+# fails. Reading the existing zone also keeps `terraform destroy` from taking
+# the delegation with it.
+data "aws_route53_zone" "this" {
+  name         = var.dns_zone_name
+  private_zone = false
 }

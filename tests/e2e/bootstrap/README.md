@@ -53,8 +53,17 @@ terraform init -backend-config="bucket=${NAME}-tfstate-${ACCOUNT}" -backend-conf
 terraform apply
 ```
 
-`dns_zone_name` defaults to `rise-deploy.click`. Delegate it from the registrar
-once, using the `dns_name_servers` output.
+`dns_zone_name` defaults to `rise-deploy.click`, and its **public hosted zone
+must already exist** — the bootstrap reads it, it does not create it. Registering
+the domain through Route 53 Domains is enough: that creates the zone and
+delegates the domain to it in one step. For a domain registered elsewhere,
+create the zone by hand and set its nameservers (the `dns_name_servers` output)
+at the registrar.
+
+Do not let a second zone for the same name exist. Two zones for one domain are
+both valid and have different nameservers, only one of which the domain points
+at; records written to the other resolve for nobody, and the harness fails
+looking like a broken service rather than a name that does not resolve.
 
 The `backend_config` output prints those arguments if you forget them.
 

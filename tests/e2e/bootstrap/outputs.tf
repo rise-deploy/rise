@@ -57,16 +57,21 @@ output "ecr_repo_prefix" {
 }
 
 output "dns_zone_id" {
-  value = aws_route53_zone.this.zone_id
+  value = data.aws_route53_zone.this.zone_id
 }
 
 output "dns_zone_name" {
-  value = aws_route53_zone.this.name
+  value = data.aws_route53_zone.this.name
 }
 
 output "dns_name_servers" {
-  description = "Delegate the zone to these from the parent domain, once."
-  value       = aws_route53_zone.this.name_servers
+  description = <<-EOT
+    The adopted zone's nameservers. A domain registered through Route 53 Domains
+    is already delegated to these; for a domain registered elsewhere, set them
+    as its nameservers at the registrar. Nothing under the zone resolves until
+    they match.
+  EOT
+  value       = data.aws_route53_zone.this.name_servers
 }
 
 output "state_bucket" {
@@ -105,8 +110,8 @@ resource "aws_ssm_parameter" "bootstrap" {
     log_group_name           = aws_cloudwatch_log_group.this.name
     traefik_task_role_arn    = aws_iam_role.traefik.arn
     ecr_repo_prefix          = "${var.name}/"
-    dns_zone_id              = aws_route53_zone.this.zone_id
-    dns_zone_name            = trimsuffix(aws_route53_zone.this.name, ".")
+    dns_zone_id              = data.aws_route53_zone.this.zone_id
+    dns_zone_name            = trimsuffix(data.aws_route53_zone.this.name, ".")
     state_bucket             = aws_s3_bucket.state.id
   })
 
