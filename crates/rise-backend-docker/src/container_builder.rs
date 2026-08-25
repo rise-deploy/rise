@@ -1350,7 +1350,7 @@ mod tests {
             labels
                 .get(&format!("traefik.http.routers.{r}.middlewares"))
                 .map(String::as_str),
-            Some(format!("{r}-auth@docker").as_str())
+            Some(format!("{r}-auth").as_str())
         );
     }
 
@@ -1418,7 +1418,7 @@ mod tests {
             labels
                 .get(&format!("traefik.http.routers.{member_router}.middlewares"))
                 .map(String::as_str),
-            Some(format!("{member_router}-auth@docker").as_str())
+            Some(format!("{member_router}-auth").as_str())
         );
     }
 
