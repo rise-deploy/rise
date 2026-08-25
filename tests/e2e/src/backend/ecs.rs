@@ -402,6 +402,15 @@ impl EcsBackend {
     /// a shared apex would have each run repointing the other's traffic.
     ///
     /// The wildcard is required: projects are served at
+    /// The prefix Rise is actually configured with, which is the bootstrap's
+    /// prefix plus this run's scope -- `local.scoped_ecr_repo_prefix` in the
+    /// per-run root. The bootstrap prefix alone spans every run, so anything
+    /// derived from it matches a concurrent run's repositories too, and
+    /// anything expecting it looks for a name the control plane never creates.
+    fn scoped_repo_prefix(&self) -> String {
+        format!("{}{}/", self.env().ecr_repo_prefix, self.scope)
+    }
+
     /// `<project>.<scope>.<zone>`. One wildcard label is enough because groups
     /// and environments join the project name with a dash, not a dot.
     fn change_dns(&self, action: &str, ip: &str) -> Result<()> {
@@ -669,10 +678,9 @@ impl EcsBackend {
         // Repositories are billed while they hold images, and `auto_remove` only
         // fires on a project delete that never happened.
         //
-        // Under this scope's own segment of the shared prefix, matching
-        // `local.scoped_ecr_repo_prefix` in the per-run root -- the bootstrap
+        // Under this scope's own segment of the shared prefix: the bootstrap
         // prefix alone spans every run, and a concurrent one's images are live.
-        let repo_prefix = format!("{}{}/", self.env().ecr_repo_prefix, self.scope);
+        let repo_prefix = self.scoped_repo_prefix();
         let repos: Vec<String> = serde_json::from_str(
             &self
                 .aws(&[
@@ -1105,7 +1113,7 @@ impl Backend for EcsBackend {
     }
 
     fn wait_registry_ready(&self, project: &str) -> Result<()> {
-        let repo = format!("{}{project}", self.env().ecr_repo_prefix);
+        let repo = format!("{}{project}", self.scoped_repo_prefix());
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
         loop {
             if self

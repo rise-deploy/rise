@@ -31,6 +31,20 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Docker installs restart the containers of non-public projects once, on the
+  first reconcile after upgrade.** The Traefik router's forwardAuth middleware
+  was referenced as `{router}-auth@docker`. Naming a provider is wrong for any
+  other: on ECS that reference resolves to nothing, Traefik logs `middleware
+  ... does not exist`, and every request to a private project 404s while public
+  projects route normally. The reference is now unqualified, which resolves
+  within whichever provider read the labels.
+
+  Docker's behaviour is unchanged — same provider, same middleware — but the
+  label's value feeds the container recreate signature, so each affected
+  container is recreated once to pick it up. Only projects whose access class
+  is `Authenticated` or `Member` carry the label at all; public projects have no
+  middleware and are untouched. No action is required.
+
 - **Action required if you granted generic resource API access by adding people
   to `auth.operator_users` — the API is now authorized, not operator-gated.**
   `/api/v1/resources` no longer refuses everyone but operators. Every request is

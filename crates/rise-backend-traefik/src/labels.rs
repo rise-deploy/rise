@@ -216,9 +216,16 @@ pub fn render_traefik_labels(route: &TraefikRoute<'_>) -> HashMap<String, String
             format!("traefik.http.middlewares.{r}-auth.forwardauth.authResponseHeaders"),
             fa.auth_response_headers.to_string(),
         );
+        // No `@provider` suffix. The middleware is defined by the labels above,
+        // so it belongs to whichever provider read them, and an unqualified
+        // reference resolves within that provider. Naming one explicitly is
+        // wrong for every other: `@docker` on an `@ecs` router leaves Traefik
+        // logging `middleware ... does not exist` and 404ing the route, which
+        // fails closed for private projects but only for them -- a public
+        // project has no middleware and routes fine.
         labels.insert(
             format!("traefik.http.routers.{r}.middlewares"),
-            format!("{r}-auth@docker"),
+            format!("{r}-auth"),
         );
     }
     labels
@@ -472,7 +479,36 @@ mod tests {
             labels
                 .get("traefik.http.routers.app.middlewares")
                 .map(String::as_str),
-            Some("app-auth@docker")
+            Some("app-auth")
+        );
+    }
+
+    #[test]
+    fn the_auth_middleware_reference_names_no_provider() {
+        let hosts = vec!["a.rise.dev".to_string()];
+        let route = TraefikRoute {
+            router_name: "app",
+            hosts: &hosts,
+            path_prefix: None,
+            port: 8080,
+            entrypoint: "web",
+            network: None,
+            certresolver: None,
+            forward_auth: Some(ForwardAuth {
+                address: "http://rise:3000/api/v1/auth/ingress",
+                auth_response_headers: "X-Auth-Request-Email",
+            }),
+        };
+        let labels = render_traefik_labels(&route);
+        let reference = labels
+            .get("traefik.http.routers.app.middlewares")
+            .expect("a forwardAuth route references its middleware");
+        // A suffix would bind the reference to one provider: correct for the
+        // provider it names and broken for every other, since the middleware
+        // is defined wherever these labels are read.
+        assert!(
+            !reference.contains('@'),
+            "middleware reference must not name a provider, got {reference:?}"
         );
     }
 
