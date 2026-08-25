@@ -102,15 +102,15 @@ account you care about.
 3. **A published `RISE_IMAGE_TAG`.** ECS pulls the control-plane image from
    GHCR, so a local build is not visible to it. Same constraint the Docker
    driver already has.
-4. **A public hosted zone for `dns_zone_name`, with the domain delegated to
-   it.** `bootstrap/` *adopts* the zone (`data "aws_route53_zone"`); it does not
-   create one. Registering the domain through Route 53 Domains gives you both
-   halves at once — the zone, and the delegation to it. Anything else means
-   creating the zone yourself and setting its nameservers at the registrar.
-   Never leave two zones for the same name: both are valid, they have different
-   nameservers, and records written to the one the domain does *not* point at
-   resolve for nobody. The harness checks resolution at bring-up and prints the
-   zone's nameservers when it fails.
+4. **A public hosted zone, passed as `dns_zone_id`, with the domain delegated
+   to it.** `bootstrap/` neither creates the zone nor looks it up. Registering
+   the domain through Route 53 Domains gives you both halves at once — the
+   zone, and the delegation to it. Anything else means creating the zone
+   yourself and setting its nameservers at the registrar. Never leave two zones
+   for the same domain: both are valid, they have different nameservers, and
+   records written to the one the domain does *not* point at resolve for
+   nobody. The harness checks resolution at bring-up and prints the zone's
+   nameservers when it fails.
 
 The environment is **persistent** — applied once by hand, not per run. See
 [`bootstrap/README.md`](bootstrap/README.md) for what it creates and how to wire

@@ -21,13 +21,33 @@ variable "github_repository" {
   }
 }
 
+variable "dns_zone_id" {
+  description = <<-EOT
+    The public hosted zone to serve this environment from. It must already
+    exist, and the domain must be delegated to it.
+
+    Taken as an id rather than created here, or looked up by name, for two
+    reasons. Creating one invites a *second* zone for a domain that already has
+    one -- registering through Route 53 Domains creates a zone and delegates to
+    it, so a `resource` here yields two valid zones with different nameservers,
+    only one of which the domain points at; records written to the other
+    resolve for nobody. Looking one up by name reintroduces that ambiguity and
+    costs an API call at plan time, which the credential-free plan tests cannot
+    make.
+  EOT
+  type        = string
+
+  validation {
+    condition     = can(regex("^Z[A-Z0-9]+$", var.dns_zone_id))
+    error_message = "dns_zone_id must be a Route 53 hosted zone id, e.g. Z09798271JB9GIJW4BB9X."
+  }
+}
+
 variable "dns_zone_name" {
   description = <<-EOT
-    Public hosted zone for the environment. It must already exist and the domain
-    must be delegated to it -- the bootstrap adopts the zone rather than
-    creating one, so that a second zone for the same name cannot appear. The
-    harness UPSERTs a per-run scope beneath it (`*.<scope>.<zone>`) at every run
-    start, so runs never collide over one name.
+    The domain `dns_zone_id` serves, without a trailing dot. The harness UPSERTs
+    a per-run scope beneath it (`*.<scope>.<zone>`) at every run start, so runs
+    never collide over one name.
   EOT
   type        = string
   default     = "rise-deploy.click"

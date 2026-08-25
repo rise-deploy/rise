@@ -46,6 +46,7 @@ override_data {
 variables {
   name              = "rise-e2e"
   region            = "eu-central-1"
+  dns_zone_id       = "Z00000000000000000000"
   dns_zone_name     = "rise-deploy.click"
   github_repository = "rise-deploy/rise"
 }
