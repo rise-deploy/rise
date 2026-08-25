@@ -84,27 +84,22 @@ for that reason, and two things narrow it when on:
 
 ## Wiring the suite into CI
 
-Applying this workspace is not enough on its own; the workflow
-(`.github/workflows/e2e-ecs.yml`) needs three repository **variables** and one
-label.
+For this repository's own environment, nothing. The workflow
+(`.github/workflows/e2e-ecs.yml`) hardcodes the role ARN and region, because
+neither is secret and both are already committed a few files away — the account
+is in the state bucket's name in `versions.tf`, the region beside it. The only
+one-off is creating the **`ecs-e2e` label**, since the pull-request trigger
+matches that exact name.
 
-Under *Settings → Secrets and variables → Actions → Variables*:
+Pointing it at a *different* bootstrap takes three repository variables
+(*Settings → Secrets and variables → Actions → Variables*), each overriding the
+built-in default:
 
-| Variable | Value |
+| Variable | Default |
 |---|---|
-| `AWS_E2E_ROLE_ARN` | `terraform output ci_role_arn` |
-| `AWS_E2E_REGION` | the region this was applied to |
-| `AWS_E2E_ENV_NAME` | only if `name` is not `rise-e2e` |
-
-Variables rather than secrets on purpose: a role ARN and a region are not
-sensitive, and a masked value that is simply *unset* fails as an empty string
-with no hint of why. Note the tab — `vars.*` does not see anything set under
-*Secrets*, so a value in the wrong place reads as empty. The workflow checks all
-three before assuming the role and names whichever is missing.
-
-Then create the **`ecs-e2e` label** once. The pull-request trigger fires on
-`labeled` and matches that exact name, so without the label existing there is no
-way to opt a pull request in.
+| `AWS_E2E_ROLE_ARN` | `terraform output ci_role_arn` of this repo's environment |
+| `AWS_E2E_REGION` | `eu-central-1` |
+| `AWS_E2E_ENV_NAME` | `rise-e2e` |
 
 Three ways to run it:
 

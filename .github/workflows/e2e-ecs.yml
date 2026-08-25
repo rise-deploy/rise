@@ -50,6 +50,16 @@ jobs:
     name: ECS
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Hardcoded because none of it is secret and all of it is already in the
+      # repository: the account is in the state bucket's name in
+      # tests/e2e/bootstrap/versions.tf, and the region sits beside it. Making
+      # CI ask for the same public values through repository settings bought
+      # nothing but a setup step to forget -- and an opaque failure when it was.
+      #
+      # `vars.*` still wins, for anyone pointing this at their own bootstrap.
+      AWS_E2E_ROLE_ARN: ${{ vars.AWS_E2E_ROLE_ARN || 'arn:aws:iam::806938668647:role/rise-e2e-ci' }}
+      AWS_E2E_REGION: ${{ vars.AWS_E2E_REGION || 'eu-central-1' }}
     # A labelled PR only, and only one from this repository: a fork's head is
     # untrusted and this job holds credentials.
     #
@@ -97,32 +107,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `vars.*` reads the repository's *Variables*, not its Secrets -- a value
-      # set in the wrong tab reads as empty here. Unset, the AWS action fails
-      # with "Input required and not supplied: aws-region", which names neither
-      # the variable nor the fact that the role ARN is missing too.
-      - name: Check the e2e variables are set
-        shell: bash
-        env:
-          ROLE_ARN: ${{ vars.AWS_E2E_ROLE_ARN }}
-          REGION: ${{ vars.AWS_E2E_REGION }}
-        run: |
-          set -euo pipefail
-          missing=()
-          [[ -n "${ROLE_ARN}" ]] || missing+=("AWS_E2E_ROLE_ARN — terraform -chdir=tests/e2e/bootstrap output ci_role_arn")
-          [[ -n "${REGION}" ]] || missing+=("AWS_E2E_REGION — the region the bootstrap was applied to")
-          if (( ${#missing[@]} )); then
-            echo "::error::Missing repository variables. Set them under Settings → Secrets and variables → Actions → Variables (not Secrets):"
-            printf '::error::  %s\n' "${missing[@]}"
-            exit 1
-          fi
-          echo "role=${ROLE_ARN} region=${REGION}"
-
       - name: Assume the e2e role
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_E2E_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_E2E_REGION }}
+          role-to-assume: ${{ env.AWS_E2E_ROLE_ARN }}
+          aws-region: ${{ env.AWS_E2E_REGION }}
           role-session-name: rise-e2e-${{ github.run_id }}
 
       # Built here rather than pulled from ci.yml's artifact: this workflow runs
@@ -137,7 +126,7 @@ jobs:
           # The run's identity: `pr-<number>` on a pull request, `nightly` on the
           # schedule. Read straight off a preview URL.
           RISE_E2E_SCOPE: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
-          AWS_REGION: ${{ vars.AWS_E2E_REGION }}
+          AWS_REGION: ${{ env.AWS_E2E_REGION }}
           RISE_IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
           RISE_IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
         run: ./tests/e2e/target/release/rise-e2e
@@ -154,7 +143,7 @@ jobs:
       - name: Destroy the per-run stack
         if: always()
         env:
-          AWS_REGION: ${{ vars.AWS_E2E_REGION }}
+          AWS_REGION: ${{ env.AWS_E2E_REGION }}
         run: |
           if [[ -d tests/e2e/run/.terraform ]]; then
             terraform -chdir=tests/e2e/run destroy -auto-approve -input=false || true
