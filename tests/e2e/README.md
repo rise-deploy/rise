@@ -32,7 +32,7 @@ RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
 # ECS backend (runs against the persistent environment — see "ECS Backend"
-# below, and apply aws/bootstrap once first).
+# below, and apply bootstrap/ once first).
 AWS_PROFILE=<scratch> AWS_REGION=eu-central-1 \
 RISE_E2E_BACKEND=ecs RISE_E2E_ENV=rise-e2e RISE_IMAGE_TAG=<published-tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
@@ -104,15 +104,15 @@ account you care about.
    driver already has.
 
 The environment is **persistent** — applied once by hand, not per run. See
-[`aws/bootstrap/README.md`](aws/bootstrap/README.md) for what it creates and how
-to wire CI to it. Per run the harness applies `aws/run` (Postgres and the control
-plane), so every run starts on a fresh database and the image under test, and
-destroys it afterwards.
+[`bootstrap/README.md`](bootstrap/README.md) for what it creates and how to wire
+CI to it. Per run the harness applies `run/` — Traefik, Dex, Postgres and the
+control plane — so every run starts on a fresh database, a fresh proxy and the
+image under test, and destroys the lot afterwards.
 
 ### Caller permissions
 
 Applying the bootstrap needs IAM write, which is why it is done by hand. Running
-the suite does not: `aws/bootstrap` creates a GitHub OIDC role holding only what
+the suite does not: `bootstrap/` creates a GitHub OIDC role holding only what
 a run needs — ECS, the EC2 describes plus edge security-group rules, Route 53
 record changes on the environment's zone, ECR and SSM for the sweep, S3 for the
 per-run state, and `iam:PassRole` on exactly the three pre-created roles. Nothing
@@ -124,6 +124,26 @@ The environment runs with `registry: ecr` under a repository prefix, so the suit
 exercises the real path: Rise provisions a repository per project, the CLI pushes
 with the STS-scoped credentials Rise mints, and the task execution role pulls.
 
+### The scope, and what it isolates
+
+Every run picks a **scope** — `pr-<number>` in CI, `nightly` on the schedule and
+on a manual dispatch, `dev-<user>` locally — and that one token names everything
+the run touches, so concurrent runs share the cluster without seeing each other:
+
+| | |
+|---|---|
+| Terraform state | `run/<scope>/terraform.tfstate` |
+| DNS | `rise.<scope>.<zone>`, `dex.<scope>.<zone>` |
+| Controller class | `<scope>`, which is also this run's Traefik constraint |
+| ECS services, task families, log stream prefixes | `…-<scope>-…` |
+| Rise's own resource, ECR and SSM prefixes | scoped, so the sweep below can enumerate its own |
+
+Anything added here has to carry it. An unscoped ECS service name fails a
+concurrent run's `CreateService` outright; an unscoped ECR or SSM prefix is worse
+than that, because the bring-up sweep enumerates by prefix and would delete a
+live run's images and secrets. The per-run plan tests assert the scope on all of
+these.
+
 ### Cleanup, and why the sweep runs at bring-up
 
 Deployments the suite creates are ECS services **Rise** owns, not Terraform.
@@ -134,6 +154,13 @@ see. Left alone they hold Fargate quota until a later run fails mid-suite.
 So teardown deletes projects through the API first (which also exercises project
 delete and ECR auto-removal), and bring-up sweeps by tag before anything else —
 a crashed or cancelled run never reaches teardown.
+
+The sweep is same-scope only, and so is Rise's own orphan collector, so **a scope
+that never runs again is never reaped**. A pull request whose last run was
+cancelled mid-suite leaves its workload services, ECR repositories, SSM
+parameters and DNS records behind for good — the workflow's backstop destroys the
+Terraform stack, but not what Rise created inside it. Watch for it after a burst
+of cancelled runs; a cross-scope reaper is the fix and is not written yet.
 
 **`KEEP=1` leaves the per-run stack up** for inspection. It keeps consuming quota
 and leaves the edge open until you destroy it:
@@ -148,12 +175,14 @@ terraform -chdir=tests/e2e/run destroy -auto-approve
   own stack: `DockerBackend` via `docker compose` (CLI extraction via `docker cp`,
   Traefik reach); `MinikubeBackend` via `minikube start` + `helm upgrade --install`
   + the JFrog/Vault registry stack + background `kubectl port-forward`s (server,
-  Dex, per-app reach); `EcsBackend` by driving `terraform` against `aws/run` in a
+  Dex, per-app reach); `EcsBackend` by driving `terraform` against `run/` in a
   persistent cluster, where Traefik, Postgres, Dex and Rise all run as ECS
   services (CLI extraction via `docker cp`, reach via Traefik's address with an
   explicit `Host` header).
-- `aws/bootstrap/` — the persistent environment and its IAM, applied by hand.
-- `aws/run/` — Postgres and the control plane, applied and destroyed per run.
+- `bootstrap/` — the persistent shell (VPC, cluster, zone, state bucket) and its
+  IAM, applied by hand.
+- `run/` — Traefik, Dex, Postgres and the control plane, applied and destroyed
+  per run.
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
   `Scenario::applies_to(backend)` returns `Run` or `Skip(reason)`.
 - `src/compose.rs` — standalone `rise compose` suite. It runs the CLI directly
