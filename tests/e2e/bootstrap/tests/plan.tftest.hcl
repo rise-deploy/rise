@@ -22,17 +22,6 @@ override_data {
   values = { partition = "aws" }
 }
 
-# The zone is read, not created, so the plan needs an answer for it without
-# reaching a real account.
-override_data {
-  target = data.aws_route53_zone.this
-  values = {
-    zone_id      = "Z00000000000000000"
-    name         = "rise-deploy.click."
-    name_servers = ["ns-1.awsdns-00.org", "ns-2.awsdns-00.com"]
-  }
-}
-
 # The submodule reads identity too.
 override_data {
   target = module.rise_aws.data.aws_caller_identity.current
