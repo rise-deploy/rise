@@ -43,7 +43,7 @@ resource "aws_service_discovery_service" "rise" {
 # -----------------------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "postgres" {
-  family                   = "${var.name}-postgres"
+  family                   = "${var.name}-${var.scope}-postgres"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = "512"
@@ -77,7 +77,7 @@ resource "aws_ecs_task_definition" "postgres" {
         options = {
           "awslogs-group"         = local.env.log_group_name
           "awslogs-region"        = var.region
-          "awslogs-stream-prefix" = "postgres"
+          "awslogs-stream-prefix" = "postgres-${var.scope}"
         }
       }
     }
@@ -87,7 +87,7 @@ resource "aws_ecs_task_definition" "postgres" {
 }
 
 resource "aws_ecs_service" "postgres" {
-  name            = "${var.name}-postgres"
+  name            = "${var.name}-${var.scope}-postgres"
   cluster         = local.env.cluster_arn
   task_definition = aws_ecs_task_definition.postgres.arn
   launch_type     = "FARGATE"
@@ -112,7 +112,7 @@ resource "aws_ecs_service" "postgres" {
 # -----------------------------------------------------------------------------
 
 resource "aws_ecs_task_definition" "rise" {
-  family                   = "${var.name}-rise"
+  family                   = "${var.name}-${var.scope}-rise"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = "1024"
@@ -162,7 +162,7 @@ resource "aws_ecs_task_definition" "rise" {
         options = {
           "awslogs-group"         = local.env.log_group_name
           "awslogs-region"        = var.region
-          "awslogs-stream-prefix" = "rise"
+          "awslogs-stream-prefix" = "rise-${var.scope}"
         }
       }
     }
@@ -172,7 +172,7 @@ resource "aws_ecs_task_definition" "rise" {
 }
 
 resource "aws_ecs_service" "rise" {
-  name            = "${var.name}-rise"
+  name            = "${var.name}-${var.scope}-rise"
   cluster         = local.env.cluster_arn
   task_definition = aws_ecs_task_definition.rise.arn
   launch_type     = "FARGATE"

@@ -136,6 +136,35 @@ run "the_scope_isolates_dns_routing_and_collection" {
     error_message = "the control plane would be filtered out by the run's own Traefik constraint"
   }
 
+  # ECS service names are unique per cluster and the cluster is shared, so an
+  # unscoped name is not a cosmetic slip: the second concurrent run's apply
+  # fails outright on CreateService. Asserted for all four rather than for the
+  # ones that were wrong, so the next service added has to answer for itself.
+  assert {
+    condition = alltrue([
+      for n in [
+        aws_ecs_service.postgres.name,
+        aws_ecs_service.rise.name,
+        aws_ecs_service.traefik.name,
+        aws_ecs_service.dex.name,
+      ] : strcontains(n, "-pr-457-")
+    ])
+    error_message = "an ECS service name does not carry the run's scope"
+  }
+
+  # Same for what Rise itself creates. These are enumerated by prefix at the
+  # next run's bring-up sweep, so an unscoped prefix hands that sweep a
+  # concurrent run's live images and secrets.
+  assert {
+    condition     = local.scoped_ecr_repo_prefix == "rise-e2e/pr-457/"
+    error_message = "Rise's ECR repositories are not confined to this run"
+  }
+
+  assert {
+    condition     = module.control_plane_env.environment["RISE_ECS_SSM_PREFIX"] == "rise-e2e/pr-457"
+    error_message = "Rise's SSM parameters are not confined to this run"
+  }
+
   # Cloud Map is shared across runs, so per-run services need distinct names.
   assert {
     condition     = aws_service_discovery_service.traefik.name == "traefik-pr-457"

@@ -36,7 +36,8 @@ output "region" {
 }
 
 output "ecr_repo_prefix" {
-  value = local.env.ecr_repo_prefix
+  description = "Scoped to this run, so the harness sweep never enumerates another run's repositories."
+  value       = local.scoped_ecr_repo_prefix
 }
 
 output "traefik_service_name" {

@@ -327,7 +327,7 @@ impl EcsBackend {
                     anyhow::ensure!(
                         std::time::Instant::now() < deadline,
                         "{service} had no running task with a public address within 5 \
-                         minutes. Its events and stopped-task reasons are dumped above -- \
+                         minutes. Its events and stopped-task reasons follow below -- \
                          a task that never starts is usually an image it cannot pull or an \
                          exhausted Fargate quota."
                     );
@@ -548,7 +548,7 @@ impl EcsBackend {
                 if !managed || !ours || !live {
                     continue;
                 }
-                let _ = self.aws(&[
+                match self.aws(&[
                     "ecs",
                     "delete-service",
                     "--cluster",
@@ -556,13 +556,22 @@ impl EcsBackend {
                     "--service",
                     name,
                     "--force",
-                ]);
-                swept += 1;
+                ]) {
+                    Ok(_) => swept += 1,
+                    // Counting the attempt would report cleanups that did not
+                    // happen, and the run afterwards looks clean when it is not.
+                    Err(e) => report::note(&format!("could not sweep service {name}: {e:#}")),
+                }
             }
         }
 
         // Repositories are billed while they hold images, and `auto_remove` only
         // fires on a project delete that never happened.
+        //
+        // Under this scope's own segment of the shared prefix, matching
+        // `local.scoped_ecr_repo_prefix` in the per-run root -- the bootstrap
+        // prefix alone spans every run, and a concurrent one's images are live.
+        let repo_prefix = format!("{}{}/", self.env().ecr_repo_prefix, self.scope);
         let repos: Vec<String> = serde_json::from_str(
             &self
                 .aws(&[
@@ -570,8 +579,7 @@ impl EcsBackend {
                     "describe-repositories",
                     "--query",
                     &format!(
-                        "repositories[?starts_with(repositoryName, '{}')].repositoryName",
-                        self.env().ecr_repo_prefix
+                        "repositories[?starts_with(repositoryName, '{repo_prefix}')].repositoryName"
                     ),
                     "--output",
                     "json",
@@ -595,8 +603,10 @@ impl EcsBackend {
                 .aws(&[
                     "ssm",
                     "get-parameters-by-path",
+                    // Likewise scoped, matching `ssm_parameter_prefix` in the
+                    // per-run root: another run's secrets are in use.
                     "--path",
-                    &format!("/{}/", self.env_name),
+                    &format!("/{}/{}/", self.env_name, self.scope),
                     "--recursive",
                     "--query",
                     "Parameters[].Name",
@@ -609,7 +619,9 @@ impl EcsBackend {
         let stale: Vec<&str> = params
             .iter()
             .map(String::as_str)
-            // Never the bootstrap's own description of the environment.
+            // Never the bootstrap's own description of the environment, which a
+            // scope literally named `e2e` would otherwise sweep out from under
+            // every other run.
             .filter(|n| !n.ends_with("/e2e/bootstrap"))
             .collect();
         for chunk in stale.chunks(10) {
@@ -1113,7 +1125,7 @@ impl Backend for EcsBackend {
             cli::dump(&format!("why {service} tasks stopped"), why);
         }
 
-        for container in ["traefik", "dex", "rise"] {
+        for container in ["traefik", "dex", "postgres", "rise"] {
             let mut logs = Command::new("aws");
             logs.args([
                 "logs",

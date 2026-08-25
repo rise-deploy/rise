@@ -44,6 +44,12 @@ locals {
   # Traefik is constrained to the same value below.
   controller_class = var.scope
 
+  # The bootstrap's prefix is shared by every run; Rise's repositories go under
+  # this run's own segment of it so the bring-up sweep can enumerate its own
+  # without reaching a concurrent run's. The trailing slash is what makes it a
+  # prefix rather than a repository name.
+  scoped_ecr_repo_prefix = "${local.env.ecr_repo_prefix}${var.scope}/"
+
   # Cloud Map is shared, so per-run services need distinct names within it.
   postgres_host = "postgres-${var.scope}.${local.env.cloud_map_namespace_name}"
   rise_host     = "rise-${var.scope}.${local.env.cloud_map_namespace_name}"
@@ -107,8 +113,13 @@ module "control_plane_env" {
   # Faster than production's 30s: a suite waiting on reconciliation is waiting
   # on this.
   reconcile_interval_secs = 10
-  resource_prefix         = var.name
-  ssm_parameter_prefix    = var.name
+  # Everything Rise itself creates is scoped too, not just the stack around it.
+  # ECS service names are cluster-unique, and the ECR repositories and SSM
+  # parameters are what the next run's bring-up sweep enumerates by prefix -- an
+  # unscoped prefix makes that sweep reach into a concurrent run's live images
+  # and secrets.
+  resource_prefix      = "${var.name}-${var.scope}"
+  ssm_parameter_prefix = "${var.name}/${var.scope}"
 
   # See `local.controller_class`: this is what isolates one run from another.
   controller_class_name = local.controller_class
@@ -117,7 +128,7 @@ module "control_plane_env" {
     type          = "ecr"
     account_id    = data.aws_caller_identity.current.account_id
     push_role_arn = local.env.ecr_push_role_arn
-    repo_prefix   = local.env.ecr_repo_prefix
+    repo_prefix   = local.scoped_ecr_repo_prefix
     # Project deletion at teardown then removes the repository, which is both
     # the cleanup path and a free test of it.
     auto_remove = true
