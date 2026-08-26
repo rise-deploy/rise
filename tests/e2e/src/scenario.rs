@@ -1076,7 +1076,10 @@ impl Scenario for HealthRollingCutover {
         let mut status_ok = false;
         let mut last = String::new();
         for _ in 0..30 {
-            let resp = b.traefik_api(&format!("/api/http/services/{svc}@docker"))?;
+            let resp = b.traefik_api(&format!(
+                "/api/http/services/{svc}@{}",
+                b.traefik_provider()
+            ))?;
             last = resp.body.clone();
             if resp.status == 200 {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.body) {
@@ -1106,7 +1109,8 @@ impl Scenario for HealthRollingCutover {
         }
         anyhow::ensure!(
             status_ok,
-            "Traefik API never exposed a valid non-empty serverStatus for {svc}@docker; last:\n{last}"
+            "Traefik API never exposed a valid non-empty serverStatus for {svc}@{}; last:\n{last}",
+            b.traefik_provider()
         );
 
         // Force a cutover (changed env → new revision) and assert NO 5xx gap across

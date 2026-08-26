@@ -1561,6 +1561,115 @@ impl Backend for EcsBackend {
         http::get(&format!("{}{}", self.stack().traefik_api, path), None)
     }
 
+    fn traefik_provider(&self) -> &'static str {
+        "ecs"
+    }
+
+    /// The app container's Traefik `dockerLabels`, as a JSON object — the ECS
+    /// analogue of `docker inspect --format {{json .Config.Labels}}`. Read off
+    /// the project's active service's task definition.
+    fn app_container_labels(&self, project: &str) -> Result<String> {
+        let services = self.project_services(project)?;
+        let svc = services
+            .first()
+            .with_context(|| format!("no live ECS service for project {project}"))?;
+        let td = self.aws(&[
+            "ecs",
+            "describe-services",
+            "--cluster",
+            &self.env().cluster_name,
+            "--services",
+            svc,
+            "--query",
+            "services[0].taskDefinition",
+            "--output",
+            "text",
+        ])?;
+        let td = td.trim();
+        anyhow::ensure!(!td.is_empty(), "no task definition on service {svc}");
+        self.aws(&[
+            "ecs",
+            "describe-task-definition",
+            "--task-definition",
+            td,
+            "--query",
+            "taskDefinition.containerDefinitions[0].dockerLabels",
+            "--output",
+            "json",
+        ])
+    }
+
+    /// One JSON array of `KEY=VALUE` strings per RUNNING app task, matching the
+    /// shape the Docker backend returns from `.Config.Env`. Deduped by task
+    /// definition, so a task still on the outgoing revision still shows its env
+    /// (which is how the cutover check sees the old revision retire). Secret env
+    /// vars live in the task definition's `secrets` block, not `environment`, and
+    /// are deliberately absent here — the cutover check only reads plain vars.
+    fn app_container_envs(&self, project: &str) -> Result<Vec<String>> {
+        let cluster = self.env().cluster_name.clone();
+        let mut task_defs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for svc in self.project_services(project)? {
+            let arns: Vec<String> = serde_json::from_str(
+                &self
+                    .aws(&[
+                        "ecs",
+                        "list-tasks",
+                        "--cluster",
+                        &cluster,
+                        "--service-name",
+                        &svc,
+                        "--desired-status",
+                        "RUNNING",
+                        "--query",
+                        "taskArns[]",
+                        "--output",
+                        "json",
+                    ])
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default();
+            for chunk in arns.chunks(100) {
+                let mut args: Vec<String> = vec![
+                    "ecs".into(),
+                    "describe-tasks".into(),
+                    "--cluster".into(),
+                    cluster.clone(),
+                    "--query".into(),
+                    "tasks[].taskDefinitionArn".into(),
+                    "--output".into(),
+                    "json".into(),
+                    "--tasks".into(),
+                ];
+                args.extend(chunk.iter().cloned());
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let td_arns: Vec<String> =
+                    serde_json::from_str(&self.aws(&refs)?).unwrap_or_default();
+                task_defs.extend(td_arns);
+            }
+        }
+
+        let mut envs = Vec::new();
+        for td in task_defs {
+            let raw = self.aws(&[
+                "ecs",
+                "describe-task-definition",
+                "--task-definition",
+                &td,
+                "--query",
+                "taskDefinition.containerDefinitions[0].environment",
+                "--output",
+                "json",
+            ])?;
+            let parsed: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+            let kv: Vec<String> = parsed
+                .iter()
+                .filter_map(|e| Some(format!("{}={}", e["name"].as_str()?, e["value"].as_str()?)))
+                .collect();
+            envs.push(serde_json::to_string(&kv)?);
+        }
+        Ok(envs)
+    }
+
     fn app_host(&self, project: &str) -> String {
         format!("{}.{}", project, self.stack().domain)
     }

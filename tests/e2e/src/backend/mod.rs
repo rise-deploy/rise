@@ -153,12 +153,20 @@ pub trait Backend {
         )
     }
 
-    /// GET the Traefik API (e.g. `/api/http/services/...`). Docker only.
+    /// GET the Traefik API (e.g. `/api/http/services/...`). Traefik-fronted
+    /// backends only (Docker, ECS).
     fn traefik_api(&self, _path: &str) -> Result<HttpResponse> {
         anyhow::bail!(
             "the Traefik API is not available on the {} backend",
             self.name()
         )
+    }
+
+    /// Traefik provider name a service is registered under, for the `@<provider>`
+    /// suffix the API keys services by. `docker` for the Docker daemon provider,
+    /// `ecs` for the ECS provider.
+    fn traefik_provider(&self) -> &'static str {
+        "docker"
     }
 
     /// The app's ingress hostname for this backend (Traefik host on docker, the
