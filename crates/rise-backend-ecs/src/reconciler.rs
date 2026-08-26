@@ -2108,7 +2108,12 @@ impl EcsReconciler {
                 }
             };
 
-            let expected = actual.desired_count.max(1) as usize;
+            // The count Rise *wants*, not the service's observed `desiredCount`.
+            // An out-of-band console scale-up raises the observed count, and
+            // judging readiness against tasks that legitimately do not exist yet
+            // would flap the deployment Unhealthy for a tick before the next
+            // reconcile corrects the drift. `clamp_replicas` already floors at 1.
+            let expected = clamp_replicas(spec.replicas) as usize;
             let mut spec_ready = true;
             for idx in 0..expected {
                 let label = if expected == 1 {

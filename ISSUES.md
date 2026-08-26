@@ -5,7 +5,8 @@ Working scratchpad from a six-lane review panel over the ECS backend
 machinery it uses, `modules/rise-aws` + `modules/rise-ecs`, the `tests/e2e`
 driver, and the CI workflow) on branch `claude/ecs-deployment-backend-5xdgqa`.
 
-**Status:** A, B, C, D, E fixed (see the ✅ notes). Everything else open.
+**Status:** A–E, G, H, I, J, L, S fixed (see the ✅ notes). CloudWatch log
+backend split out as a Follow-up. Remaining open: F, K, M, O, P, Q, R.
 
 This is a triage list, not a deliverable. Every item below
 was verified against the code, not inferred from names. Severity is this
@@ -167,7 +168,11 @@ fails at reconcile. No test covers per-value length (only the 50-tag count).
 
 ## Fix-worthy — e2e harness (scratch account only, but real)
 
-### G. `reap_dead_scopes` never reaps a dead scope's ECS workload services — Med — Scope: harness
+### ✅ G. `reap_dead_scopes` never reaps a dead scope's ECS workload services — Med — Scope: harness
+> **FIXED.** New `all_managed_workloads` lists every managed workload service
+> with its owning scope; `reap_dead_scopes` now deletes those whose scope is
+> dead, and `workload_services`/`sweep` filter the same list to the current
+> scope. Reap summary counts services too.
 `tests/e2e/src/backend/ecs.rs` `reap_dead_scopes` (~:681) collects a dead scope's
 orphaned ECR repositories and SSM parameters but **not** its Rise-created ECS
 workload services — even though its own doc comment claims "repositories, secrets
@@ -182,7 +187,10 @@ services by controller-class tag or name and delete them).
 **Verified:** function body collects repos + params only; `sweep()` (self-scope
 workloads) never runs against another scope.
 
-### H. DNS A-record leaked when `bring_up` fails after the UPSERT — Low — Scope: harness
+### ✅ H. DNS A-record leaked when `bring_up` fails after the UPSERT — Low — Scope: harness
+> **FIXED.** `self.stack` (which carries `traefik_ip`) is now recorded before
+> the DNS UPSERT/verify steps, so a bring-up that fails on them still lets
+> `tear_down` delete the record.
 `bring_up` UPSERTs `<scope>.<zone>` + `*.<scope>.<zone>` (~:1132) before setting
 `self.stack` (~:1145). If any step in between fails (`verify_dns_visible`,
 propagation timeout), `bring_up` returns `Err` with `self.stack == None`, so
@@ -192,7 +200,11 @@ UPSERTs over it.
 **Fix:** capture `traefik_ip` (or set `self.stack`) before/independent of the DNS
 + verify steps.
 
-### I. `tear_down` panics and skips all cleanup if `bring_up` fails on its first line — Low — Scope: harness
+### ✅ I. `tear_down` panics and skips all cleanup if `bring_up` fails on its first line — Low — Scope: harness
+> **FIXED.** `tear_down` returns early when `env` is unset (nothing was
+> created) and gates the API-based steps (`delete_projects`,
+> `wait_workloads_removed`) on `stack` being up; sweep + destroy + DNS-delete
+> still run when only `env` is present.
 `bring_up` sets `self.env` (~:1074) after `read_bootstrap_env()?` (~:1069). If
 that first call fails, `self.env == None`; `main.rs` then calls `tear_down`
 (outside the `catch_unwind`), which reaches `workload_services()` →
@@ -207,7 +219,10 @@ tolerate `env == None`.
 
 ## Infra / IAM hardening (production)
 
-### J. SecureStrings readable by any broad-SSM-read principal without a customer CMK — Med — Scope: infra
+### ✅ J. SecureStrings readable by any broad-SSM-read principal without a customer CMK — Med — Scope: infra
+> **FIXED (docs).** ECS operator docs now carry a caution: set a
+> customer-managed `ssm_kms_key_id` on multi-tenant installs, or broad SSM-read
+> principals can decrypt every project's secrets under `alias/aws/ssm`.
 `put_secrets` sets `key_id` only when `ssm_kms_key_id` is `Some`
 (`reconciler.rs:1451`); `modules/rise-aws` makes `ssm_kms_key_arn` optional
 (null → AWS-managed `alias/aws/ssm`). Under the AWS-managed key, decryption is
@@ -231,7 +246,10 @@ account."
 **Verified:** statement is unconditional; service-principal statement is the
 `dynamic` block below it.
 
-### L. `oidc_client_secret` silently defaults to a repo-published constant — Low — Scope: infra
+### ✅ L. `oidc_client_secret` silently defaults to a repo-published constant — Low — Scope: infra
+> **FIXED.** `modules/rise-ecs` now has a precondition requiring
+> `oidc_client_secret` when `deploy_dex = false`, instead of coalescing to the
+> published `rise-backend-secret` default.
 `modules/rise-ecs/secrets.tf:76` + `dex.tf:14`: `coalesce(var.oidc_client_secret,
 "rise-backend-secret")`, default `null`. Intentional for the Dex demo; for a
 real-IdP install where the operator forgets it, the module writes a well-known
@@ -248,7 +266,12 @@ guard + GitHub's fork-approval gate stand in front regardless. Worth tightening
 (exclude `:pull_request`, or pin to `:ref:`/`:environment:`) as defense-in-depth
 so it never depends on that GitHub behaviour. Scratch account only.
 
-### N. One shared CloudWatch log group across all projects — Low — Scope: infra
+### ✅ N. One shared CloudWatch log group across all projects — Low — Scope: infra
+> **ADDRESSED (interim doc) → proper fix deferred.** The real resolution is a
+> native CloudWatch log backend (see the Follow-up section) so users read logs
+> through Rise's authz and never need direct CloudWatch access. Until then the
+> ECS docs note that the single install-wide log group is not a per-project
+> boundary. Rise never logs secret values, so this is app-output visibility.
 All projects' container stdout/stderr land in one log group, separated only by
 stream prefix (`task_definition.rs:270`). App-controlled output, so an app that
 logs its own secrets makes them cross-project visible to a logs-read principal.
@@ -305,7 +328,10 @@ leadership-lost replica's step-4 (which runs no `confirm_leadership`, unlike
 apply/sweep) can write stale statuses. Shared with Docker.
 **Fix:** status-guarded `UPDATE ... WHERE status = $expected`.
 
-### S. Out-of-band `desiredCount` drift flaps Unhealthy for a tick — Low (shared) — Scope: shared
+### ✅ S. Out-of-band `desiredCount` drift flaps Unhealthy for a tick — Low (shared) — Scope: shared
+> **FIXED.** The health pass now sizes the expected replica count from
+> `clamp_replicas(spec.replicas)` (what Rise wants) rather than the observed
+> `desiredCount`, so a console scale-up no longer flaps the deployment.
 `reconciler.rs:~1992` uses the snapshot's `desired_count` as the expected replica
 count (Docker uses the spec's). A console scale-up makes the intervening tick
 judge expected against tasks that legitimately don't exist yet → Unhealthy flap,
@@ -313,6 +339,20 @@ no outage. Narrow (deployment `replicas` is immutable after insert).
 **Fix:** `clamp_replicas(spec.replicas)` like Docker, or `min(snapshot, desired)`.
 
 ---
+
+## Follow-up — after this PR
+
+### CloudWatch runtime-log backend — ECS log parity + resolves N
+ECS runs on the `None` log backend (`src/server/deployment/logs.rs`), so ECS
+deployments surface **no** logs in the Rise UI/API — a parity gap with
+Kubernetes/Docker/Loki. Add a `DeploymentLogsSettings::CloudWatch` variant and a
+`CloudWatchLogBackend` implementing `RuntimeLogBackend::stream_logs` (FilterLogEvents
+against the install log group, scoped by the `{project}-{deployment_group}/` stream
+prefix — trailing slash matters, it disambiguates `proj-a`+`b` from `proj`+`a-b`)
+and `query_volume` (likely `supports_volume=false`, as Kubernetes). Plus config
+wiring in `config/ecs.yaml`, the `logs:FilterLogEvents`/`GetLogEvents` grant, a
+feature-matrix row, and docs. This dissolves **N**: logs are served through Rise's
+own project authz, so operators never delegate CloudWatch access.
 
 ## Excluded as known / accepted (briefed out of the review)
 

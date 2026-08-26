@@ -581,7 +581,11 @@ impl EcsBackend {
     /// would name a concurrent run's live workloads. The controller-class tag
     /// is the same token Rise's own orphan collector scopes to, and the per-run
     /// stack's own services never carry it — they are Terraform's, not Rise's.
-    fn workload_services(&self) -> Result<Vec<String>> {
+    /// Every live Rise-managed workload service in the cluster, paired with the
+    /// scope (controller class) that owns it -- across all runs, not just this
+    /// one. `sweep` filters this to its own scope; `reap_dead_scopes` filters it
+    /// to scopes whose control plane is gone.
+    fn all_managed_workloads(&self) -> Result<Vec<(String, String)>> {
         let cluster = &self.env().cluster_name;
         let arns: Vec<String> = serde_json::from_str(&self.aws(&[
             "ecs",
@@ -595,7 +599,7 @@ impl EcsBackend {
         ])?)
         .unwrap_or_default();
 
-        let mut names = Vec::new();
+        let mut workloads = Vec::new();
         for chunk in arns.chunks(10) {
             let mut args: Vec<String> = vec![
                 "ecs".into(),
@@ -617,17 +621,27 @@ impl EcsBackend {
                     svc["tags"].as_array()?.iter().find(|t| t["key"] == key)?["value"].as_str()
                 };
                 let managed = tag(MANAGED_BY_TAG).is_some();
-                let ours = tag(CONTROLLER_CLASS_TAG) == Some(self.scope.as_str());
                 let live = svc["status"] != serde_json::json!("INACTIVE");
-                let Some(name) = svc["serviceName"].as_str() else {
+                let (Some(name), Some(scope)) =
+                    (svc["serviceName"].as_str(), tag(CONTROLLER_CLASS_TAG))
+                else {
                     continue;
                 };
-                if managed && ours && live {
-                    names.push(name.to_string());
+                if managed && live {
+                    workloads.push((name.to_string(), scope.to_string()));
                 }
             }
         }
-        Ok(names)
+        Ok(workloads)
+    }
+
+    fn workload_services(&self) -> Result<Vec<String>> {
+        Ok(self
+            .all_managed_workloads()?
+            .into_iter()
+            .filter(|(_, scope)| scope == &self.scope)
+            .map(|(name, _)| name)
+            .collect())
     }
 
     /// Wait for Rise to finish removing the workloads its project deletes
@@ -711,6 +725,29 @@ impl EcsBackend {
         // This run's own scope is live by construction, and `sweep` owns it.
         let dead = |scope: &String| !live.contains(scope) && scope != &self.scope;
 
+        // Workload services of a dead scope. These are Rise's own resources, not
+        // Terraform's, so the workflow's `terraform destroy` backstop never
+        // reaches them: a crashed run leaves its deployed apps running, pinning
+        // Fargate tasks and ENIs, until this collects them.
+        let dead_workloads: Vec<String> = self
+            .all_managed_workloads()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, scope)| dead(scope))
+            .map(|(name, _)| name)
+            .collect();
+        for name in &dead_workloads {
+            let _ = self.aws(&[
+                "ecs",
+                "delete-service",
+                "--cluster",
+                cluster,
+                "--service",
+                name,
+                "--force",
+            ]);
+        }
+
         let repos: Vec<String> = self
             .aws(&[
                 "ecr",
@@ -769,9 +806,10 @@ impl EcsBackend {
             let _ = self.aws(&args);
         }
 
-        if !orphaned.is_empty() || !stale.is_empty() {
+        if !dead_workloads.is_empty() || !orphaned.is_empty() || !stale.is_empty() {
             report::note(&format!(
-                "reaped {} repositor(ies) and {} parameter(s) from scopes whose control plane is gone",
+                "reaped {} service(s), {} repositor(ies) and {} parameter(s) from scopes whose control plane is gone",
+                dead_workloads.len(),
                 orphaned.len(),
                 stale.len()
             ));
@@ -1129,25 +1167,31 @@ impl Backend for EcsBackend {
             self.service_public_ip(&traefik_service)
         })?;
 
-        report::step("point this run's DNS at its Traefik", || {
-            self.change_dns("UPSERT", &traefik_ip)
-        })?;
-        report::step("confirm the record resolves", || {
-            self.verify_dns_visible(&format!("dex.{domain}"))
-        })?;
-
         let rise_url = format!("http://rise.{domain}");
         report::note(&format!(
             "scope={} traefik={traefik_ip} domain={domain}",
             self.scope
         ));
 
+        // Record the stack BEFORE the DNS steps below. `change_dns` writes a
+        // durable Route 53 record, and `verify_dns_visible` can fail (delegation
+        // not ready, propagation timeout) after that write has landed. tear_down
+        // only deletes the record it can find on `self.stack`, so setting it here
+        // means a bring-up that fails on the DNS steps still cleans up after
+        // itself instead of leaking a dangling record.
         self.stack = Some(StackState {
             traefik_api: format!("http://{traefik_ip}:8080"),
-            traefik_ip,
-            domain,
+            traefik_ip: traefik_ip.clone(),
+            domain: domain.clone(),
             rise_url: rise_url.clone(),
         });
+
+        report::step("point this run's DNS at its Traefik", || {
+            self.change_dns("UPSERT", &traefik_ip)
+        })?;
+        report::step("confirm the record resolves", || {
+            self.verify_dns_visible(&format!("dex.{domain}"))
+        })?;
 
         // The bearer's `iss` must equal the server's public_url, and the secret
         // must be the one the per-run stack was just given.
@@ -1185,17 +1229,29 @@ impl Backend for EcsBackend {
             return;
         }
 
-        // Through the API first: it exercises project delete and the ECR
-        // auto-remove path, and it is the only thing that removes the workloads
-        // before the control plane that owns them goes away.
-        self.delete_projects();
+        // A bring_up that failed before it even read the environment created
+        // nothing to tear down -- and `sweep`/`workload_services` would panic on
+        // the absent env. Nothing to do.
+        if self.env.is_none() {
+            return;
+        }
 
-        // Project deletion is asynchronous -- it marks deployments terminal and
-        // the reconciler retires the services a tick later. Destroying now
-        // would take the control plane away mid-retirement and leave workload
-        // ENIs pinning this run's security groups, so the order is: let Rise
-        // finish, force-delete the remainder, and only then destroy.
-        self.wait_workloads_removed(Duration::from_secs(120));
+        // Project deletion and the workload wait both go through the Rise API,
+        // which only exists once the stack is up. If bring_up failed before that,
+        // skip straight to the sweep + destroy below (which need only the env).
+        if self.stack.is_some() {
+            // Through the API first: it exercises project delete and the ECR
+            // auto-remove path, and it is the only thing that removes the
+            // workloads before the control plane that owns them goes away.
+            self.delete_projects();
+
+            // Project deletion is asynchronous -- it marks deployments terminal
+            // and the reconciler retires the services a tick later. Destroying
+            // now would take the control plane away mid-retirement and leave
+            // workload ENIs pinning this run's security groups, so the order is:
+            // let Rise finish, force-delete the remainder, and only then destroy.
+            self.wait_workloads_removed(Duration::from_secs(120));
+        }
         let _ = self.sweep();
 
         let destroy = cli::run(self.terraform(&["destroy", "-auto-approve", "-input=false"]));

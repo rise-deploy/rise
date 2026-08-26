@@ -74,4 +74,15 @@ resource "aws_secretsmanager_secret" "oidc_client_secret" {
 resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
   secret_id     = aws_secretsmanager_secret.oidc_client_secret.id
   secret_string = coalesce(var.oidc_client_secret, "rise-backend-secret")
+
+  lifecycle {
+    # The `rise-backend-secret` default is deliberate only for the bundled Dex
+    # demo, where Dex and Rise share it. With a real IdP (`deploy_dex = false`)
+    # it would silently write a value published in this repository as the client
+    # secret, so require an explicit one there.
+    precondition {
+      condition     = var.deploy_dex || var.oidc_client_secret != null
+      error_message = "oidc_client_secret is required when deploy_dex = false; without it the module would store the well-known default 'rise-backend-secret' as the OIDC client secret."
+    }
+  }
 }

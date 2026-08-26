@@ -181,6 +181,16 @@ credentials inside it needs no redeploy.
 | `traefik_api_url` | required for projects using `health_check` |
 | `reconcile_interval_secs` | defaults to 30; ECS is a throttled API |
 
+:::caution[Set a customer-managed KMS key for secret isolation]
+`ssm_kms_key_id` is optional, but on a multi-tenant install it should be set.
+Without it, secret env vars are written as `SecureString`s under the
+AWS-managed `alias/aws/ssm` key, whose default policy lets **any** account
+principal permitted to call SSM decrypt them — so a broad `ReadOnlyAccess`-style
+role can read every project's secrets. A customer-managed key gates decryption
+behind an explicit `kms:Decrypt` grant (scoped by `kms:ViaService = ssm.*`),
+which is what makes "reading ECS reveals only a parameter name" hold.
+:::
+
 ## Not supported yet
 
 Each of these **fails closed at deploy time** with an error naming the reason
@@ -192,9 +202,16 @@ work:
 - **Workload identity tokens** (`[identity].audiences`) — there is no way to
   write files into a running Fargate task; a sidecar on a shared task volume is
   the intended mechanism.
-- **Runtime logs** — `deployment_logs: none` by default. Installs running Loki
-  can use `type: loki` today (it is backend-agnostic); a CloudWatch backend is
-  the intended replacement.
+- **Runtime logs in the Rise UI/API** — `deployment_logs: none` by default, so
+  `rise deployment logs` and the UI's Logs tab return nothing for ECS
+  deployments. Installs running Loki can point `type: loki` at it today (it is
+  backend-agnostic). A native **CloudWatch log backend** is the intended
+  replacement — it lets Rise surface a deployment's logs scoped to the project
+  the caller is authorized for, using the control plane's own IAM, so operators
+  need not hand out CloudWatch access. Until it lands, the only way to read ECS
+  workload logs is the CloudWatch console: all workloads share one install-wide
+  log group (separated only by a `{project}-{group}` stream prefix), so that
+  access is not a per-project boundary — scope it accordingly.
 
 ## Troubleshooting
 

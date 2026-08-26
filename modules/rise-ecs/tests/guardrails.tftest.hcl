@@ -115,6 +115,19 @@ run "rejects_an_install_with_no_identity_provider" {
   expect_failures = [aws_lb.this]
 }
 
+run "a_real_idp_install_must_supply_its_own_oidc_client_secret" {
+  command = plan
+
+  variables {
+    deploy_dex         = false
+    oidc_client_secret = null
+  }
+
+  # Without this the module would write the repo-published `rise-backend-secret`
+  # constant as the client secret; that default is only for the bundled Dex demo.
+  expect_failures = [aws_secretsmanager_secret_version.oidc_client_secret]
+}
+
 run "deploy_dex_uses_a_browser_reachable_issuer" {
   command = plan
 
