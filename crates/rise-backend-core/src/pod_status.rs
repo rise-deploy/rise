@@ -4,8 +4,8 @@
 
 use chrono::Utc;
 
-use super::diff::InspectedContainer;
-use rise_backend_core::models::DeploymentStatus;
+use crate::diff::InspectedContainer;
+use crate::models::DeploymentStatus;
 
 /// Assemble the `controller_metadata` JSON for the deployment: a
 /// K8s-pod-status-shaped `pod_status` block (so the Pods tab renders unchanged —
@@ -15,7 +15,7 @@ use rise_backend_core::models::DeploymentStatus;
 /// running count, `ready_replicas` = healthy count). Pure so it can be
 /// unit-tested without a daemon. The container readiness verdict (`is_ready`) is
 /// the same one driving the status transitions.
-pub(crate) fn build_controller_metadata(
+pub fn build_controller_metadata(
     pods: &[(String, Option<InspectedContainer>)],
     status: &DeploymentStatus,
     is_ready: bool,
@@ -57,7 +57,7 @@ pub(crate) fn build_controller_metadata(
 /// `is_ready` is the reconciler's overall readiness verdict (every container
 /// must be ready). A container's per-pod `ready` reflects that verdict only when
 /// the container is actually running, so a crashed container never shows ready.
-pub(crate) fn build_pod_status(
+pub fn build_pod_status(
     named: &[(String, Option<InspectedContainer>)],
     is_ready: bool,
 ) -> serde_json::Value {

@@ -35,7 +35,7 @@ use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use super::pod_status::build_controller_metadata;
-use super::rolling::{filter_rolling_actions, replica_ready, service_names_for_spec, ReadyVerdict};
+use super::rolling::filter_rolling_actions;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use rise_backend_core::rise_system_env_vars;
@@ -47,6 +47,7 @@ use rise_backend_core::state_machine;
 use rise_backend_core::DeploymentUrlBuilder;
 use rise_backend_core::EncryptionProvider;
 use rise_backend_core::RegistryProvider;
+use rise_backend_traefik::readiness::{replica_ready, service_names_for_spec, ReadyVerdict};
 
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
@@ -258,7 +259,7 @@ impl DockerReconciler {
         let traefik_api = config
             .traefik_api_url
             .as_deref()
-            .and_then(super::traefik_api::TraefikApiClient::new);
+            .and_then(|url| super::traefik_api::TraefikApiClient::new(url, "docker"));
         Self {
             docker,
             store,
@@ -2863,7 +2864,7 @@ mod tests {
 
     #[test]
     fn identity_targets_are_the_create_and_recreate_deployment_uuids() {
-        use crate::test_helpers::{desired, identity_of};
+        use rise_backend_core::test_helpers::{desired, identity_of};
 
         // A Create targeting the desired slot resolves to that deployment's UUID;
         // a Remove never needs identity material. Resolving through `desired`

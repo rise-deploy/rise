@@ -5,6 +5,8 @@ members = [
     "crates/rise-backend-auth",
     "crates/rise-backend-core",
     "crates/rise-backend-docker",
+    "crates/rise-backend-ecs",
+    "crates/rise-backend-traefik",
     "crates/rise-deployment-spec",
     "crates/rise-resource-api",
     "crates/rise-resource-store-postgres",
@@ -86,6 +88,8 @@ backend = [
     "dep:rise-backend-auth",
     "dep:rise-backend-core",
     "dep:rise-backend-docker",
+    "dep:rise-backend-ecs",
+    "dep:rise-backend-traefik",
     "dep:rise-resource-api",
     "dep:rise-resource-store-postgres",
     "dep:rise-runtime-sync",
@@ -122,6 +126,8 @@ backend = [
     # AWS services (former "aws" feature)
     "dep:aws-config",
     "dep:aws-sdk-ecr",
+    "dep:aws-sdk-ecs",
+    "dep:aws-sdk-ssm",
     "dep:aws-sdk-iam",
     "dep:aws-sdk-kms",
     "dep:aws-sdk-rds",
@@ -137,6 +143,8 @@ rise-authz = { path = "crates/rise-authz", optional = true }
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
 rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
+rise-backend-ecs = { path = "crates/rise-backend-ecs", optional = true }
+rise-backend-traefik = { path = "crates/rise-backend-traefik", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }
 rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
@@ -203,6 +211,8 @@ tera = { version = "1.20", optional = true }
 # AWS feature dependencies
 aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
 aws-sdk-ecr = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-ecs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-ssm = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-iam = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-kms = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-rds = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }

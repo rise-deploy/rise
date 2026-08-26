@@ -31,6 +31,11 @@ const TRAEFIK_API_TIMEOUT_SECS: u64 = 3;
 /// separate credentials) and a dedicated `reqwest::Client` with a short timeout.
 #[derive(Clone)]
 pub struct TraefikApiClient {
+    /// Traefik provider suffix appended to the service name when querying
+    /// (`{service}@{provider}`). `"docker"` for the Docker provider, `"ecs"` for
+    /// the ECS provider — querying the wrong one 404s, so `serverStatus` is never
+    /// observed and a health-checked deployment never becomes Healthy.
+    provider: &'static str,
     http: reqwest::Client,
     /// Base URL with userinfo removed, no trailing slash (e.g.
     /// `http://rise-traefik:8080`).
@@ -46,7 +51,10 @@ impl TraefikApiClient {
     /// the stored base URL has it stripped. Returns `None` when the URL can't be
     /// parsed (the reconciler then has no in-rotation signal — health-checked
     /// containers can't become Healthy).
-    pub fn new(traefik_api_url: &str) -> Option<Self> {
+    /// `provider` is the Traefik provider name the workloads are discovered
+    /// through (`"docker"` / `"ecs"`); it becomes the `@provider` suffix on every
+    /// service lookup.
+    pub fn new(traefik_api_url: &str, provider: &'static str) -> Option<Self> {
         let (base_url, basic_auth) = split_userinfo(traefik_api_url)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(TRAEFIK_API_TIMEOUT_SECS))
@@ -54,6 +62,7 @@ impl TraefikApiClient {
             .ok()?;
         Some(Self {
             http,
+            provider,
             base_url,
             basic_auth,
         })
@@ -63,12 +72,15 @@ impl TraefikApiClient {
     /// server URL (`http://{ip}:{port}`) → `true` (UP) / `false` (DOWN).
     ///
     /// `service` is the bare service base name (e.g. `myapp-default-app`); the
-    /// `@docker` provider suffix is appended here. Returns `None` on ANY error
+    /// `@{provider}` suffix is appended here. Returns `None` on ANY error
     /// (unreachable, non-200, body parse failure, or `serverStatus` absent —
     /// which is the case when no health check is configured), so the caller
     /// treats the container as not-yet-in-rotation.
     pub async fn server_status(&self, service: &str) -> Option<HashMap<String, bool>> {
-        let url = format!("{}/api/http/services/{}@docker", self.base_url, service);
+        let url = format!(
+            "{}/api/http/services/{}@{}",
+            self.base_url, service, self.provider
+        );
         let mut req = self.http.get(&url);
         if let Some((user, pass)) = &self.basic_auth {
             req = req.basic_auth(user, Some(pass));
@@ -292,7 +304,8 @@ mod tests {
 
     #[test]
     fn client_new_with_basic_auth_url() {
-        let client = TraefikApiClient::new("http://admin:pw@rise-traefik:8080").expect("builds");
+        let client =
+            TraefikApiClient::new("http://admin:pw@rise-traefik:8080", "docker").expect("builds");
         assert_eq!(client.base_url, "http://rise-traefik:8080");
         assert_eq!(
             client.basic_auth,

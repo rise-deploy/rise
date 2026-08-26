@@ -219,6 +219,20 @@ pub enum DeploymentLogsSettings {
     /// client is shared from the Docker deployment controller, so this variant
     /// carries no connection fields of its own.
     Docker {},
+    /// No runtime log backend.
+    ///
+    /// Every other variant needs a runtime client the ECS backend does not have
+    /// (a kube client, a bollard handle), so without this an ECS install would
+    /// fall through to the `Kubernetes` default and **crash at startup** with
+    /// "Kubernetes log backend requires kube client". This makes "no runtime
+    /// logs" an explicit, working choice: the API answers with a clear
+    /// `historical_backend_not_configured` status instead of an error, and the
+    /// UI renders its empty state.
+    ///
+    /// ECS installs that want runtime logs today can use the `loki` variant,
+    /// which is backend-agnostic (it queries by stream labels, not a runtime
+    /// client). A CloudWatch variant is the intended replacement — see ADR-0005.
+    None {},
     Loki {
         url: String,
         #[serde(default)]
@@ -433,6 +447,62 @@ where
             .trim()
             .parse::<u32>()
             .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u32"))),
+    }
+}
+
+/// Deserialize a list of strings from either a YAML sequence or a single
+/// comma-separated string, dropping blank entries.
+///
+/// A scalar environment variable cannot express a YAML list, but subnet and
+/// security-group lists are exactly the settings an operator wants to inject
+/// from the environment (they differ per account and are often produced by
+/// Terraform outputs). Accepting `"subnet-a,subnet-b"` alongside
+/// `["subnet-a", "subnet-b"]` makes `subnets: "${RISE_ECS_SUBNETS}"` work
+/// without a bespoke config file per install.
+fn deserialize_string_list_flexible<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListOrString {
+        List(Vec<String>),
+        Str(String),
+    }
+
+    let raw = match ListOrString::deserialize(deserializer)? {
+        ListOrString::List(items) => items,
+        ListOrString::Str(s) => s.split(',').map(|part| part.to_string()).collect(),
+    };
+    Ok(raw
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Accept a `u64` from either a JSON number or a numeric string, for the same
+/// reason as [`deserialize_u32_flexible`]: an env-driven `${VAR:-N}` reaches
+/// serde as a string, and serde will not coerce it.
+fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U64OrString {
+        Num(u64),
+        Str(String),
+    }
+
+    match U64OrString::deserialize(deserializer)? {
+        U64OrString::Num(n) => Ok(n),
+        U64OrString::Str(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u64"))),
     }
 }
 
@@ -778,6 +848,69 @@ fn default_reconcile_interval_secs() -> u64 {
     5
 }
 
+// ── Amazon ECS deployment controller defaults ──────────────────────────────
+
+/// ECS is a polled, throttled control plane — service reads sustain 20 req/s and
+/// `RegisterTaskDefinition` only 1 req/s — so the loop ticks far less often than
+/// the Docker backend's 5s against a local daemon.
+#[cfg(feature = "backend")]
+/// ECS caps an `awsvpcConfiguration` at 16 subnets and 5 security groups.
+/// Checked at config load so the operator learns at startup rather than from a
+/// failed `CreateService` on the first deploy.
+#[cfg(feature = "backend")]
+const MAX_SUBNETS_PER_AWSVPC: usize = 16;
+#[cfg(feature = "backend")]
+const MAX_SECURITY_GROUPS_PER_AWSVPC: usize = 5;
+
+fn default_ecs_reconcile_interval_secs() -> u64 {
+    30
+}
+
+/// Prefix for generated ECS resource names (cluster-scoped, so it also namespaces
+/// two Rise installs sharing one cluster).
+#[cfg(feature = "backend")]
+fn default_ecs_resource_prefix() -> String {
+    "rise".to_string()
+}
+
+/// Root of the SSM Parameter Store hierarchy holding secret env vars.
+#[cfg(feature = "backend")]
+fn default_ssm_parameter_prefix() -> String {
+    "rise".to_string()
+}
+
+/// Fargate CPU architecture. `ARM64` is cheaper where images support it.
+#[cfg(feature = "backend")]
+fn default_cpu_architecture() -> String {
+    "X86_64".to_string()
+}
+
+/// Canonicalise the configured Fargate CPU architecture at load, so everything
+/// downstream — the task definition, the CLI's platform hint — sees exactly one
+/// of the two tokens ECS accepts.
+///
+/// Rejecting here is the whole point: an architecture we can neither recognise
+/// nor normalise has no safe default. Guessing `X86_64` would hand ARM64
+/// operators images their tasks cannot execute, and passing the string through
+/// would surface as an AWS error on every deploy instead of once at startup.
+#[cfg(feature = "backend")]
+fn deserialize_fargate_cpu_architecture<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    rise_backend_ecs::task_definition::canonical_cpu_architecture(&raw)
+        .map(str::to_string)
+        .map_err(|e| serde::de::Error::custom(format!("deployment_controller.{e}")))
+}
+
+/// Mirrors [`default_docker_access_classes`]: a permissive `public` class so an
+/// install works before an operator defines their own.
+#[cfg(feature = "backend")]
+fn default_ecs_access_classes() -> std::collections::HashMap<String, Option<AccessClass>> {
+    default_docker_access_classes()
+}
+
 fn default_crd_upsert_interval_ms() -> u64 {
     1000
 }
@@ -808,10 +941,10 @@ pub struct AccessClass {
     pub custom_annotations: std::collections::HashMap<String, String>,
 }
 
-/// Validate that a Docker deployment controller can actually enforce the
-/// authentication required by its configured access classes.
+/// Validate that a Traefik-fronted deployment controller (Docker or ECS) can
+/// actually enforce the authentication required by its configured access classes.
 ///
-/// The Docker backend wires ingress authentication via a Traefik forwardAuth
+/// Both backends wire ingress authentication via a Traefik forwardAuth
 /// middleware whose address is derived from `auth_backend_url`. If that URL is
 /// empty/blank, no middleware is stamped and any access class requiring
 /// `Authenticated`/`Member` would be served PUBLICLY — failing open. To fail
@@ -821,7 +954,7 @@ pub struct AccessClass {
 /// `null`-valued access classes (used to remove inherited entries) are ignored.
 /// Returns the names of offending access classes (sorted) when the config is
 /// invalid, or an empty `Vec` when it is acceptable.
-pub fn docker_access_classes_missing_auth_backend_url(
+pub fn access_classes_missing_auth_backend_url(
     access_classes: &std::collections::HashMap<String, Option<AccessClass>>,
     auth_backend_url: &str,
 ) -> Vec<String> {
@@ -1442,6 +1575,201 @@ pub enum DeploymentControllerSettings {
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
         traefik_api_url: Option<String>,
     },
+
+    /// Amazon ECS deployment controller (Fargate launch type).
+    ///
+    /// Deploys each container spec as its own ECS service and lets Traefik's ECS
+    /// provider route to the tasks via labels Rise stamps on the container
+    /// definition. No Kubernetes, no Metacontroller — reconciliation runs
+    /// in-process (see `rise_backend_ecs::reconciler::EcsReconciler`).
+    ///
+    /// See ADR-0005 for the design and its deliberate v1 limitations.
+    #[cfg(feature = "backend")]
+    Ecs {
+        /// AWS region hosting the cluster.
+        region: String,
+
+        /// Override the AWS service endpoint (VPC/PrivateLink or FIPS endpoints).
+        /// The AWS SDK also honours `AWS_ENDPOINT_URL`; this is the explicit form.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        endpoint_url: Option<String>,
+
+        /// Static credentials, for a control plane running outside AWS. Leave
+        /// unset in production so the standard chain (task role / instance
+        /// profile) applies.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        access_key_id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        secret_access_key: Option<String>,
+
+        /// ECS cluster name that carries the deployed workloads.
+        cluster: String,
+
+        /// Subnets for the tasks' `awsvpc` ENIs. At least one is required; ECS
+        /// caps an `awsvpcConfiguration` at 16. Accepts a YAML sequence or a
+        /// comma-separated string so it can come straight from an env var.
+        #[serde(deserialize_with = "deserialize_string_list_flexible")]
+        #[schemars(with = "Vec<String>")]
+        subnets: Vec<String>,
+
+        /// Security groups applied to the tasks' ENIs. ECS caps this at 5.
+        /// Accepts a YAML sequence or a comma-separated string.
+        #[serde(default, deserialize_with = "deserialize_string_list_flexible")]
+        #[schemars(with = "Vec<String>")]
+        security_groups: Vec<String>,
+
+        /// Assign a public IP to each task. Required when the subnets are public
+        /// (no NAT gateway), since Fargate must reach ECR and CloudWatch to start.
+        // Accepts a YAML boolean or a string, so it can be env-driven — the
+        // loader interpolates `${VAR}` into a string before deserialization.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
+        assign_public_ip: bool,
+
+        /// IAM role ECS itself assumes to pull images and resolve SSM secrets.
+        /// Required whenever a project uses secret env vars or a private registry.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        execution_role_arn: Option<String>,
+
+        /// IAM role the application containers run as (their AWS identity).
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        task_role_arn: Option<String>,
+
+        /// ARN of a Secrets Manager secret holding `{"username": …, "password": …}`
+        /// for a private registry that is not ECR.
+        ///
+        /// ECS re-authenticates on every task start and cannot take inline
+        /// credentials, so a static-credential registry needs the credentials
+        /// parked somewhere ECS can read them itself. The ARN is stamped onto
+        /// each container definition as `repositoryCredentials`; the execution
+        /// role needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`
+        /// when the secret uses a customer-managed key).
+        ///
+        /// Leave unset for ECR (the execution role authenticates the pull) and
+        /// for anonymous registries.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        repository_credentials_secret_arn: Option<String>,
+
+        /// CloudWatch log group for app containers (`awslogs` driver). When
+        /// unset, containers get no log driver and runtime logs are unavailable.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        log_group: Option<String>,
+
+        /// Prefix for generated ECS resource names. Defaults to `rise`.
+        #[serde(default = "default_ecs_resource_prefix")]
+        resource_prefix: String,
+
+        /// Root of the SSM hierarchy holding secret env vars. Defaults to `rise`.
+        #[serde(default = "default_ssm_parameter_prefix")]
+        ssm_parameter_prefix: String,
+
+        /// KMS key for the `SecureString` parameters. Unset uses the AWS-managed
+        /// `alias/aws/ssm` key.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        ssm_kms_key_id: Option<String>,
+
+        /// Fargate CPU architecture: `X86_64` or `ARM64`. Defaults to `X86_64`.
+        #[serde(
+            default = "default_cpu_architecture",
+            deserialize_with = "deserialize_fargate_cpu_architecture"
+        )]
+        cpu_architecture: String,
+
+        /// Ingress URL template for the production (default) deployment group.
+        /// Same semantics as the other backends. Must contain `{project_name}`.
+        production_ingress_url_template: String,
+
+        /// Ingress URL template for staging (non-default) deployment groups.
+        /// Must contain both `{project_name}` and `{deployment_group}`.
+        #[serde(default)]
+        staging_ingress_url_template: Option<String>,
+
+        /// Ingress URL template for named environments.
+        /// Must contain both `{project_name}` and `{environment}`.
+        #[serde(default)]
+        environment_ingress_url_template: Option<String>,
+
+        /// Optional port appended to all generated ingress URLs.
+        #[serde(default)]
+        ingress_port: Option<u16>,
+
+        /// URL scheme for generated ingress URLs. Defaults to `https`.
+        #[serde(default = "default_ingress_schema")]
+        ingress_schema: String,
+
+        /// Access classes defining ingress authentication levels. For classes
+        /// whose `access_requirement` is `Authenticated`/`Member` the controller
+        /// stamps Traefik forwardAuth labels, which requires `auth_backend_url`;
+        /// the backend refuses to start otherwise rather than serve those
+        /// projects publicly with no auth enforced.
+        #[serde(default = "default_ecs_access_classes")]
+        access_classes: std::collections::HashMap<String, Option<AccessClass>>,
+
+        /// Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+        /// subrequest. Must be resolvable **from inside the cluster** — a Cloud Map
+        /// name or an internal load balancer, not the public URL.
+        #[serde(default)]
+        auth_backend_url: String,
+
+        /// Browser-facing base URL for the login redirect. Falls back to the
+        /// server `public_url` when empty.
+        #[serde(default)]
+        auth_signin_url: String,
+
+        /// Traefik entrypoint name routers bind to. Defaults to `web`.
+        #[serde(default = "default_traefik_entrypoint")]
+        traefik_entrypoint: String,
+
+        /// Optional Traefik certresolver name for automatic TLS.
+        #[serde(default)]
+        traefik_certresolver: Option<String>,
+
+        /// Base URL of Traefik's API. Read for per-server `serverStatus`, the
+        /// authoritative readiness signal (no fallback), so this is **required
+        /// for projects that set a `health_check`** — without it such a
+        /// deployment never becomes Healthy.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        traefik_api_url: Option<String>,
+
+        /// Label namespace prefix for Rise bookkeeping tags. Defaults to `rise.dev`.
+        #[serde(default = "default_label_namespace")]
+        label_namespace: String,
+
+        /// Stable identifier for this deployment controller. The reconciler only
+        /// reconciles projects matching this class. Defaults to `default`.
+        #[serde(default = "default_controller_class_name")]
+        controller_class_name: String,
+
+        /// Interval in seconds between reconcile ticks. Defaults to 30 — ECS is
+        /// a throttled API, unlike a local Docker daemon.
+        #[serde(
+            default = "default_ecs_reconcile_interval_secs",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
+        reconcile_interval_secs: u64,
+
+        /// Default resource values for new deployments when not specified.
+        #[serde(default)]
+        deployment_defaults: DeploymentDefaults,
+
+        /// Platform-level constraints for deployment resources.
+        #[serde(default)]
+        deployment_constraints: DeploymentConstraints,
+
+        /// Health probe configuration.
+        #[serde(default)]
+        health_probes: Option<HealthProbeConfig>,
+
+        /// Lifetime in seconds of workload identity tokens. Accepted for
+        /// forward-compatibility; ECS v1 does not deliver identity material and
+        /// rejects deployments that request it.
+        #[serde(default = "default_identity_token_ttl_seconds")]
+        identity_token_ttl_seconds: u64,
+    },
 }
 
 /// Registry provider configuration
@@ -1460,7 +1788,14 @@ pub enum RegistrySettings {
         #[allow(dead_code)]
         push_role_arn: String,
         /// Whether to automatically delete ECR repos when projects are deleted
-        #[serde(default)]
+        // Env-drivable: the loader interpolates `${VAR}` into a string before
+        // deserialization, so a config value of "${RISE_ECR_AUTO_REMOVE:-false}"
+        // reaches serde as the string "false", not a bool.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
         #[allow(dead_code)]
         auto_remove: bool,
         #[serde(default)]
@@ -1846,6 +2181,43 @@ impl Settings {
             }
         }
 
+        // `account_id` and `push_role_arn` are string-formatted into every image
+        // reference and into the STS AssumeRole call. Neither can be blank in a
+        // working install, so catching them here turns a first-deploy failure
+        // into a startup error.
+        if let Some(RegistrySettings::Ecr {
+            account_id,
+            push_role_arn,
+            repo_prefix,
+            ..
+        }) = &settings.registry
+        {
+            if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ConfigError::Message(format!(
+                    "registry.account_id must be a 12-digit AWS account ID, got {account_id:?}"
+                )));
+            }
+            if push_role_arn.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "registry.push_role_arn must name the IAM role Rise assumes to mint \
+                     scoped ECR credentials"
+                        .to_string(),
+                ));
+            }
+            // The prefix is concatenated literally, so `rise` yields repositories
+            // named `risemyapp`. That is a working configuration for an install
+            // already running on it, so warn rather than refuse to start.
+            if !repo_prefix.is_empty() && !repo_prefix.ends_with('/') {
+                tracing::warn!(
+                    "registry.repo_prefix {:?} does not end in '/': repositories will be \
+                     named {}<project> rather than {}/<project>",
+                    repo_prefix,
+                    repo_prefix,
+                    repo_prefix
+                );
+            }
+        }
+
         // Validate deployment controller settings if configured
         if let Some(DeploymentControllerSettings::Kubernetes {
             ref production_ingress_url_template,
@@ -1979,6 +2351,142 @@ impl Settings {
                     "environment_ingress_url_template",
                     "{environment}",
                 )?;
+            }
+        }
+
+        // Validate the ECS deployment controller variant with the same contract
+        // as the other two, plus the ECS-specific requirements a misconfiguration
+        // of which would otherwise surface as an opaque AWS error on the first
+        // deploy rather than at startup.
+        #[cfg(feature = "backend")]
+        if let Some(DeploymentControllerSettings::Ecs {
+            ref production_ingress_url_template,
+            ref staging_ingress_url_template,
+            ref environment_ingress_url_template,
+            ref controller_class_name,
+            ref cluster,
+            ref subnets,
+            ref security_groups,
+            ref execution_role_arn,
+            ref repository_credentials_secret_arn,
+            ..
+        }) = settings.deployment_controller
+        {
+            Self::validate_format_string(
+                production_ingress_url_template,
+                "production_ingress_url_template",
+                "{project_name}",
+            )?;
+
+            Self::validate_label_value(
+                controller_class_name,
+                "deployment_controller.controller_class_name",
+            )?;
+
+            if let Some(ref staging_template) = staging_ingress_url_template {
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{deployment_group}",
+                )?;
+            }
+
+            if let Some(ref environment_template) = environment_ingress_url_template {
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{environment}",
+                )?;
+            }
+
+            if cluster.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.cluster must name an ECS cluster".to_string(),
+                ));
+            }
+
+            // A task with no subnet cannot be placed at all, and ECS's own error
+            // for it arrives only on the first CreateService — long after startup.
+            if subnets.is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.subnets must list at least one subnet for the \
+                     tasks' awsvpc network interfaces"
+                        .to_string(),
+                ));
+            }
+            if subnets.len() > MAX_SUBNETS_PER_AWSVPC {
+                return Err(ConfigError::Message(format!(
+                    "deployment_controller.subnets has {} entries, over the ECS limit of {}",
+                    subnets.len(),
+                    MAX_SUBNETS_PER_AWSVPC
+                )));
+            }
+            if security_groups.len() > MAX_SECURITY_GROUPS_PER_AWSVPC {
+                return Err(ConfigError::Message(format!(
+                    "deployment_controller.security_groups has {} entries, over the ECS \
+                     limit of {}",
+                    security_groups.len(),
+                    MAX_SECURITY_GROUPS_PER_AWSVPC
+                )));
+            }
+            // ECS authenticates every image pull itself, at every task start —
+            // scale-out, task replacement, AZ rebalance. It never receives a
+            // credential Rise minted, so a registry whose only pull mechanism is
+            // a short-lived Rise-issued token cannot work here, and one that
+            // needs static credentials must park them where ECS can read them.
+            // Deciding that at startup is the difference between a clear error
+            // and an opaque `CannotPullContainerError` on the first deploy.
+            match &settings.registry {
+                Some(RegistrySettings::Ecr { .. }) if execution_role_arn.is_none() => {
+                    return Err(ConfigError::Message(
+                        "registry.type is 'ecr' but deployment_controller.execution_role_arn \
+                         is unset: ECS pulls from ECR with the task execution role, so \
+                         without one every task fails with CannotPullContainerError. Create \
+                         a role ECS can assume (trust principal ecs-tasks.amazonaws.com) \
+                         with the AmazonECSTaskExecutionRolePolicy managed policy attached, \
+                         and set its ARN here."
+                            .to_string(),
+                    ));
+                }
+                // ECR with an execution role: exactly the supported shape.
+                Some(RegistrySettings::Ecr { .. }) => {}
+                Some(RegistrySettings::OciClientAuth {
+                    username, password, ..
+                }) => {
+                    let anonymous = username.is_empty() && password.is_empty();
+                    if !anonymous && repository_credentials_secret_arn.is_none() {
+                        return Err(ConfigError::Message(
+                            "registry.type is 'oci-client-auth' with static credentials, but \
+                             deployment_controller.repository_credentials_secret_arn is unset: \
+                             ECS cannot be handed inline registry credentials. Store the \
+                             username/password in a Secrets Manager secret, set its ARN here, \
+                             and grant the execution role secretsmanager:GetSecretValue on it."
+                                .to_string(),
+                        ));
+                    }
+                }
+                Some(RegistrySettings::GitLab { .. }) | Some(RegistrySettings::Jfrog { .. }) => {
+                    return Err(ConfigError::Message(
+                        "registry.type is not supported by the ECS deployment controller: \
+                         GitLab and JFrog pull credentials are short-lived scoped tokens that \
+                         Rise refreshes on the puller's behalf, which ECS gives it no way to \
+                         do — deploys would succeed and then fail once the token expired. Use \
+                         'ecr', or an 'oci-client-auth' registry that is either anonymous or \
+                         reachable through repository_credentials_secret_arn."
+                            .to_string(),
+                    ));
+                }
+                None => {}
             }
         }
 
@@ -2721,11 +3229,11 @@ auth:
             Some(access_class(AccessRequirement::Member)),
         );
 
-        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        let offending = access_classes_missing_auth_backend_url(&classes, "");
         assert_eq!(offending, vec!["private".to_string()]);
 
         // Whitespace-only is treated as blank.
-        let offending_ws = docker_access_classes_missing_auth_backend_url(&classes, "   ");
+        let offending_ws = access_classes_missing_auth_backend_url(&classes, "   ");
         assert_eq!(offending_ws, vec!["private".to_string()]);
     }
 
@@ -2737,7 +3245,7 @@ auth:
             Some(access_class(AccessRequirement::Authenticated)),
         );
 
-        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        let offending = access_classes_missing_auth_backend_url(&classes, "");
         assert_eq!(offending, vec!["authed".to_string()]);
     }
 
@@ -2749,7 +3257,7 @@ auth:
             Some(access_class(AccessRequirement::None)),
         );
 
-        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+        assert!(access_classes_missing_auth_backend_url(&classes, "").is_empty());
     }
 
     #[test]
@@ -2765,9 +3273,7 @@ auth:
         );
 
         // Mirrors config/docker.yaml (private + auth URL set).
-        assert!(
-            docker_access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty()
-        );
+        assert!(access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty());
     }
 
     /// Stage the real shipped `config/docker.yaml` plus a minimal `default.yaml`
@@ -2797,6 +3303,250 @@ auth:
         let env_lookup = move |name: &str| owned.get(name).cloned();
 
         Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &env_lookup)
+    }
+
+    /// Load the real shipped `config/ecs.yaml` the same way an operator's install
+    /// does, so a typo or a field rename in the YAML fails here rather than at
+    /// their startup.
+    fn load_shipped_ecs_config(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+    ) -> Result<Settings, ConfigError> {
+        load_shipped_ecs_config_with_overlay(env, None)
+    }
+
+    /// As above, with an optional `local.yaml` layered over the shipped file —
+    /// the way an operator overrides a section they cannot express through the
+    /// file's env vars (a different registry type, say).
+    fn load_shipped_ecs_config_with_overlay(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+        overlay: Option<&str>,
+    ) -> Result<Settings, ConfigError> {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let ecs_yaml = fs::read_to_string(format!("{manifest_dir}/config/ecs.yaml"))
+            .expect("config/ecs.yaml must exist");
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("ecs.yaml"), ecs_yaml).unwrap();
+        if let Some(overlay) = overlay {
+            fs::write(temp_dir.path().join("local.yaml"), overlay).unwrap();
+        }
+
+        let owned: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env_lookup = move |name: &str| owned.get(name).cloned();
+
+        Settings::new_with_env(temp_dir.path().to_str().unwrap(), "ecs", &env_lookup)
+    }
+
+    #[test]
+    fn shipped_ecs_config_loads_and_selects_the_ecs_controller() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+
+        let settings = load_shipped_ecs_config(&env).expect("shipped ecs.yaml must load");
+
+        let Some(DeploymentControllerSettings::Ecs {
+            cluster,
+            subnets,
+            reconcile_interval_secs,
+            cpu_architecture,
+            access_classes,
+            resource_prefix,
+            ..
+        }) = settings.deployment_controller
+        else {
+            panic!("config/ecs.yaml must select the ECS deployment controller");
+        };
+        assert_eq!(cluster, "rise-e2e");
+        // A comma-separated env var is split — a scalar env var cannot carry a
+        // YAML list, and subnet lists are exactly what operators inject that way.
+        assert_eq!(
+            subnets,
+            vec!["subnet-abc".to_string(), "subnet-def".to_string()]
+        );
+        // ECS is a throttled API: a Docker-like 5s tick would burn the quota.
+        assert_eq!(reconcile_interval_secs, 30);
+        assert_eq!(cpu_architecture, "X86_64");
+        assert_eq!(resource_prefix, "rise");
+        assert!(access_classes.contains_key("public"));
+        assert!(access_classes.contains_key("private"));
+
+        // Without this the install would crash at startup on the Kubernetes
+        // default log backend, which needs a kube client ECS does not have.
+        assert!(matches!(
+            settings.deployment_logs,
+            DeploymentLogsSettings::None { .. }
+        ));
+    }
+
+    #[test]
+    fn ecs_config_without_subnets_is_rejected_at_load() {
+        // A task with no subnet cannot be placed at all, and ECS only says so on
+        // the first CreateService — long after startup, and to nobody watching.
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert("RISE_ECS_SUBNETS", "");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("at least one subnet"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    /// The env every ECS-mode load needs before it can get as far as the
+    /// registry checks these tests are about.
+    fn ecs_base_env() -> std::collections::HashMap<&'static str, &'static str> {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert("RISE_ECS_SUBNETS", "subnet-abc");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+        env
+    }
+
+    #[test]
+    fn shipped_ecs_config_selects_ecr_from_one_env_flip() {
+        // The file's own comment recommends ECR; if switching to it needed the
+        // file edited, that recommendation would be advice nobody can take.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+        env.insert(
+            "RISE_ECS_EXECUTION_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-exec",
+        );
+
+        let settings = load_shipped_ecs_config(&env).expect("ecr mode must load");
+        let Some(RegistrySettings::Ecr {
+            account_id,
+            repo_prefix,
+            ..
+        }) = settings.registry
+        else {
+            panic!("RISE_REGISTRY_TYPE=ecr must select the ECR registry");
+        };
+        assert_eq!(account_id, "123456789012");
+        assert_eq!(repo_prefix, "rise/");
+    }
+
+    #[test]
+    fn cpu_architecture_is_canonicalised_at_load_and_a_bad_one_is_rejected() {
+        // `RISE_ECS_CPU_ARCHITECTURE` is an env var, so lower case and the
+        // Docker/OCI spelling are what operators actually type. Canonicalising
+        // at load is what lets the rest of the system assume one of two tokens.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CPU_ARCHITECTURE", "aarch64");
+        let settings = load_shipped_ecs_config(&env).expect("aarch64 must be accepted");
+        let Some(DeploymentControllerSettings::Ecs {
+            cpu_architecture, ..
+        }) = settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(cpu_architecture, "ARM64");
+
+        // An architecture we can neither recognise nor normalise has no safe
+        // default: guessing would build images the tasks cannot execute.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CPU_ARCHITECTURE", "riscv64");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("X86_64 or ARM64"),
+            "should name the valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn ecr_on_ecs_without_an_execution_role_is_rejected() {
+        // ECS pulls from ECR with the execution role and nothing else. Without
+        // one every task dies with CannotPullContainerError, which names neither
+        // the cause nor the fix.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("execution_role_arn"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("AmazonECSTaskExecutionRolePolicy"),
+            "should name the policy that fixes it: {msg}"
+        );
+    }
+
+    #[test]
+    fn static_credential_oci_on_ecs_needs_a_secrets_manager_secret() {
+        // Anonymous is fine; static credentials are not, because ECS cannot be
+        // handed them inline and would fail at task start instead.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_USERNAME", "u");
+        env.insert("RISE_REGISTRY_PASSWORD", "p");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("repository_credentials_secret_arn"),
+            "unhelpful: {err}"
+        );
+
+        // With the ARN supplied it loads.
+        let mut env = env.clone();
+        env.insert(
+            "RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN",
+            "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise-registry",
+        );
+        load_shipped_ecs_config(&env).expect("static creds plus a secret ARN must load");
+    }
+
+    #[test]
+    fn anonymous_oci_on_ecs_is_accepted() {
+        // The shipped defaults leave username/password empty, so this is also a
+        // guard that the static-credential check does not fire on them.
+        load_shipped_ecs_config(&ecs_base_env()).expect("anonymous OCI must load");
+    }
+
+    #[test]
+    fn short_lived_token_registries_are_rejected_on_ecs() {
+        // GitLab and JFrog pull credentials expire and are refreshed by Rise on
+        // Kubernetes. ECS re-authenticates at every task start with no refresh
+        // path, so these deploy successfully and break hours later.
+        let overlay = "\
+registry:
+  type: gitlab
+  gitlab_url: https://gitlab.example.com
+  registry_url: registry.gitlab.example.com
+  namespace: org/project
+  username: rise
+  token: glpat-xxx
+";
+        let err = load_shipped_ecs_config_with_overlay(&ecs_base_env(), Some(overlay))
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("not supported"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("ecr"),
+            "should name a supported alternative: {msg}"
+        );
     }
 
     #[test]
@@ -3053,7 +3803,7 @@ auth:
         );
         classes.insert("private".to_string(), None);
 
-        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+        assert!(access_classes_missing_auth_backend_url(&classes, "").is_empty());
     }
 }
 

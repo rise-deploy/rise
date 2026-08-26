@@ -13,6 +13,7 @@ use crate::http::HttpResponse;
 pub use crate::BackendKind;
 
 mod docker;
+mod ecs;
 mod minikube;
 
 /// Auth override for a single CLI invocation. Passing `None` to
@@ -86,6 +87,29 @@ pub trait Backend {
     /// A small HTTP app to deploy for the public-deploy scenario.
     fn sample_app(&self) -> SampleApp;
 
+    /// Block until the registry has a repository ready for `project`, for
+    /// backends whose registry provisions them asynchronously.
+    ///
+    /// Default: nothing to wait for. ECS with an ECR registry overrides it —
+    /// repositories are created by a leader-elected controller on a 10-second
+    /// poll, not at project-create time, so a create-then-deploy inside that
+    /// window pushes against a repository that does not exist yet.
+    fn wait_registry_ready(&self, project: &str) -> Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// The image reference the runtime was actually told to run for `project`.
+    ///
+    /// `Ok(None)` means the backend does not expose it — a declared gap, never a
+    /// silent pass. ECS reads it back off the running service's task definition,
+    /// which is the only evidence that the pull went through the configured
+    /// registry rather than somewhere else.
+    fn deployed_image(&self, project: &str) -> Result<Option<String>> {
+        let _ = project;
+        Ok(None)
+    }
+
     /// Whether this backend can build & deploy an app from source
     /// (`deploy --backend docker:build`) — i.e. it has a registry the runtime can
     /// pull from. Only minikube's jfrog-vault mode does, in the harness.
@@ -129,12 +153,20 @@ pub trait Backend {
         )
     }
 
-    /// GET the Traefik API (e.g. `/api/http/services/...`). Docker only.
+    /// GET the Traefik API (e.g. `/api/http/services/...`). Traefik-fronted
+    /// backends only (Docker, ECS).
     fn traefik_api(&self, _path: &str) -> Result<HttpResponse> {
         anyhow::bail!(
             "the Traefik API is not available on the {} backend",
             self.name()
         )
+    }
+
+    /// Traefik provider name a service is registered under, for the `@<provider>`
+    /// suffix the API keys services by. `docker` for the Docker daemon provider,
+    /// `ecs` for the ECS provider.
+    fn traefik_provider(&self) -> &'static str {
+        "docker"
     }
 
     /// The app's ingress hostname for this backend (Traefik host on docker, the
@@ -244,5 +276,6 @@ pub fn create(kind: BackendKind) -> Result<Box<dyn Backend>> {
     Ok(match kind {
         BackendKind::Docker => Box::new(docker::DockerBackend::new()?),
         BackendKind::Minikube => Box::new(minikube::MinikubeBackend::new()?),
+        BackendKind::Ecs => Box::new(ecs::EcsBackend::new()?),
     })
 }

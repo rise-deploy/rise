@@ -18,6 +18,9 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 regex = "1.11"
+# Traefik API client for the shared readiness signal (`serverStatus`). HTTP only —
+# this crate still never touches a database.
+reqwest = { version = "0.13.0", features = ["json"] }
 rise-deployment-spec = { path = "../rise-deployment-spec" }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true }
@@ -25,8 +28,11 @@ serde_json = { workspace = true }
 # Only for `#[derive(sqlx::FromRow)]` / `#[derive(sqlx::Type)]` on the moved
 # models. This crate never opens a connection or runs a query — the
 # `DeploymentStore` implementation lives in `rise-deploy`.
+sha2 = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
+urlencoding = "2.1"
 uuid = { workspace = true }
 
 [dev-dependencies]

@@ -1083,14 +1083,50 @@ where
     Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
 }
 
+/// Whether to colour log output.
+///
+/// Colours by default, including when nothing is attached to a terminal:
+/// whether that renders depends on what reads the stream, not on this process.
+/// `kubectl logs` passes the bytes through to a terminal that renders them, so
+/// a Kubernetes install wants colour despite having no tty; the ECS console
+/// draws the same bytes literally, so an ECS install does not. Being
+/// non-terminal is what those two share, which is why it cannot decide this --
+/// `modules/rise-ecs` sets `never` for the console it knows it is logging to.
+///
+/// `RISE_LOG_COLOR` selects: `never` (`0`, `false`, `no`) never colours,
+/// `always` (`1`, `true`, `yes`) always does, and `auto` colours only a
+/// terminal, for a pipe or a file. `NO_COLOR` set to anything non-empty
+/// disables, per <https://no-color.org>.
+fn ansi_enabled(rise_log_color: Option<&str>, no_color: Option<&str>, is_terminal: bool) -> bool {
+    match rise_log_color.map(str::trim) {
+        Some("always" | "1" | "true" | "yes") => return true,
+        Some("never" | "0" | "false" | "no") => return false,
+        Some("auto") if no_color.is_none_or(str::is_empty) => return is_terminal,
+        // Anything else falls through to NO_COLOR and then the default: an
+        // unrecognised value must not be louder than NO_COLOR, and must not
+        // quietly drop colour that was on before it was misspelled.
+        _ => {}
+    }
+    no_color.is_none_or(|v| v.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for all commands
+    let ansi = ansi_enabled(
+        std::env::var("RISE_LOG_COLOR").ok().as_deref(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    );
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(ansi),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -2138,4 +2174,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod log_color_tests {
+    use super::ansi_enabled;
+
+    #[test]
+    fn colour_is_on_by_default_with_or_without_a_terminal() {
+        // A Kubernetes container has no tty and still wants colour, because
+        // `kubectl logs` hands the bytes to one.
+        assert!(ansi_enabled(None, None, true));
+        assert!(ansi_enabled(None, None, false));
+    }
+
+    #[test]
+    fn auto_defers_to_the_terminal() {
+        assert!(ansi_enabled(Some("auto"), None, true));
+        assert!(!ansi_enabled(Some("auto"), None, false));
+    }
+
+    #[test]
+    fn rise_log_color_overrides_both_the_terminal_and_no_color() {
+        assert!(ansi_enabled(Some("always"), Some("1"), false));
+        assert!(!ansi_enabled(Some("never"), None, true));
+    }
+
+    #[test]
+    fn no_color_disables_colour_on_a_terminal() {
+        assert!(!ansi_enabled(None, Some("1"), true));
+        // Set but empty is not "set", per the convention.
+        assert!(ansi_enabled(None, Some(""), true));
+    }
+
+    #[test]
+    fn an_unrecognised_override_defers_rather_than_forcing() {
+        assert!(!ansi_enabled(Some("banana"), Some("1"), true));
+        assert!(ansi_enabled(Some("banana"), None, false));
+    }
 }

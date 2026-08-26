@@ -579,6 +579,26 @@ Run with `RUST_LOG=debug` to see configuration loading details:
 RUST_LOG=debug cargo run --bin rise -- backend server
 ```
 
+### Log colour
+
+Logs are coloured by default, including with nothing attached to a terminal:
+whether that renders depends on what reads the stream. `kubectl logs` hands the
+bytes to a terminal that renders them, so a Kubernetes install keeps colour;
+the CloudWatch console prints them literally, so `modules/rise-ecs` sets
+`RISE_LOG_COLOR = "never"` on the control plane. Being non-terminal is what
+those two have in common, which is why Rise cannot decide it for you.
+
+| `RISE_LOG_COLOR` | Effect |
+|---|---|
+| unset (default) | Always colour |
+| `always` (`1`, `true`, `yes`) | Always colour |
+| `never` (`0`, `false`, `no`) | Never colour |
+| `auto` | Colour only a terminal — for a pipe or a file |
+
+`NO_COLOR` set to anything non-empty also disables colour
+([no-color.org](https://no-color.org)); an explicit `RISE_LOG_COLOR` of
+`always`/`never` wins over it.
+
 ## Debugging Authentication and Token Claims
 
 When a deploy or login is rejected with a permission or "claims do not match"

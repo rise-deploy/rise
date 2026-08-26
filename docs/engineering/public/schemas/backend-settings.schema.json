@@ -746,6 +746,262 @@
             "traefik_network"
           ],
           "type": "object"
+        },
+        {
+          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service and lets Traefik's ECS\nprovider route to the tasks via labels Rise stamps on the container\ndefinition. No Kubernetes, no Metacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0005 for the design and its deliberate v1 limitations.",
+          "properties": {
+            "access_classes": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AccessClass"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "default": {
+                "public": {
+                  "access_requirement": "None",
+                  "custom_annotations": {},
+                  "description": "Fully public — no authentication required.",
+                  "display_name": "Public",
+                  "ingress_class": "traefik"
+                }
+              },
+              "description": "Access classes defining ingress authentication levels. For classes\nwhose `access_requirement` is `Authenticated`/`Member` the controller\nstamps Traefik forwardAuth labels, which requires `auth_backend_url`;\nthe backend refuses to start otherwise rather than serve those\nprojects publicly with no auth enforced.",
+              "type": "object"
+            },
+            "access_key_id": {
+              "default": null,
+              "description": "Static credentials, for a control plane running outside AWS. Leave\nunset in production so the standard chain (task role / instance\nprofile) applies.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "assign_public_ip": {
+              "default": false,
+              "description": "Assign a public IP to each task. Required when the subnets are public\n(no NAT gateway), since Fargate must reach ECR and CloudWatch to start.",
+              "type": "boolean"
+            },
+            "auth_backend_url": {
+              "default": "",
+              "description": "Internal URL Traefik uses to reach the Rise backend for the forwardAuth\nsubrequest. Must be resolvable **from inside the cluster** — a Cloud Map\nname or an internal load balancer, not the public URL.",
+              "type": "string"
+            },
+            "auth_signin_url": {
+              "default": "",
+              "description": "Browser-facing base URL for the login redirect. Falls back to the\nserver `public_url` when empty.",
+              "type": "string"
+            },
+            "cluster": {
+              "description": "ECS cluster name that carries the deployed workloads.",
+              "type": "string"
+            },
+            "controller_class_name": {
+              "default": "default",
+              "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
+              "type": "string"
+            },
+            "cpu_architecture": {
+              "default": "X86_64",
+              "description": "Fargate CPU architecture: `X86_64` or `ARM64`. Defaults to `X86_64`.",
+              "type": "string"
+            },
+            "deployment_constraints": {
+              "$ref": "#/$defs/DeploymentConstraints",
+              "description": "Platform-level constraints for deployment resources."
+            },
+            "deployment_defaults": {
+              "$ref": "#/$defs/DeploymentDefaults",
+              "description": "Default resource values for new deployments when not specified."
+            },
+            "endpoint_url": {
+              "default": null,
+              "description": "Override the AWS service endpoint (VPC/PrivateLink or FIPS endpoints).\nThe AWS SDK also honours `AWS_ENDPOINT_URL`; this is the explicit form.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "environment_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution_role_arn": {
+              "default": null,
+              "description": "IAM role ECS itself assumes to pull images and resolve SSM secrets.\nRequired whenever a project uses secret env vars or a private registry.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "health_probes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HealthProbeConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Health probe configuration."
+            },
+            "identity_token_ttl_seconds": {
+              "default": 3600,
+              "description": "Lifetime in seconds of workload identity tokens. Accepted for\nforward-compatibility; ECS v1 does not deliver identity material and\nrejects deployments that request it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ingress_port": {
+              "default": null,
+              "description": "Optional port appended to all generated ingress URLs.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "ingress_schema": {
+              "default": "https",
+              "description": "URL scheme for generated ingress URLs. Defaults to `https`.",
+              "type": "string"
+            },
+            "label_namespace": {
+              "default": "rise.dev",
+              "description": "Label namespace prefix for Rise bookkeeping tags. Defaults to `rise.dev`.",
+              "type": "string"
+            },
+            "log_group": {
+              "default": null,
+              "description": "CloudWatch log group for app containers (`awslogs` driver). When\nunset, containers get no log driver and runtime logs are unavailable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "production_ingress_url_template": {
+              "description": "Ingress URL template for the production (default) deployment group.\nSame semantics as the other backends. Must contain `{project_name}`.",
+              "type": "string"
+            },
+            "reconcile_interval_secs": {
+              "default": 30,
+              "description": "Interval in seconds between reconcile ticks. Defaults to 30 — ECS is\na throttled API, unlike a local Docker daemon.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "region": {
+              "description": "AWS region hosting the cluster.",
+              "type": "string"
+            },
+            "repository_credentials_secret_arn": {
+              "default": null,
+              "description": "ARN of a Secrets Manager secret holding `{\"username\": …, \"password\": …}`\nfor a private registry that is not ECR.\n\nECS re-authenticates on every task start and cannot take inline\ncredentials, so a static-credential registry needs the credentials\nparked somewhere ECS can read them itself. The ARN is stamped onto\neach container definition as `repositoryCredentials`; the execution\nrole needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`\nwhen the secret uses a customer-managed key).\n\nLeave unset for ECR (the execution role authenticates the pull) and\nfor anonymous registries.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resource_prefix": {
+              "default": "rise",
+              "description": "Prefix for generated ECS resource names. Defaults to `rise`.",
+              "type": "string"
+            },
+            "secret_access_key": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "security_groups": {
+              "default": [],
+              "description": "Security groups applied to the tasks' ENIs. ECS caps this at 5.\nAccepts a YAML sequence or a comma-separated string.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "ssm_kms_key_id": {
+              "default": null,
+              "description": "KMS key for the `SecureString` parameters. Unset uses the AWS-managed\n`alias/aws/ssm` key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ssm_parameter_prefix": {
+              "default": "rise",
+              "description": "Root of the SSM hierarchy holding secret env vars. Defaults to `rise`.",
+              "type": "string"
+            },
+            "staging_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subnets": {
+              "description": "Subnets for the tasks' `awsvpc` ENIs. At least one is required; ECS\ncaps an `awsvpcConfiguration` at 16. Accepts a YAML sequence or a\ncomma-separated string so it can come straight from an env var.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "task_role_arn": {
+              "default": null,
+              "description": "IAM role the application containers run as (their AWS identity).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_api_url": {
+              "default": null,
+              "description": "Base URL of Traefik's API. Read for per-server `serverStatus`, the\nauthoritative readiness signal (no fallback), so this is **required\nfor projects that set a `health_check`** — without it such a\ndeployment never becomes Healthy.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_certresolver": {
+              "default": null,
+              "description": "Optional Traefik certresolver name for automatic TLS.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_entrypoint": {
+              "default": "web",
+              "description": "Traefik entrypoint name routers bind to. Defaults to `web`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "ecs",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "region",
+            "cluster",
+            "subnets",
+            "production_ingress_url_template"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -797,6 +1053,19 @@
           "properties": {
             "type": {
               "const": "docker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "No runtime log backend.\n\nEvery other variant needs a runtime client the ECS backend does not have\n(a kube client, a bollard handle), so without this an ECS install would\nfall through to the `Kubernetes` default and **crash at startup** with\n\"Kubernetes log backend requires kube client\". This makes \"no runtime\nlogs\" an explicit, working choice: the API answers with a clear\n`historical_backend_not_configured` status instead of an error, and the\nUI renders its empty state.\n\nECS installs that want runtime logs today can use the `loki` variant,\nwhich is backend-agnostic (it queries by stream labels, not a runtime\nclient). A CloudWatch variant is the intended replacement — see ADR-0005.",
+          "properties": {
+            "type": {
+              "const": "none",
               "type": "string"
             }
           },

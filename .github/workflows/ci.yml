@@ -333,6 +333,26 @@ jobs:
   # verification is security-critical (it must fail closed on forged/invalid
   # tokens), so its negative-path tests run on every CI — the Docker build of the
   # fixture in the e2e jobs does not execute them.
+  terraform-check:
+    name: Quality / Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      # `validate` and `test` only; `plan` against real infrastructure would
+      # need credentials, and these run on untrusted pull requests. The module
+      # tests override the identity data sources for the same reason.
+      - name: Check Terraform modules
+        run: mise run terraform:check
+
   fixture-go-test:
     name: Quality / identity fixture (Go)
     runs-on: ubuntu-latest

@@ -10,6 +10,10 @@ buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
 helm = "latest"
+# Pinned, not "latest": the modules' `terraform test` files use override_data and
+# check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
+# `mise run terraform:check` in the same change.
+terraform = "1.15.9"
 rust = { version = "1.95.0", profile = "default" }
 kubectl = "latest"
 k9s = "latest"
@@ -122,6 +126,7 @@ cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
+mise terraform:check
 # Every crate whose tests need no database. Expressed as exclusions so a new
 # crate is covered by default; only the three that require Postgres opt out.
 cargo test --workspace --all-features \
@@ -130,6 +135,24 @@ cargo test --workspace --all-features \
   --exclude rise-runtime-sync
 """
 env.SQLX_OFFLINE = true
+
+[tasks."terraform:check"]
+description = "Format-check, validate and unit-test the Terraform modules and e2e workspaces."
+run = """
+terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run
+# -backend=false so the e2e workspaces, which declare an S3 backend, check
+# without credentials or a bucket.
+for dir in modules/*/ tests/e2e/bootstrap tests/e2e/run; do
+  echo "==> $dir"
+  terraform -chdir="$dir" init -backend=false -input=false >/dev/null
+  terraform -chdir="$dir" validate
+  terraform -chdir="$dir" test
+done
+"""
+
+[tasks."terraform:fmt"]
+description = "Format the Terraform modules in place."
+run = "terraform fmt -recursive modules/"
 
 [tasks."helm:deps"]
 description = "Refresh vendored Helm chart dependencies under helm/rise/charts."

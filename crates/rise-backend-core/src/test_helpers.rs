@@ -1,3 +1,8 @@
+//! Shared test fixtures for the runtime-agnostic reconcile machinery.
+//!
+//! Public (rather than `#[cfg(test)]`) so every backend crate's tests build the
+//! same canonical desired/actual containers instead of drifting copies.
+
 //! Shared `#[cfg(test)]` fixtures for the reconciler's pure-helper unit tests.
 //!
 //! These builders construct the `DesiredContainer` / `ActualContainer` slots and
@@ -7,10 +12,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::container_builder::{self, DesiredContainer, DesiredRoute};
+use super::desired::{DesiredContainer, DesiredRoute};
 use super::diff::ActualContainer;
+use super::naming;
 
-pub(crate) fn desired(container: &str, image: &str, hash: &str) -> DesiredContainer {
+pub fn desired(container: &str, image: &str, hash: &str) -> DesiredContainer {
     DesiredContainer {
         project: "myapp".to_string(),
         access_class: "public".to_string(),
@@ -46,7 +52,7 @@ pub(crate) fn desired(container: &str, image: &str, hash: &str) -> DesiredContai
 
 /// Stable identity key for the `desired()` helper's slot, used to build the
 /// `identity` field of expected Create/Recreate actions.
-pub(crate) fn identity_of(d: &DesiredContainer) -> String {
+pub fn identity_of(d: &DesiredContainer) -> String {
     super::diff::identity_key(
         &d.project,
         &d.deployment_group,
@@ -58,14 +64,14 @@ pub(crate) fn identity_of(d: &DesiredContainer) -> String {
 
 /// Empty protected-deployment-ids set for the common case where no
 /// deployment failed desired computation.
-pub(crate) fn no_protected() -> HashSet<String> {
+pub fn no_protected() -> HashSet<String> {
     HashSet::new()
 }
 
 /// The resolved generation-ful name for the `desired()` slot at a given
 /// generation (the name a Create/Recreate action carries).
-pub(crate) fn name_of_gen(d: &DesiredContainer, generation: u32) -> String {
-    container_builder::container_name(
+pub fn name_of_gen(d: &DesiredContainer, generation: u32) -> String {
+    naming::container_name(
         "rise",
         &d.project,
         &d.deployment_group,
@@ -79,7 +85,7 @@ pub(crate) fn name_of_gen(d: &DesiredContainer, generation: u32) -> String {
 /// A live container belonging to the `desired()` helper's deployment, at a
 /// given generation. Its name carries the `_g{generation}` suffix and it
 /// carries the full identity-label set so the diff can match it.
-pub(crate) fn actual_for_gen(
+pub fn actual_for_gen(
     d: &DesiredContainer,
     image: &str,
     env_hash: &str,
@@ -103,12 +109,12 @@ pub(crate) fn actual_for_gen(
 }
 
 /// A live container at generation 1 (the common case for most diff tests).
-pub(crate) fn actual_for(d: &DesiredContainer, image: &str, env_hash: &str) -> ActualContainer {
+pub fn actual_for(d: &DesiredContainer, image: &str, env_hash: &str) -> ActualContainer {
     actual_for_gen(d, image, env_hash, 1)
 }
 
 /// Build the `desired()` slot for a specific replica index.
-pub(crate) fn desired_replica(replica: u32) -> DesiredContainer {
+pub fn desired_replica(replica: u32) -> DesiredContainer {
     let mut d = desired("app", "img:1", "h1");
     d.replica = replica;
     d
@@ -116,7 +122,7 @@ pub(crate) fn desired_replica(replica: u32) -> DesiredContainer {
 
 /// A live (matched) container for the given replica/state/image. Carries the
 /// full identity-label set including the replica so the diff matches it.
-pub(crate) fn actual_replica(replica: u32, state: &str, image: &str) -> ActualContainer {
+pub fn actual_replica(replica: u32, state: &str, image: &str) -> ActualContainer {
     let d = desired_replica(replica);
     ActualContainer {
         id: format!("cid-r{replica}"),
@@ -126,7 +132,7 @@ pub(crate) fn actual_replica(replica: u32, state: &str, image: &str) -> ActualCo
 }
 
 /// Health map marking every given identity healthy.
-pub(crate) fn all_healthy(actual: &[ActualContainer]) -> HashMap<String, bool> {
+pub fn all_healthy(actual: &[ActualContainer]) -> HashMap<String, bool> {
     actual
         .iter()
         .filter_map(|a| a.identity().map(|id| (id, true)))

@@ -16,36 +16,19 @@ RUN apt-get update && apt-get install -y \
 # Stage 2: Generate recipe file for dependencies
 FROM chef AS planner
 
-# Copy workspace project files
+# Copy the whole workspace, not a hand-listed set of manifests.
+#
+# `cargo chef prepare` reads every workspace member's Cargo.toml, so a list has
+# to name all of them — and a crate added without a matching line here fails the
+# build on a missing manifest, far from the change that caused it. Copying
+# sources into this stage costs nothing downstream: its only output is
+# recipe.json, and the expensive `cargo chef cook` layer in the builder is keyed
+# on that file's content, which changes only when dependencies change.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/rise-authz/Cargo.toml ./crates/rise-authz/Cargo.toml
-COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
-COPY crates/rise-resource-store-postgres/Cargo.toml ./crates/rise-resource-store-postgres/Cargo.toml
-COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
-COPY crates/rise-backend-core/Cargo.toml ./crates/rise-backend-core/Cargo.toml
-COPY crates/rise-backend-docker/Cargo.toml ./crates/rise-backend-docker/Cargo.toml
-COPY crates/rise-deployment-spec/Cargo.toml ./crates/rise-deployment-spec/Cargo.toml
-COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
+COPY crates ./crates
 
-# Create dummy sources for cargo to be happy
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    mkdir -p crates/rise-authz/src && \
-    echo "" > crates/rise-authz/src/lib.rs && \
-    mkdir -p crates/rise-resource-api/src && \
-    echo "" > crates/rise-resource-api/src/lib.rs && \
-    mkdir -p crates/rise-resource-store-postgres/src && \
-    echo "" > crates/rise-resource-store-postgres/src/lib.rs && \
-    mkdir -p crates/rise-backend-auth/src && \
-    echo "" > crates/rise-backend-auth/src/lib.rs && \
-    mkdir -p crates/rise-backend-core/src && \
-    echo "" > crates/rise-backend-core/src/lib.rs && \
-    mkdir -p crates/rise-backend-docker/src && \
-    echo "" > crates/rise-backend-docker/src/lib.rs && \
-    mkdir -p crates/rise-deployment-spec/src && \
-    echo "" > crates/rise-deployment-spec/src/lib.rs && \
-    mkdir -p crates/rise-runtime-sync/src && \
-    echo "" > crates/rise-runtime-sync/src/lib.rs
+# Cargo wants a source file for the root binary; the recipe needs only manifests.
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -101,7 +84,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 4: Create the final, smaller image (match builder's Debian version)
 FROM debian:trixie-slim AS rise
 
-# Install runtime dependencies
+# Runtime dependencies. Deliberately no HTTP client: the ECS health check runs
+# `rise backend health`, which probes the server over loopback using the binary
+# that is already here, so the image needs no curl or wget for it.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \

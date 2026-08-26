@@ -350,6 +350,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ecs"
+version = "1.138.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07d2f9e00079e71e5381abd5e7f7dea276de0762fc1163270d3c31528715957f"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-iam"
 version = "1.120.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,6 +492,32 @@ dependencies = [
  "sha2 0.11.0",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "aws-sdk-ssm"
+version = "1.119.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3a2007c49b4a471fbf2560999b5e2a32a2a8dddf5a6780ee32ad79163cdba12"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
 ]
 
 [[package]]
@@ -4267,13 +4319,17 @@ dependencies = [
  "async-trait",
  "chrono",
  "regex",
+ "reqwest 0.13.4",
  "rise-deployment-spec",
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
+ "url",
+ "urlencoding",
  "uuid",
 ]
 
@@ -4289,6 +4345,7 @@ dependencies = [
  "reqwest 0.13.4",
  "rise-backend-auth",
  "rise-backend-core",
+ "rise-backend-traefik",
  "rise-deployment-spec",
  "rise-resource-api",
  "rise-runtime-sync",
@@ -4306,6 +4363,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "rise-backend-ecs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-ecs",
+ "aws-sdk-ssm",
+ "aws-sdk-sts",
+ "chrono",
+ "rise-backend-core",
+ "rise-backend-traefik",
+ "rise-deployment-spec",
+ "rise-resource-api",
+ "rise-runtime-sync",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rise-backend-traefik"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.13.4",
+ "rise-backend-core",
+ "rise-deployment-spec",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
+]
+
+[[package]]
 name = "rise-deploy"
 version = "0.23.0-rc8"
 dependencies = [
@@ -4315,10 +4415,12 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-ecr",
+ "aws-sdk-ecs",
  "aws-sdk-iam",
  "aws-sdk-kms",
  "aws-sdk-rds",
  "aws-sdk-s3",
+ "aws-sdk-ssm",
  "aws-sdk-sts",
  "axum",
  "axum-extra",
@@ -4345,6 +4447,8 @@ dependencies = [
  "rise-backend-auth",
  "rise-backend-core",
  "rise-backend-docker",
+ "rise-backend-ecs",
+ "rise-backend-traefik",
  "rise-deployment-spec",
  "rise-resource-api",
  "rise-resource-store-postgres",

@@ -48,6 +48,46 @@ pub struct ResolvedDeploymentEnvVars {
     pub plain_env_vars: Vec<(String, String)>,
     /// `name → decrypted-bytes` for values that must be carried as secrets.
     pub secret_env_vars: BTreeMap<String, Vec<u8>>,
+    /// `name → fingerprint` for the same secrets, derived from their *stored*
+    /// form rather than their plaintext. See [`secret_fingerprint`].
+    pub secret_fingerprints: BTreeMap<String, String>,
+}
+
+/// Fingerprint a secret env var by the form in which it is *stored* — the
+/// ciphertext, plus the row's last-write timestamp — never by its plaintext.
+///
+/// A reconciler folds an `env_hash` into places anyone with read access to the
+/// runtime can see: an ECS service tag, a container label, a pod annotation.
+/// Hashing secret plaintext there publishes an offline guessing oracle: anyone
+/// who can read the hash can confirm a guessed password or token without ever
+/// touching the secret store. A fingerprint is unpredictable without the
+/// encryption key, so it reveals nothing — while still changing whenever the
+/// value is rewritten, which is the property the hash is there for.
+///
+/// Both inputs are folded in because either alone would be enough only under an
+/// assumption held elsewhere: the ciphertext changes on every write for a
+/// randomised scheme (AES-GCM with a fresh nonce, KMS blobs), and the timestamp
+/// changes on every write of the row. Together they change on a rewrite whether
+/// or not a given provider happens to be deterministic.
+pub fn secret_fingerprint(var: &DeploymentEnvVar) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    // Domain separation: this digest must never collide with `hash_env`'s.
+    hasher.update(b"rise.secret-env-fingerprint.v1");
+    for field in [
+        var.key.as_bytes(),
+        var.value.as_bytes(),
+        var.updated_at.to_rfc3339().as_bytes(),
+    ] {
+        hasher.update((field.len() as u64).to_le_bytes());
+        hasher.update(field);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Resolve the container + route list a reconciler should emit for a
@@ -175,6 +215,11 @@ pub async fn resolve_deployment_env_vars(
             );
         }
 
+        // Taken before the row's value is consumed by decryption: the
+        // fingerprint stands in for the plaintext wherever the drift hash is
+        // publicly visible.
+        let fingerprint = var.is_secret.then(|| secret_fingerprint(&var));
+
         let value = if var.is_secret {
             match encryption_provider {
                 Some(provider) => provider
@@ -196,10 +241,14 @@ pub async fn resolve_deployment_env_vars(
             var.value
         };
 
-        if var.is_secret {
-            resolved.secret_env_vars.insert(key, value.into_bytes());
-        } else {
-            resolved.plain_env_vars.push((key, value));
+        match fingerprint {
+            Some(fingerprint) => {
+                resolved
+                    .secret_fingerprints
+                    .insert(key.clone(), fingerprint);
+                resolved.secret_env_vars.insert(key, value.into_bytes());
+            }
+            None => resolved.plain_env_vars.push((key, value)),
         }
     }
 
@@ -264,6 +313,49 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn fingerprints_cover_only_the_secrets() {
+        let resolved = resolve_deployment_env_vars(
+            vec![
+                env_var("API_KEY", "ciphertext-a", true),
+                env_var("PORT", "8080", false),
+            ],
+            Some(&PassthroughProvider),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.secret_fingerprints.len(), 1);
+        assert!(resolved.secret_fingerprints.contains_key("API_KEY"));
+        // The plaintext must not be recoverable from, or equal to, the digest.
+        assert_ne!(resolved.secret_fingerprints["API_KEY"], "ciphertext-a");
+    }
+
+    #[test]
+    fn a_fingerprint_changes_when_the_stored_secret_is_rewritten() {
+        let stored = env_var("API_KEY", "ciphertext-a", true);
+        assert_eq!(secret_fingerprint(&stored), secret_fingerprint(&stored));
+
+        // A new value, whatever the provider's ciphertext looks like …
+        let mut rewritten = stored.clone();
+        rewritten.value = "ciphertext-b".to_string();
+        assert_ne!(secret_fingerprint(&stored), secret_fingerprint(&rewritten));
+
+        // … and a rewrite that a deterministic provider would leave
+        // byte-identical still moves the row's timestamp.
+        let mut touched = stored.clone();
+        touched.updated_at = stored.updated_at + chrono::Duration::seconds(1);
+        assert_ne!(secret_fingerprint(&stored), secret_fingerprint(&touched));
+    }
+
+    #[test]
+    fn a_fingerprint_is_bound_to_its_key() {
+        let a = env_var("API_KEY", "ciphertext", true);
+        let mut b = a.clone();
+        b.key = "OTHER_KEY".to_string();
+        assert_ne!(secret_fingerprint(&a), secret_fingerprint(&b));
     }
 
     #[tokio::test]

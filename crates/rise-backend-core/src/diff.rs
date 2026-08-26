@@ -5,7 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::container_builder::{self, DesiredContainer};
+use crate::desired::DesiredContainer;
+use crate::naming;
 
 /// Observed Rise-managed container, reduced to the fields the diff needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +70,7 @@ impl ActualContainer {
     /// `None` when any identity label is missing (a legacy/foreign container
     /// that can't be matched — it's only ever a removable orphan, if not
     /// protected).
-    pub(crate) fn identity(&self) -> Option<String> {
+    pub fn identity(&self) -> Option<String> {
         Some(identity_key(
             self.project.as_deref()?,
             self.deployment_group.as_deref()?,
@@ -82,7 +83,7 @@ impl ActualContainer {
     /// Spec-level key (identity minus replica) for grouping replicas of a spec.
     /// `None` when any spec-identity label is missing (a legacy/foreign
     /// container that can't be grouped).
-    pub(crate) fn spec_identity(&self) -> Option<String> {
+    pub fn spec_identity(&self) -> Option<String> {
         Some(spec_key(
             self.project.as_deref()?,
             self.deployment_group.as_deref()?,
@@ -223,7 +224,7 @@ pub fn diff_desired_vs_actual(
                 // Brand-new slot: create at generation 1.
                 actions.push(ReconcileAction::Create {
                     identity: identity.clone(),
-                    name: container_builder::container_name(
+                    name: naming::container_name(
                         container_prefix,
                         &d.project,
                         &d.deployment_group,
@@ -269,7 +270,7 @@ pub fn diff_desired_vs_actual(
                     let generation = a.generation + 1;
                     actions.push(ReconcileAction::Recreate {
                         identity: identity.clone(),
-                        name: container_builder::container_name(
+                        name: naming::container_name(
                             container_prefix,
                             &d.project,
                             &d.deployment_group,
@@ -310,7 +311,7 @@ pub fn diff_desired_vs_actual(
     actions
 }
 
-pub(crate) fn action_key(a: &ReconcileAction) -> (u8, String) {
+pub fn action_key(a: &ReconcileAction) -> (u8, String) {
     match a {
         ReconcileAction::Create { name, .. } => (0, name.clone()),
         ReconcileAction::Recreate { name, .. } => (1, name.clone()),
@@ -324,7 +325,7 @@ pub(crate) fn action_key(a: &ReconcileAction) -> (u8, String) {
 /// fields and from actual bookkeeping labels so the two match across name
 /// generations. The replica index is the matching unit: each replica of a spec
 /// is reconciled independently.
-pub(crate) fn identity_key(
+pub fn identity_key(
     project: &str,
     group: &str,
     deployment_id: &str,
@@ -337,7 +338,7 @@ pub(crate) fn identity_key(
 /// Spec-level key = the identity tuple MINUS the replica index
 /// (project, group, deployment_id, container). Groups all replicas of a single
 /// spec together — used by the rolling-recreate throttle to reason per-spec.
-pub(crate) fn spec_key(project: &str, group: &str, deployment_id: &str, container: &str) -> String {
+pub fn spec_key(project: &str, group: &str, deployment_id: &str, container: &str) -> String {
     format!("{project}\u{0}{group}\u{0}{deployment_id}\u{0}{container}")
 }
 

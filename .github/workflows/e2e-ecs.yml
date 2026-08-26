@@ -1,0 +1,186 @@
+name: E2E
+
+# Runs the cross-backend harness against the persistent Amazon ECS environment
+# in the scratch account (see tests/e2e/bootstrap, applied once by hand).
+#
+# Not part of ci.yml: it needs AWS credentials and takes appreciably longer than
+# the other backends. Nightly on develop, or opt in on a pull request with the
+# `ecs-e2e` label. Each run stands its whole stack up under its own scope --
+# `pr-<number>` -- and tears it down again, so runs of different pull requests
+# are independent. Once labelled, it re-runs on every push to that pull request.
+
+on:
+  schedule:
+    # 03:17 UTC — off the hour, so it does not contend with everything else
+    # scheduled at :00.
+    - cron: "17 3 * * *"
+  pull_request:
+    # `labeled` opts a pull request in; `synchronize` re-runs it on every later
+    # push. Listing types REPLACES the default set (opened/synchronize/reopened),
+    # so without `synchronize` here the suite would run once at labelling time
+    # and then never again, however many times the branch was pushed.
+    types: [labeled, synchronize]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to test (defaults to develop-<short-sha>)."
+        required: false
+        type: string
+
+# One run at a time *per scope*, not per workflow. Everything a run creates is
+# named after its scope -- Terraform state key, DNS subtree, controller class,
+# security groups, Cloud Map entries, Rise's own ECR and SSM prefixes -- so
+# different pull requests no longer collide and may overlap. Two runs of the
+# *same* scope still would, hence the group.
+#
+# Keyed on the scope itself rather than on the PR number or the ref, because the
+# scope is the thing that is actually shared: the schedule and every
+# workflow_dispatch both run as `nightly`, and keying on the ref would put a
+# dispatch from another branch in its own group while it used the same state
+# key, DNS names and controller class as the nightly run.
+#
+# Overlapping runs do share the account's Fargate quota, so a burst of labelled
+# PRs can exhaust it; the failure is a task that will not start, and the fix is
+# a quota increase rather than re-serializing.
+concurrency:
+  group: e2e-ecs-${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write # GitHub OIDC, so no long-lived AWS keys live in this repo.
+
+jobs:
+  ecs:
+    name: ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Hardcoded because none of it is secret and all of it is already in the
+      # repository: the account is in the state bucket's name in
+      # tests/e2e/bootstrap/versions.tf, and the region sits beside it. Making
+      # CI ask for the same public values through repository settings bought
+      # nothing but a setup step to forget -- and an opaque failure when it was.
+      #
+      # `vars.*` still wins, for anyone pointing this at their own bootstrap.
+      AWS_E2E_ROLE_ARN: ${{ vars.AWS_E2E_ROLE_ARN || 'arn:aws:iam::806938668647:role/rise-e2e-ci' }}
+      AWS_E2E_REGION: ${{ vars.AWS_E2E_REGION || 'eu-central-1' }}
+    # A labelled PR only, and only one from this repository: a fork's head is
+    # untrusted and this job holds credentials.
+    #
+    # The two activities need different questions asked. On `labeled`, only the
+    # label just added matters -- otherwise adding any unrelated label to an
+    # opted-in PR would spend an AWS run. On `synchronize` there is no label in
+    # the payload, so the question is whether the PR still carries it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       ((github.event.action == 'labeled' &&
+         github.event.label.name == 'ecs-e2e') ||
+        (github.event.action == 'synchronize' &&
+         contains(github.event.pull_request.labels.*.name, 'ecs-e2e'))))
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Resolve the image tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          if [[ -n "${{ inputs.image_tag }}" ]]; then
+            tag="${{ inputs.image_tag }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            tag="pr-${{ github.event.pull_request.number }}-${short_sha}"
+          else
+            tag="develop-${short_sha}"
+          fi
+          echo "image_tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Image under test: ${tag}"
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      # Built here rather than pulled from ci.yml's artifact: this workflow runs
+      # on its own schedule, with no upstream job to take one from. Before the
+      # image gate below, so its several minutes are minutes ci.yml's build has
+      # to finish in, and before the role is assumed, so no credentials are held
+      # while waiting.
+      - name: Build the harness
+        run: cargo build --manifest-path tests/e2e/Cargo.toml --release
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Without this the run fails as a five-minute /health timeout and a
+      # circuit-breaker rollback, which reads as "Rise would not start" rather
+      # than "there was nothing to start". ci.yml builds this tag on the same
+      # push, so on a fresh commit the image legitimately does not exist yet.
+      - name: Wait for the image under test
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.image_tag }}
+        run: |
+          set -uo pipefail
+          for attempt in $(seq 1 40); do
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+              echo "Found $IMAGE"
+              exit 0
+            fi
+            echo "Attempt ${attempt}/40: $IMAGE not published yet; waiting 30s."
+            sleep 30
+          done
+          echo "::error::$IMAGE never appeared."
+          echo "ci.yml publishes it for this same commit, so either that build is"
+          echo "still running, or it failed, or this run resolved a tag it never"
+          echo "builds -- on a 'labeled' event GITHUB_SHA is a merge commit"
+          echo "recomputed at label time, so pushing to the branch (or re-running"
+          echo "after ci.yml finishes) gives both workflows the same commit."
+          exit 1
+
+      - name: Assume the e2e role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_E2E_ROLE_ARN }}
+          aws-region: ${{ env.AWS_E2E_REGION }}
+          role-session-name: rise-e2e-${{ github.run_id }}
+
+      - name: Run the harness
+        env:
+          RISE_E2E_BACKEND: ecs
+          RISE_E2E_ENV: ${{ vars.AWS_E2E_ENV_NAME || 'rise-e2e' }}
+          # The run's identity: `pr-<number>` on a pull request, `nightly` on the
+          # schedule. Read straight off a preview URL.
+          RISE_E2E_SCOPE: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
+          AWS_REGION: ${{ env.AWS_E2E_REGION }}
+          RISE_IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          RISE_IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: ./tests/e2e/target/release/rise-e2e
+
+      # The harness sweeps and destroys in tear_down, but a cancelled job never
+      # gets there -- and what it would leave behind holds Fargate quota. The
+      # next run of this scope sweeps it as a backstop; this narrows the window.
+      #
+      # No -backend-config: the harness already init'd this working copy against
+      # the scope's state key, and .terraform/ still holds it. Which is also why
+      # this has to check -- the workspace declares an S3 backend, so without
+      # that init `destroy` fails with "Backend initialization required" rather
+      # than doing nothing, and every early failure ends in a spurious error.
+      - name: Destroy the per-run stack
+        if: always()
+        env:
+          AWS_REGION: ${{ env.AWS_E2E_REGION }}
+        run: |
+          if [[ -d tests/e2e/run/.terraform ]]; then
+            terraform -chdir=tests/e2e/run destroy -auto-approve -input=false || true
+          else
+            echo "The run workspace was never initialized, so nothing was created to destroy."
+          fi

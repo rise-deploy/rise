@@ -1,12 +1,14 @@
 //! Pure environment-variable merge + hashing helpers used by desired
 //! computation. All `&self`-free and unit-testable without a daemon.
 
+use std::collections::BTreeMap;
+
 use sha2::{Digest, Sha256};
 
 /// Merge env for one container in final precedence:
 /// base (plain + secret) → system env → per-container overrides. Later writes
 /// win on key conflict.
-pub(crate) fn merge_container_env(
+pub fn merge_container_env(
     base_env: &[(String, String)],
     system_env: &[(String, String)],
     injected_hosts: &[(String, String)],
@@ -46,18 +48,14 @@ pub(crate) fn merge_container_env(
 /// (always — the container's own name, a system identity var). Both overwrite
 /// any user-supplied value and fold into the `env_hash`. Mirrors the Kubernetes
 /// builder's `RISE_CONTAINER` injection in `resource_builder::build_container`.
-pub(crate) fn pin_system_env(
-    env: &mut Vec<(String, String)>,
-    container_name: &str,
-    port: Option<u16>,
-) {
+pub fn pin_system_env(env: &mut Vec<(String, String)>, container_name: &str, port: Option<u16>) {
     if let Some(port) = port {
         upsert_env(env, "PORT", &port.to_string());
     }
     upsert_env(env, "RISE_CONTAINER", container_name);
 }
 
-pub(crate) fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+pub fn upsert_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
     if let Some(existing) = env.iter_mut().find(|(k, _)| k == key) {
         existing.1 = value.to_string();
     } else {
@@ -85,6 +83,44 @@ pub fn hash_env(env: &[(String, String)]) -> String {
         .finalize()
         .iter()
         .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Replace every secret value in a merged env with its fingerprint, so the
+/// result can be fed to [`hash_env`] without the digest covering any secret
+/// plaintext.
+///
+/// A backend must hash this rather than the raw env wherever its `env_hash`
+/// ends up somewhere the secret values themselves do not — an ECS service tag,
+/// where secrets are injected from SSM and never appear in the task definition.
+/// See [`crate::secret_fingerprint`] for what the fingerprint is and why.
+/// The substitution keeps the property the hash exists for, because a
+/// fingerprint changes exactly when the stored secret is rewritten.
+///
+/// It buys nothing where the runtime already exposes the values beside the hash
+/// — Docker flattens secrets into the container environment, so `docker inspect`
+/// shows the plaintext itself and a digest of it adds no exposure.
+///
+/// A value is substituted only when it still *is* the secret's plaintext. A
+/// per-container override that shadows a secret key carries a value that came
+/// from the deploy request in the clear, so it is hashed as-is — otherwise
+/// editing that override would leave the digest unchanged and the deployment
+/// would never roll.
+pub fn redact_secrets_for_hash(
+    env: &[(String, String)],
+    secret_values: &BTreeMap<String, Vec<u8>>,
+    fingerprints: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(key, value)| {
+            let is_the_secret = secret_values
+                .get(key)
+                .is_some_and(|plaintext| plaintext.as_slice() == value.as_bytes());
+            match fingerprints.get(key) {
+                Some(fingerprint) if is_the_secret => (key.clone(), fingerprint.clone()),
+                _ => (key.clone(), value.clone()),
+            }
+        })
         .collect()
 }
 
@@ -232,6 +268,59 @@ mod tests {
         assert!(env.iter().any(|(k, v)| k == "RISE_CONTAINER" && v == "api"));
         // No PORT when the container declares none.
         assert!(!env.iter().any(|(k, _)| k == "PORT"));
+    }
+
+    #[test]
+    fn redaction_keeps_secret_plaintext_out_of_the_digest() {
+        let env = vec![
+            ("PORT".to_string(), "8080".to_string()),
+            ("API_KEY".to_string(), "hunter2".to_string()),
+        ];
+        let secrets = BTreeMap::from([("API_KEY".to_string(), b"hunter2".to_vec())]);
+        let fingerprints = BTreeMap::from([("API_KEY".to_string(), "fp-1".to_string())]);
+
+        let redacted = redact_secrets_for_hash(&env, &secrets, &fingerprints);
+        assert_eq!(
+            redacted,
+            vec![
+                ("PORT".to_string(), "8080".to_string()),
+                ("API_KEY".to_string(), "fp-1".to_string()),
+            ]
+        );
+        // The digest a reader of the tag sees must not be one they could
+        // reproduce from a guessed value.
+        assert_ne!(hash_env(&redacted), hash_env(&env));
+    }
+
+    #[test]
+    fn redaction_still_rolls_the_deployment_when_a_secret_changes() {
+        let secrets = BTreeMap::from([("API_KEY".to_string(), b"hunter2".to_vec())]);
+        let before = redact_secrets_for_hash(
+            &[("API_KEY".to_string(), "hunter2".to_string())],
+            &secrets,
+            &BTreeMap::from([("API_KEY".to_string(), "fp-1".to_string())]),
+        );
+        let after = redact_secrets_for_hash(
+            &[("API_KEY".to_string(), "correct-horse".to_string())],
+            &BTreeMap::from([("API_KEY".to_string(), b"correct-horse".to_vec())]),
+            &BTreeMap::from([("API_KEY".to_string(), "fp-2".to_string())]),
+        );
+        assert_ne!(hash_env(&before), hash_env(&after));
+    }
+
+    #[test]
+    fn a_plain_override_shadowing_a_secret_key_is_hashed_as_it_stands() {
+        // The secret still exists under this key, but the container's merged env
+        // carries an override value that came from the request in the clear.
+        // Substituting the fingerprint would freeze the digest against edits to
+        // that override.
+        let env = vec![("API_KEY".to_string(), "from-the-request".to_string())];
+        let redacted = redact_secrets_for_hash(
+            &env,
+            &BTreeMap::from([("API_KEY".to_string(), b"hunter2".to_vec())]),
+            &BTreeMap::from([("API_KEY".to_string(), "fp-1".to_string())]),
+        );
+        assert_eq!(redacted, env);
     }
 
     #[test]

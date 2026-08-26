@@ -198,6 +198,7 @@ pub async fn init_runtime_log_backend(
                 config: config.clone(),
             }))
         }
+        DeploymentLogsSettings::None { .. } => Ok(Arc::new(NoneLogBackend)),
         DeploymentLogsSettings::Docker { .. } => {
             let docker =
                 docker_client.context("Docker log backend requires a connected Docker client")?;
@@ -436,6 +437,69 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                 message: Some(
                     "Historical log volume isn't supported by the configured log backend.".into(),
                 ),
+                retention_hint: None,
+            }),
+            start_time: query.start_time.to_rfc3339(),
+            end_time: query.end_time.to_rfc3339(),
+            step_seconds: query.step_seconds,
+            buckets: vec![],
+        })
+    }
+}
+
+/// A runtime log backend that serves no logs, only a clear reason.
+///
+/// Selected by `deployment_logs: { type: none }`. Exists because every other
+/// variant requires a runtime client (a kube client, a bollard handle) that the
+/// ECS backend does not have — without it an ECS install falls through to the
+/// `Kubernetes` default and fails to start. Answering with an explicit
+/// `historical_backend_not_configured` status keeps the logs UI working (it
+/// renders its empty state) instead of surfacing an error the operator cannot
+/// act on.
+struct NoneLogBackend;
+
+#[async_trait]
+impl RuntimeLogBackend for NoneLogBackend {
+    fn backend_kind(&self) -> &'static str {
+        "none"
+    }
+
+    fn levels(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn supports_volume(&self) -> bool {
+        false
+    }
+
+    async fn stream_logs(
+        &self,
+        _deployment: &Deployment,
+        _project: &Project,
+        _query: LogQuery,
+    ) -> Result<LogEventStream> {
+        Ok(status_stream(LogStatus {
+            reason: LogStatusReason::HistoricalBackendNotConfigured,
+            message: Some(
+                "No runtime log backend is configured for this deployment backend. \
+                 Configure `deployment_logs` (for example `type: loki`) to read \
+                 application logs through Rise."
+                    .into(),
+            ),
+            retention_hint: None,
+        }))
+    }
+
+    async fn query_volume(
+        &self,
+        _deployment: &Deployment,
+        _project: &Project,
+        query: LogVolumeQuery,
+    ) -> Result<LogVolumeResponse> {
+        Ok(LogVolumeResponse {
+            status: Some(LogStatus {
+                reason: LogStatusReason::HistoricalBackendNotConfigured,
+                message: Some("No runtime log backend is configured.".into()),
                 retention_hint: None,
             }),
             start_time: query.start_time.to_rfc3339(),
