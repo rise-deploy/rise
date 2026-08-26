@@ -1007,6 +1007,7 @@ impl DockerReconciler {
             // (which never depends on the replica) is computed once below.
             let mut base = DesiredContainer {
                 project: project.name.clone(),
+                project_uuid: project.id.to_string(),
                 access_class: project.access_class.clone(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
@@ -1073,20 +1074,23 @@ impl DockerReconciler {
 
     // ── Actual containers + diff application ────────────────────────────
 
-    async fn list_actual_containers(&self, project: &Project) -> Result<Vec<ActualContainer>> {
+    /// List this controller's containers carrying one extra label filter (a
+    /// `key=value` string), scoped to `managed-by=rise` and the configured
+    /// controller-class. Without the controller-class filter the GC pass
+    /// could remove containers another Rise controller owns on the same host.
+    ///
+    /// NOTE: containers carry the controller-class they were created under as
+    /// a label. Renaming an Organization's `deploymentControllerClass` (or
+    /// this controller's configured class) leaves previously-created
+    /// containers under the old class invisible to this filter — they are
+    /// neither reconciled nor GC'd and must be cleaned up manually.
+    async fn list_managed_containers(
+        &self,
+        extra_label_filter: String,
+    ) -> Result<Vec<ActualContainer>> {
         use bollard::container::ListContainersOptions;
         let ns = &self.config.label_namespace;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        // Scope the listing to *this* controller's containers: managed-by=rise,
-        // the configured controller-class, and this project. Without the
-        // controller-class filter the GC pass could remove containers another
-        // Rise controller owns on the same host.
-        //
-        // NOTE: containers carry the controller-class they were created under as
-        // a label. Renaming an Organization's `deploymentControllerClass` (or
-        // this controller's configured class) leaves previously-created
-        // containers under the old class invisible to this filter — they are
-        // neither reconciled nor GC'd and must be cleaned up manually.
         filters.insert(
             "label".to_string(),
             vec![
@@ -1096,11 +1100,7 @@ impl DockerReconciler {
                     labels::ns_key(ns, labels::SUFFIX_CONTROLLER_CLASS),
                     self.config.controller_class
                 ),
-                format!(
-                    "{}={}",
-                    labels::ns_key(ns, labels::SUFFIX_PROJECT),
-                    project.name
-                ),
+                extra_label_filter,
             ],
         );
         let summaries = self
@@ -1162,6 +1162,46 @@ impl DockerReconciler {
                 })
             })
             .collect())
+    }
+
+    /// Actual containers belonging to `project`.
+    ///
+    /// Queries by the project's UUID label — immutable, so it survives a
+    /// rename — and, for containers created before that label existed, falls
+    /// back to a second query by name. Without the fallback, a legacy
+    /// container that has never been recreated since upgrade would be
+    /// invisible to the UUID query and (if the project were then renamed)
+    /// would also miss a name-only query, leaving a fresh set created
+    /// alongside it and the original running forever unreconciled — the
+    /// bug this two-query scheme exists to close. The two result sets are
+    /// deduped by container id, since a container created after this
+    /// controller was upgraded carries both labels and would otherwise
+    /// appear from either query.
+    async fn list_actual_containers(&self, project: &Project) -> Result<Vec<ActualContainer>> {
+        let ns = &self.config.label_namespace;
+        let by_uuid = self
+            .list_managed_containers(format!(
+                "{}={}",
+                labels::ns_key(ns, labels::SUFFIX_PROJECT_UUID),
+                project.id
+            ))
+            .await?;
+        let by_name = self
+            .list_managed_containers(format!(
+                "{}={}",
+                labels::ns_key(ns, labels::SUFFIX_PROJECT),
+                project.name
+            ))
+            .await?;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::with_capacity(by_uuid.len() + by_name.len());
+        for container in by_uuid.into_iter().chain(by_name) {
+            if seen.insert(container.id.clone()) {
+                out.push(container);
+            }
+        }
+        Ok(out)
     }
 
     async fn apply_actions(

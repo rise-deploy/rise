@@ -112,12 +112,26 @@ struct ClusterServices {
 impl ClusterServices {
     /// The services tagged as belonging to `project`.
     ///
-    /// Matching on the tag rather than the name because the name is truncated
-    /// and hashed for long projects, so it does not round-trip.
-    fn for_project(&self, project: &str) -> Vec<ActualService> {
+    /// Matches on the project's UUID tag when a service carries one, falling
+    /// back to the project name only for services tagged before that field
+    /// existed. The name is mutable -- a rename leaves already-running
+    /// services tagged with the old one -- so matching on it alone would make
+    /// every renamed project's live services invisible to this projection: the
+    /// reconciler would see no actual state, create a fresh set under the new
+    /// name, and orphan the old one until it happened to go terminal some other
+    /// way. The UUID tag is immutable for the project's lifetime, so it
+    /// survives the rename.
+    fn for_project(&self, project: &Project) -> Vec<ActualService> {
+        let project_uuid = project.id.to_string();
         self.services
             .iter()
-            .filter(|m| m.tags.project == project)
+            .filter(|m| {
+                if m.tags.project_uuid.is_empty() {
+                    m.tags.project == project.name
+                } else {
+                    m.tags.project_uuid == project_uuid
+                }
+            })
             .map(|m| m.service.clone())
             .collect()
     }
@@ -661,7 +675,7 @@ impl EcsReconciler {
         cluster: &ClusterServices,
         election: &LeaderElection,
     ) -> Result<()> {
-        let mut actual = cluster.for_project(&project.name);
+        let mut actual = cluster.for_project(project);
 
         // 1. Status transitions, isolated per deployment.
         let non_terminal = self
@@ -1158,6 +1172,7 @@ impl EcsReconciler {
 
         let mut desired_container = DesiredContainer {
             project: project.name.clone(),
+            project_uuid: project.id.to_string(),
             access_class: project.access_class.clone(),
             deployment_group: deployment.deployment_group.clone(),
             deployment_id: deployment.deployment_id.clone(),
@@ -1267,6 +1282,7 @@ impl EcsReconciler {
             desired_count: replica_count as i32,
             tags: ServiceTags {
                 project: project.name.clone(),
+                project_uuid: project.id.to_string(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
                 deployment_uuid: deployment.id.to_string(),
@@ -2557,7 +2573,7 @@ mod tests {
 
     /// A cluster entry as `list_managed_services` would build it: the tags are
     /// the identity, the `ActualService` is what the diff sees.
-    fn managed(project: &str, deployment_id: &str) -> super::ManagedService {
+    fn managed(project: &str, project_uuid: &str, deployment_id: &str) -> super::ManagedService {
         super::ManagedService {
             service: crate::service::ActualService {
                 name: format!("rise-{project}-{deployment_id}-web"),
@@ -2574,6 +2590,7 @@ mod tests {
             },
             tags: crate::tags::ServiceTags {
                 project: project.to_string(),
+                project_uuid: project_uuid.to_string(),
                 deployment_group: "main".to_string(),
                 deployment_id: deployment_id.to_string(),
                 deployment_uuid: uuid::Uuid::nil().to_string(),
@@ -2586,22 +2603,45 @@ mod tests {
         }
     }
 
+    /// Minimal `Project` fixture for tests exercising project-scoped lookups.
+    fn project_fixture(name: &str, uuid: &str) -> Project {
+        let now = chrono::Utc::now();
+        Project {
+            id: Uuid::parse_str(uuid).unwrap(),
+            name: name.to_string(),
+            status: rise_backend_core::models::ProjectStatus::Running,
+            access_class: "public".to_string(),
+            owner_user_id: None,
+            owner_team_id: None,
+            finalizers: Vec::new(),
+            source_url: None,
+            template_id: None,
+            template_image: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     /// The tick reads the cluster once and projects per-project slices out of
     /// it. If the projection matched loosely -- on the service name, say --
     /// `rise-app` and `rise-app-staging` would leak into each other's diffs and
     /// each would try to delete the other's services.
+    const APP_UUID: &str = "11111111-1111-1111-1111-111111111111";
+    const STAGING_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
     #[test]
     fn a_project_slice_holds_only_that_project_s_services() {
         let cluster = super::ClusterServices {
             services: vec![
-                managed("app", "d-1"),
-                managed("app-staging", "d-2"),
-                managed("app", "d-3"),
+                managed("app", APP_UUID, "d-1"),
+                managed("app-staging", STAGING_UUID, "d-2"),
+                managed("app", APP_UUID, "d-3"),
             ],
             unattributable: Vec::new(),
         };
 
-        let slice = cluster.for_project("app");
+        let app = project_fixture("app", APP_UUID);
+        let slice = cluster.for_project(&app);
         assert_eq!(slice.len(), 2);
         assert!(
             slice
@@ -2609,11 +2649,50 @@ mod tests {
                 .all(|s| s.deployment_id.as_deref() != Some("d-2")),
             "a different project's service must not appear in this project's slice"
         );
-        assert!(
-            cluster.for_project("app-stag").is_empty(),
-            "no prefix match"
+        assert!(cluster
+            .for_project(&project_fixture(
+                "nope",
+                "33333333-3333-3333-3333-333333333333"
+            ))
+            .is_empty());
+    }
+
+    /// After a rename, the project's ROW keeps its UUID -- only `name`
+    /// changes -- and the tag stamped on already-running services is the
+    /// UUID, not the name. The slice must still find them under the new name;
+    /// this is the specific bug in the projection matching services on
+    /// `project` (the mutable name) instead.
+    #[test]
+    fn a_project_slice_survives_a_rename() {
+        let cluster = super::ClusterServices {
+            services: vec![managed("old-name", APP_UUID, "d-1")],
+            unattributable: Vec::new(),
+        };
+
+        let renamed = project_fixture("new-name", APP_UUID);
+        let slice = cluster.for_project(&renamed);
+        assert_eq!(
+            slice.len(),
+            1,
+            "a service tagged under the pre-rename name must still be found by UUID"
         );
-        assert!(cluster.for_project("nope").is_empty());
+    }
+
+    /// A service created before the `project-uuid` tag existed has no such
+    /// tag; the projection must still find it by the name it does carry, or
+    /// every pre-upgrade service would look orphaned on the first tick after
+    /// upgrade.
+    #[test]
+    fn a_project_slice_falls_back_to_name_for_untagged_legacy_services() {
+        let mut legacy = managed("app", APP_UUID, "d-1");
+        legacy.tags.project_uuid = String::new();
+        let cluster = super::ClusterServices {
+            services: vec![legacy],
+            unattributable: Vec::new(),
+        };
+
+        let app = project_fixture("app", APP_UUID);
+        assert_eq!(cluster.for_project(&app).len(), 1);
     }
 
     /// The three-way split exists because the two non-owning answers want

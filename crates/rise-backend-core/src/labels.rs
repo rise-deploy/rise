@@ -20,6 +20,14 @@ use std::collections::HashMap;
 pub const SUFFIX_MANAGED_BY: &str = "managed-by";
 pub const SUFFIX_CONTROLLER_CLASS: &str = "controller-class";
 pub const SUFFIX_PROJECT: &str = "project";
+/// The project's immutable identity. `project` (the name) is mutable and is
+/// not a safe key for recognising a workload after a rename — the reconciler
+/// prefers this tag/label when present, falling back to `project` only for
+/// workloads created before it existed. See `secret_fingerprint`-style
+/// leniency note on `ServiceTags::parse`: this suffix must stay OPTIONAL to
+/// read (a missing value, never a required one) so an upgrade doesn't
+/// suddenly find every pre-existing workload unattributable.
+pub const SUFFIX_PROJECT_UUID: &str = "project-uuid";
 pub const SUFFIX_DEPLOYMENT_GROUP: &str = "deployment-group";
 pub const SUFFIX_DEPLOYMENT_ID: &str = "deployment-id";
 pub const SUFFIX_DEPLOYMENT_UUID: &str = "deployment-uuid";
@@ -55,6 +63,8 @@ pub struct BookkeepingLabels<'a> {
     pub label_namespace: &'a str,
     pub controller_class: &'a str,
     pub project: &'a str,
+    /// The project's immutable identity — see [`SUFFIX_PROJECT_UUID`].
+    pub project_uuid: &'a str,
     pub deployment_group: &'a str,
     pub deployment_id: &'a str,
     pub deployment_uuid: &'a str,
@@ -87,6 +97,10 @@ impl BookkeepingLabels<'_> {
             self.controller_class.to_string(),
         );
         labels.insert(ns_key(ns, SUFFIX_PROJECT), self.project.to_string());
+        labels.insert(
+            ns_key(ns, SUFFIX_PROJECT_UUID),
+            self.project_uuid.to_string(),
+        );
         labels.insert(
             ns_key(ns, SUFFIX_DEPLOYMENT_GROUP),
             self.deployment_group.to_string(),

@@ -19,6 +19,7 @@ use super::naming;
 pub fn desired(container: &str, image: &str, hash: &str) -> DesiredContainer {
     DesiredContainer {
         project: "myapp".to_string(),
+        project_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
         access_class: "public".to_string(),
         deployment_group: "default".to_string(),
         deployment_id: "20260101-120000".to_string(),

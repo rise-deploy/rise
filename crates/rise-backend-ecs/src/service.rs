@@ -226,6 +226,7 @@ mod tests {
     fn tags(deployment_id: &str) -> ServiceTags {
         ServiceTags {
             project: "myapp".to_string(),
+            project_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
             deployment_group: "default".to_string(),
             deployment_id: deployment_id.to_string(),
             deployment_uuid: "11111111-1111-1111-1111-111111111111".to_string(),
