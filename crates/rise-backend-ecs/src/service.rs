@@ -56,6 +56,45 @@ pub struct ActualService {
     pub running_count: i32,
     /// `deployment-id` tag, used by the protected-deployment GC guard.
     pub deployment_id: Option<String>,
+    /// When ECS started rolling out the service's PRIMARY deployment, as
+    /// `DescribeServices` reports it. `None` when ECS reports no primary.
+    pub rollout_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Whether a `Healthy` deployment should keep that status while ECS replaces
+/// its tasks in place.
+///
+/// An in-place `UpdateService` is a rolling replacement: ECS keeps the outgoing
+/// revision serving every request until the incoming one is up. Readiness is
+/// judged against the incoming revision — that is the whole point of pairing
+/// replica slots to it — so for the length of the roll it reads as "not ready",
+/// which is true of the revision and false of the deployment. Flipping to
+/// `Unhealthy` there would report an outage that is not happening, on a path
+/// that runs for every custom domain added to a live project.
+///
+/// The hold is deliberately not unconditional. It requires the outgoing
+/// revision to actually still be serving, so a genuine outage is still reported;
+/// and it expires, so a rollout that never completes stops being papered over —
+/// otherwise a broken in-place change would leave a project reading `Healthy`
+/// forever while serving the content it was supposed to replace.
+///
+/// `just_registered` covers the tick that starts the roll, where ECS has not yet
+/// reported a new PRIMARY deployment and `rollout_started_at` still describes
+/// the outgoing one.
+pub fn hold_status_during_rollout(
+    outgoing_still_serving: bool,
+    just_registered: bool,
+    rollout_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    window: chrono::Duration,
+) -> bool {
+    if !outgoing_still_serving {
+        return false;
+    }
+    if just_registered {
+        return true;
+    }
+    rollout_started_at.is_some_and(|started| now - started < window)
 }
 
 /// What the reconciler should do about one service.
@@ -216,7 +255,74 @@ mod tests {
             desired_count: count,
             running_count: count,
             deployment_id: Some(d.tags.deployment_id.clone()),
+            rollout_started_at: None,
         }
+    }
+
+    fn rollout_tests_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-08-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn an_outage_is_never_held_back() {
+        // Nothing of the outgoing revision is serving, so "not ready" is the
+        // truth about the deployment and must be reported.
+        assert!(!hold_status_during_rollout(
+            false,
+            true,
+            Some(rollout_tests_now()),
+            rollout_tests_now(),
+            chrono::Duration::minutes(5),
+        ));
+    }
+
+    #[test]
+    fn the_tick_that_starts_the_roll_holds() {
+        // ECS still reports the outgoing revision as PRIMARY here, so the
+        // timestamp alone would not recognise the roll.
+        let long_ago = rollout_tests_now() - chrono::Duration::days(3);
+        assert!(hold_status_during_rollout(
+            true,
+            true,
+            Some(long_ago),
+            rollout_tests_now(),
+            chrono::Duration::minutes(5),
+        ));
+    }
+
+    #[test]
+    fn a_roll_in_progress_holds_until_the_window_expires() {
+        let now = rollout_tests_now();
+        let window = chrono::Duration::minutes(5);
+        assert!(hold_status_during_rollout(
+            true,
+            false,
+            Some(now - chrono::Duration::minutes(4)),
+            now,
+            window,
+        ));
+        // Past the window the rollout is not "in progress", it is stuck, and a
+        // project serving superseded content should say so.
+        assert!(!hold_status_during_rollout(
+            true,
+            false,
+            Some(now - chrono::Duration::minutes(6)),
+            now,
+            window,
+        ));
+    }
+
+    #[test]
+    fn no_known_rollout_start_does_not_hold() {
+        assert!(!hold_status_during_rollout(
+            true,
+            false,
+            None,
+            rollout_tests_now(),
+            chrono::Duration::minutes(5),
+        ));
     }
 
     #[test]

@@ -38,9 +38,10 @@ pub struct ServiceTags {
     pub deployment_uuid: String,
     pub container: String,
     pub environment: Option<String>,
-    /// Drift digest over the container's whole environment. ECS tags are widely
-    /// readable, so secret values enter it as fingerprints of their stored form,
-    /// never as plaintext — see `redact_secrets_for_hash`.
+    /// Digest over the container's whole environment, for operators comparing
+    /// two services. ECS tags are widely readable, so secret values enter it as
+    /// fingerprints of their stored form, never as plaintext — see
+    /// `redact_secrets_for_hash`.
     pub env_hash: String,
     pub image: String,
     pub route_hash: String,

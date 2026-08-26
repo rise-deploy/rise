@@ -28,7 +28,7 @@ use rise_backend_core::{
     pin_system_env, redact_secrets_for_hash, resolve_deployment_env_vars,
     resolve_runtime_containers, rise_system_env_vars, should_have_infrastructure, spec_key,
     DeploymentStore, DeploymentUrlBuilder, DesiredContainer, DesiredRoute, EncryptionProvider,
-    InspectedContainer, ResolvedDeploymentEnvVars,
+    InspectedContainer, ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES,
 };
 use rise_backend_traefik::{replica_ready, ReadyVerdict, TraefikApiClient};
 use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
@@ -702,7 +702,8 @@ impl EcsReconciler {
         if !actions.is_empty() && !self.confirm_leadership(election).await {
             return Ok(());
         }
-        self.apply_actions(project, &desired, &actual, &actions, election)
+        let registered = self
+            .apply_actions(project, &desired, &actual, &actions, election)
             .await;
 
         // 4. Health and status, from a fresh read of the deployment rows.
@@ -717,7 +718,13 @@ impl EcsReconciler {
                 continue;
             }
             if let Err(e) = self
-                .reconcile_health(project, deployment, &actual, &mut server_status_cache)
+                .reconcile_health(
+                    project,
+                    deployment,
+                    &actual,
+                    &registered,
+                    &mut server_status_cache,
+                )
                 .await
             {
                 warn!(
@@ -1037,13 +1044,12 @@ impl EcsReconciler {
 
         let mut env = merge_container_env(base_env, system_env, &[], spec, env_name);
         pin_system_env(&mut env, &spec.name, spec.port);
-        // The hash covers the FULL env, not only what reaches the task
-        // definition: otherwise editing a secret would leave the hash unchanged
-        // and the deployment would never roll to pick up the new value sitting
-        // in SSM. Secret values enter it as fingerprints rather than plaintext,
-        // because this digest is stamped on the service as a tag — a plaintext
-        // digest would hand every reader of the cluster an offline oracle for
-        // confirming a guessed secret.
+        // Bookkeeping for operators, not a gate: `task_definition_hash` is what
+        // the diff compares. It still covers the FULL env, so two services can
+        // be told apart by it — but secret values enter as fingerprints rather
+        // than plaintext, because the tag is stamped on the service and
+        // propagated to every task, and a plaintext digest would hand every
+        // reader of the cluster an oracle for confirming a guessed secret.
         let env_hash = hash_env(&redact_secrets_for_hash(
             &env,
             &secret_env.secret_env_vars,
@@ -1282,6 +1288,7 @@ impl EcsReconciler {
                         desired_count: svc.desired_count(),
                         running_count: svc.running_count(),
                         deployment_id: None,
+                        rollout_started_at: primary_rollout_start(svc),
                     });
                     continue;
                 };
@@ -1306,6 +1313,7 @@ impl EcsReconciler {
                         desired_count: svc.desired_count(),
                         running_count: svc.running_count(),
                         deployment_id: Some(parsed.deployment_id.clone()),
+                        rollout_started_at: primary_rollout_start(svc),
                     },
                     tags: parsed,
                 });
@@ -1322,6 +1330,11 @@ impl EcsReconciler {
     /// Apply the diff's actions, isolating failures per action so one bad
     /// deployment cannot stall the others, and re-verifying leadership before
     /// each one (a create can take seconds, exceeding the validity window).
+    ///
+    /// Returns `service name -> task-definition ARN` for the services pointed at
+    /// a new revision here. The health pass runs against the snapshot taken at
+    /// the top of the tick, which predates these writes, so this is the only
+    /// record of what the affected services are converging on right now.
     async fn apply_actions(
         &self,
         project: &Project,
@@ -1329,7 +1342,7 @@ impl EcsReconciler {
         actual: &[ActualService],
         actions: &[ServiceAction],
         election: &LeaderElection,
-    ) {
+    ) -> HashMap<String, String> {
         let by_key: HashMap<&str, &(DesiredService, TaskDefinitionSpec, DesiredContainer)> =
             desired.iter().map(|e| (e.0.key.as_str(), e)).collect();
         // Tagging needs the service's real ARN, and only DescribeServices has it.
@@ -1338,26 +1351,32 @@ impl EcsReconciler {
             .map(|a| (a.name.as_str(), a.arn.as_str()))
             .collect();
 
+        let mut registered: HashMap<String, String> = HashMap::new();
         for action in actions {
             if !self.confirm_leadership(election).await {
-                return;
+                return registered;
             }
             let result = match action {
                 ServiceAction::Create { key, name } => match by_key.get(key.as_str()) {
-                    Some(entry) => self.create_service(project, entry, name).await,
+                    Some(entry) => self
+                        .create_service(project, entry, name)
+                        .await
+                        .map(|arn| registered.insert(name.clone(), arn))
+                        .map(|_| ()),
                     None => continue,
                 },
                 ServiceAction::UpdateTaskDefinition { key, name } => {
                     match by_key.get(key.as_str()) {
-                        Some(entry) => {
-                            self.update_service(
+                        Some(entry) => self
+                            .update_service(
                                 project,
                                 entry,
                                 name,
                                 arn_by_name.get(name.as_str()).copied(),
                             )
                             .await
-                        }
+                            .map(|arn| registered.insert(name.clone(), arn))
+                            .map(|_| ()),
                         None => continue,
                     }
                 }
@@ -1372,6 +1391,7 @@ impl EcsReconciler {
                 error!(action = ?action, "ECS action failed; will retry next tick: {:?}", e);
             }
         }
+        registered
     }
 
     /// Write a deployment's secret parameters, then register the task definition.
@@ -1661,7 +1681,7 @@ impl EcsReconciler {
         project: &Project,
         entry: &(DesiredService, TaskDefinitionSpec, DesiredContainer),
         name: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let task_definition_arn = self.prepare_task_definition(project, entry).await?;
         let (desired, _, _) = entry;
 
@@ -1691,7 +1711,7 @@ impl EcsReconciler {
             replicas = desired.desired_count,
             "Created ECS service"
         );
-        Ok(())
+        Ok(task_definition_arn)
     }
 
     /// Point an existing service at a new task-definition revision.
@@ -1705,7 +1725,7 @@ impl EcsReconciler {
         entry: &(DesiredService, TaskDefinitionSpec, DesiredContainer),
         name: &str,
         service_arn: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let task_definition_arn = self.prepare_task_definition(project, entry).await?;
         let (desired, _, _) = entry;
 
@@ -1745,7 +1765,7 @@ impl EcsReconciler {
         })?;
 
         info!(project = %project.name, service = %name, "Updated ECS service task definition");
-        Ok(())
+        Ok(task_definition_arn)
     }
 
     async fn scale_service(&self, name: &str, desired_count: i32) -> Result<()> {
@@ -1822,6 +1842,7 @@ impl EcsReconciler {
         project: &Project,
         deployment: &Deployment,
         services: &[ActualService],
+        registered: &HashMap<String, String>,
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
     ) -> Result<()> {
         if !matches!(
@@ -1859,6 +1880,10 @@ impl EcsReconciler {
         // An empty spec set is never ready — otherwise a corrupt deployment row
         // would report Healthy while running nothing.
         let mut all_ready = !container_specs.is_empty();
+        // Only meaningful when `all_ready` is false: every container that is not
+        // ready is mid-roll with its predecessor still serving.
+        let mut rolling_but_serving = true;
+        let now = chrono::Utc::now();
         let mut reasons: Vec<String> = Vec::new();
         let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
 
@@ -1871,6 +1896,7 @@ impl EcsReconciler {
             );
             let Some(actual) = by_key.get(key.as_str()) else {
                 all_ready = false;
+                rolling_but_serving = false;
                 reasons.push(format!("service for '{}' not found", spec.name));
                 pods.push((spec.name.clone(), None));
                 continue;
@@ -1909,30 +1935,34 @@ impl EcsReconciler {
                 );
             }
 
-            let mut tasks = self
-                .describe_service_tasks(&actual.name, &actual.task_definition_arn)
-                .await;
+            // The revision this deployment is *supposed* to be running. The
+            // service snapshot was taken before this tick applied its actions,
+            // so a roll started this tick is only visible in `registered`;
+            // reading the snapshot alone would judge the tick that starts a
+            // rollout by the revision it is replacing.
+            let target_arn = registered
+                .get(actual.name.as_str())
+                .map(String::as_str)
+                .unwrap_or(actual.task_definition_arn.as_str());
+
+            // A service mid-roll owns both revisions' tasks. Readiness is about
+            // the incoming one; the outgoing one only answers whether anything
+            // is still serving.
+            let (mut current, outgoing): (Vec<TaskView>, Vec<TaskView>) = self
+                .describe_service_tasks(&actual.name)
+                .await
+                .into_iter()
+                .partition(|t| t.task_definition_arn == target_arn);
             // ListTasks returns no defined order, so indexing it straight would
             // let two ticks give the same replica slot to different tasks and
             // report a replica flapping that never moved. The task id is stable
             // for a task's whole life, which is all a slot needs.
-            tasks.sort_by(|a, b| a.name.cmp(&b.name));
+            current.sort_by(|a, b| a.name.cmp(&b.name));
             let api_available = self.traefik_api.is_some() && server_status.is_some();
 
-            let expected = actual.desired_count.max(1) as usize;
-            for idx in 0..expected {
-                let label = if expected == 1 {
-                    spec.name.clone()
-                } else {
-                    format!("{}[{}]", spec.name, idx)
-                };
-                let task = tasks.get(idx);
-                let inspected = task.map(|t| t.inspected.clone());
-                let running = task.is_some_and(|t| t.running);
-
-                let verdict = match (task, spec.port) {
-                    (None, _) => ReadyVerdict::NotReady(format!("'{label}' task not running")),
-                    (Some(task), Some(port)) => {
+            let verdict_for = |task: &TaskView, label: &str| -> ReadyVerdict {
+                match spec.port {
+                    Some(port) => {
                         // Absent from serverStatus must be `None`, NOT `Some(false)`:
                         // "Traefik has not seen this server yet" is a different
                         // state from "Traefik says it is DOWN", and collapsing
@@ -1947,29 +1977,57 @@ impl EcsReconciler {
                         replica_ready(
                             router_withheld,
                             has_health_path,
-                            running,
+                            task.running,
                             api_available,
                             server_up.flatten(),
                         )
                     }
-                    (Some(_), None) => {
-                        // A port-less worker has no router and no probe: running
-                        // is the only signal available.
-                        if running {
-                            ReadyVerdict::Ready
-                        } else {
-                            ReadyVerdict::NotReady(format!("worker '{label}' not running"))
-                        }
-                    }
+                    // A port-less worker has no router and no probe: running
+                    // is the only signal available.
+                    None if task.running => ReadyVerdict::Ready,
+                    None => ReadyVerdict::NotReady(format!("worker '{label}' not running")),
+                }
+            };
+
+            let expected = actual.desired_count.max(1) as usize;
+            let mut spec_ready = true;
+            for idx in 0..expected {
+                let label = if expected == 1 {
+                    spec.name.clone()
+                } else {
+                    format!("{}[{}]", spec.name, idx)
+                };
+                let task = current.get(idx);
+                let inspected = task.map(|t| t.inspected.clone());
+
+                let verdict = match task {
+                    None => ReadyVerdict::NotReady(format!("'{label}' task not running")),
+                    Some(task) => verdict_for(task, &label),
                 };
 
                 if let ReadyVerdict::NotReady(reason) = verdict {
                     all_ready = false;
+                    spec_ready = false;
                     reasons.push(format!("'{label}': {reason}"));
                 }
                 // Always recorded, even when the verdict short-circuits, so the
                 // Pods tab shows the full picture rather than a truncated one.
                 pods.push((task.map(|t| t.name.clone()).unwrap_or(label), inspected));
+            }
+
+            // Whether the revision being replaced is still answering for this
+            // container. Only consulted when the incoming one is not ready yet.
+            if !spec_ready {
+                let still_serving = outgoing
+                    .iter()
+                    .any(|t| matches!(verdict_for(t, &spec.name), ReadyVerdict::Ready));
+                rolling_but_serving &= service::hold_status_during_rollout(
+                    still_serving,
+                    registered.contains_key(actual.name.as_str()),
+                    actual.rollout_started_at,
+                    now,
+                    chrono::Duration::minutes(DEPLOYING_TIMEOUT_MINUTES),
+                );
             }
         }
 
@@ -1995,6 +2053,13 @@ impl EcsReconciler {
             DeploymentStatus::Deploying if all_ready => {
                 self.handle_deployment_became_healthy(project, deployment)
                     .await?;
+            }
+            DeploymentStatus::Healthy if !all_ready && rolling_but_serving => {
+                debug!(
+                    deployment = %deployment.deployment_id,
+                    "New task-definition revision still rolling out; the outgoing one is \
+                     still serving, so the deployment stays Healthy"
+                );
             }
             DeploymentStatus::Healthy if !all_ready => {
                 self.store
@@ -2046,21 +2111,14 @@ impl EcsReconciler {
         any.then_some(merged)
     }
 
-    /// Describe the tasks of `service_name` that run `task_definition_arn`,
-    /// projecting each onto the backend-agnostic [`InspectedContainer`] the
-    /// shared `pod_status` builder consumes.
+    /// Describe a service's tasks, projecting each onto the backend-agnostic
+    /// [`InspectedContainer`] the shared `pod_status` builder consumes and
+    /// tagging it with the revision it runs.
     ///
-    /// Filtered rather than taken whole: during a roll the service's tasks
-    /// include the outgoing revision's, and a readiness verdict drawn from
-    /// those reports the *previous* deployment's health as the new one's. ECS
-    /// keeps the old tasks serving throughout, so the cost is a deployment that
-    /// claims Healthy while the revision asked for is not — wrong in the one
-    /// place an operator looks to find out.
-    async fn describe_service_tasks(
-        &self,
-        service_name: &str,
-        task_definition_arn: &str,
-    ) -> Vec<TaskView> {
+    /// Every task is returned, both revisions' during a roll: the caller needs
+    /// the incoming revision to judge readiness and the outgoing one to know
+    /// whether anything is still serving.
+    async fn describe_service_tasks(&self, service_name: &str) -> Vec<TaskView> {
         let listed = self
             .ecs
             .list_tasks()
@@ -2094,9 +2152,6 @@ impl EcsReconciler {
                 }
             };
             for task in out.tasks() {
-                if task.task_definition_arn() != Some(task_definition_arn) {
-                    continue;
-                }
                 let last_status = task.last_status().unwrap_or_default().to_string();
                 let running = last_status == "RUNNING";
                 let name = task
@@ -2115,6 +2170,7 @@ impl EcsReconciler {
 
                 views.push(TaskView {
                     name: name.clone(),
+                    task_definition_arn: task.task_definition_arn().unwrap_or_default().to_string(),
                     running,
                     ip,
                     inspected: InspectedContainer {
@@ -2235,11 +2291,30 @@ impl EcsReconciler {
 /// One observed ECS task, reduced to what readiness and `pod_status` need.
 struct TaskView {
     name: String,
+    /// ARN of the task definition this task runs. During a roll a service owns
+    /// tasks of two revisions at once, and they must be told apart.
+    task_definition_arn: String,
     running: bool,
     /// The task's ENI private IP — the key Traefik's `serverStatus` uses
     /// (`http://{ip}:{port}`).
     ip: Option<String>,
     inspected: InspectedContainer,
+}
+
+/// When ECS started rolling out the service's current (PRIMARY) deployment.
+///
+/// ECS reports one entry per in-flight revision; PRIMARY is the one it is
+/// converging on. Its `createdAt` is the only signal available for how long a
+/// roll has been running, which is what bounds the status hold in
+/// [`service::hold_status_during_rollout`].
+fn primary_rollout_start(
+    svc: &aws_sdk_ecs::types::Service,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    svc.deployments()
+        .iter()
+        .find(|d| d.status() == Some("PRIMARY"))
+        .and_then(|d| d.created_at())
+        .and_then(|t| chrono::DateTime::from_timestamp(t.secs(), 0))
 }
 
 /// Map an ECS task `lastStatus` onto the Docker-shaped container state the
@@ -2307,6 +2382,7 @@ mod tests {
                 desired_count: 1,
                 running_count: 1,
                 deployment_id: Some(deployment_id.to_string()),
+                rollout_started_at: None,
             },
             tags: crate::tags::ServiceTags {
                 project: project.to_string(),

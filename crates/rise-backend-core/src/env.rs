@@ -90,11 +90,16 @@ pub fn hash_env(env: &[(String, String)]) -> String {
 /// result can be fed to [`hash_env`] without the digest covering any secret
 /// plaintext.
 ///
-/// A backend that publishes its `env_hash` somewhere readable — an ECS service
-/// tag, a container label — must hash this rather than the raw env: see
-/// [`crate::secret_fingerprint`] for why, and for what the fingerprint is.
+/// A backend must hash this rather than the raw env wherever its `env_hash`
+/// ends up somewhere the secret values themselves do not — an ECS service tag,
+/// where secrets are injected from SSM and never appear in the task definition.
+/// See [`crate::secret_fingerprint`] for what the fingerprint is and why.
 /// The substitution keeps the property the hash exists for, because a
 /// fingerprint changes exactly when the stored secret is rewritten.
+///
+/// It buys nothing where the runtime already exposes the values beside the hash
+/// — Docker flattens secrets into the container environment, so `docker inspect`
+/// shows the plaintext itself and a digest of it adds no exposure.
 ///
 /// A value is substituted only when it still *is* the secret's plaintext. A
 /// per-container override that shadows a secret key carries a value that came

@@ -329,15 +329,21 @@ adjustable). Both are far above typical use but must fail at deploy time with a
 clear error, not at `RegisterTaskDefinition`.
 
 **The `env-hash` tag carries fingerprints, never secret plaintext.** The
-reconciler stamps each service with an `env-hash` tag so drift detection is a tag
-comparison rather than a re-read of every value, and that hash covers the *full*
-environment — otherwise editing a secret would leave the hash unchanged and the
-deployment would never roll to pick up the new value. ECS resource tags are
+reconciler stamps each service with an `env-hash` tag covering the *full*
+environment, as the Docker backend's equivalent label does. What actually
+triggers a roll here is `task_definition_hash` (D13) — and a secret *value*
+never needs to trigger one, because env vars are snapshotted per deployment, so
+editing one produces a new deployment, which gets its own service and its own
+SSM parameter path. The tag is bookkeeping an operator reads, not a gate the
+reconciler consults.
+
+Which does not make its contents free. ECS resource tags are
 readable by any principal with `ecs:DescribeServices` (`ReadOnlyAccess` includes
-it), so a digest over secret plaintext would hand every reader of the cluster an
-offline oracle: guess a password, hash it, compare. That would narrow D7 from
-"reading ECS reveals only a parameter name" to "… a parameter name and a
-verifier for the values".
+it), and propagate to every task, so a digest over secret plaintext would hand
+every reader of the cluster an offline oracle: guess a password, hash it,
+compare. That would narrow D7 from "reading ECS reveals only a parameter name"
+to "… a parameter name and a verifier for the values" — and buy nothing, since
+nothing reads the tag back.
 
 So a secret enters the digest as a **fingerprint of its stored form** — the
 ciphertext held in `deployment_env_vars`, plus that row's `updated_at` — rather
@@ -358,6 +364,12 @@ does not deduplicate identical values, and then the changed hash triggers the
 next write, forever; or by reading parameter metadata for every deployment on
 every tick, against an API budget the controller is already careful with (D13).
 The stored form is available for free, at the point the env is resolved.
+
+The fingerprint also leaves the door open. If a same-deployment secret rewrite is
+ever added — `rise env set` applying to a live deployment rather than only to the
+next one — the signal that must roll the service is already computed and already
+free of plaintext; what would have to change is that something starts comparing
+it, since today `task_definition_hash` covers secrets by parameter *name* only.
 
 **Several installs, one cluster.** The controller class is the isolation token,
 and it does two jobs. The orphan collector already scopes to its own class, so
@@ -676,12 +688,24 @@ check, remains ECS's business — it restarts what it judges unhealthy — but i
 not what decides routing.
 
 Whichever tasks the verdict is drawn from, it is drawn from the tasks running
-**the revision being reconciled**. During a roll a service owns both revisions'
-tasks at once, and ECS keeps the outgoing ones serving, so an unfiltered read
-would answer "is the deployment healthy?" with the health of the deployment it
-replaces. The task list is also unordered, so tasks are sorted by id before they
-are paired to replica slots — otherwise two ticks can hand the same slot to
-different tasks and report a replica flapping that never moved.
+**the revision being converged on** — the one `apply_actions` just registered,
+or the service's current revision when this tick registered nothing. During a
+roll a service owns both revisions' tasks at once, so an unfiltered read would
+answer "is the deployment healthy?" with the health of the revision being
+replaced, and could call a deployment Healthy — retiring its predecessor — on
+the strength of tasks that are on their way out. The task list is also
+unordered, so tasks are sorted by id before they are paired to replica slots.
+
+The outgoing revision is not discarded, though, because ECS keeps it serving
+every request until the incoming one is up. So "the incoming revision is not
+ready" is a statement about the revision, not about the deployment, and it must
+not flip a `Healthy` project to `Unhealthy` — a path that runs whenever a live
+project gains a custom domain. `hold_status_during_rollout` keeps the status
+while a roll is in flight *and* the outgoing revision still passes the same
+readiness verdict. The hold expires after `DEPLOYING_TIMEOUT_MINUTES`, measured
+from the PRIMARY deployment's `createdAt`: a roll that never completes is a real
+problem, and a project serving content its deployment was supposed to replace
+should stop claiming to be Healthy.
 
 ## Consequences
 
