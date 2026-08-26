@@ -1904,7 +1904,14 @@ impl EcsReconciler {
                 );
             }
 
-            let tasks = self.describe_service_tasks(&actual.name).await;
+            let mut tasks = self
+                .describe_service_tasks(&actual.name, &actual.task_definition_arn)
+                .await;
+            // ListTasks returns no defined order, so indexing it straight would
+            // let two ticks give the same replica slot to different tasks and
+            // report a replica flapping that never moved. The task id is stable
+            // for a task's whole life, which is all a slot needs.
+            tasks.sort_by(|a, b| a.name.cmp(&b.name));
             let api_available = self.traefik_api.is_some() && server_status.is_some();
 
             let expected = actual.desired_count.max(1) as usize;
@@ -2034,9 +2041,21 @@ impl EcsReconciler {
         any.then_some(merged)
     }
 
-    /// Describe a service's tasks, projecting each onto the backend-agnostic
-    /// [`InspectedContainer`] the shared `pod_status` builder consumes.
-    async fn describe_service_tasks(&self, service_name: &str) -> Vec<TaskView> {
+    /// Describe the tasks of `service_name` that run `task_definition_arn`,
+    /// projecting each onto the backend-agnostic [`InspectedContainer`] the
+    /// shared `pod_status` builder consumes.
+    ///
+    /// Filtered rather than taken whole: during a roll the service's tasks
+    /// include the outgoing revision's, and a readiness verdict drawn from
+    /// those reports the *previous* deployment's health as the new one's. ECS
+    /// keeps the old tasks serving throughout, so the cost is a deployment that
+    /// claims Healthy while the revision asked for is not — wrong in the one
+    /// place an operator looks to find out.
+    async fn describe_service_tasks(
+        &self,
+        service_name: &str,
+        task_definition_arn: &str,
+    ) -> Vec<TaskView> {
         let listed = self
             .ecs
             .list_tasks()
@@ -2070,6 +2089,9 @@ impl EcsReconciler {
                 }
             };
             for task in out.tasks() {
+                if task.task_definition_arn() != Some(task_definition_arn) {
+                    continue;
+                }
                 let last_status = task.last_status().unwrap_or_default().to_string();
                 let running = last_status == "RUNNING";
                 let name = task

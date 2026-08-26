@@ -662,6 +662,14 @@ the same healthcheck labels. Container health, where an image does supply a
 check, remains ECS's business — it restarts what it judges unhealthy — but it is
 not what decides routing.
 
+Whichever tasks the verdict is drawn from, it is drawn from the tasks running
+**the revision being reconciled**. During a roll a service owns both revisions'
+tasks at once, and ECS keeps the outgoing ones serving, so an unfiltered read
+would answer "is the deployment healthy?" with the health of the deployment it
+replaces. The task list is also unordered, so tasks are sorted by id before they
+are paired to replica slots — otherwise two ticks can hand the same slot to
+different tasks and report a replica flapping that never moved.
+
 ## Consequences
 
 **Positive**
