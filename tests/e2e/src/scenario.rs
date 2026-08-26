@@ -24,8 +24,8 @@ pub trait Scenario {
     fn run(&self, b: &dyn Backend) -> Result<()>;
 }
 
-/// The scenarios the harness runs. Workload-identity, health-rolling cutover and
-/// private/forwardAuth are tracked as follow-ups (ROADMAP).
+/// Every scenario the harness knows. Which ones actually run against a given
+/// backend is decided per scenario by [`Scenario::applies_to`], not here.
 pub fn all() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(PublicDeploy),
@@ -975,7 +975,7 @@ impl Scenario for RouteAccessOverride {
     }
 }
 
-// ---- (g) health-rolling cutover (docker only) ------------------------------
+// ---- (g) health-rolling cutover (docker + ECS) -----------------------------
 
 /// Sanitize to a Traefik router/service base name (lowercase; non-alnum runs → `-`).
 fn sanitize_router_name(s: &str) -> String {
@@ -1004,14 +1004,11 @@ impl Scenario for HealthRollingCutover {
         match b.kind() {
             // Reads Traefik serverStatus + per-container env; Traefik-specific.
             BackendKind::Docker => Applicability::Run,
-            // ECS is Traefik-fronted too and the driver implements both hooks,
-            // but each app task rounds up to 0.5 vCPU and this scenario asks for
-            // two replicas plus an overlapping cutover — enough to exhaust a
-            // fresh account's Fargate quota of 6. Enable once the quota is
-            // raised; the mechanism itself is exercised by the other scenarios.
-            BackendKind::Ecs => Applicability::Skip(
-                "needs ~2 extra vCPU of Fargate quota for a 2-replica overlapping cutover",
-            ),
+            // ECS is Traefik-fronted too and the driver implements both hooks.
+            // Each app task rounds up to 0.5 vCPU, so two replicas plus an
+            // overlapping cutover need ~2 extra vCPU on top of the base stack —
+            // comfortably inside the scratch account's raised Fargate quota.
+            BackendKind::Ecs => Applicability::Run,
             BackendKind::Minikube => {
                 Applicability::Skip("cutover probe reads the Traefik API (docker-specific)")
             }
