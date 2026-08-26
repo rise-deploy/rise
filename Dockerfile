@@ -84,12 +84,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 4: Create the final, smaller image (match builder's Debian version)
 FROM debian:trixie-slim AS rise
 
-# Runtime dependencies. curl is one of them, not a convenience: container
-# health checks run *inside* the container, and the ECS task definitions in
-# modules/rise-ecs probe /health over HTTP from there.
+# Runtime dependencies. Deliberately no HTTP client: the ECS health check runs
+# `rise backend health`, which probes the server over loopback using the binary
+# that is already here, so the image needs no curl or wget for it.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    curl \
     libssl3 \
     && rm -rf /var/lib/apt/lists/*
 

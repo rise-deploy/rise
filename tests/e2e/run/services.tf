@@ -148,7 +148,10 @@ resource "aws_ecs_task_definition" "rise" {
       ]
 
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -fsS http://localhost:3000/health || exit 1"]
+        # `rise backend health` rather than curl: an ECS health check runs
+        # inside the container, and the binary is already there. See
+        # `rise backend health --help`.
+        command     = ["CMD", "rise", "backend", "health"]
         interval    = 15
         timeout     = 5
         retries     = 5
