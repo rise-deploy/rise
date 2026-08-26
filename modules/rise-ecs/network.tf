@@ -50,7 +50,12 @@ resource "aws_subnet" "database" {
 
   vpc_id            = aws_vpc.this[0].id
   availability_zone = each.value
-  cidr_block        = cidrsubnet(var.vpc_cidr, 8, index(local.azs, each.value) + 64)
+  # Netnum 128, not 64. The private subnets are /20s at netnum `index + 1`, so at
+  # the maximum four AZs the fourth is `cidrsubnet(vpc, 4, 4)` = the /20 covering
+  # netnums 64..79 in /24 terms — a database /24 at netnum 64 would fall inside
+  # it and `apply` would reject the overlap. Starting at 128 clears the private
+  # range (which tops out at /24-equivalent 79) with room to spare.
+  cidr_block = cidrsubnet(var.vpc_cidr, 8, index(local.azs, each.value) + 128)
 
   tags = merge(local.tags, { Name = "${local.name}-database-${each.value}" })
 }

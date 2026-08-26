@@ -76,6 +76,40 @@ run "creates_a_whole_install" {
   }
 }
 
+# The database /24s must stay clear of the private /20s at the maximum four AZs.
+# The private subnets are /20s at netnum `index + 1`, so the fourth AZ's is
+# 10.42.64.0/20 (covering /24-netnums 64..79). A database range starting at
+# netnum 64 would fall inside it, and `apply` rejects overlapping subnet CIDRs --
+# masked at the 2-AZ default, a hard failure at 4. `plan` cannot see the overlap
+# (AWS validates it at apply), so this pins the computed CIDRs instead.
+run "database_subnets_clear_the_private_range_at_four_azs" {
+  command = plan
+
+  override_data {
+    target = data.aws_availability_zones.available
+    values = { names = ["eu-central-1a", "eu-central-1b", "eu-central-1c", "eu-central-1d"] }
+  }
+
+  variables {
+    availability_zone_count = 4
+  }
+
+  # The private /20 that used to collide with the database range.
+  assert {
+    condition     = aws_subnet.private["eu-central-1d"].cidr_block == "10.42.64.0/20"
+    error_message = "the fourth private subnet moved; re-check the database offset"
+  }
+  # Database /24s at netnum 128+, well above the private range's /24-netnum 79.
+  assert {
+    condition     = aws_subnet.database["eu-central-1a"].cidr_block == "10.42.128.0/24"
+    error_message = "database subnet must start clear of the private /20 range"
+  }
+  assert {
+    condition     = aws_subnet.database["eu-central-1d"].cidr_block == "10.42.131.0/24"
+    error_message = "database subnet must start clear of the private /20 range"
+  }
+}
+
 # A cluster shared by two installs is only safe if each Traefik discovers just
 # its own containers. The constraint is what enforces that, and it must stay off
 # by default so a single-install cluster keeps routing everything Rise labels.
