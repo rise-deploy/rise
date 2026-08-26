@@ -33,10 +33,13 @@ Two consequences are worth internalising before you operate it:
   not by daemon event as on Docker, so there's a bounded window where it may
   still send a request to a task that already received `SIGTERM`. A project
   with a `health_check` is largely protected — Traefik's own per-server probe
-  drops a dead server independent of the poll. Lower the Terraform variable
-  to shrink the window; see [ADR-0005 D12](/operator-docs/adr/0005-ecs-deployment-backend/#d12-cutover-and-health-overlap-and-drain-traefik-authoritative-readiness)
-  for why closing it fully needs a workload-side drain contract rather than a
-  reconciler change.
+  drops a dead server independent of the poll. Lowering the Terraform variable
+  shrinks the window for everyone; if your app is sensitive to it, keep it
+  accepting connections for a few seconds into its `SIGTERM` handler, and
+  confirm the task's `stopTimeout` is long enough to cover that — ECS sends
+  `SIGKILL` once it elapses, whether or not your app was still draining. See
+  [ADR-0005 D12](/operator-docs/adr/0005-ecs-deployment-backend/#d12-cutover-and-health-overlap-and-drain-traefik-authoritative-readiness)
+  for the full rationale.
 - **Task definitions are registered only when their content hash changes.**
   `RegisterTaskDefinition` sustains one request per second, so a steady install
   costs zero registrations.
