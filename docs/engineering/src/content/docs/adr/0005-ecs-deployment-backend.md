@@ -328,23 +328,36 @@ ARN per secret — must fit ECS's **64 KiB task-definition size limit** (not
 adjustable). Both are far above typical use but must fail at deploy time with a
 clear error, not at `RegisterTaskDefinition`.
 
-**Known weakness — the `env-hash` tag is a digest over secret plaintext.** The
+**The `env-hash` tag carries fingerprints, never secret plaintext.** The
 reconciler stamps each service with an `env-hash` tag so drift detection is a tag
-comparison rather than a re-read of every value, and that hash deliberately
-covers the *full* environment including secret plaintext — otherwise editing a
-secret would leave the hash unchanged and the deployment would never roll to pick
-up the new value. It is an unsalted SHA-256, and ECS resource tags are readable by
-any principal with `ecs:DescribeServices` (`ReadOnlyAccess` includes it), so a
-reader who can enumerate the cluster gets an offline oracle against
-low-entropy secret values. That does not expose a strong secret, but it narrows
-the D7 isolation story from "reading ECS reveals only a parameter name" to
-"reading ECS reveals only a parameter name and a digest of the values".
+comparison rather than a re-read of every value, and that hash covers the *full*
+environment — otherwise editing a secret would leave the hash unchanged and the
+deployment would never roll to pick up the new value. ECS resource tags are
+readable by any principal with `ecs:DescribeServices` (`ReadOnlyAccess` includes
+it), so a digest over secret plaintext would hand every reader of the cluster an
+offline oracle: guess a password, hash it, compare. That would narrow D7 from
+"reading ECS reveals only a parameter name" to "… a parameter name and a
+verifier for the values".
 
-The intended fix keeps the roll-on-change property without hashing plaintext at
-all: derive the drift signal from the plain env plus each secret's **SSM
-parameter version**, which `PutParameter` returns and which changes exactly when
-a value is rewritten. Tracked as follow-up work; it reorders secret writes ahead
-of desired-state computation, so it is a change worth making on its own.
+So a secret enters the digest as a **fingerprint of its stored form** — the
+ciphertext held in `deployment_env_vars`, plus that row's `updated_at` — rather
+than as its value (`rise_backend_core::secret_fingerprint`). The fingerprint is
+unpredictable without the install's encryption key, so it confirms nothing; and
+it changes whenever the value is rewritten, which is the whole property the hash
+exists for. Both inputs are folded in so the guarantee does not rest on an
+assumption about one provider: the ciphertext moves on every write under a
+randomised scheme (AES-GCM with a fresh nonce, KMS blobs) and the timestamp moves
+on every write of the row.
+
+The alternative considered was each secret's **SSM parameter version**, which
+`PutParameter` returns. It was rejected on both correctness and cost. Secrets are
+written only when the reconciler has already decided to act, so a version-derived
+hash has to learn the versions *before* that decision — either by writing every
+secret on every tick, which bumps the version on every tick if `PutParameter`
+does not deduplicate identical values, and then the changed hash triggers the
+next write, forever; or by reading parameter metadata for every deployment on
+every tick, against an API budget the controller is already careful with (D13).
+The stored form is available for free, at the point the env is resolved.
 
 **Several installs, one cluster.** The controller class is the isolation token,
 and it does two jobs. The orphan collector already scopes to its own class, so

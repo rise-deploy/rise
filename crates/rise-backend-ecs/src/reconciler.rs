@@ -25,9 +25,10 @@ use anyhow::{Context, Result};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use rise_backend_core::{
     build_controller_metadata, effective_health_path, hash_env, merge_container_env,
-    pin_system_env, resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
-    should_have_infrastructure, spec_key, DeploymentStore, DeploymentUrlBuilder, DesiredContainer,
-    DesiredRoute, EncryptionProvider, InspectedContainer,
+    pin_system_env, redact_secrets_for_hash, resolve_deployment_env_vars,
+    resolve_runtime_containers, rise_system_env_vars, should_have_infrastructure, spec_key,
+    DeploymentStore, DeploymentUrlBuilder, DesiredContainer, DesiredRoute, EncryptionProvider,
+    InspectedContainer, ResolvedDeploymentEnvVars,
 };
 use rise_backend_traefik::{replica_ready, ReadyVerdict, TraefikApiClient};
 use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
@@ -917,19 +918,15 @@ impl EcsReconciler {
         let primary_hosts: Vec<String> = primary_hosts.into_iter().map(|h| h.host).collect();
 
         // Secrets are kept SEPARATE from plain env — the whole point of D7. They
-        // still ride in the merged env for hashing (so editing a secret rolls the
-        // deployment) but are stripped from the task definition later.
+        // still ride in the merged env, since a container sees one flat
+        // environment, but they are stripped from the task definition later and
+        // never reach the drift hash in the clear (see `desired_for_spec`).
         let raw_env_vars = self.store.list_deployment_env_vars(deployment.id).await?;
         let resolved =
             resolve_deployment_env_vars(raw_env_vars, self.encryption_provider.as_deref()).await?;
-        let secret_plaintext: Vec<(String, Vec<u8>)> = resolved
-            .secret_env_vars
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
 
         let mut base_env = resolved.plain_env_vars.clone();
-        for (key, value) in &secret_plaintext {
+        for (key, value) in &resolved.secret_env_vars {
             base_env.push((key.clone(), String::from_utf8_lossy(value).to_string()));
         }
         let system_env = rise_system_env_vars(
@@ -962,7 +959,7 @@ impl EcsReconciler {
                     &primary_hosts,
                     &base_env,
                     &system_env,
-                    &secret_plaintext,
+                    &resolved,
                     env_name.as_deref(),
                     &base_image,
                 )
@@ -1021,7 +1018,7 @@ impl EcsReconciler {
         primary_hosts: &[String],
         base_env: &[(String, String)],
         system_env: &[(String, String)],
-        secret_plaintext: &[(String, Vec<u8>)],
+        secret_env: &ResolvedDeploymentEnvVars,
         env_name: Option<&str>,
         base_image: &str,
     ) -> Result<(DesiredService, TaskDefinitionSpec, DesiredContainer)> {
@@ -1040,11 +1037,18 @@ impl EcsReconciler {
 
         let mut env = merge_container_env(base_env, system_env, &[], spec, env_name);
         pin_system_env(&mut env, &spec.name, spec.port);
-        // The hash covers the FULL env including secret plaintext. If it covered
-        // only what reaches the task definition, editing a secret would leave the
-        // hash unchanged and the deployment would never roll to pick up the new
-        // value sitting in SSM.
-        let env_hash = hash_env(&env);
+        // The hash covers the FULL env, not only what reaches the task
+        // definition: otherwise editing a secret would leave the hash unchanged
+        // and the deployment would never roll to pick up the new value sitting
+        // in SSM. Secret values enter it as fingerprints rather than plaintext,
+        // because this digest is stamped on the service as a tag — a plaintext
+        // digest would hand every reader of the cluster an offline oracle for
+        // confirming a guessed secret.
+        let env_hash = hash_env(&redact_secrets_for_hash(
+            &env,
+            &secret_env.secret_env_vars,
+            &secret_env.secret_fingerprints,
+        ));
 
         let container_routes: Vec<DesiredRoute> = route_specs
             .iter()
@@ -1103,9 +1107,10 @@ impl EcsReconciler {
         );
 
         // Secret env vars become SSM parameter references.
-        let secrets: Vec<SecretRef> = secret_plaintext
-            .iter()
-            .map(|(key, _)| SecretRef {
+        let secrets: Vec<SecretRef> = secret_env
+            .secret_env_vars
+            .keys()
+            .map(|key| SecretRef {
                 name: key.clone(),
                 value_from: ssm::parameter_name(
                     &self.config.ssm_parameter_prefix,
@@ -1116,7 +1121,7 @@ impl EcsReconciler {
                 ),
             })
             .collect();
-        for (key, value) in secret_plaintext {
+        for (key, value) in &secret_env.secret_env_vars {
             // A name ECS will not accept is a property of the spec, not of the
             // moment.
             Self::permanent(ssm::validate(key, value))?;

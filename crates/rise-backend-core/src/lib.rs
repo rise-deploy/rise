@@ -48,7 +48,7 @@ pub use diff::{
     diff_desired_vs_actual, identity_key, spec_key, ActualContainer, InspectedContainer,
     ReconcileAction,
 };
-pub use env::{hash_env, merge_container_env, pin_system_env, upsert_env};
+pub use env::{hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash, upsert_env};
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use health_path::effective_health_path;
 pub use naming::{container_name, group_app_name, sanitize_ecs_name, stable_identity_name};
@@ -60,8 +60,8 @@ pub use rise_deployment_spec::AccessRequirement;
 pub use rolling::filter_rolling_actions;
 pub use runtime::{
     effective_access_requirement, resolve_deployment_env_vars, resolve_runtime_containers,
-    should_have_infrastructure, ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES,
-    PRE_PUSHED_TIMEOUT_MINUTES,
+    secret_fingerprint, should_have_infrastructure, ResolvedDeploymentEnvVars,
+    DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
 pub use store::DeploymentStore;
 pub use system_env::rise_system_env_vars;
