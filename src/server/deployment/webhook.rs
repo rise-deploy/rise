@@ -21,7 +21,6 @@ use k8s_openapi::api::core::v1::{EnvVar, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::ByteString;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
@@ -1518,11 +1517,14 @@ async fn compute_desired_children(
                 &namespace,
                 env_name.as_deref(),
                 &observed.secrets,
-                env_vars
-                    .secret_env_vars
-                    .into_iter()
-                    .map(|(k, v)| (k, ByteString(v)))
-                    .collect(),
+                DeploymentEnvSecretData {
+                    data: env_vars
+                        .secret_env_vars
+                        .into_iter()
+                        .map(|(k, v)| (k, ByteString(v)))
+                        .collect(),
+                    fingerprints: env_vars.secret_fingerprints,
+                },
             ))
         };
 
@@ -2281,25 +2283,6 @@ async fn prepare_identity_secret(
     })
 }
 
-fn hash_deployment_env_secret(data: &BTreeMap<String, ByteString>) -> String {
-    let mut hasher = Sha256::new();
-
-    for (key, value) in data {
-        let key_len = key.len() as u64;
-        let value_len = value.0.len() as u64;
-        hasher.update(key_len.to_le_bytes());
-        hasher.update(key.as_bytes());
-        hasher.update(value_len.to_le_bytes());
-        hasher.update(&value.0);
-    }
-
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn observed_secret_matches_hash(
     observed_secrets: &HashMap<String, serde_json::Value>,
     namespace: &str,
@@ -2316,6 +2299,13 @@ fn observed_secret_matches_hash(
         == Some(expected_hash)
 }
 
+/// A deployment's env Secret payload, alongside the fingerprints (never the
+/// plaintext) the drift-detection hash is derived from.
+struct DeploymentEnvSecretData {
+    data: BTreeMap<String, ByteString>,
+    fingerprints: BTreeMap<String, String>,
+}
+
 fn prepare_deployment_env_secret(
     resource_builder: &ResourceBuilder,
     project: &Project,
@@ -2323,16 +2313,24 @@ fn prepare_deployment_env_secret(
     namespace: &str,
     environment_name: Option<&str>,
     observed_secrets: &HashMap<String, serde_json::Value>,
-    data: BTreeMap<String, ByteString>,
+    secret_data: DeploymentEnvSecretData,
 ) -> PreparedDeploymentEnvSecret {
-    let secret_hash = hash_deployment_env_secret(&data);
+    // Hashed from each secret's fingerprint, never its plaintext: this digest
+    // is stamped as a pod annotation, readable with only `get pods` — a much
+    // weaker grant than `get secrets`. A fingerprint is unpredictable without
+    // the encryption key, so the annotation can't be turned into an offline
+    // guessing oracle the way a hash of the plaintext would be. It still
+    // changes exactly when a secret is rewritten, which is the property the
+    // hash exists for. See `rise_backend_core::runtime::secret_fingerprint`.
+    let secret_hash =
+        rise_backend_core::env::hash_env(&secret_data.fingerprints.into_iter().collect::<Vec<_>>());
     let secret = resource_builder.create_deployment_env_secret(
         project,
         deployment,
         namespace,
         environment_name,
         &secret_hash,
-        data,
+        secret_data.data,
     );
     let secret_name = secret
         .metadata
@@ -2741,25 +2739,90 @@ mod tests {
     }
 
     #[test]
-    fn deployment_env_secret_hash_is_stable_for_identical_data() {
+    fn deployment_env_secret_hash_is_stable_for_identical_fingerprints() {
+        let mut fp_a = BTreeMap::new();
+        fp_a.insert("API_KEY".to_string(), "fp-1".to_string());
+        fp_a.insert("SESSION_SECRET".to_string(), "fp-2".to_string());
+
+        let mut fp_b = BTreeMap::new();
+        fp_b.insert("SESSION_SECRET".to_string(), "fp-2".to_string());
+        fp_b.insert("API_KEY".to_string(), "fp-1".to_string());
+
+        let hash = |fps: &BTreeMap<String, String>| {
+            rise_backend_core::env::hash_env(
+                &fps.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(hash(&fp_a), hash(&fp_b));
+    }
+
+    #[test]
+    fn deployment_env_secret_hash_tracks_the_fingerprint_not_the_plaintext() {
+        // The Secret's stored plaintext must not drive the annotation hash:
+        // two different values under the same fingerprint hash identically...
+        let builder = test_resource_builder();
+        let project = test_project();
+        let deployment = test_deployment(DeploymentStatus::Deploying);
+
+        let mut fingerprints = BTreeMap::new();
+        fingerprints.insert("API_KEY".to_string(), "fp-1".to_string());
+
         let mut data_a = BTreeMap::new();
         data_a.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
-        data_a.insert(
-            "SESSION_SECRET".to_string(),
-            ByteString(b"secret-b".to_vec()),
-        );
-
         let mut data_b = BTreeMap::new();
         data_b.insert(
-            "SESSION_SECRET".to_string(),
-            ByteString(b"secret-b".to_vec()),
+            "API_KEY".to_string(),
+            ByteString(b"totally-different".to_vec()),
         );
-        data_b.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
 
-        assert_eq!(
-            hash_deployment_env_secret(&data_a),
-            hash_deployment_env_secret(&data_b)
+        let prepared_a = prepare_deployment_env_secret(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            None,
+            &HashMap::new(),
+            DeploymentEnvSecretData {
+                data: data_a,
+                fingerprints: fingerprints.clone(),
+            },
         );
+        let prepared_b = prepare_deployment_env_secret(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            None,
+            &HashMap::new(),
+            DeploymentEnvSecretData {
+                data: data_b,
+                fingerprints: fingerprints.clone(),
+            },
+        );
+        assert_eq!(prepared_a.secret_hash, prepared_b.secret_hash);
+
+        // ...and the same plaintext hashes differently once its fingerprint
+        // changes (a rewrite), which is the drift signal the hash exists for.
+        let mut data_c = BTreeMap::new();
+        data_c.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
+        let mut other_fingerprint = BTreeMap::new();
+        other_fingerprint.insert("API_KEY".to_string(), "fp-2".to_string());
+        let prepared_c = prepare_deployment_env_secret(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            None,
+            &HashMap::new(),
+            DeploymentEnvSecretData {
+                data: data_c,
+                fingerprints: other_fingerprint,
+            },
+        );
+        assert_ne!(prepared_a.secret_hash, prepared_c.secret_hash);
     }
 
     #[test]
@@ -2769,6 +2832,8 @@ mod tests {
         let deployment = test_deployment(DeploymentStatus::Deploying);
         let mut data = BTreeMap::new();
         data.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
+        let mut fingerprints = BTreeMap::new();
+        fingerprints.insert("API_KEY".to_string(), "fp-1".to_string());
 
         let prepared = prepare_deployment_env_secret(
             &builder,
@@ -2777,7 +2842,10 @@ mod tests {
             "demo",
             None,
             &HashMap::new(),
-            data.clone(),
+            DeploymentEnvSecretData {
+                data: data.clone(),
+                fingerprints: fingerprints.clone(),
+            },
         );
 
         assert!(!prepared.is_ready);
@@ -2801,7 +2869,7 @@ mod tests {
             "demo",
             None,
             &observed_secrets,
-            data,
+            DeploymentEnvSecretData { data, fingerprints },
         );
 
         assert!(prepared_ready.is_ready);
