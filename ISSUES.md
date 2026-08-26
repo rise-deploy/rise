@@ -5,7 +5,7 @@ Working scratchpad from a six-lane review panel over the ECS backend
 machinery it uses, `modules/rise-aws` + `modules/rise-ecs`, the `tests/e2e`
 driver, and the CI workflow) on branch `claude/ecs-deployment-backend-5xdgqa`.
 
-**Status:** A, B, D, E fixed (see the ✅ notes). Everything else open.
+**Status:** A, B, C, D, E fixed (see the ✅ notes). Everything else open.
 
 This is a triage list, not a deliverable. Every item below
 was verified against the code, not inferred from names. Severity is this
@@ -91,7 +91,16 @@ failing roll.)
 **Verified:** `list_tasks()` builder has no `desired_status`; the partition +
 hold at ~:1951 / ~:2020.
 
-### C. Persistent `TagResource` failure → perpetual re-roll, and the hold never expires — Med — Scope: ECS
+### ✅ C. Persistent `TagResource` failure → perpetual re-roll, and the hold never expires — Med — Scope: ECS
+> **FIXED (option 2).** The converged task-definition hash is now persisted in
+> the deployment's `controller_metadata` (no new column) in the same DB write
+> that records health. The diff treats a service as converged if the tag **or**
+> the persisted hash matches desired, and the `TagResource` write is downgraded
+> to best-effort — so a role missing `ecs:TagResource` no longer drives an
+> unbounded re-roll. Note on the "reads Healthy while churning" line: with fix B
+> the hold only holds because an outgoing task is genuinely serving, so traffic
+> does flow throughout; the defect was the silent re-roll, not a false Healthy.
+> A distinct "reconciling/progressing" status is deferred as a future nicety.
 The convergence marker (`task-definition-hash` tag) is written in a separate,
 failable call *after* the `UpdateService` it records (`update_service`, ~:1745).
 If tagging fails persistently — realistic case: the controller role missing

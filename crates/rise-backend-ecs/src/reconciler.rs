@@ -125,8 +125,48 @@ impl ClusterServices {
 
 /// Tag suffix carrying the content hash of the task definition a service runs.
 /// Stamped alongside the bookkeeping tags so drift detection is a tag comparison
-/// rather than a `DescribeTaskDefinition` per service per tick.
+/// rather than a `DescribeTaskDefinition` per service per tick. A best-effort
+/// cache: the durable convergence marker is [`persisted_td_hash`], which a tag
+/// write cannot corrupt.
 const TASK_DEFINITION_HASH_SUFFIX: &str = "task-definition-hash";
+
+/// Keys under a deployment's `controller_metadata` where the ECS reconciler
+/// records the content hash of the task definition its service has converged to.
+///
+/// This is the authoritative drift marker, not the service's `task-definition-hash`
+/// tag: the tag is stamped by a separate `TagResource` call *after* `UpdateService`,
+/// so a persistently failing tag write (e.g. a role missing `ecs:TagResource`)
+/// would leave the service looking drifted every tick and re-roll it forever. The
+/// hash is instead persisted here, in the same DB write that records health, so it
+/// cannot fail independently of the update it records.
+const ECS_META_KEY: &str = "ecs";
+const TD_HASH_META_KEY: &str = "task_definition_hash";
+
+/// Read the converged task-definition hash a prior tick persisted for a
+/// deployment, if any.
+fn persisted_td_hash(controller_metadata: &serde_json::Value) -> Option<String> {
+    controller_metadata
+        .get(ECS_META_KEY)?
+        .get(TD_HASH_META_KEY)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Fold the converged task-definition hash into a controller-metadata object,
+/// leaving the health/pod-status keys untouched. A no-op if `hash` is `None` or
+/// the metadata is not a JSON object.
+fn with_persisted_td_hash(
+    mut metadata: serde_json::Value,
+    hash: Option<&str>,
+) -> serde_json::Value {
+    if let (Some(hash), Some(obj)) = (hash, metadata.as_object_mut()) {
+        obj.insert(
+            ECS_META_KEY.to_string(),
+            serde_json::json!({ TD_HASH_META_KEY: hash }),
+        );
+    }
+    metadata
+}
 
 /// Owned controller configuration.
 #[derive(Clone)]
@@ -621,7 +661,7 @@ impl EcsReconciler {
         cluster: &ClusterServices,
         election: &LeaderElection,
     ) -> Result<()> {
-        let actual = cluster.for_project(&project.name);
+        let mut actual = cluster.for_project(&project.name);
 
         // 1. Status transitions, isolated per deployment.
         let non_terminal = self
@@ -697,6 +737,40 @@ impl EcsReconciler {
             }
         }
 
+        // The task-definition hash each deployment desires, by deployment id.
+        let desired_hash_by_deployment: HashMap<String, String> = desired
+            .iter()
+            .map(|(d, _, _)| (d.tags.deployment_id.clone(), d.task_definition_hash.clone()))
+            .collect();
+
+        // Overlay the durable convergence marker onto the cluster snapshot: when
+        // a prior tick recorded that a service reached the hash it still desires,
+        // treat it as converged even if its `task-definition-hash` tag is stale
+        // (a failed `TagResource` write). Without this a persistent tag failure
+        // would re-roll the service every tick. The tag remains a fast path; the
+        // persisted hash is the backstop.
+        let persisted_hash_by_deployment: HashMap<&str, String> = non_terminal
+            .iter()
+            .filter_map(|d| {
+                Some((
+                    d.deployment_id.as_str(),
+                    persisted_td_hash(&d.controller_metadata)?,
+                ))
+            })
+            .collect();
+        for a in &mut actual {
+            if let Some(deployment_id) = a.deployment_id.as_deref() {
+                if let (Some(desired_hash), Some(persisted)) = (
+                    desired_hash_by_deployment.get(deployment_id),
+                    persisted_hash_by_deployment.get(deployment_id),
+                ) {
+                    if desired_hash == persisted {
+                        a.task_definition_hash = desired_hash.clone();
+                    }
+                }
+            }
+        }
+
         // 3. Diff and apply against the snapshot taken at the top of the tick.
         let desired_services: Vec<DesiredService> =
             desired.iter().map(|(d, _, _)| d.clone()).collect();
@@ -726,6 +800,9 @@ impl EcsReconciler {
                     deployment,
                     &actual,
                     &registered,
+                    desired_hash_by_deployment
+                        .get(&deployment.deployment_id)
+                        .map(String::as_str),
                     &mut server_status_cache,
                 )
                 .await
@@ -1781,27 +1858,29 @@ impl EcsReconciler {
                 anyhow::anyhow!("UpdateService {:?} failed: {}", name, aws_error_detail(&e))
             })?;
 
-        // Re-tag so the next tick sees the new content hash and converges.
-        // Without this the service looks permanently drifted and we register a
-        // revision every tick -- which is why a failure here is an error rather
-        // than a warning: the loop would otherwise be silent and unbounded.
-        let Some(service_arn) = service_arn else {
-            anyhow::bail!(
-                "no ARN observed for service {name:?}; cannot stamp its content-hash tag, \
-                 and without that the next tick would register another task-definition \
-                 revision for the same content"
+        // Re-tag so the next tick can see the new content hash without reading
+        // the DB. Best-effort: the durable convergence marker is the hash
+        // `reconcile_health` persists to `controller_metadata`, so a tag failure
+        // here only loses a fast path, it no longer drives an unbounded re-roll.
+        if let Some(service_arn) = service_arn {
+            let mut req = self.ecs.tag_resource().resource_arn(service_arn);
+            for tag in self.service_tag_list(desired) {
+                req = req.tags(tag);
+            }
+            if let Err(e) = req.send().await {
+                warn!(
+                    project = %project.name,
+                    service = %name,
+                    "Failed to re-tag after update; convergence is tracked in the DB: {}",
+                    aws_error_detail(&e)
+                );
+            }
+        } else {
+            warn!(
+                service = %name,
+                "No ARN observed to re-tag after update; convergence is tracked in the DB"
             );
-        };
-        let mut req = self.ecs.tag_resource().resource_arn(service_arn);
-        for tag in self.service_tag_list(desired) {
-            req = req.tags(tag);
         }
-        req.send().await.with_context(|| {
-            format!(
-                "tag ECS service {name:?} after updating it. Until this succeeds every \
-                 tick re-registers a task definition for unchanged content"
-            )
-        })?;
 
         info!(project = %project.name, service = %name, "Updated ECS service task definition");
         Ok(task_definition_arn)
@@ -1882,6 +1961,7 @@ impl EcsReconciler {
         deployment: &Deployment,
         services: &[ActualService],
         registered: &HashMap<String, String>,
+        desired_td_hash: Option<&str>,
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
     ) -> Result<()> {
         if !matches!(
@@ -2070,7 +2150,31 @@ impl EcsReconciler {
             }
         }
 
-        let metadata = build_controller_metadata(&pods, &deployment.status, all_ready);
+        // Record the task-definition hash this service has converged to, so a
+        // failed `TagResource` cannot make the next tick re-roll it. When this
+        // tick registered the service (Create/UpdateTaskDefinition succeeded),
+        // that is the hash it now desires; otherwise carry forward what a prior
+        // tick recorded, rather than dropping it.
+        let just_rolled = container_specs.iter().any(|spec| {
+            let name = service::service_name(
+                &self.config.resource_prefix,
+                &project.name,
+                &deployment.deployment_group,
+                &deployment.deployment_id,
+                &spec.name,
+            );
+            registered.contains_key(&name)
+        });
+        let converged_hash = if just_rolled {
+            desired_td_hash.map(str::to_string)
+        } else {
+            persisted_td_hash(&deployment.controller_metadata)
+        };
+
+        let metadata = with_persisted_td_hash(
+            build_controller_metadata(&pods, &deployment.status, all_ready),
+            converged_hash.as_deref(),
+        );
         if let Err(e) = self
             .store
             .update_deployment_controller_metadata(deployment.id, &metadata)
@@ -2416,6 +2520,36 @@ pub(crate) fn clamp_replicas(requested: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::{persisted_td_hash, with_persisted_td_hash};
+
+    #[test]
+    fn converged_hash_round_trips_through_controller_metadata() {
+        let base = serde_json::json!({
+            "pod_status": { "ready_replicas": 1 },
+            "health": { "healthy": true },
+        });
+        assert_eq!(persisted_td_hash(&base), None);
+
+        let stamped = with_persisted_td_hash(base.clone(), Some("abc123"));
+        assert_eq!(persisted_td_hash(&stamped).as_deref(), Some("abc123"));
+        // The health/pod-status keys survive the stamp untouched.
+        assert_eq!(stamped["pod_status"]["ready_replicas"], 1);
+        assert_eq!(stamped["health"]["healthy"], true);
+    }
+
+    #[test]
+    fn stamping_none_leaves_the_metadata_unchanged() {
+        let base = serde_json::json!({ "health": { "healthy": false } });
+        assert_eq!(with_persisted_td_hash(base.clone(), None), base);
+    }
+
+    #[test]
+    fn a_later_stamp_overwrites_an_earlier_one() {
+        let once = with_persisted_td_hash(serde_json::json!({}), Some("old"));
+        let twice = with_persisted_td_hash(once, Some("new"));
+        assert_eq!(persisted_td_hash(&twice).as_deref(), Some("new"));
+    }
+
     /// A cluster entry as `list_managed_services` would build it: the tags are
     /// the identity, the `ActualService` is what the diff sees.
     fn managed(project: &str, deployment_id: &str) -> super::ManagedService {

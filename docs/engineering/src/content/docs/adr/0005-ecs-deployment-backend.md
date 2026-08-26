@@ -189,6 +189,16 @@ same bookkeeping set the Docker backend stamps as labels — `{ns}/managed-by`,
 the service's tags onto its tasks. The reconciler's drift detection and orphan GC
 read these tags, so the diff logic stays conceptually identical to Docker's.
 
+Drift detection compares the desired task-definition content hash against the
+`/task-definition-hash` tag. That tag is a *cache*, not the source of truth: it
+is stamped by a separate `TagResource` call after `UpdateService`, so a role
+missing `ecs:TagResource` could leave every service looking permanently drifted
+and re-roll it on every tick. The authoritative convergence marker is therefore
+the same hash persisted in the deployment's `controller_metadata` — written in
+the same DB update that records health, so it cannot fail independently of the
+roll it records. A tick treats a service as converged if *either* the tag or the
+persisted hash matches; the tag write is best-effort.
+
 ### D5. Ingress: Traefik on ECS, with a load balancer as the edge
 
 **Traefik is the router.** It runs as an ECS service in the same cluster, using
