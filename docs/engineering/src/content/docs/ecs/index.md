@@ -28,6 +28,15 @@ Two consequences are worth internalising before you operate it:
   rolling replacement itself, so nothing is destroyed to change anything. A
   cutover between deployments still overlaps two services behind one Traefik
   service and drains via Traefik's health check, as on Docker.
+- **A retiring task can stay routable for up to `traefik_refresh_seconds`
+  after it stops.** Traefik's ECS provider learns a task is gone by polling,
+  not by daemon event as on Docker, so there's a bounded window where it may
+  still send a request to a task that already received `SIGTERM`. A project
+  with a `health_check` is largely protected — Traefik's own per-server probe
+  drops a dead server independent of the poll. Lower the Terraform variable
+  to shrink the window; see [ADR-0005 D12](/operator-docs/adr/0005-ecs-deployment-backend/#d12-cutover-and-health-overlap-and-drain-traefik-authoritative-readiness)
+  for why closing it fully needs a workload-side drain contract rather than a
+  reconciler change.
 - **Task definitions are registered only when their content hash changes.**
   `RegisterTaskDefinition` sustains one request per second, so a steady install
   costs zero registrations.
