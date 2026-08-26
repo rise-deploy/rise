@@ -10,22 +10,28 @@
 //!
 //! Two consequences worth stating, because both are easy to get wrong:
 //!
-//! - **The env hash still covers secret values.** Drift detection hashes the full
-//!   merged environment, plaintext included. If it hashed only what reaches the
-//!   task definition, editing a secret would leave the hash unchanged and the
-//!   deployment would never roll — the new value would sit in SSM, unread.
+//! - **The env hash still covers secret values, via a fingerprint.** Drift
+//!   detection hashes the full merged environment; if it hashed only what reaches
+//!   the task definition, editing a secret would leave the hash unchanged and the
+//!   deployment would never roll. Secret values enter the hash as fingerprints of
+//!   their stored form, never plaintext (see `redact_secrets_for_hash`).
 //! - **Parameters are per deployment, not per project.** A rollback re-creates
 //!   the prior deployment's services, which must resolve the values that
 //!   deployment shipped with. Sharing one path across deployments would make a
 //!   rollback silently pick up the newer secret.
 
 use anyhow::{bail, Result};
+use rise_backend_core::normalize_deployment_group;
 
 /// SSM Standard-tier parameters cap the value at 4 KB. Advanced tier raises it to
 /// 8 KB at a per-parameter cost; Rise stays on Standard and rejects oversized
 /// values with an actionable message instead of silently upgrading the tier and
 /// the operator's bill.
 pub const MAX_STANDARD_VALUE_BYTES: usize = 4096;
+
+/// Upper bound on a secret's env-var name as an SSM path segment, chosen so the
+/// full parameter name cannot exceed SSM's 2048-character limit.
+pub const MAX_KEY_SEGMENT_CHARS: usize = 512;
 
 /// The parameter path for one deployment's secret.
 ///
@@ -41,7 +47,13 @@ pub fn parameter_name(
     key: &str,
 ) -> String {
     let prefix = prefix.trim_matches('/');
-    format!("/{prefix}/{project}/{deployment_group}/{deployment_id}/{key}")
+    // The group is escaped to a single path segment: a raw group legally
+    // contains `/` (branch/MR conventions like `mr/123`), and interpolating it
+    // straight would deepen the hierarchy past SSM's 15-level cap and make
+    // `PutParameter` fail for every secret. Same escaping the K8s and Docker
+    // backends apply to the group, so a deployment resolves to one node here too.
+    let group = normalize_deployment_group(deployment_group);
+    format!("/{prefix}/{project}/{group}/{deployment_id}/{key}")
 }
 
 /// The path prefix covering every secret of one deployment. Used to enumerate
@@ -53,7 +65,10 @@ pub fn deployment_path_prefix(
     deployment_id: &str,
 ) -> String {
     let prefix = prefix.trim_matches('/');
-    format!("/{prefix}/{project}/{deployment_group}/{deployment_id}")
+    // Must escape the group identically to `parameter_name`, or the delete
+    // prefix would not match the names that were written.
+    let group = normalize_deployment_group(deployment_group);
+    format!("/{prefix}/{project}/{group}/{deployment_id}")
 }
 
 /// Whether an environment variable name is usable as an SSM path segment.
@@ -76,6 +91,17 @@ pub fn validate(key: &str, value: &[u8]) -> Result<()> {
         bail!(
             "environment variable name {key:?} cannot be stored as an SSM parameter: \
              names may contain only letters, digits, '_', '.' and '-'"
+        );
+    }
+    // Bound the key so the composed `/{prefix}/{project}/{group}/{id}/{key}` name
+    // stays under SSM's 2048-character limit. The other segments are each already
+    // bounded (project and normalized group <= 63, the id a timestamp), so a
+    // generous cap here is enough, and far above any real environment variable.
+    if key.len() > MAX_KEY_SEGMENT_CHARS {
+        bail!(
+            "environment variable name {key:?} is {} characters, over the \
+             {MAX_KEY_SEGMENT_CHARS}-character limit for an SSM parameter segment",
+            key.len()
         );
     }
     if value.len() > MAX_STANDARD_VALUE_BYTES {
@@ -129,6 +155,35 @@ mod tests {
 
         let err = validate("API/KEY", b"v").expect_err("must reject");
         assert!(err.to_string().contains("cannot be stored"));
+    }
+
+    #[test]
+    fn a_slashed_group_is_flattened_to_one_segment() {
+        // A raw group is allowed to contain `/`; left unescaped it would deepen
+        // the path past SSM's 15-level cap. It must resolve to a single segment,
+        // and the delete prefix must still match what was written.
+        let name = parameter_name(
+            "rise",
+            "myapp",
+            "team/app/feature",
+            "20260101-120000",
+            "API_KEY",
+        );
+        assert_eq!(
+            name,
+            "/rise/myapp/team--app--feature/20260101-120000/API_KEY"
+        );
+        let prefix = deployment_path_prefix("rise", "myapp", "team/app/feature", "20260101-120000");
+        assert!(name.starts_with(&prefix));
+    }
+
+    #[test]
+    fn an_overlong_key_is_rejected() {
+        let long = "X".repeat(MAX_KEY_SEGMENT_CHARS + 1);
+        let err = validate(&long, b"v").expect_err("must reject");
+        assert!(err.to_string().contains("over the"), "{err}");
+        // At the bound it is still accepted.
+        assert!(validate(&"X".repeat(MAX_KEY_SEGMENT_CHARS), b"v").is_ok());
     }
 
     #[test]

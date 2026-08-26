@@ -16,7 +16,7 @@
 //! runs as 0.5 vCPU / 1 GB. Callers surface [`FargateSize::rounded_up`] so that
 //! is visible rather than a silent 4× on the memory line of an invoice.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use rise_backend_core::quantity::{
     parse_cpu_millicores, parse_cpu_request_limit, parse_memory_bytes, parse_memory_request_limit,
 };
@@ -150,9 +150,23 @@ pub fn resolve(cpu: &str, memory: &str) -> Result<FargateSize> {
     let want_bytes = parse_memory_bytes(&memory_limit)
         .map_err(|e| anyhow::anyhow!("invalid memory value {memory:?}: {e}"))?;
 
-    // 1 vCPU = 1000 millicores = 1024 CPU units.
-    let want_cpu_units = (want_millicores * 1024).div_ceil(1000) as u32;
-    let want_mib = want_bytes.div_ceil(1024 * 1024) as u32;
+    // 1 vCPU = 1000 millicores = 1024 CPU units. A request so large its unit or
+    // MiB count overflows u32 cannot fit any Fargate size, and a truncating cast
+    // would silently wrap it down to a small valid one -- under-provisioning a
+    // workload that should be rejected outright. Treat overflow as "too large".
+    let too_large = || {
+        let max = TABLE.last().expect("table is non-empty");
+        anyhow::anyhow!(
+            "cpu {cpu:?} / memory {memory:?} exceeds the largest Fargate task size \
+             ({} vCPU / {} GiB). Reduce the request, or run this workload on a \
+             backend without Fargate's fixed size table.",
+            max.cpu / 1024,
+            max.max_mib / 1024,
+        )
+    };
+    let want_cpu_units = u32::try_from(want_millicores.saturating_mul(1024).div_ceil(1000))
+        .map_err(|_| too_large())?;
+    let want_mib = u32::try_from(want_bytes.div_ceil(1024 * 1024)).map_err(|_| too_large())?;
 
     for row in TABLE {
         if row.cpu < want_cpu_units {
@@ -167,14 +181,7 @@ pub fn resolve(cpu: &str, memory: &str) -> Result<FargateSize> {
         }
     }
 
-    let max = TABLE.last().expect("table is non-empty");
-    bail!(
-        "cpu {cpu:?} / memory {memory:?} exceeds the largest Fargate task size \
-         ({} vCPU / {} GiB). Reduce the request, or run this workload on a \
-         backend without Fargate's fixed size table.",
-        max.cpu / 1024,
-        max.max_mib / 1024,
-    )
+    Err(too_large())
 }
 
 #[cfg(test)]
@@ -279,6 +286,19 @@ mod tests {
         assert_eq!(size.cpu_units, 1024);
         assert_eq!(size.memory_mib, 2048);
         assert_valid_combination(size);
+    }
+
+    #[test]
+    fn a_request_past_the_u32_boundary_is_rejected_not_wrapped() {
+        // The unit count for this request overflows u32; a truncating cast would
+        // wrap it down to a small in-table size and silently under-provision.
+        // It must be rejected with the same "too large" error instead.
+        let err = resolve("4194305", "256Mi").expect_err("beyond u32 of CPU units");
+        assert!(
+            err.to_string()
+                .contains("exceeds the largest Fargate task size"),
+            "must reject, not wrap: {err}"
+        );
     }
 
     #[test]

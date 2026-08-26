@@ -56,6 +56,12 @@ pub struct ActualService {
     pub running_count: i32,
     /// `deployment-id` tag, used by the protected-deployment GC guard.
     pub deployment_id: Option<String>,
+    /// `project` / `deployment-group` tags. Together with `deployment_id` they
+    /// form the SSM path prefix, so a `Delete` can retire the service's secret
+    /// parameters. Empty for an unattributable service (which is never diffed
+    /// into a `Delete`).
+    pub project: String,
+    pub deployment_group: String,
     /// When ECS started rolling out the service's PRIMARY deployment, as
     /// `DescribeServices` reports it. `None` when ECS reports no primary.
     pub rollout_started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -255,6 +261,8 @@ mod tests {
             desired_count: count,
             running_count: count,
             deployment_id: Some(d.tags.deployment_id.clone()),
+            project: d.tags.project.clone(),
+            deployment_group: d.tags.deployment_group.clone(),
             rollout_started_at: None,
         }
     }

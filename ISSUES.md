@@ -5,7 +5,9 @@ Working scratchpad from a six-lane review panel over the ECS backend
 machinery it uses, `modules/rise-aws` + `modules/rise-ecs`, the `tests/e2e`
 driver, and the CI workflow) on branch `claude/ecs-deployment-backend-5xdgqa`.
 
-**Not committed.** This is a triage list, not a deliverable. Every item below
+**Status:** A, B, D, E fixed (see the ✅ notes). Everything else open.
+
+This is a triage list, not a deliverable. Every item below
 was verified against the code, not inferred from names. Severity is this
 reviewer's grading, sometimes lower than the finding lane's.
 
@@ -46,7 +48,11 @@ carry the same defect), flagged for completeness, not a regression here.
 
 ## Fix-worthy — ECS-specific, owned by this work
 
-### A. Secret parameters leak on every retirement path except supersession — Med — Scope: ECS
+### ✅ A. Secret parameters leak on every retirement path except supersession — Med — Scope: ECS
+> **FIXED.** `delete_secrets_for` now also runs from the diff's `Delete` action
+> (via new `project`/`deployment_group` fields on `ActualService`), after a
+> successful `delete_service`, best-effort. Refactored to take the path
+> components rather than a synthetic `ServiceTags`.
 `delete_service` (`crates/rise-backend-ecs/src/reconciler.rs`) scales to zero and
 force-deletes; it never touches SSM. `delete_secrets_for` has only two call
 sites: the orphan sweep (~:564) and the superseded-predecessor path (~:2233).
@@ -62,7 +68,11 @@ until full project deletion — a hygiene issue and slow erosion of the
 `ManagedService`), or from `complete_termination`.
 **Verified:** `delete_service` body + the two call sites.
 
-### B. Rollout-hold flaps Healthy→Unhealthy in the terminal phase of an in-place roll — Med — Scope: ECS
+### ✅ B. Rollout-hold flaps Healthy→Unhealthy in the terminal phase of an in-place roll — Med — Scope: ECS
+> **FIXED.** `describe_service_tasks` now lists both `desiredStatus=RUNNING`
+> and `=STOPPED` tasks and merges them, so a draining-but-serving outgoing
+> task is visible to the hold. The `lastStatus == RUNNING` check keeps
+> `still_serving` accurate.
 `describe_service_tasks` (`reconciler.rs`, ~:2048) calls `list_tasks()` with only
 cluster + service, so it defaults to `desiredStatus=RUNNING`. When ECS (no LB, no
 container health check) reaches the new task's RUNNING state it immediately flips
@@ -99,7 +109,11 @@ mutate), or persist the hash on the DB row where it can't fail.
 **Verified:** tag-after-update ordering; `primary_rollout_start` reset each roll;
 hold expiry keyed on it.
 
-### D. SSM path built from the raw `deployment_group` → breaks AWS's 15-level hierarchy cap — Med — Scope: ECS
+### ✅ D. SSM path built from the raw `deployment_group` → breaks AWS's 15-level hierarchy cap — Med — Scope: ECS
+> **FIXED.** `ssm::parameter_name` and `deployment_path_prefix` now escape the
+> group with `normalize_deployment_group` (parity with K8s/Docker), collapsing
+> `/` to a single segment. Added a `MAX_KEY_SEGMENT_CHARS` bound so the composed
+> name cannot exceed SSM's 2048-char limit.
 `ssm::parameter_name` composes `/{prefix}/{project}/{group}/{deployment_id}/{KEY}`
 from `deployment.deployment_group` passed **raw** (`reconciler.rs:1124`). The DB
 stores the group raw, and `is_valid_group_name` legally permits `/` inside it
@@ -116,7 +130,9 @@ composed name's length + depth in `ssm::validate`.
 **Verified:** raw pass-through at :1124; `normalize_deployment_group` applied
 only at use sites; K8s `escaped_group_name` at `resource_builder.rs:224+`.
 
-### E. Fargate CPU sizing truncates an oversized request to a small valid size — Med — Scope: ECS
+### ✅ E. Fargate CPU sizing truncates an oversized request to a small valid size — Med — Scope: ECS
+> **FIXED.** The two `as u32` casts are now `u32::try_from(...)` that bail with
+> the "exceeds the largest Fargate task size" error on overflow.
 `sizing.rs` `let want_cpu_units = (want_millicores * 1024).div_ceil(1000) as u32;`
 truncates a `u64` (from unbounded `parse_cpu_millicores`) rather than
 saturating/erroring. A CPU request whose true `want_cpu_units` exceeds 2^32 wraps

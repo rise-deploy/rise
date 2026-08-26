@@ -561,7 +561,10 @@ impl EcsReconciler {
             }
             // The service is gone; its secrets would otherwise outlive it in
             // Parameter Store forever.
-            if let Err(e) = self.delete_secrets_for(tags).await {
+            if let Err(e) = self
+                .delete_secrets_for(&tags.project, &tags.deployment_group, &tags.deployment_id)
+                .await
+            {
                 warn!(service = %name, "Failed to delete the orphan's secrets: {:?}", e);
             }
         }
@@ -1288,6 +1291,8 @@ impl EcsReconciler {
                         desired_count: svc.desired_count(),
                         running_count: svc.running_count(),
                         deployment_id: None,
+                        project: String::new(),
+                        deployment_group: String::new(),
                         rollout_started_at: primary_rollout_start(svc),
                     });
                     continue;
@@ -1313,6 +1318,8 @@ impl EcsReconciler {
                         desired_count: svc.desired_count(),
                         running_count: svc.running_count(),
                         deployment_id: Some(parsed.deployment_id.clone()),
+                        project: parsed.project.clone(),
+                        deployment_group: parsed.deployment_group.clone(),
                         rollout_started_at: primary_rollout_start(svc),
                     },
                     tags: parsed,
@@ -1350,6 +1357,10 @@ impl EcsReconciler {
             .iter()
             .map(|a| (a.name.as_str(), a.arn.as_str()))
             .collect();
+        // A `Delete` retires a service; its secrets in SSM must go with it, and
+        // the path prefix is recovered from the service's own tags.
+        let actual_by_name: HashMap<&str, &ActualService> =
+            actual.iter().map(|a| (a.name.as_str(), a)).collect();
 
         let mut registered: HashMap<String, String> = HashMap::new();
         for action in actions {
@@ -1385,7 +1396,30 @@ impl EcsReconciler {
                     desired_count,
                     ..
                 } => self.scale_service(name, *desired_count).await,
-                ServiceAction::Delete { name } => self.delete_service(name).await,
+                ServiceAction::Delete { name } => {
+                    let deleted = self.delete_service(name).await;
+                    // Only once the service is actually gone: while it exists a
+                    // task can still restart and needs its parameters. Secret
+                    // cleanup is best-effort — a leftover costs nothing, whereas
+                    // failing the whole action would strand the service.
+                    if deleted.is_ok() {
+                        if let Some(a) = actual_by_name.get(name.as_str()) {
+                            if let Some(deployment_id) = a.deployment_id.as_deref() {
+                                if let Err(e) = self
+                                    .delete_secrets_for(
+                                        &a.project,
+                                        &a.deployment_group,
+                                        deployment_id,
+                                    )
+                                    .await
+                                {
+                                    warn!(service = %name, "Failed to delete a retired service's secrets: {:?}", e);
+                                }
+                            }
+                        }
+                    }
+                    deleted
+                }
             };
             if let Err(e) = result {
                 error!(action = ?action, "ECS action failed; will retry next tick: {:?}", e);
@@ -1476,12 +1510,17 @@ impl EcsReconciler {
     /// subtree if the prefix is ever computed wrong. Leftovers are harmless
     /// (they cost nothing on the Standard tier) whereas over-deleting breaks a
     /// live deployment.
-    async fn delete_secrets_for(&self, tags: &ServiceTags) -> Result<()> {
+    async fn delete_secrets_for(
+        &self,
+        project: &str,
+        deployment_group: &str,
+        deployment_id: &str,
+    ) -> Result<()> {
         let prefix = ssm::deployment_path_prefix(
             &self.config.ssm_parameter_prefix,
-            &tags.project,
-            &tags.deployment_group,
-            &tags.deployment_id,
+            project,
+            deployment_group,
+            deployment_id,
         );
         // Paginated: GetParametersByPath returns 10 per page by default, so a
         // deployment with more secrets than that would leave the rest behind.
@@ -2118,21 +2157,34 @@ impl EcsReconciler {
     /// Every task is returned, both revisions' during a roll: the caller needs
     /// the incoming revision to judge readiness and the outgoing one to know
     /// whether anything is still serving.
+    ///
+    /// Both desired states are listed. `ListTasks` defaults to
+    /// `desiredStatus=RUNNING`, but the moment ECS starts draining the outgoing
+    /// revision it flips those tasks to `desiredStatus=STOPPED` — while they are
+    /// still `lastStatus=RUNNING` and still serving every request until the
+    /// incoming revision is up. Listing only RUNNING-desired tasks would drop
+    /// them, so the caller would conclude "nothing is serving" during the very
+    /// window the drain protects, and flap a healthy in-place roll to Unhealthy.
     async fn describe_service_tasks(&self, service_name: &str) -> Vec<TaskView> {
-        let listed = self
-            .ecs
-            .list_tasks()
-            .cluster(&self.config.cluster)
-            .service_name(service_name)
-            .send()
-            .await;
-        let arns: Vec<String> = match listed {
-            Ok(out) => out.task_arns().to_vec(),
-            Err(e) => {
-                debug!(service = %service_name, "ListTasks failed: {}", aws_error_detail(&e));
-                return Vec::new();
+        use aws_sdk_ecs::types::DesiredStatus;
+
+        let mut arns: Vec<String> = Vec::new();
+        for desired_status in [DesiredStatus::Running, DesiredStatus::Stopped] {
+            match self
+                .ecs
+                .list_tasks()
+                .cluster(&self.config.cluster)
+                .service_name(service_name)
+                .desired_status(desired_status.clone())
+                .send()
+                .await
+            {
+                Ok(out) => arns.extend(out.task_arns().iter().cloned()),
+                Err(e) => {
+                    debug!(service = %service_name, ?desired_status, "ListTasks failed: {}", aws_error_detail(&e));
+                }
             }
-        };
+        }
         if arns.is_empty() {
             return Vec::new();
         }
@@ -2219,18 +2271,13 @@ impl EcsReconciler {
                 // The retired deployment's secrets go with it, so a later
                 // rollback re-creates them from the database rather than reading
                 // a stale value.
-                let tags = ServiceTags {
-                    project: project.name.clone(),
-                    deployment_group: previous.deployment_group.clone(),
-                    deployment_id: previous.deployment_id.clone(),
-                    deployment_uuid: previous.id.to_string(),
-                    container: String::new(),
-                    environment: None,
-                    env_hash: String::new(),
-                    image: String::new(),
-                    route_hash: String::new(),
-                };
-                let _ = self.delete_secrets_for(&tags).await;
+                let _ = self
+                    .delete_secrets_for(
+                        &project.name,
+                        &previous.deployment_group,
+                        &previous.deployment_id,
+                    )
+                    .await;
             }
         }
 
@@ -2382,6 +2429,8 @@ mod tests {
                 desired_count: 1,
                 running_count: 1,
                 deployment_id: Some(deployment_id.to_string()),
+                project: project.to_string(),
+                deployment_group: "main".to_string(),
                 rollout_started_at: None,
             },
             tags: crate::tags::ServiceTags {
