@@ -11,6 +11,19 @@ variable "ingress_domain" {
   type        = string
 }
 
+variable "control_plane_host" {
+  description = <<-EOT
+    Hostname Rise itself answers on. Null keeps `rise.<ingress_domain>`.
+
+    Set it to `ingress_domain` to serve Rise at the apex, with projects on the
+    labels below it. Anything at or under `ingress_domain` is reachable without
+    further DNS or certificate work: the module already points both the apex and
+    the wildcard at the load balancer.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "ingress_scheme" {
   description = "http or https. Drives PUBLIC_URL, cookie security and the URLs Rise hands out."
   type        = string

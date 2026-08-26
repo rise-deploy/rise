@@ -262,6 +262,31 @@ variable "ingress_domain" {
   }
 }
 
+variable "control_plane_host" {
+  description = <<-EOT
+    Hostname Rise itself answers on. Null gives `rise.<ingress_domain>`.
+
+    Set it to the same value as `ingress_domain` to serve Rise at the apex, with
+    each project on a label below it — `apps.example.com` for Rise and
+    `<project>.apps.example.com` for projects. No extra DNS or certificate work:
+    the apex and the wildcard both already point at the load balancer.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    # Both operands must tolerate null: a validation's `||` evaluates each side
+    # rather than short-circuiting, so a null guard on the left does not spare
+    # the right. Defaulting to `ingress_domain` makes the unset case pass by the
+    # same rule the apex does.
+    condition = (
+      coalesce(var.control_plane_host, var.ingress_domain) == var.ingress_domain ||
+      endswith(coalesce(var.control_plane_host, var.ingress_domain), ".${var.ingress_domain}")
+    )
+    error_message = "control_plane_host must be ingress_domain itself or a name under it; anything else is covered by neither the DNS records nor the wildcard certificate this module provisions."
+  }
+}
+
 variable "edge_mode" {
   description = <<-EOT
     - "nlb-traefik-acme": NLB in TCP passthrough, Traefik terminates TLS with

@@ -121,6 +121,48 @@ run "the_control_plane_carries_the_label_its_own_traefik_constrains_on" {
   }
 }
 
+run "the_control_plane_answers_on_a_subdomain_by_default" {
+  command = plan
+
+  assert {
+    condition     = module.control_plane_env.docker_labels["traefik.http.routers.rise-cp.rule"] == "Host(`rise.rise.example.com`)"
+    error_message = "the default control-plane host changed"
+  }
+
+  assert {
+    condition     = module.control_plane_env.public_url == "https://rise.rise.example.com"
+    error_message = "public_url must name the host the router matches, or login redirects land nowhere"
+  }
+}
+
+# The layout an internal platform tends to want: Rise on the domain itself,
+# projects on the labels below it.
+run "the_control_plane_can_answer_at_the_apex" {
+  command = plan
+
+  variables {
+    ingress_domain     = "apps.platform.internal"
+    control_plane_host = "apps.platform.internal"
+  }
+
+  assert {
+    condition     = module.control_plane_env.docker_labels["traefik.http.routers.rise-cp.rule"] == "Host(`apps.platform.internal`)"
+    error_message = "the control plane does not answer at the apex"
+  }
+
+  assert {
+    condition     = module.control_plane_env.public_url == "https://apps.platform.internal"
+    error_message = "public_url still names a subdomain the router does not match"
+  }
+
+  # A project's router must remain distinct from the control plane's, or the
+  # two collide on one host and whichever Traefik sorts first wins.
+  assert {
+    condition     = module.control_plane_env.docker_labels["traefik.http.routers.rise-cp.rule"] != "Host(`myapp.apps.platform.internal`)"
+    error_message = "the control plane would swallow a project hostname"
+  }
+}
+
 run "traefik_discovery_can_be_confined_to_one_install" {
   command = plan
 

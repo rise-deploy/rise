@@ -63,7 +63,8 @@ locals {
   acme_enabled       = var.edge_mode == "nlb-traefik-acme"
   traefik_entrypoint = local.acme_enabled ? "websecure" : "web"
   ingress_scheme     = "https"
-  public_url         = "https://rise.${var.ingress_domain}"
+  control_plane_host = coalesce(var.control_plane_host, "rise.${var.ingress_domain}")
+  public_url         = "${local.ingress_scheme}://${local.control_plane_host}"
 
   # --- Database -------------------------------------------------------------
   create_database = var.database_url_secret_arn == null
@@ -89,10 +90,11 @@ locals {
 module "control_plane_env" {
   source = "./modules/control-plane-env"
 
-  ingress_domain = var.ingress_domain
-  ingress_scheme = local.ingress_scheme
-  region         = local.region
-  admin_email    = var.admin_email
+  ingress_domain     = var.ingress_domain
+  control_plane_host = local.control_plane_host
+  ingress_scheme     = local.ingress_scheme
+  region             = local.region
+  admin_email        = var.admin_email
 
   cluster_name           = local.cluster_name
   subnet_ids             = local.private_subnet_ids

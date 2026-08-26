@@ -1,5 +1,6 @@
 locals {
-  public_url = "${var.ingress_scheme}://rise.${var.ingress_domain}"
+  control_plane_host = coalesce(var.control_plane_host, "rise.${var.ingress_domain}")
+  public_url         = "${var.ingress_scheme}://${local.control_plane_host}"
 
   environment = merge(
     {
@@ -79,7 +80,7 @@ locals {
     "${var.label_namespace}/controller-class" = var.controller_class_name
 
     "traefik.enable"                                         = "true"
-    "traefik.http.routers.rise-cp.rule"                      = "Host(`rise.${var.ingress_domain}`)"
+    "traefik.http.routers.rise-cp.rule"                      = "Host(`${local.control_plane_host}`)"
     "traefik.http.routers.rise-cp.entrypoints"               = var.traefik_entrypoint
     "traefik.http.routers.rise-cp.service"                   = "rise-cp"
     "traefik.http.services.rise-cp.loadbalancer.server.port" = "3000"

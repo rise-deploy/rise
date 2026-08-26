@@ -87,6 +87,41 @@ Either can be brought independently. Brought subnets are checked against the VPC
 you named and a brought cluster is checked for `ACTIVE`, so a mismatch surfaces
 in `terraform plan` rather than several minutes into an apply.
 
+## Where Rise itself answers
+
+By default Rise answers on `rise.<ingress_domain>` and each project on
+`<project>.<ingress_domain>`. `control_plane_host` moves the control plane,
+most usefully onto the domain itself:
+
+```hcl
+module "rise_ecs" {
+  # …
+  ingress_domain     = "apps.platform.internal"
+  control_plane_host = "apps.platform.internal"
+}
+```
+
+which gives:
+
+| Host | Serves |
+|---|---|
+| `apps.platform.internal` | Rise — the API and web UI |
+| `<project>.apps.platform.internal` | that project |
+
+No extra DNS or certificate work: the module already points both the apex and
+the wildcard at the load balancer, and `dns_records_required` lists what to
+create when you manage DNS yourself. `control_plane_host` must be
+`ingress_domain` or a name under it — anything else is covered by neither of
+those records, and the plan refuses it rather than producing an install whose
+console is unreachable.
+
+Two things worth knowing before choosing the apex. A project can never collide
+with Rise, since projects only ever occupy a label *below* the domain. And this
+is unrelated to the Cloud Map namespace: that is internal service discovery
+between the control plane, Traefik and the database, and nothing addresses a
+project through it — so an existing namespace like `platform.internal` is
+passed as `cloud_map_namespace_id` and left alone.
+
 ## Several installs in one cluster
 
 Supported, and it takes two settings rather than one. Give each install its own
