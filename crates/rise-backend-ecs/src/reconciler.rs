@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::{
     build_controller_metadata, effective_health_path, hash_env, merge_container_env,
     pin_system_env, redact_secrets_for_hash, resolve_deployment_env_vars,
@@ -112,12 +112,26 @@ struct ClusterServices {
 impl ClusterServices {
     /// The services tagged as belonging to `project`.
     ///
-    /// Matching on the tag rather than the name because the name is truncated
-    /// and hashed for long projects, so it does not round-trip.
-    fn for_project(&self, project: &str) -> Vec<ActualService> {
+    /// Matches on the project's UUID tag when a service carries one, falling
+    /// back to the project name only for services tagged before that field
+    /// existed. The name is mutable -- a rename leaves already-running
+    /// services tagged with the old one -- so matching on it alone would make
+    /// every renamed project's live services invisible to this projection: the
+    /// reconciler would see no actual state, create a fresh set under the new
+    /// name, and orphan the old one until it happened to go terminal some other
+    /// way. The UUID tag is immutable for the project's lifetime, so it
+    /// survives the rename.
+    fn for_project(&self, project: &Project) -> Vec<ActualService> {
+        let project_uuid = project.id.to_string();
         self.services
             .iter()
-            .filter(|m| m.tags.project == project)
+            .filter(|m| {
+                if m.tags.project_uuid.is_empty() {
+                    m.tags.project == project.name
+                } else {
+                    m.tags.project_uuid == project_uuid
+                }
+            })
             .map(|m| m.service.clone())
             .collect()
     }
@@ -661,15 +675,30 @@ impl EcsReconciler {
         cluster: &ClusterServices,
         election: &LeaderElection,
     ) -> Result<()> {
-        let mut actual = cluster.for_project(&project.name);
+        let mut actual = cluster.for_project(project);
 
-        // 1. Status transitions, isolated per deployment.
+        // 1. Status transitions, isolated per deployment. A `Terminating`
+        // deployment completes immediately here; its services are retired by
+        // the diff on the next tick (`should_have_infrastructure` keeps them
+        // in the desired set while still Terminating, dropped once terminal).
+        // That ordering means the project-deletion controller (5s poll,
+        // against this loop's 30s) can delete the project row before the
+        // services are gone, putting them out of reach of every future
+        // per-project pass -- waiting here cannot fix it, since the very diff
+        // that removes them will not run until this transition happens. The
+        // cluster-wide orphan sweep is what closes it.
         let non_terminal = self
             .store
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         for deployment in &non_terminal {
-            if let Err(e) = self.perform_status_transition(project, deployment).await {
+            if let Err(e) = rise_backend_core::lifecycle::perform_status_transition(
+                self.store.as_ref(),
+                project,
+                deployment,
+            )
+            .await
+            {
                 warn!(
                     deployment = %deployment.deployment_id,
                     "Status transition failed: {:?}", e
@@ -813,134 +842,6 @@ impl EcsReconciler {
                 );
             }
         }
-        Ok(())
-    }
-
-    /// Drive the time- and state-based transitions that do not depend on the
-    /// runtime: timeouts, expiry, cancellation and termination completion.
-    /// Identical in shape and thresholds to the Docker backend so a deployment's
-    /// lifecycle reads the same on every backend.
-    async fn perform_status_transition(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        use rise_backend_core::{DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES};
-        let now = chrono::Utc::now();
-
-        match deployment.status {
-            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing
-                if now - deployment.created_at
-                    > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES) =>
-            {
-                self.store
-                    .mark_deployment_failed(
-                        deployment.id,
-                        "Deployment timed out before the image was pushed — the CLI was \
-                         most likely interrupted during build or push.",
-                    )
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Cancelling => {
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Terminating => {
-                // Complete immediately. The services are retired by the diff on
-                // the next tick -- `should_have_infrastructure` keeps them in
-                // the desired set while the deployment is still Terminating, so
-                // they are only dropped once it reaches a terminal status.
-                //
-                // That ordering means the project-deletion controller (5s poll,
-                // against this loop's 30s) can delete the project row before the
-                // services are gone, putting them out of reach of every future
-                // per-project pass. Waiting here cannot fix it: the very diff
-                // that removes them will not run until this transition happens.
-                // The cluster-wide sweep is what closes it.
-                self.complete_termination(project, deployment).await?;
-            }
-            DeploymentStatus::Pushed => {
-                self.store
-                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Deploying => {
-                if let Some(started) = deployment.deploying_started_at {
-                    if now - started > chrono::Duration::minutes(DEPLOYING_TIMEOUT_MINUTES) {
-                        self.store
-                            .mark_deployment_failed(
-                                deployment.id,
-                                &format!(
-                                    "Deployment timed out after {} seconds in Deploying state",
-                                    DEPLOYING_TIMEOUT_MINUTES * 60
-                                ),
-                            )
-                            .await?;
-                        self.store
-                            .update_project_calculated_status(project.id)
-                            .await?;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        if let Some(expires_at) = deployment.expires_at {
-            if expires_at <= now
-                && !matches!(
-                    deployment.status,
-                    DeploymentStatus::Terminating | DeploymentStatus::Cancelling
-                )
-            {
-                self.store
-                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn complete_termination(&self, project: &Project, deployment: &Deployment) -> Result<()> {
-        match deployment.termination_reason {
-            Some(TerminationReason::Superseded) => {
-                self.store.mark_deployment_superseded(deployment.id).await?;
-            }
-            Some(TerminationReason::UserStopped) => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-            Some(TerminationReason::Expired) => {
-                self.store.mark_deployment_expired(deployment.id).await?;
-            }
-            Some(TerminationReason::Failed) => {
-                let message = deployment
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "Deployment failed".to_string());
-                self.store
-                    .mark_deployment_failed(deployment.id, &message)
-                    .await?;
-            }
-            Some(TerminationReason::Cancelled) => {
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-            }
-            None => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-        }
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
         Ok(())
     }
 
@@ -1158,6 +1059,7 @@ impl EcsReconciler {
 
         let mut desired_container = DesiredContainer {
             project: project.name.clone(),
+            project_uuid: project.id.to_string(),
             access_class: project.access_class.clone(),
             deployment_group: deployment.deployment_group.clone(),
             deployment_id: deployment.deployment_id.clone(),
@@ -1267,6 +1169,7 @@ impl EcsReconciler {
             desired_count: replica_count as i32,
             tags: ServiceTags {
                 project: project.name.clone(),
+                project_uuid: project.id.to_string(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
                 deployment_uuid: deployment.id.to_string(),
@@ -2039,9 +1942,14 @@ impl EcsReconciler {
                 &route_specs,
                 &primary_hosts,
             );
-            let server_status = self
-                .fetch_server_status_aggregated(&service_names, server_status_cache)
-                .await;
+            let server_status = match self.traefik_api.as_ref() {
+                Some(client) => {
+                    client
+                        .aggregated_server_status(&service_names, server_status_cache)
+                        .await
+                }
+                None => None,
+            };
 
             if has_health_path && self.traefik_api.is_none() {
                 warn!(
@@ -2199,8 +2107,13 @@ impl EcsReconciler {
 
         match deployment.status {
             DeploymentStatus::Deploying if all_ready => {
-                self.handle_deployment_became_healthy(project, deployment)
-                    .await?;
+                rise_backend_core::lifecycle::handle_deployment_became_healthy(
+                    self.store.as_ref(),
+                    Some(self),
+                    project,
+                    deployment,
+                )
+                .await?;
             }
             DeploymentStatus::Healthy if !all_ready && rolling_but_serving => {
                 debug!(
@@ -2226,37 +2139,6 @@ impl EcsReconciler {
             _ => {}
         }
         Ok(())
-    }
-
-    /// Merge `serverStatus` across a container's route services with OR
-    /// semantics: the per-route Traefik services share the same backing servers,
-    /// so a server is UP if any of them reports it UP.
-    async fn fetch_server_status_aggregated(
-        &self,
-        service_names: &[String],
-        cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
-    ) -> Option<HashMap<String, bool>> {
-        let client = self.traefik_api.as_ref()?;
-        let mut merged: HashMap<String, bool> = HashMap::new();
-        let mut any = false;
-        for name in service_names {
-            let status = match cache.get(name) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fetched = client.server_status(name).await;
-                    cache.insert(name.clone(), fetched.clone());
-                    fetched
-                }
-            };
-            if let Some(status) = status {
-                any = true;
-                for (server, up) in status {
-                    let entry = merged.entry(server).or_insert(false);
-                    *entry = *entry || up;
-                }
-            }
-        }
-        any.then_some(merged)
     }
 
     /// Describe a service's tasks, projecting each onto the backend-agnostic
@@ -2357,78 +2239,6 @@ impl EcsReconciler {
         views
     }
 
-    /// Mark this deployment active and supersede the outgoing one.
-    async fn handle_deployment_became_healthy(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        let previous_active = self
-            .store
-            .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
-            .await?;
-
-        self.store.mark_deployment_healthy(deployment.id).await?;
-
-        if let Some(previous) = previous_active {
-            if previous.id != deployment.id
-                && !rise_backend_core::state_machine::is_terminal(&previous.status)
-            {
-                self.store
-                    .mark_deployment_terminating(previous.id, TerminationReason::Superseded)
-                    .await?;
-                // The retired deployment's secrets go with it, so a later
-                // rollback re-creates them from the database rather than reading
-                // a stale value.
-                let _ = self
-                    .delete_secrets_for(
-                        &project.name,
-                        &previous.deployment_group,
-                        &previous.deployment_id,
-                    )
-                    .await;
-            }
-        }
-
-        // Any other still-active row in this group is a straggler; retire it too.
-        let siblings = self
-            .store
-            .find_non_terminal_deployments_for_project_and_group(
-                project.id,
-                &deployment.deployment_group,
-            )
-            .await?;
-        for other in siblings {
-            if other.id == deployment.id {
-                continue;
-            }
-            // On the status, not on `is_active`: the flag is set in the write
-            // just below this loop, so a replica that died between marking a
-            // deployment healthy and flagging it active leaves a sibling that
-            // is serving traffic and would never be retired.
-            if rise_backend_core::state_machine::is_active(&other.status)
-                && !rise_backend_core::state_machine::is_terminal(&other.status)
-            {
-                self.store
-                    .mark_deployment_terminating(other.id, TerminationReason::Superseded)
-                    .await?;
-            }
-        }
-
-        self.store
-            .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
-            .await?;
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
-        info!(
-            project = %project.name,
-            deployment = %deployment.deployment_id,
-            "Deployment is healthy and now active"
-        );
-        Ok(())
-    }
-
     fn traefik_render_config(&self) -> rise_backend_traefik::TraefikRenderConfig<'_> {
         rise_backend_traefik::TraefikRenderConfig {
             label_namespace: &self.config.label_namespace,
@@ -2441,6 +2251,20 @@ impl EcsReconciler {
             auth_backend_url: &self.config.auth_backend_url,
             access_classes: &self.config.access_classes,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl rise_backend_core::lifecycle::SupersededHook for EcsReconciler {
+    /// The retired deployment's SSM secrets go with it, so a later rollback
+    /// re-creates them from the database rather than reading a stale value.
+    async fn on_superseded(&self, project: &Project, superseded: &Deployment) -> Result<()> {
+        self.delete_secrets_for(
+            &project.name,
+            &superseded.deployment_group,
+            &superseded.deployment_id,
+        )
+        .await
     }
 }
 
@@ -2557,7 +2381,7 @@ mod tests {
 
     /// A cluster entry as `list_managed_services` would build it: the tags are
     /// the identity, the `ActualService` is what the diff sees.
-    fn managed(project: &str, deployment_id: &str) -> super::ManagedService {
+    fn managed(project: &str, project_uuid: &str, deployment_id: &str) -> super::ManagedService {
         super::ManagedService {
             service: crate::service::ActualService {
                 name: format!("rise-{project}-{deployment_id}-web"),
@@ -2574,6 +2398,7 @@ mod tests {
             },
             tags: crate::tags::ServiceTags {
                 project: project.to_string(),
+                project_uuid: project_uuid.to_string(),
                 deployment_group: "main".to_string(),
                 deployment_id: deployment_id.to_string(),
                 deployment_uuid: uuid::Uuid::nil().to_string(),
@@ -2586,22 +2411,45 @@ mod tests {
         }
     }
 
+    /// Minimal `Project` fixture for tests exercising project-scoped lookups.
+    fn project_fixture(name: &str, uuid: &str) -> Project {
+        let now = chrono::Utc::now();
+        Project {
+            id: Uuid::parse_str(uuid).unwrap(),
+            name: name.to_string(),
+            status: rise_backend_core::models::ProjectStatus::Running,
+            access_class: "public".to_string(),
+            owner_user_id: None,
+            owner_team_id: None,
+            finalizers: Vec::new(),
+            source_url: None,
+            template_id: None,
+            template_image: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     /// The tick reads the cluster once and projects per-project slices out of
     /// it. If the projection matched loosely -- on the service name, say --
     /// `rise-app` and `rise-app-staging` would leak into each other's diffs and
     /// each would try to delete the other's services.
+    const APP_UUID: &str = "11111111-1111-1111-1111-111111111111";
+    const STAGING_UUID: &str = "22222222-2222-2222-2222-222222222222";
+
     #[test]
     fn a_project_slice_holds_only_that_project_s_services() {
         let cluster = super::ClusterServices {
             services: vec![
-                managed("app", "d-1"),
-                managed("app-staging", "d-2"),
-                managed("app", "d-3"),
+                managed("app", APP_UUID, "d-1"),
+                managed("app-staging", STAGING_UUID, "d-2"),
+                managed("app", APP_UUID, "d-3"),
             ],
             unattributable: Vec::new(),
         };
 
-        let slice = cluster.for_project("app");
+        let app = project_fixture("app", APP_UUID);
+        let slice = cluster.for_project(&app);
         assert_eq!(slice.len(), 2);
         assert!(
             slice
@@ -2609,11 +2457,50 @@ mod tests {
                 .all(|s| s.deployment_id.as_deref() != Some("d-2")),
             "a different project's service must not appear in this project's slice"
         );
-        assert!(
-            cluster.for_project("app-stag").is_empty(),
-            "no prefix match"
+        assert!(cluster
+            .for_project(&project_fixture(
+                "nope",
+                "33333333-3333-3333-3333-333333333333"
+            ))
+            .is_empty());
+    }
+
+    /// After a rename, the project's ROW keeps its UUID -- only `name`
+    /// changes -- and the tag stamped on already-running services is the
+    /// UUID, not the name. The slice must still find them under the new name;
+    /// this is the specific bug in the projection matching services on
+    /// `project` (the mutable name) instead.
+    #[test]
+    fn a_project_slice_survives_a_rename() {
+        let cluster = super::ClusterServices {
+            services: vec![managed("old-name", APP_UUID, "d-1")],
+            unattributable: Vec::new(),
+        };
+
+        let renamed = project_fixture("new-name", APP_UUID);
+        let slice = cluster.for_project(&renamed);
+        assert_eq!(
+            slice.len(),
+            1,
+            "a service tagged under the pre-rename name must still be found by UUID"
         );
-        assert!(cluster.for_project("nope").is_empty());
+    }
+
+    /// A service created before the `project-uuid` tag existed has no such
+    /// tag; the projection must still find it by the name it does carry, or
+    /// every pre-upgrade service would look orphaned on the first tick after
+    /// upgrade.
+    #[test]
+    fn a_project_slice_falls_back_to_name_for_untagged_legacy_services() {
+        let mut legacy = managed("app", APP_UUID, "d-1");
+        legacy.tags.project_uuid = String::new();
+        let cluster = super::ClusterServices {
+            services: vec![legacy],
+            unattributable: Vec::new(),
+        };
+
+        let app = project_fixture("app", APP_UUID);
+        assert_eq!(cluster.for_project(&app).len(), 1);
     }
 
     /// The three-way split exists because the two non-owning answers want

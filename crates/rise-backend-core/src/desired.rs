@@ -26,6 +26,12 @@ pub struct DesiredRoute {
 #[derive(Debug, Clone)]
 pub struct DesiredContainer {
     pub project: String,
+    /// The project's immutable identity, stamped alongside `project` so a
+    /// reconciler can recognise a workload after the project is renamed. The
+    /// project name is mutable and is not a safe matching key on its own: a
+    /// rename leaves previously-created workloads tagged with the old name,
+    /// invisible to any lookup keyed on the current one.
+    pub project_uuid: String,
     /// Name of the project's access class (looked up in
     /// [`BuilderConfig::access_classes`] to decide whether to stamp Traefik
     /// forwardAuth middleware labels).

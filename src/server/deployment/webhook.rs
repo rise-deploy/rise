@@ -21,7 +21,6 @@ use k8s_openapi::api::core::v1::{EnvVar, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::ByteString;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 
 use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
@@ -39,7 +38,7 @@ use rise_backend_auth::WorkloadSubjectInfo;
 // so existing `crate::server::deployment::webhook::*` callers stay unchanged.
 pub(crate) use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
-    ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
+    ResolvedDeploymentEnvVars,
 };
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
@@ -527,208 +526,40 @@ async fn perform_status_transitions(
     namespace_prefix: &str,
 ) -> anyhow::Result<()> {
     for deployment in non_terminal {
-        // Skip pre-infrastructure deployments — the CLI drives those transitions
+        // Timeouts, expiry, cancellation and termination completion — the
+        // part of the lifecycle that needs no runtime observation and is
+        // identical on every backend.
+        rise_backend_core::lifecycle::perform_status_transition(
+            state.deployment_store.as_ref(),
+            project,
+            deployment,
+        )
+        .await?;
+
+        // Deciding whether a deployment IS healthy needs the observed K8s
+        // Deployment/pod status, so it stays Kubernetes-specific and reads
+        // `deployment.status` as it was at the top of this iteration — a
+        // Pushed deployment the call above just moved to Deploying is
+        // checked on the *next* tick, not this one, matching every other
+        // backend's reconcile loop.
         if matches!(
             deployment.status,
-            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing
+            DeploymentStatus::Deploying | DeploymentStatus::Healthy | DeploymentStatus::Unhealthy
         ) {
-            // Check for pre-pushed timeout
-            check_pre_pushed_timeout(state, deployment).await?;
-            continue;
-        }
-
-        // Handle Cancelling — mark as Cancelled immediately.
-        // Any K8s resources created during Deploying will be garbage-collected by
-        // Metacontroller since `should_have_infrastructure` returns false for Cancelled.
-        if deployment.status == DeploymentStatus::Cancelling {
-            info!(
-                deployment_id = %deployment.deployment_id,
-                "Cancelling deployment — marking as Cancelled"
-            );
-            state
-                .deployment_store
-                .mark_deployment_cancelled(deployment.id)
-                .await?;
-            state
-                .deployment_store
-                .update_project_calculated_status(project.id)
-                .await?;
-            continue;
-        }
-
-        // Handle Terminating — mark as terminal based on reason
-        // (Metacontroller will delete the K8s Deployment since we won't return it)
-        if deployment.status == DeploymentStatus::Terminating {
-            complete_termination(state, deployment, project).await?;
-            continue;
-        }
-
-        // For Pushed/Deploying/Healthy/Unhealthy — check observed K8s Deployment
-        match deployment.status {
-            DeploymentStatus::Pushed => {
-                // Transition Pushed → Deploying
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment image pushed, transitioning to Deploying"
-                );
-                state
-                    .deployment_store
-                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
-                    .await?;
-                state
-                    .deployment_store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-
-            DeploymentStatus::Deploying => {
-                check_deploying_timeout(state, deployment, project).await?;
-                check_deployment_health_from_observed(
-                    state,
-                    deployment,
-                    project,
-                    observed,
-                    namespace_prefix,
-                )
-                .await?;
-            }
-
-            DeploymentStatus::Healthy | DeploymentStatus::Unhealthy => {
-                check_deployment_health_from_observed(
-                    state,
-                    deployment,
-                    project,
-                    observed,
-                    namespace_prefix,
-                )
-                .await?;
-            }
-
-            _ => {}
+            check_deployment_health_from_observed(
+                state,
+                deployment,
+                project,
+                observed,
+                namespace_prefix,
+            )
+            .await?;
         }
     }
-
-    // Check for expired deployments
-    check_expirations(state, non_terminal, project).await?;
 
     // Failed deployments don't need explicit cleanup: `should_have_infrastructure` returns
     // false for Failed status, so Metacontroller garbage-collects their K8s resources.
 
-    Ok(())
-}
-
-/// Check if a pre-pushed deployment has timed out
-async fn check_pre_pushed_timeout(state: &AppState, deployment: &Deployment) -> anyhow::Result<()> {
-    let elapsed = Utc::now().signed_duration_since(deployment.created_at);
-    if elapsed > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES) {
-        warn!(
-            deployment_id = %deployment.deployment_id,
-            "Deployment stuck in {} state for >{} minutes, marking as Failed",
-            deployment.status,
-            PRE_PUSHED_TIMEOUT_MINUTES
-        );
-        let error_msg = format!(
-            "Deployment timed out after {} minutes in {} state. \
-             This usually indicates the CLI was interrupted during build/push.",
-            PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
-        );
-        state
-            .deployment_store
-            .mark_deployment_failed(deployment.id, &error_msg)
-            .await?;
-        state
-            .deployment_store
-            .update_project_calculated_status(deployment.project_id)
-            .await?;
-    }
-    Ok(())
-}
-
-/// Check if a deploying deployment has timed out
-async fn check_deploying_timeout(
-    state: &AppState,
-    deployment: &Deployment,
-    project: &Project,
-) -> anyhow::Result<()> {
-    if let Some(deploying_started_at) = deployment.deploying_started_at {
-        let elapsed = Utc::now().signed_duration_since(deploying_started_at);
-        if elapsed > chrono::Duration::minutes(DEPLOYING_TIMEOUT_MINUTES) {
-            let error_msg = format!(
-                "Deployment timed out after {} seconds in Deploying state",
-                elapsed.num_seconds()
-            );
-            warn!(
-                deployment_id = %deployment.deployment_id,
-                "{}", error_msg
-            );
-            state
-                .deployment_store
-                .mark_deployment_failed(deployment.id, &error_msg)
-                .await?;
-            state
-                .deployment_store
-                .update_project_calculated_status(project.id)
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-/// Complete termination: move from Terminating to the appropriate terminal state.
-async fn complete_termination(
-    state: &AppState,
-    deployment: &Deployment,
-    project: &Project,
-) -> anyhow::Result<()> {
-    match deployment.termination_reason {
-        Some(TerminationReason::Superseded) => {
-            state
-                .deployment_store
-                .mark_deployment_superseded(deployment.id)
-                .await?;
-        }
-        Some(TerminationReason::UserStopped) => {
-            state
-                .deployment_store
-                .mark_deployment_stopped(deployment.id)
-                .await?;
-        }
-        Some(TerminationReason::Expired) => {
-            state
-                .deployment_store
-                .mark_deployment_expired(deployment.id)
-                .await?;
-        }
-        Some(TerminationReason::Failed) => {
-            state
-                .deployment_store
-                .mark_deployment_failed(
-                    deployment.id,
-                    deployment
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("Deployment failed"),
-                )
-                .await?;
-        }
-        Some(TerminationReason::Cancelled) => {
-            state
-                .deployment_store
-                .mark_deployment_cancelled(deployment.id)
-                .await?;
-        }
-        None => {
-            // Missing termination reason resolves to Stopped
-            state
-                .deployment_store
-                .mark_deployment_stopped(deployment.id)
-                .await?;
-        }
-    }
-    state
-        .deployment_store
-        .update_project_calculated_status(project.id)
-        .await?;
     Ok(())
 }
 
@@ -877,7 +708,13 @@ async fn check_deployment_health_from_observed(
                     ready_replicas,
                     desired_replicas
                 );
-                handle_deployment_became_healthy(state, deployment, project).await?;
+                rise_backend_core::lifecycle::handle_deployment_became_healthy(
+                    state.deployment_store.as_ref(),
+                    None,
+                    project,
+                    deployment,
+                )
+                .await?;
             }
         }
 
@@ -1220,110 +1057,6 @@ async fn check_pod_errors_via_kube(
     }
 }
 
-/// Handle a deployment becoming Healthy: mark active, supersede old deployments.
-async fn handle_deployment_became_healthy(
-    state: &AppState,
-    deployment: &Deployment,
-    project: &Project,
-) -> anyhow::Result<()> {
-    // Find currently active deployment in this group BEFORE marking new as Healthy
-    let active_in_group = state
-        .deployment_store
-        .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
-        .await?;
-
-    // Mark the new deployment as healthy
-    state
-        .deployment_store
-        .mark_deployment_healthy(deployment.id)
-        .await?;
-
-    // Supersede the old active deployment
-    if let Some(old_active) = active_in_group {
-        if old_active.id != deployment.id && !state_machine::is_terminal(&old_active.status) {
-            info!(
-                "Deployment {} replacing {} in group '{}', marking old as Terminating",
-                deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
-            );
-            state
-                .deployment_store
-                .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
-                .await?;
-        }
-    }
-
-    // Clean up other active (Healthy/Unhealthy) deployments in the group
-    let others = state
-        .deployment_store
-        .find_non_terminal_deployments_for_project_and_group(
-            project.id,
-            &deployment.deployment_group,
-        )
-        .await?;
-
-    for other in others {
-        if other.id != deployment.id
-            && state_machine::is_active(&other.status)
-            && !state_machine::is_terminal(&other.status)
-        {
-            info!(
-                "Cleaning up non-active deployment {} in group '{}', marking as Terminating",
-                other.deployment_id, deployment.deployment_group
-            );
-            state
-                .deployment_store
-                .mark_deployment_terminating(other.id, TerminationReason::Superseded)
-                .await?;
-        }
-    }
-
-    // Mark deployment as active
-    state
-        .deployment_store
-        .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
-        .await?;
-
-    state
-        .deployment_store
-        .update_project_calculated_status(project.id)
-        .await?;
-
-    Ok(())
-}
-
-/// Check for expired deployments
-async fn check_expirations(
-    state: &AppState,
-    non_terminal: &[&Deployment],
-    project: &Project,
-) -> anyhow::Result<()> {
-    let now = Utc::now();
-    for deployment in non_terminal {
-        if let Some(expires_at) = deployment.expires_at {
-            if now > expires_at
-                && !matches!(
-                    deployment.status,
-                    DeploymentStatus::Terminating | DeploymentStatus::Cancelling
-                )
-            {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment has expired, marking as Terminating"
-                );
-                state
-                    .deployment_store
-                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
-                    .await?;
-                state
-                    .deployment_store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-        }
-    }
-    Ok(())
-}
-
 // ── Compute desired children ───────────────────────────────────────────
 
 /// Compute the desired set of Kubernetes child resources for a project.
@@ -1518,11 +1251,14 @@ async fn compute_desired_children(
                 &namespace,
                 env_name.as_deref(),
                 &observed.secrets,
-                env_vars
-                    .secret_env_vars
-                    .into_iter()
-                    .map(|(k, v)| (k, ByteString(v)))
-                    .collect(),
+                DeploymentEnvSecretData {
+                    data: env_vars
+                        .secret_env_vars
+                        .into_iter()
+                        .map(|(k, v)| (k, ByteString(v)))
+                        .collect(),
+                    fingerprints: env_vars.secret_fingerprints,
+                },
             ))
         };
 
@@ -2281,25 +2017,6 @@ async fn prepare_identity_secret(
     })
 }
 
-fn hash_deployment_env_secret(data: &BTreeMap<String, ByteString>) -> String {
-    let mut hasher = Sha256::new();
-
-    for (key, value) in data {
-        let key_len = key.len() as u64;
-        let value_len = value.0.len() as u64;
-        hasher.update(key_len.to_le_bytes());
-        hasher.update(key.as_bytes());
-        hasher.update(value_len.to_le_bytes());
-        hasher.update(&value.0);
-    }
-
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn observed_secret_matches_hash(
     observed_secrets: &HashMap<String, serde_json::Value>,
     namespace: &str,
@@ -2316,6 +2033,13 @@ fn observed_secret_matches_hash(
         == Some(expected_hash)
 }
 
+/// A deployment's env Secret payload, alongside the fingerprints (never the
+/// plaintext) the drift-detection hash is derived from.
+struct DeploymentEnvSecretData {
+    data: BTreeMap<String, ByteString>,
+    fingerprints: BTreeMap<String, String>,
+}
+
 fn prepare_deployment_env_secret(
     resource_builder: &ResourceBuilder,
     project: &Project,
@@ -2323,16 +2047,24 @@ fn prepare_deployment_env_secret(
     namespace: &str,
     environment_name: Option<&str>,
     observed_secrets: &HashMap<String, serde_json::Value>,
-    data: BTreeMap<String, ByteString>,
+    secret_data: DeploymentEnvSecretData,
 ) -> PreparedDeploymentEnvSecret {
-    let secret_hash = hash_deployment_env_secret(&data);
+    // Hashed from each secret's fingerprint, never its plaintext: this digest
+    // is stamped as a pod annotation, readable with only `get pods` — a much
+    // weaker grant than `get secrets`. A fingerprint is unpredictable without
+    // the encryption key, so the annotation can't be turned into an offline
+    // guessing oracle the way a hash of the plaintext would be. It still
+    // changes exactly when a secret is rewritten, which is the property the
+    // hash exists for. See `rise_backend_core::runtime::secret_fingerprint`.
+    let secret_hash =
+        rise_backend_core::env::hash_env(&secret_data.fingerprints.into_iter().collect::<Vec<_>>());
     let secret = resource_builder.create_deployment_env_secret(
         project,
         deployment,
         namespace,
         environment_name,
         &secret_hash,
-        data,
+        secret_data.data,
     );
     let secret_name = secret
         .metadata
@@ -2741,25 +2473,90 @@ mod tests {
     }
 
     #[test]
-    fn deployment_env_secret_hash_is_stable_for_identical_data() {
+    fn deployment_env_secret_hash_is_stable_for_identical_fingerprints() {
+        let mut fp_a = BTreeMap::new();
+        fp_a.insert("API_KEY".to_string(), "fp-1".to_string());
+        fp_a.insert("SESSION_SECRET".to_string(), "fp-2".to_string());
+
+        let mut fp_b = BTreeMap::new();
+        fp_b.insert("SESSION_SECRET".to_string(), "fp-2".to_string());
+        fp_b.insert("API_KEY".to_string(), "fp-1".to_string());
+
+        let hash = |fps: &BTreeMap<String, String>| {
+            rise_backend_core::env::hash_env(
+                &fps.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(hash(&fp_a), hash(&fp_b));
+    }
+
+    #[test]
+    fn deployment_env_secret_hash_tracks_the_fingerprint_not_the_plaintext() {
+        // The Secret's stored plaintext must not drive the annotation hash:
+        // two different values under the same fingerprint hash identically...
+        let builder = test_resource_builder();
+        let project = test_project();
+        let deployment = test_deployment(DeploymentStatus::Deploying);
+
+        let mut fingerprints = BTreeMap::new();
+        fingerprints.insert("API_KEY".to_string(), "fp-1".to_string());
+
         let mut data_a = BTreeMap::new();
         data_a.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
-        data_a.insert(
-            "SESSION_SECRET".to_string(),
-            ByteString(b"secret-b".to_vec()),
-        );
-
         let mut data_b = BTreeMap::new();
         data_b.insert(
-            "SESSION_SECRET".to_string(),
-            ByteString(b"secret-b".to_vec()),
+            "API_KEY".to_string(),
+            ByteString(b"totally-different".to_vec()),
         );
-        data_b.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
 
-        assert_eq!(
-            hash_deployment_env_secret(&data_a),
-            hash_deployment_env_secret(&data_b)
+        let prepared_a = prepare_deployment_env_secret(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            None,
+            &HashMap::new(),
+            DeploymentEnvSecretData {
+                data: data_a,
+                fingerprints: fingerprints.clone(),
+            },
         );
+        let prepared_b = prepare_deployment_env_secret(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            None,
+            &HashMap::new(),
+            DeploymentEnvSecretData {
+                data: data_b,
+                fingerprints: fingerprints.clone(),
+            },
+        );
+        assert_eq!(prepared_a.secret_hash, prepared_b.secret_hash);
+
+        // ...and the same plaintext hashes differently once its fingerprint
+        // changes (a rewrite), which is the drift signal the hash exists for.
+        let mut data_c = BTreeMap::new();
+        data_c.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
+        let mut other_fingerprint = BTreeMap::new();
+        other_fingerprint.insert("API_KEY".to_string(), "fp-2".to_string());
+        let prepared_c = prepare_deployment_env_secret(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            None,
+            &HashMap::new(),
+            DeploymentEnvSecretData {
+                data: data_c,
+                fingerprints: other_fingerprint,
+            },
+        );
+        assert_ne!(prepared_a.secret_hash, prepared_c.secret_hash);
     }
 
     #[test]
@@ -2769,6 +2566,8 @@ mod tests {
         let deployment = test_deployment(DeploymentStatus::Deploying);
         let mut data = BTreeMap::new();
         data.insert("API_KEY".to_string(), ByteString(b"secret-a".to_vec()));
+        let mut fingerprints = BTreeMap::new();
+        fingerprints.insert("API_KEY".to_string(), "fp-1".to_string());
 
         let prepared = prepare_deployment_env_secret(
             &builder,
@@ -2777,7 +2576,10 @@ mod tests {
             "demo",
             None,
             &HashMap::new(),
-            data.clone(),
+            DeploymentEnvSecretData {
+                data: data.clone(),
+                fingerprints: fingerprints.clone(),
+            },
         );
 
         assert!(!prepared.is_ready);
@@ -2801,7 +2603,7 @@ mod tests {
             "demo",
             None,
             &observed_secrets,
-            data,
+            DeploymentEnvSecretData { data, fingerprints },
         );
 
         assert!(prepared_ready.is_ready);

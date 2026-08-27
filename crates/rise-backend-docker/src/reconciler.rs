@@ -37,13 +37,11 @@ use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use super::pod_status::build_controller_metadata;
 use super::rolling::filter_rolling_actions;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
-use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::rise_system_env_vars;
 use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
-    DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
-use rise_backend_core::state_machine;
 use rise_backend_core::DeploymentUrlBuilder;
 use rise_backend_core::EncryptionProvider;
 use rise_backend_core::RegistryProvider;
@@ -514,11 +512,19 @@ impl DockerReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
 
-        // 1. Status transitions (port of webhook::perform_status_transitions).
-        // Isolate per-deployment so one transient DB-write error can't abort the
-        // whole project tick — matching the desired-compute and health loops.
+        // 1. Status transitions. Isolate per-deployment so one transient
+        // DB-write error can't abort the whole project tick — matching the
+        // desired-compute and health loops. A deployment this moves to a
+        // terminal status needs no separate container cleanup here: it drops
+        // out of the desired set and is GC'd by the next diff pass.
         for deployment in &non_terminal {
-            if let Err(e) = self.perform_status_transition(project, deployment).await {
+            if let Err(e) = rise_backend_core::lifecycle::perform_status_transition(
+                self.store.as_ref(),
+                project,
+                deployment,
+            )
+            .await
+            {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     "Status transition failed: {:?}", e
@@ -652,140 +658,6 @@ impl DockerReconciler {
             }
         }
 
-        Ok(())
-    }
-
-    // ── Status transitions ─────────────────────────────────────────────
-
-    async fn perform_status_transition(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        match deployment.status {
-            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing => {
-                // The CLI drives these; only time them out.
-                let elapsed = Utc::now().signed_duration_since(deployment.created_at);
-                if elapsed > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES) {
-                    let msg = format!(
-                        "Deployment timed out after {} minutes in {} state. \
-                         This usually indicates the CLI was interrupted during build/push.",
-                        PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
-                    );
-                    warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                    self.store
-                        .mark_deployment_failed(deployment.id, &msg)
-                        .await?;
-                    self.store
-                        .update_project_calculated_status(project.id)
-                        .await?;
-                }
-            }
-            DeploymentStatus::Cancelling => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Cancelling deployment — marking as Cancelled"
-                );
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Terminating => {
-                self.complete_termination(project, deployment).await?;
-            }
-            DeploymentStatus::Pushed => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment image pushed, transitioning to Deploying"
-                );
-                self.store
-                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Deploying => {
-                if let Some(started) = deployment.deploying_started_at {
-                    let elapsed = Utc::now().signed_duration_since(started);
-                    if elapsed > chrono::Duration::minutes(DEPLOYING_TIMEOUT_MINUTES) {
-                        let msg = format!(
-                            "Deployment timed out after {} seconds in Deploying state",
-                            elapsed.num_seconds()
-                        );
-                        warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                        self.store
-                            .mark_deployment_failed(deployment.id, &msg)
-                            .await?;
-                        self.store
-                            .update_project_calculated_status(project.id)
-                            .await?;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Expiration applies to every non-terminal deployment.
-        if let Some(expires_at) = deployment.expires_at {
-            if Utc::now() > expires_at
-                && !matches!(
-                    deployment.status,
-                    DeploymentStatus::Terminating | DeploymentStatus::Cancelling
-                )
-            {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment has expired, marking as Terminating"
-                );
-                self.store
-                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Port of `webhook::complete_termination`.
-    async fn complete_termination(&self, project: &Project, deployment: &Deployment) -> Result<()> {
-        match deployment.termination_reason {
-            Some(TerminationReason::Superseded) => {
-                self.store.mark_deployment_superseded(deployment.id).await?;
-            }
-            Some(TerminationReason::UserStopped) => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-            Some(TerminationReason::Expired) => {
-                self.store.mark_deployment_expired(deployment.id).await?;
-            }
-            Some(TerminationReason::Failed) => {
-                self.store
-                    .mark_deployment_failed(
-                        deployment.id,
-                        deployment
-                            .error_message
-                            .as_deref()
-                            .unwrap_or("Deployment failed"),
-                    )
-                    .await?;
-            }
-            Some(TerminationReason::Cancelled) => {
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-            }
-            None => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-        }
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
-        // The container itself is GC'd on the next diff pass (no longer in the
-        // desired set once the deployment is terminal).
         Ok(())
     }
 
@@ -1007,6 +879,7 @@ impl DockerReconciler {
             // (which never depends on the replica) is computed once below.
             let mut base = DesiredContainer {
                 project: project.name.clone(),
+                project_uuid: project.id.to_string(),
                 access_class: project.access_class.clone(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
@@ -1073,20 +946,23 @@ impl DockerReconciler {
 
     // ── Actual containers + diff application ────────────────────────────
 
-    async fn list_actual_containers(&self, project: &Project) -> Result<Vec<ActualContainer>> {
+    /// List this controller's containers carrying one extra label filter (a
+    /// `key=value` string), scoped to `managed-by=rise` and the configured
+    /// controller-class. Without the controller-class filter the GC pass
+    /// could remove containers another Rise controller owns on the same host.
+    ///
+    /// NOTE: containers carry the controller-class they were created under as
+    /// a label. Renaming an Organization's `deploymentControllerClass` (or
+    /// this controller's configured class) leaves previously-created
+    /// containers under the old class invisible to this filter — they are
+    /// neither reconciled nor GC'd and must be cleaned up manually.
+    async fn list_managed_containers(
+        &self,
+        extra_label_filter: String,
+    ) -> Result<Vec<ActualContainer>> {
         use bollard::container::ListContainersOptions;
         let ns = &self.config.label_namespace;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        // Scope the listing to *this* controller's containers: managed-by=rise,
-        // the configured controller-class, and this project. Without the
-        // controller-class filter the GC pass could remove containers another
-        // Rise controller owns on the same host.
-        //
-        // NOTE: containers carry the controller-class they were created under as
-        // a label. Renaming an Organization's `deploymentControllerClass` (or
-        // this controller's configured class) leaves previously-created
-        // containers under the old class invisible to this filter — they are
-        // neither reconciled nor GC'd and must be cleaned up manually.
         filters.insert(
             "label".to_string(),
             vec![
@@ -1096,11 +972,7 @@ impl DockerReconciler {
                     labels::ns_key(ns, labels::SUFFIX_CONTROLLER_CLASS),
                     self.config.controller_class
                 ),
-                format!(
-                    "{}={}",
-                    labels::ns_key(ns, labels::SUFFIX_PROJECT),
-                    project.name
-                ),
+                extra_label_filter,
             ],
         );
         let summaries = self
@@ -1162,6 +1034,46 @@ impl DockerReconciler {
                 })
             })
             .collect())
+    }
+
+    /// Actual containers belonging to `project`.
+    ///
+    /// Queries by the project's UUID label — immutable, so it survives a
+    /// rename — and, for containers created before that label existed, falls
+    /// back to a second query by name. Without the fallback, a legacy
+    /// container that has never been recreated since upgrade would be
+    /// invisible to the UUID query and (if the project were then renamed)
+    /// would also miss a name-only query, leaving a fresh set created
+    /// alongside it and the original running forever unreconciled — the
+    /// bug this two-query scheme exists to close. The two result sets are
+    /// deduped by container id, since a container created after this
+    /// controller was upgraded carries both labels and would otherwise
+    /// appear from either query.
+    async fn list_actual_containers(&self, project: &Project) -> Result<Vec<ActualContainer>> {
+        let ns = &self.config.label_namespace;
+        let by_uuid = self
+            .list_managed_containers(format!(
+                "{}={}",
+                labels::ns_key(ns, labels::SUFFIX_PROJECT_UUID),
+                project.id
+            ))
+            .await?;
+        let by_name = self
+            .list_managed_containers(format!(
+                "{}={}",
+                labels::ns_key(ns, labels::SUFFIX_PROJECT),
+                project.name
+            ))
+            .await?;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::with_capacity(by_uuid.len() + by_name.len());
+        for container in by_uuid.into_iter().chain(by_name) {
+            if seen.insert(container.id.clone()) {
+                out.push(container);
+            }
+        }
+        Ok(out)
     }
 
     async fn apply_actions(
@@ -1874,51 +1786,6 @@ impl DockerReconciler {
 
     // ── Health → status ────────────────────────────────────────────────
 
-    /// Fetch and aggregate Traefik `serverStatus` across the service name(s) a
-    /// container's labels emit (one bare-base service for a single-route
-    /// container, per-route `{base}-{idx}` services for a multi-route one),
-    /// memoized per service for the reconcile pass via `cache`.
-    ///
-    /// Returns `Some(merged map)` if AT LEAST ONE queried service reported a
-    /// serverStatus (the per-route services share the same `http://{ip}:{port}`
-    /// servers, so merging them is safe and a server reported UP by any route's
-    /// health check counts as UP). `None` when there is no Traefik API, no
-    /// service names, or every queried service returned `None` (unreachable /
-    /// non-200 / no HC labels) — a health-checked container is then treated as
-    /// not-ready (no fallback) until Traefik reports its server.
-    async fn fetch_server_status_aggregated(
-        &self,
-        service_names: &[String],
-        cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
-    ) -> Option<HashMap<String, bool>> {
-        let client = self.traefik_api.as_ref()?;
-        let mut merged: HashMap<String, bool> = HashMap::new();
-        let mut any = false;
-        for service in service_names {
-            let status = match cache.get(service) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fetched = client.server_status(service).await;
-                    cache.insert(service.clone(), fetched.clone());
-                    fetched
-                }
-            };
-            if let Some(map) = status {
-                any = true;
-                for (server, up) in map {
-                    // A server is UP if ANY route's health check reports it UP.
-                    let entry = merged.entry(server).or_insert(false);
-                    *entry = *entry || up;
-                }
-            }
-        }
-        if any {
-            Some(merged)
-        } else {
-            None
-        }
-    }
-
     /// Resolve the deployment's primary ingress hosts — the same set
     /// `compute_desired_for_deployment` feeds into each route's `hosts`. Used by
     /// the readiness pass to decide whether the container emits a Traefik router
@@ -2036,9 +1903,14 @@ impl DockerReconciler {
                 &primary_hosts,
             );
             let has_health_path = effective_health_path(spec, &self.config.health_path).is_some();
-            let server_status = self
-                .fetch_server_status_aggregated(&service_names, server_status_cache)
-                .await;
+            let server_status = match self.traefik_api.as_ref() {
+                Some(client) => {
+                    client
+                        .aggregated_server_status(&service_names, server_status_cache)
+                        .await
+                }
+                None => None,
+            };
             // Surface the two ways a health-checked container has no Traefik
             // signal. Both leave it not-ready (serverStatus is required), but the
             // first is a persistent operator misconfiguration worth a louder log.
@@ -2213,8 +2085,13 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     "Deployment is ready, marking as Healthy"
                 );
-                self.handle_deployment_became_healthy(project, deployment)
-                    .await?;
+                rise_backend_core::lifecycle::handle_deployment_became_healthy(
+                    self.store.as_ref(),
+                    None,
+                    project,
+                    deployment,
+                )
+                .await?;
             }
             DeploymentStatus::Healthy if !is_ready => {
                 warn!(
@@ -2449,63 +2326,6 @@ impl DockerReconciler {
             ip,
             published_host_port,
         })
-    }
-
-    /// Port of `webhook::handle_deployment_became_healthy`: mark healthy,
-    /// supersede the prior active deployment, mark this one active.
-    async fn handle_deployment_became_healthy(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        let active_in_group = self
-            .store
-            .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
-            .await?;
-
-        self.store.mark_deployment_healthy(deployment.id).await?;
-
-        if let Some(old_active) = active_in_group {
-            if old_active.id != deployment.id && !state_machine::is_terminal(&old_active.status) {
-                info!(
-                    "Deployment {} replacing {} in group '{}', marking old as Terminating",
-                    deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
-                );
-                self.store
-                    .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
-                    .await?;
-            }
-        }
-
-        let others = self
-            .store
-            .find_non_terminal_deployments_for_project_and_group(
-                project.id,
-                &deployment.deployment_group,
-            )
-            .await?;
-        for other in others {
-            if other.id != deployment.id
-                && state_machine::is_active(&other.status)
-                && !state_machine::is_terminal(&other.status)
-            {
-                info!(
-                    "Cleaning up non-active deployment {} in group '{}', marking as Terminating",
-                    other.deployment_id, deployment.deployment_group
-                );
-                self.store
-                    .mark_deployment_terminating(other.id, TerminationReason::Superseded)
-                    .await?;
-            }
-        }
-
-        self.store
-            .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
-            .await?;
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
-        Ok(())
     }
 }
 

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use rise_backend_core::labels::{
     ns_key, SUFFIX_CONTAINER, SUFFIX_CONTROLLER_CLASS, SUFFIX_DEPLOYMENT_GROUP,
     SUFFIX_DEPLOYMENT_ID, SUFFIX_DEPLOYMENT_UUID, SUFFIX_ENVIRONMENT, SUFFIX_ENV_HASH,
-    SUFFIX_IMAGE, SUFFIX_MANAGED_BY, SUFFIX_PROJECT, SUFFIX_ROUTE_HASH,
+    SUFFIX_IMAGE, SUFFIX_MANAGED_BY, SUFFIX_PROJECT, SUFFIX_PROJECT_UUID, SUFFIX_ROUTE_HASH,
 };
 
 /// ECS allows 50 tags per resource. We stamp ~11, so the headroom is ample — but
@@ -33,6 +33,13 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceTags {
     pub project: String,
+    /// The project's immutable identity. Optional to parse (defaults to empty
+    /// for a service tagged before this field existed) so an upgrade doesn't
+    /// find every pre-existing service unattributable — see `parse`'s frozen-set
+    /// note. The reconciler prefers this over `project` (the name) when
+    /// present, since a rename leaves `project` stale on already-running
+    /// services.
+    pub project_uuid: String,
     pub deployment_group: String,
     pub deployment_id: String,
     pub deployment_uuid: String,
@@ -63,6 +70,10 @@ impl ServiceTags {
         out.insert(
             ns_key(label_namespace, SUFFIX_PROJECT),
             self.project.clone(),
+        );
+        out.insert(
+            ns_key(label_namespace, SUFFIX_PROJECT_UUID),
+            self.project_uuid.clone(),
         );
         out.insert(
             ns_key(label_namespace, SUFFIX_DEPLOYMENT_GROUP),
@@ -117,6 +128,7 @@ impl ServiceTags {
         let get = |suffix: &str| tags.get(&ns_key(label_namespace, suffix)).cloned();
         Some(Self {
             project: get(SUFFIX_PROJECT)?,
+            project_uuid: get(SUFFIX_PROJECT_UUID).unwrap_or_default(),
             deployment_group: get(SUFFIX_DEPLOYMENT_GROUP)?,
             deployment_id: get(SUFFIX_DEPLOYMENT_ID)?,
             deployment_uuid: get(SUFFIX_DEPLOYMENT_UUID)?,
@@ -154,6 +166,7 @@ mod tests {
     fn sample() -> ServiceTags {
         ServiceTags {
             project: "myapp".to_string(),
+            project_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
             deployment_group: "default".to_string(),
             deployment_id: "20260101-120000".to_string(),
             deployment_uuid: "11111111-1111-1111-1111-111111111111".to_string(),

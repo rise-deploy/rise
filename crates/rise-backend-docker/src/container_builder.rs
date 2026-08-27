@@ -127,6 +127,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         label_namespace: cfg.label_namespace,
         controller_class: cfg.controller_class,
         project: &desired.project,
+        project_uuid: &desired.project_uuid,
         deployment_group: &desired.deployment_group,
         deployment_id: &desired.deployment_id,
         deployment_uuid: &desired.deployment_uuid,
@@ -337,6 +338,7 @@ mod tests {
     fn single_container() -> DesiredContainer {
         DesiredContainer {
             project: "myapp".to_string(),
+            project_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
             access_class: "public".to_string(),
             deployment_group: "default".to_string(),
             deployment_id: "20260101-120000".to_string(),

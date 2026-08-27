@@ -109,6 +109,48 @@ impl TraefikApiClient {
         };
         parse_server_status(&body)
     }
+
+    /// Merge `serverStatus` across a container's route services with OR
+    /// semantics: the per-route Traefik services share the same backing
+    /// servers, so a server is UP if any of them reports it UP.
+    ///
+    /// Memoizes each service's result in `cache` for the reconcile pass this
+    /// call is part of — callers query the same service repeatedly across
+    /// several containers/deployments in one tick.
+    ///
+    /// Returns `Some(merged map)` if AT LEAST ONE queried service reported a
+    /// `serverStatus` (the per-route services share the same
+    /// `http://{ip}:{port}` servers, so merging them is safe). `None` when
+    /// every queried service returned `None` (unreachable / non-200 / no
+    /// health-check labels) — a health-checked container is then treated as
+    /// not-ready, with no fallback, until Traefik reports its server.
+    pub async fn aggregated_server_status(
+        &self,
+        service_names: &[String],
+        cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
+    ) -> Option<HashMap<String, bool>> {
+        let mut merged: HashMap<String, bool> = HashMap::new();
+        let mut any = false;
+        for service in service_names {
+            let status = match cache.get(service) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = self.server_status(service).await;
+                    cache.insert(service.clone(), fetched.clone());
+                    fetched
+                }
+            };
+            if let Some(status) = status {
+                any = true;
+                for (server, up) in status {
+                    // A server is UP if ANY route's health check reports it UP.
+                    let entry = merged.entry(server).or_insert(false);
+                    *entry = *entry || up;
+                }
+            }
+        }
+        any.then_some(merged)
+    }
 }
 
 /// Split an optional basic-auth userinfo out of `raw`, returning the base URL
