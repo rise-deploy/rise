@@ -102,6 +102,24 @@ variable "oidc_client_id" {
   type = string
 }
 
+variable "oidc_group_claim" {
+  type = string
+}
+
+variable "admin_idp_group" {
+  type    = string
+  default = null
+}
+
+variable "platform_access_policy" {
+  type = string
+}
+
+variable "platform_allowed_idp_group" {
+  type    = string
+  default = null
+}
+
 variable "allow_private_ssrf" {
   description = <<-EOT
     Let Rise make outbound requests to private addresses and over plain HTTP.

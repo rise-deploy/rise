@@ -1,11 +1,14 @@
 # Rise AWS Terraform Module
 
-This module creates the AWS IAM resources required for the Rise backend to manage AWS services (ECR for container registries and RDS for database instances).
+This module creates the AWS IAM resources required for the Rise backend to manage AWS services and deploy applications onto ECS.
 
 ## Features
 
-- **Controller role**: Manages ECR repository lifecycle (create, delete, tag) and RDS instances
+- **Controller role**: Manages the enabled providers and ECS deployment controller
 - **Push role**: Separate role for generating scoped image push credentials
+- Separate ECS execution, application, and Traefik discovery roles
+- Optional common permissions boundary on every generated role
+- Inline policy mode for deployers that may create roles but not customer-managed policies
 - Supports IAM role (for AWS deployments with IRSA or instance profiles)
 - Supports IAM user with access keys (for non-AWS deployments)
 - Configurable repository prefix for multi-tenant isolation
@@ -15,7 +18,7 @@ This module creates the AWS IAM resources required for the Rise backend to manag
 
 ## Architecture
 
-The module creates two separate IAM roles with distinct permissions:
+The module creates distinct identities for each responsibility:
 
 1. **Backend Role** (e.g., `rise-backend`): Used by the Rise backend to manage AWS resources
    - ECR repositories: Create/delete, tag, list for discovery
@@ -26,6 +29,12 @@ The module creates two separate IAM roles with distinct permissions:
 2. **Push Role** (e.g., `rise-backend-ecr-push`): Assumed by the backend to generate scoped credentials
    - Push images to ECR
    - The backend uses STS AssumeRole with an inline session policy to scope credentials to specific repositories
+
+3. **ECS execution role**: ECS image pulls, logs, and task secret resolution
+
+4. **Application task role**: The identity applications run as; it has no controller policy
+
+5. **Traefik task role**: Read-only ECS, EC2, and SSM discovery calls
 
 ## Usage
 
@@ -42,6 +51,29 @@ module "rise_aws" {
   tags = {
     Environment = "production"
   }
+}
+```
+
+### Delegated ECS installation
+
+```hcl
+module "rise_aws" {
+  source = "./modules/rise-aws"
+
+  name                     = "rise-prod-controller"
+  enable_ecr               = true
+  enable_ecs               = true
+  enable_rds               = false
+  iam_policy_mode          = "inline"
+  permissions_boundary_arn = var.runtime_boundary_arn
+
+  ecr_repository_prefix  = "rise-prod/"
+  ecr_push_role_name     = "rise-prod-ecr-push"
+  ecs_cluster_name       = "platform"
+  ecs_execution_role_name = "rise-prod-execution"
+  ecs_workload_role_name  = "rise-prod-app"
+  ecs_traefik_role_name   = "rise-prod-traefik"
+  ssm_parameter_prefix    = "rise-prod"
 }
 ```
 
@@ -168,8 +200,12 @@ This makes it easy to reference in your configuration management tool (e.g., usi
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
 | name | Name for the IAM role and policy | `string` | `"rise-backend"` | no |
+| permissions_boundary_arn | Boundary attached to every generated role | `string` | `null` | no |
+| iam_policy_mode | `managed` or `inline` generated policies | `string` | `"managed"` | no |
 | tags | Tags to apply to all resources | `map(string)` | `{}` | no |
 | enable_ecr | Enable ECR permissions | `bool` | `true` | no |
+| ecr_repository_prefix | Repository path prefix | `string` | `<name>/` | no |
+| ecr_push_role_name | ECR publisher role name | `string` | `<name>-ecr-push` | no |
 | enable_rds | Enable RDS permissions | `bool` | `false` | no |
 | rds_vpc_id | VPC ID for RDS resources | `string` | `null` | no |
 | rds_subnet_ids | Subnet IDs for RDS DB subnet group | `list(string)` | `[]` | no |
@@ -184,6 +220,11 @@ This makes it easy to reference in your configuration management tool (e.g., usi
 | image_tag_mutability | Tag mutability for repositories | `string` | `"MUTABLE"` | no |
 | scan_on_push | Enable image scanning on push | `bool` | `true` | no |
 | max_image_count | Max images to retain per repository | `number` | `100` | no |
+| enable_ecs | Enable ECS controller identities and policies | `bool` | `false` | no |
+| ecs_cluster_name | Existing cluster Rise reconciles | `string` | `<name>` | no |
+| ecs_execution_role_name | ECS execution role name | `string` | `<name>-ecs-execution` | no |
+| ecs_workload_role_name | Application task role name | `string` | `<name>-app` | no |
+| ecs_traefik_role_name | Traefik discovery role name | `string` | `<name>-traefik` | no |
 
 ## Outputs
 
@@ -201,12 +242,15 @@ This makes it easy to reference in your configuration management tool (e.g., usi
 | role_name | Name of the controller IAM role |
 | push_role_arn | ARN of the push IAM role (ECR only) |
 | push_role_name | Name of the push IAM role (ECR only) |
+| ecs_execution_role_arn | ECS execution role ARN |
+| ecs_task_role_arn | Application task role ARN |
+| ecs_traefik_role_arn | Traefik discovery role ARN |
 | user_arn | ARN of the IAM user (if created) |
 | user_name | Name of the IAM user (if created) |
 | access_key_id | Access key ID (sensitive, if IAM user created) |
 | secret_access_key | Secret access key (sensitive, if IAM user created) |
-| controller_policy_arn | ARN of the controller IAM policy |
-| push_policy_arn | ARN of the push IAM policy (ECR only) |
+| controller_policy_arn | ARN of the controller IAM policy in managed mode; otherwise null |
+| push_policy_arn | ARN of the push IAM policy in managed mode; otherwise null |
 | policy_document | The controller IAM policy document JSON |
 | lifecycle_policy | ECR lifecycle policy JSON |
 | kms_key_arn | ARN of the KMS key (if KMS enabled) |

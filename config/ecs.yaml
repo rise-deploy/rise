@@ -35,10 +35,17 @@ auth:
   issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
   client_id: "${OIDC_CLIENT_ID:-rise-backend}"
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
+  idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
   admin_users:
     - "${ADMIN_EMAIL:-admin@example.com}"
+  admin_idp_groups:
+    - "${RISE_ADMIN_IDP_GROUP:-}"
   allow_team_creation: true
   allow_list_all_teams: true
+  platform_access:
+    policy: "${RISE_PLATFORM_ACCESS_POLICY:-allow_all}"
+    allowed_idp_groups:
+      - "${RISE_PLATFORM_ALLOWED_IDP_GROUP:-}"
 
 registry:
   # ECR is the recommended registry for this backend: ECS pulls with the task

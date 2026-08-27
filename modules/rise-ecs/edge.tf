@@ -83,8 +83,18 @@ resource "aws_lb_listener" "http" {
   protocol          = local.is_nlb ? "TCP" : "HTTP"
 
   default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.traefik["80"].arn
+    type             = local.is_nlb ? "forward" : "redirect"
+    target_group_arn = local.is_nlb ? aws_lb_target_group.traefik["80"].arn : null
+
+    dynamic "redirect" {
+      for_each = local.is_nlb ? [] : [1]
+
+      content {
+        port        = "443"
+        protocol    = "HTTPS"
+        status_code = "HTTP_301"
+      }
+    }
   }
 }
 
