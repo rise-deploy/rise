@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::{
     build_controller_metadata, effective_health_path, hash_env, merge_container_env,
     pin_system_env, redact_secrets_for_hash, resolve_deployment_env_vars,
@@ -677,13 +677,28 @@ impl EcsReconciler {
     ) -> Result<()> {
         let mut actual = cluster.for_project(project);
 
-        // 1. Status transitions, isolated per deployment.
+        // 1. Status transitions, isolated per deployment. A `Terminating`
+        // deployment completes immediately here; its services are retired by
+        // the diff on the next tick (`should_have_infrastructure` keeps them
+        // in the desired set while still Terminating, dropped once terminal).
+        // That ordering means the project-deletion controller (5s poll,
+        // against this loop's 30s) can delete the project row before the
+        // services are gone, putting them out of reach of every future
+        // per-project pass -- waiting here cannot fix it, since the very diff
+        // that removes them will not run until this transition happens. The
+        // cluster-wide orphan sweep is what closes it.
         let non_terminal = self
             .store
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         for deployment in &non_terminal {
-            if let Err(e) = self.perform_status_transition(project, deployment).await {
+            if let Err(e) = rise_backend_core::lifecycle::perform_status_transition(
+                self.store.as_ref(),
+                project,
+                deployment,
+            )
+            .await
+            {
                 warn!(
                     deployment = %deployment.deployment_id,
                     "Status transition failed: {:?}", e
@@ -827,134 +842,6 @@ impl EcsReconciler {
                 );
             }
         }
-        Ok(())
-    }
-
-    /// Drive the time- and state-based transitions that do not depend on the
-    /// runtime: timeouts, expiry, cancellation and termination completion.
-    /// Identical in shape and thresholds to the Docker backend so a deployment's
-    /// lifecycle reads the same on every backend.
-    async fn perform_status_transition(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        use rise_backend_core::{DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES};
-        let now = chrono::Utc::now();
-
-        match deployment.status {
-            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing
-                if now - deployment.created_at
-                    > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES) =>
-            {
-                self.store
-                    .mark_deployment_failed(
-                        deployment.id,
-                        "Deployment timed out before the image was pushed — the CLI was \
-                         most likely interrupted during build or push.",
-                    )
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Cancelling => {
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Terminating => {
-                // Complete immediately. The services are retired by the diff on
-                // the next tick -- `should_have_infrastructure` keeps them in
-                // the desired set while the deployment is still Terminating, so
-                // they are only dropped once it reaches a terminal status.
-                //
-                // That ordering means the project-deletion controller (5s poll,
-                // against this loop's 30s) can delete the project row before the
-                // services are gone, putting them out of reach of every future
-                // per-project pass. Waiting here cannot fix it: the very diff
-                // that removes them will not run until this transition happens.
-                // The cluster-wide sweep is what closes it.
-                self.complete_termination(project, deployment).await?;
-            }
-            DeploymentStatus::Pushed => {
-                self.store
-                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Deploying => {
-                if let Some(started) = deployment.deploying_started_at {
-                    if now - started > chrono::Duration::minutes(DEPLOYING_TIMEOUT_MINUTES) {
-                        self.store
-                            .mark_deployment_failed(
-                                deployment.id,
-                                &format!(
-                                    "Deployment timed out after {} seconds in Deploying state",
-                                    DEPLOYING_TIMEOUT_MINUTES * 60
-                                ),
-                            )
-                            .await?;
-                        self.store
-                            .update_project_calculated_status(project.id)
-                            .await?;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        if let Some(expires_at) = deployment.expires_at {
-            if expires_at <= now
-                && !matches!(
-                    deployment.status,
-                    DeploymentStatus::Terminating | DeploymentStatus::Cancelling
-                )
-            {
-                self.store
-                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn complete_termination(&self, project: &Project, deployment: &Deployment) -> Result<()> {
-        match deployment.termination_reason {
-            Some(TerminationReason::Superseded) => {
-                self.store.mark_deployment_superseded(deployment.id).await?;
-            }
-            Some(TerminationReason::UserStopped) => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-            Some(TerminationReason::Expired) => {
-                self.store.mark_deployment_expired(deployment.id).await?;
-            }
-            Some(TerminationReason::Failed) => {
-                let message = deployment
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "Deployment failed".to_string());
-                self.store
-                    .mark_deployment_failed(deployment.id, &message)
-                    .await?;
-            }
-            Some(TerminationReason::Cancelled) => {
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-            }
-            None => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-        }
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
         Ok(())
     }
 
@@ -2055,9 +1942,14 @@ impl EcsReconciler {
                 &route_specs,
                 &primary_hosts,
             );
-            let server_status = self
-                .fetch_server_status_aggregated(&service_names, server_status_cache)
-                .await;
+            let server_status = match self.traefik_api.as_ref() {
+                Some(client) => {
+                    client
+                        .aggregated_server_status(&service_names, server_status_cache)
+                        .await
+                }
+                None => None,
+            };
 
             if has_health_path && self.traefik_api.is_none() {
                 warn!(
@@ -2215,8 +2107,13 @@ impl EcsReconciler {
 
         match deployment.status {
             DeploymentStatus::Deploying if all_ready => {
-                self.handle_deployment_became_healthy(project, deployment)
-                    .await?;
+                rise_backend_core::lifecycle::handle_deployment_became_healthy(
+                    self.store.as_ref(),
+                    Some(self),
+                    project,
+                    deployment,
+                )
+                .await?;
             }
             DeploymentStatus::Healthy if !all_ready && rolling_but_serving => {
                 debug!(
@@ -2242,37 +2139,6 @@ impl EcsReconciler {
             _ => {}
         }
         Ok(())
-    }
-
-    /// Merge `serverStatus` across a container's route services with OR
-    /// semantics: the per-route Traefik services share the same backing servers,
-    /// so a server is UP if any of them reports it UP.
-    async fn fetch_server_status_aggregated(
-        &self,
-        service_names: &[String],
-        cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
-    ) -> Option<HashMap<String, bool>> {
-        let client = self.traefik_api.as_ref()?;
-        let mut merged: HashMap<String, bool> = HashMap::new();
-        let mut any = false;
-        for name in service_names {
-            let status = match cache.get(name) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fetched = client.server_status(name).await;
-                    cache.insert(name.clone(), fetched.clone());
-                    fetched
-                }
-            };
-            if let Some(status) = status {
-                any = true;
-                for (server, up) in status {
-                    let entry = merged.entry(server).or_insert(false);
-                    *entry = *entry || up;
-                }
-            }
-        }
-        any.then_some(merged)
     }
 
     /// Describe a service's tasks, projecting each onto the backend-agnostic
@@ -2373,78 +2239,6 @@ impl EcsReconciler {
         views
     }
 
-    /// Mark this deployment active and supersede the outgoing one.
-    async fn handle_deployment_became_healthy(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        let previous_active = self
-            .store
-            .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
-            .await?;
-
-        self.store.mark_deployment_healthy(deployment.id).await?;
-
-        if let Some(previous) = previous_active {
-            if previous.id != deployment.id
-                && !rise_backend_core::state_machine::is_terminal(&previous.status)
-            {
-                self.store
-                    .mark_deployment_terminating(previous.id, TerminationReason::Superseded)
-                    .await?;
-                // The retired deployment's secrets go with it, so a later
-                // rollback re-creates them from the database rather than reading
-                // a stale value.
-                let _ = self
-                    .delete_secrets_for(
-                        &project.name,
-                        &previous.deployment_group,
-                        &previous.deployment_id,
-                    )
-                    .await;
-            }
-        }
-
-        // Any other still-active row in this group is a straggler; retire it too.
-        let siblings = self
-            .store
-            .find_non_terminal_deployments_for_project_and_group(
-                project.id,
-                &deployment.deployment_group,
-            )
-            .await?;
-        for other in siblings {
-            if other.id == deployment.id {
-                continue;
-            }
-            // On the status, not on `is_active`: the flag is set in the write
-            // just below this loop, so a replica that died between marking a
-            // deployment healthy and flagging it active leaves a sibling that
-            // is serving traffic and would never be retired.
-            if rise_backend_core::state_machine::is_active(&other.status)
-                && !rise_backend_core::state_machine::is_terminal(&other.status)
-            {
-                self.store
-                    .mark_deployment_terminating(other.id, TerminationReason::Superseded)
-                    .await?;
-            }
-        }
-
-        self.store
-            .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
-            .await?;
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
-        info!(
-            project = %project.name,
-            deployment = %deployment.deployment_id,
-            "Deployment is healthy and now active"
-        );
-        Ok(())
-    }
-
     fn traefik_render_config(&self) -> rise_backend_traefik::TraefikRenderConfig<'_> {
         rise_backend_traefik::TraefikRenderConfig {
             label_namespace: &self.config.label_namespace,
@@ -2457,6 +2251,20 @@ impl EcsReconciler {
             auth_backend_url: &self.config.auth_backend_url,
             access_classes: &self.config.access_classes,
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl rise_backend_core::lifecycle::SupersededHook for EcsReconciler {
+    /// The retired deployment's SSM secrets go with it, so a later rollback
+    /// re-creates them from the database rather than reading a stale value.
+    async fn on_superseded(&self, project: &Project, superseded: &Deployment) -> Result<()> {
+        self.delete_secrets_for(
+            &project.name,
+            &superseded.deployment_group,
+            &superseded.deployment_id,
+        )
+        .await
     }
 }
 

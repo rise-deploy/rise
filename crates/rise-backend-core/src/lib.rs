@@ -26,6 +26,7 @@ pub mod group;
 pub mod health_path;
 pub mod identity;
 pub mod labels;
+pub mod lifecycle;
 pub mod models;
 pub mod naming;
 pub mod pod_status;
@@ -51,6 +52,10 @@ pub use diff::{
 pub use env::{hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash, upsert_env};
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use health_path::effective_health_path;
+pub use lifecycle::{
+    complete_termination, handle_deployment_became_healthy, perform_status_transition,
+    SupersededHook,
+};
 pub use naming::{container_name, group_app_name, sanitize_ecs_name, stable_identity_name};
 pub use pod_status::{build_controller_metadata, build_pod_status};
 pub use providers::{
