@@ -2,7 +2,7 @@
 
 Terraform for a working Rise install on Amazon ECS (Fargate), in the shape
 [ADR-0005](../../docs/engineering/src/content/docs/adr/0005-ecs-deployment-backend.md)
-describes: an NLB fronting Traefik, Traefik terminating TLS with ACME, the Rise
+describes: a public load balancer fronting Traefik, the Rise
 control plane and every deployed workload in private subnets, RDS for the
 control-plane store, and ECR for images.
 
@@ -24,8 +24,9 @@ module "rise_aws" {
   ecs_cluster_name     = "rise"
   ssm_parameter_prefix = "rise"
 
-  # Lets the execution role read the secrets rise-ecs creates.
-  ecs_secret_arns = module.rise_ecs.secret_arns_for_execution_role
+  # Names are deterministic, which avoids a module dependency cycle while
+  # still confining task-secret reads to this install.
+  ecs_secret_arns = ["arn:aws:secretsmanager:eu-west-1:123456789012:secret:rise/*"]
 }
 
 module "rise_ecs" {
@@ -39,6 +40,8 @@ module "rise_ecs" {
 
   controller_role_arn = module.rise_aws.role_arn
   execution_role_arn  = module.rise_aws.ecs_execution_role_arn
+  workload_task_role_arn = module.rise_aws.ecs_task_role_arn
+  traefik_task_role_arn  = module.rise_aws.ecs_traefik_role_arn
   ecr_push_role_arn   = module.rise_aws.push_role_arn
 
   oidc_issuer        = "https://id.example.com"
@@ -46,6 +49,10 @@ module "rise_ecs" {
   oidc_client_secret = var.oidc_client_secret
 }
 ```
+
+`rise_image_ref` accepts a digest-pinned public image directly, for example
+`ghcr.io/rise-deploy/rise@sha256:…`. Set exactly one of `rise_image_ref` and
+`rise_image_tag`.
 
 Then create the DNS records from the `dns_records_required` output, or pass
 `route53_zone_id` and let the module make them. **The wildcard is required**:
@@ -107,8 +114,8 @@ step.
 `edge_mode = "alb-acm"` terminates at an ALB instead, buying L7 access logs and
 WAF. It costs custom domains their automatic certificates: ACM has no HTTP-01,
 so each one gains a DNS-validated certificate an operator has to create, against
-a default limit of 25 per listener. Traefik still routes and still enforces
-access classes in both modes.
+a default limit of 25 per listener. Port 80 redirects permanently to HTTPS;
+Traefik still routes and still enforces access classes in both modes.
 
 **Traefik runs one replica, and that is not configurable.** Its ACME file store
 is not multi-writer safe. In ACME mode the deployment configuration also stops
@@ -121,6 +128,11 @@ Point `oidc_issuer` at a real provider. `deploy_dex = true` runs Dex as an ECS
 service instead, so the install is usable end to end without one — **a demo**:
 storage is in-memory, so sessions and refresh tokens are lost whenever the task
 is replaced, and there is no HA.
+
+For an IdP that publishes groups, set `oidc_group_claim`, `admin_idp_group`,
+`platform_access_policy = "restrictive"`, and `platform_allowed_idp_group`.
+These values are rendered through the ECS environment into the shipped
+configuration; no mounted override file is required.
 
 Dex needs a bcrypt hash, since Terraform has no bcrypt function:
 

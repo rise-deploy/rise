@@ -244,6 +244,12 @@ variable "log_retention_days" {
   default     = 30
 }
 
+variable "log_group_name" {
+  description = "CloudWatch log group for the control plane, rise-traefik and deployed applications. Defaults to /<name>."
+  type        = string
+  default     = null
+}
+
 # -----------------------------------------------------------------------------
 # Ingress and edge
 # -----------------------------------------------------------------------------
@@ -389,8 +395,20 @@ variable "rise_image" {
 }
 
 variable "rise_image_tag" {
-  description = "Image tag. No default on purpose — a floating tag makes the running version unknowable."
+  description = "Image tag. Set this or rise_image_ref, but not both."
   type        = string
+  default     = null
+}
+
+variable "rise_image_ref" {
+  description = "Complete immutable control-plane image reference, such as ghcr.io/rise-deploy/rise@sha256:…. Set this or rise_image_tag, but not both."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.rise_image_ref == null || strcontains(var.rise_image_ref, "@sha256:")
+    error_message = "rise_image_ref must be an OCI digest reference containing @sha256:."
+  }
 }
 
 variable "rise_cpu" {
@@ -434,6 +452,12 @@ variable "resource_prefix" {
   default     = "rise"
 }
 
+variable "controller_class_name" {
+  description = "Controller identity stamped onto every managed service and used to isolate multiple Rise installations sharing one cluster."
+  type        = string
+  default     = "default"
+}
+
 variable "ssm_parameter_prefix" {
   description = "SSM path for secret environment variables. Must match the value given to modules/rise-aws."
   type        = string
@@ -455,6 +479,40 @@ variable "max_replicas" {
 variable "admin_email" {
   description = "Bootstrap admin user (auth.admin_users)."
   type        = string
+}
+
+variable "oidc_group_claim" {
+  description = "ID-token claim containing identity-provider group names."
+  type        = string
+  default     = "groups"
+}
+
+variable "admin_idp_group" {
+  description = "Identity-provider group whose members are Rise administrators. Null grants no group administrative access."
+  type        = string
+  default     = null
+}
+
+variable "platform_access_policy" {
+  description = "Who may use the Rise platform: allow_all or restrictive."
+  type        = string
+  default     = "allow_all"
+
+  validation {
+    condition     = contains(["allow_all", "restrictive"], var.platform_access_policy)
+    error_message = "platform_access_policy must be allow_all or restrictive."
+  }
+}
+
+variable "platform_allowed_idp_group" {
+  description = "Identity-provider group allowed to use Rise when platform_access_policy is restrictive."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.platform_access_policy != "restrictive" || try(trimspace(var.platform_allowed_idp_group), "") != ""
+    error_message = "restrictive platform access requires platform_allowed_idp_group."
+  }
 }
 
 # -----------------------------------------------------------------------------

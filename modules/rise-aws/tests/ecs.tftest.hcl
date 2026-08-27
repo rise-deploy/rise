@@ -146,3 +146,46 @@ run "disabling_ecs_emits_no_ecs_statements" {
     error_message = "ECS statements leak into the policy when enable_ecs is false"
   }
 }
+
+run "inline_roles_share_the_supplied_boundary" {
+  command = plan
+
+  variables {
+    iam_policy_mode          = "inline"
+    permissions_boundary_arn = "arn:aws:iam::123456789012:policy/rise-boundary"
+    ecs_execution_role_name  = "rise-execution"
+    ecs_workload_role_name   = "rise-app"
+    ecs_traefik_role_name    = "rise-traefik"
+    ecr_push_role_name       = "rise-ecr-push"
+  }
+
+  assert {
+    condition = alltrue([
+      aws_iam_role.backend.permissions_boundary == "arn:aws:iam::123456789012:policy/rise-boundary",
+      aws_iam_role.push_role[0].permissions_boundary == "arn:aws:iam::123456789012:policy/rise-boundary",
+      aws_iam_role.ecs_execution[0].permissions_boundary == "arn:aws:iam::123456789012:policy/rise-boundary",
+      aws_iam_role.ecs_workload[0].permissions_boundary == "arn:aws:iam::123456789012:policy/rise-boundary",
+      aws_iam_role.ecs_traefik[0].permissions_boundary == "arn:aws:iam::123456789012:policy/rise-boundary",
+    ])
+    error_message = "every ECS runtime role must carry the supplied permissions boundary"
+  }
+
+  assert {
+    condition = (
+      length(aws_iam_policy.backend) == 0
+      && length(aws_iam_policy.push_role) == 0
+      && length(aws_iam_policy.assume_push_role) == 0
+      && length(aws_iam_policy.ecs_execution) == 0
+    )
+    error_message = "inline mode must not create customer-managed policies"
+  }
+
+  assert {
+    condition = (
+      output.ecs_task_role_name == "rise-app"
+      && output.ecs_traefik_role_name == "rise-traefik"
+      && aws_iam_role.backend.name == "rise-backend"
+    )
+    error_message = "applications and Traefik must use identities distinct from the controller"
+  }
+}

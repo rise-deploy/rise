@@ -21,7 +21,7 @@ resource "aws_ecs_task_definition" "rise" {
   container_definitions = jsonencode([
     {
       name      = "rise"
-      image     = "${var.rise_image}:${var.rise_image_tag}"
+      image     = local.rise_image_ref
       essential = true
       command   = ["backend", "server"]
 
@@ -105,6 +105,11 @@ resource "aws_ecs_service" "rise" {
     precondition {
       condition     = length(local.private_subnet_ids) <= 16
       error_message = "At most 16 subnets: an awsvpc network configuration accepts no more, and the backend rejects the setting at startup."
+    }
+
+    precondition {
+      condition     = (var.rise_image_ref == null) != (var.rise_image_tag == null)
+      error_message = "Set exactly one of rise_image_ref or rise_image_tag."
     }
   }
 

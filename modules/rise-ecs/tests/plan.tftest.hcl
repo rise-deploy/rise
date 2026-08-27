@@ -76,6 +76,42 @@ run "creates_a_whole_install" {
   }
 }
 
+run "alb_uses_https_and_group_restricted_auth" {
+  command = plan
+
+  variables {
+    edge_mode                  = "alb-acm"
+    acme_email                 = null
+    acm_certificate_arn        = "arn:aws:acm:eu-central-1:123456789012:certificate/abc"
+    rise_image_tag             = null
+    rise_image_ref             = "ghcr.io/rise-deploy/rise@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    oidc_group_claim           = "cognito:groups"
+    admin_idp_group            = "rise-admins"
+    platform_access_policy     = "restrictive"
+    platform_allowed_idp_group = "rise-platform-users"
+  }
+
+  assert {
+    condition = (
+      aws_lb_listener.http.default_action[0].type == "redirect"
+      && aws_lb_listener.http.default_action[0].redirect[0].protocol == "HTTPS"
+      && aws_lb_listener.http.default_action[0].redirect[0].status_code == "HTTP_301"
+    )
+    error_message = "ALB mode must redirect HTTP to HTTPS"
+  }
+
+  assert {
+    condition = alltrue([
+      local.rise_image_ref == "ghcr.io/rise-deploy/rise@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      local.rise_environment["OIDC_GROUP_CLAIM"] == "cognito:groups",
+      local.rise_environment["RISE_ADMIN_IDP_GROUP"] == "rise-admins",
+      local.rise_environment["RISE_PLATFORM_ACCESS_POLICY"] == "restrictive",
+      local.rise_environment["RISE_PLATFORM_ALLOWED_IDP_GROUP"] == "rise-platform-users",
+    ])
+    error_message = "digest and group-based authorization settings must reach the control-plane task"
+  }
+}
+
 # The database /24s must stay clear of the private /20s at the maximum four AZs.
 # The private subnets are /20s at netnum `index + 1`, so the fourth AZ's is
 # 10.42.64.0/20 (covering /24-netnums 64..79). A database range starting at

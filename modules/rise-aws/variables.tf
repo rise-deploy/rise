@@ -4,6 +4,23 @@ variable "name" {
   default     = "rise-backend"
 }
 
+variable "permissions_boundary_arn" {
+  description = "Optional permissions boundary attached to every IAM role this module creates."
+  type        = string
+  default     = null
+}
+
+variable "iam_policy_mode" {
+  description = "How this module attaches its generated policies. inline avoids iam:CreatePolicy in delegated installations; managed preserves the existing resource shape."
+  type        = string
+  default     = "managed"
+
+  validation {
+    condition     = contains(["inline", "managed"], var.iam_policy_mode)
+    error_message = "iam_policy_mode must be inline or managed."
+  }
+}
+
 variable "tags" {
   description = "Tags to apply to all resources"
   type        = map(string)
@@ -54,6 +71,23 @@ variable "enable_ecr" {
   description = "Enable ECR permissions for the Rise backend. Set to true if using ECR for container registry."
   type        = bool
   default     = true
+}
+
+variable "ecr_repository_prefix" {
+  description = "Repository path prefix managed by Rise. Defaults to <name>/."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ecr_repository_prefix == null || endswith(var.ecr_repository_prefix, "/")
+    error_message = "ecr_repository_prefix must end in /."
+  }
+}
+
+variable "ecr_push_role_name" {
+  description = "Name for the scoped ECR publisher role. Defaults to <name>-ecr-push."
+  type        = string
+  default     = null
 }
 
 variable "enable_rds" {
@@ -162,6 +196,18 @@ variable "ecs_cluster_name" {
 
 variable "ecs_execution_role_name" {
   description = "Name for the ECS task execution role this module creates. Defaults to \"<name>-ecs-execution\"."
+  type        = string
+  default     = null
+}
+
+variable "ecs_workload_role_name" {
+  description = "Name for the task role used by applications Rise deploys. Defaults to <name>-app."
+  type        = string
+  default     = null
+}
+
+variable "ecs_traefik_role_name" {
+  description = "Name for the discovery-only Traefik task role. Defaults to <name>-traefik."
   type        = string
   default     = null
 }

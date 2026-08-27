@@ -19,8 +19,12 @@ locals {
       AWS_REGION          = var.region
       ADMIN_EMAIL         = var.admin_email
 
-      DEX_ISSUER     = var.oidc_issuer
-      OIDC_CLIENT_ID = var.oidc_client_id
+      DEX_ISSUER                      = var.oidc_issuer
+      OIDC_CLIENT_ID                  = var.oidc_client_id
+      OIDC_GROUP_CLAIM                = var.oidc_group_claim
+      RISE_ADMIN_IDP_GROUP            = var.admin_idp_group != null ? var.admin_idp_group : ""
+      RISE_PLATFORM_ACCESS_POLICY     = var.platform_access_policy
+      RISE_PLATFORM_ALLOWED_IDP_GROUP = var.platform_allowed_idp_group != null ? var.platform_allowed_idp_group : ""
 
       RISE_SSRF_ALLOW_PRIVATE = tostring(var.allow_private_ssrf)
       RISE_SSRF_ALLOW_HTTP    = tostring(var.allow_private_ssrf)

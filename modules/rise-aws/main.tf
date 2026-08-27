@@ -1,6 +1,6 @@
 locals {
   name        = var.name
-  repo_prefix = "${var.name}/"
+  repo_prefix = coalesce(var.ecr_repository_prefix, "${var.name}/")
 
   # KMS key alias name - defaults to just the name, but can be overridden for backwards compatibility
   kms_key_alias = var.kms_key_alias != null ? var.kms_key_alias : var.name
@@ -41,6 +41,9 @@ locals {
 
   ecs_cluster_name        = coalesce(var.ecs_cluster_name, var.name)
   ecs_execution_role_name = coalesce(var.ecs_execution_role_name, "${var.name}-ecs-execution")
+  ecs_workload_role_name  = coalesce(var.ecs_workload_role_name, "${var.name}-app")
+  ecs_traefik_role_name   = coalesce(var.ecs_traefik_role_name, "${var.name}-traefik")
+  ecr_push_role_name      = coalesce(var.ecr_push_role_name, "${var.name}-ecr-push")
   ecs_cluster_arn         = "arn:${local.partition}:ecs:${local.region}:${local.account_id}:cluster/${local.ecs_cluster_name}"
 
   # Trailing slashes in the configured prefix would produce `parameter//rise//*`,
@@ -427,7 +430,7 @@ data "aws_iam_policy_document" "backend" {
       # should see the two ARNs, not "(known after apply)".
       resources = [
         "arn:${local.partition}:iam::${local.account_id}:role/${local.ecs_execution_role_name}",
-        "arn:${local.partition}:iam::${local.account_id}:role/${local.name}"
+        "arn:${local.partition}:iam::${local.account_id}:role/${local.ecs_workload_role_name}"
       ]
       condition {
         test     = "StringEquals"
@@ -480,6 +483,8 @@ data "aws_iam_policy_document" "backend" {
 }
 
 resource "aws_iam_policy" "backend" {
+  count = var.iam_policy_mode == "managed" ? 1 : 0
+
   name        = local.name
   description = "IAM policy for Rise backend to manage ECR repositories, RDS instances, and S3 buckets"
   policy      = data.aws_iam_policy_document.backend.json
@@ -556,15 +561,26 @@ locals {
 }
 
 resource "aws_iam_role" "backend" {
-  name               = local.name
-  description        = "IAM role for Rise backend"
-  assume_role_policy = local.assume_role_policy
-  tags               = local.tags
+  name                 = local.name
+  description          = "IAM role for Rise backend"
+  assume_role_policy   = local.assume_role_policy
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 resource "aws_iam_role_policy_attachment" "backend" {
+  count = var.iam_policy_mode == "managed" ? 1 : 0
+
   role       = aws_iam_role.backend.name
-  policy_arn = aws_iam_policy.backend.arn
+  policy_arn = aws_iam_policy.backend[0].arn
+}
+
+resource "aws_iam_role_policy" "backend" {
+  count = var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "controller"
+  role   = aws_iam_role.backend.id
+  policy = data.aws_iam_policy_document.backend.json
 }
 
 # -----------------------------------------------------------------------------
@@ -579,10 +595,18 @@ resource "aws_iam_user" "backend" {
 }
 
 resource "aws_iam_user_policy_attachment" "backend" {
-  count = var.create_iam_user ? 1 : 0
+  count = var.create_iam_user && var.iam_policy_mode == "managed" ? 1 : 0
 
   user       = aws_iam_user.backend[0].name
-  policy_arn = aws_iam_policy.backend.arn
+  policy_arn = aws_iam_policy.backend[0].arn
+}
+
+resource "aws_iam_user_policy" "backend" {
+  count = var.create_iam_user && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "controller"
+  user   = aws_iam_user.backend[0].name
+  policy = data.aws_iam_policy_document.backend.json
 }
 
 resource "aws_iam_access_key" "backend" {
@@ -632,9 +656,9 @@ data "aws_iam_policy_document" "push_role" {
 }
 
 resource "aws_iam_policy" "push_role" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
-  name        = "${var.name}-ecr-push"
+  name        = local.ecr_push_role_name
   description = "IAM policy for Rise ECR push operations"
   policy      = data.aws_iam_policy_document.push_role[0].json
   tags        = local.tags
@@ -671,17 +695,26 @@ data "aws_iam_policy_document" "push_role_assume" {
 resource "aws_iam_role" "push_role" {
   count = var.enable_ecr ? 1 : 0
 
-  name               = "${var.name}-ecr-push"
-  description        = "IAM role for Rise ECR push operations (assumed to generate scoped credentials)"
-  assume_role_policy = data.aws_iam_policy_document.push_role_assume[0].json
-  tags               = local.tags
+  name                 = local.ecr_push_role_name
+  description          = "IAM role for Rise ECR push operations (assumed to generate scoped credentials)"
+  assume_role_policy   = data.aws_iam_policy_document.push_role_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 resource "aws_iam_role_policy_attachment" "push_role" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   role       = aws_iam_role.push_role[0].name
   policy_arn = aws_iam_policy.push_role[0].arn
+}
+
+resource "aws_iam_role_policy" "push_role" {
+  count = var.enable_ecr && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "push"
+  role   = aws_iam_role.push_role[0].id
+  policy = data.aws_iam_policy_document.push_role[0].json
 }
 
 # The controller also needs permission to assume the push role
@@ -699,7 +732,7 @@ data "aws_iam_policy_document" "assume_push_role" {
 }
 
 resource "aws_iam_policy" "assume_push_role" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   name        = "${var.name}-ecr-assume-push"
   description = "Allow assuming the ECR push role"
@@ -708,17 +741,33 @@ resource "aws_iam_policy" "assume_push_role" {
 }
 
 resource "aws_iam_role_policy_attachment" "controller_assume_push" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   role       = aws_iam_role.backend.name
   policy_arn = aws_iam_policy.assume_push_role[0].arn
 }
 
+resource "aws_iam_role_policy" "controller_assume_push" {
+  count = var.enable_ecr && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "assume-ecr-push"
+  role   = aws_iam_role.backend.id
+  policy = data.aws_iam_policy_document.assume_push_role[0].json
+}
+
 resource "aws_iam_user_policy_attachment" "controller_assume_push" {
-  count = var.create_iam_user && var.enable_ecr ? 1 : 0
+  count = var.create_iam_user && var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   user       = aws_iam_user.backend[0].name
   policy_arn = aws_iam_policy.assume_push_role[0].arn
+}
+
+resource "aws_iam_user_policy" "controller_assume_push" {
+  count = var.create_iam_user && var.enable_ecr && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "assume-ecr-push"
+  user   = aws_iam_user.backend[0].name
+  policy = data.aws_iam_policy_document.assume_push_role[0].json
 }
 
 # -----------------------------------------------------------------------------
@@ -755,10 +804,11 @@ data "aws_iam_policy_document" "ecs_execution_assume" {
 resource "aws_iam_role" "ecs_execution" {
   count = var.enable_ecs ? 1 : 0
 
-  name               = local.ecs_execution_role_name
-  description        = "ECS task execution role for Rise workloads (image pull + secret resolution)"
-  assume_role_policy = data.aws_iam_policy_document.ecs_execution_assume[0].json
-  tags               = local.tags
+  name                 = local.ecs_execution_role_name
+  description          = "ECS task execution role for Rise workloads (image pull + secret resolution)"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_execution_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 # ECR pull and CloudWatch Logs. This is the managed policy AWS maintains for
@@ -816,7 +866,7 @@ data "aws_iam_policy_document" "ecs_execution" {
 }
 
 resource "aws_iam_policy" "ecs_execution" {
-  count = var.enable_ecs ? 1 : 0
+  count = var.enable_ecs && var.iam_policy_mode == "managed" ? 1 : 0
 
   name        = "${local.ecs_execution_role_name}-secrets"
   description = "Secret resolution for the Rise ECS task execution role"
@@ -825,10 +875,73 @@ resource "aws_iam_policy" "ecs_execution" {
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_execution" {
-  count = var.enable_ecs ? 1 : 0
+  count = var.enable_ecs && var.iam_policy_mode == "managed" ? 1 : 0
 
   role       = aws_iam_role.ecs_execution[0].name
   policy_arn = aws_iam_policy.ecs_execution[0].arn
+}
+
+resource "aws_iam_role_policy" "ecs_execution" {
+  count = var.enable_ecs && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "secrets"
+  role   = aws_iam_role.ecs_execution[0].id
+  policy = data.aws_iam_policy_document.ecs_execution[0].json
+}
+
+# -----------------------------------------------------------------------------
+# Application and Traefik task roles
+#
+# These identities are deliberately separate from the controller. The module
+# supplies only Traefik's discovery policy; applications start with an empty
+# role and receive whatever their operator adds within the common boundary.
+# -----------------------------------------------------------------------------
+
+resource "aws_iam_role" "ecs_workload" {
+  count = var.enable_ecs ? 1 : 0
+
+  name                 = local.ecs_workload_role_name
+  description          = "Task role for applications deployed by Rise"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_execution_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
+}
+
+data "aws_iam_policy_document" "ecs_traefik" {
+  count = var.enable_ecs ? 1 : 0
+
+  statement {
+    sid = "DiscoverTasks"
+    actions = [
+      "ec2:DescribeInstances",
+      "ecs:DescribeClusters",
+      "ecs:DescribeContainerInstances",
+      "ecs:DescribeTaskDefinition",
+      "ecs:DescribeTasks",
+      "ecs:ListClusters",
+      "ecs:ListTasks",
+      "ssm:DescribeInstanceInformation",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role" "ecs_traefik" {
+  count = var.enable_ecs ? 1 : 0
+
+  name                 = local.ecs_traefik_role_name
+  description          = "Traefik ECS provider discovery"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_execution_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
+}
+
+resource "aws_iam_role_policy" "ecs_traefik" {
+  count = var.enable_ecs ? 1 : 0
+
+  name   = "discovery"
+  role   = aws_iam_role.ecs_traefik[0].id
+  policy = data.aws_iam_policy_document.ecs_traefik[0].json
 }
 
 # -----------------------------------------------------------------------------

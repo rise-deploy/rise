@@ -78,7 +78,10 @@ locals {
   workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
   traefik_task_role_arn  = coalesce(var.traefik_task_role_arn, try(aws_iam_role.traefik[0].arn, null))
 
-  log_group_name = "/${local.name}"
+  log_group_name = coalesce(var.log_group_name, "/${local.name}")
+  rise_image_ref = var.rise_image_ref != null ? var.rise_image_ref : (
+    var.rise_image_tag != null ? "${var.rise_image}:${var.rise_image_tag}" : ""
+  )
 
   # --- Control-plane environment -------------------------------------------
   # Built by modules/control-plane-env, which the e2e test root also consumes so
@@ -109,8 +112,12 @@ module "control_plane_env" {
   traefik_entrypoint   = local.traefik_entrypoint
   traefik_certresolver = local.acme_enabled ? "letsencrypt" : null
 
-  oidc_issuer    = local.oidc_issuer
-  oidc_client_id = var.oidc_client_id
+  oidc_issuer                = local.oidc_issuer
+  oidc_client_id             = var.oidc_client_id
+  oidc_group_claim           = var.oidc_group_claim
+  admin_idp_group            = var.admin_idp_group
+  platform_access_policy     = var.platform_access_policy
+  platform_allowed_idp_group = var.platform_allowed_idp_group
   # The issuer is public here (Traefik-fronted, or an operator's own IdP), so
   # the SSRF defaults stay closed.
   allow_private_ssrf = false

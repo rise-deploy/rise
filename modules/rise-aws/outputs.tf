@@ -58,12 +58,12 @@ output "push_role_name" {
 
 output "controller_policy_arn" {
   description = "ARN of the IAM policy for the Rise backend"
-  value       = aws_iam_policy.backend.arn
+  value       = var.iam_policy_mode == "managed" ? aws_iam_policy.backend[0].arn : null
 }
 
 output "push_policy_arn" {
   description = "ARN of the IAM policy for push operations (null if ECR not enabled)"
-  value       = var.enable_ecr ? aws_iam_policy.push_role[0].arn : null
+  value       = var.enable_ecr && var.iam_policy_mode == "managed" ? aws_iam_policy.push_role[0].arn : null
 }
 
 output "policy_document" {
@@ -105,11 +105,25 @@ output "ecs_execution_role_name" {
 
 output "ecs_task_role_arn" {
   description = <<-EOT
-    ARN of the role deployed workloads run as. This is the backend role: on ECS
-    the control plane and the workloads it launches share one identity, since
-    per-project task roles are not implemented (ADR-0005 D14).
+    ARN of the role deployed workloads run as. It is separate from the backend
+    role so application policies cannot grant the controller's permissions.
   EOT
-  value       = var.enable_ecs ? aws_iam_role.backend.arn : null
+  value       = var.enable_ecs ? aws_iam_role.ecs_workload[0].arn : null
+}
+
+output "ecs_task_role_name" {
+  description = "Name of the role deployed workloads run as."
+  value       = var.enable_ecs ? aws_iam_role.ecs_workload[0].name : null
+}
+
+output "ecs_traefik_role_arn" {
+  description = "ARN of the discovery-only Traefik task role."
+  value       = var.enable_ecs ? aws_iam_role.ecs_traefik[0].arn : null
+}
+
+output "ecs_traefik_role_name" {
+  description = "Name of the discovery-only Traefik task role."
+  value       = var.enable_ecs ? aws_iam_role.ecs_traefik[0].name : null
 }
 
 output "rise_config" {
@@ -152,7 +166,7 @@ output "rise_config" {
         cluster              = local.ecs_cluster_name
         region               = local.region
         execution_role_arn   = aws_iam_role.ecs_execution[0].arn
-        task_role_arn        = aws_iam_role.backend.arn
+        task_role_arn        = aws_iam_role.ecs_workload[0].arn
         ssm_parameter_prefix = local.ssm_prefix
         ssm_kms_key_id       = var.ssm_kms_key_arn
       }
