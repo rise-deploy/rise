@@ -103,7 +103,8 @@ variable "oidc_client_id" {
 }
 
 variable "oidc_group_claim" {
-  type = string
+  type    = string
+  default = "groups"
 }
 
 variable "admin_idp_group" {
@@ -112,7 +113,8 @@ variable "admin_idp_group" {
 }
 
 variable "platform_access_policy" {
-  type = string
+  type    = string
+  default = "allow_all"
 }
 
 variable "platform_allowed_idp_group" {
