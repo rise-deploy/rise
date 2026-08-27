@@ -92,6 +92,14 @@ fn group_routes_by_requirement<'a>(
 // Re-export constants used by webhook and other consumers
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const LABEL_PROJECT: &str = "rise.dev/project";
+/// The project's immutable identity, alongside the mutable `LABEL_PROJECT`
+/// name — same key (`project-uuid`) as the Docker/ECS backends'
+/// `rise_backend_core::labels::SUFFIX_PROJECT_UUID`, for one bookkeeping
+/// vocabulary across backends. Purely informational here: the `RiseProject`
+/// CRD's own identity is still name-derived (see `crd::ensure_rise_project`),
+/// so this label does not by itself make a rename safe the way it does for
+/// Docker/ECS's tag/label-based discovery.
+pub const LABEL_PROJECT_UUID: &str = "rise.dev/project-uuid";
 pub const LABEL_DEPLOYMENT_GROUP: &str = "rise.dev/deployment-group";
 pub const LABEL_DEPLOYMENT_ID: &str = "rise.dev/deployment-id";
 pub const LABEL_DEPLOYMENT_UUID: &str = "rise.dev/deployment-uuid";
@@ -324,6 +332,9 @@ impl ResourceBuilder {
         let mut labels = BTreeMap::new();
         labels.insert(LABEL_MANAGED_BY.to_string(), "rise".to_string());
         labels.insert(LABEL_PROJECT.to_string(), project.name.clone());
+        // A UUID's hex-and-hyphens form is already a valid label value; no
+        // sanitization needed the way the user-supplied name/environment need.
+        labels.insert(LABEL_PROJECT_UUID.to_string(), project.id.to_string());
         if let Some(env) = environment_name {
             labels.insert(
                 LABEL_ENVIRONMENT.to_string(),
@@ -2200,6 +2211,55 @@ mod tests {
                 .and_then(|annotations| annotations.get(ANNOTATION_ENV_SECRET_HASH))
                 .map(String::as_str),
             Some("abc123")
+        );
+    }
+
+    #[test]
+    fn create_k8s_deployment_stamps_project_uuid_on_object_and_pod_template() {
+        // The project's immutable identity must be queryable at both the
+        // Deployment-object level and on the pods it creates (the label rides
+        // in the pod template), matching the Docker/ECS backends' bookkeeping
+        // vocabulary. See LABEL_PROJECT_UUID's doc comment: this is purely
+        // informational on K8s and does not by itself make a rename safe.
+        let builder = test_resource_builder();
+        let project = test_project();
+        let deployment = test_deployment();
+
+        let k8s_deployment = legacy_app_deployment(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            "registry.example.test/rise/demo:20260502-000000",
+            8080,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let expected = project.id.to_string();
+        assert_eq!(
+            k8s_deployment
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_PROJECT_UUID)),
+            Some(&expected)
+        );
+        assert_eq!(
+            k8s_deployment
+                .spec
+                .as_ref()
+                .unwrap()
+                .template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .and_then(|labels| labels.get(LABEL_PROJECT_UUID)),
+            Some(&expected)
         );
     }
 

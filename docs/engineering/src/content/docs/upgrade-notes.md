@@ -45,6 +45,17 @@ Merged to `develop`:
   is `Authenticated` or `Member` carry the label at all; public projects have no
   middleware and are untouched. No action is required.
 
+- **Kubernetes installs restart every pod once, on the first reconcile after
+  upgrade.** Pods now also carry a `rise.dev/project-uuid` label alongside the
+  existing `rise.dev/project` (name) label — the project's immutable identity,
+  for the same bookkeeping vocabulary the Docker and ECS backends already use.
+  The label lands in the Deployment's pod template, so every Deployment gets a
+  new ReplicaSet and a one-time rolling restart to pick it up. This label is
+  purely informational on Kubernetes today (queryable via `kubectl get pods -l
+  rise.dev/project-uuid=...`); it does not by itself make a project rename safe
+  there, since the `RiseProject` CRD's own identity is still derived from the
+  project name. No action is required beyond expecting the restart.
+
 - **Action required if you granted generic resource API access by adding people
   to `auth.operator_users` — the API is now authorized, not operator-gated.**
   `/api/v1/resources` no longer refuses everyone but operators. Every request is
