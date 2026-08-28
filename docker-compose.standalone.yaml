@@ -182,7 +182,7 @@ services:
   # version 1.24 is too old"), and Traefik then 404s every route. v3.7.1
   # negotiates the API directly over the raw socket — no socket-proxy/relay.
   traefik:
-    image: traefik:v3.7.11
+    image: traefik:v3.7.12
     container_name: rise-traefik
     restart: unless-stopped
     command:
