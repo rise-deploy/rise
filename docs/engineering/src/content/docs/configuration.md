@@ -12,9 +12,12 @@ Configuration files are located in `config/` and loaded in this order:
 2. `{RISE_CONFIG_RUN_MODE}.yaml` - Environment-specific config (**required**)
    - `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
    - `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
-3. `local.yaml` - Local overrides (not checked into git, optional)
+3. The local configuration layer (optional):
+   - `RISE_LOCAL_CONFIG_YAML` when the environment variable is present
+   - `local.yaml` otherwise (not checked into git)
 
-Later files override earlier ones.
+Later layers override earlier ones. `RISE_LOCAL_CONFIG_YAML` is parsed as YAML
+and replaces the `local.yaml` source; Rise does not load both.
 
 In container deployments, `RISE_CONFIG_DIR` is typically `/etc/rise`.
 
@@ -666,11 +669,11 @@ The `icon` field accepts either:
 ### Defaults and overrides
 
 Rise ships a `default.yaml` config layer with four curated templates. The
-config loader (`default.yaml` → `<run_mode>.yaml` → `local.yaml`) merges maps
+config loader (`default.yaml` → `<run_mode>.yaml` → local layer) merges maps
 but **replaces arrays**, so any `quickstart.templates` list in a later layer
 replaces the defaults entirely. To extend the shipped catalog, copy
-`/etc/rise/default.yaml`'s `quickstart.templates` into your override file and
-add to the list.
+`/etc/rise/default.yaml`'s `quickstart.templates` into your local layer and add
+to the list.
 
 ### Validation
 

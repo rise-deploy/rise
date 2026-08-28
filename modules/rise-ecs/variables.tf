@@ -447,13 +447,13 @@ variable "rise_memory" {
 
 variable "control_plane_local_config_secret_arn" {
   description = <<-EOT
-    Secrets Manager secret whose value is a Rise YAML overlay. The control
-    plane writes it to a mode-0600 local.yaml before startup, after which Rise
-    layers it over the shipped default.yaml and ecs.yaml. Null loads no overlay.
+    Secrets Manager secret whose value supplies Rise's local YAML configuration
+    layer over the shipped default.yaml and ecs.yaml. Null loads no overlay.
 
     The task execution role must be allowed to read this ARN. Use the secret
     for operator-specific configuration and credentials that must not appear in
-    the task definition, such as extension-provider settings.
+    the task definition, such as extension-provider settings. The ECS module
+    owns server.host and server.port; the overlay must not set them.
   EOT
   type        = string
   default     = null

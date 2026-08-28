@@ -149,11 +149,13 @@ secret live in Secrets Manager and reach the task through the task definition's
 
 Set `control_plane_local_config_secret_arn` when the control plane needs an
 operator-specific YAML overlay, for example extension-provider configuration.
-The secret value becomes `local.yaml`, which Rise loads after its shipped
-`default.yaml` and `ecs.yaml`. The task bootstrap writes the file with mode 0600
-and removes the secret from the environment before starting Rise. Include the
-secret ARN in `modules/rise-aws`'s `ecs_secret_arns` so the task execution role
-can resolve it:
+ECS injects the secret value as `RISE_LOCAL_CONFIG_YAML`, which supplies the
+local configuration layer that Rise loads after its shipped `default.yaml` and
+`ecs.yaml`. The ECS module owns the control-plane address `0.0.0.0:3000`; the
+overlay must not set `server.host` or `server.port` because task networking,
+security groups, internal URLs and Traefik use that address. Include the secret
+ARN in `modules/rise-aws`'s `ecs_secret_arns` so the task execution role can
+resolve it:
 
 ```hcl
 module "rise_aws" {

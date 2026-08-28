@@ -19,11 +19,11 @@ resource "aws_ecs_task_definition" "rise" {
   }
 
   container_definitions = jsonencode([
-    merge({
+    {
       name      = "rise"
       image     = local.rise_image_ref
       essential = true
-      command   = local.control_plane_command
+      command   = ["backend", "server"]
 
       portMappings = [{ containerPort = 3000 }]
 
@@ -57,7 +57,7 @@ resource "aws_ecs_task_definition" "rise" {
           "awslogs-stream-prefix" = "rise"
         }
       }
-    }, local.control_plane_entry_point)
+    }
   ])
 
   tags = local.tags
