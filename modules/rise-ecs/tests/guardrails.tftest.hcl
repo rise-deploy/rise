@@ -104,6 +104,28 @@ run "rejects_ecr_without_a_push_role" {
   expect_failures = [aws_lb.this]
 }
 
+run "rejects_external_traefik_mode_without_an_arn" {
+  command = plan
+
+  variables {
+    create_traefik_task_role = false
+    traefik_task_role_arn    = null
+  }
+
+  expect_failures = [var.create_traefik_task_role]
+}
+
+run "rejects_module_owned_traefik_mode_with_an_external_arn" {
+  command = plan
+
+  variables {
+    create_traefik_task_role = true
+    traefik_task_role_arn    = "arn:aws:iam::123456789012:role/rise-traefik"
+  }
+
+  expect_failures = [var.create_traefik_task_role]
+}
+
 run "rejects_an_install_with_no_identity_provider" {
   command = plan
 

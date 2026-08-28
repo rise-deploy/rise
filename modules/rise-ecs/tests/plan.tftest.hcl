@@ -76,6 +76,25 @@ run "creates_a_whole_install" {
   }
 }
 
+run "uses_an_external_traefik_role_without_creating_iam" {
+  command = plan
+
+  variables {
+    create_traefik_task_role = false
+    traefik_task_role_arn    = "arn:aws:iam::123456789012:role/rise-traefik"
+  }
+
+  assert {
+    condition     = length(aws_iam_role.traefik) == 0
+    error_message = "an external Traefik role must disable module-owned IAM"
+  }
+
+  assert {
+    condition     = aws_ecs_task_definition.traefik.task_role_arn == "arn:aws:iam::123456789012:role/rise-traefik"
+    error_message = "the external Traefik role must reach the task definition"
+  }
+}
+
 run "alb_uses_https_and_group_restricted_auth" {
   command = plan
 

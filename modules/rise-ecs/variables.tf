@@ -50,10 +50,32 @@ variable "traefik_task_role_arn" {
     Pre-created task role for Traefik. Leave null and the module creates one.
 
     Set it where the applying identity has no IAM-write -- the e2e harness runs
-    that way, with IAM pre-created in a bootstrap apply.
+    that way, with IAM pre-created in a bootstrap apply. When the ARN comes
+    from another module's resource output, also set create_traefik_task_role to
+    false so resource counts stay known during the first plan.
   EOT
   type        = string
   default     = null
+}
+
+variable "create_traefik_task_role" {
+  description = <<-EOT
+    Whether this module creates Traefik's task role. Null infers the decision
+    from traefik_task_role_arn for compatibility with plan-known ARNs. Set
+    false explicitly when the external ARN is unknown until apply; Terraform
+    requires resource count decisions to be known during planning.
+  EOT
+  type        = bool
+  default     = null
+
+  validation {
+    condition = var.create_traefik_task_role == null || (
+      var.create_traefik_task_role
+      ? var.traefik_task_role_arn == null
+      : var.traefik_task_role_arn != null
+    )
+    error_message = "create_traefik_task_role must be true with no traefik_task_role_arn, or false with an external ARN."
+  }
 }
 
 variable "registry_type" {
