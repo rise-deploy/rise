@@ -146,6 +146,26 @@ $ htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
 secret live in Secrets Manager and reach the task through the task definition's
 `secrets` block, so they never appear in a `DescribeTaskDefinition` response.
 
+Set `control_plane_local_config_secret_arn` when the control plane needs an
+operator-specific YAML overlay, for example extension-provider configuration.
+The secret value becomes `local.yaml`, which Rise loads after its shipped
+`default.yaml` and `ecs.yaml`. The task bootstrap writes the file with mode 0600
+and removes the secret from the environment before starting Rise. Include the
+secret ARN in `modules/rise-aws`'s `ecs_secret_arns` so the task execution role
+can resolve it:
+
+```hcl
+module "rise_aws" {
+  # ...
+  ecs_secret_arns = [aws_secretsmanager_secret.rise_local_config.arn]
+}
+
+module "rise_ecs" {
+  # ...
+  control_plane_local_config_secret_arn = aws_secretsmanager_secret.rise_local_config.arn
+}
+```
+
 **The generated database password is in Terraform state.** Use an encrypted
 remote backend with restricted access. To keep it out entirely, create the
 secret yourself and pass `database_url_secret_arn` — the module then creates no

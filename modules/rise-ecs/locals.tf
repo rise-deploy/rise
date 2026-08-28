@@ -88,6 +88,31 @@ locals {
   # the two cannot drift on the one contract that matters: what the control
   # plane's environment and Traefik labels look like on ECS.
   rise_environment = module.control_plane_env.environment
+
+  control_plane_command = var.control_plane_local_config_secret_arn == null ? ["backend", "server"] : [<<-SH
+    set -eu
+    umask 077
+    mkdir -p /tmp/rise-config
+    cp /etc/rise/default.yaml /etc/rise/ecs.yaml /tmp/rise-config/
+    printf '%s' "$RISE_LOCAL_CONFIG_YAML" > /tmp/rise-config/local.yaml
+    unset RISE_LOCAL_CONFIG_YAML
+    export RISE_CONFIG_DIR=/tmp/rise-config
+    exec /usr/local/bin/rise backend server
+  SH
+  ]
+
+  control_plane_entry_point = var.control_plane_local_config_secret_arn == null ? {} : {
+    entryPoint = ["/bin/sh", "-c"]
+  }
+
+  control_plane_secrets = concat([
+    { name = "DATABASE_URL", valueFrom = local.database_url_secret_arn },
+    { name = "RISE_JWT_SIGNING_SECRET", valueFrom = aws_secretsmanager_secret.jwt_signing_secret.arn },
+    { name = "RISE_ENCRYPTION_KEY", valueFrom = aws_secretsmanager_secret.encryption_key.arn },
+    { name = "OIDC_CLIENT_SECRET", valueFrom = aws_secretsmanager_secret.oidc_client_secret.arn },
+    ], var.control_plane_local_config_secret_arn == null ? [] : [
+    { name = "RISE_LOCAL_CONFIG_YAML", valueFrom = var.control_plane_local_config_secret_arn },
+  ])
 }
 
 module "control_plane_env" {

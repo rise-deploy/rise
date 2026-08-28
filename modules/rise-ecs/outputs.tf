@@ -103,12 +103,14 @@ output "rise_task_environment" {
 
 output "rise_task_secrets" {
   description = "Secrets Manager ARNs to inject as environment variables, keyed by variable name."
-  value = {
+  value = merge({
     DATABASE_URL            = local.database_url_secret_arn
     RISE_JWT_SIGNING_SECRET = aws_secretsmanager_secret.jwt_signing_secret.arn
     RISE_ENCRYPTION_KEY     = aws_secretsmanager_secret.encryption_key.arn
     OIDC_CLIENT_SECRET      = aws_secretsmanager_secret.oidc_client_secret.arn
-  }
+    }, var.control_plane_local_config_secret_arn == null ? {} : {
+    RISE_LOCAL_CONFIG_YAML = var.control_plane_local_config_secret_arn
+  })
 }
 
 output "secret_arns_for_execution_role" {
@@ -123,6 +125,7 @@ output "secret_arns_for_execution_role" {
     aws_secretsmanager_secret.encryption_key.arn,
     aws_secretsmanager_secret.oidc_client_secret.arn,
     var.repository_credentials_secret_arn,
+    var.control_plane_local_config_secret_arn,
   ])
 }
 

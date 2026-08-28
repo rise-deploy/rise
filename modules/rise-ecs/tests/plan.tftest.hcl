@@ -74,6 +74,49 @@ run "creates_a_whole_install" {
     condition     = local.rise_environment["RISE_ECS_ASSIGN_PUBLIC_IP"] == "false"
     error_message = "workloads must run in private subnets without public IPs"
   }
+
+  assert {
+    condition = alltrue([
+      join(" ", local.control_plane_command) == "backend server",
+      length(local.control_plane_entry_point) == 0,
+    ])
+    error_message = "the control plane must start directly when no local config overlay is configured"
+  }
+}
+
+run "loads_a_secret_local_config_overlay" {
+  command = plan
+
+  variables {
+    control_plane_local_config_secret_arn = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/local-config-abc123"
+  }
+
+  assert {
+    condition     = local.control_plane_entry_point.entryPoint == ["/bin/sh", "-c"]
+    error_message = "a local config overlay must use the shell bootstrap entrypoint"
+  }
+
+  assert {
+    condition = alltrue([
+      strcontains(one(local.control_plane_command), "local.yaml"),
+      strcontains(one(local.control_plane_command), "unset RISE_LOCAL_CONFIG_YAML"),
+    ])
+    error_message = "the bootstrap must write the overlay with restrictive permissions and remove it from the Rise process environment"
+  }
+
+  assert {
+    condition = one([
+      for secret in local.control_plane_secrets :
+      secret.valueFrom
+      if secret.name == "RISE_LOCAL_CONFIG_YAML"
+    ]) == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/local-config-abc123"
+    error_message = "the overlay must reach the task through ECS secret injection"
+  }
+
+  assert {
+    condition     = output.rise_task_secrets["RISE_LOCAL_CONFIG_YAML"] == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/local-config-abc123"
+    error_message = "module outputs must expose the overlay secret to external task-definition wiring"
+  }
 }
 
 run "alb_uses_https_and_group_restricted_auth" {

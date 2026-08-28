@@ -19,11 +19,11 @@ resource "aws_ecs_task_definition" "rise" {
   }
 
   container_definitions = jsonencode([
-    {
+    merge({
       name      = "rise"
       image     = local.rise_image_ref
       essential = true
-      command   = ["backend", "server"]
+      command   = local.control_plane_command
 
       portMappings = [{ containerPort = 3000 }]
 
@@ -33,12 +33,7 @@ resource "aws_ecs_task_definition" "rise" {
 
       # Resolved by ECS at task start under the execution role, so none of these
       # appear in a DescribeTaskDefinition response.
-      secrets = [
-        { name = "DATABASE_URL", valueFrom = local.database_url_secret_arn },
-        { name = "RISE_JWT_SIGNING_SECRET", valueFrom = aws_secretsmanager_secret.jwt_signing_secret.arn },
-        { name = "RISE_ENCRYPTION_KEY", valueFrom = aws_secretsmanager_secret.encryption_key.arn },
-        { name = "OIDC_CLIENT_SECRET", valueFrom = aws_secretsmanager_secret.oidc_client_secret.arn },
-      ]
+      secrets = local.control_plane_secrets
 
       healthCheck = {
         # `rise backend health` rather than curl: an ECS health check runs
@@ -62,7 +57,7 @@ resource "aws_ecs_task_definition" "rise" {
           "awslogs-stream-prefix" = "rise"
         }
       }
-    }
+    }, local.control_plane_entry_point)
   ])
 
   tags = local.tags
