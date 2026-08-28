@@ -76,7 +76,11 @@ locals {
   oidc_issuer = var.deploy_dex ? "https://dex.${var.ingress_domain}/dex" : var.oidc_issuer
 
   workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
-  traefik_task_role_arn  = coalesce(var.traefik_task_role_arn, try(aws_iam_role.traefik[0].arn, null))
+  create_traefik_task_role = coalesce(
+    var.create_traefik_task_role,
+    var.traefik_task_role_arn == null,
+  )
+  traefik_task_role_arn = coalesce(var.traefik_task_role_arn, try(aws_iam_role.traefik[0].arn, null))
 
   log_group_name = coalesce(var.log_group_name, "/${local.name}")
   rise_image_ref = var.rise_image_ref != null ? var.rise_image_ref : (

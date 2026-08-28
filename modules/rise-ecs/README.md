@@ -38,11 +38,12 @@ module "rise_ecs" {
   admin_email    = "ops@example.com"
   acme_email     = "ops@example.com"
 
-  controller_role_arn = module.rise_aws.role_arn
-  execution_role_arn  = module.rise_aws.ecs_execution_role_arn
-  workload_task_role_arn = module.rise_aws.ecs_task_role_arn
-  traefik_task_role_arn  = module.rise_aws.ecs_traefik_role_arn
-  ecr_push_role_arn   = module.rise_aws.push_role_arn
+  controller_role_arn      = module.rise_aws.role_arn
+  execution_role_arn       = module.rise_aws.ecs_execution_role_arn
+  workload_task_role_arn   = module.rise_aws.ecs_task_role_arn
+  traefik_task_role_arn    = module.rise_aws.ecs_traefik_role_arn
+  create_traefik_task_role = false
+  ecr_push_role_arn        = module.rise_aws.push_role_arn
 
   oidc_issuer        = "https://id.example.com"
   oidc_client_id     = "rise"
