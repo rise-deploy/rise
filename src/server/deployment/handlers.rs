@@ -1982,7 +1982,12 @@ async fn perform_status_update(
             let error_msg = payload.error_message.as_deref().unwrap_or("Unknown error");
             let deployment = db_deployments::mark_failed(&state.db_pool, deployment.id, error_msg)
                 .await
-                .internal_err("Failed to update deployment")?;
+                .internal_err("Failed to update deployment")?
+                .ok_or_else(|| {
+                    ServerError::conflict(
+                        "Deployment was modified concurrently; please retry".to_string(),
+                    )
+                })?;
 
             // Update project status to Failed
             projects::update_calculated_status(&state.db_pool, project.id)
@@ -2406,7 +2411,7 @@ pub async fn stop_deployments_by_group(
         let result = if state_machine::is_cancellable(&deployment.status) {
             db_deployments::mark_cancelling(&state.db_pool, deployment.id)
                 .await
-                .map(|_| "Cancelling")
+                .map(|opt| opt.map(|_| "Cancelling"))
         } else {
             db_deployments::mark_terminating(
                 &state.db_pool,
@@ -2414,15 +2419,24 @@ pub async fn stop_deployments_by_group(
                 crate::db::models::TerminationReason::UserStopped,
             )
             .await
-            .map(|_| "Terminating")
+            .map(|opt| opt.map(|_| "Terminating"))
         };
         match result {
-            Ok(new_status) => {
+            Ok(Some(new_status)) => {
                 info!(
                     "Marked deployment {} as {}",
                     deployment.deployment_id, new_status
                 );
                 stopped_ids.push(deployment.deployment_id);
+            }
+            Ok(None) => {
+                // Guard rejected the write: some other request already moved
+                // this deployment on. Benign in a bulk group-stop — nothing
+                // left for this one to do.
+                info!(
+                    "Deployment {} was already transitioning concurrently; skipping",
+                    deployment.deployment_id
+                );
             }
             Err(e) => {
                 error!(
@@ -2525,10 +2539,17 @@ pub async fn stop_deployment(
     // Use the appropriate state transition based on current status:
     // Pre-infrastructure states (Pending, Building, Pushing, Pushed, Deploying) → Cancelling
     // Infrastructure states (Healthy, Unhealthy) → Terminating
+    let concurrently_modified = || {
+        ServerError::conflict(format!(
+            "Deployment '{}' was modified concurrently; please retry",
+            deployment_id
+        ))
+    };
     let updated_deployment = if state_machine::is_cancellable(&deployment.status) {
         let d = db_deployments::mark_cancelling(&state.db_pool, deployment.id)
             .await
-            .internal_err("Failed to cancel deployment")?;
+            .internal_err("Failed to cancel deployment")?
+            .ok_or_else(concurrently_modified)?;
         info!("Marked deployment {} as Cancelling", deployment_id);
         d
     } else {
@@ -2538,7 +2559,8 @@ pub async fn stop_deployment(
             crate::db::models::TerminationReason::UserStopped,
         )
         .await
-        .internal_err("Failed to stop deployment")?;
+        .internal_err("Failed to stop deployment")?
+        .ok_or_else(concurrently_modified)?;
         info!("Marked deployment {} as Terminating", deployment_id);
         d
     };

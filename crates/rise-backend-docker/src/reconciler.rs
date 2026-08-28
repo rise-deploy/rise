@@ -1149,17 +1149,21 @@ impl DockerReconciler {
                                 );
                                 let deployment_uuid = Uuid::parse_str(&d.deployment_uuid)
                                     .context("Desired container has an invalid deployment UUID")?;
-                                self.store
+                                if self
+                                    .store
                                     .mark_deployment_failed(deployment_uuid, &message)
                                     .await
                                     .context(
                                         "Failed to persist terminal container creation failure",
-                                    )?;
-                                self.store
-                                    .update_project_calculated_status(project.id)
-                                    .await
-                                    .context("Failed to update project status after container creation failure")?;
-                                failed_deployment_uuids.insert(d.deployment_uuid.clone());
+                                    )?
+                                    .is_some()
+                                {
+                                    self.store
+                                        .update_project_calculated_status(project.id)
+                                        .await
+                                        .context("Failed to update project status after container creation failure")?;
+                                    failed_deployment_uuids.insert(d.deployment_uuid.clone());
+                                }
                             } else {
                                 error!(
                                     project = %project.name,
@@ -2098,22 +2102,32 @@ impl DockerReconciler {
                     deployment_id = %deployment.deployment_id,
                     "Healthy deployment is now unhealthy: {unhealthy_reason}"
                 );
-                self.store
+                if self
+                    .store
                     .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                    .await?
+                    .is_some()
+                {
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             }
             DeploymentStatus::Unhealthy if is_ready => {
                 info!(
                     deployment_id = %deployment.deployment_id,
                     "Unhealthy deployment has recovered, marking as Healthy"
                 );
-                self.store.mark_deployment_healthy(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                if self
+                    .store
+                    .mark_deployment_healthy(deployment.id)
+                    .await?
+                    .is_some()
+                {
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             }
             _ => {}
         }

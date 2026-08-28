@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use crate::runtime::{DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES};
 use crate::state_machine;
-use crate::store::DeploymentStore;
+use crate::store::{DeploymentStore, SupersessionOutcome};
 
 /// Backend-specific cleanup run when a deployment is superseded by a newly
 /// healthy one in the same group. Default no-op.
@@ -66,8 +66,13 @@ pub async fn perform_status_transition(
                     PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
                 );
                 warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                store.mark_deployment_failed(deployment.id, &msg).await?;
-                store.update_project_calculated_status(project.id).await?;
+                if store
+                    .mark_deployment_failed(deployment.id, &msg)
+                    .await?
+                    .is_some()
+                {
+                    store.update_project_calculated_status(project.id).await?;
+                }
             }
         }
         DeploymentStatus::Cancelling => {
@@ -75,8 +80,13 @@ pub async fn perform_status_transition(
                 deployment_id = %deployment.deployment_id,
                 "Cancelling deployment — marking as Cancelled"
             );
-            store.mark_deployment_cancelled(deployment.id).await?;
-            store.update_project_calculated_status(project.id).await?;
+            if store
+                .mark_deployment_cancelled(deployment.id)
+                .await?
+                .is_some()
+            {
+                store.update_project_calculated_status(project.id).await?;
+            }
         }
         DeploymentStatus::Terminating => {
             complete_termination(store, project, deployment).await?;
@@ -100,8 +110,13 @@ pub async fn perform_status_transition(
                         elapsed.num_seconds()
                     );
                     warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                    store.mark_deployment_failed(deployment.id, &msg).await?;
-                    store.update_project_calculated_status(project.id).await?;
+                    if store
+                        .mark_deployment_failed(deployment.id, &msg)
+                        .await?
+                        .is_some()
+                    {
+                        store.update_project_calculated_status(project.id).await?;
+                    }
                 }
             }
         }
@@ -124,10 +139,13 @@ pub async fn perform_status_transition(
                 deployment_id = %deployment.deployment_id,
                 "Deployment has expired, marking as Terminating"
             );
-            store
+            if store
                 .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
-                .await?;
-            store.update_project_calculated_status(project.id).await?;
+                .await?
+                .is_some()
+            {
+                store.update_project_calculated_status(project.id).await?;
+            }
         }
     }
 
@@ -141,16 +159,14 @@ pub async fn complete_termination(
     project: &Project,
     deployment: &Deployment,
 ) -> Result<()> {
-    match deployment.termination_reason {
+    let applied = match deployment.termination_reason {
         Some(TerminationReason::Superseded) => {
-            store.mark_deployment_superseded(deployment.id).await?;
+            store.mark_deployment_superseded(deployment.id).await?
         }
         Some(TerminationReason::UserStopped) => {
-            store.mark_deployment_stopped(deployment.id).await?;
+            store.mark_deployment_stopped(deployment.id).await?
         }
-        Some(TerminationReason::Expired) => {
-            store.mark_deployment_expired(deployment.id).await?;
-        }
+        Some(TerminationReason::Expired) => store.mark_deployment_expired(deployment.id).await?,
         Some(TerminationReason::Failed) => {
             store
                 .mark_deployment_failed(
@@ -160,17 +176,21 @@ pub async fn complete_termination(
                         .as_deref()
                         .unwrap_or("Deployment failed"),
                 )
-                .await?;
+                .await?
         }
         Some(TerminationReason::Cancelled) => {
-            store.mark_deployment_cancelled(deployment.id).await?;
+            store.mark_deployment_cancelled(deployment.id).await?
         }
         None => {
             // Missing termination reason resolves to Stopped.
-            store.mark_deployment_stopped(deployment.id).await?;
+            store.mark_deployment_stopped(deployment.id).await?
         }
     }
-    store.update_project_calculated_status(project.id).await?;
+    .is_some();
+
+    if applied {
+        store.update_project_calculated_status(project.id).await?;
+    }
     Ok(())
 }
 
@@ -186,29 +206,37 @@ pub async fn handle_deployment_became_healthy(
     project: &Project,
     deployment: &Deployment,
 ) -> Result<()> {
-    // Find currently active deployment in this group BEFORE marking new as healthy.
-    let active_in_group = store
-        .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
+    // Atomically: mark this deployment Healthy, and if some other deployment
+    // is currently the group's active (Healthy) one, mark it Terminating in
+    // the same database transaction. A crash between "mark new healthy" and
+    // "mark old terminating" can then never leave both non-terminal.
+    let outcome: SupersessionOutcome = store
+        .mark_deployment_healthy_and_supersede(
+            deployment.id,
+            project.id,
+            &deployment.deployment_group,
+        )
         .await?;
 
-    store.mark_deployment_healthy(deployment.id).await?;
+    if !outcome.became_healthy {
+        // The deployment moved to a protected status (e.g. a concurrent stop
+        // request already moved it to Terminating) between the reconciler's
+        // readiness read and this call. A routine "became healthy"
+        // transition must not resurrect or override that decision.
+        return Ok(());
+    }
 
-    if let Some(old_active) = active_in_group {
-        if old_active.id != deployment.id && !state_machine::is_terminal(&old_active.status) {
-            info!(
-                "Deployment {} replacing {} in group '{}', marking old as Terminating",
-                deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
-            );
-            store
-                .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
-                .await?;
-            if let Some(hook) = hook {
-                if let Err(e) = hook.on_superseded(project, &old_active).await {
-                    warn!(
-                        deployment_id = %old_active.deployment_id,
-                        "Post-supersession cleanup failed: {:?}", e
-                    );
-                }
+    if let Some(old_active) = outcome.superseded {
+        info!(
+            "Deployment {} replacing {} in group '{}', marking old as Terminating",
+            deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
+        );
+        if let Some(hook) = hook {
+            if let Err(e) = hook.on_superseded(project, &old_active).await {
+                warn!(
+                    deployment_id = %old_active.deployment_id,
+                    "Post-supersession cleanup failed: {:?}", e
+                );
             }
         }
     }
@@ -217,7 +245,10 @@ pub async fn handle_deployment_became_healthy(
     // the status, not on `is_active`: the flag is set in the write below, so a
     // replica that died between marking a deployment healthy and flagging it
     // active would otherwise leave a sibling that is serving traffic and
-    // would never be retired.
+    // would never be retired. Self-healing: this also catches an old-active
+    // deployment currently sitting in `Unhealthy` (not covered by the atomic
+    // write above, which only supersedes a `Healthy` predecessor) the next
+    // time some deployment in the group becomes healthy.
     let others = store
         .find_non_terminal_deployments_for_project_and_group(
             project.id,
@@ -319,6 +350,10 @@ mod tests {
         calls: Mutex<Vec<String>>,
         active_in_group: Mutex<HashMap<(Uuid, String), Deployment>>,
         siblings_in_group: Mutex<HashMap<(Uuid, String), Vec<Deployment>>>,
+        /// When set, `mark_deployment_healthy_and_supersede` reports
+        /// `became_healthy: false` without touching `calls` — simulating a
+        /// deployment that already moved to a protected status.
+        reject_healthy: Mutex<bool>,
     }
 
     #[async_trait]
@@ -375,18 +410,6 @@ mod tests {
         ) -> Result<Vec<Deployment>> {
             unimplemented!()
         }
-        async fn find_active_deployment_for_project_and_group(
-            &self,
-            project_id: Uuid,
-            group: &str,
-        ) -> Result<Option<Deployment>> {
-            Ok(self
-                .active_in_group
-                .lock()
-                .unwrap()
-                .get(&(project_id, group.to_string()))
-                .cloned())
-        }
         async fn find_non_terminal_deployments_for_project_and_group(
             &self,
             project_id: Uuid,
@@ -422,48 +445,48 @@ mod tests {
             &self,
             _id: Uuid,
             error_message: &str,
-        ) -> Result<Deployment> {
+        ) -> Result<Option<Deployment>> {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("failed:{error_message}"));
-            Ok(deployment(DeploymentStatus::Failed))
+            Ok(Some(deployment(DeploymentStatus::Failed)))
         }
-        async fn mark_deployment_cancelling(&self, _id: Uuid) -> Result<Deployment> {
+        async fn mark_deployment_cancelling(&self, _id: Uuid) -> Result<Option<Deployment>> {
             unimplemented!()
         }
-        async fn mark_deployment_cancelled(&self, _id: Uuid) -> Result<Deployment> {
+        async fn mark_deployment_cancelled(&self, _id: Uuid) -> Result<Option<Deployment>> {
             self.calls.lock().unwrap().push("cancelled".to_string());
-            Ok(deployment(DeploymentStatus::Cancelled))
+            Ok(Some(deployment(DeploymentStatus::Cancelled)))
         }
-        async fn mark_deployment_stopped(&self, _id: Uuid) -> Result<Deployment> {
+        async fn mark_deployment_stopped(&self, _id: Uuid) -> Result<Option<Deployment>> {
             self.calls.lock().unwrap().push("stopped".to_string());
-            Ok(deployment(DeploymentStatus::Stopped))
+            Ok(Some(deployment(DeploymentStatus::Stopped)))
         }
-        async fn mark_deployment_superseded(&self, _id: Uuid) -> Result<Deployment> {
+        async fn mark_deployment_superseded(&self, _id: Uuid) -> Result<Option<Deployment>> {
             self.calls.lock().unwrap().push("superseded".to_string());
-            Ok(deployment(DeploymentStatus::Superseded))
+            Ok(Some(deployment(DeploymentStatus::Superseded)))
         }
-        async fn mark_deployment_expired(&self, _id: Uuid) -> Result<Deployment> {
+        async fn mark_deployment_expired(&self, _id: Uuid) -> Result<Option<Deployment>> {
             self.calls.lock().unwrap().push("expired".to_string());
-            Ok(deployment(DeploymentStatus::Expired))
+            Ok(Some(deployment(DeploymentStatus::Expired)))
         }
-        async fn mark_deployment_healthy(&self, _id: Uuid) -> Result<Deployment> {
+        async fn mark_deployment_healthy(&self, _id: Uuid) -> Result<Option<Deployment>> {
             self.calls.lock().unwrap().push("healthy".to_string());
-            Ok(deployment(DeploymentStatus::Healthy))
+            Ok(Some(deployment(DeploymentStatus::Healthy)))
         }
         async fn mark_deployment_unhealthy(
             &self,
             _id: Uuid,
             _reason: String,
-        ) -> Result<Deployment> {
+        ) -> Result<Option<Deployment>> {
             unimplemented!()
         }
         async fn mark_deployment_terminating(
             &self,
             id: Uuid,
             reason: TerminationReason,
-        ) -> Result<Deployment> {
+        ) -> Result<Option<Deployment>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -471,7 +494,39 @@ mod tests {
             let mut d = deployment(DeploymentStatus::Terminating);
             d.id = id;
             d.termination_reason = Some(reason);
-            Ok(d)
+            Ok(Some(d))
+        }
+        async fn mark_deployment_healthy_and_supersede(
+            &self,
+            deployment_id: Uuid,
+            project_id: Uuid,
+            deployment_group: &str,
+        ) -> Result<SupersessionOutcome> {
+            if *self.reject_healthy.lock().unwrap() {
+                return Ok(SupersessionOutcome {
+                    became_healthy: false,
+                    superseded: None,
+                });
+            }
+            self.calls.lock().unwrap().push("healthy".to_string());
+            let superseded = self
+                .active_in_group
+                .lock()
+                .unwrap()
+                .get(&(project_id, deployment_group.to_string()))
+                .filter(|d| d.id != deployment_id && d.status == DeploymentStatus::Healthy)
+                .cloned();
+            if let Some(old) = &superseded {
+                self.calls.lock().unwrap().push(format!(
+                    "terminating:{}:{:?}",
+                    old.id,
+                    TerminationReason::Superseded
+                ));
+            }
+            Ok(SupersessionOutcome {
+                became_healthy: true,
+                superseded,
+            })
         }
         async fn mark_deployment_as_active(
             &self,
@@ -731,5 +786,48 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.starts_with(&format!("terminating:{}", straggler.id))));
+    }
+
+    #[tokio::test]
+    async fn when_the_atomic_write_is_rejected_nothing_else_happens() {
+        struct RecordingHook {
+            called_with: Mutex<Option<Uuid>>,
+        }
+        #[async_trait]
+        impl SupersededHook for RecordingHook {
+            async fn on_superseded(
+                &self,
+                _project: &Project,
+                superseded: &Deployment,
+            ) -> Result<()> {
+                *self.called_with.lock().unwrap() = Some(superseded.id);
+                Ok(())
+            }
+        }
+
+        let store = FakeStore::default();
+        *store.reject_healthy.lock().unwrap() = true;
+        let project = project();
+        let new = deployment(DeploymentStatus::Deploying);
+        let mut old_active = deployment(DeploymentStatus::Healthy);
+        old_active.deployment_group = new.deployment_group.clone();
+        store
+            .active_in_group
+            .lock()
+            .unwrap()
+            .insert((project.id, new.deployment_group.clone()), old_active);
+        let hook = RecordingHook {
+            called_with: Mutex::new(None),
+        };
+
+        handle_deployment_became_healthy(&store, Some(&hook), &project, &new)
+            .await
+            .unwrap();
+
+        assert!(
+            store.calls.lock().unwrap().is_empty(),
+            "a rejected atomic write must trigger no hook, no straggler cleanup, no activation"
+        );
+        assert_eq!(*hook.called_with.lock().unwrap(), None);
     }
 }

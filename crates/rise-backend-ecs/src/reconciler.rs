@@ -738,12 +738,16 @@ impl EcsReconciler {
                             deployment = %deployment.deployment_id,
                             "Rejecting deployment: {}", message
                         );
-                        self.store
+                        if self
+                            .store
                             .mark_deployment_failed(deployment.id, &message)
-                            .await?;
-                        self.store
-                            .update_project_calculated_status(project.id)
-                            .await?;
+                            .await?
+                            .is_some()
+                        {
+                            self.store
+                                .update_project_calculated_status(project.id)
+                                .await?;
+                        }
                     } else {
                         // Already serving, or on its way down. See
                         // `rejection_fails_deployment`.
@@ -2123,18 +2127,28 @@ impl EcsReconciler {
                 );
             }
             DeploymentStatus::Healthy if !all_ready => {
-                self.store
+                if self
+                    .store
                     .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                    .await?
+                    .is_some()
+                {
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             }
             DeploymentStatus::Unhealthy if all_ready => {
-                self.store.mark_deployment_healthy(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                if self
+                    .store
+                    .mark_deployment_healthy(deployment.id)
+                    .await?
+                    .is_some()
+                {
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             }
             _ => {}
         }
