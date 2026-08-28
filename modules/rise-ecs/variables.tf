@@ -445,6 +445,20 @@ variable "rise_memory" {
   default     = "2048"
 }
 
+variable "control_plane_local_config_secret_arn" {
+  description = <<-EOT
+    Secrets Manager secret whose value is a Rise YAML overlay. The control
+    plane writes it to a mode-0600 local.yaml before startup, after which Rise
+    layers it over the shipped default.yaml and ecs.yaml. Null loads no overlay.
+
+    The task execution role must be allowed to read this ARN. Use the secret
+    for operator-specific configuration and credentials that must not appear in
+    the task definition, such as extension-provider settings.
+  EOT
+  type        = string
+  default     = null
+}
+
 variable "rise_desired_count" {
   description = "Control-plane replicas. Safe above 1: the reconcile loop is leader-elected through rise-runtime-sync."
   type        = number
