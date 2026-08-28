@@ -237,15 +237,26 @@ run "traefik_discovery_can_be_confined_to_one_install" {
   command = plan
 
   variables {
-    traefik_constraints = "Label(`rise.dev/controller-class`, `pr-457`)"
+    controller_class_name = "pr-462"
+    traefik_constraints   = "Label(`rise.dev/controller-class`, `pr-462`)"
   }
 
   assert {
     condition = contains(
       local.traefik_command,
-      "--providers.ecs.constraints=Label(`rise.dev/controller-class`, `pr-457`)"
+      "--providers.ecs.constraints=Label(`rise.dev/controller-class`, `pr-462`)"
     )
     error_message = "traefik_constraints must reach Traefik as a provider flag"
+  }
+
+  assert {
+    condition     = module.control_plane_env.docker_labels["rise.dev/controller-class"] == "pr-462"
+    error_message = "controller_class_name must label the control plane matched by Traefik"
+  }
+
+  assert {
+    condition     = module.control_plane_env.environment.RISE_CONTROLLER_CLASS_NAME == "pr-462"
+    error_message = "controller_class_name must reach the controller's orphan-reconciliation scope"
   }
 }
 

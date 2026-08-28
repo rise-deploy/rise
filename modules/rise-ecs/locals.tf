@@ -123,6 +123,7 @@ module "control_plane_env" {
   allow_private_ssrf = false
 
   resource_prefix         = var.resource_prefix
+  controller_class_name   = var.controller_class_name
   ssm_parameter_prefix    = var.ssm_parameter_prefix
   ssm_kms_key_arn         = var.ssm_kms_key_arn
   cpu_architecture        = var.cpu_architecture
