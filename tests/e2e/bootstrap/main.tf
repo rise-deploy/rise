@@ -58,62 +58,6 @@ module "rise_aws" {
 }
 
 # -----------------------------------------------------------------------------
-# Traefik's task role
-#
-# Pre-created here rather than by modules/rise-ecs, because the per-run identity
-# cannot write IAM. It grants cluster reads and nothing else -- deliberately not
-# the Rise controller role, since Traefik's API is unauthenticated.
-# -----------------------------------------------------------------------------
-
-data "aws_iam_policy_document" "traefik_assume" {
-  statement {
-    effect = "Allow"
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
-    actions = ["sts:AssumeRole"]
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceAccount"
-      values   = [local.account_id]
-    }
-  }
-}
-
-resource "aws_iam_role" "traefik" {
-  name               = "${var.name}-traefik"
-  description        = "Traefik ECS provider discovery for the Rise e2e environment"
-  assume_role_policy = data.aws_iam_policy_document.traefik_assume.json
-  tags               = local.tags
-}
-
-resource "aws_iam_role_policy" "traefik" {
-  name = "discovery"
-  role = aws_iam_role.traefik.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ecs:ListClusters",
-        "ecs:DescribeClusters",
-        "ecs:ListTasks",
-        "ecs:DescribeTasks",
-        "ecs:DescribeContainerInstances",
-        "ecs:DescribeTaskDefinition",
-        # See modules/rise-ecs/traefik.tf: both are in Traefik's published
-        # policy, and without them its ECS provider discovers nothing.
-        "ec2:DescribeInstances",
-        "ssm:DescribeInstanceInformation",
-      ]
-      Resource = "*"
-    }]
-  })
-}
-
-# -----------------------------------------------------------------------------
 # Terraform state for the per-run apply
 # -----------------------------------------------------------------------------
 

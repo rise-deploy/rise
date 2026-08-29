@@ -36,7 +36,7 @@ output "log_retention_days" {
 
 output "traefik_task_role_arn" {
   description = "Pre-created here because the per-run identity cannot write IAM."
-  value       = aws_iam_role.traefik.arn
+  value       = module.rise_aws.ecs_traefik_role_arn
 }
 
 output "vpc_id" {
@@ -113,7 +113,7 @@ resource "aws_ssm_parameter" "bootstrap" {
     cloud_map_namespace_name = aws_service_discovery_private_dns_namespace.this.name
     log_group_name           = aws_cloudwatch_log_group.this.name
     log_retention_days       = var.log_retention_days
-    traefik_task_role_arn    = aws_iam_role.traefik.arn
+    traefik_task_role_arn    = module.rise_aws.ecs_traefik_role_arn
     ecr_repo_prefix          = "${var.name}/"
     dns_zone_id              = aws_route53_zone.this.zone_id
     dns_zone_name            = trimsuffix(aws_route53_zone.this.name, ".")
