@@ -14,6 +14,7 @@ import { QueryLine } from './query-line';
 import { LogStream, type FocusRequest } from './log-stream';
 import { useLogFeed } from './use-log-feed';
 import type { LogEntry } from './types';
+import type { LifecycleMarker } from './lifecycle';
 
 // Recharts and react-day-picker are heavy and each pull their own CSS; keep
 // them out of the main bundle until the console actually needs them.
@@ -77,6 +78,8 @@ export interface LogConsoleProps {
     deploymentCreated?: string | null;
     /** Container names declared by the deployment, for the container filter. */
     containers?: string[];
+    /** Deployment events drawn on the volume rail's time axis. */
+    markers?: LifecycleMarker[];
     /** Deployment metadata panels, shown in the slide-over details drawer. */
     details?: React.ReactNode;
     /** `page` fills the viewport; `embedded` sits inside the deployment tab. */
@@ -92,6 +95,7 @@ export function LogConsole({
     deploymentCompletedAt,
     deploymentCreated,
     containers = [],
+    markers = [],
     details,
     variant = 'embedded',
     lead,
@@ -367,6 +371,7 @@ export function LogConsole({
                                 onSelectBucket={feed.setSelectedBucket}
                                 selectedBucketTs={feed.selectedBucket?.endMs ?? null}
                                 height={72}
+                                markers={markers}
                             />
                         </Suspense>
                     </div>

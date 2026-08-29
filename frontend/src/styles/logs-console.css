@@ -757,3 +757,45 @@
     display: block;
     color: var(--text-muted);
 }
+
+/* ---------- lifecycle markers on the volume rail ---------- */
+
+/* Deployment events share the chart's time axis, so a burst of errors can be
+   read against what the deployment itself was doing at that moment. */
+.r-logc-chart-body { position: relative; }
+
+.r-logc-markers {
+    position: relative;
+    height: 11px;
+    margin-top: 1px;
+    pointer-events: none;
+}
+
+/* The slot owns the position; the dot inside it stays in normal flow so the
+   tooltip wrapper can hug it. */
+.r-logc-marker-slot {
+    position: absolute;
+    top: 2px;
+    margin-left: -3.5px;
+    line-height: 0;
+    pointer-events: auto;
+}
+
+.r-logc-marker {
+    display: block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: 1px solid var(--surface);
+    cursor: default;
+}
+
+[data-density="compact"] .r-logc-markers { height: 8px; }
+
+/* A dot standing for several coincident events reads slightly heavier, so it
+   is clear there is more here than one moment. */
+.r-logc-marker.is-cluster {
+    width: 9px;
+    height: 9px;
+    box-shadow: 0 0 0 2px color-mix(in oklch, var(--text-soft) 30%, transparent);
+}

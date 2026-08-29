@@ -11,6 +11,7 @@ import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { LogConsole } from './logs/log-console';
+import { buildLifecycleMarkers } from './logs/lifecycle';
 
 const STATUS_TONES = {
     Healthy: 'ok',
@@ -1541,6 +1542,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const isMultiContainer = !!containers && containers.length > 0;
     // Populates the log console's container filter without a second request.
     const containerNames = (containers || []).map((c) => c.name).filter(Boolean);
+    const lifecycleMarkers = buildLifecycleMarkers(deployment, containerNames);
     const totals = isMultiContainer
         ? aggregateContainerResources(containers)
         : { replicas: deployment.replicas, cpu: deployment.cpu, memory: deployment.memory };
@@ -1700,6 +1702,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     deploymentCompletedAt={deployment.completed_at}
                     deploymentCreated={deployment.created}
                     containers={containerNames}
+                    markers={lifecycleMarkers}
                     lead={
                         <a
                             className="r-logc-expand"
