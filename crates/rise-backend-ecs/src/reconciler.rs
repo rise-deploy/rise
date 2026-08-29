@@ -2126,30 +2126,36 @@ impl EcsReconciler {
                      still serving, so the deployment stays Healthy"
                 );
             }
+            DeploymentStatus::Healthy
+                if !all_ready
+                    && self
+                        .store
+                        .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
+                        .await?
+                        .is_some() =>
+            {
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
+            }
             DeploymentStatus::Healthy if !all_ready => {
-                if self
-                    .store
-                    .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
-                    .await?
-                    .is_some()
-                {
-                    self.store
-                        .update_project_calculated_status(project.id)
-                        .await?;
-                }
+                // The guarded write above was a no-op: some other request
+                // already moved this deployment on. Benign race, nothing
+                // left to do this tick.
             }
-            DeploymentStatus::Unhealthy if all_ready => {
-                if self
-                    .store
-                    .mark_deployment_healthy(deployment.id)
-                    .await?
-                    .is_some()
-                {
-                    self.store
-                        .update_project_calculated_status(project.id)
-                        .await?;
-                }
+            DeploymentStatus::Unhealthy
+                if all_ready
+                    && self
+                        .store
+                        .mark_deployment_healthy(deployment.id)
+                        .await?
+                        .is_some() =>
+            {
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
             }
+            DeploymentStatus::Unhealthy if all_ready => {}
             _ => {}
         }
         Ok(())
