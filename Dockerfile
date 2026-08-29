@@ -62,8 +62,9 @@ FROM chef AS builder
 COPY --from=planner /usr/src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/target \
-    cargo chef cook --release --all-features --recipe-path recipe.json
+    --mount=type=cache,target=/usr/src/target,sharing=locked \
+    cargo chef cook --release --all-features --recipe-path recipe.json && \
+    date +%s%N > target/.rise-cargo-chef-generation
 
 # Copy project files
 COPY Cargo.toml Cargo.lock ./
@@ -73,15 +74,20 @@ COPY migrations ./migrations
 COPY static ./static
 COPY --from=frontend-builder /usr/src/frontend/dist/ ./static/
 COPY .sqlx ./.sqlx
+COPY scripts/refresh-cargo-source-mtimes.sh ./scripts/refresh-cargo-source-mtimes.sh
 
 # Build the application with server features
-# Shared target caches may contain workspace artifacts newer than this checkout.
-# Refresh local source mtimes so Cargo validates every workspace crate.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/target \
-    find src crates -type f -exec touch {} + && \
+    --mount=type=cache,target=/usr/src/target,sharing=locked \
+    scripts/refresh-cargo-source-mtimes.sh \
+        target/.rise-source-checksums \
+        /tmp/rise-source-checksums \
+        target/.rise-cargo-chef-generation \
+        target/.rise-built-cargo-chef-generation && \
     SQLX_OFFLINE=true cargo build --release --all-features --bin rise && \
+    cp /tmp/rise-source-checksums target/.rise-source-checksums && \
+    cp target/.rise-cargo-chef-generation target/.rise-built-cargo-chef-generation && \
     cp target/release/rise /usr/local/bin/rise
 
 # Stage 4: Create the final, smaller image (match builder's Debian version)

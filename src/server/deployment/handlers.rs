@@ -2754,7 +2754,7 @@ pub struct LogStreamParams {
     pub since: Option<i64>,
     /// Start of an explicit time range in RFC3339 format
     pub start: Option<String>,
-    /// End of an explicit time range in RFC3339 format.
+    /// Exclusive end of an explicit time range in RFC3339 format.
     pub end: Option<String>,
     /// Restrict to lines whose backend-emitted level matches one of these
     /// values. Repeated query param: `?level=info&level=warn`. Empty list
@@ -2841,21 +2841,8 @@ pub async fn stream_deployment_logs(
 
     let start_time = parse_log_time(params.start.as_deref())?;
     let end_time = parse_log_time(params.end.as_deref())?;
-    if params.cursor.is_some()
-        && (params.follow || params.since.is_some() || start_time.is_some() || end_time.is_some())
-    {
-        return Err(ServerError::bad_request(
-            "A log cursor cannot be combined with follow or time-range parameters",
-        ));
-    }
+    validate_log_stream_query(&params, start_time.as_ref(), end_time.as_ref())?;
     let followable = crate::server::deployment::logs::is_followable_status(&deployment.status);
-    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
-        if start_time >= end_time {
-            return Err(ServerError::bad_request(
-                "Log range start must be before end",
-            ));
-        }
-    }
 
     // Get log stream from configured runtime log backend.
     // Follow defaults to 1 line so active deployments start at the most
@@ -3098,6 +3085,33 @@ fn validate_log_levels(levels: &[String], allowed: &[&'static str]) -> Result<()
     Ok(())
 }
 
+fn validate_log_stream_query(
+    params: &LogStreamParams,
+    start_time: Option<&chrono::DateTime<chrono::Utc>>,
+    end_time: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ServerError> {
+    if params.cursor.is_some()
+        && (params.follow || params.since.is_some() || start_time.is_some() || end_time.is_some())
+    {
+        return Err(ServerError::bad_request(
+            "A log cursor cannot be combined with follow or time-range parameters",
+        ));
+    }
+    if params.follow && end_time.is_some() {
+        return Err(ServerError::bad_request(
+            "Following logs cannot be combined with an explicit end time",
+        ));
+    }
+    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
+        if start_time >= end_time {
+            return Err(ServerError::bad_request(
+                "Log range start must be before end",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_log_time(
     value: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
@@ -3121,11 +3135,37 @@ mod tests {
     use super::{
         normalize_env_override_is_protected, resolve_resource_check_inputs,
         validate_container_resource_names, validate_env_override, validate_env_override_key,
-        validate_identity_audiences,
+        validate_identity_audiences, validate_log_stream_query, LogStreamParams,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn log_follow_rejects_an_explicit_end_time() {
+        let params = LogStreamParams {
+            follow: true,
+            tail: None,
+            timestamps: false,
+            since: None,
+            start: None,
+            end: Some("2026-08-29T12:00:00Z".into()),
+            level: Vec::new(),
+            search: None,
+            cursor: None,
+        };
+        let end = chrono::DateTime::parse_from_rfc3339(params.end.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let error = validate_log_stream_query(&params, None, Some(&end)).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message,
+            "Following logs cannot be combined with an explicit end time"
+        );
+    }
 
     fn make_spec(
         name: &str,

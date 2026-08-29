@@ -20,6 +20,7 @@ const MAX_TAIL: i64 = 5_000;
 const MAX_SCAN_EVENTS: usize = 100_000;
 const MAX_SCAN_PAGES: usize = 100;
 const PAGE_SIZE: i32 = 10_000;
+const LIVE_TAIL_BUFFER_SIZE: usize = 16;
 // CloudWatch rejects descending FilterLogEvents requests whose start precedes
 // 2024-01-01. No stream matching this backend's UUID prefix contains earlier
 // events.
@@ -40,16 +41,18 @@ struct CloudWatchLine {
     log_stream: String,
     message: String,
     id: String,
+    // FilterLogEvents exposes an event ID for pagination ordering; Live Tail does not.
+    pagination_id: String,
 }
 
 impl CloudWatchLine {
-    fn occurrence_key(&self) -> (i64, i64, &str, &str) {
-        (
-            self.timestamp_millis,
-            self.ingestion_time_millis,
-            &self.log_stream,
-            &self.message,
-        )
+    fn occurrence_key(&self) -> CloudWatchOccurrenceKey {
+        CloudWatchOccurrenceKey {
+            timestamp_millis: self.timestamp_millis,
+            ingestion_time_millis: self.ingestion_time_millis,
+            log_stream: self.log_stream.clone(),
+            message: self.message.clone(),
+        }
     }
 
     fn from_filtered(event: &aws_sdk_cloudwatchlogs::types::FilteredLogEvent) -> Option<Self> {
@@ -61,8 +64,8 @@ impl CloudWatchLine {
             .unwrap_or_default()
             .trim_end_matches(['\r', '\n'])
             .to_string();
-        let id = event.event_id().map(str::to_string).unwrap_or_else(|| {
-            stable_cloudwatch_id(
+        let pagination_id = event.event_id().map(str::to_string).unwrap_or_else(|| {
+            stable_cloudwatch_source_id(
                 timestamp_millis,
                 ingestion_time_millis,
                 &log_stream,
@@ -70,7 +73,8 @@ impl CloudWatchLine {
             )
         });
         Some(Self {
-            id,
+            id: String::new(),
+            pagination_id,
             timestamp_millis,
             ingestion_time_millis,
             log_stream,
@@ -87,19 +91,43 @@ impl CloudWatchLine {
             .unwrap_or_default()
             .trim_end_matches(['\r', '\n'])
             .to_string();
-        let id = stable_cloudwatch_id(
-            timestamp_millis,
-            ingestion_time_millis,
-            &log_stream,
-            &message,
-        );
         Some(Self {
-            id,
+            id: String::new(),
+            pagination_id: String::new(),
             timestamp_millis,
             ingestion_time_millis,
             log_stream,
             message,
         })
+    }
+
+    fn assign_occurrence_id(&mut self, occurrence: u64) {
+        let timestamp = self.timestamp_millis.to_be_bytes();
+        let ingestion = self.ingestion_time_millis.to_be_bytes();
+        let occurrence = occurrence.to_be_bytes();
+        self.id = stable_log_id(
+            "cloudwatch",
+            [
+                timestamp.as_slice(),
+                ingestion.as_slice(),
+                self.log_stream.as_bytes(),
+                self.message.as_bytes(),
+                occurrence.as_slice(),
+            ],
+        );
+    }
+
+    fn pagination_key(&self) -> CloudWatchKey {
+        CloudWatchKey {
+            timestamp_millis: self.timestamp_millis,
+            ingestion_time_millis: self.ingestion_time_millis,
+            log_stream: self.log_stream.clone(),
+            id: self.pagination_id.clone(),
+        }
+    }
+
+    fn pagination_primary(&self) -> (i64, i64) {
+        (self.timestamp_millis, self.ingestion_time_millis)
     }
 
     fn level(&self) -> &'static str {
@@ -122,7 +150,7 @@ impl CloudWatchLine {
     }
 }
 
-fn stable_cloudwatch_id(
+fn stable_cloudwatch_source_id(
     timestamp_millis: i64,
     ingestion_time_millis: i64,
     log_stream: &str,
@@ -141,12 +169,29 @@ fn stable_cloudwatch_id(
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CloudWatchOccurrenceKey {
+    timestamp_millis: i64,
+    ingestion_time_millis: i64,
+    log_stream: String,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct CloudWatchKey {
+    timestamp_millis: i64,
+    ingestion_time_millis: i64,
+    log_stream: String,
+    id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct CloudWatchCursor {
     version: u8,
     signature: String,
+    start_millis: i64,
     end_millis: i64,
-    offset: usize,
+    before: Option<CloudWatchKey>,
 }
 
 struct BacklogPage {
@@ -157,6 +202,24 @@ struct BacklogPage {
 struct ScanResult {
     lines: Vec<CloudWatchLine>,
     complete: bool,
+}
+
+struct CloudWatchScan<'a> {
+    prefix: &'a str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    levels: &'a [String],
+    search: Option<&'a str>,
+    stop_after: Option<usize>,
+    before: Option<&'a CloudWatchKey>,
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn volume_bucket_index(
@@ -175,18 +238,52 @@ fn volume_bucket_index(
     (index < bucket_count).then_some(index)
 }
 
+fn cloudwatch_inclusive_end_millis(exclusive_end: DateTime<Utc>) -> i64 {
+    let end_millis = exclusive_end.timestamp_millis();
+    if exclusive_end
+        .timestamp_subsec_nanos()
+        .is_multiple_of(1_000_000)
+    {
+        end_millis.saturating_sub(1)
+    } else {
+        end_millis
+    }
+}
+
+fn next_occurrence(
+    occurrences: &mut HashMap<CloudWatchOccurrenceKey, u64>,
+    key: CloudWatchOccurrenceKey,
+) -> Result<u64> {
+    let next = occurrences.entry(key).or_insert(0);
+    let occurrence = *next;
+    *next = next
+        .checked_add(1)
+        .context("CloudWatch log occurrence counter overflowed")?;
+    Ok(occurrence)
+}
+
+fn consume_backlog_overlap(
+    remaining: &mut HashMap<CloudWatchOccurrenceKey, u64>,
+    key: &CloudWatchOccurrenceKey,
+) -> bool {
+    remaining.get_mut(key).is_some_and(|count| {
+        if *count == 0 {
+            return false;
+        }
+        *count -= 1;
+        true
+    })
+}
+
 fn select_backlog_page(
-    lines_newest_first: Vec<CloudWatchLine>,
-    skip_recent: usize,
+    mut lines: Vec<CloudWatchLine>,
     tail: usize,
-) -> Vec<CloudWatchLine> {
-    let mut page = lines_newest_first
-        .into_iter()
-        .skip(skip_recent)
-        .take(tail)
-        .collect::<Vec<_>>();
-    page.sort();
-    page
+) -> (Vec<CloudWatchLine>, Option<CloudWatchKey>) {
+    lines.sort_by_key(|line| std::cmp::Reverse(line.pagination_key()));
+    lines.truncate(tail);
+    let boundary = lines.last().map(CloudWatchLine::pagination_key);
+    lines.sort();
+    (lines, boundary)
 }
 
 impl CloudWatchLogBackend {
@@ -268,28 +365,28 @@ impl CloudWatchLogBackend {
         }
     }
 
-    async fn scan(
-        &self,
-        prefix: &str,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        levels: &[String],
-        search: Option<&str>,
-        stop_after: Option<usize>,
-    ) -> Result<ScanResult> {
+    async fn scan(&self, query: CloudWatchScan<'_>) -> Result<ScanResult> {
         let mut next_token: Option<String> = None;
         let mut seen_tokens = HashSet::new();
         let mut scanned = 0usize;
         let mut lines = Vec::new();
+        let mut stop_primary = None;
+        let mut occurrence_primary = None;
+        let mut occurrences = HashMap::new();
 
         for _ in 0..MAX_SCAN_PAGES {
             let mut request = self
                 .client
                 .filter_log_events()
                 .log_group_name(&self.log_group)
-                .log_stream_name_prefix(prefix)
-                .start_time(start.timestamp_millis().max(DESCENDING_START_MIN_MILLIS))
-                .end_time(end.timestamp_millis().max(0))
+                .log_stream_name_prefix(query.prefix)
+                .start_time(
+                    query
+                        .start
+                        .timestamp_millis()
+                        .max(DESCENDING_START_MIN_MILLIS),
+                )
+                .end_time(query.end.timestamp_millis().max(0))
                 .start_from_head(false)
                 .limit(PAGE_SIZE);
             if let Some(token) = next_token.as_deref() {
@@ -300,24 +397,55 @@ impl CloudWatchLogBackend {
                 format!("Failed to read CloudWatch log group {:?}", self.log_group)
             })?;
             for event in output.events() {
+                let mut line = CloudWatchLine::from_filtered(event);
+                if line.as_ref().is_some_and(|line| {
+                    stop_primary.is_some_and(|primary| line.pagination_primary() < primary)
+                }) {
+                    return Ok(ScanResult {
+                        lines,
+                        complete: false,
+                    });
+                }
                 scanned += 1;
                 if scanned > MAX_SCAN_EVENTS {
                     anyhow::bail!(
                         "CloudWatch log scan exceeds the limit of {MAX_SCAN_EVENTS} events"
                     );
                 }
-                let Some(line) = CloudWatchLine::from_filtered(event) else {
+                let Some(mut line) = line.take() else {
                     continue;
                 };
-                if line.matches(levels, search) {
+                let primary = line.pagination_primary();
+                if occurrence_primary != Some(primary) {
+                    occurrences.clear();
+                    occurrence_primary = Some(primary);
+                }
+                let occurrence = next_occurrence(&mut occurrences, line.occurrence_key())?;
+                line.assign_occurrence_id(occurrence);
+                if query
+                    .before
+                    .is_some_and(|boundary| line.pagination_key() >= *boundary)
+                {
+                    continue;
+                }
+                if line.matches(query.levels, query.search) {
                     lines.push(line);
+                    if stop_primary.is_none()
+                        && query.stop_after.is_some_and(|limit| lines.len() >= limit)
+                    {
+                        // FilterLogEvents does not expose its request-id tie-breaker.
+                        // The cursor can order an entire timestamp/ingestion group by event ID.
+                        stop_primary = Some(primary);
+                    }
                 }
             }
 
             let token = output.next_token().map(str::to_string);
-            let complete = token.is_none();
-            if complete || stop_after.is_some_and(|limit| lines.len() >= limit) {
-                return Ok(ScanResult { lines, complete });
+            if token.is_none() {
+                return Ok(ScanResult {
+                    lines,
+                    complete: true,
+                });
             }
             let token = token.expect("checked above");
             if !seen_tokens.insert(token.clone()) {
@@ -344,49 +472,77 @@ impl CloudWatchLogBackend {
             .transpose()?;
         if cursor
             .as_ref()
-            .is_some_and(|cursor| cursor.version != 1 || cursor.signature != signature)
+            .is_some_and(|cursor| cursor.version != 2 || cursor.signature != signature)
         {
             anyhow::bail!("invalid log cursor for this deployment or filter");
-        }
-        let skip_recent = cursor.as_ref().map_or(0, |cursor| cursor.offset);
-        if skip_recent >= MAX_SCAN_EVENTS {
-            anyhow::bail!("invalid log cursor offset");
         }
         let prefix = self.stream_prefix(deployment, project);
         let end = if let Some(cursor) = &cursor {
             DateTime::<Utc>::from_timestamp_millis(cursor.end_millis)
-                .context("invalid log cursor timestamp")?
+                .context("invalid log cursor end timestamp")?
+        } else if let Some(exclusive_end) = query.end_time {
+            // FilterLogEvents endTime is inclusive; LogQuery end_time is exclusive.
+            DateTime::<Utc>::from_timestamp_millis(cloudwatch_inclusive_end_millis(exclusive_end))
+                .context("CloudWatch log end is outside the supported timestamp range")?
         } else {
-            query.end_time.unwrap_or_else(Utc::now)
+            Utc::now()
         };
-        let start = if cursor.is_some() {
-            deployment.created_at
+        let start = if let Some(cursor) = &cursor {
+            DateTime::<Utc>::from_timestamp_millis(cursor.start_millis)
+                .context("invalid log cursor start timestamp")?
         } else {
             Self::effective_start(deployment, query)
         };
+        if cursor.is_none() && start > end {
+            return Ok(BacklogPage {
+                lines: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        if start > end || (cursor.is_some() && start < deployment.created_at) {
+            anyhow::bail!("invalid log cursor time range");
+        }
+        if cursor
+            .as_ref()
+            .and_then(|cursor| cursor.before.as_ref())
+            .is_some_and(|boundary| {
+                boundary.timestamp_millis < start.timestamp_millis()
+                    || boundary.timestamp_millis > end.timestamp_millis()
+            })
+        {
+            anyhow::bail!("invalid log cursor boundary");
+        }
         let result = self
-            .scan(
-                &prefix,
+            .scan(CloudWatchScan {
+                prefix: &prefix,
                 start,
                 end,
-                &query.levels,
-                query.search.as_deref(),
-                Some(tail.saturating_add(skip_recent)),
-            )
+                levels: &query.levels,
+                search: query.search.as_deref(),
+                stop_after: Some(tail),
+                before: cursor.as_ref().and_then(|cursor| cursor.before.as_ref()),
+            })
             .await?;
-        let matched_count = result.lines.len();
-        let lines = select_backlog_page(result.lines, skip_recent, tail);
-        let has_more = lines.len() == tail
-            && (!result.complete
-                || matched_count > skip_recent.saturating_add(lines.len())
-                || start > deployment.created_at);
-        let next_cursor = has_more
-            .then(|| {
+        let has_more_in_segment = !result.complete || result.lines.len() > tail;
+        let (lines, boundary) = select_backlog_page(result.lines, tail);
+        let next_segment = if has_more_in_segment {
+            boundary.map(|boundary| (start, end, Some(boundary)))
+        } else if start > deployment.created_at {
+            let older_end =
+                DateTime::<Utc>::from_timestamp_millis(start.timestamp_millis().saturating_sub(1))
+                    .context("invalid log cursor time range")?;
+            (deployment.created_at <= older_end).then_some((deployment.created_at, older_end, None))
+        } else {
+            None
+        };
+        let next_cursor = next_segment
+            .map(|(start, end, before)| {
                 encode_log_cursor(&CloudWatchCursor {
-                    version: 1,
+                    version: 2,
                     signature,
+                    start_millis: start.timestamp_millis(),
                     end_millis: end.timestamp_millis(),
-                    offset: skip_recent.saturating_add(lines.len()),
+                    before,
                 })
             })
             .transpose()?;
@@ -411,29 +567,33 @@ impl CloudWatchLogBackend {
             .await
             .context("Failed to start CloudWatch Live Tail")?;
         let mut response_stream = response.response_stream;
-        let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(LIVE_TAIL_BUFFER_SIZE);
+        let live_task = AbortOnDrop(tokio::spawn(async move {
             loop {
                 let event = match response_stream.recv().await {
                     Ok(Some(event)) => Ok(event),
-                    Ok(None) => break,
+                    Ok(None) => Err(anyhow::anyhow!(
+                        "CloudWatch Live Tail stream ended; reconnect to resume streaming"
+                    )),
                     Err(error)
                         if error
                             .as_service_error()
                             .is_some_and(|service| service.is_session_timeout_exception()) =>
                     {
-                        break;
+                        Err(anyhow::anyhow!(
+                            "CloudWatch Live Tail session expired; reconnect to resume streaming"
+                        ))
                     }
                     Err(error) => Err(anyhow::anyhow!(
                         "CloudWatch Live Tail stream failed: {error}"
                     )),
                 };
                 let failed = event.is_err();
-                if live_tx.send(event).is_err() || failed {
+                if live_tx.send(event).await.is_err() || failed {
                     break;
                 }
             }
-        });
+        }));
         let initial = self.backlog(&deployment, &project, &query).await?;
         let levels = query.levels.clone();
         let search = query.search.clone();
@@ -441,12 +601,14 @@ impl CloudWatchLogBackend {
 
         let log_group = self.log_group.clone();
         let stream = async_stream::try_stream! {
+            let _live_task = live_task;
             let backlog_count = initial.lines.len();
-            let mut backlog_occurrences: HashMap<(i64, i64, String, String), usize> = HashMap::new();
+            let mut backlog_occurrences: HashMap<CloudWatchOccurrenceKey, u64> = HashMap::new();
+            let mut live_occurrences = HashMap::new();
+            let mut occurrence_primary = None;
             for line in &initial.lines {
-                let (timestamp, ingestion, stream, message) = line.occurrence_key();
                 *backlog_occurrences
-                    .entry((timestamp, ingestion, stream.to_string(), message.to_string()))
+                    .entry(line.occurrence_key())
                     .or_insert(0) += 1;
             }
             for line in initial.lines {
@@ -465,24 +627,23 @@ impl CloudWatchLogBackend {
                         warn!(log_group = %log_group, "CloudWatch Live Tail sampled log events");
                     }
                     for event in update.session_results() {
-                        let Some(line) = CloudWatchLine::from_live(event) else {
+                        let Some(mut line) = CloudWatchLine::from_live(event) else {
                             continue;
                         };
-                        let (timestamp, ingestion, stream, message) = line.occurrence_key();
-                        if let Some(remaining) = backlog_occurrences.get_mut(&(
-                            timestamp,
-                            ingestion,
-                            stream.to_string(),
-                            message.to_string(),
-                        )) {
-                            if *remaining > 0 {
-                                *remaining -= 1;
-                                continue;
-                            }
+                        let primary = line.pagination_primary();
+                        if occurrence_primary != Some(primary) {
+                            live_occurrences.clear();
+                            occurrence_primary = Some(primary);
+                        }
+                        let key = line.occurrence_key();
+                        let occurrence = next_occurrence(&mut live_occurrences, key.clone())?;
+                        if consume_backlog_overlap(&mut backlog_occurrences, &key) {
+                            continue;
                         }
                         if !line.matches(&levels, search.as_deref()) {
                             continue;
                         }
+                        line.assign_occurrence_id(occurrence);
                         let level = line.level().to_string();
                         yield LogEvent::Line { id: line.id.clone(), text: line.render(timestamps), level };
                     }
@@ -593,14 +754,15 @@ impl RuntimeLogBackend for CloudWatchLogBackend {
 
         let prefix = self.stream_prefix(deployment, project);
         let result = self
-            .scan(
-                &prefix,
-                query.start_time,
-                query.end_time,
-                &query.levels,
-                query.search.as_deref(),
-                None,
-            )
+            .scan(CloudWatchScan {
+                prefix: &prefix,
+                start: query.start_time,
+                end: query.end_time,
+                levels: &query.levels,
+                search: query.search.as_deref(),
+                stop_after: None,
+                before: None,
+            })
             .await?;
         debug_assert!(result.complete);
 
@@ -651,6 +813,7 @@ mod tests {
     fn filtered_line_uses_the_shared_classifier_and_search() {
         let line = CloudWatchLine {
             id: "event-1".into(),
+            pagination_id: "event-1".into(),
             timestamp_millis: 1_700_000_000_000,
             ingestion_time_millis: 1_700_000_000_100,
             log_stream: "rise/project/deployment/app/task".into(),
@@ -666,6 +829,7 @@ mod tests {
     fn render_uses_the_cloudwatch_event_timestamp() {
         let line = CloudWatchLine {
             id: "event-1".into(),
+            pagination_id: "event-1".into(),
             timestamp_millis: 1_700_000_000_000,
             ingestion_time_millis: 1_700_000_000_100,
             log_stream: "stream".into(),
@@ -698,27 +862,161 @@ mod tests {
     }
 
     #[test]
-    fn backlog_pagination_skips_newest_events_before_sorting_the_page() {
-        let line = |timestamp_millis, message: &str| CloudWatchLine {
-            id: format!("{timestamp_millis}-{message}"),
+    fn explicit_log_end_is_converted_to_an_inclusive_cloudwatch_bound() {
+        let exclusive_end = DateTime::<Utc>::from_timestamp_millis(1_700_000_000_000).unwrap();
+        assert_eq!(
+            cloudwatch_inclusive_end_millis(exclusive_end),
+            1_699_999_999_999
+        );
+
+        let sub_millisecond_end =
+            DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap();
+        assert_eq!(
+            cloudwatch_inclusive_end_millis(sub_millisecond_end),
+            1_700_000_000_123
+        );
+    }
+
+    #[test]
+    fn backlog_pagination_uses_the_oldest_returned_event_as_its_boundary() {
+        let line = |timestamp_millis, id: &str| CloudWatchLine {
+            id: id.into(),
+            pagination_id: id.into(),
             timestamp_millis,
             ingestion_time_millis: timestamp_millis,
             log_stream: "stream".into(),
-            message: message.into(),
+            message: id.into(),
         };
-        let newest_first = vec![
-            line(3, "third"),
-            line(2, "second-b"),
-            line(2, "second-a"),
-            line(1, "first"),
+        let all = vec![
+            line(500, "fifth"),
+            line(400, "fourth"),
+            line(300, "third"),
+            line(200, "second"),
+            line(100, "first"),
         ];
 
-        let page = select_backlog_page(newest_first, 1, 2);
+        let (page, boundary) = select_backlog_page(all.clone(), 2);
         assert_eq!(
             page.into_iter()
                 .map(|line| line.message)
                 .collect::<Vec<_>>(),
-            vec!["second-a", "second-b"]
+            vec!["fourth", "fifth"]
         );
+
+        let boundary = boundary.expect("a non-empty page has a boundary");
+        let mut next_candidates = all;
+        next_candidates.push(line(600, "late-newer"));
+        next_candidates.push(line(350, "late-older"));
+        next_candidates.retain(|line| line.pagination_key() < boundary);
+        let (next_page, _) = select_backlog_page(next_candidates, 2);
+        assert_eq!(
+            next_page
+                .into_iter()
+                .map(|line| line.message)
+                .collect::<Vec<_>>(),
+            vec!["third", "late-older"]
+        );
+    }
+
+    #[test]
+    fn backlog_boundary_orders_events_with_identical_cloudwatch_timestamps() {
+        let line = |id: &str| CloudWatchLine {
+            id: id.into(),
+            pagination_id: id.into(),
+            timestamp_millis: 500,
+            ingestion_time_millis: 600,
+            log_stream: "stream".into(),
+            message: id.into(),
+        };
+        let all = vec![line("a"), line("b"), line("c")];
+
+        let (page, boundary) = select_backlog_page(all.clone(), 2);
+        assert_eq!(
+            page.into_iter().map(|line| line.id).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+
+        let boundary = boundary.expect("a non-empty page has a boundary");
+        let remainder = all
+            .into_iter()
+            .filter(|line| line.pagination_key() < boundary)
+            .collect::<Vec<_>>();
+        let (page, _) = select_backlog_page(remainder, 2);
+        assert_eq!(
+            page.into_iter().map(|line| line.id).collect::<Vec<_>>(),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn filtered_and_live_occurrence_ids_match_and_repeats_differ() {
+        let line = || CloudWatchLine {
+            id: String::new(),
+            pagination_id: String::new(),
+            timestamp_millis: 500,
+            ingestion_time_millis: 600,
+            log_stream: "stream".into(),
+            message: "repeated".into(),
+        };
+        let mut first = line();
+        let mut second = line();
+        let mut repeated_first = line();
+
+        first.pagination_id = "filtered-event-id".into();
+        first.assign_occurrence_id(0);
+        second.assign_occurrence_id(1);
+        repeated_first.assign_occurrence_id(0);
+
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.id, repeated_first.id);
+    }
+
+    #[test]
+    fn backlog_overlap_consumes_its_occurrence_before_a_repeat_is_emitted() {
+        let key = CloudWatchOccurrenceKey {
+            timestamp_millis: 500,
+            ingestion_time_millis: 600,
+            log_stream: "stream".into(),
+            message: "repeated".into(),
+        };
+        let mut backlog_remaining = HashMap::from([(key.clone(), 1)]);
+        let mut live_occurrences = HashMap::new();
+
+        let overlap = next_occurrence(&mut live_occurrences, key.clone()).unwrap();
+        assert_eq!(overlap, 0);
+        assert!(consume_backlog_overlap(&mut backlog_remaining, &key));
+
+        let repeated = next_occurrence(&mut live_occurrences, key.clone()).unwrap();
+        assert_eq!(repeated, 1);
+        assert!(!consume_backlog_overlap(&mut backlog_remaining, &key));
+    }
+
+    #[tokio::test]
+    async fn dropping_abort_guard_cancels_the_live_tail_reader() {
+        struct NotifyOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for NotifyOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            let _notify = NotifyOnDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        }));
+        started_rx.await.expect("reader task starts");
+
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("reader task is cancelled")
+            .expect("reader task drop is observed");
     }
 }

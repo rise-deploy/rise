@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
@@ -1095,9 +1095,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         if (Number.isNaN(d.getTime())) return null;
         return new Date(d.getTime() + LOG_TERMINATED_END_CUSHION_MS);
     }, [streamable, deploymentCompletedAt]);
-    const [entries, setEntries] = useState([]);
+    const [logEntriesState, setLogEntriesState] = useState({
+        entries: [],
+        rebaseEnd: null,
+    });
+    const entries = logEntriesState.entries;
     const [streaming, setStreaming] = useState(false);
     const [error, setError] = useState(null);
+    const [olderLoadError, setOlderLoadError] = useState(null);
     const [logStatus, setLogStatus] = useState(null);
     const [counts, setCounts] = useState([]);
     const [countsLoading, setCountsLoading] = useState(false);
@@ -1156,9 +1161,19 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     const countsRequestIdRef = useRef(0);
     const seqRef = useRef(0);
     const paginationCursorRef = useRef(null);
+    const paginationRebaseEndRef = useRef(null);
+    const paginationDetachedFromStreamRef = useRef(false);
     const loadingMoreRef = useRef(false);
     const ignoreScrollRef = useRef(false);
     const streamGenRef = useRef(0);
+
+    useLayoutEffect(() => {
+        if (!logEntriesState.rebaseEnd) return;
+        paginationRebaseEndRef.current = logEntriesState.rebaseEnd;
+        paginationCursorRef.current = null;
+        paginationDetachedFromStreamRef.current = true;
+        setHasMore(true);
+    }, [logEntriesState.rebaseEnd]);
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
     const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd, rangeNowTick]);
@@ -1335,6 +1350,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
     const loadHistoricalLogs = useCallback(async () => {
         const gen = ++streamGenRef.current;
+        setOlderLoadError(null);
         if (!logWindow) {
             setError('Select a valid time range.');
             setCounts([]);
@@ -1354,13 +1370,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             setLoadingMore(false);
         }
 
-        setEntries([]);
+        setLogEntriesState({ entries: [], rebaseEnd: null });
         setExpandedIds(new Set());
         setError(null);
         setLogStatus(null);
         setStreaming(false);
         setHasMore(false);
         paginationCursorRef.current = null;
+        paginationRebaseEndRef.current = null;
+        paginationDetachedFromStreamRef.current = false;
 
         const collected = [];
         let newStatus = null;
@@ -1401,7 +1419,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             if (gen !== streamGenRef.current) return;
             // Backend sorts ascending; reverse so newest is on top.
             const reversed = collected.slice().reverse();
-            setEntries(reversed);
+            setLogEntriesState({ entries: reversed, rebaseEnd: null });
             setLogStatus(newStatus);
             paginationCursorRef.current = nextCursor;
             setHasMore(nextCursor !== null);
@@ -1422,7 +1440,18 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         if (!hasMore) return;
         if (!logWindow) return;
         const cursor = paginationCursorRef.current;
-        if (!cursor) return;
+        const rebaseEnd = paginationRebaseEndRef.current;
+        if (!cursor && !rebaseEnd) return;
+        setOlderLoadError(null);
+
+        // Once the bounded live window starts evicting rows, freeze it before
+        // bootstrapping older pages. A continuing stream would keep moving the
+        // oldest retained boundary while the finite request is in flight.
+        if (paginationDetachedFromStreamRef.current && abortControllerRef.current) {
+            abortControllerRef.current.abort();
+            abortControllerRef.current = null;
+            setStreaming(false);
+        }
 
         // Abort any in-flight pagination; otherwise a stale response can land
         // after the user has changed filter/range and overwrite the new window.
@@ -1438,8 +1467,13 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         const params = new URLSearchParams({
             timestamps: 'true',
             tail: String(LOG_PAGE_SIZE),
-            cursor,
         });
+        if (cursor) {
+            params.set('cursor', cursor);
+        } else {
+            params.set('start', logWindow.start.toISOString());
+            params.set('end', rebaseEnd);
+        }
         for (const level of levelFilter) {
             params.append('level', level);
         }
@@ -1478,18 +1512,27 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
             if (controller.signal.aborted) return;
             const reversed = collected.slice().reverse();
-            setEntries((prev) => {
-                const seen = new Set(prev.map((e) => e.id));
+            setLogEntriesState((prevState) => {
+                const seen = new Set(prevState.entries.map((e) => e.id));
                 const filtered = reversed.filter((entry) => !seen.has(entry.id));
-                if (filtered.length === 0) return prev;
+                if (filtered.length === 0) {
+                    return prevState.rebaseEnd === null
+                        ? prevState
+                        : { ...prevState, rebaseEnd: null };
+                }
                 filtered.sort((a, b) => b.timestampMs - a.timestampMs);
-                return prev.concat(filtered);
+                return {
+                    entries: prevState.entries.concat(filtered),
+                    rebaseEnd: null,
+                };
             });
+            paginationRebaseEndRef.current = null;
             paginationCursorRef.current = nextCursor;
             setHasMore(nextCursor !== null);
         } catch (err) {
             if (err.name === 'AbortError') return;
             console.error('Failed to load older logs:', err);
+            setOlderLoadError(err.message || 'The older log page could not be loaded.');
         } finally {
             if (loadOlderAbortControllerRef.current === controller) {
                 loadOlderAbortControllerRef.current = null;
@@ -1501,6 +1544,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
 
     const startStreaming = useCallback(async () => {
         const gen = ++streamGenRef.current;
+        setOlderLoadError(null);
         // Cancel any in-flight pagination — a stale older-page response that
         // arrives after this resets the entry list would merge old-filter
         // rows into the new window.
@@ -1510,13 +1554,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             loadingMoreRef.current = false;
             setLoadingMore(false);
         }
-        setEntries([]);
+        setLogEntriesState({ entries: [], rebaseEnd: null });
         setExpandedIds(new Set());
         setError(null);
         setLogStatus(null);
         setStreaming(true);
         setHasMore(false);
         paginationCursorRef.current = null;
+        paginationRebaseEndRef.current = null;
+        paginationDetachedFromStreamRef.current = false;
 
         try {
             await fetchLogFeed({
@@ -1531,16 +1577,29 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 onLine: (line, lineLevel, eventId) => {
                     if (streamGenRef.current !== gen) return;
                     const newEntry = parseLogLine(line, seqRef.current++, lineLevel, eventId);
-                    setEntries((prev) => {
-                        if (prev.some((entry) => entry.id === newEntry.id)) return prev;
+                    setLogEntriesState((prevState) => {
+                        const prev = prevState.entries;
+                        if (prev.some((entry) => entry.id === newEntry.id)) return prevState;
                         // Loki tail can deliver lines slightly out-of-order; keep
                         // the array sorted descending by timestamp.
                         let i = 0;
                         while (i < prev.length && prev[i].timestampMs > newEntry.timestampMs) i++;
                         const next = prev.slice();
                         next.splice(i, 0, newEntry);
-                        if (next.length > LOG_STREAM_CAP) next.length = LOG_STREAM_CAP;
-                        return next;
+                        let rebaseEnd = prevState.rebaseEnd;
+                        if (next.length > LOG_STREAM_CAP) {
+                            next.length = LOG_STREAM_CAP;
+                            const oldestRetained = next[next.length - 1];
+                            if (oldestRetained.timestampMs > 0) {
+                                // Finite ranges use an exclusive end. Advancing
+                                // one millisecond includes every row at the
+                                // retained boundary; stable IDs remove overlap.
+                                rebaseEnd = new Date(
+                                    oldestRetained.timestampMs + 1,
+                                ).toISOString();
+                            }
+                        }
+                        return { entries: next, rebaseEnd };
                     });
                 },
                 onStatus: (payload) => {
@@ -1567,6 +1626,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 },
                 onCursor: (payload) => {
                     if (streamGenRef.current !== gen) return;
+                    if (paginationDetachedFromStreamRef.current) return;
                     try {
                         const parsed = JSON.parse(payload);
                         const nextCursor = typeof parsed.next_cursor === 'string'
@@ -1901,10 +1961,17 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 </div>
             </div>
             <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {error && (
+                {(error || olderLoadError) && (
                     <div className="r-alert err" style={{ fontSize: 12.5 }}>
                         <Icon name="info" size={14} />
-                        <div style={{ flex: 1 }}>Error: {error}</div>
+                        <div style={{ flex: 1 }}>
+                            {olderLoadError ? `Error loading older logs: ${olderLoadError}` : `Error: ${error}`}
+                        </div>
+                        {olderLoadError && (
+                            <RButton size="sm" onClick={() => { void loadOlder(); }}>
+                                Retry older logs
+                            </RButton>
+                        )}
                     </div>
                 )}
                 <div className="r-logs-chart" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
