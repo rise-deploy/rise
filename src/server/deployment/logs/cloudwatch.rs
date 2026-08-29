@@ -4,13 +4,15 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
 
 use super::{
-    classify_k8s_line, is_followable_status, line_matches_search, parse_duration_hint,
-    status_stream, LogEvent, LogEventStream, LogQuery, LogStatus, LogStatusReason, LogVolumeBucket,
+    classify_k8s_line, decode_log_cursor, encode_log_cursor, is_followable_status,
+    line_matches_search, log_cursor_signature, parse_duration_hint, stable_log_id, status_stream,
+    LogEvent, LogEventStream, LogQuery, LogStatus, LogStatusReason, LogVolumeBucket,
     LogVolumeQuery, LogVolumeResponse, RuntimeLogBackend, KUBERNETES_LEVELS,
 };
 
@@ -37,32 +39,66 @@ struct CloudWatchLine {
     ingestion_time_millis: i64,
     log_stream: String,
     message: String,
+    id: String,
 }
 
 impl CloudWatchLine {
+    fn occurrence_key(&self) -> (i64, i64, &str, &str) {
+        (
+            self.timestamp_millis,
+            self.ingestion_time_millis,
+            &self.log_stream,
+            &self.message,
+        )
+    }
+
     fn from_filtered(event: &aws_sdk_cloudwatchlogs::types::FilteredLogEvent) -> Option<Self> {
+        let timestamp_millis = event.timestamp()?;
+        let ingestion_time_millis = event.ingestion_time().unwrap_or_default();
+        let log_stream = event.log_stream_name().unwrap_or_default().to_string();
+        let message = event
+            .message()
+            .unwrap_or_default()
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let id = event.event_id().map(str::to_string).unwrap_or_else(|| {
+            stable_cloudwatch_id(
+                timestamp_millis,
+                ingestion_time_millis,
+                &log_stream,
+                &message,
+            )
+        });
         Some(Self {
-            timestamp_millis: event.timestamp()?,
-            ingestion_time_millis: event.ingestion_time().unwrap_or_default(),
-            log_stream: event.log_stream_name().unwrap_or_default().to_string(),
-            message: event
-                .message()
-                .unwrap_or_default()
-                .trim_end_matches(['\r', '\n'])
-                .to_string(),
+            id,
+            timestamp_millis,
+            ingestion_time_millis,
+            log_stream,
+            message,
         })
     }
 
     fn from_live(event: &aws_sdk_cloudwatchlogs::types::LiveTailSessionLogEvent) -> Option<Self> {
+        let timestamp_millis = event.timestamp()?;
+        let ingestion_time_millis = event.ingestion_time().unwrap_or_default();
+        let log_stream = event.log_stream_name().unwrap_or_default().to_string();
+        let message = event
+            .message()
+            .unwrap_or_default()
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let id = stable_cloudwatch_id(
+            timestamp_millis,
+            ingestion_time_millis,
+            &log_stream,
+            &message,
+        );
         Some(Self {
-            timestamp_millis: event.timestamp()?,
-            ingestion_time_millis: event.ingestion_time().unwrap_or_default(),
-            log_stream: event.log_stream_name().unwrap_or_default().to_string(),
-            message: event
-                .message()
-                .unwrap_or_default()
-                .trim_end_matches(['\r', '\n'])
-                .to_string(),
+            id,
+            timestamp_millis,
+            ingestion_time_millis,
+            log_stream,
+            message,
         })
     }
 
@@ -76,14 +112,46 @@ impl CloudWatchLine {
             && line_matches_search(&self.message, search)
     }
 
-    fn render(self, timestamps: bool) -> String {
+    fn render(&self, timestamps: bool) -> String {
         if !timestamps {
-            return self.message;
+            return self.message.clone();
         }
         let timestamp = DateTime::<Utc>::from_timestamp_millis(self.timestamp_millis)
             .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         format!("{} {}", timestamp.to_rfc3339(), self.message)
     }
+}
+
+fn stable_cloudwatch_id(
+    timestamp_millis: i64,
+    ingestion_time_millis: i64,
+    log_stream: &str,
+    message: &str,
+) -> String {
+    let timestamp = timestamp_millis.to_be_bytes();
+    let ingestion = ingestion_time_millis.to_be_bytes();
+    stable_log_id(
+        "cloudwatch",
+        [
+            timestamp.as_slice(),
+            ingestion.as_slice(),
+            log_stream.as_bytes(),
+            message.as_bytes(),
+        ],
+    )
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CloudWatchCursor {
+    version: u8,
+    signature: String,
+    end_millis: i64,
+    offset: usize,
+}
+
+struct BacklogPage {
+    lines: Vec<CloudWatchLine>,
+    next_cursor: Option<String>,
 }
 
 struct ScanResult {
@@ -266,29 +334,63 @@ impl CloudWatchLogBackend {
         deployment: &Deployment,
         project: &Project,
         query: &LogQuery,
-    ) -> Result<Vec<CloudWatchLine>> {
+    ) -> Result<BacklogPage> {
         let tail = query.tail_lines.unwrap_or(1_000).clamp(1, MAX_TAIL) as usize;
-        let skip_recent = query.skip_recent.unwrap_or(0).max(0) as usize;
+        let signature = log_cursor_signature("cloudwatch", deployment, project, query);
+        let cursor = query
+            .cursor
+            .as_deref()
+            .map(decode_log_cursor::<CloudWatchCursor>)
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.version != 1 || cursor.signature != signature)
+        {
+            anyhow::bail!("invalid log cursor for this deployment or filter");
+        }
+        let skip_recent = cursor.as_ref().map_or(0, |cursor| cursor.offset);
+        if skip_recent >= MAX_SCAN_EVENTS {
+            anyhow::bail!("invalid log cursor offset");
+        }
         let prefix = self.stream_prefix(deployment, project);
-        // Timestamp-only pagination can strand events when several ECS streams
-        // share the oldest loaded millisecond. Count-based pagination scans the
-        // same newest-first result set and skips exactly what the caller has.
-        let end = if skip_recent > 0 {
-            Utc::now()
+        let end = if let Some(cursor) = &cursor {
+            DateTime::<Utc>::from_timestamp_millis(cursor.end_millis)
+                .context("invalid log cursor timestamp")?
         } else {
             query.end_time.unwrap_or_else(Utc::now)
+        };
+        let start = if cursor.is_some() {
+            deployment.created_at
+        } else {
+            Self::effective_start(deployment, query)
         };
         let result = self
             .scan(
                 &prefix,
-                Self::effective_start(deployment, query),
+                start,
                 end,
                 &query.levels,
                 query.search.as_deref(),
                 Some(tail.saturating_add(skip_recent)),
             )
             .await?;
-        Ok(select_backlog_page(result.lines, skip_recent, tail))
+        let matched_count = result.lines.len();
+        let lines = select_backlog_page(result.lines, skip_recent, tail);
+        let has_more = lines.len() == tail
+            && (!result.complete
+                || matched_count > skip_recent.saturating_add(lines.len())
+                || start > deployment.created_at);
+        let next_cursor = has_more
+            .then(|| {
+                encode_log_cursor(&CloudWatchCursor {
+                    version: 1,
+                    signature,
+                    end_millis: end.timestamp_millis(),
+                    offset: skip_recent.saturating_add(lines.len()),
+                })
+            })
+            .transpose()?;
+        Ok(BacklogPage { lines, next_cursor })
     }
 
     async fn live_tail(
@@ -339,16 +441,19 @@ impl CloudWatchLogBackend {
 
         let log_group = self.log_group.clone();
         let stream = async_stream::try_stream! {
-            let backlog_count = initial.len();
-            let mut backlog_occurrences: HashMap<CloudWatchLine, usize> = HashMap::new();
-            for line in &initial {
-                *backlog_occurrences.entry(line.clone()).or_insert(0) += 1;
+            let backlog_count = initial.lines.len();
+            let mut backlog_occurrences: HashMap<(i64, i64, String, String), usize> = HashMap::new();
+            for line in &initial.lines {
+                let (timestamp, ingestion, stream, message) = line.occurrence_key();
+                *backlog_occurrences
+                    .entry((timestamp, ingestion, stream.to_string(), message.to_string()))
+                    .or_insert(0) += 1;
             }
-            for line in initial {
+            for line in initial.lines {
                 let level = line.level().to_string();
-                yield LogEvent::Line { text: line.render(timestamps), level };
+                yield LogEvent::Line { id: line.id.clone(), text: line.render(timestamps), level };
             }
-            yield LogEvent::BacklogLoaded { count: backlog_count };
+            yield LogEvent::BacklogLoaded { count: backlog_count, next_cursor: initial.next_cursor };
 
             while let Some(event) = live_rx.recv().await {
                 let event = event?;
@@ -363,7 +468,13 @@ impl CloudWatchLogBackend {
                         let Some(line) = CloudWatchLine::from_live(event) else {
                             continue;
                         };
-                        if let Some(remaining) = backlog_occurrences.get_mut(&line) {
+                        let (timestamp, ingestion, stream, message) = line.occurrence_key();
+                        if let Some(remaining) = backlog_occurrences.get_mut(&(
+                            timestamp,
+                            ingestion,
+                            stream.to_string(),
+                            message.to_string(),
+                        )) {
                             if *remaining > 0 {
                                 *remaining -= 1;
                                 continue;
@@ -373,7 +484,7 @@ impl CloudWatchLogBackend {
                             continue;
                         }
                         let level = line.level().to_string();
-                        yield LogEvent::Line { text: line.render(timestamps), level };
+                        yield LogEvent::Line { id: line.id.clone(), text: line.render(timestamps), level };
                     }
                 }
             }
@@ -421,19 +532,27 @@ impl RuntimeLogBackend for CloudWatchLogBackend {
                 .await;
         }
 
-        let lines = self.backlog(deployment, project, &query).await?;
-        if lines.is_empty() {
-            return Ok(status_stream(self.empty_status(deployment)));
-        }
+        let page = self.backlog(deployment, project, &query).await?;
         let timestamps = query.timestamps;
-        Ok(futures::stream::iter(lines.into_iter().map(move |line| {
-            let level = line.level().to_string();
-            Ok(LogEvent::Line {
-                text: line.render(timestamps),
-                level,
+        let mut events = page
+            .lines
+            .into_iter()
+            .map(move |line| {
+                let level = line.level().to_string();
+                Ok(LogEvent::Line {
+                    id: line.id.clone(),
+                    text: line.render(timestamps),
+                    level,
+                })
             })
-        }))
-        .boxed())
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            events.push(Ok(LogEvent::Status(self.empty_status(deployment))));
+        }
+        events.push(Ok(LogEvent::PageLoaded {
+            next_cursor: page.next_cursor,
+        }));
+        Ok(futures::stream::iter(events).boxed())
     }
 
     async fn query_volume(
@@ -531,6 +650,7 @@ mod tests {
     #[test]
     fn filtered_line_uses_the_shared_classifier_and_search() {
         let line = CloudWatchLine {
+            id: "event-1".into(),
             timestamp_millis: 1_700_000_000_000,
             ingestion_time_millis: 1_700_000_000_100,
             log_stream: "rise/project/deployment/app/task".into(),
@@ -545,6 +665,7 @@ mod tests {
     #[test]
     fn render_uses_the_cloudwatch_event_timestamp() {
         let line = CloudWatchLine {
+            id: "event-1".into(),
             timestamp_millis: 1_700_000_000_000,
             ingestion_time_millis: 1_700_000_000_100,
             log_stream: "stream".into(),
@@ -579,6 +700,7 @@ mod tests {
     #[test]
     fn backlog_pagination_skips_newest_events_before_sorting_the_page() {
         let line = |timestamp_millis, message: &str| CloudWatchLine {
+            id: format!("{timestamp_millis}-{message}"),
             timestamp_millis,
             ingestion_time_millis: timestamp_millis,
             log_stream: "stream".into(),

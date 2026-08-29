@@ -919,16 +919,24 @@ async function readSseResponse(response, handlers) {
                     handlers.onStatus?.(payload);
                 } else if (eventType === 'backlog_complete') {
                     handlers.onBacklogComplete?.(payload);
+                } else if (eventType === 'page_complete') {
+                    handlers.onPageComplete?.(payload);
+                } else if (eventType === 'cursor') {
+                    handlers.onCursor?.(payload);
                 } else if (payload.trim()) {
-                    // Backend wire format: {"line": "<raw line>", "level": "info"|"warn"|"error"|"unknown"}.
+                    // Backend wire format: {"id": "<stable id>", "line": "<raw line>", "level": "<level>"}.
                     // Be defensive: fall back to rendering the payload verbatim
                     // with level=unknown if it doesn't parse as expected.
                     let parsedLine = payload;
                     let parsedLevel = 'unknown';
+                    let parsedId = null;
                     try {
                         const obj = JSON.parse(payload);
                         if (obj && typeof obj.line === 'string') {
                             parsedLine = obj.line;
+                            if (typeof obj.id === 'string' && obj.id) {
+                                parsedId = obj.id;
+                            }
                             if (typeof obj.level === 'string') {
                                 parsedLevel = obj.level;
                             }
@@ -941,7 +949,7 @@ async function readSseResponse(response, handlers) {
                             console.warn('Malformed log SSE payload; rendering raw line with level=unknown', err);
                         }
                     }
-                    handlers.onLine?.(parsedLine, parsedLevel);
+                    handlers.onLine?.(parsedLine, parsedLevel, parsedId);
                 }
             } else if (line === '') {
                 eventType = 'message';
@@ -996,7 +1004,7 @@ function orderedLevels(levels) {
     return [...levels].sort((a, b) => levelSeverityRank(a) - levelSeverityRank(b));
 }
 
-function parseLogLine(line, seq, level) {
+function parseLogLine(line, seq, level, eventId = null) {
     // Backend prepends "<RFC3339> " when timestamps=true.
     const sp = line.indexOf(' ');
     const isoCandidate = sp > 0 ? line.slice(0, sp) : '';
@@ -1011,7 +1019,7 @@ function parseLogLine(line, seq, level) {
     // CSS doesn't recognise falls back to the default text colour.
     const styleLevel = level && level.trim() ? level.trim() : 'unknown';
     return {
-        id: `${timestampMs}-${seq}`,
+        id: eventId || `${timestampMs}-${seq}`,
         timestampMs,
         iso,
         raw,
@@ -1105,7 +1113,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     // a "supports everything" shape so the UI is fully usable while the
     // first request is in flight.
     const [capabilities, setCapabilities] = useState({
-        backend: null,
         levels: ['info', 'warn', 'error'],
         supports_volume: true,
     });
@@ -1148,24 +1155,10 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
     const loadOlderAbortControllerRef = useRef(null);
     const countsRequestIdRef = useRef(0);
     const seqRef = useRef(0);
-    const oldestLoadedMsRef = useRef(null);
+    const paginationCursorRef = useRef(null);
     const loadingMoreRef = useRef(false);
     const ignoreScrollRef = useRef(false);
     const streamGenRef = useRef(0);
-    // Tracks whether the active streaming request has finished its initial
-    // backlog phase. Until then we keep `hasMore` optimistic so the user can
-    // scroll to load older. Once the backlog count is known we set `hasMore`
-    // definitively and stop overriding it with each new live-tail line.
-    const backlogCompleteRef = useRef(false);
-    // Set once `loadOlder` proves the backend can't surface more historical
-    // lines (returned a page but all rows were already in view — typical for
-    // the Kubernetes backend, whose `pods/log` API has no end-time filter).
-    // Streaming onLine handlers must not flip `hasMore` back on after this.
-    const paginationExhaustedRef = useRef(false);
-    // Mirrors `entries.length` so `loadOlder` can pass it as `skip_recent`
-    // without re-creating the callback on every streamed line. Kept in sync
-    // by the small effect right below.
-    const entriesCountRef = useRef(0);
 
     // eslint-disable-next-line react-hooks/exhaustive-deps
     const rangeWindow = useMemo(() => resolveLogWindow(rangeValue, customStart, customEnd, anchorEnd), [rangeValue, customStart, customEnd, anchorEnd, rangeNowTick]);
@@ -1192,7 +1185,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 const caps = await api.getLogsCapabilities();
                 if (cancelled || !caps) return;
                 setCapabilities({
-                    backend: caps.backend || null,
                     levels: Array.isArray(caps.levels) && caps.levels.length > 0
                         ? caps.levels
                         : ['info', 'warn', 'error'],
@@ -1206,10 +1198,6 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         loadCapabilities();
         return () => { cancelled = true; };
     }, []);
-
-    useEffect(() => {
-        entriesCountRef.current = entries.length;
-    }, [entries.length]);
 
     const stopStreaming = useCallback(() => {
         if (abortControllerRef.current) {
@@ -1283,18 +1271,21 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }
     }, [deploymentId, projectName, rangeStepSeconds, rangeWindow, levelFilter, searchActive]);
 
-    // Cancellable SSE fetch. `onLine` receives raw (timestamped) lines along
-    // with the backend-provided per-line level classification.
-    const fetchLogFeed = useCallback(async ({ follow, start, end, tail, levels, search, onLine, onStatus, onBacklogComplete }: {
+    // Cancellable SSE fetch. `onLine` receives the backend's stable event id,
+    // rendered line, and level classification.
+    const fetchLogFeed = useCallback(async ({ follow, start, end, cursor, tail, levels, search, onLine, onStatus, onBacklogComplete, onPageComplete, onCursor }: {
         follow: boolean;
         start?: string;
         end?: string;
+        cursor?: string;
         tail: number;
         levels?: string[];
         search?: string;
-        onLine: (line: string, lineLevel: string) => void;
+        onLine: (line: string, lineLevel: string, eventId: string | null) => void;
         onStatus?: (payload: string) => void;
         onBacklogComplete?: (payload: string) => void;
+        onPageComplete?: (payload: string) => void;
+        onCursor?: (payload: string) => void;
     }) => {
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
@@ -1314,6 +1305,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         }
         if (start) params.set('start', start);
         if (end) params.set('end', end);
+        if (cursor) params.set('cursor', cursor);
         for (const lv of levels || []) {
             params.append('level', lv);
         }
@@ -1332,7 +1324,13 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             throw new Error(await readHttpErrorMessage(response));
         }
 
-        await readSseResponse(response, { onLine, onStatus, onBacklogComplete });
+        await readSseResponse(response, {
+            onLine,
+            onStatus,
+            onBacklogComplete,
+            onPageComplete,
+            onCursor,
+        });
     }, [deploymentId, projectName]);
 
     const loadHistoricalLogs = useCallback(async () => {
@@ -1362,11 +1360,11 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setLogStatus(null);
         setStreaming(false);
         setHasMore(false);
-        oldestLoadedMsRef.current = null;
-        paginationExhaustedRef.current = false;
+        paginationCursorRef.current = null;
 
         const collected = [];
         let newStatus = null;
+        let nextCursor = null;
 
         try {
             await fetchLogFeed({
@@ -1376,9 +1374,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 tail: LOG_PAGE_SIZE,
                 levels: levelFilter,
                 search: searchActive,
-                onLine: (line, lineLevel) => {
+                onLine: (line, lineLevel, eventId) => {
                     if (gen !== streamGenRef.current) return;
-                    collected.push(parseLogLine(line, seqRef.current++, lineLevel));
+                    collected.push(parseLogLine(line, seqRef.current++, lineLevel, eventId));
                 },
                 onStatus: (payload) => {
                     if (gen !== streamGenRef.current) return;
@@ -1388,16 +1386,25 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                         newStatus = { reason: 'backend_unavailable' };
                     }
                 },
+                onPageComplete: (payload) => {
+                    if (gen !== streamGenRef.current) return;
+                    try {
+                        const parsed = JSON.parse(payload);
+                        nextCursor = typeof parsed.next_cursor === 'string'
+                            ? parsed.next_cursor
+                            : null;
+                    } catch {
+                        nextCursor = null;
+                    }
+                },
             });
             if (gen !== streamGenRef.current) return;
             // Backend sorts ascending; reverse so newest is on top.
             const reversed = collected.slice().reverse();
             setEntries(reversed);
             setLogStatus(newStatus);
-            if (reversed.length > 0) {
-                oldestLoadedMsRef.current = reversed[reversed.length - 1].timestampMs;
-            }
-            setHasMore(collected.length === LOG_PAGE_SIZE);
+            paginationCursorRef.current = nextCursor;
+            setHasMore(nextCursor !== null);
         } catch (err) {
             if (err.name === 'AbortError') return;
             if (gen !== streamGenRef.current) return;
@@ -1414,8 +1421,8 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         if (loadingMoreRef.current) return;
         if (!hasMore) return;
         if (!logWindow) return;
-        const oldestMs = oldestLoadedMsRef.current;
-        if (!oldestMs) return;
+        const cursor = paginationCursorRef.current;
+        if (!cursor) return;
 
         // Abort any in-flight pagination; otherwise a stale response can land
         // after the user has changed filter/range and overwrite the new window.
@@ -1428,27 +1435,15 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setLoadingMore(true);
 
         const baseUrl = CONFIG.backendUrl;
-        // Intentionally no `start` — let pagination extend past the user's
-        // selected range and surface whatever the backend still holds
-        // (kubelet buffer for K8s, configured retention for Loki, capped
-        // at deployment.created_at). The log list dims out-of-range
-        // timestamps so the user can see they're past the chart window.
         const params = new URLSearchParams({
             timestamps: 'true',
             tail: String(LOG_PAGE_SIZE),
-            end: new Date(oldestMs).toISOString(),
+            cursor,
         });
         for (const level of levelFilter) {
             params.append('level', level);
         }
         if (searchActive) params.set('search', searchActive);
-        // K8s and CloudWatch use this to skip past the lines already in view;
-        // Loki uses `end`. Sending both lets each backend pick its stable
-        // pagination cursor.
-        if (entriesCountRef.current > 0) {
-            params.set('skip_recent', String(entriesCountRef.current));
-        }
-
         try {
             const response = await fetch(
                 `${baseUrl}/api/v1/projects/${projectName}/deployments/${deploymentId}/logs?${params.toString()}`,
@@ -1464,48 +1459,34 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             }
 
             const collected = [];
+            let nextCursor = null;
             await readSseResponse(response, {
-                onLine: (line, lineLevel) => {
-                    collected.push(parseLogLine(line, seqRef.current++, lineLevel));
+                onLine: (line, lineLevel, eventId) => {
+                    collected.push(parseLogLine(line, seqRef.current++, lineLevel, eventId));
+                },
+                onPageComplete: (payload) => {
+                    try {
+                        const parsed = JSON.parse(payload);
+                        nextCursor = typeof parsed.next_cursor === 'string'
+                            ? parsed.next_cursor
+                            : null;
+                    } catch {
+                        nextCursor = null;
+                    }
                 },
             });
 
             if (controller.signal.aborted) return;
             const reversed = collected.slice().reverse();
-            let newlyAdded = 0;
-            let oldestAddedMs: number | null = null;
             setEntries((prev) => {
                 const seen = new Set(prev.map((e) => e.id));
-                // CloudWatch pages by count because different ECS streams can
-                // share a millisecond. Its next page is non-overlapping, so
-                // equal-timestamp rows are valid; timestamp-cursor backends
-                // repeat their inclusive boundary and must stay strictly older.
-                const beforeCursor = capabilities.backend === 'cloudwatch'
-                    ? (entry) => entry.timestampMs <= oldestMs
-                    : (entry) => entry.timestampMs < oldestMs;
-                const filtered = reversed.filter((e) => !seen.has(e.id) && beforeCursor(e));
-                newlyAdded = filtered.length;
+                const filtered = reversed.filter((entry) => !seen.has(entry.id));
                 if (filtered.length === 0) return prev;
-                // Stable descending sort by timestamp so any backdated rows
-                // land in the right place rather than appended out of order.
                 filtered.sort((a, b) => b.timestampMs - a.timestampMs);
-                oldestAddedMs = filtered[filtered.length - 1].timestampMs;
                 return prev.concat(filtered);
             });
-            if (newlyAdded > 0 && oldestAddedMs !== null) {
-                oldestLoadedMsRef.current = oldestAddedMs;
-            }
-            // Gate on *new* rows. Without this, a backend that ignores
-            // end_time (e.g. Kubernetes' pods/log API) returns the same
-            // most-recent N lines every time, dedup filters them all, but
-            // collected.length stays at the page size — the IntersectionObserver
-            // would re-fire forever. A page short of new rows means we're
-            // either at the start of the range or this backend can't paginate.
-            const exhausted = newlyAdded < LOG_PAGE_SIZE;
-            if (exhausted) {
-                paginationExhaustedRef.current = true;
-            }
-            setHasMore(!exhausted);
+            paginationCursorRef.current = nextCursor;
+            setHasMore(nextCursor !== null);
         } catch (err) {
             if (err.name === 'AbortError') return;
             console.error('Failed to load older logs:', err);
@@ -1516,7 +1497,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 setLoadingMore(false);
             }
         }
-    }, [deploymentId, projectName, hasMore, logWindow, levelFilter, searchActive, capabilities.backend]);
+    }, [deploymentId, projectName, hasMore, logWindow, levelFilter, searchActive]);
 
     const startStreaming = useCallback(async () => {
         const gen = ++streamGenRef.current;
@@ -1535,9 +1516,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
         setLogStatus(null);
         setStreaming(true);
         setHasMore(false);
-        oldestLoadedMsRef.current = null;
-        backlogCompleteRef.current = false;
-        paginationExhaustedRef.current = false;
+        paginationCursorRef.current = null;
 
         try {
             await fetchLogFeed({
@@ -1549,31 +1528,20 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 tail: LOG_PAGE_SIZE,
                 levels: levelFilter,
                 search: searchActive,
-                onLine: (line, lineLevel) => {
+                onLine: (line, lineLevel, eventId) => {
                     if (streamGenRef.current !== gen) return;
-                    const newEntry = parseLogLine(line, seqRef.current++, lineLevel);
+                    const newEntry = parseLogLine(line, seqRef.current++, lineLevel, eventId);
                     setEntries((prev) => {
+                        if (prev.some((entry) => entry.id === newEntry.id)) return prev;
                         // Loki tail can deliver lines slightly out-of-order; keep
                         // the array sorted descending by timestamp.
                         let i = 0;
                         while (i < prev.length && prev[i].timestampMs > newEntry.timestampMs) i++;
-                        if (i < prev.length && prev[i].id === newEntry.id) return prev;
                         const next = prev.slice();
                         next.splice(i, 0, newEntry);
                         if (next.length > LOG_STREAM_CAP) next.length = LOG_STREAM_CAP;
                         return next;
                     });
-                    if (newEntry.timestampMs > 0
-                        && (oldestLoadedMsRef.current === null
-                            || newEntry.timestampMs < oldestLoadedMsRef.current)) {
-                        oldestLoadedMsRef.current = newEntry.timestampMs;
-                    }
-                    // Optimistic during backlog; once backlog_complete fires or
-                    // loadOlder has proven the backend can't surface more,
-                    // hasMore is authoritative — don't override on tail lines.
-                    if (!backlogCompleteRef.current && !paginationExhaustedRef.current) {
-                        setHasMore(true);
-                    }
                 },
                 onStatus: (payload) => {
                     if (streamGenRef.current !== gen) return;
@@ -1585,16 +1553,31 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 },
                 onBacklogComplete: (payload) => {
                     if (streamGenRef.current !== gen) return;
-                    backlogCompleteRef.current = true;
-                    let count = 0;
                     try {
-                        count = JSON.parse(payload).count || 0;
+                        const parsed = JSON.parse(payload);
+                        const nextCursor = typeof parsed.next_cursor === 'string'
+                            ? parsed.next_cursor
+                            : null;
+                        paginationCursorRef.current = nextCursor;
+                        setHasMore(nextCursor !== null);
                     } catch {
-                        // Treat malformed payload as a full page so we don't
-                        // wrongly claim we've reached the start of the range.
-                        count = LOG_PAGE_SIZE;
+                        paginationCursorRef.current = null;
+                        setHasMore(false);
                     }
-                    setHasMore(count >= LOG_PAGE_SIZE);
+                },
+                onCursor: (payload) => {
+                    if (streamGenRef.current !== gen) return;
+                    try {
+                        const parsed = JSON.parse(payload);
+                        const nextCursor = typeof parsed.next_cursor === 'string'
+                            ? parsed.next_cursor
+                            : null;
+                        paginationCursorRef.current = nextCursor;
+                        setHasMore(nextCursor !== null);
+                    } catch {
+                        paginationCursorRef.current = null;
+                        setHasMore(false);
+                    }
                 },
             });
         } catch (err) {

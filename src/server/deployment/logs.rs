@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -53,12 +55,9 @@ pub struct LogQuery {
     /// Optional case-insensitive substring users can type into the runtime
     /// logs search box. Empty/whitespace means "no filter".
     pub search: Option<String>,
-    /// Skip this many of the most-recent qualifying lines before returning.
-    /// Used by the Kubernetes backend to paginate older lines without an
-    /// end-time filter — the frontend passes the number of lines it has
-    /// already displayed. The Loki backend ignores this and uses its
-    /// timestamp-windowed pagination instead.
-    pub skip_recent: Option<i64>,
+    /// Opaque continuation returned by the configured backend. Its contents
+    /// are private to that backend and bound to the deployment and filters.
+    pub cursor: Option<String>,
     /// Per-Organization namespace prefix resolved by the caller (see
     /// `resolve_project_namespace_prefix`). Used by the Kubernetes backend
     /// to compute the Pod namespace; the Loki backend ignores this and
@@ -124,22 +123,86 @@ pub enum LogEvent {
     /// when `timestamps=true`). `level` is the level string the configured
     /// backend emits — either Loki's `detected_level` (one of `LOKI_LEVELS`,
     /// defaulting to `"unknown"`) or the K8s regex classifier's output (one
-    /// of `KUBERNETES_LEVELS`).
+    /// of `KUBERNETES_LEVELS`). `id` remains stable when the same stored event
+    /// appears in a retried or adjacent request.
     Line {
+        id: String,
         text: String,
         level: String,
     },
     Status(LogStatus),
     /// Sent once the initial backlog phase of a streaming request has been
-    /// fully emitted, before the live-tail loop begins. `count` is the number
-    /// of backlog lines yielded; the frontend uses it to decide whether older
-    /// lines may still exist in the selected window.
+    /// fully emitted, before the live-tail loop begins. `count` reports the
+    /// emitted backlog size and `next_cursor` continues toward older entries.
     BacklogLoaded {
         count: usize,
+        next_cursor: Option<String>,
+    },
+    /// Completes a finite historical page. A cursor is present exactly when
+    /// the backend can continue paging toward older entries.
+    PageLoaded {
+        next_cursor: Option<String>,
+    },
+    /// Makes a continuation available before a combined backlog/follow source
+    /// reaches an explicit backlog boundary.
+    CursorUpdated {
+        next_cursor: String,
     },
 }
 
 pub type LogEventStream = futures::stream::BoxStream<'static, Result<LogEvent>>;
+
+pub(super) fn encode_log_cursor<T: Serialize>(cursor: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(cursor).context("Failed to encode log cursor")?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+pub(super) fn decode_log_cursor<T: DeserializeOwned>(cursor: &str) -> Result<T> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .context("invalid log cursor encoding")?;
+    serde_json::from_slice(&bytes).context("invalid log cursor payload")
+}
+
+pub(super) fn log_cursor_signature(
+    backend: &str,
+    deployment: &Deployment,
+    project: &Project,
+    query: &LogQuery,
+) -> String {
+    let mut levels = query.levels.clone();
+    levels.sort();
+    levels.dedup();
+    let deployment_id = deployment.id.to_string();
+    let project_id = project.id.to_string();
+    let levels = levels.join("\0");
+
+    let mut digest = Sha256::new();
+    for part in [
+        backend.as_bytes(),
+        deployment_id.as_bytes(),
+        project_id.as_bytes(),
+        levels.as_bytes(),
+        query.search.as_deref().unwrap_or_default().as_bytes(),
+    ] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+pub(super) fn stable_log_id<'a>(
+    backend: &str,
+    parts: impl IntoIterator<Item = &'a [u8]>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(backend.as_bytes());
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
 
 /// Server-scoped capabilities of the configured log backend. Surfaced to the
 /// frontend (and any other client) via `GET /api/v1/logs/capabilities` so the
@@ -160,9 +223,8 @@ pub struct LogsCapabilities {
 
 #[async_trait]
 pub trait RuntimeLogBackend: Send + Sync {
-    /// Identifier for the backend variant (`"loki"` or `"kubernetes"`). Used
-    /// only in the capabilities response — handlers branch on the trait, not
-    /// this string.
+    /// Identifier surfaced for diagnostics in the capabilities response.
+    /// Query and pagination behavior remains behind the trait.
     fn backend_kind(&self) -> &'static str;
 
     /// Full list of level strings the backend can emit. Drives both the
@@ -287,6 +349,13 @@ struct KubernetesLogBackend {
     config: KubernetesLogBackendSettings,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct TailLogCursor {
+    version: u8,
+    signature: String,
+    offset: usize,
+}
+
 pub(crate) fn is_followable_status(status: &DeploymentStatus) -> bool {
     matches!(
         status,
@@ -368,27 +437,35 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             .context("Pod name not found")?
             .clone();
 
-        // `skip_recent` lets the frontend page backward without an end-time
-        // filter: the kubelet returns lines in chronological order, so by
-        // bumping `tail_lines` we widen the window backward and then drop
-        // the trailing N qualifying lines (which the frontend already has).
-        let skip_recent = query.skip_recent.unwrap_or(0).max(0);
+        let signature = log_cursor_signature("kubernetes", deployment, project, &query);
+        let cursor = query
+            .cursor
+            .as_deref()
+            .map(decode_log_cursor::<TailLogCursor>)
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.version != 1 || cursor.signature != signature)
+        {
+            anyhow::bail!("invalid log cursor for this deployment or filter");
+        }
+        let skip_recent = cursor.as_ref().map_or(0, |cursor| cursor.offset);
+        let page_size = query.tail_lines.unwrap_or(1_000).max(1) as usize;
         // Cap the requested tail at the configured ceiling. Once the frontend
         // hits this cap, paging stops yielding new lines — the same outcome
         // as when the kubelet's own ring buffer is exhausted.
-        let max_tail = self.config.max_tail_lines.max(1);
-        let effective_tail = query
-            .tail_lines
-            .map(|t| t.saturating_add(skip_recent).clamp(1, max_tail));
+        let max_tail = self.config.max_tail_lines.max(1) as usize;
+        if skip_recent >= max_tail {
+            anyhow::bail!("invalid log cursor offset");
+        }
+        let effective_tail = page_size.saturating_add(skip_recent).min(max_tail);
 
         let mut log_params = LogParams {
             follow: query.follow && is_followable_status(&deployment.status),
             timestamps: query.timestamps,
             ..Default::default()
         };
-        if let Some(tail) = effective_tail {
-            log_params.tail_lines = Some(tail);
-        }
+        log_params.tail_lines = Some(effective_tail as i64);
         if let Some(since) = query.since_seconds {
             log_params.since_seconds = Some(since);
         } else if let Some(start_time) = query.start_time {
@@ -418,14 +495,17 @@ impl RuntimeLogBackend for KubernetesLogBackend {
         let log_stream = pod_api.log_stream(&pod_name, &log_params).await?;
         let levels = query.levels.clone();
         let search = query.search.clone();
+        let follow = log_params.follow;
+        let pod_name_for_id = pod_name.clone();
+        let namespace_for_id = namespace.clone();
         let stream = async_stream::stream! {
             use futures::AsyncBufReadExt;
             use std::collections::VecDeque;
-            let skip = skip_recent as usize;
-            // Buffer the trailing `skip` qualifying lines so we can drop them
-            // once the stream ends. While the buffer is full, evict the oldest
-            // and yield it — that's a line the frontend doesn't already have.
-            let mut trailing: VecDeque<(String, &'static str)> = VecDeque::with_capacity(skip.saturating_add(1));
+            // Kubelet returns chronological lines. Holding the trailing
+            // qualifying offset leaves the next older page at the front.
+            let mut trailing: VecDeque<(String, &'static str, String)> =
+                VecDeque::with_capacity(skip_recent.saturating_add(1));
+            let mut emitted_count = 0usize;
             let mut lines = futures::io::BufReader::new(log_stream).lines();
             while let Some(line) = lines.next().await {
                 let line = match line {
@@ -439,19 +519,50 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                 let level = classify_k8s_line(&line);
                 if !levels.is_empty() && !levels.iter().any(|l| l == level) { continue; }
                 if !line_matches_search(&line, search.as_deref()) { continue; }
-                if skip == 0 {
-                    yield Ok(LogEvent::Line { text: line, level: level.to_string() });
-                } else {
-                    trailing.push_back((line, level));
-                    if trailing.len() > skip {
-                        if let Some((out, level)) = trailing.pop_front() {
-                            yield Ok(LogEvent::Line { text: out, level: level.to_string() });
+                let id = stable_log_id(
+                    "kubernetes",
+                    [namespace_for_id.as_bytes(), pod_name_for_id.as_bytes(), line.as_bytes()],
+                );
+                trailing.push_back((line, level, id));
+                if trailing.len() <= skip_recent {
+                    continue;
+                }
+                let Some((line, level, id)) = trailing.pop_front() else { continue; };
+                emitted_count = emitted_count.saturating_add(1);
+                yield Ok(LogEvent::Line { id, text: line, level: level.to_string() });
+                if follow {
+                    match encode_log_cursor(&TailLogCursor {
+                        version: 1,
+                        signature: signature.clone(),
+                        offset: skip_recent.saturating_add(emitted_count),
+                    }) {
+                        Ok(next_cursor) => yield Ok(LogEvent::CursorUpdated { next_cursor }),
+                        Err(error) => {
+                            yield Err(error);
+                            return;
                         }
                     }
                 }
             }
-            // Anything left in the buffer is in the trailing `skip` window and
-            // intentionally dropped — those are the lines the frontend already has.
+            if !follow {
+                let has_more = emitted_count >= page_size
+                    && skip_recent.saturating_add(emitted_count) < max_tail;
+                let next_cursor = if has_more {
+                    encode_log_cursor(&TailLogCursor {
+                        version: 1,
+                        signature,
+                        offset: skip_recent.saturating_add(emitted_count),
+                    })
+                } else {
+                    Ok(String::new())
+                };
+                match next_cursor {
+                    Ok(next_cursor) => yield Ok(LogEvent::PageLoaded {
+                        next_cursor: has_more.then_some(next_cursor),
+                    }),
+                    Err(error) => yield Err(error),
+                }
+            }
         };
 
         Ok(stream.boxed())
@@ -504,8 +615,11 @@ impl RuntimeLogBackend for NoneLogBackend {
         &self,
         _deployment: &Deployment,
         _project: &Project,
-        _query: LogQuery,
+        query: LogQuery,
     ) -> Result<LogEventStream> {
+        if query.cursor.is_some() {
+            anyhow::bail!("invalid log cursor for the configured backend");
+        }
         Ok(status_stream(LogStatus {
             reason: LogStatusReason::HistoricalBackendNotConfigured,
             message: Some(
@@ -649,6 +763,9 @@ impl RuntimeLogBackend for DockerLogBackend {
                 retention_hint: None,
             }));
         }
+        if query.cursor.is_some() {
+            anyhow::bail!("invalid log cursor for the configured backend");
+        }
 
         let Some(container_id) = self.resolve_container_id(deployment, project).await? else {
             return Ok(status_stream(LogStatus {
@@ -689,6 +806,8 @@ impl RuntimeLogBackend for DockerLogBackend {
         let log_stream = self.docker.logs(&container_id, Some(options));
         let levels = query.levels.clone();
         let search = query.search.clone();
+        let follow = query.follow && is_followable_status(&deployment.status);
+        let container_id_for_lines = container_id.clone();
         let stream = async_stream::stream! {
             futures::pin_mut!(log_stream);
             while let Some(item) = log_stream.next().await {
@@ -712,11 +831,19 @@ impl RuntimeLogBackend for DockerLogBackend {
                     if !line_matches_search(line, search.as_deref()) {
                         continue;
                     }
+                    let id = stable_log_id(
+                        "docker",
+                        [container_id_for_lines.as_bytes(), line.as_bytes()],
+                    );
                     yield Ok(LogEvent::Line {
+                        id,
                         text: line.to_string(),
                         level: level.to_string(),
                     });
                 }
+            }
+            if !follow {
+                yield Ok(LogEvent::PageLoaded { next_cursor: None });
             }
         };
 
@@ -753,6 +880,45 @@ struct LokiLogBackend {
     retention_hint: Option<String>,
     labels: LokiLabels,
     http_client: reqwest::Client,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LokiLogCursor {
+    version: u8,
+    signature: String,
+    end_nanos: i64,
+    boundary_offset: usize,
+}
+
+struct LokiLogPage {
+    lines: Vec<LogLine>,
+    next_cursor: Option<String>,
+}
+
+fn select_loki_page(
+    lines_ascending: Vec<LogLine>,
+    page_size: usize,
+    boundary_nanos: Option<i128>,
+    boundary_offset: usize,
+) -> Vec<LogLine> {
+    let mut remaining_boundary = boundary_offset;
+    let mut lines = Vec::with_capacity(page_size);
+    for line in lines_ascending.into_iter().rev() {
+        if boundary_nanos == Some(line.timestamp_nanos) && remaining_boundary > 0 {
+            remaining_boundary -= 1;
+            continue;
+        }
+        lines.push(line);
+        if lines.len() == page_size {
+            break;
+        }
+    }
+    lines.sort_by(|a, b| {
+        a.timestamp_nanos
+            .cmp(&b.timestamp_nanos)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    lines
 }
 
 impl LokiLogBackend {
@@ -868,12 +1034,96 @@ impl LokiLogBackend {
             .into_iter()
             .flat_map(|stream| {
                 let level = stream.stream.get("detected_level").cloned();
-                stream.values.into_iter().map(move |v| (v, level.clone()))
+                let stream_key = canonical_loki_stream(&stream.stream);
+                stream
+                    .values
+                    .into_iter()
+                    .map(move |v| (v, level.clone(), stream_key.clone()))
             })
-            .filter_map(|(value, level)| LogLine::from_loki_value(value, level.as_deref()))
+            .filter_map(|(value, level, stream_key)| {
+                LogLine::from_loki_value(value, level.as_deref(), &stream_key)
+            })
             .collect::<Vec<_>>();
-        lines.sort_by_key(|line| line.timestamp_nanos);
+        lines.sort_by(|a, b| {
+            a.timestamp_nanos
+                .cmp(&b.timestamp_nanos)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         Ok(lines)
+    }
+
+    async fn query_page(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+        query: &LogQuery,
+    ) -> Result<LokiLogPage> {
+        let page_size = query.tail_lines.unwrap_or(1_000).clamp(1, LOKI_MAX_TAIL) as usize;
+        let signature = log_cursor_signature("loki", deployment, project, query);
+        let cursor = query
+            .cursor
+            .as_deref()
+            .map(decode_log_cursor::<LokiLogCursor>)
+            .transpose()?;
+        if cursor.as_ref().is_some_and(|cursor| {
+            cursor.version != 1
+                || cursor.signature != signature
+                || cursor.boundary_offset >= LOKI_MAX_TAIL as usize
+        }) {
+            anyhow::bail!("invalid log cursor for this deployment or filter");
+        }
+
+        let mut page_query = query.clone();
+        page_query.follow = false;
+        let (boundary_nanos, boundary_offset) = if let Some(cursor) = &cursor {
+            page_query.start_time = Some(deployment.created_at);
+            page_query.end_time = Some(DateTime::<Utc>::from_timestamp_nanos(cursor.end_nanos));
+            (Some(cursor.end_nanos as i128), cursor.boundary_offset)
+        } else {
+            (None, 0)
+        };
+        let request_limit = page_size
+            .saturating_add(boundary_offset)
+            .min(LOKI_MAX_TAIL as usize);
+        if request_limit <= boundary_offset {
+            anyhow::bail!("invalid log cursor boundary for the Loki query limit");
+        }
+        page_query.tail_lines = Some(request_limit as i64);
+
+        let lines = select_loki_page(
+            self.query_range(deployment, project, &page_query).await?,
+            page_size,
+            boundary_nanos,
+            boundary_offset,
+        );
+
+        let has_more = lines.len() == page_size;
+        let next_cursor = if has_more {
+            let oldest_nanos = lines
+                .first()
+                .map(|line| line.timestamp_nanos)
+                .context("Loki page cursor requires an oldest line")?;
+            let page_boundary_count = lines
+                .iter()
+                .take_while(|line| line.timestamp_nanos == oldest_nanos)
+                .count();
+            let boundary_offset = if boundary_nanos == Some(oldest_nanos) {
+                boundary_offset.saturating_add(page_boundary_count)
+            } else {
+                page_boundary_count
+            };
+            Some(encode_log_cursor(&LokiLogCursor {
+                version: 1,
+                signature,
+                end_nanos: i64::try_from(oldest_nanos)
+                    .context("Loki cursor timestamp is outside the supported range")?,
+                boundary_offset,
+            })?)
+        } else {
+            None
+        };
+
+        Ok(LokiLogPage { lines, next_cursor })
     }
 
     fn apply_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -917,9 +1167,12 @@ impl LokiLogBackend {
         // negligible backlog. Otherwise query_range would scan the full
         // [start, end] window just to drop all but one row at the limit.
         let initial = if matches!(query.tail_lines, Some(t) if t <= 1) {
-            Vec::new()
+            LokiLogPage {
+                lines: Vec::new(),
+                next_cursor: None,
+            }
         } else {
-            self.query_range(&deployment, &project, &query).await?
+            self.query_page(&deployment, &project, &query).await?
         };
         let selector = self.selector(
             &deployment,
@@ -932,12 +1185,12 @@ impl LokiLogBackend {
         let bearer_token = self.bearer_token.clone();
 
         let stream = async_stream::try_stream! {
-            let backlog_count = initial.len();
-            for line in initial {
+            let backlog_count = initial.lines.len();
+            for line in initial.lines {
                 let level = line.classified_level();
-                yield LogEvent::Line { text: line.render(query.timestamps), level };
+                yield LogEvent::Line { id: line.id.clone(), text: line.render(query.timestamps), level };
             }
-            yield LogEvent::BacklogLoaded { count: backlog_count };
+            yield LogEvent::BacklogLoaded { count: backlog_count, next_cursor: initial.next_cursor };
 
             let mut request = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())
                 .context("Failed to build Loki tail websocket request")?;
@@ -977,10 +1230,12 @@ impl LokiLogBackend {
                             .context("Invalid Loki tail payload")?;
                         for stream in response.streams {
                             let stream_level = stream.stream.get("detected_level").cloned();
+                            let stream_key = canonical_loki_stream(&stream.stream);
                             for value in stream.values {
-                                if let Some(line) = LogLine::from_loki_value(value, stream_level.as_deref()) {
+                                if let Some(line) = LogLine::from_loki_value(value, stream_level.as_deref(), &stream_key) {
                                     let level = line.classified_level();
                                     yield LogEvent::Line {
+                                        id: line.id.clone(),
                                         text: line.render(query.timestamps),
                                         level,
                                     };
@@ -1174,24 +1429,27 @@ impl RuntimeLogBackend for LokiLogBackend {
                 .await;
         }
 
-        let mut historical_query = query.clone();
-        historical_query.follow = false;
-        let lines = self
-            .query_range(deployment, project, &historical_query)
-            .await?;
-        if lines.is_empty() {
-            return Ok(status_stream(self.empty_status(deployment)));
-        }
-
+        let page = self.query_page(deployment, project, &query).await?;
         let timestamps = query.timestamps;
-        Ok(futures::stream::iter(lines.into_iter().map(move |line| {
-            let level = line.classified_level();
-            Ok(LogEvent::Line {
-                text: line.render(timestamps),
-                level,
+        let mut events = page
+            .lines
+            .into_iter()
+            .map(move |line| {
+                let level = line.classified_level();
+                Ok(LogEvent::Line {
+                    id: line.id.clone(),
+                    text: line.render(timestamps),
+                    level,
+                })
             })
-        }))
-        .boxed())
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            events.push(Ok(LogEvent::Status(self.empty_status(deployment))));
+        }
+        events.push(Ok(LogEvent::PageLoaded {
+            next_cursor: page.next_cursor,
+        }));
+        Ok(futures::stream::iter(events).boxed())
     }
 
     async fn query_volume(
@@ -1276,8 +1534,22 @@ impl RuntimeLogBackend for LokiLogBackend {
     }
 }
 
+fn canonical_loki_stream(stream: &HashMap<String, String>) -> String {
+    let mut labels = stream
+        .iter()
+        .filter(|(key, _)| key.as_str() != "detected_level")
+        .collect::<Vec<_>>();
+    labels.sort_by_key(|(key, _)| *key);
+    labels
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", key, value))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
 #[derive(Debug)]
 struct LogLine {
+    id: String,
     timestamp_nanos: i128,
     line: String,
     /// `detected_level` extracted from the Loki entry's structured metadata
@@ -1289,13 +1561,17 @@ struct LogLine {
 }
 
 impl LogLine {
-    fn from_loki_value(value: LokiValue, stream_level: Option<&str>) -> Option<Self> {
+    fn from_loki_value(
+        value: LokiValue,
+        stream_level: Option<&str>,
+        stream_key: &str,
+    ) -> Option<Self> {
         let LokiValue {
             timestamp,
             line,
             structured_metadata,
         } = value;
-        let timestamp_nanos = timestamp.parse().ok()?;
+        let timestamp_nanos: i128 = timestamp.parse().ok()?;
         // Prefer per-entry structured metadata (Loki 3.x optional 3-tuple
         // shape), then fall back to the stream-level label (the form Loki
         // actually emits today). Either way, an empty string means "not
@@ -1312,7 +1588,17 @@ impl LogLine {
         // behavior so renderers/SSE consumers don't end up with blank lines
         // between entries.
         let line = line.trim_end_matches(['\r', '\n']).to_string();
+        let timestamp_bytes = timestamp_nanos.to_be_bytes();
+        let id = stable_log_id(
+            "loki",
+            [
+                timestamp_bytes.as_slice(),
+                stream_key.as_bytes(),
+                line.as_bytes(),
+            ],
+        );
         Some(Self {
+            id,
             timestamp_nanos,
             line,
             detected_level,
@@ -1339,9 +1625,9 @@ impl LogLine {
         }
     }
 
-    fn render(self, timestamps: bool) -> String {
+    fn render(&self, timestamps: bool) -> String {
         if !timestamps {
-            return self.line;
+            return self.line.clone();
         }
         let ts = DateTime::<Utc>::from_timestamp_nanos(self.timestamp_nanos as i64);
         format!("{} {}", ts.to_rfc3339(), self.line)
@@ -1739,6 +2025,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opaque_log_cursor_round_trips() {
+        let encoded = encode_log_cursor(&TailLogCursor {
+            version: 1,
+            signature: "deployment-and-filters".into(),
+            offset: 400,
+        })
+        .expect("cursor encodes");
+        assert!(!encoded.contains('{'));
+
+        let decoded: TailLogCursor = decode_log_cursor(&encoded).expect("cursor decodes");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.signature, "deployment-and-filters");
+        assert_eq!(decoded.offset, 400);
+    }
+
+    #[test]
+    fn loki_cursor_advances_within_an_equal_timestamp_boundary() {
+        let line = |timestamp_nanos, id: &str| LogLine {
+            id: id.into(),
+            timestamp_nanos,
+            line: id.into(),
+            detected_level: None,
+        };
+        let first = select_loki_page(
+            vec![
+                line(1, "a"),
+                line(2, "b"),
+                line(2, "c"),
+                line(2, "d"),
+                line(3, "e"),
+            ],
+            2,
+            None,
+            0,
+        );
+        assert_eq!(
+            first
+                .iter()
+                .map(|line| line.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d", "e"]
+        );
+
+        let second = select_loki_page(
+            vec![line(1, "a"), line(2, "b"), line(2, "c"), line(2, "d")],
+            2,
+            Some(2),
+            1,
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|line| line.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+    }
+
+    #[test]
+    fn loki_event_identity_ignores_classification_label() {
+        let mut live = HashMap::from([
+            ("project".into(), "demo".into()),
+            ("deployment_id".into(), "deploy-1".into()),
+        ]);
+        let without_level = canonical_loki_stream(&live);
+        live.insert("detected_level".into(), "error".into());
+        assert_eq!(canonical_loki_stream(&live), without_level);
+    }
+
+    #[test]
     fn from_loki_value_uses_stream_label_when_metadata_absent() {
         // Loki 3.x attaches `detected_level` as a stream-level label, not as
         // per-entry structured metadata. The 2-tuple `[ts, line]` is the
@@ -1748,7 +2104,8 @@ mod tests {
             line: "anything".to_string(),
             structured_metadata: None,
         };
-        let parsed = LogLine::from_loki_value(value, Some("warn")).expect("valid loki value");
+        let parsed =
+            LogLine::from_loki_value(value, Some("warn"), "stream").expect("valid loki value");
         assert_eq!(parsed.classified_level(), "warn");
 
         // Whitespace/empty stream labels are treated as "no classification"
@@ -1760,7 +2117,8 @@ mod tests {
             line: "anything".to_string(),
             structured_metadata: None,
         };
-        let parsed = LogLine::from_loki_value(value, Some("  ")).expect("valid loki value");
+        let parsed =
+            LogLine::from_loki_value(value, Some("  "), "stream").expect("valid loki value");
         assert_eq!(parsed.classified_level(), "info");
 
         // Per-entry structured metadata wins over the stream-level label.
@@ -1771,7 +2129,8 @@ mod tests {
             line: "anything".to_string(),
             structured_metadata: Some(md),
         };
-        let parsed = LogLine::from_loki_value(value, Some("warn")).expect("valid loki value");
+        let parsed =
+            LogLine::from_loki_value(value, Some("warn"), "stream").expect("valid loki value");
         assert_eq!(parsed.classified_level(), "error");
     }
 
@@ -1792,7 +2151,7 @@ mod tests {
                 line: input.to_string(),
                 structured_metadata: None,
             };
-            let parsed = LogLine::from_loki_value(value, None).expect("valid loki value");
+            let parsed = LogLine::from_loki_value(value, None, "stream").expect("valid loki value");
             assert_eq!(parsed.line, expected, "input {input:?}");
         }
     }
@@ -2166,6 +2525,7 @@ mod tests {
         // driven by `/api/v1/logs/capabilities`.
         for raw in ["info", "warn", "error", "critical", "fatal", "trace"] {
             let l = LogLine {
+                id: "id".into(),
                 timestamp_nanos: 0,
                 line: "anything".into(),
                 detected_level: Some(raw.into()),
@@ -2175,6 +2535,7 @@ mod tests {
 
         // Whitespace is trimmed.
         let l = LogLine {
+            id: "id".into(),
             timestamp_nanos: 0,
             line: "anything".into(),
             detected_level: Some("  warn  ".into()),
@@ -2184,6 +2545,7 @@ mod tests {
         // Loki's explicit "unknown" is still trusted verbatim — when Loki
         // says "I can't classify this", we don't second-guess.
         let l = LogLine {
+            id: "id".into(),
             timestamp_nanos: 0,
             line: "ERROR something exploded".into(),
             detected_level: Some("unknown".into()),
@@ -2206,6 +2568,7 @@ mod tests {
         for (line, expected) in cases {
             for raw in [None, Some(String::new()), Some("   ".into())] {
                 let l = LogLine {
+                    id: "id".into(),
                     timestamp_nanos: 0,
                     line: line.into(),
                     detected_level: raw,

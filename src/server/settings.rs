@@ -193,9 +193,9 @@ impl Default for LokiLabels {
 pub struct KubernetesLogBackendSettings {
     /// Upper bound on the number of lines the backend will ever request from
     /// the kubelet in a single call. The frontend pages backward by widening
-    /// `tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,
-    /// paging stops yielding new lines — the same outcome as when the
-    /// kubelet's own ring buffer is exhausted. Default: 100000.
+    /// `tail_lines` through an opaque continuation; paging stops at this
+    /// ceiling or when the kubelet's own ring buffer is exhausted. Default:
+    /// 100000.
     #[serde(default = "default_kubernetes_max_tail_lines")]
     pub max_tail_lines: i64,
 }
