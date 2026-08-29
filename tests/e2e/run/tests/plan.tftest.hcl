@@ -29,8 +29,9 @@ override_data {
       log_group_name           = "/rise-e2e"
       log_retention_days       = 30
       traefik_task_role_arn    = "arn:aws:iam::123456789012:role/rise-e2e-traefik"
-      controller_role_arn      = "arn:aws:iam::123456789012:role/rise-e2e"
+      controller_role_arn      = "arn:aws:iam::123456789012:role/rise-e2e-control-plane"
       execution_role_arn       = "arn:aws:iam::123456789012:role/rise-e2e-ecs-execution"
+      workload_task_role_arn   = "arn:aws:iam::123456789012:role/rise-e2e-app"
       ecr_push_role_arn        = "arn:aws:iam::123456789012:role/rise-e2e-ecr-push"
       ecr_repo_prefix          = "rise-e2e/"
       dns_zone_id              = "Z123"
@@ -75,6 +76,11 @@ run "per_run_stack_plans" {
   assert {
     condition     = module.control_plane_env.environment["DEX_ISSUER"] == "http://dex-pr-457.rise-e2e.internal:5556/dex"
     error_message = "the issuer must be the Cloud Map address the password grant is served from"
+  }
+
+  assert {
+    condition     = module.control_plane_env.environment["RISE_ECS_TASK_ROLE_ARN"] == "arn:aws:iam::123456789012:role/rise-e2e-app"
+    error_message = "deployed applications must use the workload role, not the control-plane role"
   }
 
   # No NAT in this topology, so a task without a public IP cannot reach ECR.

@@ -4,6 +4,12 @@ variable "name" {
   default     = "rise-backend"
 }
 
+variable "controller_role_name" {
+  description = "Name for the Rise control-plane IAM role. Defaults to var.name."
+  type        = string
+  default     = null
+}
+
 variable "permissions_boundary_arn" {
   description = "Optional permissions boundary attached to every IAM role this module creates."
   type        = string

@@ -1,6 +1,7 @@
 locals {
-  name        = var.name
-  repo_prefix = coalesce(var.ecr_repository_prefix, "${var.name}/")
+  name                 = var.name
+  controller_role_name = coalesce(var.controller_role_name, var.name)
+  repo_prefix          = coalesce(var.ecr_repository_prefix, "${var.name}/")
 
   # KMS key alias name - defaults to just the name, but can be overridden for backwards compatibility
   kms_key_alias = var.kms_key_alias != null ? var.kms_key_alias : var.name
@@ -577,7 +578,7 @@ locals {
 }
 
 resource "aws_iam_role" "backend" {
-  name                 = local.name
+  name                 = local.controller_role_name
   description          = "IAM role for Rise backend"
   assume_role_policy   = local.assume_role_policy
   permissions_boundary = var.permissions_boundary_arn

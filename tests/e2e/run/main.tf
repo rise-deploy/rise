@@ -96,7 +96,7 @@ module "control_plane_env" {
   assign_public_ip = true
 
   execution_role_arn     = local.env.execution_role_arn
-  workload_task_role_arn = local.env.controller_role_arn
+  workload_task_role_arn = local.env.workload_task_role_arn
   log_group_name         = local.env.log_group_name
   log_retention_days     = local.env.log_retention_days
 

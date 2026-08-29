@@ -24,7 +24,8 @@ locals {
     "rise.dev/purpose"    = "e2e"
   }, var.tags)
 
-  namespace_name = "${var.name}.internal"
+  namespace_name       = "${var.name}.internal"
+  controller_role_name = "${var.name}-control-plane"
 
   # The one contract with the per-run apply. It reads these from remote state.
   state_bucket = "${var.name}-tfstate-${local.account_id}"
@@ -41,6 +42,8 @@ module "rise_aws" {
   enable_ecr = true
   enable_ecs = true
   enable_kms = false
+
+  controller_role_name = local.controller_role_name
 
   ecs_cluster_name     = var.name
   ecs_log_group_name   = aws_cloudwatch_log_group.this.name

@@ -51,6 +51,10 @@ output "execution_role_arn" {
   value = module.rise_aws.ecs_execution_role_arn
 }
 
+output "workload_task_role_arn" {
+  value = module.rise_aws.ecs_task_role_arn
+}
+
 output "ecr_push_role_arn" {
   value = module.rise_aws.push_role_arn
 }
@@ -113,6 +117,9 @@ resource "aws_ssm_parameter" "bootstrap" {
     cloud_map_namespace_name = aws_service_discovery_private_dns_namespace.this.name
     log_group_name           = aws_cloudwatch_log_group.this.name
     log_retention_days       = var.log_retention_days
+    controller_role_arn      = module.rise_aws.role_arn
+    execution_role_arn       = module.rise_aws.ecs_execution_role_arn
+    workload_task_role_arn   = module.rise_aws.ecs_task_role_arn
     traefik_task_role_arn    = module.rise_aws.ecs_traefik_role_arn
     ecr_repo_prefix          = "${var.name}/"
     dns_zone_id              = aws_route53_zone.this.zone_id

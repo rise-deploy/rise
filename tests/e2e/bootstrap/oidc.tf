@@ -136,7 +136,7 @@ data "aws_iam_policy_document" "ci" {
     # known at `terraform plan` -- the escalation-prone statement should be
     # readable in a diff, not "(known after apply)".
     resources = [
-      "arn:${local.partition}:iam::${local.account_id}:role/${var.name}",
+      "arn:${local.partition}:iam::${local.account_id}:role/${local.controller_role_name}",
       "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-ecs-execution",
       "arn:${local.partition}:iam::${local.account_id}:role/${var.name}-traefik",
     ]

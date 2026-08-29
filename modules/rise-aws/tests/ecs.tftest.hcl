@@ -167,6 +167,7 @@ run "inline_roles_share_the_supplied_boundary" {
   variables {
     iam_policy_mode          = "inline"
     permissions_boundary_arn = "arn:aws:iam::123456789012:policy/rise-boundary"
+    controller_role_name     = "rise-control-plane"
     ecs_execution_role_name  = "rise-execution"
     ecs_workload_role_name   = "rise-app"
     ecs_traefik_role_name    = "rise-traefik"
@@ -198,7 +199,7 @@ run "inline_roles_share_the_supplied_boundary" {
     condition = (
       output.ecs_task_role_name == "rise-app"
       && output.ecs_traefik_role_name == "rise-traefik"
-      && aws_iam_role.backend.name == "rise-backend"
+      && aws_iam_role.backend.name == "rise-control-plane"
     )
     error_message = "applications and Traefik must use identities distinct from the controller"
   }
