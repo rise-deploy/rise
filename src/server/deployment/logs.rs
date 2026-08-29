@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
-use crate::server::deployment::resource_builder::ResourceBuilder;
+use crate::server::deployment::resource_builder::{ResourceBuilder, LABEL_CONTAINER};
 use crate::server::settings::{DeploymentLogsSettings, KubernetesLogBackendSettings, LokiLabels};
 
 mod cloudwatch;
@@ -55,6 +55,11 @@ pub struct LogQuery {
     /// Optional case-insensitive substring users can type into the runtime
     /// logs search box. Empty/whitespace means "no filter".
     pub search: Option<String>,
+    /// Containers of the deployment the caller wants to see. Empty means
+    /// "all". Names are the deployment's own container names (the implicit
+    /// `app` for a single-container deployment); each backend maps them onto
+    /// whatever carries the attribution in its own store.
+    pub containers: Vec<String>,
     /// Opaque continuation returned by the configured backend. Its contents
     /// are private to that backend and bound to the deployment and filters.
     pub cursor: Option<String>,
@@ -72,6 +77,8 @@ pub struct LogVolumeQuery {
     pub step_seconds: i64,
     /// Levels the caller wants counted. Empty means "all" (no filter).
     pub levels: Vec<String>,
+    /// Containers the caller wants counted. Empty means "all".
+    pub containers: Vec<String>,
     pub search: Option<String>,
 }
 
@@ -124,11 +131,14 @@ pub enum LogEvent {
     /// backend emits — either Loki's `detected_level` (one of `LOKI_LEVELS`,
     /// defaulting to `"unknown"`) or the K8s regex classifier's output (one
     /// of `KUBERNETES_LEVELS`). `id` remains stable when the same stored event
-    /// appears in a retried or adjacent request.
+    /// appears in a retried or adjacent request. `container` names the
+    /// deployment container the line came from, when the backend can
+    /// attribute it.
     Line {
         id: String,
         text: String,
         level: String,
+        container: Option<String>,
     },
     Status(LogStatus),
     /// Sent once the initial backlog phase of a streaming request has been
@@ -173,9 +183,13 @@ pub(super) fn log_cursor_signature(
     let mut levels = query.levels.clone();
     levels.sort();
     levels.dedup();
+    let mut containers = query.containers.clone();
+    containers.sort();
+    containers.dedup();
     let deployment_id = deployment.id.to_string();
     let project_id = project.id.to_string();
     let levels = levels.join("\0");
+    let containers = containers.join("\0");
 
     let mut digest = Sha256::new();
     for part in [
@@ -184,6 +198,7 @@ pub(super) fn log_cursor_signature(
         project_id.as_bytes(),
         levels.as_bytes(),
         query.search.as_deref().unwrap_or_default().as_bytes(),
+        containers.as_bytes(),
     ] {
         digest.update((part.len() as u64).to_be_bytes());
         digest.update(part);
@@ -342,6 +357,7 @@ pub async fn init_runtime_log_backend(
         } => {
             validate_loki_label_name("project", &labels.project)?;
             validate_loki_label_name("deployment_id", &labels.deployment_id)?;
+            validate_loki_label_name("container", &labels.container)?;
             if let Some(tenant) = tenant_id.as_deref() {
                 validate_header_value("tenant_id", tenant)?;
             }
@@ -497,11 +513,19 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             .context("Kubernetes log backend requires the project's namespace_prefix")?;
         let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
         let pod_api: Api<Pod> = Api::namespaced(self.kube_client.clone(), &namespace);
+        let mut selector = format!("rise.dev/deployment-id={}", deployment.deployment_id);
+        if !query.containers.is_empty() {
+            // Every container of a deployment gets its own Pod carrying
+            // `rise.dev/container` (single-container apps included, under the
+            // implicit `app`), so the filter is a set-based label selector.
+            selector.push_str(&format!(
+                ",{} in ({})",
+                LABEL_CONTAINER,
+                query.containers.join(",")
+            ));
+        }
         let pods = pod_api
-            .list(&ListParams::default().labels(&format!(
-                "rise.dev/deployment-id={}",
-                deployment.deployment_id
-            )))
+            .list(&ListParams::default().labels(&selector))
             .await?;
 
         let Some(pod) = pods.items.first() else {
@@ -521,6 +545,14 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             .as_ref()
             .context("Pod name not found")?
             .clone();
+        // One Pod carries exactly one deployment container, so its label
+        // attributes every line the kubelet returns below.
+        let container = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get(LABEL_CONTAINER))
+            .cloned();
 
         let signature = log_cursor_signature("kubernetes", deployment, project, &query);
         let cursor = query
@@ -670,7 +702,12 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                 if follow {
                     let id = distinct_log_id(&mut seen_ids, base_id);
                     emitted_count = emitted_count.saturating_add(1);
-                    yield Ok(LogEvent::Line { id, text: rendered, level: level.to_string() });
+                    yield Ok(LogEvent::Line {
+                        id,
+                        text: rendered,
+                        level: level.to_string(),
+                        container: container.clone(),
+                    });
                     match encode_log_cursor(&TailLogCursor {
                         version: 3,
                         signature: signature.clone(),
@@ -708,7 +745,12 @@ impl RuntimeLogBackend for KubernetesLogBackend {
                     select_recent_page(finite_lines, page_size, skip_recent);
                 emitted_count = page.len();
                 for (line, level, id) in page {
-                    yield Ok(LogEvent::Line { id, text: line, level: level.to_string() });
+                    yield Ok(LogEvent::Line {
+                        id,
+                        text: line,
+                        level: level.to_string(),
+                        container: container.clone(),
+                    });
                 }
                 let has_more = kubernetes_page_has_more(
                     has_older_in_window,
@@ -845,9 +887,11 @@ struct DockerLogBackend {
 }
 
 impl DockerLogBackend {
-    /// Find the most relevant container id for a deployment by its
-    /// `<label_namespace>/deployment-id` label, scoped to the owning project.
-    /// Prefers a running container.
+    /// Find the most relevant container for a deployment by its
+    /// `<label_namespace>/deployment-id` label, scoped to the owning project,
+    /// and return its id alongside the deployment container name it runs.
+    /// Prefers a running container. `wanted` restricts the choice to those
+    /// deployment containers; empty means "any".
     ///
     /// `deployment_id` is a `YYYYMMDD-HHMMSS` timestamp that is unique only
     /// *per project* (DB constraint `UNIQUE (deployment_id, project_id)`), so
@@ -856,13 +900,14 @@ impl DockerLogBackend {
     /// label (matching `project.name`, exactly as the reconciler stamps it)
     /// plus `managed-by=rise` for defense-in-depth, mirroring
     /// `list_actual_containers`.
-    async fn resolve_container_id(
+    async fn resolve_container(
         &self,
         deployment: &Deployment,
         project: &Project,
-    ) -> Result<Option<String>> {
+        wanted: &[String],
+    ) -> Result<Option<(String, Option<String>)>> {
         use crate::server::deployment::controller::docker::labels::{
-            self, SUFFIX_DEPLOYMENT_ID, SUFFIX_MANAGED_BY, SUFFIX_PROJECT,
+            self, SUFFIX_CONTAINER, SUFFIX_DEPLOYMENT_ID, SUFFIX_MANAGED_BY, SUFFIX_PROJECT,
         };
         use bollard::container::ListContainersOptions;
         use std::collections::HashMap as StdHashMap;
@@ -890,13 +935,30 @@ impl DockerLogBackend {
             }))
             .await?;
 
+        // Docker ANDs repeated `label` filters, so the container filter — an
+        // OR over names — is applied here rather than in the daemon query.
+        let container_key = labels::ns_key(ns, SUFFIX_CONTAINER);
+        let container_name = |summary: &bollard::secret::ContainerSummary| {
+            summary
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(&container_key))
+                .cloned()
+        };
+        let candidates = summaries
+            .into_iter()
+            .filter(|summary| {
+                wanted.is_empty()
+                    || container_name(summary).is_some_and(|name| wanted.contains(&name))
+            })
+            .collect::<Vec<_>>();
+
         // Prefer a running container; fall back to any.
-        let chosen = summaries
+        let chosen = candidates
             .iter()
             .find(|c| c.state.as_deref() == Some("running"))
-            .or_else(|| summaries.first())
-            .and_then(|c| c.id.clone());
-        Ok(chosen)
+            .or_else(|| candidates.first());
+        Ok(chosen.and_then(|summary| summary.id.clone().map(|id| (id, container_name(summary)))))
     }
 }
 
@@ -941,7 +1003,10 @@ impl RuntimeLogBackend for DockerLogBackend {
             anyhow::bail!("invalid log cursor for the configured backend");
         }
 
-        let Some(container_id) = self.resolve_container_id(deployment, project).await? else {
+        let Some((container_id, container)) = self
+            .resolve_container(deployment, project, &query.containers)
+            .await?
+        else {
             return Ok(status_stream(LogStatus {
                 reason: LogStatusReason::HistoricalBackendNotConfigured,
                 message: Some(
@@ -1036,6 +1101,7 @@ impl RuntimeLogBackend for DockerLogBackend {
                         id,
                         text: if render_timestamps { line.to_string() } else { content.to_string() },
                         level: level.to_string(),
+                        container: container.clone(),
                     });
                 }
             }
@@ -1180,16 +1246,17 @@ impl LokiLogBackend {
         })
     }
 
-    fn base_selector(&self, deployment: &Deployment, project: &Project) -> String {
-        // {project, deployment_id} is enough to uniquely scope to a single
-        // deployment's log stream — deployment_id is generated to be unique
-        // within a project, and Rise enforces project-level authz upstream.
-        format!(
-            "{{{}=\"{}\",{}=\"{}\"}}",
-            self.labels.project,
-            escape_logql_label_value(&project.name),
-            self.labels.deployment_id,
-            escape_logql_label_value(&deployment.deployment_id),
+    fn base_selector(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+        containers: &[String],
+    ) -> String {
+        loki_base_selector(
+            &self.labels,
+            &project.name,
+            &deployment.deployment_id,
+            containers,
         )
     }
 
@@ -1199,8 +1266,9 @@ impl LokiLogBackend {
         project: &Project,
         levels: &[String],
         search: Option<&str>,
+        containers: &[String],
     ) -> String {
-        let base = self.base_selector(deployment, project);
+        let base = self.base_selector(deployment, project, containers);
         let with_level = append_detected_level_filter(&base, levels);
         append_search_filter(&with_level, search)
     }
@@ -1225,7 +1293,13 @@ impl LokiLogBackend {
         project: &Project,
         query: &LogQuery,
     ) -> Result<Vec<LogLine>> {
-        let selector = self.selector(deployment, project, &query.levels, query.search.as_deref());
+        let selector = self.selector(
+            deployment,
+            project,
+            &query.levels,
+            query.search.as_deref(),
+            &query.containers,
+        );
         let end = self.effective_end_time(query);
         // Cursor boundaries are inclusive so every occurrence at the oldest
         // timestamp remains reachable. Caller-supplied range ends are
@@ -1273,15 +1347,30 @@ impl LokiLogBackend {
             .into_iter()
             .flat_map(|stream| {
                 let level = stream.stream.get("detected_level").cloned();
+                let container = stream.stream.get(&self.labels.container).cloned();
                 let stream_key = canonical_loki_stream(&stream.stream);
                 stream
                     .values
                     .into_iter()
                     .enumerate()
-                    .map(move |(order, v)| (v, level.clone(), stream_key.clone(), order))
+                    .map(move |(order, v)| {
+                        (
+                            v,
+                            level.clone(),
+                            container.clone(),
+                            stream_key.clone(),
+                            order,
+                        )
+                    })
             })
-            .filter_map(|(value, level, stream_key, stream_order)| {
-                LogLine::from_loki_value(value, level.as_deref(), &stream_key, stream_order)
+            .filter_map(|(value, level, container, stream_key, stream_order)| {
+                LogLine::from_loki_value(
+                    value,
+                    level.as_deref(),
+                    container,
+                    &stream_key,
+                    stream_order,
+                )
             })
             .collect::<Vec<_>>();
         assign_distinct_loki_ids(&mut lines);
@@ -1432,16 +1521,23 @@ impl LokiLogBackend {
             &project,
             &query.levels,
             query.search.as_deref(),
+            &query.containers,
         );
         let url = websocket_url(&self.tail_url, &selector);
         let tenant_id = self.tenant_id.clone();
         let bearer_token = self.bearer_token.clone();
+        let container_label = self.labels.container.clone();
 
         let stream = async_stream::try_stream! {
             let backlog_count = initial.lines.len();
             for line in initial.lines {
                 let level = line.classified_level();
-                yield LogEvent::Line { id: line.id.clone(), text: line.render(query.timestamps), level };
+                yield LogEvent::Line {
+                    id: line.id.clone(),
+                    text: line.render(query.timestamps),
+                    level,
+                    container: line.container.clone(),
+                };
             }
             yield LogEvent::BacklogLoaded { count: backlog_count, next_cursor: initial.next_cursor };
 
@@ -1484,15 +1580,17 @@ impl LokiLogBackend {
                             .context("Invalid Loki tail payload")?;
                         for stream in response.streams {
                             let stream_level = stream.stream.get("detected_level").cloned();
+                            let stream_container = stream.stream.get(&container_label).cloned();
                             let stream_key = canonical_loki_stream(&stream.stream);
                             for (stream_order, value) in stream.values.into_iter().enumerate() {
-                                if let Some(mut line) = LogLine::from_loki_value(value, stream_level.as_deref(), &stream_key, stream_order) {
+                                if let Some(mut line) = LogLine::from_loki_value(value, stream_level.as_deref(), stream_container.clone(), &stream_key, stream_order) {
                                     line.id = distinct_log_id(&mut seen_ids, line.id);
                                     let level = line.classified_level();
                                     yield LogEvent::Line {
                                         id: line.id.clone(),
                                         text: line.render(query.timestamps),
                                         level,
+                                        container: line.container.clone(),
                                     };
                                 }
                             }
@@ -1695,6 +1793,7 @@ impl RuntimeLogBackend for LokiLogBackend {
                     id: line.id.clone(),
                     text: line.render(timestamps),
                     level,
+                    container: line.container.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -1753,7 +1852,7 @@ impl RuntimeLogBackend for LokiLogBackend {
         let aligned_start = aligned_nanos(query.start_time, false);
         let aligned_end = aligned_nanos(query.end_time, true);
 
-        let base = self.base_selector(deployment, project);
+        let base = self.base_selector(deployment, project, &query.containers);
         let range = format!("[{step_seconds}s]");
         // The chart reflects the same filters as the log list: same search
         // clause, same `detected_level` filter. When the caller passes
@@ -1816,12 +1915,16 @@ struct LogLine {
     /// `None` means the entry didn't include a `detected_level`; the line is
     /// then classified by regex (matching the K8s backend's behavior).
     detected_level: Option<String>,
+    /// Deployment container the stream is labelled with, when the shipper
+    /// emits the configured container label.
+    container: Option<String>,
 }
 
 impl LogLine {
     fn from_loki_value(
         value: LokiValue,
         stream_level: Option<&str>,
+        container: Option<String>,
         stream_key: &str,
         stream_order: usize,
     ) -> Option<Self> {
@@ -1863,6 +1966,7 @@ impl LogLine {
             stream_order,
             line,
             detected_level,
+            container,
         })
     }
 
@@ -2240,6 +2344,47 @@ fn append_detected_level_filter(selector: &str, levels: &[String]) -> String {
     format!("{selector} | detected_level=~\"{pattern}\"")
 }
 
+/// Stream selector scoping a query to one deployment, optionally narrowed to
+/// some of its containers.
+///
+/// {project, deployment_id} is enough to uniquely scope to a single
+/// deployment's log stream — deployment_id is generated to be unique within a
+/// project, and Rise enforces project-level authz upstream. The container
+/// filter narrows within that scope, on the stream label the shipper
+/// attributes each line with.
+fn loki_base_selector(
+    labels: &LokiLabels,
+    project_name: &str,
+    deployment_id: &str,
+    containers: &[String],
+) -> String {
+    let container = match container_label_pattern(containers) {
+        Some(pattern) => format!(",{}=~\"{}\"", labels.container, pattern),
+        None => String::new(),
+    };
+    format!(
+        "{{{}=\"{}\",{}=\"{}\"{}}}",
+        labels.project,
+        escape_logql_label_value(project_name),
+        labels.deployment_id,
+        escape_logql_label_value(deployment_id),
+        container,
+    )
+}
+
+/// Regex alternation over the requested container names, for a `=~` label
+/// matcher. `None` when no container filter was requested. Each name is
+/// regex-escaped so it matches literally.
+fn container_label_pattern(containers: &[String]) -> Option<String> {
+    let cleaned: Vec<String> = containers
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .map(regex::escape)
+        .collect();
+    (!cleaned.is_empty()).then(|| cleaned.join("|"))
+}
+
 fn normalize_search(value: Option<&str>) -> Option<String> {
     value
         .map(|s| s.trim())
@@ -2503,6 +2648,7 @@ mod tests {
             stream_order: 0,
             line: id.into(),
             detected_level: None,
+            container: None,
         };
         let first = select_loki_page(
             vec![
@@ -2553,6 +2699,7 @@ mod tests {
             stream_order: 0,
             line: id.into(),
             detected_level: None,
+            container: None,
         };
         let page = select_loki_page(
             vec![
@@ -2580,6 +2727,7 @@ mod tests {
             stream_order,
             line: id.into(),
             detected_level: None,
+            container: None,
         };
         let mut expanded = vec![
             line(0, "newest"),
@@ -2612,12 +2760,12 @@ mod tests {
             structured_metadata: None,
         };
         let mut first = vec![
-            LogLine::from_loki_value(value(), None, "stream", 0).unwrap(),
-            LogLine::from_loki_value(value(), None, "stream", 1).unwrap(),
+            LogLine::from_loki_value(value(), None, None, "stream", 0).unwrap(),
+            LogLine::from_loki_value(value(), None, None, "stream", 1).unwrap(),
         ];
         let mut retry = vec![
-            LogLine::from_loki_value(value(), None, "stream", 0).unwrap(),
-            LogLine::from_loki_value(value(), None, "stream", 1).unwrap(),
+            LogLine::from_loki_value(value(), None, None, "stream", 0).unwrap(),
+            LogLine::from_loki_value(value(), None, None, "stream", 1).unwrap(),
         ];
         assign_distinct_loki_ids(&mut first);
         assign_distinct_loki_ids(&mut retry);
@@ -2649,8 +2797,8 @@ mod tests {
             line: "anything".to_string(),
             structured_metadata: None,
         };
-        let parsed =
-            LogLine::from_loki_value(value, Some("warn"), "stream", 0).expect("valid loki value");
+        let parsed = LogLine::from_loki_value(value, Some("warn"), None, "stream", 0)
+            .expect("valid loki value");
         assert_eq!(parsed.classified_level(), "warn");
 
         // Whitespace/empty stream labels are treated as "no classification"
@@ -2662,8 +2810,8 @@ mod tests {
             line: "anything".to_string(),
             structured_metadata: None,
         };
-        let parsed =
-            LogLine::from_loki_value(value, Some("  "), "stream", 0).expect("valid loki value");
+        let parsed = LogLine::from_loki_value(value, Some("  "), None, "stream", 0)
+            .expect("valid loki value");
         assert_eq!(parsed.classified_level(), "info");
 
         // Per-entry structured metadata wins over the stream-level label.
@@ -2674,8 +2822,8 @@ mod tests {
             line: "anything".to_string(),
             structured_metadata: Some(md),
         };
-        let parsed =
-            LogLine::from_loki_value(value, Some("warn"), "stream", 0).expect("valid loki value");
+        let parsed = LogLine::from_loki_value(value, Some("warn"), None, "stream", 0)
+            .expect("valid loki value");
         assert_eq!(parsed.classified_level(), "error");
     }
 
@@ -2697,7 +2845,7 @@ mod tests {
                 structured_metadata: None,
             };
             let parsed =
-                LogLine::from_loki_value(value, None, "stream", 0).expect("valid loki value");
+                LogLine::from_loki_value(value, None, None, "stream", 0).expect("valid loki value");
             assert_eq!(parsed.line, expected, "input {input:?}");
         }
     }
@@ -2816,6 +2964,37 @@ mod tests {
         assert_eq!(buckets[0].total, 18);
         // Second bucket (timestamp=120) covers (60, 120] → nothing.
         assert_eq!(buckets[1].total, 0);
+    }
+
+    #[test]
+    fn loki_base_selector_narrows_to_the_requested_containers() {
+        let labels = LokiLabels::default();
+        assert_eq!(
+            loki_base_selector(&labels, "shop", "20260830-101500", &[]),
+            "{rise_project=\"shop\",rise_deployment_id=\"20260830-101500\"}"
+        );
+        assert_eq!(
+            loki_base_selector(
+                &labels,
+                "shop",
+                "20260830-101500",
+                &["web".to_string(), "api".to_string()]
+            ),
+            "{rise_project=\"shop\",rise_deployment_id=\"20260830-101500\",\
+             container=~\"web|api\"}"
+        );
+    }
+
+    #[test]
+    fn container_label_pattern_escapes_and_drops_blanks() {
+        assert_eq!(container_label_pattern(&[]), None);
+        assert_eq!(container_label_pattern(&["  ".to_string()]), None);
+        // Regex metacharacters are matched literally, so a name can never
+        // widen the selector past the container it names.
+        assert_eq!(
+            container_label_pattern(&["web".to_string(), "a.b".to_string()]),
+            Some("web|a\\.b".to_string())
+        );
     }
 
     #[test]
@@ -3077,6 +3256,7 @@ mod tests {
                 stream_order: 0,
                 line: "anything".into(),
                 detected_level: Some(raw.into()),
+                container: None,
             };
             assert_eq!(l.classified_level(), raw);
         }
@@ -3089,6 +3269,7 @@ mod tests {
             stream_order: 0,
             line: "anything".into(),
             detected_level: Some("  warn  ".into()),
+            container: None,
         };
         assert_eq!(l.classified_level(), "warn");
 
@@ -3101,6 +3282,7 @@ mod tests {
             stream_order: 0,
             line: "ERROR something exploded".into(),
             detected_level: Some("unknown".into()),
+            container: None,
         };
         assert_eq!(l.classified_level(), "unknown");
     }
@@ -3126,6 +3308,7 @@ mod tests {
                     stream_order: 0,
                     line: line.into(),
                     detected_level: raw,
+                    container: None,
                 };
                 assert_eq!(l.classified_level(), expected, "input {line:?}");
             }

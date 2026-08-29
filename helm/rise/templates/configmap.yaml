@@ -33,6 +33,7 @@ data:
 {{- $_ := set $deploymentLogs "labels" (dict
     "project" .Values.logs.loki.labels.project
     "deployment_id" .Values.logs.loki.labels.deploymentId
+    "container" .Values.logs.loki.labels.container
 ) }}
 {{- $_ := set $config "deployment_logs" $deploymentLogs }}
 {{- else }}

@@ -179,6 +179,7 @@ logs:
     labels:
       project: rise_project
       deploymentId: rise_deployment_id
+      container: container
   alloy:
     # Installs the Grafana Alloy subchart when true. Alloy ships pod logs to
     # Loki and preserves Rise deployment labels for historical lookup.

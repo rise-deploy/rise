@@ -673,6 +673,12 @@ enum DeploymentCommands {
         /// vocabulary.
         #[arg(long = "level")]
         level: Vec<String>,
+        /// Show only lines from the given container of the deployment.
+        /// Repeat to allow multiple (e.g. `--container web --container api`).
+        /// Omit for every container. A single-container deployment has one
+        /// implicit container, `app`.
+        #[arg(long = "container")]
+        container: Vec<String>,
     },
 }
 
@@ -1654,6 +1660,7 @@ async fn main() -> Result<()> {
                 timestamps,
                 since,
                 level,
+                container,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
                 let token =
@@ -1670,6 +1677,7 @@ async fn main() -> Result<()> {
                         timestamps: *timestamps,
                         since: since.as_deref(),
                         levels: level,
+                        containers: container,
                     },
                 )
                 .await?;

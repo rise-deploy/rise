@@ -168,6 +168,10 @@ fn default_loki_deployment_id_label() -> String {
     "rise_deployment_id".to_string()
 }
 
+fn default_loki_container_label() -> String {
+    "container".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct LokiLabels {
     /// Loki stream label that carries the Rise project name.
@@ -178,6 +182,12 @@ pub struct LokiLabels {
     /// identify a deployment's log stream.
     #[serde(default = "default_loki_deployment_id_label")]
     pub deployment_id: String,
+    /// Loki stream label that carries the deployment's container name, used
+    /// by the `?container=` filter and for per-line attribution. The bundled
+    /// Alloy config writes the Kubernetes container name here, which is the
+    /// Rise container name (`app` for a single-container deployment).
+    #[serde(default = "default_loki_container_label")]
+    pub container: String,
 }
 
 impl Default for LokiLabels {
@@ -185,6 +195,7 @@ impl Default for LokiLabels {
         Self {
             project: default_loki_project_label(),
             deployment_id: default_loki_deployment_id_label(),
+            container: default_loki_container_label(),
         }
     }
 }

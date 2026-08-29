@@ -1630,6 +1630,11 @@
     },
     "LokiLabels": {
       "properties": {
+        "container": {
+          "default": "container",
+          "description": "Loki stream label that carries the deployment's container name, used\nby the `?container=` filter and for per-line attribution. The bundled\nAlloy config writes the Kubernetes container name here, which is the\nRise container name (`app` for a single-container deployment).",
+          "type": "string"
+        },
         "deployment_id": {
           "default": "rise_deployment_id",
           "description": "Loki stream label that carries the Rise deployment id (e.g.\n\"20241205-1234\"). Together with `project`, this must uniquely\nidentify a deployment's log stream.",

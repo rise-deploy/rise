@@ -159,6 +159,7 @@ The following table lists the configurable parameters of the Rise chart and thei
 | `logs.loki.bearerTokenSecret.key` | Key inside the secret holding the token | `token` |
 | `logs.loki.labels.project` | Loki stream label that carries the Rise project name | `rise_project` |
 | `logs.loki.labels.deploymentId` | Loki stream label that carries the Rise deployment id | `rise_deployment_id` |
+| `logs.loki.labels.container` | Loki stream label that carries the deployment's container name | `container` |
 | `logs.alloy.enabled` | Install bundled Grafana Alloy subchart for Pod log shipping | `false` |
 
 When pointing Rise at an operator-managed Loki whose existing labels differ

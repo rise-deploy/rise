@@ -2786,6 +2786,12 @@ pub struct LogStreamParams {
     pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
+    /// Restrict to lines from these containers of the deployment. Repeated
+    /// query param: `?container=web&container=api`. Empty list (param absent)
+    /// means every container. Accepted values are the deployment's own
+    /// container names — `app` for a single-container deployment.
+    #[serde(default, rename = "container")]
+    pub container: Vec<String>,
     /// Opaque continuation returned by `page_complete`, `backlog_complete`, or
     /// `cursor`. The configured backend owns its contents and validation.
     pub cursor: Option<String>,
@@ -2807,6 +2813,10 @@ pub struct LogVolumeParams {
     pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
+    /// Restrict counts to lines from these containers of the deployment.
+    /// Repeated query param: `?container=web&container=api`.
+    #[serde(default, rename = "container")]
+    pub container: Vec<String>,
 }
 
 /// Stream logs from a deployment via Server-Sent Events
@@ -2876,6 +2886,7 @@ pub async fn stream_deployment_logs(
 
     validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
     let levels = params.level.clone();
+    let containers = validate_log_containers(&params.container, &deployment)?;
     let search = params
         .search
         .as_ref()
@@ -2908,6 +2919,7 @@ pub async fn stream_deployment_logs(
                 end_time,
                 levels,
                 search,
+                containers,
                 cursor: params.cursor,
                 namespace_prefix: Some(namespace_prefix),
             },
@@ -2938,10 +2950,21 @@ pub async fn stream_deployment_logs(
     // `backlog_complete` or `cursor`.
     use futures::stream;
     let sse_stream = log_stream.flat_map(|result| match result {
-        Ok(crate::server::deployment::logs::LogEvent::Line { id, text, level }) => {
+        Ok(crate::server::deployment::logs::LogEvent::Line {
+            id,
+            text,
+            level,
+            container,
+        }) => {
+            let mut payload = serde_json::json!({ "id": id, "line": text, "level": level });
+            // Only backends that can attribute a line emit `container`; leave
+            // the key out entirely rather than sending an explicit null.
+            if let (Some(container), Some(object)) = (container, payload.as_object_mut()) {
+                object.insert("container".into(), serde_json::Value::String(container));
+            }
             stream::iter(vec![Event::default()
                 .event("log")
-                .json_data(serde_json::json!({ "id": id, "line": text, "level": level }))
+                .json_data(payload)
                 .map_err(anyhow::Error::from)])
         }
         Ok(crate::server::deployment::logs::LogEvent::Status(status)) => {
@@ -3041,6 +3064,7 @@ pub async fn query_deployment_log_volume(
 
     validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
     let levels = params.level.clone();
+    let containers = validate_log_containers(&params.container, &deployment)?;
     let search = params
         .search
         .as_ref()
@@ -3071,6 +3095,7 @@ pub async fn query_deployment_log_volume(
                 step_seconds,
                 levels,
                 search,
+                containers,
             },
         )
         .await
@@ -3105,6 +3130,59 @@ fn validate_log_levels(levels: &[String], allowed: &[&'static str]) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Validate caller-supplied `?container=` values against the deployment's own
+/// container names, so a typo (or a name from a different deployment) surfaces
+/// as a 400 with the accepted values instead of silently matching nothing.
+/// A single-container deployment declares no side-data and accepts only the
+/// implicit `app`. An empty list means "no filter" and is accepted.
+fn validate_log_containers(
+    requested: &[String],
+    deployment: &crate::db::models::Deployment,
+) -> Result<Vec<String>, ServerError> {
+    check_log_containers(requested, &declared_container_names(deployment))
+}
+
+/// The deployment's container names. A single-container deployment carries no
+/// side-data and runs the one implicit container. Unreadable side-data is
+/// treated the same way — `to_response` already logs and renders that row
+/// best-effort rather than failing the request.
+fn declared_container_names(deployment: &crate::db::models::Deployment) -> Vec<String> {
+    let declared: Vec<String> = deployment
+        .containers
+        .as_ref()
+        .and_then(|value| {
+            models::decode_side_data::<crate::server::deployment::models::ContainerSpec>(value).ok()
+        })
+        .map(|specs| specs.into_iter().map(|spec| spec.name).collect())
+        .unwrap_or_default();
+    if declared.is_empty() {
+        vec![crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string()]
+    } else {
+        declared
+    }
+}
+
+fn check_log_containers(
+    requested: &[String],
+    declared: &[String],
+) -> Result<Vec<String>, ServerError> {
+    let requested: Vec<String> = requested
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    for container in &requested {
+        if !declared.contains(container) {
+            return Err(ServerError::bad_request(format!(
+                "Unknown container '{}' for this deployment.",
+                container
+            ))
+            .with_suggestions(Some(declared.to_vec())));
+        }
+    }
+    Ok(requested)
 }
 
 fn validate_log_stream_query(
@@ -3155,13 +3233,32 @@ fn default_log_count_step_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_env_override_is_protected, resolve_resource_check_inputs,
+        check_log_containers, normalize_env_override_is_protected, resolve_resource_check_inputs,
         validate_container_resource_names, validate_env_override, validate_env_override_key,
         validate_identity_audiences, validate_log_stream_query, LogStreamParams,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn log_container_filter_accepts_only_declared_containers() {
+        let declared = vec!["web".to_string(), "worker".to_string()];
+        assert_eq!(
+            check_log_containers(&[], &declared).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            check_log_containers(&[" web ".to_string()], &declared).unwrap(),
+            vec!["web".to_string()]
+        );
+
+        // A name from another deployment (or a typo) is a 400 with the
+        // accepted values, not a filter that silently matches nothing.
+        let err = check_log_containers(&["api".to_string()], &declared).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.suggestions, Some(declared));
+    }
 
     #[test]
     fn log_follow_rejects_an_explicit_end_time() {
@@ -3174,6 +3271,7 @@ mod tests {
             end: Some("2026-08-29T12:00:00Z".into()),
             level: Vec::new(),
             search: None,
+            container: Vec::new(),
             cursor: None,
         };
         let end = chrono::DateTime::parse_from_rfc3339(params.end.as_deref().unwrap())

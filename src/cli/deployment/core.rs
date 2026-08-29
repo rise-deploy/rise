@@ -2035,6 +2035,10 @@ pub struct GetLogsParams<'a> {
     /// but the CLI doesn't validate — the server returns no matches for
     /// unknown values.
     pub levels: &'a [String],
+    /// Restrict to these containers of the deployment (repeated `?container=`
+    /// on the wire). Empty = every container. The server rejects a name the
+    /// deployment doesn't declare.
+    pub containers: &'a [String],
 }
 
 /// Get logs from a deployment
@@ -2068,6 +2072,9 @@ pub async fn get_logs(
     }
     for level in params.levels {
         query_params.push(format!("level={}", urlencoding::encode(level)));
+    }
+    for container in params.containers {
+        query_params.push(format!("container={}", urlencoding::encode(container)));
     }
 
     if !query_params.is_empty() {
