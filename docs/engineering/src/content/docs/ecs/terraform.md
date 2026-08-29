@@ -160,12 +160,13 @@ The Rise container runs the `config/ecs.yaml` that ships in the image
 environment interpolations. Two of them are the difference between a working
 install and a puzzling one, and the module derives both from Cloud Map:
 
-- `RISE_AUTH_BACKEND_URL` — `http://rise.<namespace>:3000`. Traefik calls it for
-  every forwardAuth subrequest, so it must be reachable *from inside the
-  cluster* and must never be the public URL.
-- `RISE_TRAEFIK_API_URL` — `http://traefik.<namespace>:8080`. Readiness comes
-  from Traefik's `serverStatus` with no fallback, so without it a project with a
-  `health_check` never becomes Healthy.
+- `RISE_AUTH_BACKEND_URL` —
+  `http://<name>-control-plane.<namespace>:3000`. Traefik calls it for every
+  forwardAuth subrequest, so it must be reachable *from inside the cluster* and
+  must never be the public URL.
+- `RISE_TRAEFIK_API_URL` — `http://<name>-traefik.<namespace>:8080`. Readiness
+  comes from Traefik's `serverStatus` with no fallback, so without it a project
+  with a `health_check` never becomes Healthy.
 
 Subnets and security groups are passed as comma-separated strings. The settings
 loader accepts a YAML list or a comma-separated string precisely so a Terraform

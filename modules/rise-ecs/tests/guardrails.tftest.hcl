@@ -165,4 +165,12 @@ run "deploy_dex_uses_a_browser_reachable_issuer" {
     condition     = local.rise_environment["DEX_ISSUER"] == "https://dex.rise.example.com/dex"
     error_message = "the demo issuer must be publicly reachable, not the Cloud Map address"
   }
+
+  assert {
+    condition = alltrue([
+      aws_service_discovery_service.dex[0].name == "rise-dex",
+      length(aws_service_discovery_service.dex[0].health_check_custom_config) == 0,
+    ])
+    error_message = "Dex discovery must be install-scoped without an empty custom health check"
+  }
 }

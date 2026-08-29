@@ -97,6 +97,11 @@ resource "aws_ecs_service" "rise" {
   tags           = local.tags
 
   lifecycle {
+    # Cloud Map derives service ids from the namespace and name, so recreating a
+    # service can produce the same ARN after deregistering every task. Replace
+    # the ECS service with it so ECS registers the new tasks against that ARN.
+    replace_triggered_by = [aws_service_discovery_service.rise]
+
     precondition {
       condition     = length(local.private_subnet_ids) <= 16
       error_message = "At most 16 subnets: an awsvpc network configuration accepts no more, and the backend rejects the setting at startup."

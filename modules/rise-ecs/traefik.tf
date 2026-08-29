@@ -236,6 +236,12 @@ resource "aws_ecs_service" "traefik" {
   propagate_tags = "SERVICE"
   tags           = local.tags
 
+  lifecycle {
+    # Replacing the discovery service removes its instances even when its ARN
+    # remains stable. A fresh ECS service registers its tasks again.
+    replace_triggered_by = [aws_service_discovery_service.traefik]
+  }
+
   depends_on = [
     aws_lb_listener.http,
     aws_efs_mount_target.acme,

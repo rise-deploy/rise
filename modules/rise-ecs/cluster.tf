@@ -51,7 +51,7 @@ resource "aws_service_discovery_private_dns_namespace" "this" {
 }
 
 resource "aws_service_discovery_service" "rise" {
-  name = "rise"
+  name = local.control_plane_discovery_name
 
   dns_config {
     namespace_id   = local.namespace_id
@@ -62,9 +62,6 @@ resource "aws_service_discovery_service" "rise" {
       ttl  = 10
     }
   }
-
-  # Registration is ECS's job, not a Cloud Map health check's.
-  health_check_custom_config {}
 
   # Instances must be deregistered before a Cloud Map service will delete, and
   # ECS deregisters them only as its own tasks drain. `terraform destroy` hits
@@ -75,7 +72,7 @@ resource "aws_service_discovery_service" "rise" {
 }
 
 resource "aws_service_discovery_service" "traefik" {
-  name = "traefik"
+  name = local.traefik_discovery_name
 
   dns_config {
     namespace_id   = local.namespace_id
@@ -86,9 +83,6 @@ resource "aws_service_discovery_service" "traefik" {
       ttl  = 10
     }
   }
-
-  # Registration is ECS's job, not a Cloud Map health check's.
-  health_check_custom_config {}
 
   force_destroy = true
   tags          = local.tags
@@ -97,7 +91,7 @@ resource "aws_service_discovery_service" "traefik" {
 resource "aws_service_discovery_service" "dex" {
   count = var.deploy_dex ? 1 : 0
 
-  name = "dex"
+  name = local.dex_discovery_name
 
   dns_config {
     namespace_id   = local.namespace_id
@@ -108,9 +102,6 @@ resource "aws_service_discovery_service" "dex" {
       ttl  = 10
     }
   }
-
-  # Registration is ECS's job, not a Cloud Map health check's.
-  health_check_custom_config {}
 
   force_destroy = true
   tags          = local.tags
