@@ -2769,9 +2769,9 @@ pub struct LogStreamParams {
     pub search: Option<String>,
     /// For backward pagination: skip this many of the most-recent qualifying
     /// lines before returning. Used by the Kubernetes backend (whose
-    /// `pods/log` API has no end-time filter) so the frontend can scroll
-    /// further back than the initial tail window. The Loki backend ignores
-    /// this and uses its own timestamp-based pagination.
+    /// `pods/log` API has no end-time filter) and CloudWatch (where several
+    /// streams can share one millisecond timestamp). Loki uses its own
+    /// timestamp-based pagination.
     pub skip_recent: Option<i64>,
 }
 

@@ -30,6 +30,10 @@ output "log_group_name" {
   value = aws_cloudwatch_log_group.this.name
 }
 
+output "log_retention_days" {
+  value = var.log_retention_days
+}
+
 output "traefik_task_role_arn" {
   description = "Pre-created here because the per-run identity cannot write IAM."
   value       = aws_iam_role.traefik.arn
@@ -108,6 +112,7 @@ resource "aws_ssm_parameter" "bootstrap" {
     cloud_map_namespace_id   = aws_service_discovery_private_dns_namespace.this.id
     cloud_map_namespace_name = aws_service_discovery_private_dns_namespace.this.name
     log_group_name           = aws_cloudwatch_log_group.this.name
+    log_retention_days       = var.log_retention_days
     traefik_task_role_arn    = aws_iam_role.traefik.arn
     ecr_repo_prefix          = "${var.name}/"
     dns_zone_id              = aws_route53_zone.this.zone_id

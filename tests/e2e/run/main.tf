@@ -98,6 +98,7 @@ module "control_plane_env" {
   execution_role_arn     = local.env.execution_role_arn
   workload_task_role_arn = local.env.controller_role_arn
   log_group_name         = local.env.log_group_name
+  log_retention_days     = local.env.log_retention_days
 
   auth_backend_url   = local.auth_backend_url
   traefik_api_url    = local.traefik_api_url

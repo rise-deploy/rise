@@ -40,6 +40,7 @@ locals {
   s3_bucket_prefix = var.s3_bucket_prefix != null ? var.s3_bucket_prefix : var.name
 
   ecs_cluster_name        = coalesce(var.ecs_cluster_name, var.name)
+  ecs_log_group_name      = coalesce(var.ecs_log_group_name, "/${var.name}")
   ecs_execution_role_name = coalesce(var.ecs_execution_role_name, "${var.name}-ecs-execution")
   ecs_workload_role_name  = coalesce(var.ecs_workload_role_name, "${var.name}-app")
   ecs_traefik_role_name   = coalesce(var.ecs_traefik_role_name, "${var.name}-traefik")
@@ -306,13 +307,10 @@ data "aws_iam_policy_document" "backend" {
   # ---------------------------------------------------------------------------
   # ECS deployment controller (ADR-0005 D14)
   #
-  # Scoped to what crates/rise-backend-ecs actually calls, which is a short list:
-  # the crate depends on aws-sdk-ecs, aws-sdk-ssm and aws-sdk-sts and nothing
-  # else. In particular it needs no ec2, logs or servicediscovery access --
-  # task IPs come from DescribeTasks attachment details rather than
-  # DescribeNetworkInterfaces, workload logs are written by the ECS agent under
-  # the execution role, and Cloud Map registration (D10) is not implemented.
-  # Grant those when the calls exist, not before.
+  # The deployment controller calls ECS, SSM and STS; its runtime-log reader
+  # also calls CloudWatch Logs. It needs no EC2 or service-discovery access:
+  # task IPs come from DescribeTasks attachment details, and workloads do not
+  # register with Cloud Map.
   # ---------------------------------------------------------------------------
 
   # Services and their tasks, in one cluster. CreateService is included here
@@ -339,6 +337,24 @@ data "aws_iam_policy_document" "backend" {
         variable = "ecs:cluster"
         values   = [local.ecs_cluster_arn]
       }
+    }
+  }
+
+  # Runtime logs are read back through the control plane after project-scoped
+  # authorization. Both actions support a log-group resource, so the grant is
+  # confined to the one group named by the ECS controller.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid    = "ReadECSRuntimeLogs"
+      effect = "Allow"
+      actions = [
+        "logs:FilterLogEvents",
+        "logs:StartLiveTail"
+      ]
+      resources = [
+        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}:*"
+      ]
     }
   }
 

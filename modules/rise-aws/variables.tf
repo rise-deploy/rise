@@ -194,6 +194,20 @@ variable "ecs_cluster_name" {
   default     = null
 }
 
+variable "ecs_log_group_name" {
+  description = "CloudWatch log group Rise reads for ECS runtime logs. Defaults to /<name>; must match deployment_controller.log_group."
+  type        = string
+  default     = null
+
+  validation {
+    condition = var.ecs_log_group_name == null ? true : can(regex(
+      "^[A-Za-z0-9._/#-]+$",
+      var.ecs_log_group_name
+    ))
+    error_message = "ecs_log_group_name must be a non-empty CloudWatch Logs group name."
+  }
+}
+
 variable "ecs_execution_role_name" {
   description = "Name for the ECS task execution role this module creates. Defaults to \"<name>-ecs-execution\"."
   type        = string

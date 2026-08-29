@@ -10,6 +10,9 @@ use crate::db::models::{Deployment, DeploymentStatus, Project};
 use crate::server::deployment::resource_builder::ResourceBuilder;
 use crate::server::settings::{DeploymentLogsSettings, KubernetesLogBackendSettings, LokiLabels};
 
+mod cloudwatch;
+use cloudwatch::CloudWatchLogBackend;
+
 /// Loki 3.x's documented `detected_level` value set. Passed through verbatim
 /// to clients; the frontend renders each via its own palette entry.
 pub const LOKI_LEVELS: &[&str] = &[
@@ -23,6 +26,17 @@ pub const KUBERNETES_LEVELS: &[&str] = &["info", "warn", "error"];
 /// Server-side cap on `?tail=` passed to Loki's `query_range`. Advertised via
 /// `LogsCapabilities::max_tail` so the frontend can mirror the limit.
 pub const LOKI_MAX_TAIL: i64 = 5000;
+
+/// AWS context owned by the ECS deployment controller and shared with the
+/// CloudWatch runtime-log reader. The writer and reader therefore use the same
+/// credential chain, region, endpoint, log group and resource prefix.
+#[derive(Clone)]
+pub struct EcsCloudWatchContext {
+    pub sdk_config: aws_config::SdkConfig,
+    pub region: String,
+    pub log_group: Option<String>,
+    pub resource_prefix: String,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LogQuery {
@@ -189,6 +203,7 @@ pub async fn init_runtime_log_backend(
     kube_client: Option<kube::Client>,
     docker_client: Option<bollard::Docker>,
     docker_label_namespace: Option<&str>,
+    ecs_cloudwatch: Option<EcsCloudWatchContext>,
 ) -> Result<Arc<dyn RuntimeLogBackend>> {
     match settings {
         DeploymentLogsSettings::Kubernetes { config } => {
@@ -214,6 +229,23 @@ pub async fn init_runtime_log_backend(
                 docker,
                 label_namespace,
             }))
+        }
+        DeploymentLogsSettings::Cloudwatch { retention_hint } => {
+            let context = ecs_cloudwatch
+                .context("CloudWatch log backend requires the ECS deployment controller")?;
+            let log_group = context
+                .log_group
+                .context("CloudWatch log backend requires deployment_controller.log_group")?;
+            Ok(Arc::new(
+                CloudWatchLogBackend::new(
+                    context.sdk_config,
+                    context.region,
+                    log_group,
+                    context.resource_prefix,
+                    retention_hint.clone(),
+                )
+                .await?,
+            ))
         }
         DeploymentLogsSettings::Loki {
             url,
@@ -449,13 +481,9 @@ impl RuntimeLogBackend for KubernetesLogBackend {
 
 /// A runtime log backend that serves no logs, only a clear reason.
 ///
-/// Selected by `deployment_logs: { type: none }`. Exists because every other
-/// variant requires a runtime client (a kube client, a bollard handle) that the
-/// ECS backend does not have — without it an ECS install falls through to the
-/// `Kubernetes` default and fails to start. Answering with an explicit
-/// `historical_backend_not_configured` status keeps the logs UI working (it
-/// renders its empty state) instead of surfacing an error the operator cannot
-/// act on.
+/// Selected by `deployment_logs: { type: none }`. The explicit
+/// `historical_backend_not_configured` status lets the logs UI render an empty
+/// state for installs that intentionally disable runtime-log access.
 struct NoneLogBackend;
 
 #[async_trait]
@@ -510,7 +538,7 @@ impl RuntimeLogBackend for NoneLogBackend {
     }
 }
 
-fn status_stream(status: LogStatus) -> LogEventStream {
+pub(super) fn status_stream(status: LogStatus) -> LogEventStream {
     futures::stream::once(async move { Ok(LogEvent::Status(status)) }).boxed()
 }
 
@@ -1608,7 +1636,7 @@ const LEVEL_REGEX_WARN: &str = r"(?i)\b(warn|warning)\b";
 /// Classify a raw log line into one of the three `KUBERNETES_LEVELS`. The
 /// Kubernetes backend has no upstream classifier (kubelet returns raw bytes),
 /// so each line is scanned for error/warn keywords with an info catch-all.
-fn classify_k8s_line(line: &str) -> &'static str {
+pub(super) fn classify_k8s_line(line: &str) -> &'static str {
     use std::sync::OnceLock;
     static ERROR_RE: OnceLock<regex::Regex> = OnceLock::new();
     static WARN_RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -1689,7 +1717,7 @@ fn websocket_url(http_url: &str, selector: &str) -> String {
 
 /// Parse a short retention hint like `"7d"` or `"2w"`. Supported units:
 /// `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks; 7 days).
-fn parse_duration_hint(value: &str) -> Option<Duration> {
+pub(super) fn parse_duration_hint(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
     if trimmed.len() < 2 {
         return None;

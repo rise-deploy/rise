@@ -41,9 +41,9 @@ run "ecs_policy_grants_only_what_the_controller_calls" {
   command = plan
 
   # crates/rise-backend-ecs depends on aws-sdk-ecs, aws-sdk-ssm and aws-sdk-sts
-  # and nothing else. Task IPs come from DescribeTasks attachment details, app
-  # logs are written by the ECS agent under the execution role, and Cloud Map
-  # registration (D10) is unimplemented -- so none of these may appear.
+  # and the runtime log backend reads the configured CloudWatch group. Task IPs
+  # come from DescribeTasks attachment details, and Cloud Map registration is
+  # outside this controller.
   assert {
     condition     = !strcontains(data.aws_iam_policy_document.backend.json, "ec2:")
     error_message = "controller policy grants ec2:*, which the crate never calls"
@@ -54,9 +54,23 @@ run "ecs_policy_grants_only_what_the_controller_calls" {
     error_message = "controller policy grants servicediscovery:*, unused until D10 lands"
   }
 
+}
+
+run "runtime_log_reads_are_confined_to_the_configured_group" {
+  command = plan
+
+  variables {
+    ecs_log_group_name = "/rise/custom"
+  }
+
   assert {
-    condition     = !strcontains(data.aws_iam_policy_document.backend.json, "logs:")
-    error_message = "controller policy grants logs:*, which the crate never calls"
+    condition = anytrue([
+      for s in jsondecode(data.aws_iam_policy_document.backend.json).Statement :
+      s.Sid == "ReadECSRuntimeLogs"
+      && toset(flatten([s.Action])) == toset(["logs:FilterLogEvents", "logs:StartLiveTail"])
+      && s.Resource == "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom:*"
+    ])
+    error_message = "runtime log policy must grant only FilterLogEvents and StartLiveTail on the configured group"
   }
 }
 

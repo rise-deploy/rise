@@ -212,13 +212,13 @@ terraform -chdir=tests/e2e/run destroy -auto-approve
 
 ## Scenarios
 
-| id                  | docker | minikube | asserts |
-|---------------------|--------|----------|---------|
-| `public-deploy`     | Run    | Run      | deploy a sample app → Healthy; HTTP 200 (+ body marker) |
-| `sa-token-exchange` | Run    | Run      | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
-| `loki-log-retention`| Skip   | Run      | stop deployment, pods gone, `/logs/volume` total>0 + `rise deployment logs` returns backlog (served by Loki) |
-| `helm-idempotency`  | Skip   | Run      | re-run `helm upgrade` applies cleanly |
-| `workload-identity` | Skip   | Run¹     | build fixture from source; `/identity` reports valid file+exchanged tokens, project-bound sub, matching iss; file token re-mints (new jti) |
+| id                  | docker | minikube | ECS  | asserts |
+|---------------------|--------|----------|------|---------|
+| `public-deploy`     | Run    | Run      | Run  | deploy a sample app → Healthy; HTTP 200 (+ body marker) |
+| `sa-token-exchange` | Run    | Run      | Run  | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
+| `persistent-log-retention` | Skip | Run | Run | stop deployment, workload gone, `/logs/volume` total>0 + `rise deployment logs` returns retained backlog |
+| `helm-idempotency`  | Skip   | Run      | Skip | re-run `helm upgrade` applies cleanly |
+| `workload-identity` | Run    | Run¹     | Skip | build fixture from source; `/identity` reports valid file+exchanged tokens, project-bound sub, matching iss; file token re-mints (new jti) |
 
 ¹ minikube only in `jfrog-vault` registry mode (source build needs a cluster-pullable registry); otherwise `Skip`.
 

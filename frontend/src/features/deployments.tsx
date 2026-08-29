@@ -1442,9 +1442,9 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             params.append('level', level);
         }
         if (searchActive) params.set('search', searchActive);
-        // K8s backend uses this to skip past the lines already in view (it
-        // has no end-time filter on pods/log). Loki ignores it and uses
-        // `end` instead — sending both lets each backend pick what it needs.
+        // K8s and CloudWatch use this to skip past the lines already in view;
+        // Loki uses `end`. Sending both lets each backend pick its stable
+        // pagination cursor.
         if (entriesCountRef.current > 0) {
             params.set('skip_recent', String(entriesCountRef.current));
         }
@@ -1476,7 +1476,14 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
             let oldestAddedMs: number | null = null;
             setEntries((prev) => {
                 const seen = new Set(prev.map((e) => e.id));
-                const filtered = reversed.filter((e) => !seen.has(e.id) && e.timestampMs < oldestMs);
+                // CloudWatch pages by count because different ECS streams can
+                // share a millisecond. Its next page is non-overlapping, so
+                // equal-timestamp rows are valid; timestamp-cursor backends
+                // repeat their inclusive boundary and must stay strictly older.
+                const beforeCursor = capabilities.backend === 'cloudwatch'
+                    ? (entry) => entry.timestampMs <= oldestMs
+                    : (entry) => entry.timestampMs < oldestMs;
+                const filtered = reversed.filter((e) => !seen.has(e.id) && beforeCursor(e));
                 newlyAdded = filtered.length;
                 if (filtered.length === 0) return prev;
                 // Stable descending sort by timestamp so any backdated rows
@@ -1509,7 +1516,7 @@ function DeploymentLogs({ projectName, deploymentId, deploymentStatus, deploymen
                 setLoadingMore(false);
             }
         }
-    }, [deploymentId, projectName, hasMore, logWindow, levelFilter, searchActive]);
+    }, [deploymentId, projectName, hasMore, logWindow, levelFilter, searchActive, capabilities.backend]);
 
     const startStreaming = useCallback(async () => {
         const gen = ++streamGenRef.current;

@@ -140,7 +140,7 @@ restricted to Fargate's discrete size table (see D9).
 | Secret env vars | SSM Parameter Store `SecureString` parameters (D7) | per deployment |
 | Route / access class | Traefik router + middleware labels in `dockerLabels` (D5) | per deployment |
 | Cross-container discovery | AWS Cloud Map service (D10) | per project/group/container |
-| Logs | CloudWatch Logs group + stream (D11) | per project |
+| Logs | CloudWatch Logs group + stream (D11) | group per install; stream per task/container |
 
 The critical choice here is **one ECS service per (deployment, container spec)**,
 not per (project, group, container) updated in place. It mirrors both existing
@@ -475,12 +475,14 @@ bounds.
 
 ### D11. Logs: CloudWatch by default
 
-App containers use the `awslogs` driver into a log group per project
-(`/{prefix}/{project}`), stream prefixed by deployment and container, retention
-configurable. A new `DeploymentLogsSettings::CloudWatch` variant implements the
-existing `RuntimeLogBackend` seam — tail, follow, level classification (reusing
-the Kubernetes backend's regex classifier), search, and the volume histogram over
-CloudWatch Logs' `FilterLogEvents`/`StartLiveTail`.
+App containers use the `awslogs` driver into the install's configured log
+group. Streams are prefixed by
+`{resource_prefix}/{project_uuid}/{deployment_uuid}` before the driver adds the
+container name and task ID. The `DeploymentLogsSettings::Cloudwatch` variant
+implements the existing `RuntimeLogBackend` seam — tail, follow, level
+classification (reusing the Kubernetes backend's regex classifier), search,
+and the volume histogram over CloudWatch Logs'
+`FilterLogEvents`/`StartLiveTail`.
 
 Installs already running Loki keep it: FireLens (Fluent Bit) as the log driver
 plus the existing `Loki` logs backend, with the standard `rise_project` /

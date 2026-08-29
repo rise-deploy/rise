@@ -193,7 +193,7 @@ rise deployment logs -p my-app 20241205-1234 --since 5m
 rise deployment logs -p my-app 20241205-1234 --timestamps
 ```
 
-When Rise is configured with the Kubernetes log backend, runtime logs are available only while deployment Pods still exist. When Rise is configured with the Loki log backend, runtime logs can also be shown for past deployments until the Loki retention policy removes them. If no historical logs are found, Rise will indicate whether they may have expired based on the operator-configured retention hint.
+When Rise is configured with the Kubernetes log backend, runtime logs are available only while deployment Pods still exist. Loki and CloudWatch retain runtime logs independently of the workload, so past deployments remain readable until the backing service's retention policy removes their events. If no historical logs are found, Rise indicates whether they may have expired based on the operator-configured retention hint.
 
 ## Rollback
 

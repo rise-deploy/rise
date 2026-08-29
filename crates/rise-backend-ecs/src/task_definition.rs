@@ -114,6 +114,9 @@ impl TaskDefinitionSpec {
             for (k, v) in &c.docker_labels {
                 n += k.len() + v.len() + 12;
             }
+            if let Some(log) = &c.log_config {
+                n += log.log_group.len() + log.region.len() + log.stream_prefix.len() + 64;
+            }
         }
         n
     }
@@ -151,6 +154,15 @@ impl TaskDefinitionSpec {
             for (k, v) in &c.docker_labels {
                 field(k.as_bytes());
                 field(v.as_bytes());
+            }
+            if let Some(log) = &c.log_config {
+                field(log.log_group.as_bytes());
+                field(log.region.as_bytes());
+                field(log.stream_prefix.as_bytes());
+            } else {
+                field(b"");
+                field(b"");
+                field(b"");
             }
             field(
                 c.repository_credentials_secret_arn
@@ -270,7 +282,12 @@ pub fn build(
     let log_config = cfg.log_group.map(|group| LogConfig {
         log_group: group.to_string(),
         region: cfg.region.to_string(),
-        stream_prefix: format!("{}-{}", desired.project, desired.deployment_group),
+        stream_prefix: format!(
+            "{}/{}/{}",
+            sanitize_ecs_name(cfg.resource_prefix),
+            desired.project_uuid,
+            desired.deployment_uuid
+        ),
     });
 
     let spec = TaskDefinitionSpec {
@@ -538,6 +555,33 @@ mod tests {
         assert_ne!(
             base.content_hash(),
             build(&new_env, &[], &c).expect("builds").content_hash()
+        );
+    }
+
+    #[test]
+    fn log_stream_prefix_is_immutable_and_part_of_the_hash() {
+        let classes = access_classes();
+        let c = cfg(&classes);
+        let base = build(&desired(), &[], &c).expect("builds");
+        assert_eq!(
+            base.containers[0]
+                .log_config
+                .as_ref()
+                .map(|log| log.stream_prefix.as_str()),
+            Some("rise/22222222-2222-2222-2222-222222222222/11111111-1111-1111-1111-111111111111")
+        );
+
+        let mut other = desired();
+        other.deployment_uuid = "33333333-3333-3333-3333-333333333333".to_string();
+        let changed = build(&other, &[], &c).expect("builds");
+        assert_ne!(base.content_hash(), changed.content_hash());
+
+        let mut renamed = desired();
+        renamed.project = "renamed-project".to_string();
+        let renamed = build(&renamed, &[], &c).expect("builds");
+        assert_eq!(
+            base.containers[0].log_config, renamed.containers[0].log_config,
+            "mutable project names must not determine historical log identity"
         );
     }
 

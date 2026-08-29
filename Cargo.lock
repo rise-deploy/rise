@@ -324,6 +324,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cloudwatchlogs"
+version = "1.146.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d679fb61381b88701c0c1700237e458d4f1848a9bca969047f6f08293b9bfc"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-eventstream",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ecr"
 version = "1.124.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4414,6 +4441,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-sdk-cloudwatchlogs",
  "aws-sdk-ecr",
  "aws-sdk-ecs",
  "aws-sdk-iam",

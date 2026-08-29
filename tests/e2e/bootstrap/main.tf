@@ -43,6 +43,7 @@ module "rise_aws" {
   enable_kms = false
 
   ecs_cluster_name     = var.name
+  ecs_log_group_name   = aws_cloudwatch_log_group.this.name
   ssm_parameter_prefix = var.name
   # rise-aws derives its ECR repo prefix from `name` ("<name>/"), so the
   # per-run apply must pass the same prefix to Rise.

@@ -76,6 +76,11 @@ run "creates_a_whole_install" {
   }
 
   assert {
+    condition     = local.rise_environment["RISE_ECS_LOG_RETENTION_HINT"] == "30d"
+    error_message = "the CloudWatch retention policy must reach Rise's empty-log status hint"
+  }
+
+  assert {
     condition = alltrue([
       join(" ", local.control_plane_command) == "backend server",
       length(local.control_plane_entry_point) == 0,

@@ -135,6 +135,7 @@ module "control_plane_env" {
   execution_role_arn     = var.execution_role_arn
   workload_task_role_arn = local.workload_task_role_arn
   log_group_name         = aws_cloudwatch_log_group.this.name
+  log_retention_days     = var.log_retention_days
 
   auth_backend_url     = local.auth_backend_url
   traefik_api_url      = local.traefik_api_url
