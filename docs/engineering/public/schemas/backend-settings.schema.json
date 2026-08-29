@@ -1034,7 +1034,7 @@
           "properties": {
             "max_tail_lines": {
               "default": 100000,
-              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,\npaging stops yielding new lines — the same outcome as when the\nkubelet's own ring buffer is exhausted. Default: 100000.",
+              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines` through an opaque continuation; paging stops at this\nceiling or when the kubelet's own ring buffer is exhausted. Default:\n100000.",
               "format": "int64",
               "type": "integer"
             },
@@ -1062,7 +1062,28 @@
           "type": "object"
         },
         {
-          "description": "No runtime log backend.\n\nEvery other variant needs a runtime client the ECS backend does not have\n(a kube client, a bollard handle), so without this an ECS install would\nfall through to the `Kubernetes` default and **crash at startup** with\n\"Kubernetes log backend requires kube client\". This makes \"no runtime\nlogs\" an explicit, working choice: the API answers with a clear\n`historical_backend_not_configured` status instead of an error, and the\nUI renders its empty state.\n\nECS installs that want runtime logs today can use the `loki` variant,\nwhich is backend-agnostic (it queries by stream labels, not a runtime\nclient). A CloudWatch variant is the intended replacement — see ADR-0005.",
+          "description": "Read deployment logs from the CloudWatch log group configured by the\nactive ECS deployment controller. AWS connection settings and the log\ngroup stay single-sourced on that controller so the writer and reader\ncannot point at different regions or groups.",
+          "properties": {
+            "retention_hint": {
+              "default": null,
+              "description": "Display-only retention hint used to explain an empty historical\nresult. An empty env-interpolated value is treated as unset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "cloudwatch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "No runtime log backend.\n\nThe API answers with `historical_backend_not_configured` and the UI\nrenders its empty state.",
           "properties": {
             "type": {
               "const": "none",

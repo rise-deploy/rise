@@ -2776,10 +2776,7 @@ pub struct LogStreamParams {
     pub since: Option<i64>,
     /// Start of an explicit time range in RFC3339 format
     pub start: Option<String>,
-    /// End of an explicit time range in RFC3339 format. Honored by the Loki
-    /// backend. The Kubernetes backend has no `pods/log` end-time filter and
-    /// silently ignores this — for past windows on the Kubernetes backend,
-    /// use the Loki backend instead.
+    /// Exclusive end of an explicit time range in RFC3339 format.
     pub end: Option<String>,
     /// Restrict to lines whose backend-emitted level matches one of these
     /// values. Repeated query param: `?level=info&level=warn`. Empty list
@@ -2789,12 +2786,9 @@ pub struct LogStreamParams {
     pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
-    /// For backward pagination: skip this many of the most-recent qualifying
-    /// lines before returning. Used by the Kubernetes backend (whose
-    /// `pods/log` API has no end-time filter) so the frontend can scroll
-    /// further back than the initial tail window. The Loki backend ignores
-    /// this and uses its own timestamp-based pagination.
-    pub skip_recent: Option<i64>,
+    /// Opaque continuation returned by `page_complete`, `backlog_complete`, or
+    /// `cursor`. The configured backend owns its contents and validation.
+    pub cursor: Option<String>,
 }
 
 /// Query parameters for log volume
@@ -2869,14 +2863,8 @@ pub async fn stream_deployment_logs(
 
     let start_time = parse_log_time(params.start.as_deref())?;
     let end_time = parse_log_time(params.end.as_deref())?;
+    validate_log_stream_query(&params, start_time.as_ref(), end_time.as_ref())?;
     let followable = crate::server::deployment::logs::is_followable_status(&deployment.status);
-    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
-        if start_time >= end_time {
-            return Err(ServerError::bad_request(
-                "Log range start must be before end",
-            ));
-        }
-    }
 
     // Get log stream from configured runtime log backend.
     // Follow defaults to 1 line so active deployments start at the most
@@ -2920,7 +2908,7 @@ pub async fn stream_deployment_logs(
                 end_time,
                 levels,
                 search,
-                skip_recent: params.skip_recent.filter(|n| *n > 0),
+                cursor: params.cursor,
                 namespace_prefix: Some(namespace_prefix),
             },
         )
@@ -2929,6 +2917,9 @@ pub async fn stream_deployment_logs(
             let error_msg = format!("{:#}", e);
             if error_msg.contains("not ready yet") || error_msg.contains("waiting to start") {
                 ServerError::service_unavailable("Deployment logs are not ready yet.").expected()
+            } else if error_msg.contains("invalid log cursor") {
+                ServerError::bad_request("The log pagination cursor is invalid or expired.")
+                    .expected()
             } else if error_msg.contains("exceeds the limit") {
                 ServerError::bad_request(
                     "Selected time range is too large for the log backend. Pick a shorter range.",
@@ -2941,17 +2932,16 @@ pub async fn stream_deployment_logs(
 
     // Convert typed log events to SSE events.
     //
-    // The `log` event payload is a JSON object `{"line": ..., "level": ...}`
-    // so the frontend chart (counted by `detected_level`) and the live log
-    // list classify each line identically — the backend is now the single
-    // source of truth for per-line level. See the wire-format contract in
-    // PR #333 / src/server/deployment/logs.rs (ClassifiedLevel).
+    // Each `log` event carries a stable id alongside its rendered line and
+    // backend classification. Finite pages end with `page_complete`; combined
+    // backlog/follow streams expose the same continuation through
+    // `backlog_complete` or `cursor`.
     use futures::stream;
     let sse_stream = log_stream.flat_map(|result| match result {
-        Ok(crate::server::deployment::logs::LogEvent::Line { text, level }) => {
+        Ok(crate::server::deployment::logs::LogEvent::Line { id, text, level }) => {
             stream::iter(vec![Event::default()
                 .event("log")
-                .json_data(serde_json::json!({ "line": text, "level": level }))
+                .json_data(serde_json::json!({ "id": id, "line": text, "level": level }))
                 .map_err(anyhow::Error::from)])
         }
         Ok(crate::server::deployment::logs::LogEvent::Status(status)) => {
@@ -2960,10 +2950,25 @@ pub async fn stream_deployment_logs(
                 .json_data(status)
                 .map_err(anyhow::Error::from)])
         }
-        Ok(crate::server::deployment::logs::LogEvent::BacklogLoaded { count }) => {
+        Ok(crate::server::deployment::logs::LogEvent::BacklogLoaded { count, next_cursor }) => {
             stream::iter(vec![Event::default()
                 .event("backlog_complete")
-                .json_data(serde_json::json!({ "count": count }))
+                .json_data(serde_json::json!({
+                    "count": count,
+                    "next_cursor": next_cursor,
+                }))
+                .map_err(anyhow::Error::from)])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::PageLoaded { next_cursor }) => {
+            stream::iter(vec![Event::default()
+                .event("page_complete")
+                .json_data(serde_json::json!({ "next_cursor": next_cursor }))
+                .map_err(anyhow::Error::from)])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::CursorUpdated { next_cursor }) => {
+            stream::iter(vec![Event::default()
+                .event("cursor")
+                .json_data(serde_json::json!({ "next_cursor": next_cursor }))
                 .map_err(anyhow::Error::from)])
         }
         Err(e) => {
@@ -3102,6 +3107,33 @@ fn validate_log_levels(levels: &[String], allowed: &[&'static str]) -> Result<()
     Ok(())
 }
 
+fn validate_log_stream_query(
+    params: &LogStreamParams,
+    start_time: Option<&chrono::DateTime<chrono::Utc>>,
+    end_time: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ServerError> {
+    if params.cursor.is_some()
+        && (params.follow || params.since.is_some() || start_time.is_some() || end_time.is_some())
+    {
+        return Err(ServerError::bad_request(
+            "A log cursor cannot be combined with follow or time-range parameters",
+        ));
+    }
+    if params.follow && end_time.is_some() {
+        return Err(ServerError::bad_request(
+            "Following logs cannot be combined with an explicit end time",
+        ));
+    }
+    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
+        if start_time >= end_time {
+            return Err(ServerError::bad_request(
+                "Log range start must be before end",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_log_time(
     value: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
@@ -3125,11 +3157,37 @@ mod tests {
     use super::{
         normalize_env_override_is_protected, resolve_resource_check_inputs,
         validate_container_resource_names, validate_env_override, validate_env_override_key,
-        validate_identity_audiences,
+        validate_identity_audiences, validate_log_stream_query, LogStreamParams,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn log_follow_rejects_an_explicit_end_time() {
+        let params = LogStreamParams {
+            follow: true,
+            tail: None,
+            timestamps: false,
+            since: None,
+            start: None,
+            end: Some("2026-08-29T12:00:00Z".into()),
+            level: Vec::new(),
+            search: None,
+            cursor: None,
+        };
+        let end = chrono::DateTime::parse_from_rfc3339(params.end.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let error = validate_log_stream_query(&params, None, Some(&end)).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message,
+            "Following logs cannot be combined with an explicit end time"
+        );
+    }
 
     fn make_spec(
         name: &str,

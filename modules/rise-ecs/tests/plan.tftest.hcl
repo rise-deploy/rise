@@ -91,6 +91,10 @@ run "creates_a_whole_install" {
     condition     = local.rise_environment["RISE_ECS_ASSIGN_PUBLIC_IP"] == "false"
     error_message = "workloads must run in private subnets without public IPs"
   }
+  assert {
+    condition     = local.rise_environment["RISE_ECS_LOG_RETENTION_HINT"] == "30d"
+    error_message = "the CloudWatch retention policy must reach Rise's empty-log status hint"
+  }
 }
 
 run "loads_a_secret_local_config_overlay" {

@@ -74,6 +74,10 @@ variable "log_group_name" {
   type = string
 }
 
+variable "log_retention_days" {
+  type = number
+}
+
 variable "auth_backend_url" {
   description = "Reachable from inside the cluster. Traefik calls it for every forwardAuth subrequest; the backend refuses to start when empty."
   type        = string

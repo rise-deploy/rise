@@ -190,8 +190,6 @@ failing closed at deploy time rather than half-working:
   Cloud Map namespace.
 - **Workload identity tokens.** There is no way to write files into a running
   Fargate task; a sidecar on a shared volume is the intended mechanism.
-- **Runtime logs.** `deployment_logs` is `none`. Installs running Loki can use
-  `type: loki` today; a CloudWatch backend is the intended replacement.
 
 ## Teardown
 

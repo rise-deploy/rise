@@ -34,7 +34,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
-        Box::new(LokiLogRetention),
+        Box::new(PersistentLogRetention),
         Box::new(HelmIdempotency),
         // Last: on Docker it recreates the backend with the identity overlay, so
         // it must run after the scenarios that expect the default config.
@@ -404,13 +404,13 @@ impl Scenario for SaTokenExchange {
     }
 }
 
-// ---- (d) Loki log retention -----------------------------------------------
+// ---- (d) persistent runtime-log retention ---------------------------------
 
-struct LokiLogRetention;
+struct PersistentLogRetention;
 
-impl Scenario for LokiLogRetention {
+impl Scenario for PersistentLogRetention {
     fn id(&self) -> &'static str {
-        "loki-log-retention"
+        "persistent-log-retention"
     }
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
@@ -419,21 +419,18 @@ impl Scenario for LokiLogRetention {
             BackendKind::Docker => {
                 Applicability::Skip("the docker compose stack has no Loki log backend")
             }
-            BackendKind::Ecs => Applicability::Skip(
-                "the ECS stack has no runtime log backend yet (deployment_logs: none); a \
-                 CloudWatch backend is the intended replacement",
-            ),
+            BackendKind::Ecs => Applicability::Run,
         }
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
-        let project = unique("e2e-loki");
+        let project = unique("e2e-logs");
         let app = b.sample_app();
         create_public_project(b, &project)?;
         deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
-        // Generate an access-log line, then give the log agent a window to scrape
-        // before the pod is removed.
+        // Generate an access-log line, then give the persistent store a window
+        // to ingest before the workload is removed.
         let _ = b.reach_app(&project, "/")?;
         std::thread::sleep(std::time::Duration::from_secs(5));
 
@@ -455,7 +452,7 @@ impl Scenario for LokiLogRetention {
             .to_string();
 
         // Stop the deployment and wait for the workload to actually be gone — with
-        // the pod removed, logs can only come from Loki (not live kubelet).
+        // the workload removed, logs can only come from the persistent backend.
         expect_ok(
             b.rise_cli(
                 &[
@@ -472,8 +469,8 @@ impl Scenario for LokiLogRetention {
         )?;
         b.wait_workload_removed(&project)?;
 
-        // Query the log-volume API over a window around now; retry while Loki
-        // finishes ingesting.
+        // Query the log-volume API over a window around now; retry while the
+        // backend finishes ingesting.
         let now = chrono::Utc::now();
         let start = (now - chrono::Duration::minutes(10))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -509,14 +506,14 @@ impl Scenario for LokiLogRetention {
         }
         anyhow::ensure!(
             total > 0,
-            "expected /logs/volume total>0 after pod removal; last response:\n{last}"
+            "expected /logs/volume total>0 after workload removal; last response:\n{last}"
         );
         anyhow::ensure!(
             levels >= 1,
             "expected /logs/volume to report >=1 level; last response:\n{last}"
         );
 
-        // The SSE log stream (non-follow) must still return backlog from Loki.
+        // The SSE log stream (non-follow) must still return retained backlog.
         let logs = expect_ok(
             b.rise_cli(
                 &[

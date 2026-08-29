@@ -24,7 +24,8 @@ locals {
     "rise.dev/purpose"    = "e2e"
   }, var.tags)
 
-  namespace_name = "${var.name}.internal"
+  namespace_name       = "${var.name}.internal"
+  controller_role_name = "${var.name}-control-plane"
 
   # The one contract with the per-run apply. It reads these from remote state.
   state_bucket = "${var.name}-tfstate-${local.account_id}"
@@ -42,7 +43,10 @@ module "rise_aws" {
   enable_ecs = true
   enable_kms = false
 
+  controller_role_name = local.controller_role_name
+
   ecs_cluster_name     = var.name
+  ecs_log_group_name   = aws_cloudwatch_log_group.this.name
   ssm_parameter_prefix = var.name
   # rise-aws derives its ECR repo prefix from `name` ("<name>/"), so the
   # per-run apply must pass the same prefix to Rise.
@@ -54,62 +58,6 @@ module "rise_aws" {
   ecs_secret_arns = ["arn:${local.partition}:secretsmanager:${var.region}:${local.account_id}:secret:${var.name}/*"]
 
   tags = local.tags
-}
-
-# -----------------------------------------------------------------------------
-# Traefik's task role
-#
-# Pre-created here rather than by modules/rise-ecs, because the per-run identity
-# cannot write IAM. It grants cluster reads and nothing else -- deliberately not
-# the Rise controller role, since Traefik's API is unauthenticated.
-# -----------------------------------------------------------------------------
-
-data "aws_iam_policy_document" "traefik_assume" {
-  statement {
-    effect = "Allow"
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
-    actions = ["sts:AssumeRole"]
-    condition {
-      test     = "StringEquals"
-      variable = "aws:SourceAccount"
-      values   = [local.account_id]
-    }
-  }
-}
-
-resource "aws_iam_role" "traefik" {
-  name               = "${var.name}-traefik"
-  description        = "Traefik ECS provider discovery for the Rise e2e environment"
-  assume_role_policy = data.aws_iam_policy_document.traefik_assume.json
-  tags               = local.tags
-}
-
-resource "aws_iam_role_policy" "traefik" {
-  name = "discovery"
-  role = aws_iam_role.traefik.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = [
-        "ecs:ListClusters",
-        "ecs:DescribeClusters",
-        "ecs:ListTasks",
-        "ecs:DescribeTasks",
-        "ecs:DescribeContainerInstances",
-        "ecs:DescribeTaskDefinition",
-        # See modules/rise-ecs/traefik.tf: both are in Traefik's published
-        # policy, and without them its ECS provider discovers nothing.
-        "ec2:DescribeInstances",
-        "ssm:DescribeInstanceInformation",
-      ]
-      Resource = "*"
-    }]
-  })
 }
 
 # -----------------------------------------------------------------------------

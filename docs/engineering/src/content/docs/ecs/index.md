@@ -108,11 +108,12 @@ there surfaces as a task that cannot start rather than as an API error.
 That last scoping matters: an unscoped `iam:PassRole` would let anyone who can
 create a Rise deployment run a task as any role in the account.
 
-The control plane needs **no** `ec2`, `logs` or `servicediscovery` access. Task
-addresses come from `DescribeTasks` attachment details rather than
-`DescribeNetworkInterfaces`, workload logs are written by the ECS agent under the
-execution role, and Cloud Map registration for workloads is not implemented.
-`modules/rise-aws` grants none of them.
+The control plane needs no `ec2` or `servicediscovery` access. Task addresses
+come from `DescribeTasks` attachment details rather than
+`DescribeNetworkInterfaces`, and Cloud Map registration for workloads is not
+implemented. Runtime-log reads require `logs:FilterLogEvents` and
+`logs:StartLiveTail` on the configured group; writes belong to the ECS task
+execution role.
 
 The control-plane role must also trust `ecs-tasks.amazonaws.com`: on ECS it *is*
 the task role Rise runs as, so without that trust the task cannot start.
@@ -189,7 +190,7 @@ credentials inside it needs no redeploy.
 | `assign_public_ip` | required on public subnets |
 | `execution_role_arn`, `task_role_arn` | see IAM above; the execution role is also what pulls from ECR |
 | `repository_credentials_secret_arn` | Secrets Manager secret for a private non-ECR registry |
-| `log_group` | `awslogs` destination; omit for no container logging |
+| `log_group` | `awslogs` destination and CloudWatch runtime-log source; required by the shipped `deployment_logs.type: cloudwatch` configuration |
 | `ssm_parameter_prefix`, `ssm_kms_key_id` | where secret env vars live |
 | `cpu_architecture` | `X86_64` or `ARM64` — also the CLI's platform hint. Common spellings (`amd64`, `aarch64`, any case) are normalised; anything else is **refused at startup**, since defaulting would build images the tasks cannot execute |
 | `auth_backend_url` | **must be reachable from inside the cluster** (a Cloud Map name or internal load balancer), never the public URL |
@@ -217,16 +218,6 @@ work:
 - **Workload identity tokens** (`[identity].audiences`) — there is no way to
   write files into a running Fargate task; a sidecar on a shared task volume is
   the intended mechanism.
-- **Runtime logs in the Rise UI/API** — `deployment_logs: none` by default, so
-  `rise deployment logs` and the UI's Logs tab return nothing for ECS
-  deployments. Installs running Loki can point `type: loki` at it today (it is
-  backend-agnostic). A native **CloudWatch log backend** is the intended
-  replacement — it lets Rise surface a deployment's logs scoped to the project
-  the caller is authorized for, using the control plane's own IAM, so operators
-  need not hand out CloudWatch access. Until it lands, the only way to read ECS
-  workload logs is the CloudWatch console: all workloads share one install-wide
-  log group (separated only by a `{project}-{group}` stream prefix), so that
-  access is not a per-project boundary — scope it accordingly.
 
 ## Troubleshooting
 

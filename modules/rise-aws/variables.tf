@@ -4,6 +4,12 @@ variable "name" {
   default     = "rise-backend"
 }
 
+variable "controller_role_name" {
+  description = "Name for the Rise control-plane IAM role. Defaults to var.name."
+  type        = string
+  default     = null
+}
+
 variable "permissions_boundary_arn" {
   description = "Optional permissions boundary attached to every IAM role this module creates."
   type        = string
@@ -192,6 +198,20 @@ variable "ecs_cluster_name" {
   description = "Name of the ECS cluster Rise reconciles. Defaults to var.name; must match the cluster rise-ecs creates or the one you already run."
   type        = string
   default     = null
+}
+
+variable "ecs_log_group_name" {
+  description = "CloudWatch log group Rise reads for ECS runtime logs. Defaults to /<name>; must match deployment_controller.log_group."
+  type        = string
+  default     = null
+
+  validation {
+    condition = var.ecs_log_group_name == null ? true : can(regex(
+      "^[A-Za-z0-9._/#-]+$",
+      var.ecs_log_group_name
+    ))
+    error_message = "ecs_log_group_name must be a non-empty CloudWatch Logs group name."
+  }
 }
 
 variable "ecs_execution_role_name" {

@@ -27,9 +27,11 @@ override_data {
       cloud_map_namespace_id   = "ns-abc"
       cloud_map_namespace_name = "rise-e2e.internal"
       log_group_name           = "/rise-e2e"
+      log_retention_days       = 30
       traefik_task_role_arn    = "arn:aws:iam::123456789012:role/rise-e2e-traefik"
-      controller_role_arn      = "arn:aws:iam::123456789012:role/rise-e2e"
+      controller_role_arn      = "arn:aws:iam::123456789012:role/rise-e2e-control-plane"
       execution_role_arn       = "arn:aws:iam::123456789012:role/rise-e2e-ecs-execution"
+      workload_task_role_arn   = "arn:aws:iam::123456789012:role/rise-e2e-app"
       ecr_push_role_arn        = "arn:aws:iam::123456789012:role/rise-e2e-ecr-push"
       ecr_repo_prefix          = "rise-e2e/"
       dns_zone_id              = "Z123"
@@ -86,10 +88,20 @@ run "per_run_stack_plans" {
     error_message = "the issuer must be the Cloud Map address the password grant is served from"
   }
 
+  assert {
+    condition     = module.control_plane_env.environment["RISE_ECS_TASK_ROLE_ARN"] == "arn:aws:iam::123456789012:role/rise-e2e-app"
+    error_message = "deployed applications must use the workload role, not the control-plane role"
+  }
+
   # No NAT in this topology, so a task without a public IP cannot reach ECR.
   assert {
     condition     = module.control_plane_env.environment["RISE_ECS_ASSIGN_PUBLIC_IP"] == "true"
     error_message = "workloads need public IPs here; there is no NAT for them to egress through"
+  }
+
+  assert {
+    condition     = module.control_plane_env.environment["RISE_ECS_LOG_RETENTION_HINT"] == "30d"
+    error_message = "the bootstrap log retention must reach Rise's empty-log status hint"
   }
 
   # Two runs sharing the cluster with the same controller class delete each

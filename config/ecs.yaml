@@ -152,9 +152,6 @@ deployment_controller:
       ingress_class: traefik
       access_requirement: Member
 
-# No runtime log backend yet. Every other variant needs a runtime client the ECS
-# backend does not have, and the Kubernetes default would crash at startup.
-# Installs that run Loki can switch to `type: loki` — it is backend-agnostic.
-# A CloudWatch variant is the intended replacement (see ADR-0005).
 deployment_logs:
-  type: "none"
+  type: "cloudwatch"
+  retention_hint: "${RISE_ECS_LOG_RETENTION_HINT:-}"

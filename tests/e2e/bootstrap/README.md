@@ -12,7 +12,7 @@ everything requiring an IAM write is created here, and the per-run apply
 | | |
 |---|---|
 | GitHub OIDC | provider + the role CI assumes (`repo:rise-deploy/rise:*`) |
-| IAM for Rise | `modules/rise-aws` with `enable_ecs` — controller role, execution role, ECR push role — plus Traefik's task role |
+| IAM for Rise | `modules/rise-aws` with `enable_ecs` — control-plane, execution, application, ECR push, and Traefik roles |
 | Runtime | VPC with public subnets, ECS cluster, Cloud Map namespace, log group |
 | Addressing | a Route 53 zone; each run UPSERTs its own subtree into it |
 | State | the S3 bucket both workspaces keep their state in |

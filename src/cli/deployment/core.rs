@@ -2135,10 +2135,9 @@ pub async fn get_logs(
                                         print_log_status(data);
                                     } else if event_type == "log" || event_type == "message" {
                                         // `log` events are JSON-wrapped:
-                                        // {"line": "...", "level": "..."}.
-                                        // Other event types (`backlog_complete`)
-                                        // are ignored — they're meta-events
-                                        // the CLI has no use for.
+                                        // {"id": "...", "line": "...", "level": "..."}.
+                                        // Pagination and status metadata is
+                                        // ignored by this CLI view.
                                         print_log_event(data);
                                     }
                                 }
@@ -2440,10 +2439,9 @@ impl LogStream {
                         && (self.event_type == "log" || self.event_type == "message")
                     {
                         // `log` events are JSON-wrapped:
-                        // {"line": "...", "level": "..."}. Yield both so
-                        // the follow UI can colour the line by level.
-                        // Other event types (status, backlog_complete) are
-                        // ignored by the streaming follow UI.
+                        // {"id": "...", "line": "...", "level": "..."}.
+                        // Yield the rendered line and level; pagination and
+                        // status metadata is ignored by the follow UI.
                         return Some(Ok(extract_log_event(data)));
                     }
                     continue;

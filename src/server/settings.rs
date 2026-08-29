@@ -193,9 +193,9 @@ impl Default for LokiLabels {
 pub struct KubernetesLogBackendSettings {
     /// Upper bound on the number of lines the backend will ever request from
     /// the kubelet in a single call. The frontend pages backward by widening
-    /// `tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,
-    /// paging stops yielding new lines — the same outcome as when the
-    /// kubelet's own ring buffer is exhausted. Default: 100000.
+    /// `tail_lines` through an opaque continuation; paging stops at this
+    /// ceiling or when the kubelet's own ring buffer is exhausted. Default:
+    /// 100000.
     #[serde(default = "default_kubernetes_max_tail_lines")]
     pub max_tail_lines: i64,
 }
@@ -220,19 +220,20 @@ pub enum DeploymentLogsSettings {
     /// client is shared from the Docker deployment controller, so this variant
     /// carries no connection fields of its own.
     Docker {},
+    /// Read deployment logs from the CloudWatch log group configured by the
+    /// active ECS deployment controller. AWS connection settings and the log
+    /// group stay single-sourced on that controller so the writer and reader
+    /// cannot point at different regions or groups.
+    Cloudwatch {
+        /// Display-only retention hint used to explain an empty historical
+        /// result. An empty env-interpolated value is treated as unset.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        retention_hint: Option<String>,
+    },
     /// No runtime log backend.
     ///
-    /// Every other variant needs a runtime client the ECS backend does not have
-    /// (a kube client, a bollard handle), so without this an ECS install would
-    /// fall through to the `Kubernetes` default and **crash at startup** with
-    /// "Kubernetes log backend requires kube client". This makes "no runtime
-    /// logs" an explicit, working choice: the API answers with a clear
-    /// `historical_backend_not_configured` status instead of an error, and the
-    /// UI renders its empty state.
-    ///
-    /// ECS installs that want runtime logs today can use the `loki` variant,
-    /// which is backend-agnostic (it queries by stream labels, not a runtime
-    /// client). A CloudWatch variant is the intended replacement — see ADR-0005.
+    /// The API answers with `historical_backend_not_configured` and the UI
+    /// renders its empty state.
     None {},
     Loki {
         url: String,
@@ -2500,6 +2501,31 @@ impl Settings {
             }
         }
 
+        if matches!(
+            &settings.deployment_logs,
+            DeploymentLogsSettings::Cloudwatch { .. }
+        ) {
+            match &settings.deployment_controller {
+                Some(DeploymentControllerSettings::Ecs {
+                    log_group: Some(log_group),
+                    ..
+                }) if !log_group.trim().is_empty() => {}
+                Some(DeploymentControllerSettings::Ecs { .. }) => {
+                    return Err(ConfigError::Message(
+                        "deployment_logs.type is 'cloudwatch' but deployment_controller.log_group \
+                         is unset: the reader must use the same group as ECS's awslogs driver"
+                            .to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(ConfigError::Message(
+                        "deployment_logs.type 'cloudwatch' requires an ECS deployment controller"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         if let Some(ref resource_gc) = settings.resource_gc {
             resource_gc.validate()?;
         }
@@ -3293,6 +3319,13 @@ auth:
     fn load_shipped_docker_config(
         env: &std::collections::HashMap<&'static str, &'static str>,
     ) -> Result<Settings, ConfigError> {
+        load_shipped_docker_config_with_overlay(env, None)
+    }
+
+    fn load_shipped_docker_config_with_overlay(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+        overlay: Option<&str>,
+    ) -> Result<Settings, ConfigError> {
         use std::fs;
         use tempfile::TempDir;
 
@@ -3305,6 +3338,9 @@ auth:
         // the docker.yaml layer carries everything the assertions check.
         fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
         fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+        if let Some(overlay) = overlay {
+            fs::write(temp_dir.path().join("local.yaml"), overlay).unwrap();
+        }
 
         let owned: std::collections::HashMap<String, String> = env
             .iter()
@@ -3361,6 +3397,7 @@ auth:
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
         env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+        env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
 
         let settings = load_shipped_ecs_config(&env).expect("shipped ecs.yaml must load");
 
@@ -3390,12 +3427,57 @@ auth:
         assert!(access_classes.contains_key("public"));
         assert!(access_classes.contains_key("private"));
 
-        // Without this the install would crash at startup on the Kubernetes
-        // default log backend, which needs a kube client ECS does not have.
         assert!(matches!(
             settings.deployment_logs,
-            DeploymentLogsSettings::None { .. }
+            DeploymentLogsSettings::Cloudwatch {
+                retention_hint: None
+            }
         ));
+    }
+
+    #[test]
+    fn shipped_ecs_config_passes_the_cloudwatch_retention_hint() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_LOG_RETENTION_HINT", "30d");
+
+        let settings = load_shipped_ecs_config(&env).expect("retention hint must load");
+        assert!(matches!(
+            settings.deployment_logs,
+            DeploymentLogsSettings::Cloudwatch {
+                retention_hint: Some(ref hint)
+            } if hint == "30d"
+        ));
+    }
+
+    #[test]
+    fn cloudwatch_logs_require_the_ecs_log_group() {
+        let mut env = ecs_base_env();
+        env.remove("RISE_ECS_LOG_GROUP");
+
+        let err = load_shipped_ecs_config(&env).expect_err("missing log group must fail");
+        assert!(
+            err.to_string().contains("deployment_controller.log_group"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn cloudwatch_logs_require_the_ecs_controller() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_APP_BACKEND_HOST_ALIAS", "rise.localhost");
+        let overlay = "\
+deployment_logs:
+  type: cloudwatch
+";
+
+        let err = load_shipped_docker_config_with_overlay(&env, Some(overlay))
+            .expect_err("cloudwatch with Docker must fail");
+        assert!(
+            err.to_string()
+                .contains("requires an ECS deployment controller"),
+            "unhelpful message: {err}"
+        );
     }
 
     #[test]
@@ -3443,6 +3525,7 @@ server:
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
         env.insert("RISE_ECS_SUBNETS", "subnet-abc");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+        env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
         env
     }
 

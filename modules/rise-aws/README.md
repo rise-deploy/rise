@@ -67,9 +67,10 @@ module "rise_aws" {
   iam_policy_mode          = "inline"
   permissions_boundary_arn = var.runtime_boundary_arn
 
-  ecr_repository_prefix  = "rise-prod/"
-  ecr_push_role_name     = "rise-prod-ecr-push"
-  ecs_cluster_name       = "platform"
+  controller_role_name    = "rise-prod-control-plane"
+  ecr_repository_prefix   = "rise-prod/"
+  ecr_push_role_name      = "rise-prod-ecr-push"
+  ecs_cluster_name        = "platform"
   ecs_execution_role_name = "rise-prod-execution"
   ecs_workload_role_name  = "rise-prod-app"
   ecs_traefik_role_name   = "rise-prod-traefik"
@@ -200,6 +201,7 @@ This makes it easy to reference in your configuration management tool (e.g., usi
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
 | name | Name for the IAM role and policy | `string` | `"rise-backend"` | no |
+| controller_role_name | Control-plane IAM role name | `string` | `<name>` | no |
 | permissions_boundary_arn | Boundary attached to every generated role | `string` | `null` | no |
 | iam_policy_mode | `managed` or `inline` generated policies | `string` | `"managed"` | no |
 | tags | Tags to apply to all resources | `map(string)` | `{}` | no |

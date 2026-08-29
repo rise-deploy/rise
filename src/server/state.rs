@@ -377,7 +377,11 @@ async fn init_ecs_backend(
     store: Arc<dyn rise_backend_core::DeploymentStore>,
     public_url: &str,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<(Arc<dyn DeploymentBackend>, tokio::task::JoinHandle<()>)> {
+) -> Result<(
+    Arc<dyn DeploymentBackend>,
+    tokio::task::JoinHandle<()>,
+    crate::server::deployment::logs::EcsCloudWatchContext,
+)> {
     use crate::server::settings::DeploymentControllerSettings;
     use rise_backend_core::DeploymentUrlBuilder;
     use rise_backend_ecs::reconciler::{EcsReconciler, ReconcilerConfig};
@@ -535,6 +539,12 @@ async fn init_ecs_backend(
     Ok((
         Arc::new(backend) as Arc<dyn DeploymentBackend>,
         reconciler_handle,
+        crate::server::deployment::logs::EcsCloudWatchContext {
+            sdk_config: aws_config,
+            region: region.clone(),
+            log_group: log_group.clone(),
+            resource_prefix: resource_prefix.clone(),
+        },
     ))
 }
 
@@ -1418,7 +1428,7 @@ impl AppState {
         // backend; Docker connects bollard, builds its own ResourceBuilder, and
         // spawns the in-process reconcile loop (under a leader election).
         #[cfg(feature = "backend")]
-        let (deployment_backend, docker_client, reconciler_handle) = {
+        let (deployment_backend, docker_client, ecs_cloudwatch, reconciler_handle) = {
             use crate::server::settings::DeploymentControllerSettings;
             match &settings.deployment_controller {
                 Some(DeploymentControllerSettings::Kubernetes { .. }) => {
@@ -1430,6 +1440,7 @@ impl AppState {
                         .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
                     (
                         init_kubernetes_backend(rb, kc, deployment_store.clone()).await?,
+                        None,
                         None,
                         None,
                     )
@@ -1447,7 +1458,7 @@ impl AppState {
                         shutdown.clone(),
                     )
                     .await?;
-                    (backend, Some(docker), Some(reconciler_handle))
+                    (backend, Some(docker), None, Some(reconciler_handle))
                 }
                 Some(ecs_settings @ DeploymentControllerSettings::Ecs { .. }) => {
                     let ecr_account_id = match &settings.registry {
@@ -1456,7 +1467,7 @@ impl AppState {
                         }) => Some(account_id.as_str()),
                         _ => None,
                     };
-                    let (backend, reconciler_handle) = init_ecs_backend(
+                    let (backend, reconciler_handle, cloudwatch) = init_ecs_backend(
                         ecs_settings,
                         ecr_account_id,
                         registry_provider.clone(),
@@ -1468,7 +1479,7 @@ impl AppState {
                         shutdown.clone(),
                     )
                     .await?;
-                    (backend, None, Some(reconciler_handle))
+                    (backend, None, Some(cloudwatch), Some(reconciler_handle))
                 }
                 None => {
                     return Err(anyhow::anyhow!(
@@ -1500,6 +1511,7 @@ impl AppState {
             webhook_kube_client.clone(),
             docker_client.clone(),
             docker_label_namespace.as_deref(),
+            ecs_cloudwatch,
         )
         .await?;
 

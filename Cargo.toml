@@ -127,6 +127,7 @@ backend = [
     "dep:aws-config",
     "dep:aws-sdk-ecr",
     "dep:aws-sdk-ecs",
+    "dep:aws-sdk-cloudwatchlogs",
     "dep:aws-sdk-ssm",
     "dep:aws-sdk-iam",
     "dep:aws-sdk-kms",
@@ -212,6 +213,7 @@ tera = { version = "1.20", optional = true }
 aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
 aws-sdk-ecr = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-ecs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-cloudwatchlogs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-ssm = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-iam = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-kms = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }

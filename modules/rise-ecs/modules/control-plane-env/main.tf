@@ -44,6 +44,7 @@ locals {
       RISE_ECS_EXECUTION_ROLE_ARN      = var.execution_role_arn
       RISE_ECS_TASK_ROLE_ARN           = var.workload_task_role_arn
       RISE_ECS_LOG_GROUP               = var.log_group_name
+      RISE_ECS_LOG_RETENTION_HINT      = "${var.log_retention_days}d"
       RISE_ECS_RESOURCE_PREFIX         = var.resource_prefix
       RISE_ECS_SSM_PREFIX              = var.ssm_parameter_prefix
       RISE_ECS_SSM_KMS_KEY_ID          = var.ssm_kms_key_arn != null ? var.ssm_kms_key_arn : ""
