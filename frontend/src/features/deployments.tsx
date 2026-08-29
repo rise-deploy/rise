@@ -1540,10 +1540,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const containers = Array.isArray(deployment.containers) ? deployment.containers : null;
     const isMultiContainer = !!containers && containers.length > 0;
     // Populates the log console's container filter without a second request.
-    const containerNames = useMemo(
-        () => (containers || []).map((c) => c.name).filter(Boolean),
-        [containers],
-    );
+    const containerNames = (containers || []).map((c) => c.name).filter(Boolean);
     const totals = isMultiContainer
         ? aggregateContainerResources(containers)
         : { replicas: deployment.replicas, cpu: deployment.cpu, memory: deployment.memory };

@@ -428,6 +428,7 @@ export function LogConsole({
             <LogStream
                 entries={entries}
                 rangeWindow={rangeWindow}
+                openEnded={feed.streaming}
                 showDay={showDay}
                 wrap={wrap}
                 search={searchActive}

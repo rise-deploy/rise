@@ -55,6 +55,8 @@ export type LogStreamKind = 'stdout' | 'stderr';
  */
 export interface LogEntry {
     id: string;
+    /** The backend's own line id, when it supplied one. Stable across requests. */
+    backendId?: string;
     /** Epoch millis, or 0 when the line carried no parseable timestamp. */
     timestampMs: number;
     /** The RFC3339 prefix the backend emitted, or '' when absent. */

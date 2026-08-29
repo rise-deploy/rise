@@ -24,6 +24,12 @@ export interface LogStreamProps {
     entries: LogEntry[];
     /** Window the user selected, for dimming rows paginated in from outside it. */
     rangeWindow: LogWindow | null;
+    /**
+     * A live preset range means "the last N minutes up to now", so its end
+     * keeps moving. Without this, every line that streams in after the window
+     * was resolved would render as though it fell outside the range.
+     */
+    openEnded: boolean;
     showDay: boolean;
     wrap: boolean;
     search: string;
@@ -45,6 +51,7 @@ export interface LogStreamProps {
 export function LogStream({
     entries,
     rangeWindow,
+    openEnded,
     showDay,
     wrap,
     search,
@@ -87,7 +94,9 @@ export function LogStream({
     const [scrolls, setScrolls] = useState(false);
 
     const rangeStartMs = rangeWindow?.start.getTime() ?? 0;
-    const rangeEndMs = rangeWindow?.end.getTime() ?? 0;
+    const rangeEndMs = openEnded
+        ? Number.POSITIVE_INFINITY
+        : rangeWindow?.end.getTime() ?? 0;
 
     /**
      * Ticks for the heat track: one per notable line at its relative offset,

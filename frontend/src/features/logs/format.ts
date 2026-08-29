@@ -146,7 +146,10 @@ export function parseLogLine(payload: LogLinePayload, seq: number): LogEntry {
     const parsed = extractLogJson(raw);
     const level = payload.level && payload.level.trim() ? payload.level.trim() : 'unknown';
     return {
-        id: `${timestampMs}-${seq}`,
+        // The backend's id is stable across requests, which is what dedup wants;
+        // the sequence fallback only has to be unique within this session.
+        id: payload.id ?? `${timestampMs}-${seq}`,
+        backendId: payload.id,
         timestampMs,
         iso: hasTs ? isoCandidate : '',
         raw,
@@ -161,11 +164,12 @@ export function parseLogLine(payload: LogLinePayload, seq: number): LogEntry {
 
 /**
  * Identity for deduplicating paginated pages against what is already loaded.
- * `id` cannot serve: it embeds a monotonic sequence number, so rows from a new
- * page never collide with rows already in state.
+ * Prefers the backend's own id; the fallback pairs timestamp and text, because
+ * the synthesised id embeds a monotonic sequence number and so would never
+ * collide with a row already in state.
  */
 export function entryKey(entry: LogEntry): string {
-    return `${entry.timestampMs} ${entry.raw}`;
+    return entry.backendId ?? `${entry.timestampMs} ${entry.raw}`;
 }
 
 /** Human-readable text for a typed empty state. */

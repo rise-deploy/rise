@@ -9,10 +9,15 @@
  * accumulated until a blank line dispatches the event, `data:` may repeat
  * within one event (joined with newlines), and a single optional space after
  * the colon is stripped.
+ *
+ * Event types are handled by name and unknown ones are dropped, so a server
+ * that grows new events does not spill their payloads into the log output.
  */
 
 /** The wire shape of an `event: log` payload. */
 export interface LogLinePayload {
+    /** Stable per-line identity from the backend, when it supplies one. */
+    id?: string;
     /** The raw line, optionally prefixed with an RFC3339 timestamp. */
     line: string;
     /** Backend-emitted level classification. */
@@ -40,6 +45,7 @@ function parseLinePayload(data: string): LogLinePayload | null {
     const record = obj as Record<string, unknown>;
     if (typeof record.line !== 'string') return null;
     return {
+        id: typeof record.id === 'string' ? record.id : undefined,
         line: record.line,
         level: typeof record.level === 'string' ? record.level : 'unknown',
         container: typeof record.container === 'string' ? record.container : undefined,
@@ -80,6 +86,10 @@ export async function readSseResponse(response: Response, handlers: SseHandlers)
             handlers.onBacklogComplete?.(payload);
             return;
         }
+        // Only `log` carries a line. Anything else is protocol chatter — a
+        // server may add event types this client predates, and treating an
+        // unknown one as a line would render its payload as log output.
+        if (type !== 'log' && type !== 'message') return;
         if (!payload.trim()) return;
 
         let parsed: LogLinePayload | null = null;
@@ -132,8 +142,7 @@ export async function readSseResponse(response: Response, handlers: SseHandlers)
         for (const line of lines) handleField(line);
     }
 
-    // Flush whatever the server left unterminated.
-    buffer += decoder.decode();
-    if (buffer) handleField(buffer);
-    dispatch();
+    // A trailing event with no blank line after it is incomplete, and the SSE
+    // spec says to discard pending data at end of stream. Dispatching it
+    // instead would surface a truncated payload as a garbage log line.
 }
