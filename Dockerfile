@@ -75,9 +75,12 @@ COPY --from=frontend-builder /usr/src/frontend/dist/ ./static/
 COPY .sqlx ./.sqlx
 
 # Build the application with server features
+# Shared target caches may contain workspace artifacts newer than this checkout.
+# Refresh local source mtimes so Cargo validates every workspace crate.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/target \
+    find src crates -type f -exec touch {} + && \
     SQLX_OFFLINE=true cargo build --release --all-features --bin rise && \
     cp target/release/rise /usr/local/bin/rise
 

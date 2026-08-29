@@ -1034,7 +1034,7 @@
           "properties": {
             "max_tail_lines": {
               "default": 100000,
-              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,\npaging stops yielding new lines — the same outcome as when the\nkubelet's own ring buffer is exhausted. Default: 100000.",
+              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines` through an opaque continuation; paging stops at this\nceiling or when the kubelet's own ring buffer is exhausted. Default:\n100000.",
               "format": "int64",
               "type": "integer"
             },
