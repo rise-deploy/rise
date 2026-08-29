@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { fetchLogVolume, getLogsCapabilities, streamLogs } from './api';
+import { StaleCursorError, fetchLogVolume, getLogsCapabilities, streamLogs } from './api';
 import {
     chooseCountStepSeconds,
     entryKey,
@@ -35,6 +35,12 @@ const LOG_PAGE_SIZE = 200;
  * furthest from where the user is reading gets trimmed.
  */
 const LOG_BUFFER_CAP = 50_000;
+
+/**
+ * How far back a streamed line is checked for having already arrived. Sized
+ * well above a page so the whole backlog/live seam is covered.
+ */
+const LIVE_DEDUP_WINDOW = 1_000;
 
 /** Distance from the bottom, in px, that still counts as "following". */
 export const LOG_FOLLOW_THRESHOLD_PX = 24;
@@ -155,19 +161,15 @@ export function useLogFeed({
     const olderAbortRef = useRef<AbortController | null>(null);
     const countsRequestIdRef = useRef(0);
     const seqRef = useRef(0);
-    const oldestLoadedMsRef = useRef<number | null>(null);
     const loadingMoreRef = useRef(false);
     const streamGenRef = useRef(0);
-    // Whether the active stream has finished its backlog phase. Until then
-    // `hasMore` stays optimistic so the user can scroll back.
-    const backlogCompleteRef = useRef(false);
-    // Set once pagination proves the backend can't surface more history —
-    // typical for Kubernetes, whose pods/log API has no end-time filter.
-    // Streaming must not flip `hasMore` back on afterwards.
-    const paginationExhaustedRef = useRef(false);
-    // Mirrors entries.length so `loadOlder` can pass it as `skip_recent`
-    // without being recreated on every streamed line.
-    const entriesCountRef = useRef(0);
+    /**
+     * Continuation token for older lines, refreshed by every `page_complete`,
+     * `backlog_complete` and `cursor` event. `null` means the backend has said
+     * there is nothing older — which is also how a backend that cannot page
+     * backwards at all (Docker) reports itself.
+     */
+    const paginationCursorRef = useRef<string | null>(null);
 
     /**
      * For a terminal deployment, anchor preset ranges to when it stopped —
@@ -230,10 +232,6 @@ export function useLogFeed({
     }, []);
 
     useEffect(() => {
-        entriesCountRef.current = entries.length;
-    }, [entries.length]);
-
-    useEffect(() => {
         if (typeof window === 'undefined') return;
         try {
             window.localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(autoRefreshSeconds));
@@ -241,6 +239,12 @@ export function useLogFeed({
             /* localStorage may be disabled — best effort */
         }
     }, [autoRefreshSeconds]);
+
+    /** Adopt a continuation token; `hasMore` is exactly "a cursor exists". */
+    const applyCursor = useCallback((next: string | null) => {
+        paginationCursorRef.current = next;
+        setHasMore(next !== null);
+    }, []);
 
     const abortOlder = useCallback(() => {
         if (olderAbortRef.current) {
@@ -313,11 +317,10 @@ export function useLogFeed({
         setEntries([]);
         setError(null);
         setStatus(null);
-        setHasMore(false);
-        oldestLoadedMsRef.current = null;
-        backlogCompleteRef.current = false;
-        paginationExhaustedRef.current = false;
-    }, [abortOlder]);
+        // A cursor is signed over the filters it was minted for, so any reload
+        // invalidates it.
+        applyCursor(null);
+    }, [abortOlder, applyCursor]);
 
     const loadHistoricalLogs = useCallback(async () => {
         const gen = ++streamGenRef.current;
@@ -339,6 +342,7 @@ export function useLogFeed({
 
         const collected: LogEntry[] = [];
         let newStatus: LogStatus | null = null;
+        let nextCursor: string | null = null;
 
         try {
             await streamLogs(
@@ -365,6 +369,10 @@ export function useLogFeed({
                             newStatus = { reason: 'backend_unavailable' };
                         }
                     },
+                    onPageComplete: ({ next_cursor }) => {
+                        if (gen !== streamGenRef.current) return;
+                        nextCursor = next_cursor;
+                    },
                     onMalformed: (err) => {
                         console.warn('Malformed log payload; rendering the raw line', err);
                     },
@@ -374,14 +382,13 @@ export function useLogFeed({
             // The backend already yields ascending, which is the order we keep.
             setEntries(collected);
             setStatus(newStatus);
-            oldestLoadedMsRef.current = collected.length > 0 ? collected[0].timestampMs : null;
-            setHasMore(collected.length >= pageSize);
+            applyCursor(nextCursor);
         } catch (err) {
             if (isAbort(err) || gen !== streamGenRef.current) return;
             console.error('Failed to load logs:', err);
             setError(errorMessage(err));
         }
-    }, [projectName, deploymentId, logWindow, pageSize, filters, resetForReload]);
+    }, [projectName, deploymentId, logWindow, pageSize, filters, resetForReload, applyCursor]);
 
     const startStreaming = useCallback(async () => {
         const gen = ++streamGenRef.current;
@@ -410,17 +417,6 @@ export function useLogFeed({
                         if (streamGenRef.current !== gen) return;
                         const entry = parseLogLine(payload, seqRef.current++);
                         setEntries((prev) => appendLive(prev, entry));
-                        if (entry.timestampMs > 0
-                            && (oldestLoadedMsRef.current === null
-                                || entry.timestampMs < oldestLoadedMsRef.current)) {
-                            oldestLoadedMsRef.current = entry.timestampMs;
-                        }
-                        // Optimistic during backlog only; once backlog_complete
-                        // fires, or pagination has proven the backend can't go
-                        // further, `hasMore` is authoritative.
-                        if (!backlogCompleteRef.current && !paginationExhaustedRef.current) {
-                            setHasMore(true);
-                        }
                     },
                     onStatus: (payload) => {
                         if (streamGenRef.current !== gen) return;
@@ -430,18 +426,15 @@ export function useLogFeed({
                             setStatus({ reason: 'backend_unavailable' });
                         }
                     },
-                    onBacklogComplete: (payload) => {
+                    onBacklogComplete: ({ next_cursor }) => {
                         if (streamGenRef.current !== gen) return;
-                        backlogCompleteRef.current = true;
-                        let count: number;
-                        try {
-                            count = (JSON.parse(payload) as { count?: number }).count ?? 0;
-                        } catch {
-                            // Treat a malformed payload as a full page rather
-                            // than wrongly claiming we reached the range start.
-                            count = pageSize;
-                        }
-                        setHasMore(count >= pageSize);
+                        applyCursor(next_cursor);
+                    },
+                    // A long-lived follow stream refreshes its continuation
+                    // token as the backend's own window advances.
+                    onCursor: ({ next_cursor }) => {
+                        if (streamGenRef.current !== gen) return;
+                        applyCursor(next_cursor);
                     },
                     onMalformed: (err) => {
                         console.warn('Malformed log payload; rendering the raw line', err);
@@ -459,12 +452,12 @@ export function useLogFeed({
                 setStreaming(false);
             }
         }
-    }, [projectName, deploymentId, rangeWindow, pageSize, filters, resetForReload]);
+    }, [projectName, deploymentId, rangeWindow, pageSize, filters, resetForReload, applyCursor]);
 
     const loadOlder = useCallback(async () => {
-        if (loadingMoreRef.current || !hasMore || !logWindow) return;
-        const oldestMs = oldestLoadedMsRef.current;
-        if (!oldestMs) return;
+        if (loadingMoreRef.current) return;
+        const cursor = paginationCursorRef.current;
+        if (!cursor) return;
 
         olderAbortRef.current?.abort();
         const controller = new AbortController();
@@ -473,17 +466,16 @@ export function useLogFeed({
         setLoadingMore(true);
 
         const collected: LogEntry[] = [];
+        let nextCursor: string | null = null;
         try {
             await streamLogs(
                 {
                     projectName,
                     deploymentId,
-                    // Deliberately no `start`: let pagination reach past the
-                    // selected range and surface whatever the backend still
-                    // holds. Rows outside the window are dimmed in the list.
-                    end: new Date(oldestMs).toISOString(),
+                    // The cursor carries the window and the filters it was
+                    // minted for, so nothing else about the query is restated.
+                    cursor,
                     tail: pageSize,
-                    skipRecent: entriesCountRef.current,
                     signal: controller.signal,
                     ...filters,
                 },
@@ -491,39 +483,34 @@ export function useLogFeed({
                     onLine: (payload) => {
                         collected.push(parseLogLine(payload, seqRef.current++));
                     },
+                    onPageComplete: ({ next_cursor }) => {
+                        nextCursor = next_cursor;
+                    },
                 },
             );
             if (controller.signal.aborted) return;
 
-            let newlyAdded = 0;
             setEntries((prev) => {
+                // Line ids are stable across requests, so identity alone
+                // settles what a page has already delivered.
                 const seen = new Set(prev.map(entryKey));
-                // CloudWatch pages by count because separate ECS streams can
-                // share a millisecond, so its next page is non-overlapping and
-                // equal timestamps are legitimate. Timestamp-cursor backends
-                // repeat their inclusive boundary and must stay strictly older.
-                const withinCursor = capabilities.backend === 'cloudwatch'
-                    ? (entry: LogEntry) => entry.timestampMs <= oldestMs
-                    : (entry: LogEntry) => entry.timestampMs < oldestMs;
-                const fresh = collected.filter((e) => withinCursor(e) && !seen.has(entryKey(e)));
-                newlyAdded = fresh.length;
+                const fresh = collected.filter((e) => !seen.has(entryKey(e)));
                 if (fresh.length === 0) return prev;
                 fresh.sort((a, b) => a.timestampMs - b.timestampMs);
-                oldestLoadedMsRef.current = fresh[0].timestampMs;
                 // Prepending: trim the newest end if the buffer overflows, since
                 // the user is reading backwards.
                 return trimTail(fresh.concat(prev));
             });
-
-            // Gate on *new* rows, not the page size. A backend that ignores
-            // end-time (Kubernetes) returns the same most-recent N lines every
-            // call; dedup drops them all but the page stays full, which would
-            // make the load-older trigger fire forever.
-            const exhausted = newlyAdded < pageSize;
-            if (exhausted) paginationExhaustedRef.current = true;
-            setHasMore(!exhausted);
+            applyCursor(nextCursor);
         } catch (err) {
-            if (!isAbort(err)) console.error('Failed to load older logs:', err);
+            if (isAbort(err)) return;
+            if (err instanceof StaleCursorError) {
+                // The token no longer matches this deployment or filter set.
+                // Paging back is simply over; it isn't a stream failure.
+                applyCursor(null);
+                return;
+            }
+            console.error('Failed to load older logs:', err);
         } finally {
             if (olderAbortRef.current === controller) {
                 olderAbortRef.current = null;
@@ -531,7 +518,7 @@ export function useLogFeed({
                 setLoadingMore(false);
             }
         }
-    }, [projectName, deploymentId, hasMore, logWindow, pageSize, filters, capabilities.backend]);
+    }, [projectName, deploymentId, pageSize, filters, applyCursor]);
 
     // ---- effects ----------------------------------------------------------
 
@@ -676,13 +663,24 @@ export function useLogFeed({
 }
 
 /**
- * Append a streamed line, keeping the list ascending.
+ * Append a streamed line, keeping the list ascending and free of repeats.
  *
- * Loki's tail can deliver lines slightly out of order, but only by a little, so
- * scanning backwards from the end settles in one comparison for the common case
- * instead of walking the whole array per line.
+ * A follow stream re-delivers the tail end of its own backlog, so the seam
+ * between the two phases produces duplicates. They are always near the end —
+ * a tail never re-sends something thousands of lines back — so a bounded scan
+ * backwards catches them at constant cost, where checking the whole buffer
+ * would be O(n) per line.
+ *
+ * The same scan finds the insertion point: Loki's tail can deliver slightly
+ * out of order, but only by a little, so it settles in one comparison for the
+ * common case.
  */
 function appendLive(prev: LogEntry[], entry: LogEntry): LogEntry[] {
+    const floor = Math.max(0, prev.length - LIVE_DEDUP_WINDOW);
+    for (let i = prev.length - 1; i >= floor; i--) {
+        if (prev[i].id === entry.id) return prev;
+    }
+
     const last = prev.length > 0 ? prev[prev.length - 1] : null;
     if (!last || entry.timestampMs >= last.timestampMs) {
         return trimHead(prev.concat(entry));

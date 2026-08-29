@@ -67,6 +67,8 @@ export interface LogEntry {
     /** Set when `raw` contains a JSON object/array; holds the parsed value. */
     isJson: boolean;
     parsed: unknown;
+    /** Text that preceded the JSON on the line, preserved for the expanded view. */
+    jsonPrefix?: string;
     /** Attribution, when the configured backend can supply it. */
     container?: string;
     replica?: string;

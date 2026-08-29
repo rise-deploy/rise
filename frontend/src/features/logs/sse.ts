@@ -28,15 +28,53 @@ export interface LogLinePayload {
     stream?: 'stdout' | 'stderr';
 }
 
+/**
+ * Continuation token for backward pagination. `null` means there is nothing
+ * older to fetch — the client must not synthesise one.
+ */
+export interface CursorPayload {
+    next_cursor: string | null;
+}
+
 export interface SseHandlers {
     onLine?: (payload: LogLinePayload) => void;
     onStatus?: (payload: string) => void;
-    onBacklogComplete?: (payload: string) => void;
+    /** Ends the backlog phase of a follow stream; carries a continuation cursor. */
+    onBacklogComplete?: (payload: CursorPayload & { count?: number }) => void;
+    /** Ends a finite historical page. */
+    onPageComplete?: (payload: CursorPayload) => void;
+    /** Refreshes the continuation cursor while a follow stream is attached. */
+    onCursor?: (payload: CursorPayload) => void;
     /**
      * Called at most once per stream when a payload doesn't parse. The line is
      * still delivered verbatim with `level: 'unknown'`.
      */
     onMalformed?: (err: unknown) => void;
+}
+
+/**
+ * A cursor event that doesn't parse is treated as "no continuation" rather
+ * than as an error: losing the ability to page back is recoverable, inventing
+ * a cursor is not — the server rejects a malformed one with a 400.
+ */
+function parseCursorPayload(data: string): CursorPayload {
+    try {
+        const obj = JSON.parse(data) as Record<string, unknown>;
+        return {
+            next_cursor: typeof obj?.next_cursor === 'string' ? obj.next_cursor : null,
+        };
+    } catch {
+        return { next_cursor: null };
+    }
+}
+
+function readCount(data: string): number | undefined {
+    try {
+        const obj = JSON.parse(data) as Record<string, unknown>;
+        return typeof obj?.count === 'number' ? obj.count : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 function parseLinePayload(data: string): LogLinePayload | null {
@@ -83,7 +121,19 @@ export async function readSseResponse(response: Response, handlers: SseHandlers)
             return;
         }
         if (type === 'backlog_complete') {
-            handlers.onBacklogComplete?.(payload);
+            const parsed = parseCursorPayload(payload);
+            handlers.onBacklogComplete?.({
+                ...parsed,
+                count: readCount(payload),
+            });
+            return;
+        }
+        if (type === 'page_complete') {
+            handlers.onPageComplete?.(parseCursorPayload(payload));
+            return;
+        }
+        if (type === 'cursor') {
+            handlers.onCursor?.(parseCursorPayload(payload));
             return;
         }
         // Only `log` carries a line. Anything else is protocol chatter — a

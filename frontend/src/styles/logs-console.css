@@ -437,6 +437,29 @@
 }
 
 .r-logc-row:hover { background: var(--r-logs-bg-hover); }
+.r-logc-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* A JSON line expands on click, so it has to read as clickable. The caret is
+   the only standing hint; text stays selectable, and a drag is not a toggle. */
+.r-logc-row.is-expandable { cursor: pointer; }
+.r-logc-row.is-expandable .r-logc-msg::before {
+    content: "\203A";
+    display: inline-block;
+    width: 0.75em;
+    margin-left: -0.75em;
+    color: var(--text-soft);
+    transition: transform 0.12s cubic-bezier(0.23, 1, 0.32, 1);
+}
+.r-logc-row.is-expandable.is-expanded .r-logc-msg::before {
+    transform: rotate(90deg);
+}
+/* The caret sits in the gutter the message column already has, so it must not
+   push the text: reserve its width on every row in the stream. */
+.r-logc-msg { padding-left: 0.75em; }
+
+@media (prefers-reduced-motion: reduce) {
+    .r-logc-row.is-expandable .r-logc-msg::before { transition: none; }
+}
 
 /* Severity spine — the scan channel. Neutral levels stay invisible so the
    loud ones are the only thing the eye catches. */
@@ -727,3 +750,10 @@
 .r-logc-expand:hover { color: var(--text); background: var(--hover); }
 .r-logc-back:focus-visible,
 .r-logc-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Text that preceded a JSON payload on the same line. Kept above the formatted
+   block so expanding never hides part of the line. */
+.r-logc-json-prefix {
+    display: block;
+    color: var(--text-muted);
+}

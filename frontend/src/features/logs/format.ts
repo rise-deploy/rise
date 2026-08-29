@@ -115,14 +115,22 @@ export function windowSpansDays(window: LogWindow | null): boolean {
     return window.start.toDateString() !== window.end.toDateString();
 }
 
-/** Find the first `{`/`[` and parse from there. Returns null when it isn't JSON. */
-export function extractLogJson(raw: string): unknown {
-    const s = raw.trim();
-    if (s.length < 2) return null;
-    const candidates = ['{', '['].map((c) => s.indexOf(c)).filter((i) => i >= 0);
+/**
+ * Find the first `{`/`[` and parse from there.
+ *
+ * Structured lines are routinely prefixed — a logger name, a level tag, a
+ * request id — so the text before the JSON is returned alongside the parsed
+ * value rather than discarded: the expanded view has to show the whole line,
+ * not just the part that happened to parse.
+ */
+export function extractLogJson(raw: string): { value: unknown; prefix: string } | null {
+    const trimmed = raw.trim();
+    if (trimmed.length < 2) return null;
+    const candidates = ['{', '['].map((c) => trimmed.indexOf(c)).filter((i) => i >= 0);
     if (candidates.length === 0) return null;
+    const at = Math.min(...candidates);
     try {
-        return JSON.parse(s.slice(Math.min(...candidates)));
+        return { value: JSON.parse(trimmed.slice(at)), prefix: trimmed.slice(0, at) };
     } catch {
         return null;
     }
@@ -143,7 +151,7 @@ export function parseLogLine(payload: LogLinePayload, seq: number): LogEntry {
     const hasTs = date !== null && !Number.isNaN(date.getTime());
     const timestampMs = hasTs ? date.getTime() : 0;
     const raw = hasTs ? line.slice(sp + 1) : line;
-    const parsed = extractLogJson(raw);
+    const json = extractLogJson(raw);
     const level = payload.level && payload.level.trim() ? payload.level.trim() : 'unknown';
     return {
         // The backend's id is stable across requests, which is what dedup wants;
@@ -154,8 +162,9 @@ export function parseLogLine(payload: LogLinePayload, seq: number): LogEntry {
         iso: hasTs ? isoCandidate : '',
         raw,
         level,
-        isJson: parsed !== null,
-        parsed,
+        isJson: json !== null,
+        parsed: json?.value ?? null,
+        jsonPrefix: json?.prefix ?? '',
         container: payload.container,
         replica: payload.replica,
         stream: payload.stream,

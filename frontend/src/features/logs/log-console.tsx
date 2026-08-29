@@ -1,5 +1,5 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Button as RButton, Combobox, Status, Tooltip } from '../../components/r-ui';
+import { Button as RButton, Combobox, Empty, Status, Tooltip } from '../../components/r-ui';
 import { Icon } from '../../components/icon';
 import { useToast } from '../../components/toast';
 import {
@@ -246,7 +246,26 @@ export function LogConsole({
         return () => document.removeEventListener('keydown', onKeyDown);
     }, [entries.length, jumpToMatch]);
 
-    if (!feed.loggable) return null;
+    // A deployment that has not reached a loggable state has nothing to stream.
+    // Embedded, the surrounding page still explains itself and rendering
+    // nothing is right; on its own route it would be a blank screen.
+    if (!feed.loggable) {
+        if (variant !== 'page') return null;
+        return (
+            <div className="r-logc r-logc-page">
+                <div className="r-logc-bar">
+                    <div className="r-logc-bar-left">
+                        {lead}
+                        <Status status={deploymentStatus} />
+                    </div>
+                </div>
+                <Empty title="No logs yet">
+                    This deployment is {deploymentStatus.toLowerCase()}; logs start once its
+                    workload is running.
+                </Empty>
+            </div>
+        );
+    }
 
     const showDay = windowSpansDays(rangeWindow);
     const emptyMessage = describeLogStatus(feed.status)

@@ -1,8 +1,11 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useRef } from 'react';
 import { colorFor } from '../../components/r-ui';
 import { formatDay, formatHms } from './format';
 import { findMatches } from './query';
 import type { LogEntry } from './types';
+
+/** Pointer travel, in px, past which a click is treated as a text selection. */
+const DRAG_SLOP_PX = 4;
 
 /** Regex-based JSON syntax highlighting — cheap, and only runs when expanded. */
 function highlightJson(value: unknown): React.ReactElement {
@@ -78,14 +81,51 @@ function LogRowImpl({
         () => (expanded && entry.isJson ? highlightJson(entry.parsed) : null),
         [expanded, entry.isJson, entry.parsed],
     );
+    const prefix = entry.jsonPrefix?.trimEnd();
 
     const attribution = entry.container ?? entry.replica;
     const className = `r-logc-row lv-${entry.level}`
+        + (canExpand ? ' is-expandable' : '')
         + (expanded ? ' is-expanded' : '')
         + (outOfRange ? ' is-out-of-range' : '');
 
+    /**
+     * Clicking a JSON line expands it — but a log viewer's other primary
+     * gesture is selecting text, and a drag ending inside the row also fires a
+     * click. Compare the press and release positions and let anything that
+     * moved count as a selection, not a toggle.
+     */
+    const pressRef = useRef<{ x: number; y: number } | null>(null);
+    const onPointerDown = (e: React.PointerEvent) => {
+        pressRef.current = { x: e.clientX, y: e.clientY };
+    };
+    const onClick = (e: React.MouseEvent) => {
+        if (!canExpand) return;
+        // Never swallow a click on the row's own controls.
+        if ((e.target as HTMLElement).closest('button')) return;
+        const press = pressRef.current;
+        pressRef.current = null;
+        if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > DRAG_SLOP_PX) return;
+        if (!window.getSelection()?.isCollapsed) return;
+        onToggleExpand(entry.id);
+    };
+
     return (
-        <div className={className} title={entry.iso || undefined}>
+        <div
+            className={className}
+            title={entry.iso || undefined}
+            onPointerDown={canExpand ? onPointerDown : undefined}
+            onClick={canExpand ? onClick : undefined}
+            onKeyDown={canExpand ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    onToggleExpand(entry.id);
+                }
+            } : undefined}
+            role={canExpand ? 'button' : undefined}
+            tabIndex={canExpand ? 0 : undefined}
+            aria-expanded={canExpand ? expanded : undefined}
+        >
             <span className="r-logc-spine" aria-hidden="true" />
             <span className="r-logc-ts">
                 {showDay && entry.timestampMs ? `${formatDay(entry.timestampMs)} ` : ''}
@@ -101,19 +141,15 @@ function LogRowImpl({
                 </span>
             )}
             <span className="r-logc-msg">
-                {json ?? markMatches(entry.raw, search, activeMatchOffset)}
+                {json ? (
+                    <>
+                        {/* Whatever preceded the JSON is part of the line too. */}
+                        {prefix && <span className="r-logc-json-prefix">{prefix}</span>}
+                        {json}
+                    </>
+                ) : markMatches(entry.raw, search, activeMatchOffset)}
             </span>
             <span className="r-logc-actions">
-                {canExpand && (
-                    <button
-                        type="button"
-                        className="r-logc-line-btn"
-                        onClick={() => onToggleExpand(entry.id)}
-                        aria-expanded={expanded}
-                    >
-                        {expanded ? 'Collapse' : 'JSON'}
-                    </button>
-                )}
                 <button
                     type="button"
                     className="r-logc-line-btn"

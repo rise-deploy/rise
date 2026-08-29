@@ -90,6 +90,22 @@ function applyFilters(params: URLSearchParams, filters: LogFilters): void {
     if (filters.search) params.set('search', filters.search);
 }
 
+/**
+ * The server rejected our continuation token — it was minted for a different
+ * filter set, or its backend moved on. Callers drop the cursor and stop paging
+ * rather than surfacing this as a stream error.
+ */
+export class StaleCursorError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'StaleCursorError';
+    }
+}
+
+function isCursorRejection(message: string): boolean {
+    return message.toLowerCase().includes('cursor');
+}
+
 export interface LogStreamRequest extends LogFilters {
     projectName: string;
     deploymentId: string;
@@ -98,8 +114,12 @@ export interface LogStreamRequest extends LogFilters {
     start?: string;
     end?: string;
     tail: number;
-    /** Backends without an end-time filter use this to page past loaded lines. */
-    skipRecent?: number;
+    /**
+     * Opaque continuation token from a `page_complete` / `backlog_complete` /
+     * `cursor` event. The server rejects a cursor sent alongside `follow` or
+     * any time-range parameter, so passing one here suppresses them.
+     */
+    cursor?: string;
     signal: AbortSignal;
 }
 
@@ -109,11 +129,15 @@ export interface LogStreamRequest extends LogFilters {
  */
 export async function streamLogs(request: LogStreamRequest, handlers: SseHandlers): Promise<void> {
     const params = new URLSearchParams({ timestamps: 'true', tail: String(request.tail) });
-    if (request.follow) params.set('follow', 'true');
-    if (request.start) params.set('start', request.start);
-    if (request.end) params.set('end', request.end);
-    if (request.skipRecent && request.skipRecent > 0) {
-        params.set('skip_recent', String(request.skipRecent));
+    if (request.cursor) {
+        // The cursor already encodes the window and the filters it was minted
+        // for; sending either again is a 400. Enforced here so no call site can
+        // construct an invalid request.
+        params.set('cursor', request.cursor);
+    } else {
+        if (request.follow) params.set('follow', 'true');
+        if (request.start) params.set('start', request.start);
+        if (request.end) params.set('end', request.end);
     }
     applyFilters(params, request);
 
@@ -125,7 +149,10 @@ export async function streamLogs(request: LogStreamRequest, handlers: SseHandler
             signal: request.signal,
         },
     );
-    if (!response.ok) throw new Error(await readHttpErrorMessage(response));
+    if (!response.ok) {
+        const message = await readHttpErrorMessage(response);
+        throw isCursorRejection(message) ? new StaleCursorError(message) : new Error(message);
+    }
     await readSseResponse(response, handlers);
 }
 
