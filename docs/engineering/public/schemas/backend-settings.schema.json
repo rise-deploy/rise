@@ -2432,7 +2432,7 @@
           "type": "null"
         }
       ],
-      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or `local.yaml`) *replaces* it entirely. Operators\nwho want to add to the defaults must re-include them."
+      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or the local configuration layer) *replaces* it\nentirely. Operators who want to add to the defaults must re-include\nthem."
     },
     "registry": {
       "anyOf": [
