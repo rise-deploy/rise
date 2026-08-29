@@ -64,7 +64,7 @@ function LogChartTooltip({ active, payload, stepSeconds, levels }: { active?: bo
     );
 }
 
-export default function LogVolumeChart({ counts, levels, loading, error, status, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs }) {
+export default function LogVolumeChart({ counts, levels, loading, error, status, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs, height = 96 }) {
     // Flatten each bucket's `by_level` map into top-level keys so Recharts'
     // `<Bar dataKey="info">` can read them directly.
     const data = useMemo(
@@ -135,7 +135,7 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                 <div className="py-6 text-center text-xs text-[var(--text-soft)]">{statusMessage()}</div>
             ) : (
                 <div role="img" aria-label={chartAriaLabel}>
-                <ResponsiveContainer width="100%" height={96}>
+                <ResponsiveContainer width="100%" height={height}>
                     <BarChart
                         data={data}
                         margin={{ top: 4, right: 6, bottom: 4, left: 4 }}

@@ -1,0 +1,273 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import { NOTABLE_LEVELS, levelSeverityRank } from './format';
+import { LOG_FOLLOW_THRESHOLD_PX } from './use-log-feed';
+import { LogRow } from './log-row';
+import type { LogEntry, LogWindow } from './types';
+
+/** Row height guess before measurement; a single unwrapped line at 12px/1.55. */
+const ESTIMATED_ROW_PX = 20;
+
+/** Vertical resolution of the heat track, in ticks. */
+const HEAT_SLOTS = 160;
+
+/** Distance from the top, in px, that triggers loading the previous page. */
+const LOAD_OLDER_THRESHOLD_PX = 240;
+
+export interface FocusRequest {
+    index: number;
+    /** Changes on every request so repeat jumps to the same row still fire. */
+    token: number;
+}
+
+export interface LogStreamProps {
+    entries: LogEntry[];
+    /** Window the user selected, for dimming rows paginated in from outside it. */
+    rangeWindow: LogWindow | null;
+    showDay: boolean;
+    wrap: boolean;
+    search: string;
+    expandedIds: Set<string>;
+    onToggleExpand: (id: string) => void;
+    onCopyLine: (entry: LogEntry) => void;
+    following: boolean;
+    onFollowingChange: (following: boolean) => void;
+    hasMore: boolean;
+    loadingMore: boolean;
+    onLoadOlder: () => void;
+    /** Character offset of the focused match, keyed by entry id. */
+    activeMatch: { id: string; offset: number } | null;
+    focusRequest: FocusRequest | null;
+    /** Rendered when there are no entries at all. */
+    empty: React.ReactNode;
+}
+
+export function LogStream({
+    entries,
+    rangeWindow,
+    showDay,
+    wrap,
+    search,
+    expandedIds,
+    onToggleExpand,
+    onCopyLine,
+    following,
+    onFollowingChange,
+    hasMore,
+    loadingMore,
+    onLoadOlder,
+    activeMatch,
+    focusRequest,
+    empty,
+}: LogStreamProps) {
+    const scrollRef = useRef<HTMLDivElement>(null);
+    // Distance from the bottom captured before a prepend, so scroll position
+    // can be restored once the older page has been measured.
+    const anchorFromBottomRef = useRef<number | null>(null);
+    // Suppress the follow-off detection while we move the scroll ourselves.
+    const programmaticScrollRef = useRef(false);
+
+    const virtualizer = useVirtualizer({
+        count: entries.length,
+        getScrollElement: () => scrollRef.current,
+        estimateSize: () => ESTIMATED_ROW_PX,
+        overscan: 24,
+        getItemKey: (index) => entries[index].id,
+        // Dynamic measurement fires from a ref callback while React is still
+        // rendering, so the default synchronous flush both warns and forces one
+        // re-render per measured row. Batching costs a frame of settle on rows
+        // whose height was mis-estimated, which is invisible next to the churn.
+        useFlushSync: false,
+    });
+
+    const items = virtualizer.getVirtualItems();
+    const totalSize = virtualizer.getTotalSize();
+    // The heat track maps buffer position, so it only means anything once the
+    // buffer is taller than the viewport.
+    const [scrolls, setScrolls] = useState(false);
+
+    const rangeStartMs = rangeWindow?.start.getTime() ?? 0;
+    const rangeEndMs = rangeWindow?.end.getTime() ?? 0;
+
+    /**
+     * Ticks for the heat track: one per notable line at its relative offset,
+     * collapsed to a fixed number of slots. Without the collapse a busy buffer
+     * paints a solid bar — and renders thousands of nodes to say nothing.
+     * The most severe level in a slot wins, so an error is never hidden by the
+     * warnings around it.
+     */
+    const heatTicks = useMemo(() => {
+        if (entries.length === 0) return [];
+        const slots = new Map<number, string>();
+        for (let i = 0; i < entries.length; i++) {
+            const level = entries[i].level;
+            if (!NOTABLE_LEVELS.has(level)) continue;
+            const slot = Math.floor((i / entries.length) * HEAT_SLOTS);
+            const current = slots.get(slot);
+            if (current === undefined || levelSeverityRank(level) > levelSeverityRank(current)) {
+                slots.set(slot, level);
+            }
+        }
+        return [...slots.entries()].map(([slot, level]) => ({
+            pct: (slot / HEAT_SLOTS) * 100,
+            level,
+        }));
+    }, [entries]);
+
+    useLayoutEffect(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        setScrolls(el.scrollHeight > el.clientHeight + 8);
+    }, [totalSize, entries.length]);
+
+    const scrollToBottom = useCallback(() => {
+        const el = scrollRef.current;
+        if (!el) return;
+        programmaticScrollRef.current = true;
+        el.scrollTop = el.scrollHeight;
+        requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+    }, []);
+
+    /** Stick to the newest line while following. */
+    useLayoutEffect(() => {
+        if (!following) return;
+        scrollToBottom();
+    }, [following, entries.length, totalSize, scrollToBottom]);
+
+    /** Restore the reading position after an older page is prepended. */
+    useLayoutEffect(() => {
+        const fromBottom = anchorFromBottomRef.current;
+        if (fromBottom === null) return;
+        const el = scrollRef.current;
+        if (!el) return;
+        anchorFromBottomRef.current = null;
+        programmaticScrollRef.current = true;
+        el.scrollTop = el.scrollHeight - fromBottom;
+        requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+    }, [entries.length, totalSize]);
+
+    /** Jump to a specific row (search navigation, heat-track clicks). */
+    useEffect(() => {
+        if (!focusRequest) return;
+        onFollowingChange(false);
+        programmaticScrollRef.current = true;
+        virtualizer.scrollToIndex(focusRequest.index, { align: 'center' });
+        requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+        // `virtualizer` identity changes every render; the token is the trigger.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [focusRequest?.token]);
+
+    const handleScroll = useCallback(() => {
+        const el = scrollRef.current;
+        if (!el || programmaticScrollRef.current) return;
+
+        const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+        const atBottom = distanceFromBottom <= LOG_FOLLOW_THRESHOLD_PX;
+        if (atBottom !== following) onFollowingChange(atBottom);
+
+        if (el.scrollTop <= LOAD_OLDER_THRESHOLD_PX && hasMore && !loadingMore) {
+            anchorFromBottomRef.current = el.scrollHeight - el.scrollTop;
+            onLoadOlder();
+        }
+    }, [following, onFollowingChange, hasMore, loadingMore, onLoadOlder]);
+
+    const jumpToTick = useCallback((pct: number) => {
+        const index = Math.min(entries.length - 1, Math.floor((pct / 100) * entries.length));
+        if (index < 0) return;
+        onFollowingChange(false);
+        programmaticScrollRef.current = true;
+        virtualizer.scrollToIndex(index, { align: 'center' });
+        requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+    }, [entries.length, onFollowingChange, virtualizer]);
+
+    return (
+        <div className="r-logc-stream-wrap">
+            <div
+                ref={scrollRef}
+                className={wrap ? 'r-logc-stream' : 'r-logc-stream is-nowrap'}
+                onScroll={handleScroll}
+                role="log"
+                aria-label="Deployment log lines"
+                aria-live={following ? 'polite' : 'off'}
+                tabIndex={0}
+            >
+                {entries.length === 0 ? (
+                    <div className="r-logc-empty">{empty}</div>
+                ) : (
+                    <>
+                        {/* Oldest first, so the boundary marker belongs above
+                            the rows: older lines load as you scroll up. */}
+                        <div className={hasMore ? 'r-logc-loader' : 'r-logc-loader is-end'}>
+                            {!hasMore ? 'Start of available logs' : loadingMore ? (
+                                <>
+                                    <span className="r-spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+                                    Loading older…
+                                </>
+                            ) : 'Scroll up for older lines'}
+                        </div>
+                        <div className="r-logc-rows" style={{ height: totalSize }}>
+                            {items.map((item) => {
+                                const entry = entries[item.index];
+                                const outOfRange = rangeWindow !== null
+                                    && entry.timestampMs > 0
+                                    && (entry.timestampMs < rangeStartMs || entry.timestampMs > rangeEndMs);
+                                return (
+                                    <div
+                                        key={item.key}
+                                        data-index={item.index}
+                                        ref={virtualizer.measureElement}
+                                        className="r-logc-slot"
+                                        style={{ transform: `translateY(${item.start}px)` }}
+                                    >
+                                        <LogRow
+                                            entry={entry}
+                                            showDay={showDay}
+                                            outOfRange={outOfRange}
+                                            expanded={expandedIds.has(entry.id)}
+                                            onToggleExpand={onToggleExpand}
+                                            onCopy={onCopyLine}
+                                            search={search}
+                                            activeMatchOffset={
+                                                activeMatch?.id === entry.id ? activeMatch.offset : null
+                                            }
+                                        />
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </>
+                )}
+            </div>
+
+            {scrolls && heatTicks.length > 0 && (
+                <div
+                    className="r-logc-heat"
+                    role="presentation"
+                    title={`${heatTicks.length} warning or error lines`}
+                    onClick={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        jumpToTick(((e.clientY - rect.top) / rect.height) * 100);
+                    }}
+                >
+                    {heatTicks.map((tick, i) => (
+                        <span
+                            key={i}
+                            className={`r-logc-heat-tick lv-${tick.level}`}
+                            style={{ top: `${tick.pct}%` }}
+                        />
+                    ))}
+                </div>
+            )}
+
+            {!following && entries.length > 0 && (
+                <button
+                    type="button"
+                    className="r-logc-jump"
+                    onClick={() => { onFollowingChange(true); scrollToBottom(); }}
+                >
+                    Jump to latest ↓
+                </button>
+            )}
+        </div>
+    );
+}
