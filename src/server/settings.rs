@@ -46,8 +46,9 @@ pub struct Settings {
     /// Curated catalog of stateless container images surfaced as one-click
     /// "quickstart" deploys in the UI. The catalog is layered: `default.yaml`
     /// ships the built-in selection and any `quickstart.templates` list in a
-    /// later layer (run-mode or `local.yaml`) *replaces* it entirely. Operators
-    /// who want to add to the defaults must re-include them.
+    /// later layer (run-mode or the local configuration layer) *replaces* it
+    /// entirely. Operators who want to add to the defaults must re-include
+    /// them.
     #[serde(default)]
     pub quickstart: Option<QuickstartSettings>,
 }
@@ -2106,8 +2107,17 @@ impl Settings {
         // 2. Load environment-specific config (required)
         Self::try_add_config_file(&mut builder, config_dir, run_mode, true)?;
 
-        // 3. Load local config (optional, not checked into git)
-        Self::try_add_config_file(&mut builder, config_dir, "local", false)?;
+        // 3. Load the local config layer from the environment when supplied,
+        //    otherwise from the optional file that is not checked into git.
+        if let Some(local_yaml) = env_lookup("RISE_LOCAL_CONFIG_YAML") {
+            tracing::info!("Loading local config from RISE_LOCAL_CONFIG_YAML");
+            builder = builder.add_source(config::File::from_str(
+                &local_yaml,
+                config::FileFormat::Yaml,
+            ));
+        } else {
+            Self::try_add_config_file(&mut builder, config_dir, "local", false)?;
+        }
 
         // Build config and substitute environment variables
         let config = builder.build()?;
@@ -3314,9 +3324,9 @@ auth:
         load_shipped_ecs_config_with_overlay(env, None)
     }
 
-    /// As above, with an optional `local.yaml` layered over the shipped file —
-    /// the way an operator overrides a section they cannot express through the
-    /// file's env vars (a different registry type, say).
+    /// As above, with an optional environment-backed local layer over the
+    /// shipped file — the way ECS supplies settings that do not belong in its
+    /// task definition (a registry credential, say).
     fn load_shipped_ecs_config_with_overlay(
         env: &std::collections::HashMap<&'static str, &'static str>,
         overlay: Option<&str>,
@@ -3331,14 +3341,14 @@ auth:
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
         fs::write(temp_dir.path().join("ecs.yaml"), ecs_yaml).unwrap();
-        if let Some(overlay) = overlay {
-            fs::write(temp_dir.path().join("local.yaml"), overlay).unwrap();
-        }
 
-        let owned: std::collections::HashMap<String, String> = env
+        let mut owned: std::collections::HashMap<String, String> = env
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        if let Some(overlay) = overlay {
+            owned.insert("RISE_LOCAL_CONFIG_YAML".to_string(), overlay.to_string());
+        }
         let env_lookup = move |name: &str| owned.get(name).cloned();
 
         Settings::new_with_env(temp_dir.path().to_str().unwrap(), "ecs", &env_lookup)
@@ -3386,6 +3396,26 @@ auth:
             settings.deployment_logs,
             DeploymentLogsSettings::None { .. }
         ));
+    }
+
+    #[test]
+    fn ecs_local_config_yaml_supplies_the_local_layer() {
+        let mut env = ecs_base_env();
+        env.insert("OVERLAY_PUBLIC_URL", "https://control.example.com");
+
+        let settings = load_shipped_ecs_config_with_overlay(
+            &env,
+            Some(
+                r#"
+server:
+  public_url: "${OVERLAY_PUBLIC_URL}"
+"#,
+            ),
+        )
+        .expect("environment-backed local YAML must load");
+
+        assert_eq!(settings.server.public_url, "https://control.example.com");
+        assert_eq!(settings.server.port, 3000);
     }
 
     #[test]
