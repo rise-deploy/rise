@@ -24,7 +24,6 @@ const MARKER_COLOR = {
     up: 'var(--ok)',
     done: 'var(--ok)',
     restart: 'var(--warn)',
-    warning: 'var(--warn)',
     failed: 'var(--err)',
 };
 
@@ -310,7 +309,7 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
     );
 }
 
-const MARKER_KIND_PRIORITY = ['failed', 'restart', 'warning', 'up', 'rollout', 'done'];
+const MARKER_KIND_PRIORITY = ['failed', 'restart', 'up', 'rollout', 'done'];
 
 /**
  * Merge markers that would land on the same few pixels.

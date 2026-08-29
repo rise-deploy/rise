@@ -861,14 +861,6 @@ function buildDeploymentTimeline(deployment: any) {
 }
 
 // TypeScript interfaces matching Rust backend structs
-interface PodEvent {
-    type: string;
-    reason: string;
-    message: string;
-    count: number;
-    last_timestamp: string;
-}
-
 interface ContainerState {
     state_type: 'waiting' | 'running' | 'terminated';
     reason?: string;
@@ -900,7 +892,6 @@ interface PodInfo {
     terminated?: boolean;
     conditions?: PodCondition[];
     containers?: ContainerStatusInfo[];
-    events?: PodEvent[];
 }
 
 interface PodStatus {
@@ -1160,33 +1151,6 @@ function PodInfoRow({ pod }: { pod: PodInfo }) {
                             ))}
                         </div>
                     )}
-
-                    {/* Recent events */}
-                    {pod.events && pod.events.length > 0 && (
-                        <div>
-                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                                Recent Events
-                            </div>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                                {pod.events.map((event, idx) => (
-                                    <div
-                                        key={idx}
-                                        className={`r-alert ${event.type === 'Error' ? 'err' : 'warn'}`}
-                                        style={{ fontSize: 12, display: 'block' }}
-                                    >
-                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-                                            <span style={{ fontWeight: 600 }}>{event.reason}</span>
-                                            <span style={{ color: 'var(--text-muted)' }}>
-                                                {event.count > 1 && `${event.count}× `}
-                                                {formatRelativeTimeRounded(event.last_timestamp)}
-                                            </span>
-                                        </div>
-                                        <div className="mono">{event.message}</div>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    )}
                 </div>
             )}
         </div>
@@ -1216,12 +1180,9 @@ function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
     const inactivePods = podStatus.pods?.filter(p => p.terminating || p.terminated) || [];
 
     const replicasMismatch = podStatus.ready_replicas < podStatus.desired_replicas;
-    const hasPodIssues =
-        activePods.some(
-            (p) =>
-                (p.containers && p.containers.some(c => c.restart_count > 0)) ||
-                (p.events && p.events.length > 0)
-        );
+    const hasPodIssues = activePods.some(
+        (p) => p.containers?.some((c) => c.restart_count > 0) ?? false,
+    );
 
     const hasIssues = replicasMismatch || hasPodIssues;
 

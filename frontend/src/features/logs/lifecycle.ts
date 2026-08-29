@@ -11,7 +11,6 @@
 export type LifecycleMarkerKind =
     | 'failed'
     | 'restart'
-    | 'warning'
     | 'up'
     | 'rollout'
     | 'done';
@@ -26,10 +25,9 @@ export interface LifecycleMarker {
 const KIND_PRIORITY: Record<LifecycleMarkerKind, number> = {
     failed: 0,
     restart: 1,
-    warning: 2,
-    up: 3,
-    rollout: 4,
-    done: 5,
+    up: 2,
+    rollout: 3,
+    done: 4,
 };
 
 interface ContainerState {
@@ -46,16 +44,9 @@ interface ContainerStatus {
     last_state?: ContainerState;
 }
 
-interface PodEvent {
-    type?: string;
-    reason?: string;
-    last_timestamp?: string;
-}
-
 interface Pod {
     name?: string;
     containers?: ContainerStatus[];
-    events?: PodEvent[];
 }
 
 /** Shape of the fields this reads off a deployment; everything else is ignored. */
@@ -85,6 +76,14 @@ function terminationReason(state: ContainerState): string {
  * Collect the markers worth drawing. Coincident markers with the same label are
  * collapsed, since several deployment fields share a single timestamp and three
  * rules stacked on one pixel read as one thicker rule, not as more information.
+ *
+ * What is available differs by backend, because this reads a *snapshot* of
+ * observed state rather than a history. Rollout and completion come from the
+ * deployment row, so every backend has them; container starts come from the
+ * pod-status block every backend builds. Restarts need `last_state`, which only
+ * the Kubernetes path emits, and it holds one prior termination — so a
+ * crash-looping container contributes a single marker regardless of how many
+ * times it has restarted.
  */
 export function buildLifecycleMarkers(
     deployment: LifecycleSource | null | undefined,
@@ -136,13 +135,6 @@ export function buildLifecycleMarkers(
                     kind: 'restart',
                 });
             }
-        }
-
-        for (const event of pod.events ?? []) {
-            if (event.type !== 'Warning') continue;
-            const ts = toMs(event.last_timestamp);
-            if (ts === null) continue;
-            markers.push({ ts, label: event.reason || 'Warning', kind: 'warning' });
         }
     }
 
