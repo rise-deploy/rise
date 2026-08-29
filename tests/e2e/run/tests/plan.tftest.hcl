@@ -53,6 +53,16 @@ variables {
 run "per_run_stack_plans" {
   command = plan
 
+  assert {
+    condition = alltrue([
+      length(aws_service_discovery_service.postgres.health_check_custom_config) == 0,
+      length(aws_service_discovery_service.rise.health_check_custom_config) == 0,
+      length(aws_service_discovery_service.traefik.health_check_custom_config) == 0,
+      length(aws_service_discovery_service.dex.health_check_custom_config) == 0,
+    ])
+    error_message = "empty custom health checks cause perpetual Cloud Map service replacement"
+  }
+
   # Plain HTTP: no load balancer to terminate at, no ACME. A Secure cookie is
   # never sent over HTTP, so this must follow the scheme.
   assert {

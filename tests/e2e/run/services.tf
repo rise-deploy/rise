@@ -11,7 +11,6 @@ resource "aws_service_discovery_service" "postgres" {
     }
   }
 
-  health_check_custom_config {}
   force_destroy = true
   tags          = local.tags
 }
@@ -29,7 +28,6 @@ resource "aws_service_discovery_service" "rise" {
     }
   }
 
-  health_check_custom_config {}
   force_destroy = true
   tags          = local.tags
 }
@@ -105,6 +103,10 @@ resource "aws_ecs_service" "postgres" {
 
   propagate_tags = "SERVICE"
   tags           = local.tags
+
+  lifecycle {
+    replace_triggered_by = [aws_service_discovery_service.postgres]
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -201,6 +203,10 @@ resource "aws_ecs_service" "rise" {
   propagate_tags = "SERVICE"
   tags           = local.tags
 
+  lifecycle {
+    replace_triggered_by = [aws_service_discovery_service.rise]
+  }
+
   depends_on = [aws_ecs_service.postgres]
 }
 
@@ -228,7 +234,6 @@ resource "aws_service_discovery_service" "traefik" {
     }
   }
 
-  health_check_custom_config {}
   force_destroy = true
   tags          = local.tags
 }
@@ -324,6 +329,10 @@ resource "aws_ecs_service" "traefik" {
   }
 
   tags = local.tags
+
+  lifecycle {
+    replace_triggered_by = [aws_service_discovery_service.traefik]
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -348,7 +357,6 @@ resource "aws_service_discovery_service" "dex" {
     }
   }
 
-  health_check_custom_config {}
   force_destroy = true
   tags          = local.tags
 }
@@ -428,4 +436,8 @@ resource "aws_ecs_service" "dex" {
   }
 
   tags = local.tags
+
+  lifecycle {
+    replace_triggered_by = [aws_service_discovery_service.dex]
+  }
 }

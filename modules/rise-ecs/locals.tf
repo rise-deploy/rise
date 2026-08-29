@@ -51,13 +51,17 @@ locals {
   namespace_name   = coalesce(var.cloud_map_namespace_name, "${local.name}.internal")
   namespace_id     = local.create_namespace ? aws_service_discovery_private_dns_namespace.this[0].id : var.cloud_map_namespace_id
 
+  control_plane_discovery_name = "${local.name}-control-plane"
+  traefik_discovery_name       = "${local.name}-traefik"
+  dex_discovery_name           = "${local.name}-dex"
+
   # The two internal URLs the install turns on. auth_backend_url must be
   # reachable from inside the cluster — Traefik calls it for every forwardAuth
   # subrequest — and must never be the public URL. traefik_api_url is where
   # readiness comes from: serverStatus, with no fallback, so a project with a
   # health_check never becomes Healthy without it.
-  auth_backend_url = "http://rise.${local.namespace_name}:3000"
-  traefik_api_url  = "http://traefik.${local.namespace_name}:8080"
+  auth_backend_url = "http://${local.control_plane_discovery_name}.${local.namespace_name}:3000"
+  traefik_api_url  = "http://${local.traefik_discovery_name}.${local.namespace_name}:8080"
 
   # --- Edge -----------------------------------------------------------------
   acme_enabled       = var.edge_mode == "nlb-traefik-acme"

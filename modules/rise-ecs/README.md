@@ -184,7 +184,10 @@ failing closed at deploy time rather than half-working:
 
 - **Multi-container deployments.** Cross-container discovery needs Cloud Map
   registration for workloads, which is unimplemented. The namespace here exists
-  for the control plane's own services.
+  for the control plane's own services. Their names are scoped to the module
+  name: `<name>-control-plane`, `<name>-traefik` and, when enabled,
+  `<name>-dex`. This keeps multiple installs distinct when they bring the same
+  Cloud Map namespace.
 - **Workload identity tokens.** There is no way to write files into a running
   Fargate task; a sidecar on a shared volume is the intended mechanism.
 - **Runtime logs.** `deployment_logs` is `none`. Installs running Loki can use

@@ -66,8 +66,25 @@ run "creates_a_whole_install" {
   # Never the public URL. Traefik calls it for every forwardAuth subrequest, and
   # the backend refuses to start when it is empty.
   assert {
-    condition     = local.rise_environment["RISE_AUTH_BACKEND_URL"] == "http://rise.rise.internal:3000"
+    condition     = local.rise_environment["RISE_AUTH_BACKEND_URL"] == "http://rise-control-plane.rise.internal:3000"
     error_message = "auth_backend_url must be the internal Cloud Map address"
+  }
+
+  assert {
+    condition = alltrue([
+      aws_service_discovery_service.rise.name == "rise-control-plane",
+      aws_service_discovery_service.traefik.name == "rise-traefik",
+      local.rise_environment["RISE_TRAEFIK_API_URL"] == "http://rise-traefik.rise.internal:8080",
+    ])
+    error_message = "Cloud Map names must be scoped to the Rise installation"
+  }
+
+  assert {
+    condition = alltrue([
+      length(aws_service_discovery_service.rise.health_check_custom_config) == 0,
+      length(aws_service_discovery_service.traefik.health_check_custom_config) == 0,
+    ])
+    error_message = "empty custom health checks cause perpetual Cloud Map service replacement"
   }
 
   assert {
