@@ -736,14 +736,36 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Healthy',
-            error_message = NULL,
-            first_healthy_at = COALESCE(first_healthy_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Healthy')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Healthy',
+                error_message = NULL,
+                first_healthy_at = COALESCE(first_healthy_at, NOW()),
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Healthy')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event. `is_valid_transition` admits
+            -- `from = to` so a routine health check can refresh `updated_at`,
+            -- and this writer runs on every reconcile tick while healthy —
+            -- without the filter that is one row per tick per deployment.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object('from', from_status, 'to', status)
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -759,6 +781,7 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id
     )
@@ -1438,6 +1461,110 @@ mod tests {
             "Expired" => DeploymentStatus::Expired,
             _ => panic!("Unknown status: {}", s),
         }
+    }
+
+    /// Insert the minimum rows a deployment needs, returning its id.
+    async fn seed_deployment_for_events(pool: &PgPool, status: &str) -> Uuid {
+        let user: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (email) VALUES ('events@test.local') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let project: Uuid = sqlx::query_scalar(
+            "INSERT INTO projects (name, status, access_class, owner_user_id)
+             VALUES ('events-test', 'Stopped', 'public', $1) RETURNING id",
+        )
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar(
+            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status)
+             VALUES ('20260830-000001', $1, $2, $3) RETURNING id",
+        )
+        .bind(project)
+        .bind(user)
+        .bind(status)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn status_events(pool: &PgPool, id: Uuid) -> Vec<(String, String)> {
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT attributes->>'from', attributes->>'to'
+             FROM deployment_events
+             WHERE deployment_id = $1 AND kind = 'status_changed'
+             ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A real transition records one event carrying both ends of it.
+    #[sqlx::test]
+    async fn marking_healthy_records_the_transition_it_performed(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Deploying").await;
+
+        let updated = mark_healthy(&pool, id).await.unwrap();
+        assert!(
+            updated.is_some(),
+            "the row callers depend on is still returned"
+        );
+        assert_eq!(updated.unwrap().status, DeploymentStatus::Healthy);
+
+        assert_eq!(
+            status_events(&pool, id).await,
+            vec![("Deploying".to_string(), "Healthy".to_string())],
+        );
+    }
+
+    /// `is_valid_transition` admits `from = to` so a routine health check can
+    /// refresh `updated_at`, and this writer runs on every reconcile tick while
+    /// healthy. Without the filter that is one row per tick per deployment, so
+    /// the self-transition must return the row and record nothing.
+    #[sqlx::test]
+    async fn marking_healthy_again_returns_the_row_but_records_nothing(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Deploying").await;
+
+        mark_healthy(&pool, id).await.unwrap();
+        for _ in 0..5 {
+            let repeat = mark_healthy(&pool, id).await.unwrap();
+            assert!(repeat.is_some(), "a self-transition still updates the row");
+        }
+
+        assert_eq!(
+            status_events(&pool, id).await.len(),
+            1,
+            "only the real transition is an event",
+        );
+    }
+
+    /// A deployment that flaps records both moves: they are two genuine
+    /// occurrences, which is why status events carry no dedupe key.
+    #[sqlx::test]
+    async fn flapping_records_every_real_move(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Deploying").await;
+
+        mark_healthy(&pool, id).await.unwrap();
+        mark_unhealthy(&pool, id, "probe failing".to_string())
+            .await
+            .unwrap();
+        mark_healthy(&pool, id).await.unwrap();
+
+        // `mark_unhealthy` is not converted yet, so only the two healthy edges
+        // are recorded; both are present and neither collapsed the other.
+        let events = status_events(&pool, id).await;
+        assert_eq!(
+            events,
+            vec![
+                ("Deploying".to_string(), "Healthy".to_string()),
+                ("Unhealthy".to_string(), "Healthy".to_string()),
+            ],
+        );
     }
 
     /// Test that PostgreSQL is_terminal() function matches Rust is_terminal() function

@@ -4,7 +4,13 @@ title: "ADR-0006: Deployment Event Log"
 
 ## Status
 
-**Draft** — no implementation. Date: 2026-08-30.
+**Draft** — partially implemented as a spike. Date: 2026-08-30.
+
+The table, the `kind`/`severity`/`source` vocabulary in `rise-backend-core`, the
+query layer, and status emission from `mark_healthy` exist and are tested. That
+slice was built to check the design rather than to ship it, and it already
+corrected one thing: D4 originally said only that duplicate status writes were
+tolerable, and missed that a *self*-transition must not emit at all.
 
 Draft rather than Proposed because [Open questions](#open-questions) 1 and 2
 still reach into the Decision: the identity tuple observation events dedupe on
@@ -248,9 +254,30 @@ step rather than a follow-up:
 - `update_status` performs a `SELECT`, a Rust-side `validate_transition`, and
   then the guarded `UPDATE`. The read is redundant with the guard and should go.
 
-**The contract is at-least-once, not exactly-once.** `is_valid_transition`
-returns true for `from == to` — deliberately, so `updated_at` can be refreshed —
-so a duplicate write is a *legal* transition, not a rejected one. Two concurrent
+**A self-transition must not emit at all.** `is_valid_transition` returns true
+for `from == to`, deliberately, so a routine health check can refresh
+`updated_at` — and `mark_healthy` runs on *every reconcile tick while healthy*.
+Emitting on every successful write would therefore produce one row per tick per
+deployment, which is the single largest volume risk in this design and has
+nothing to do with duplicates. The event insert is gated on the status actually
+moving:
+
+```sql
+WITH prev AS (SELECT status FROM deployments WHERE id = $1),
+     upd  AS (UPDATE deployments SET … FROM prev
+              WHERE deployments.id = $1
+                AND is_valid_transition(deployments.status, 'Healthy')
+              RETURNING deployments.*, prev.status AS from_status),
+     ev   AS (INSERT INTO deployment_events (…)
+              SELECT … FROM upd WHERE from_status IS DISTINCT FROM status)
+SELECT … FROM upd;
+```
+
+`prev` reads the pre-update value in the same statement snapshot, which is the
+only way to know `from` — `UPDATE … RETURNING` yields the new row.
+
+**Beyond that the contract is at-least-once, not exactly-once.** A duplicate
+write is a *legal* transition, not a rejected one. Two concurrent
 metacontroller syncs both observing an unhealthy deployment will both succeed,
 one on `Healthy → Unhealthy` and one on `Unhealthy → Unhealthy`, and produce two
 events. A caller retry after a lost response does the same. And a genuine
@@ -263,18 +290,9 @@ should collapse adjacent identical transitions on display.
 
 The insert is not free, either. Most writers are a single statement against a
 `&PgPool` with no open transaction to join, so keeping the event atomic with the
-status change means a data-modifying CTE — and the shape matters, because every
-caller consumes the returned row:
-
-```sql
-WITH upd AS (UPDATE deployments SET … WHERE … RETURNING …),
-     ev  AS (INSERT INTO deployment_events (…) SELECT … FROM upd)
-SELECT * FROM upd;
-```
-
-The `INSERT` cannot be the outer statement: it returns nothing, and
-`update_status` bails on `None` while `mark_healthy_and_supersede` derives its
-outcome from the row. An event exists only if the row actually changed.
+status change means a data-modifying CTE, shaped as above. The `INSERT` cannot
+be the outer statement: it returns nothing, and `update_status` bails on `None`
+while `mark_healthy_and_supersede` derives its outcome from the row.
 
 `mark_healthy_and_supersede` is the exception and needs no CTE at all — it
 already opens a transaction and commits two `UPDATE`s, so two plain inserts join
@@ -643,7 +661,9 @@ rather than a new mechanism.
 3. **Write cost.** D5 only attempts an insert when the diff is non-empty, so
    steady state should write nothing — but the diff itself runs every tick, and
    the claim should be measured in statements and index probes, not rows, before
-   step 3 ships.
+   step 3 ships. The status half is already settled: the spike showed the insert
+   has to be gated on the status actually moving (D4), without which
+   `mark_healthy` alone writes a row per tick per healthy deployment.
 
 4. **Per-install retention configuration.** D6 proposes fixed defaults. Whether
    this becomes a settings key, and whether it belongs beside `deployment_logs`

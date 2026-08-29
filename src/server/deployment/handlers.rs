@@ -2822,6 +2822,177 @@ pub struct LogVolumeParams {
 /// Stream logs from a deployment via Server-Sent Events
 ///
 /// GET /projects/{project_name}/deployments/{deployment_id}/logs
+/// Query parameters for the deployment event log.
+#[derive(serde::Deserialize)]
+pub struct EventListParams {
+    /// Page size. Clamped to `MAX_EVENT_PAGE`.
+    pub limit: Option<i64>,
+    /// Opaque continuation from a previous page's `next_cursor`.
+    pub cursor: Option<String>,
+    /// Restrict to these kinds. Repeated query param: `?kind=a&kind=b`.
+    #[serde(default, rename = "kind")]
+    pub kind: Vec<String>,
+    /// Lowest severity to return. Defaults to `info`, so `debug` detail is
+    /// opt-in rather than filling the default view.
+    pub min_severity: Option<String>,
+}
+
+const DEFAULT_EVENT_PAGE: i64 = 100;
+const MAX_EVENT_PAGE: i64 = 500;
+
+#[derive(serde::Serialize)]
+pub struct EventListResponse {
+    pub events: Vec<crate::db::deployment_events::DeploymentEvent>,
+    /// Absent when the page reached the end of the log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Read a deployment's event log (ADR-0006).
+///
+/// GET /projects/{project_name}/deployments/{deployment_id}/events
+///
+/// Pages are cut on `(recorded_at, id)` rather than on `occurred_at`: an event
+/// derived from a late observation carries an older `occurred_at` than one
+/// already returned, and a cursor over that would step past it permanently.
+/// Clients sort a page by `occurred_at` to display it.
+pub async fn list_deployment_events(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<EventListParams>,
+) -> Result<Json<EventListResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    // Mirrors the log endpoint: a caller who cannot see the project is told it
+    // does not exist, so existence itself does not leak.
+    let (user, is_sa) = auth
+        .resolve_for_project(
+            &state.db_pool,
+            &project,
+            state.controllers_by_issuer.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_EVENT_PAGE)
+        .clamp(1, MAX_EVENT_PAGE);
+    let min_severity_rank = match params.min_severity.as_deref() {
+        None => Some(severity_rank("info")),
+        Some("all") => None,
+        Some(value) => Some(
+            rise_backend_core::events::EventSeverity::parse(value)
+                .map(|s| severity_rank(s.as_str()))
+                .ok_or_else(|| {
+                    ServerError::bad_request(format!(
+                        "Unknown severity '{}'. Expected debug, info, warning, error, or all.",
+                        value
+                    ))
+                })?,
+        ),
+    };
+
+    let after = params
+        .cursor
+        .as_deref()
+        .map(decode_event_cursor)
+        .transpose()?;
+
+    // Fetch one extra row to learn whether another page exists without a
+    // second query.
+    let mut events = crate::db::deployment_events::list_for_deployment(
+        &state.db_pool,
+        deployment.id,
+        limit + 1,
+        after,
+        &params.kind,
+        min_severity_rank,
+    )
+    .await
+    .internal_err("Failed to list deployment events")?;
+
+    let next_cursor = if events.len() as i64 > limit {
+        events.truncate(limit as usize);
+        events
+            .last()
+            .map(|e| encode_event_cursor(e.recorded_at, e.id))
+    } else {
+        None
+    };
+
+    Ok(Json(EventListResponse {
+        events,
+        next_cursor,
+    }))
+}
+
+fn severity_rank(severity: &str) -> i32 {
+    match severity {
+        "debug" => 0,
+        "info" => 1,
+        "warning" => 2,
+        _ => 3,
+    }
+}
+
+/// The cursor is a position, not a capability: `deployment_id` is always taken
+/// from the path, so a forged cursor cannot page across deployments.
+fn encode_event_cursor(recorded_at: chrono::DateTime<chrono::Utc>, id: i64) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+        "{}:{}",
+        recorded_at.timestamp_micros(),
+        id
+    ))
+}
+
+fn decode_event_cursor(
+    cursor: &str,
+) -> Result<crate::db::deployment_events::EventCursor, ServerError> {
+    use base64::Engine;
+    let invalid = || ServerError::bad_request("The event cursor is invalid.");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| invalid())?;
+    let text = String::from_utf8(raw).map_err(|_| invalid())?;
+    let (micros, id) = text.split_once(':').ok_or_else(invalid)?;
+    let micros: i64 = micros.parse().map_err(|_| invalid())?;
+    let id: i64 = id.parse().map_err(|_| invalid())?;
+    Ok(crate::db::deployment_events::EventCursor {
+        recorded_at: chrono::DateTime::from_timestamp_micros(micros).ok_or_else(invalid)?,
+        id,
+    })
+}
+
 pub async fn stream_deployment_logs(
     State(state): State<AppState>,
     auth: AuthContext,
