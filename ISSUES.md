@@ -5,8 +5,14 @@ Working scratchpad from a six-lane review panel over the ECS backend
 machinery it uses, `modules/rise-aws` + `modules/rise-ecs`, the `tests/e2e`
 driver, and the CI workflow) on branch `claude/ecs-deployment-backend-5xdgqa`.
 
-**Status:** A–E, G, H, I, J, L, S fixed (see the ✅ notes). CloudWatch log
-backend split out as a Follow-up. Remaining open: F, K, M, O, P, Q, R.
+**Status:** A–E, G, H, I, J, L, O, Q, R, S fixed (see the ✅ notes). CloudWatch
+log backend split out as a Follow-up (still unimplemented — no `CloudWatch`
+variant in `src/server/deployment/logs.rs` as of 2026-08-27). Remaining open:
+F, K, M, P. Re-verified against current `develop` (post #460, #468): task #33
+(lifecycle duplication) and #35 (project rename) from "Excluded as known" are
+now fixed; the Docker/K8s plaintext-env-hash item is half-fixed (K8s only —
+see that entry). #468 closed the reconcile/status state-machine trio (O, Q,
+R) as one PR.
 
 This is a triage list, not a deliverable. Every item below
 was verified against the code, not inferred from names. Severity is this
@@ -281,7 +287,18 @@ logs its own secrets makes them cross-project visible to a logs-read principal.
 
 ## Pre-existing / cross-backend (not introduced here)
 
-### O. Supersession is non-atomic → two active deployments serving mixed versions — High (shared) — Scope: shared
+### ✅ O. Supersession is non-atomic → two active deployments serving mixed versions — High (shared) — Scope: shared
+> **FIXED.** `mark_deployment_healthy_and_supersede` (new `DeploymentStore`
+> method, `src/db/deployments.rs`) marks the new deployment `Healthy` and the
+> group's previous active deployment `Terminating(Superseded)` in one Postgres
+> transaction, modeled on the existing `mark_as_active` precedent — a
+> crash/restart/write-error between the two writes can no longer happen, since
+> there's only one write. `handle_deployment_became_healthy`
+> (`rise_backend_core::lifecycle`, shared by K8s/Docker/ECS) now calls this
+> instead of the old two-step `mark_deployment_healthy` +
+> `mark_deployment_terminating` sequence; the reconvergence loop for stragglers
+> (added in #460) is unchanged and stays as a secondary self-healing pass. The
+> `#460` note below is superseded by this fix.
 `handle_deployment_became_healthy` (`reconciler.rs:2200-2274`):
 `mark_deployment_healthy(new)` commits, then `mark_deployment_terminating(old)`.
 A crash/restart/write-error between them (caught as a warn at ~:730) leaves the
@@ -311,7 +328,15 @@ multi-controller workstream.
 on the `Migrated` branch (safe to delete only when the deployment row is
 terminal/absent).
 
-### Q. Transient `ListTasks`/`DescribeTasks` error masquerades as "no tasks" → one-tick Unhealthy flap — Low-Med (shared) — Scope: shared
+### ✅ Q. Transient `ListTasks`/`DescribeTasks` error masquerades as "no tasks" → one-tick Unhealthy flap — Low-Med (shared) — Scope: shared
+> **FIXED.** `describe_service_tasks` now returns `Result<Vec<TaskView>>`:
+> any `ListTasks`/`DescribeTasks` error along the way (tracked via `had_error`,
+> now logged at `warn!` instead of `debug!`) collapses the whole pass to `Err`
+> via the extracted `tasks_or_indeterminate` helper, rather than returning
+> whatever partial/empty data was collected. `reconcile_health` propagates the
+> error with `?` before touching `all_ready`/`pods`/status, so an
+> indeterminate tick leaves the deployment's status untouched instead of
+> flapping it to Unhealthy.
 `reconciler.rs:~2121`: both errors `debug!` and collapse to an empty list, so a
 routine `ThrottlingException` (these are per-deployment, per-tick calls against a
 throttled cluster-read budget) flips a healthy deployment to Unhealthy for a tick
@@ -319,7 +344,18 @@ throttled cluster-read budget) flips a healthy deployment to Unhealthy for a tic
 **Fix:** protect the current status on an API error (skip the transition), the
 way compute-desired errors protect services from GC.
 
-### R. `mark_*` store functions skip transition validation → status races — Low (shared) — Scope: shared
+### ✅ R. `mark_*` store functions skip transition validation → status races — Low (shared) — Scope: shared
+> **FIXED.** Every `mark_*` function in `src/db/deployments.rs`
+> (`mark_healthy`, `mark_unhealthy`, `mark_terminating`, `mark_failed`,
+> `mark_cancelled`, `mark_stopped`, `mark_superseded`, `mark_expired`,
+> `mark_cancelling`) now guards its `UPDATE` with a new
+> `is_valid_transition(status, '<target>')` SQL function (mirroring
+> `state_machine::is_valid_transition`, kept in sync by an exhaustive
+> build-time parity test) and returns `Option<Deployment>` — `None` when the
+> guard rejects a stale write. `update_status` gained the same DB-side guard
+> alongside its existing Rust-side check. Reconcile-tick callers treat `None`
+> as a benign no-op; the HTTP stop endpoints surface it as a 409 Conflict
+> instead of silently losing the user's request.
 `src/db/deployments.rs:709-825`: `mark_healthy`/`mark_unhealthy`/`mark_terminating`
 are unconditional `UPDATE ... SET status` with no `WHERE status IN (...)` and no
 `validate_transition`. The health pass can overwrite a user's concurrent stop
@@ -357,12 +393,26 @@ own project authz, so operators never delegate CloudWatch access.
 ## Excluded as known / accepted (briefed out of the review)
 
 - Retirement routing window — needs a workload-side drain (task #31).
-- ~400 lines of lifecycle logic duplicated from the Docker reconciler (task #33).
-- Project rename duplicates workloads until the old deployment goes terminal
-  (task #35).
+- ✅ ~~~400 lines of lifecycle logic duplicated from the Docker reconciler
+  (task #33)~~ — **FIXED** in #460: `perform_status_transition`,
+  `complete_termination`, and `handle_deployment_became_healthy` now live once
+  in `rise_backend_core::lifecycle`, shared by K8s/Docker/ECS.
+- ✅ ~~Project rename duplicates workloads until the old deployment goes
+  terminal (task #35)~~ — **FIXED** in #460 for Docker/ECS: workloads now carry
+  the project's immutable UUID and reconcilers match on it first. Kubernetes is
+  a documented different trade-off, not silently broken (see #460's summary):
+  a rename still orphans the name-keyed `RiseProject` CRD, but the existing
+  "project not found" path deletes it and lets owner-reference GC tear down
+  cleanly — full teardown+recreate rather than a harmless leftover duplicate.
 - `ecs_task_role_arn` defaults to the controller role — deployed workloads
   inherit the controller's account-wide `ssm:*`/`ecs:*`/`iam:PassRole` (filed
   separately; the single highest-impact cross-tenant exposure, but out of scope
-  here by prior decision).
+  here by prior decision). Still unimplemented as of 2026-08-27
+  (`modules/rise-ecs/variables.tf:38` still documents no per-project task roles).
 - Docker/Kubernetes hash secret plaintext into their env-hash label/annotation
-  (deferred by the user; the `rise-backend-core` helper is in place to fix K8s).
+  (deferred by the user). **Partially fixed in #460**: Kubernetes' pod
+  annotation hash now goes through `rise_backend_core::env::hash_env` over
+  secret *fingerprints* (`src/server/deployment/webhook.rs`), same approach ECS
+  already used (`redact_secrets_for_hash` at `reconciler.rs:1034`). **Docker is
+  still open** — `crates/rise-backend-docker/src/reconciler.rs:847` hashes the
+  full merged env including plaintext secret values, with no redaction step.

@@ -68,7 +68,7 @@ pub use runtime::{
     secret_fingerprint, should_have_infrastructure, ResolvedDeploymentEnvVars,
     DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
-pub use store::DeploymentStore;
+pub use store::{DeploymentStore, SupersessionOutcome};
 pub use system_env::rise_system_env_vars;
 pub use token_ttl::{refresh_due_after_secs, remint_after_secs};
 pub use url_builder::{DeploymentUrlBuilder, IngressUrl};

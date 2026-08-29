@@ -594,17 +594,20 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "container side-data could not be deserialized; marking deployment Failed: {:?}", e
             );
-            state
+            if state
                 .deployment_store
                 .mark_deployment_failed(
                     deployment.id,
                     "container side-data could not be deserialized",
                 )
-                .await?;
-            state
-                .deployment_store
-                .update_project_calculated_status(project.id)
-                .await?;
+                .await?
+                .is_some()
+            {
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
+            }
             return Ok(());
         }
     };
@@ -693,14 +696,17 @@ async fn check_deployment_health_from_observed(
                     deployment_id = %deployment.deployment_id,
                     "Deployment has irrecoverable pod error: {}", error_msg
                 );
-                state
+                if state
                     .deployment_store
                     .mark_deployment_failed(deployment.id, &error_msg)
-                    .await?;
-                state
-                    .deployment_store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                    .await?
+                    .is_some()
+                {
+                    state
+                        .deployment_store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             } else if is_ready {
                 info!(
                     deployment_id = %deployment.deployment_id,
@@ -729,14 +735,17 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Healthy deployment is now unhealthy: {}", msg
             );
-            state
+            if state
                 .deployment_store
                 .mark_deployment_unhealthy(deployment.id, msg)
-                .await?;
-            state
-                .deployment_store
-                .update_project_calculated_status(project.id)
-                .await?;
+                .await?
+                .is_some()
+            {
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
+            }
         }
 
         DeploymentStatus::Unhealthy if !pod_check.has_error && is_ready => {
@@ -744,14 +753,17 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Unhealthy deployment has recovered, marking as Healthy"
             );
-            state
+            if state
                 .deployment_store
                 .mark_deployment_healthy(deployment.id)
-                .await?;
-            state
-                .deployment_store
-                .update_project_calculated_status(project.id)
-                .await?;
+                .await?
+                .is_some()
+            {
+                state
+                    .deployment_store
+                    .update_project_calculated_status(project.id)
+                    .await?;
+            }
         }
 
         _ => {}
@@ -2256,34 +2268,38 @@ async fn process_finalize(
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         for deployment in deployments {
+            info!(
+                deployment_id = %deployment.deployment_id,
+                "Finalize: marking deployment as Stopped"
+            );
+            // Try the most appropriate terminal transition. Each `mark_*`
+            // call is guarded (see `is_valid_transition`) — a `None` means
+            // some other request already moved this deployment on, which is
+            // fine here: finalize is a bulk best-effort sweep, not a single
+            // targeted user request, so a benign race is simply skipped.
+            if state_machine::is_valid_transition(&deployment.status, &DeploymentStatus::Cancelling)
             {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Finalize: marking deployment as Stopped"
-                );
-                // Try the most appropriate terminal transition
-                if state_machine::is_valid_transition(
-                    &deployment.status,
-                    &DeploymentStatus::Cancelling,
-                ) {
-                    state
-                        .deployment_store
-                        .mark_deployment_cancelling(deployment.id)
-                        .await?;
+                if state
+                    .deployment_store
+                    .mark_deployment_cancelling(deployment.id)
+                    .await?
+                    .is_some()
+                {
                     state
                         .deployment_store
                         .mark_deployment_cancelled(deployment.id)
                         .await?;
-                } else {
-                    state
-                        .deployment_store
-                        .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped)
-                        .await?;
-                    state
-                        .deployment_store
-                        .mark_deployment_stopped(deployment.id)
-                        .await?;
                 }
+            } else if state
+                .deployment_store
+                .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped)
+                .await?
+                .is_some()
+            {
+                state
+                    .deployment_store
+                    .mark_deployment_stopped(deployment.id)
+                    .await?;
             }
         }
         state

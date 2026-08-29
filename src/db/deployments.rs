@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::db::models::{Deployment, DeploymentStatus, TerminationReason};
 use crate::server::deployment::state_machine;
+use rise_backend_core::SupersessionOutcome;
 
 /// Parameters for creating a new deployment
 pub struct CreateDeploymentParams<'a> {
@@ -419,7 +420,7 @@ pub async fn update_status(
                     AND completed_at IS NULL THEN NOW()
                 ELSE completed_at
             END
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, $2)
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -458,14 +459,22 @@ pub async fn update_status(
     }
 }
 
-/// Mark deployment as failed
-pub async fn mark_failed(pool: &PgPool, id: Uuid, error_message: &str) -> Result<Deployment> {
+/// Mark deployment as failed.
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) rather than
+/// clobbering a status a routine caller must not overwrite — e.g. a
+/// deployment a concurrent request already moved to `Terminating`.
+pub async fn mark_failed(
+    pool: &PgPool,
+    id: Uuid,
+    error_message: &str,
+) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
         UPDATE deployments
         SET status = 'Failed', completed_at = COALESCE(completed_at, NOW()), error_message = $2
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Failed')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -486,7 +495,7 @@ pub async fn mark_failed(pool: &PgPool, id: Uuid, error_message: &str) -> Result
         id,
         error_message
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as failed")?;
 
@@ -544,9 +553,12 @@ pub async fn find_by_project_and_deployment_id(
     find_by_deployment_id(pool, deployment_id, project_id).await
 }
 
-/// Mark deployment as cancelled
+/// Mark deployment as cancelled.
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) if the
+/// deployment is no longer in `Cancelling`.
 #[cfg(feature = "backend")]
-pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
+pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -557,7 +569,7 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             controller_metadata = '{}',
             completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Cancelled')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -577,16 +589,19 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Deployment> {
         "#,
         id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as cancelled")?;
 
     Ok(deployment)
 }
 
-/// Mark deployment as stopped (user-initiated termination)
+/// Mark deployment as stopped (user-initiated termination).
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) if the
+/// deployment is no longer in `Terminating`.
 #[cfg(feature = "backend")]
-pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
+pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -597,7 +612,7 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             controller_metadata = '{}',
             completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Stopped')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -617,16 +632,19 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Deployment> {
         "#,
         id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as stopped")?;
 
     Ok(deployment)
 }
 
-/// Mark deployment as superseded (replaced by newer deployment)
+/// Mark deployment as superseded (replaced by newer deployment).
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) if the
+/// deployment is no longer in `Terminating`.
 #[cfg(feature = "backend")]
-pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
+pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -637,7 +655,7 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             controller_metadata = '{}',
             completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Superseded')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -657,16 +675,19 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Deployment> {
         "#,
         id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as superseded")?;
 
     Ok(deployment)
 }
 
-/// Mark a deployment as expired (terminal state for deployments that timed out)
+/// Mark a deployment as expired (terminal state for deployments that timed out).
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) if the
+/// deployment is no longer in `Terminating`.
 #[cfg(feature = "backend")]
-pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
+pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -677,7 +698,7 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             controller_metadata = '{}',
             completed_at = COALESCE(completed_at, NOW()),
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Expired')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -697,16 +718,21 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Deployment> {
         "#,
         id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as expired")?;
 
     Ok(deployment)
 }
 
-/// Mark deployment as healthy
+/// Mark deployment as healthy.
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) rather than
+/// reviving a deployment a concurrent request already moved to a status a
+/// routine health-check pass must never overwrite (e.g. `Terminating` from
+/// a user's stop request).
 #[cfg(feature = "backend")]
-pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Deployment> {
+pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -716,7 +742,7 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             error_message = NULL,
             first_healthy_at = COALESCE(first_healthy_at, NOW()),
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Healthy')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -736,16 +762,19 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Deployment> {
         "#,
         id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as healthy")?;
 
     Ok(deployment)
 }
 
-/// Mark deployment as unhealthy with reason
+/// Mark deployment as unhealthy with reason.
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) rather than
+/// overwriting a status a routine health-check pass must never touch.
 #[cfg(feature = "backend")]
-pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<Deployment> {
+pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -754,7 +783,7 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<D
             status = 'Unhealthy',
             error_message = $2,
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Unhealthy')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -775,19 +804,23 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<D
         id,
         reason
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as unhealthy")?;
 
     Ok(deployment)
 }
 
-/// Mark deployment as terminating with reason
+/// Mark deployment as terminating with reason.
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) if the
+/// deployment is no longer in `Healthy`/`Unhealthy` (e.g. it already
+/// finished terminating, or moved there itself).
 pub async fn mark_terminating(
     pool: &PgPool,
     id: Uuid,
     reason: TerminationReason,
-) -> Result<Deployment> {
+) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -796,7 +829,7 @@ pub async fn mark_terminating(
             status = 'Terminating',
             termination_reason = $2,
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Terminating')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -817,15 +850,18 @@ pub async fn mark_terminating(
         id,
         reason as TerminationReason
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as terminating")?;
 
     Ok(deployment)
 }
 
-/// Mark deployment as cancelling
-pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
+/// Mark deployment as cancelling.
+///
+/// Guarded by `is_valid_transition`: returns `None` (no-op) if the
+/// deployment is no longer in a pre-infrastructure state.
+pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
@@ -834,7 +870,7 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
             status = 'Cancelling',
             termination_reason = 'Cancelled',
             updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND is_valid_transition(status, 'Cancelling')
         RETURNING
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
@@ -854,7 +890,7 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Deployment> {
         "#,
         id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
     .context("Failed to mark deployment as cancelling")?;
 
@@ -918,50 +954,6 @@ pub async fn set_identity_credential_hash(pool: &PgPool, id: Uuid, hash: &str) -
     .context("Failed to set identity credential hash")?;
 
     Ok(())
-}
-
-/// Find active deployment for a project in a specific group
-/// Active = most recent Healthy deployment in the group
-#[cfg(feature = "backend")]
-pub async fn find_active_for_project_and_group(
-    pool: &PgPool,
-    project_id: Uuid,
-    group: &str,
-) -> Result<Option<Deployment>> {
-    let deployment = sqlx::query_as!(
-        Deployment,
-        r#"
-        SELECT
-            id, deployment_id, project_id, created_by_id,
-            status as "status: DeploymentStatus",
-                        deployment_group, environment_id, expires_at,
-            termination_reason as "termination_reason: _",
-            completed_at, error_message, build_logs,
-            controller_metadata as "controller_metadata: serde_json::Value",
-            image, image_digest, rolled_back_from_deployment_id,
-            http_port, needs_reconcile, is_active,
-            deploying_started_at,
-            first_healthy_at, job_url, pull_request_url, git_repository_url,
-            replicas, cpu, memory,
-            created_at, updated_at, identity_credential_hash,
-            identity_audiences as "identity_audiences: serde_json::Value",
-            containers as "containers: serde_json::Value",
-            routes as "routes: serde_json::Value"
-        FROM deployments
-        WHERE project_id = $1
-          AND deployment_group = $2
-          AND status = 'Healthy'
-        ORDER BY created_at DESC
-        LIMIT 1
-        "#,
-        project_id,
-        group
-    )
-    .fetch_optional(pool)
-    .await
-    .context("Failed to find active deployment for project and group")?;
-
-    Ok(deployment)
 }
 
 /// Find non-terminal deployments for a project in a specific group
@@ -1273,6 +1265,120 @@ pub async fn mark_as_active(
     Ok(())
 }
 
+/// Atomically mark a deployment healthy and, if some other deployment is
+/// currently the group's active (most-recently-created `Healthy`)
+/// deployment, mark that one `Terminating(Superseded)` in the same
+/// transaction. See `rise_backend_core::store::SupersessionOutcome` for the
+/// `became_healthy: false` contract when the guard rejects the write.
+#[cfg(feature = "backend")]
+pub async fn mark_healthy_and_supersede(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    project_id: Uuid,
+    deployment_group: &str,
+) -> Result<SupersessionOutcome> {
+    let mut tx = pool.begin().await?;
+
+    let healthy = sqlx::query_as!(
+        Deployment,
+        r#"
+        UPDATE deployments
+        SET
+            status = 'Healthy',
+            error_message = NULL,
+            first_healthy_at = COALESCE(first_healthy_at, NOW()),
+            updated_at = NOW()
+        WHERE id = $1 AND is_valid_transition(status, 'Healthy')
+        RETURNING
+            id, deployment_id, project_id, created_by_id,
+            status as "status: DeploymentStatus",
+            deployment_group, environment_id, expires_at,
+            termination_reason as "termination_reason: _",
+            completed_at, error_message, build_logs,
+            controller_metadata as "controller_metadata: serde_json::Value",
+            image, image_digest, rolled_back_from_deployment_id,
+            http_port, needs_reconcile, is_active,
+            deploying_started_at,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
+            replicas, cpu, memory,
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
+        "#,
+        deployment_id
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .context("Failed to mark deployment as healthy")?;
+
+    if healthy.is_none() {
+        // Nothing to roll back — the guard rejected before any write ran.
+        // Explicit rollback documents intent to a future reader/refactor
+        // rather than relying on `tx`'s drop behavior.
+        tx.rollback().await?;
+        return Ok(SupersessionOutcome {
+            became_healthy: false,
+            superseded: None,
+        });
+    }
+
+    // Same selection as the old `find_active_for_project_and_group`: the
+    // single most-recently-created other `Healthy` deployment in the group.
+    // Scoped to `status = 'Healthy'` (not `is_active(status)`) to preserve
+    // today's exact selection semantics — an old-active deployment currently
+    // sitting in `Unhealthy` is caught by `handle_deployment_became_healthy`'s
+    // straggler self-healing loop instead, same as before this change.
+    let superseded = sqlx::query_as!(
+        Deployment,
+        r#"
+        UPDATE deployments
+        SET
+            status = 'Terminating',
+            termination_reason = 'Superseded',
+            updated_at = NOW()
+        WHERE id = (
+            SELECT id FROM deployments
+            WHERE project_id = $2
+              AND deployment_group = $3
+              AND id != $1
+              AND status = 'Healthy'
+            ORDER BY created_at DESC
+            LIMIT 1
+        )
+        RETURNING
+            id, deployment_id, project_id, created_by_id,
+            status as "status: DeploymentStatus",
+            deployment_group, environment_id, expires_at,
+            termination_reason as "termination_reason: _",
+            completed_at, error_message, build_logs,
+            controller_metadata as "controller_metadata: serde_json::Value",
+            image, image_digest, rolled_back_from_deployment_id,
+            http_port, needs_reconcile, is_active,
+            deploying_started_at,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
+            replicas, cpu, memory,
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
+        "#,
+        deployment_id,
+        project_id,
+        deployment_group
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .context("Failed to supersede previous active deployment")?;
+
+    tx.commit().await?;
+
+    Ok(SupersessionOutcome {
+        became_healthy: true,
+        superseded,
+    })
+}
+
 /// Get all active deployments for a project across all deployment groups
 pub async fn get_active_deployments_for_project(
     pool: &PgPool,
@@ -1505,6 +1611,52 @@ mod tests {
         }
     }
 
+    /// Test that PostgreSQL is_valid_transition() agrees with Rust
+    /// state_machine::is_valid_transition() for every status pair — the
+    /// guard every `mark_*` write below relies on, so a drift between the
+    /// two representations must fail the build, not surface as a silently
+    /// wrong no-op in production.
+    #[sqlx::test]
+    async fn db_is_valid_transition_matches_rust_is_valid_transition(pool: PgPool) {
+        let statuses = [
+            "Pending",
+            "Building",
+            "Pushing",
+            "Pushed",
+            "Deploying",
+            "Healthy",
+            "Unhealthy",
+            "Cancelling",
+            "Cancelled",
+            "Terminating",
+            "Stopped",
+            "Superseded",
+            "Failed",
+            "Expired",
+        ];
+
+        for from_str in statuses {
+            for to_str in statuses {
+                let result: bool = sqlx::query_scalar("SELECT is_valid_transition($1, $2)")
+                    .bind(from_str)
+                    .bind(to_str)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+
+                let expected = state_machine::is_valid_transition(
+                    &str_to_status(from_str),
+                    &str_to_status(to_str),
+                );
+
+                assert_eq!(
+                    result, expected,
+                    "is_valid_transition({from_str}, {to_str}) returned {result} but Rust expected {expected}"
+                );
+            }
+        }
+    }
+
     /// Test that deploying_started_at is set on first transition to Deploying and not overwritten
     #[sqlx::test]
     async fn deploying_started_at_set_once_on_deploying_transition(pool: PgPool) {
@@ -1659,17 +1811,284 @@ mod tests {
 
         assert!(deployment.first_healthy_at.is_none());
 
-        let deployment = mark_healthy(&pool, deployment.id).await.unwrap();
+        let deployment = mark_healthy(&pool, deployment.id).await.unwrap().unwrap();
         let first_healthy_at = deployment.first_healthy_at.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         let deployment = mark_unhealthy(&pool, deployment.id, "temporary failure".to_string())
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(deployment.first_healthy_at, Some(first_healthy_at));
 
-        let deployment = mark_healthy(&pool, deployment.id).await.unwrap();
+        let deployment = mark_healthy(&pool, deployment.id).await.unwrap().unwrap();
         assert_eq!(deployment.first_healthy_at, Some(first_healthy_at));
+    }
+
+    /// Guarded `mark_healthy`/`mark_unhealthy` must no-op (not clobber) a
+    /// deployment that already moved to a protected status — the concrete
+    /// race this guard closes: a user's stop request racing a reconciler's
+    /// routine health-check pass.
+    #[sqlx::test]
+    async fn mark_healthy_is_a_noop_on_a_protected_deployment(pool: PgPool) {
+        use uuid::Uuid;
+
+        let project_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO users (id, email) VALUES ($1, $2)",
+            user_id,
+            "test@example.com"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO projects (id, name, owner_user_id, access_class, status) VALUES ($1, $2, $3, $4, $5)",
+            project_id,
+            "test-project",
+            user_id,
+            "private",
+            "Running"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let deployment = create(
+            &pool,
+            CreateDeploymentParams {
+                deployment_id: "20260101-000000",
+                project_id,
+                created_by_id: user_id,
+                status: DeploymentStatus::Healthy,
+                image: None,
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: "default",
+                environment_id: None,
+                expires_at: None,
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 1,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A concurrent stop request moves it to Terminating.
+        mark_terminating(&pool, deployment.id, TerminationReason::UserStopped)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A stale reconciler tick still believes it's about to become
+        // healthy — this must be a no-op, not a resurrection.
+        let result = mark_healthy(&pool, deployment.id).await.unwrap();
+        assert!(result.is_none());
+
+        let current = find_by_id(&pool, deployment.id).await.unwrap().unwrap();
+        assert_eq!(current.status, DeploymentStatus::Terminating);
+
+        // Same for mark_unhealthy.
+        let result = mark_unhealthy(&pool, deployment.id, "flapping".to_string())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let current = find_by_id(&pool, deployment.id).await.unwrap().unwrap();
+        assert_eq!(current.status, DeploymentStatus::Terminating);
+    }
+
+    async fn seed_project_and_user(pool: &PgPool) -> (Uuid, Uuid) {
+        let project_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO users (id, email) VALUES ($1, $2)",
+            user_id,
+            format!("{user_id}@example.com")
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO projects (id, name, owner_user_id, access_class, status) VALUES ($1, $2, $3, $4, $5)",
+            project_id,
+            format!("test-project-{project_id}"),
+            user_id,
+            "private",
+            "Running"
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        (project_id, user_id)
+    }
+
+    async fn seed_deployment(
+        pool: &PgPool,
+        project_id: Uuid,
+        user_id: Uuid,
+        deployment_id: &str,
+        group: &str,
+        status: DeploymentStatus,
+    ) -> Deployment {
+        create(
+            pool,
+            CreateDeploymentParams {
+                deployment_id,
+                project_id,
+                created_by_id: user_id,
+                status,
+                image: None,
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: group,
+                environment_id: None,
+                expires_at: None,
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 1,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The core atomicity proof: both rows move together, in one call.
+    #[sqlx::test]
+    async fn mark_healthy_and_supersede_marks_both_rows_together(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let old = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20260101-000000",
+            "default",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        let new = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20260101-000001",
+            "default",
+            DeploymentStatus::Deploying,
+        )
+        .await;
+
+        let outcome = mark_healthy_and_supersede(&pool, new.id, project_id, "default")
+            .await
+            .unwrap();
+
+        assert!(outcome.became_healthy);
+        let superseded = outcome.superseded.expect("old deployment was superseded");
+        assert_eq!(superseded.id, old.id);
+
+        let new_row = find_by_id(&pool, new.id).await.unwrap().unwrap();
+        assert_eq!(new_row.status, DeploymentStatus::Healthy);
+        let old_row = find_by_id(&pool, old.id).await.unwrap().unwrap();
+        assert_eq!(old_row.status, DeploymentStatus::Terminating);
+        assert_eq!(
+            old_row.termination_reason,
+            Some(TerminationReason::Superseded)
+        );
+    }
+
+    /// When the primary write is rejected (deployment already moved to a
+    /// protected status), the sibling supersession write must provably
+    /// never have run — the realistic `#[sqlx::test]` proxy for "the two
+    /// writes are atomic", since a literal mid-transaction crash isn't
+    /// reproducible here.
+    #[sqlx::test]
+    async fn mark_healthy_and_supersede_does_not_touch_the_sibling_when_rejected(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let sibling = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20260101-000000",
+            "default",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        let new = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20260101-000001",
+            "default",
+            DeploymentStatus::Deploying,
+        )
+        .await;
+        // A concurrent stop request moves the incoming deployment to
+        // Cancelling (the valid stop-path from Deploying — pre-infrastructure
+        // states go through Cancelling, not Terminating) before the stale
+        // reconciler tick calls this.
+        mark_cancelling(&pool, new.id).await.unwrap().unwrap();
+
+        let outcome = mark_healthy_and_supersede(&pool, new.id, project_id, "default")
+            .await
+            .unwrap();
+
+        assert!(!outcome.became_healthy);
+        assert!(outcome.superseded.is_none());
+
+        let sibling_row = find_by_id(&pool, sibling.id).await.unwrap().unwrap();
+        assert_eq!(
+            sibling_row.status,
+            DeploymentStatus::Healthy,
+            "the sibling must be untouched when the primary write is rejected"
+        );
+    }
+
+    /// A `Healthy` deployment in a different group must never be superseded.
+    #[sqlx::test]
+    async fn mark_healthy_and_supersede_leaves_other_groups_untouched(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let other_group = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20260101-000000",
+            "canary",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        let new = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20260101-000001",
+            "default",
+            DeploymentStatus::Deploying,
+        )
+        .await;
+
+        let outcome = mark_healthy_and_supersede(&pool, new.id, project_id, "default")
+            .await
+            .unwrap();
+
+        assert!(outcome.became_healthy);
+        assert!(outcome.superseded.is_none());
+        let other_row = find_by_id(&pool, other_group.id).await.unwrap().unwrap();
+        assert_eq!(other_row.status, DeploymentStatus::Healthy);
     }
 }

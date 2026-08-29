@@ -738,12 +738,16 @@ impl EcsReconciler {
                             deployment = %deployment.deployment_id,
                             "Rejecting deployment: {}", message
                         );
-                        self.store
+                        if self
+                            .store
                             .mark_deployment_failed(deployment.id, &message)
-                            .await?;
-                        self.store
-                            .update_project_calculated_status(project.id)
-                            .await?;
+                            .await?
+                            .is_some()
+                        {
+                            self.store
+                                .update_project_calculated_status(project.id)
+                                .await?;
+                        }
                     } else {
                         // Already serving, or on its way down. See
                         // `rejection_fails_deployment`.
@@ -1977,7 +1981,7 @@ impl EcsReconciler {
             // is still serving.
             let (mut current, outgoing): (Vec<TaskView>, Vec<TaskView>) = self
                 .describe_service_tasks(&actual.name)
-                .await
+                .await?
                 .into_iter()
                 .partition(|t| t.task_definition_arn == target_arn);
             // ListTasks returns no defined order, so indexing it straight would
@@ -2122,20 +2126,36 @@ impl EcsReconciler {
                      still serving, so the deployment stays Healthy"
                 );
             }
+            DeploymentStatus::Healthy
+                if !all_ready
+                    && self
+                        .store
+                        .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
+                        .await?
+                        .is_some() =>
+            {
+                self.store
+                    .update_project_calculated_status(project.id)
+                    .await?;
+            }
             DeploymentStatus::Healthy if !all_ready => {
-                self.store
-                    .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
-                    .await?;
+                // The guarded write above was a no-op: some other request
+                // already moved this deployment on. Benign race, nothing
+                // left to do this tick.
+            }
+            DeploymentStatus::Unhealthy
+                if all_ready
+                    && self
+                        .store
+                        .mark_deployment_healthy(deployment.id)
+                        .await?
+                        .is_some() =>
+            {
                 self.store
                     .update_project_calculated_status(project.id)
                     .await?;
             }
-            DeploymentStatus::Unhealthy if all_ready => {
-                self.store.mark_deployment_healthy(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
+            DeploymentStatus::Unhealthy if all_ready => {}
             _ => {}
         }
         Ok(())
@@ -2156,10 +2176,18 @@ impl EcsReconciler {
     /// incoming revision is up. Listing only RUNNING-desired tasks would drop
     /// them, so the caller would conclude "nothing is serving" during the very
     /// window the drain protects, and flap a healthy in-place roll to Unhealthy.
-    async fn describe_service_tasks(&self, service_name: &str) -> Vec<TaskView> {
+    ///
+    /// A transient `ListTasks`/`DescribeTasks` failure makes the whole pass
+    /// indeterminate (`Err`) rather than silently returning whatever partial
+    /// data was collected: a partial or empty task list is exactly as
+    /// capable of flapping a healthy deployment to Unhealthy for a tick as a
+    /// wrongly-empty one, so the caller must skip this tick's readiness
+    /// verdict entirely rather than act on it. See `tasks_or_indeterminate`.
+    async fn describe_service_tasks(&self, service_name: &str) -> Result<Vec<TaskView>> {
         use aws_sdk_ecs::types::DesiredStatus;
 
         let mut arns: Vec<String> = Vec::new();
+        let mut had_error = false;
         for desired_status in [DesiredStatus::Running, DesiredStatus::Stopped] {
             match self
                 .ecs
@@ -2172,12 +2200,10 @@ impl EcsReconciler {
             {
                 Ok(out) => arns.extend(out.task_arns().iter().cloned()),
                 Err(e) => {
-                    debug!(service = %service_name, ?desired_status, "ListTasks failed: {}", aws_error_detail(&e));
+                    had_error = true;
+                    warn!(service = %service_name, ?desired_status, "ListTasks failed: {}", aws_error_detail(&e));
                 }
             }
-        }
-        if arns.is_empty() {
-            return Vec::new();
         }
 
         let mut views = Vec::new();
@@ -2190,7 +2216,8 @@ impl EcsReconciler {
             let out = match req.send().await {
                 Ok(out) => out,
                 Err(e) => {
-                    debug!(service = %service_name, "DescribeTasks failed: {}", aws_error_detail(&e));
+                    had_error = true;
+                    warn!(service = %service_name, "DescribeTasks failed: {}", aws_error_detail(&e));
                     continue;
                 }
             };
@@ -2236,7 +2263,7 @@ impl EcsReconciler {
                 });
             }
         }
-        views
+        tasks_or_indeterminate(views, had_error)
     }
 
     fn traefik_render_config(&self) -> rise_backend_traefik::TraefikRenderConfig<'_> {
@@ -2279,6 +2306,22 @@ struct TaskView {
     /// (`http://{ip}:{port}`).
     ip: Option<String>,
     inspected: InspectedContainer,
+}
+
+/// Collapse a `describe_service_tasks` pass into a single readiness-relevant
+/// result: any `ListTasks`/`DescribeTasks` error along the way makes the
+/// whole pass indeterminate, not just the tasks it would have contributed.
+/// Deliberately does not try to salvage a partial `views` list — a partial
+/// task set is just as capable of causing a false-Unhealthy flap as an
+/// empty one, so "some data, but incomplete" and "no data" are treated the
+/// same: skip this tick's readiness verdict rather than act on it.
+fn tasks_or_indeterminate(views: Vec<TaskView>, had_error: bool) -> Result<Vec<TaskView>> {
+    if had_error {
+        anyhow::bail!(
+            "ECS API error(s) while describing tasks; treating readiness as indeterminate for this tick"
+        );
+    }
+    Ok(views)
 }
 
 /// When ECS started rolling out the service's current (PRIMARY) deployment.
@@ -2349,7 +2392,51 @@ pub(crate) fn clamp_replicas(requested: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{persisted_td_hash, with_persisted_td_hash};
+    use super::{
+        persisted_td_hash, tasks_or_indeterminate, with_persisted_td_hash, InspectedContainer,
+        TaskView,
+    };
+
+    fn task_view(name: &str) -> TaskView {
+        TaskView {
+            name: name.to_string(),
+            task_definition_arn: "arn:aws:ecs:task-def/foo:1".to_string(),
+            running: true,
+            ip: None,
+            inspected: InspectedContainer {
+                status: Some("running".to_string()),
+                running: true,
+                started_at: None,
+                finished_at: None,
+                exit_code: None,
+                restart_count: None,
+                health: None,
+                error: None,
+                ip: None,
+                published_host_port: None,
+            },
+        }
+    }
+
+    #[test]
+    fn tasks_or_indeterminate_passes_through_a_clean_pass() {
+        assert!(tasks_or_indeterminate(Vec::new(), false)
+            .unwrap()
+            .is_empty());
+        let views = vec![task_view("a"), task_view("b")];
+        let result = tasks_or_indeterminate(views, false).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn tasks_or_indeterminate_errors_even_with_partial_data() {
+        // A partial task list is exactly as capable of causing a false flap
+        // as an empty one, so any API error makes the whole pass
+        // indeterminate rather than trying to salvage what was collected.
+        let views = vec![task_view("a")];
+        assert!(tasks_or_indeterminate(views, true).is_err());
+        assert!(tasks_or_indeterminate(Vec::new(), true).is_err());
+    }
 
     #[test]
     fn converged_hash_round_trips_through_controller_metadata() {

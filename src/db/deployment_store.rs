@@ -81,15 +81,6 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::deployments::list_non_terminal_for_project(&self.pool, project_id).await
     }
 
-    async fn find_active_deployment_for_project_and_group(
-        &self,
-        project_id: Uuid,
-        group: &str,
-    ) -> Result<Option<Deployment>> {
-        crate::db::deployments::find_active_for_project_and_group(&self.pool, project_id, group)
-            .await
-    }
-
     async fn find_non_terminal_deployments_for_project_and_group(
         &self,
         project_id: Uuid,
@@ -117,35 +108,43 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::deployments::update_controller_metadata(&self.pool, id, metadata).await
     }
 
-    async fn mark_deployment_failed(&self, id: Uuid, error_message: &str) -> Result<Deployment> {
+    async fn mark_deployment_failed(
+        &self,
+        id: Uuid,
+        error_message: &str,
+    ) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_failed(&self.pool, id, error_message).await
     }
 
-    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Deployment> {
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_cancelling(&self.pool, id).await
     }
 
-    async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment> {
+    async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_cancelled(&self.pool, id).await
     }
 
-    async fn mark_deployment_stopped(&self, id: Uuid) -> Result<Deployment> {
+    async fn mark_deployment_stopped(&self, id: Uuid) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_stopped(&self.pool, id).await
     }
 
-    async fn mark_deployment_superseded(&self, id: Uuid) -> Result<Deployment> {
+    async fn mark_deployment_superseded(&self, id: Uuid) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_superseded(&self.pool, id).await
     }
 
-    async fn mark_deployment_expired(&self, id: Uuid) -> Result<Deployment> {
+    async fn mark_deployment_expired(&self, id: Uuid) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_expired(&self.pool, id).await
     }
 
-    async fn mark_deployment_healthy(&self, id: Uuid) -> Result<Deployment> {
+    async fn mark_deployment_healthy(&self, id: Uuid) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_healthy(&self.pool, id).await
     }
 
-    async fn mark_deployment_unhealthy(&self, id: Uuid, reason: String) -> Result<Deployment> {
+    async fn mark_deployment_unhealthy(
+        &self,
+        id: Uuid,
+        reason: String,
+    ) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_unhealthy(&self.pool, id, reason).await
     }
 
@@ -153,8 +152,23 @@ impl DeploymentStore for PgDeploymentStore {
         &self,
         id: Uuid,
         reason: TerminationReason,
-    ) -> Result<Deployment> {
+    ) -> Result<Option<Deployment>> {
         crate::db::deployments::mark_terminating(&self.pool, id, reason).await
+    }
+
+    async fn mark_deployment_healthy_and_supersede(
+        &self,
+        deployment_id: Uuid,
+        project_id: Uuid,
+        deployment_group: &str,
+    ) -> Result<rise_backend_core::SupersessionOutcome> {
+        crate::db::deployments::mark_healthy_and_supersede(
+            &self.pool,
+            deployment_id,
+            project_id,
+            deployment_group,
+        )
+        .await
     }
 
     async fn mark_deployment_as_active(
