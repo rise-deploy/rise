@@ -86,7 +86,7 @@ CREATE TABLE deployment_events (
     dedupe_key    TEXT,
 
     CONSTRAINT deployment_events_severity_known
-        CHECK (severity IN ('info', 'warning', 'error')),
+        CHECK (severity IN ('debug', 'info', 'warning', 'error')),
     CONSTRAINT deployment_events_message_bounded
         CHECK (message IS NULL OR length(message) <= 4096),
     CONSTRAINT deployment_events_attributes_bounded
@@ -161,8 +161,20 @@ drift risk is already managed by an exhaustive test. One kind makes emission
 total over the state machine by construction, and consumers switch on
 `attributes.to`, which is the enum they already know.
 
-`severity` is `info`/`warning`/`error` so consumers filter without a per-kind
-table. `source` names the emitting backend (`kubernetes`, `docker`, `ecs`,
+`severity` is `debug`/`info`/`warning`/`error` so consumers filter without a
+per-kind table, and `info` is the floor for the default view. `debug` exists so a
+backend can emit detail that is genuinely useful mid-incident and pure noise
+otherwise — a Docker `health_status` transition every thirty seconds, a
+readiness probe flapping within its threshold — without that detail either
+polluting the rail or being dropped at the source. It pairs with the `severity`
+filter in D7: the console asks for `info` and above; someone debugging asks for
+everything.
+
+Severity is a property of the *occurrence*, not of the kind. The same
+`replica_terminated` is `info` for a clean exit during a rollout and `error` for
+a non-zero exit code, so the emitting backend decides.
+
+`source` names the emitting backend (`kubernetes`, `docker`, `ecs`,
 `control-plane`), which makes a parity gap legible in the data.
 
 `backend_event` is the escape hatch for runtime-native facts: Kubernetes pod
@@ -170,6 +182,51 @@ events, ECS task stopped reasons, Docker daemon events. `attributes` carries the
 native reason verbatim, bounded by the `message` limit in D2 — these strings can
 name image references, ARNs and SSM parameter paths, and the row cap in D6
 bounds rows, not bytes.
+
+### D3a. Repetition is kept, except where the source already collapsed it
+
+A crash loop is the highest-rate producer of events and the case the log exists
+to explain, so what happens to a run of near-identical events is a real
+decision — and it is a trade of debugging accuracy against size.
+
+**Derived events are stored one row per occurrence, uncollapsed.** Three
+reasons, in order of weight:
+
+1. *The onset is the answer.* The question the rail is for — "the errors start
+   four seconds after replica 2 came up" — is answered by the first few events
+   of an incident at full resolution. Any bucketing wide enough to matter for
+   size is wide enough to destroy that relationship.
+2. *Size is already bounded elsewhere.* The per-`(deployment_id, kind)` cap and
+   the age sweep in D6 bound the table without touching resolution. Bucketing
+   would not add a guarantee; it would change *which* information is lost —
+   trading "the newest N occurrences, exactly" for "all occurrences, blurred".
+   For a bounded incident the first is enough, and it is exact.
+3. *Collapsing costs more than it looks.* Folding at write time means holding a
+   window open across ticks, which is state the reconciler does not have.
+   Folding by mutating an open row — the classic Kubernetes `Event` approach —
+   makes the table no longer append-only, and D7's incremental reader keys on
+   `(recorded_at, id)` precisely because rows do not change after they are
+   written. A reader that has already paged past a row would never see its count
+   grow.
+
+**`backend_event` is the exception, because its source already aggregated.** A
+Kubernetes `Event` carries `count`, `firstTimestamp` and `lastTimestamp` — the
+API server folds repeats before Rise ever sees them. Pass-through preserves that
+shape into `attributes` rather than exploding one upstream row into N of ours or
+discarding the count. This bounds the one genuinely unbounded-rate source, and
+it loses nothing, because the individual occurrences were never available.
+
+**Runs are collapsed for display, not in storage.** A rail showing four hundred
+identical restart markers is unreadable, but that is a rendering problem with a
+rendering fix: consecutive events sharing kind, identity and reason render as one
+marker annotated with a count and a span. The data stays exact for anyone who
+asks a question the default view does not answer.
+
+The honest counter-argument is that a long crash loop under a generous retention
+window writes a lot of rows to say one thing, and if measurement shows the cap
+is doing the real work in practice then write-time bucketing for
+`replica_restarted` specifically becomes worth revisiting — see
+[Open question 6](#open-questions).
 
 ### D4. Status events are written where the status is written
 
@@ -295,9 +352,9 @@ does **not** join the resource-GC loop: that ticks every 10 seconds and is built
 for tombstoned resource rows with batch sizes and per-row leader re-checks, none
 of which fits a bulk time-range delete.
 
-The sweep keys on `recorded_at`, not `occurred_at`. `occurred_at` is a clamped
-foreign clock and is what display sorts by; retention must be driven by when
-Rise wrote the row.
+The sweep keys on `recorded_at`, not `occurred_at`. `occurred_at` is a foreign
+clock, capped but not otherwise trusted, and is what display sorts by; retention
+must be driven by when Rise wrote the row.
 
 The cap is per `(deployment_id, kind)` rather than per deployment because a
 global oldest-first cap deletes the wrong end. A crash loop is the highest-rate
@@ -509,11 +566,13 @@ between two ticks stays invisible, and the read path pays for the diff every
 time. Note this is *not* an argument against write-time diffing, which D5 does
 against the one prior snapshot that already exists.
 
-**Adopt the Kubernetes `Event` shape.** Rejected on aggregation semantics rather
-than field names: its `count`/`lastTimestamp` mutate in place, losing the
-individual occurrences that are the whole point here. (`events.k8s.io/v1` does
-separate a series from individual events, so this is a rejection of the classic
-shape, not of everything Kubernetes offers.)
+**Adopt the Kubernetes `Event` shape.** Rejected on **mutation**, not on
+counting: `count`/`lastTimestamp` are updated in place on an existing row, which
+loses the individual occurrences and makes the table something an incremental
+reader can no longer page over safely (D7). Counting itself is fine where the
+source did it — D3a passes an upstream `count` straight through for
+`backend_event`. (`events.k8s.io/v1` separates a series from individual events,
+so this rejects the classic shape rather than everything Kubernetes offers.)
 
 ## Delivery outline
 
@@ -593,6 +652,17 @@ rather than a new mechanism.
 5. **Partitioning.** An append-only table on the primary database with three
    indexes will eventually want a partitioning or vacuum story. Not needed for
    v1 volumes; should not be discovered at the wrong moment.
+
+6. **Whether `replica_restarted` should bucket after all.** D3a keeps every
+   occurrence, on the argument that the cap bounds size and the onset is what
+   matters. That argument weakens if real crash loops routinely saturate the cap
+   before the age sweep runs. The per-kind cap keeps that from evicting other
+   kinds, so the variety of an incident survives — what is lost is the *early*
+   restarts, and with them when the loop began and how fast it was at the start.
+   The measurement in question 3 should report restart rate per deployment
+   alongside write cost, because it decides this. If it does
+   bucket, the fold must happen at write time into a closed row, never by
+   mutating a row a reader may already have passed.
 
 ## References
 
