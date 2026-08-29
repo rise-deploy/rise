@@ -1087,6 +1087,22 @@ struct LokiLogCursor {
     stream_offsets: BTreeMap<String, usize>,
 }
 
+/// The window a Loki continuation query covers: from the deployment's creation
+/// up to the cursor's boundary.
+///
+/// `None` when the boundary sits at or before that floor, which would ask Loki
+/// for an empty or inverted range — it rejects those outright, and without this
+/// the rejection reaches the client as a 500 rather than as the stale cursor it
+/// is. The Kubernetes and CloudWatch backends make the same check on their own
+/// cursor shapes.
+fn loki_continuation_window(
+    created_at: DateTime<Utc>,
+    boundary_nanos: i64,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let boundary = DateTime::<Utc>::from_timestamp_nanos(boundary_nanos);
+    (created_at < boundary).then_some((created_at, boundary))
+}
+
 struct LokiLogPage {
     lines: Vec<LogLine>,
     next_cursor: Option<String>,
@@ -1302,8 +1318,10 @@ impl LokiLogBackend {
         let mut page_query = query.clone();
         page_query.follow = false;
         let (boundary_nanos, stream_offsets) = if let Some(cursor) = &cursor {
-            page_query.start_time = Some(deployment.created_at);
-            page_query.end_time = Some(DateTime::<Utc>::from_timestamp_nanos(cursor.end_nanos));
+            let (start, end) = loki_continuation_window(deployment.created_at, cursor.end_nanos)
+                .context("invalid log cursor time range")?;
+            page_query.start_time = Some(start);
+            page_query.end_time = Some(end);
             (
                 Some(cursor.end_nanos as i128),
                 cursor.stream_offsets.clone(),
@@ -2456,6 +2474,24 @@ mod tests {
         let mut retry = HashMap::new();
         assert_eq!(first, distinct_log_id(&mut retry, base_id.clone()));
         assert_eq!(second, distinct_log_id(&mut retry, base_id));
+    }
+
+    #[test]
+    fn loki_continuation_window_spans_creation_to_the_cursor_boundary() {
+        let created = DateTime::<Utc>::from_timestamp_nanos(1_000);
+        let window = loki_continuation_window(created, 5_000).expect("boundary is after creation");
+        assert_eq!(window.0, created);
+        assert_eq!(window.1, DateTime::<Utc>::from_timestamp_nanos(5_000));
+    }
+
+    #[test]
+    fn loki_continuation_window_rejects_a_boundary_at_or_before_creation() {
+        let created = DateTime::<Utc>::from_timestamp_nanos(5_000);
+        // Loki refuses an end at or before the start, so neither may be asked
+        // for: a cursor minted against entries older than the deployment (or
+        // one already walked back to its floor) is stale, not a server fault.
+        assert!(loki_continuation_window(created, 5_000).is_none());
+        assert!(loki_continuation_window(created, 1_000).is_none());
     }
 
     #[test]
