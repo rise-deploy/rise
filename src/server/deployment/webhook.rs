@@ -2084,7 +2084,7 @@ async fn process_finalize(
                 }
             } else if state
                 .deployment_store
-                .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped)
+                .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped, None)
                 .await?
                 .is_some()
             {

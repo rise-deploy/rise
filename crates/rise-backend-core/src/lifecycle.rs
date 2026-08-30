@@ -140,7 +140,7 @@ pub async fn perform_status_transition(
                 "Deployment has expired, marking as Terminating"
             );
             if store
-                .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
+                .mark_deployment_terminating(deployment.id, TerminationReason::Expired, None)
                 .await?
                 .is_some()
             {
@@ -265,7 +265,11 @@ pub async fn handle_deployment_became_healthy(
                 other.deployment_id, deployment.deployment_group
             );
             store
-                .mark_deployment_terminating(other.id, TerminationReason::Superseded)
+                .mark_deployment_terminating(
+                    other.id,
+                    TerminationReason::Superseded,
+                    Some(deployment.deployment_id.as_str()),
+                )
                 .await?;
         }
     }
@@ -486,6 +490,7 @@ mod tests {
             &self,
             id: Uuid,
             reason: TerminationReason,
+            _superseded_by: Option<&str>,
         ) -> Result<Option<Deployment>> {
             self.calls
                 .lock()

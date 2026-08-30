@@ -2468,6 +2468,7 @@ pub async fn stop_deployments_by_group(
                 &state.db_pool,
                 deployment.id,
                 crate::db::models::TerminationReason::UserStopped,
+                None,
             )
             .await
             .map(|opt| opt.map(|_| "Terminating"))
@@ -2608,6 +2609,7 @@ pub async fn stop_deployment(
             &state.db_pool,
             deployment.id,
             crate::db::models::TerminationReason::UserStopped,
+            None,
         )
         .await
         .internal_err("Failed to stop deployment")?

@@ -68,6 +68,7 @@ export function EventTimeline({
                                 key={event.id}
                                 event={event}
                                 previous={i > 0 ? events[i - 1] : null}
+                                projectName={projectName}
                             />
                         ))}
                     </div>
@@ -80,9 +81,11 @@ export function EventTimeline({
 function EventRow({
     event,
     previous,
+    projectName,
 }: {
     event: DeploymentEvent;
     previous: DeploymentEvent | null;
+    projectName: string;
 }) {
     const ts = new Date(event.occurred_at);
     const reason = typeof event.attributes?.reason === 'string' ? event.attributes.reason : null;
@@ -94,8 +97,7 @@ function EventRow({
             <span className="r-evt-body">
                 <span className="r-evt-label">{describe(event)}</span>
                 {reason && <span className="r-evt-reason">{reason}</span>}
-                <EventFacts event={event} />
-                <EventImages event={event} />
+                <EventAttributes event={event} projectName={projectName} />
             </span>
             <span className="r-evt-delta mono">{sincePrevious(event, previous)}</span>
         </div>
@@ -103,87 +105,174 @@ function EventRow({
 }
 
 /**
- * Attributes worth surfacing beside the transition, in a fixed order so the
- * eye can find the same fact in the same place on every row. Anything not
- * listed stays in the payload rather than being rendered blindly — an event
- * carries whatever its emitter thought useful, which is not the same as
- * everything being worth a reader's attention.
+ * Keys the row already renders structurally: `from`/`to` become the label,
+ * `reason` its own line. Rendering them again as attributes would say
+ * everything twice.
  */
-const FACTS: { key: string; label: string; format?: (v: unknown) => string }[] = [
-    { key: 'created_by', label: 'by' },
-    { key: 'containers', label: 'containers', format: (v) => (Array.isArray(v) ? v.join(', ') : String(v)) },
-    { key: 'replicas', label: 'replicas' },
-    { key: 'image', label: 'image' },
-    { key: 'group', label: 'group' },
-    { key: 'build_method', label: 'build' },
-    { key: 'registry', label: 'registry' },
-    { key: 'image_size_bytes', label: 'size', format: (v) => formatBytes(Number(v)) },
+const RESERVED_KEYS = new Set(['from', 'to', 'reason']);
+
+/**
+ * Presentation hints for keys we know about — a shorter label, and an order
+ * that puts the most-asked-for facts first.
+ *
+ * Cosmetic only. This deliberately does **not** decide what is shown: an
+ * attribute missing from this table still renders, under its own key. That is
+ * the whole point — a writer can add an attribute and have it appear without a
+ * frontend change, and the vocabulary in `rise-backend-core::events` stays the
+ * single place that decides what an attribute *means*.
+ */
+const LABELS: Record<string, string> = {
+    created_by: 'by',
+    build_method: 'build',
+    image_size_bytes: 'size',
+    superseded_by: 'superseded by',
+    rolled_back_from: 'rolled back from',
+    job_url: 'job',
+    pull_request_url: 'pull request',
+};
+
+/**
+ * Reading order. Postgres `jsonb` does not preserve insertion order — it stores
+ * keys sorted by length then bytes — so without this the fields of an event
+ * would appear in an order nobody chose, and one that shifts when a key is
+ * renamed.
+ */
+const ORDER = [
+    // Who and what, before how much.
+    'created_by', 'superseded_by', 'rolled_back_from', 'stopped_by',
+    'container', 'containers', 'replicas', 'cpu', 'memory',
+    // Then the build, in the order it happened.
+    'build_method', 'build_ms', 'push_ms', 'registry',
+    'image', 'image_digest', 'image_size_bytes', 'group',
 ];
 
-function EventFacts({ event }: { event: DeploymentEvent }) {
-    const shown = FACTS
-        .map(({ key, label, format }) => {
-            const value = event.attributes?.[key];
-            if (value === undefined || value === null || value === '') return null;
-            return { label, text: format ? format(value) : String(value) };
-        })
-        .filter((f): f is { label: string; text: string } => f !== null);
+/** Keys that name the subject of a breakdown row, so it can lead. */
+const NAME_KEYS = new Set(['container', 'name']);
 
-    if (shown.length === 0) return null;
-    return (
-        <span className="r-evt-facts">
-            {shown.map((f) => (
-                <span key={f.label} className="r-evt-fact">
-                    <span className="r-evt-fact-k">{f.label}</span>
-                    <span className="r-evt-fact-v">{f.text}</span>
-                </span>
-            ))}
-        </span>
-    );
-}
-
-/** One image the reporter built or pushed during this transition. */
-interface ReportedImage {
-    container?: string;
-    image?: string;
-    build_method?: string;
-    build_ms?: number;
-    push_ms?: number;
-    size_bytes?: number;
+function orderOf(key: string): number {
+    const i = ORDER.indexOf(key);
+    return i === -1 ? ORDER.length : i;
 }
 
 /**
- * Per-image detail, when the reporter supplied any.
+ * Every attribute the event carries, minus the ones the row already states.
  *
- * A multi-container deployment builds every image inside one `Building` state,
- * so the gap between transitions only gives the total. This is the breakdown
- * that says *which* image took it.
+ * Total by construction: an unrecognised key renders under its own name rather
+ * than being dropped. An allowlist here would silently discard whatever a
+ * newer backend reports, and "recorded but invisible" is indistinguishable
+ * from "never recorded" to the person reading the timeline.
  */
-function EventImages({ event }: { event: DeploymentEvent }) {
-    const images = event.attributes?.images;
-    if (!Array.isArray(images) || images.length === 0) return null;
+function EventAttributes({
+    event,
+    projectName,
+}: {
+    event: DeploymentEvent;
+    projectName: string;
+}) {
+    const entries = Object.entries(event.attributes ?? {})
+        .filter(([key, value]) => !RESERVED_KEYS.has(key) && value !== null && value !== '')
+        .sort(([a], [b]) => orderOf(a) - orderOf(b) || a.localeCompare(b));
+
+    if (entries.length === 0) return null;
+
+    // A list of objects is a breakdown, not a value — per-image build timings,
+    // and whatever else later reports in the same shape. It gets its own rows.
+    const facts = entries.filter(([, v]) => !isObjectList(v));
+    const breakdowns = entries.filter(([, v]) => isObjectList(v));
 
     return (
-        <span className="r-evt-images">
-            {(images as ReportedImage[]).map((image, i) => (
-                <span key={image.container ?? i} className="r-evt-image">
-                    <span className="r-evt-image-name">{image.container ?? image.image ?? '?'}</span>
-                    {image.build_method && (
-                        <span className="r-evt-image-meta">{image.build_method}</span>
-                    )}
-                    {typeof image.build_ms === 'number' && (
-                        <span className="r-evt-image-meta">build {formatMs(image.build_ms)}</span>
-                    )}
-                    {typeof image.push_ms === 'number' && (
-                        <span className="r-evt-image-meta">push {formatMs(image.push_ms)}</span>
-                    )}
-                    {typeof image.size_bytes === 'number' && (
-                        <span className="r-evt-image-meta">{formatBytes(image.size_bytes)}</span>
-                    )}
+        <>
+            {facts.length > 0 && (
+                <span className="r-evt-facts">
+                    {facts.map(([key, value]) => (
+                        <span key={key} className="r-evt-fact">
+                            <span className="r-evt-fact-k">{LABELS[key] ?? key.replace(/_/g, ' ')}</span>
+                            <span className="r-evt-fact-v">
+                                <AttributeValue name={key} value={value} projectName={projectName} />
+                            </span>
+                        </span>
+                    ))}
+                </span>
+            )}
+            {breakdowns.map(([key, rows]) => (
+                <span key={key} className="r-evt-images">
+                    {(rows as Record<string, unknown>[]).map((row, i) => (
+                        <span key={i} className="r-evt-image">
+                            {Object.entries(row)
+                                .filter(([, v]) => v !== null && v !== '')
+                                .sort(([a], [b]) => orderOf(a) - orderOf(b) || a.localeCompare(b))
+                                .map(([k, v]) => (
+                                    <span
+                                        key={k}
+                                        className={
+                                            NAME_KEYS.has(k) ? 'r-evt-image-name' : 'r-evt-image-meta'
+                                        }
+                                    >
+                                        {NAME_KEYS.has(k) ? String(v) : formatValue(k, v)}
+                                    </span>
+                                ))}
+                        </span>
+                    ))}
                 </span>
             ))}
-        </span>
+        </>
     );
+}
+
+function isObjectList(value: unknown): boolean {
+    return (
+        Array.isArray(value) &&
+        value.length > 0 &&
+        value.every((v) => typeof v === 'object' && v !== null && !Array.isArray(v))
+    );
+}
+
+/**
+ * A value, linked when it names something reachable.
+ *
+ * Only deployment references are linked: "superseded by X" is the one thing a
+ * reader of a dead deployment always wants next, and following it should not
+ * mean copying an id into the URL bar.
+ */
+function AttributeValue({
+    name,
+    value,
+    projectName,
+}: {
+    name: string;
+    value: unknown;
+    projectName: string;
+}) {
+    const text = formatValue(name, value);
+
+    if (name === 'superseded_by' || name === 'rolled_back_from') {
+        return <a className="r-evt-link" href={`/deployment/${projectName}/${text}`}>{text}</a>;
+    }
+    if (name.endsWith('_url') && typeof value === 'string' && /^https?:\/\//.test(value)) {
+        return <a className="r-evt-link" href={value} target="_blank" rel="noreferrer">{text}</a>;
+    }
+    return <>{text}</>;
+}
+
+/**
+ * Format by what the key's suffix says the value *is*.
+ *
+ * Convention rather than enumeration, so a new `*_ms` or `*_bytes` attribute
+ * formats correctly the day a backend starts reporting it, with nothing to add
+ * here. The units live in the key name, which is also why writers should keep
+ * naming them that way.
+ */
+function formatValue(name: string, value: unknown): string {
+    if (Array.isArray(value)) return value.map((v) => formatValue(name, v)).join(', ');
+    if (typeof value === 'object' && value !== null) return JSON.stringify(value);
+
+    if (name.endsWith('_ms') && typeof value === 'number') return formatMs(value);
+    if (name.endsWith('_bytes') && typeof value === 'number') return formatBytes(value);
+    if (name.endsWith('_at') && typeof value === 'string') {
+        const date = new Date(value);
+        if (!Number.isNaN(date.getTime())) return date.toLocaleString();
+    }
+    return String(value);
 }
 
 function formatMs(ms: number): string {

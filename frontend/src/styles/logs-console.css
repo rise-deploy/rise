@@ -1030,3 +1030,10 @@
 .r-evt-image-meta {
     color: var(--text-soft);
 }
+
+.r-evt-link {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.r-evt-link:hover { text-decoration: underline; }

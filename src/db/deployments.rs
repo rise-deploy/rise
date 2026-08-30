@@ -836,13 +836,24 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
                 deployment_id, occurred_at, kind, severity, source, attributes
             )
             SELECT
-                id, NOW(), 'status_changed', 'info', 'control-plane',
-                jsonb_build_object(
-                    'from', from_status, 'to', status,
-                    'reason', termination_reason::text
-                )
+                upd.id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_strip_nulls(jsonb_build_object(
+                    'from', upd.from_status, 'to', upd.status,
+                    'reason', upd.termination_reason::text,
+                    -- Carried from the `Terminating` event, which is where the
+                    -- replacement was in scope. `Superseded` is the row a reader
+                    -- lands on, so it is the row that has to answer "by what?".
+                    'superseded_by', (
+                        SELECT e.attributes->>'superseded_by'
+                        FROM deployment_events e
+                        WHERE e.deployment_id = upd.id
+                          AND e.attributes->>'to' = 'Terminating'
+                        ORDER BY e.id DESC
+                        LIMIT 1
+                    )
+                ))
             FROM upd
-            WHERE from_status IS DISTINCT FROM status
+            WHERE upd.from_status IS DISTINCT FROM upd.status
         )
         SELECT
             id, deployment_id, project_id, created_by_id,
@@ -1078,10 +1089,15 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<O
 /// Guarded by `is_valid_transition`: returns `None` (no-op) if the
 /// deployment is no longer in `Healthy`/`Unhealthy` (e.g. it already
 /// finished terminating, or moved there itself).
+/// `superseded_by` is the `deployment_id` of the deployment taking this one's
+/// place, and is only meaningful with `TerminationReason::Superseded`. It is
+/// recorded here because here is where it is known: by the time termination
+/// completes, the caller has only the reason, not the replacement.
 pub async fn mark_terminating(
     pool: &PgPool,
     id: Uuid,
     reason: TerminationReason,
+    superseded_by: Option<&str>,
 ) -> Result<Option<Deployment>> {
     let deployment = sqlx::query_as!(
         Deployment,
@@ -1109,10 +1125,11 @@ pub async fn mark_terminating(
             )
             SELECT
                 id, NOW(), 'status_changed', 'info', 'control-plane',
-                jsonb_build_object(
+                jsonb_strip_nulls(jsonb_build_object(
                     'from', from_status, 'to', status,
-                    'reason', termination_reason::text
-                )
+                    'reason', termination_reason::text,
+                    'superseded_by', $3::text
+                ))
             FROM upd
             WHERE from_status IS DISTINCT FROM status
         )
@@ -1135,7 +1152,8 @@ pub async fn mark_terminating(
         FROM upd
         "#,
         id,
-        reason as TerminationReason
+        reason as TerminationReason,
+        superseded_by
     )
     .fetch_optional(pool)
     .await
@@ -1690,7 +1708,11 @@ pub async fn mark_healthy_and_supersede(
                 id, NOW(), 'status_changed', 'info', 'control-plane',
                 jsonb_build_object(
                     'from', from_status, 'to', status,
-                    'reason', termination_reason::text
+                    'reason', termination_reason::text,
+                    -- $1 is the deployment taking this one's place. Named by
+                    -- its `deployment_id`, not its UUID: it is what a reader
+                    -- follows, and what the URL is built from.
+                    'superseded_by', (SELECT deployment_id FROM deployments WHERE id = $1)
                 )
             FROM upd
         )
@@ -2032,6 +2054,78 @@ mod tests {
         assert!(
             attributes.get("images").is_none(),
             "nothing is invented when nothing was reported",
+        );
+    }
+
+    /// The replacement is in scope when a deployment is marked `Terminating`
+    /// and gone by the time termination completes — but `Superseded` is the row
+    /// a reader lands on, so the answer has to survive the trip.
+    #[sqlx::test]
+    async fn superseded_events_name_the_deployment_that_replaced_them(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Healthy").await;
+
+        mark_terminating(
+            &pool,
+            id,
+            TerminationReason::Superseded,
+            Some("20260830-999999"),
+        )
+        .await
+        .unwrap()
+        .expect("a Healthy deployment can start terminating");
+        mark_superseded(&pool, id)
+            .await
+            .unwrap()
+            .expect("and finish");
+
+        let named: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT attributes->>'to', attributes->>'superseded_by'
+             FROM deployment_events
+             WHERE deployment_id = $1 AND kind = 'status_changed'
+             ORDER BY id",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            named,
+            vec![
+                (
+                    "Terminating".to_string(),
+                    Some("20260830-999999".to_string())
+                ),
+                (
+                    "Superseded".to_string(),
+                    Some("20260830-999999".to_string())
+                ),
+            ],
+        );
+    }
+
+    /// Terminating for any other reason names nobody, rather than storing a
+    /// null that reads as "superseded by something we lost".
+    #[sqlx::test]
+    async fn other_terminations_name_no_successor(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Healthy").await;
+
+        mark_terminating(&pool, id, TerminationReason::UserStopped, None)
+            .await
+            .unwrap()
+            .unwrap();
+        mark_stopped(&pool, id).await.unwrap().unwrap();
+
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT jsonb_object_keys(attributes) FROM deployment_events WHERE deployment_id = $1",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !keys.contains(&"superseded_by".to_string()),
+            "no successor key at all, not a null one: {keys:?}",
         );
     }
 
@@ -2604,7 +2698,7 @@ mod tests {
         .unwrap();
 
         // A concurrent stop request moves it to Terminating.
-        mark_terminating(&pool, deployment.id, TerminationReason::UserStopped)
+        mark_terminating(&pool, deployment.id, TerminationReason::UserStopped, None)
             .await
             .unwrap()
             .unwrap();

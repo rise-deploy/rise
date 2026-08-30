@@ -122,6 +122,7 @@ impl ProjectController {
                             &self.state.db_pool,
                             deployment.id,
                             crate::db::models::TerminationReason::UserStopped,
+                            None,
                         )
                         .await?;
                     }

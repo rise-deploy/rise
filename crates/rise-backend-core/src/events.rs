@@ -82,6 +82,67 @@ impl fmt::Display for EventKind {
     }
 }
 
+/// The attribute vocabulary: what a `status_changed` event may carry, and what
+/// each key means.
+///
+/// This module is the single place that decides an attribute's *meaning*. It is
+/// deliberately not an allowlist — readers render whatever an event carries, so
+/// a backend can report something described here later, or not at all, without
+/// anything downstream having to agree first.
+///
+/// **Naming is load-bearing.** Readers format by the key's suffix rather than by
+/// consulting a table, so a duration must end `_ms`, a size `_bytes`, and an
+/// instant `_at`. A key named `build_time` renders as a bare number; a key named
+/// `build_ms` renders as `4.0s` with nothing added anywhere.
+pub mod attributes {
+    /// The status moved from, absent on the creation event — nothing preceded it.
+    pub const FROM: &str = "from";
+    /// The status moved to. Always present.
+    pub const TO: &str = "to";
+    /// Why, in words, when the mover can say. Rendered beside the transition.
+    pub const REASON: &str = "reason";
+
+    /// Keys the transition itself owns. A reporter cannot set these: they are
+    /// applied last so that what actually happened cannot be overwritten by
+    /// what a reporter claims happened.
+    pub const RESERVED: &[&str] = &[FROM, TO, REASON];
+
+    /// Email of whoever asked for the deployment. Creation only.
+    pub const CREATED_BY: &str = "created_by";
+    /// Deployment group, replica count and resource ask, as requested at
+    /// creation. Recorded because the row can be edited afterwards; the event
+    /// keeps what was asked for.
+    pub const GROUP: &str = "group";
+    pub const REPLICAS: &str = "replicas";
+    pub const CPU: &str = "cpu";
+    pub const MEMORY: &str = "memory";
+    /// Declared container names, and the image the deployment was created with.
+    pub const CONTAINERS: &str = "containers";
+    pub const IMAGE: &str = "image";
+    /// The deployment this one was rolled back from, by its `deployment_id`.
+    pub const ROLLED_BACK_FROM: &str = "rolled_back_from";
+    /// CI provenance, when the caller supplied it.
+    pub const JOB_URL: &str = "job_url";
+    pub const PULL_REQUEST_URL: &str = "pull_request_url";
+
+    /// The deployment that replaced this one, by its `deployment_id` — the
+    /// human name, not the UUID, because it is what a reader follows.
+    ///
+    /// Known when the deployment is marked `Terminating` (the replacement is in
+    /// hand there) and carried onto `Superseded`, which is the row a reader
+    /// actually lands on.
+    pub const SUPERSEDED_BY: &str = "superseded_by";
+
+    /// Registry the images were pushed to, and the per-image breakdown: a list
+    /// of objects, one per container, each carrying `container`, `image`,
+    /// `build_method`, `build_ms` and — when a separate push makes it
+    /// observable — `push_ms`.
+    ///
+    /// Reported by the CLI, which is the only thing that observes the build.
+    pub const REGISTRY: &str = "registry";
+    pub const IMAGES: &str = "images";
+}
+
 /// How much attention an occurrence deserves.
 ///
 /// A property of the occurrence, not of the kind: the same

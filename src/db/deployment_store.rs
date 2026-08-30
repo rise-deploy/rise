@@ -152,8 +152,9 @@ impl DeploymentStore for PgDeploymentStore {
         &self,
         id: Uuid,
         reason: TerminationReason,
+        superseded_by: Option<&str>,
     ) -> Result<Option<Deployment>> {
-        crate::db::deployments::mark_terminating(&self.pool, id, reason).await
+        crate::db::deployments::mark_terminating(&self.pool, id, reason, superseded_by).await
     }
 
     async fn mark_deployment_healthy_and_supersede(

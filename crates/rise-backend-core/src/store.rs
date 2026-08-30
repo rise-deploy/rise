@@ -156,10 +156,16 @@ pub trait DeploymentStore: Send + Sync {
 
     /// Mark a deployment terminating with a termination reason. See
     /// `mark_deployment_failed` for the `None` contract.
+    ///
+    /// `superseded_by` names the replacement deployment (by its
+    /// `deployment_id`) and is only meaningful with
+    /// [`TerminationReason::Superseded`]. It is taken here because this is the
+    /// only point where the replacement is in scope.
     async fn mark_deployment_terminating(
         &self,
         id: Uuid,
         reason: TerminationReason,
+        superseded_by: Option<&str>,
     ) -> Result<Option<Deployment>>;
 
     /// Atomically mark a deployment healthy and, if some other deployment is
