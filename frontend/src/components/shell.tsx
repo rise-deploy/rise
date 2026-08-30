@@ -19,10 +19,12 @@ export interface ShellProps {
     user: { email?: string; id?: string } | null;
     onLogout: () => void;
     onOpenPalette: () => void;
+    /** Let the page own the viewport instead of scrolling inside the shell. */
+    fullBleed?: boolean;
     children: React.ReactNode;
 }
 
-export function Shell({ route, breadcrumbs, user, onLogout, onOpenPalette, children }: ShellProps) {
+export function Shell({ route, breadcrumbs, user, onLogout, onOpenPalette, fullBleed, children }: ShellProps) {
     const [prefs, setPrefs] = usePrefs();
     const effectiveTheme = resolveTheme(prefs.theme);
 
@@ -38,7 +40,7 @@ export function Shell({ route, breadcrumbs, user, onLogout, onOpenPalette, child
                 />
                 <main className="r-main">
                     <Topbar breadcrumbs={breadcrumbs} onOpenPalette={onOpenPalette} />
-                    <div className="r-content">{children}</div>
+                    <div className={fullBleed ? 'r-content is-full' : 'r-content'}>{children}</div>
                 </main>
             </div>
         </div>

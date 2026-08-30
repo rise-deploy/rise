@@ -39,8 +39,10 @@
 
     /* Log surface and chart stack colors. Read by the deployment logs UI
        (JS uses var() to fill chart bars; CSS uses for row gradients). */
-    --r-logs-bg: oklch(0.985 0.004 80);
-    --r-logs-bg-hover: oklch(0.94 0.005 80);
+    /* A step below --bg so the log surface reads as inset — it receives
+       content, like an input. Dark mode goes the other way, below --surface. */
+    --r-logs-bg: oklch(0.967 0.004 80);
+    --r-logs-bg-hover: oklch(0.93 0.005 80);
     --r-log-chart-info: oklch(0.55 0.005 80);
     --r-log-chart-warn: oklch(0.70 0.14 85);
     --r-log-chart-error: oklch(0.58 0.18 25);
@@ -391,6 +393,14 @@ a { color: inherit; }
 .r-icon-btn:hover { background: var(--hover); color: var(--text); }
 
 .r-content { flex: 1; overflow: auto; padding: 32px 36px 44px; }
+/* Full-bleed pages (the log console) own their own scrolling: the container
+   becomes a non-scrolling flex column so the page can size to the shell. */
+.r-content.is-full {
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 20px 26px 24px;
+}
 
 /* ---------- Page head ---------- */
 .r-page-head { display: flex; align-items: flex-start; gap: 18px; margin-bottom: 26px; flex-wrap: wrap; }
@@ -473,8 +483,11 @@ a { color: inherit; }
     white-space: nowrap;
 }
 .r-split-btn button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.r-split-btn-main { padding: 5px 12px 5px 14px; }
-.r-split-btn-side {
+/* The segment rules qualify the element as well as the class: `all: unset`
+   above is a class-plus-element selector, so a bare class here would lose to
+   it and the padding would collapse. */
+.r-split-btn button.r-split-btn-main { padding: 5px 12px 5px 14px; }
+.r-split-btn button.r-split-btn-side {
     padding: 5px 9px;
     border-left: 1px solid var(--border);
     color: var(--text-soft);
@@ -494,48 +507,6 @@ a { color: inherit; }
     animation: r-pulse-soft 2.4s infinite;
 }
 .r-split-btn-side.active { color: var(--accent); background: var(--accent-soft); }
-
-/* ---------- Logs panel header ----------
-   Title + level filter on the left, controls on the right. Both groups wrap
-   internally; the whole row also wraps onto two lines at narrow widths so
-   things don't get squeezed together. */
-.r-logs-head { flex-wrap: wrap; row-gap: 10px; }
-.r-logs-head-left {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    flex-wrap: wrap;
-    min-width: 0;
-}
-.r-logs-head-right {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex-wrap: wrap;
-}
-.r-logs-tail {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--text-muted);
-}
-.r-logs-tail .r-field { width: 64px; -moz-appearance: textfield; }
-.r-logs-tail .r-field::-webkit-outer-spin-button,
-.r-logs-tail .r-field::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-}
-.r-logs-level { width: 130px; }
-.r-logs-range { width: 150px; }
-.r-logs-autorefresh { width: 120px; }
-.r-logs-count {
-    font-size: 11.5px;
-    color: var(--text-soft);
-    font-variant-numeric: tabular-nums;
-    padding: 0 4px;
-    user-select: none;
-}
 
 /* ---------- Inputs ---------- *
    All form fields share a single visual style: same border, padding, focus
@@ -1138,176 +1109,6 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     border-radius: 5px;
 }
 .dark .r-logs { color: oklch(0.92 0.005 80); }
-.r-logs .ts { color: oklch(0.55 0.005 80); margin-right: 10px; }
-.r-logs .src { color: oklch(0.72 0.10 165); margin-right: 8px; }
-/* Per-line level colours. Bumped chroma vs. the chart bar palette so each
-   level is unambiguously distinct from the default text on a dark
-   background — the bars fill a region; text needs more saturation to read
-   the same way. Light-mode values are darkened enough to clear WCAG-AA on
-   the lightest (odd) row background (~oklch 0.965) while keeping info/notice
-   in the default body colour. */
-.r-logs .lv-info,
-.r-logs .lv-notice { color: inherit; }
-.r-logs .lv-warn { color: oklch(0.55 0.20 85); }
-.r-logs .lv-error { color: oklch(0.50 0.22 25); }
-.r-logs .lv-critical { color: oklch(0.45 0.23 25); }
-.r-logs .lv-fatal { color: oklch(0.40 0.22 20); }
-.r-logs .lv-debug,
-.r-logs .lv-trace { color: oklch(0.52 0.10 230); }
-.r-logs .lv-unknown { color: inherit; }
-.dark .r-logs .lv-warn { color: oklch(0.85 0.20 85); }
-.dark .r-logs .lv-error { color: oklch(0.78 0.20 25); }
-.dark .r-logs .lv-critical { color: oklch(0.72 0.22 25); }
-.dark .r-logs .lv-fatal { color: oklch(0.68 0.22 20); }
-.dark .r-logs .lv-debug,
-.dark .r-logs .lv-trace { color: oklch(0.75 0.08 230); }
-.r-logs-row {
-    position: relative;
-    display: block;
-    white-space: nowrap;
-    overflow: hidden;
-    padding: 0;
-    outline: none;
-}
-.r-logs-row.is-expandable { cursor: pointer; }
-.r-logs-row.is-expanded { cursor: zoom-out; }
-/* Subtle row striping. Tuned per mode: light mode wants a near-white
-   tint so it doesn't shout, dark mode wants a row a step brighter than
-   the panel bg to remain visible. */
-.r-logs-row:nth-child(odd):not(.is-expanded) {
-    background: oklch(0.965 0.004 80);
-}
-.dark .r-logs-row:nth-child(odd):not(.is-expanded) {
-    background: oklch(0.195 0.005 80);
-}
-.r-logs-row:hover:not(.is-expanded),
-.r-logs-row:focus-visible:not(.is-expanded) {
-    background: var(--r-logs-bg-hover);
-}
-.r-logs-row.is-expanded {
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-.r-logs-row:not(.is-expanded)::after {
-    content: "";
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: 60px;
-    pointer-events: none;
-    background: linear-gradient(to right, transparent, var(--r-logs-bg) 70%);
-}
-.r-logs-row:hover:not(.is-expanded)::after {
-    background: linear-gradient(to right, transparent, var(--r-logs-bg-hover) 70%);
-}
-.r-logs-row .r-logs-ts {
-    color: oklch(0.55 0.005 80);
-    margin-right: 10px;
-    user-select: none;
-    font-variant-numeric: tabular-nums;
-}
-/* Lines paginated in from outside the user's selected range (the Kubernetes
-   backend can keep going as long as the kubelet has buffered them). The row
-   stays readable, but the timestamp fades so it's clear the line is older
-   (or newer) than the chart's window. */
-.r-logs-row.is-out-of-range .r-logs-ts {
-    opacity: 0.4;
-}
-.r-logs-row .r-logs-action {
-    display: none;
-    position: absolute;
-    right: 4px;
-    top: 50%;
-    transform: translateY(-50%);
-    background: oklch(0.26 0.005 80);
-    border: 1px solid oklch(0.34 0.005 80);
-    color: oklch(0.90 0.005 80);
-    font-size: 10.5px;
-    line-height: 1.4;
-    padding: 1px 7px;
-    border-radius: 3px;
-    cursor: pointer;
-    z-index: 1;
-    font-family: inherit;
-}
-.r-logs-row.is-expandable:hover .r-logs-action {
-    display: inline-block;
-}
-.r-logs-row.is-expanded .r-logs-action {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    transform: none;
-    display: inline-block;
-    margin-left: 0;
-}
-.r-logs-row .r-logs-action:hover {
-    background: oklch(0.32 0.005 80);
-    color: oklch(0.95 0.005 80);
-}
-.r-logs-search {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-}
-.r-logs-search > svg {
-    position: absolute;
-    left: 8px;
-    color: var(--text-soft);
-    pointer-events: none;
-}
-.r-logs-search input.r-field {
-    padding-left: 26px;
-    width: 200px;
-    font-size: 12px;
-}
-.r-logs-bucket-banner {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    align-self: flex-start;
-    padding: 4px 6px 4px 10px;
-    background: oklch(0.40 0.10 260 / 0.18);
-    border: 1px solid oklch(0.50 0.12 260 / 0.5);
-    border-radius: 999px;
-    font-size: 11.5px;
-    color: var(--text);
-}
-.r-logs-bucket-clear {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    background: transparent;
-    border: 0;
-    border-radius: 50%;
-    color: var(--text-soft);
-    cursor: pointer;
-}
-.r-logs-bucket-clear:hover { background: oklch(0.50 0.12 260 / 0.3); color: var(--text); }
-.r-logs-loader {
-    padding: 8px 4px;
-    text-align: center;
-    color: oklch(0.55 0.005 80);
-    font-size: 11px;
-    user-select: none;
-}
-.r-logs-json {
-    margin: 4px 0 0 0;
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    line-height: 1.55;
-    white-space: pre-wrap;
-    word-break: break-word;
-    color: oklch(0.82 0.005 80);
-}
-.r-logs-json .json-key  { color: oklch(0.78 0.10 165); }
-.r-logs-json .json-str  { color: oklch(0.80 0.09 140); }
-.r-logs-json .json-num  { color: oklch(0.82 0.11 85); }
-.r-logs-json .json-bool { color: oklch(0.75 0.13 280); }
-.r-logs-json .json-null { color: oklch(0.55 0.005 80); }
 
 /* ---------- Log volume chart tooltip ---------- */
 .r-logs-chart-tip {
@@ -1326,11 +1127,10 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 }
 /* Recharts' tooltip-wrapper sometimes settles below opacity:1 during the
    show/hide animation; force it solid so our tooltip background is the
-   final word on visibility. Also bumped to a z-index above the log rows
-   below the chart — each `.r-logs-row` creates a stacking context via
-   `position: relative`, so without this the tooltip rendered under later
-   rows. Scoped to the log-volume chart so it doesn't override Recharts
-   opacity behaviour for any future charts on the page. */
+   final word on visibility. The z-index clears the log rows below the chart —
+   each `.r-logc-row` creates a stacking context via `position: relative`, so
+   without this the tooltip renders under later rows. Scoped to the log-volume
+   chart so it doesn't override Recharts opacity behaviour elsewhere. */
 .r-logs-chart .recharts-tooltip-wrapper {
     opacity: 1 !important;
     z-index: 50;
@@ -1378,59 +1178,6 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-logs-chart .recharts-rectangle:hover {
     cursor: pointer;
 }
-.r-logs-chart-head {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 4px 2px;
-    font-size: 12px;
-    color: var(--text-soft);
-    width: 100%;
-}
-.r-logs-chart-head-toggle-btn {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: 1;
-    min-width: 0;
-    background: transparent;
-    border: 0;
-    padding: 0;
-    font: inherit;
-    color: inherit;
-    cursor: pointer;
-    text-align: left;
-}
-.r-logs-chart-head-toggle-btn:hover .r-logs-chart-head-title { color: var(--text); }
-.r-logs-chart-head-toggle-btn.inert {
-    cursor: default;
-}
-.r-logs-chart-head.disabled .r-logs-chart-head-toggle {
-    color: var(--text-muted);
-}
-.r-logs-chart-head.disabled .r-logs-chart-head-title {
-    color: var(--text-soft);
-}
-.r-logs-chart-head-note {
-    margin-left: 6px;
-    color: var(--text-soft);
-    font-style: italic;
-}
-.r-logs-chart-head-toggle {
-    display: inline-flex;
-    align-items: center;
-    color: var(--text-soft);
-}
-.r-logs-chart-head-title {
-    font-weight: 500;
-    color: var(--text);
-}
-.r-logs-chart-head-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
 /* ---------- Date range popover ---------- */
 .r-date-range {
     position: relative;
@@ -1891,6 +1638,7 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 
 /* ---------- Density: compact ---------- */
 [data-density="compact"] body, [data-density="compact"] { font-size: 12.5px; }
+[data-density="compact"] .r-content.is-full { padding: 14px 20px 18px; }
 [data-density="compact"] .r-topbar { height: 44px; flex: 0 0 44px; padding: 0 22px; }
 [data-density="compact"] .r-content { padding: 22px 26px 32px; }
 [data-density="compact"] .r-page-head { margin-bottom: 18px; gap: 12px; }

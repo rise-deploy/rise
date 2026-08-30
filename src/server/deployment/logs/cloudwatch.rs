@@ -43,6 +43,9 @@ struct CloudWatchLine {
     id: String,
     // FilterLogEvents exposes an event ID for pagination ordering; Live Tail does not.
     pagination_id: String,
+    /// Deployment container the line came from, resolved from the log stream
+    /// name. `None` when the stream doesn't sit under the deployment prefix.
+    container: Option<String>,
 }
 
 impl CloudWatchLine {
@@ -79,6 +82,7 @@ impl CloudWatchLine {
             ingestion_time_millis,
             log_stream,
             message,
+            container: None,
         })
     }
 
@@ -98,6 +102,7 @@ impl CloudWatchLine {
             ingestion_time_millis,
             log_stream,
             message,
+            container: None,
         })
     }
 
@@ -134,10 +139,22 @@ impl CloudWatchLine {
         classify_k8s_line(&self.message)
     }
 
-    fn matches(&self, levels: &[String], search: Option<&str>) -> bool {
+    fn matches(&self, levels: &[String], search: Option<&str>, containers: &[String]) -> bool {
         let level = self.level();
         (levels.is_empty() || levels.iter().any(|candidate| candidate == level))
+            && (containers.is_empty()
+                || self
+                    .container
+                    .as_ref()
+                    .is_some_and(|container| containers.contains(container)))
             && line_matches_search(&self.message, search)
+    }
+
+    /// Resolve the deployment container from the log stream name. The ECS
+    /// awslogs driver appends `{container}/{task-id}` to the configured
+    /// stream prefix, which is this backend's per-deployment prefix.
+    fn attribute_container(&mut self, prefix: &str) {
+        self.container = container_from_stream(prefix, &self.log_stream);
     }
 
     fn render(&self, timestamps: bool) -> String {
@@ -148,6 +165,17 @@ impl CloudWatchLine {
             .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
         format!("{} {}", timestamp.to_rfc3339(), self.message)
     }
+}
+
+/// The container segment of an ECS awslogs stream name — the first path
+/// segment after the deployment's stream prefix.
+fn container_from_stream(prefix: &str, log_stream: &str) -> Option<String> {
+    log_stream
+        .strip_prefix(prefix)?
+        .split('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
 }
 
 fn stable_cloudwatch_source_id(
@@ -205,11 +233,17 @@ struct ScanResult {
 }
 
 struct CloudWatchScan<'a> {
+    /// Per-deployment stream prefix, also the anchor for container attribution.
     prefix: &'a str,
+    /// Prefix actually sent to CloudWatch. Narrowed to a single container's
+    /// streams when the filter names exactly one; otherwise the deployment
+    /// prefix, with the filter applied per line.
+    request_prefix: &'a str,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     levels: &'a [String],
     search: Option<&'a str>,
+    containers: &'a [String],
     stop_after: Option<usize>,
     before: Option<&'a CloudWatchKey>,
 }
@@ -331,6 +365,19 @@ impl CloudWatchLogBackend {
         )
     }
 
+    /// Stream-name prefixes to ask CloudWatch for. One per requested
+    /// container so the daemon does the narrowing where it can; the
+    /// deployment-wide prefix when no container filter is set.
+    fn request_prefixes(prefix: &str, containers: &[String]) -> Vec<String> {
+        if containers.is_empty() {
+            return vec![prefix.to_string()];
+        }
+        containers
+            .iter()
+            .map(|container| format!("{prefix}{container}/"))
+            .collect()
+    }
+
     fn effective_start(deployment: &Deployment, query: &LogQuery) -> DateTime<Utc> {
         query.start_time.unwrap_or_else(|| {
             query
@@ -379,7 +426,7 @@ impl CloudWatchLogBackend {
                 .client
                 .filter_log_events()
                 .log_group_name(&self.log_group)
-                .log_stream_name_prefix(query.prefix)
+                .log_stream_name_prefix(query.request_prefix)
                 .start_time(
                     query
                         .start
@@ -422,13 +469,14 @@ impl CloudWatchLogBackend {
                 }
                 let occurrence = next_occurrence(&mut occurrences, line.occurrence_key())?;
                 line.assign_occurrence_id(occurrence);
+                line.attribute_container(query.prefix);
                 if query
                     .before
                     .is_some_and(|boundary| line.pagination_key() >= *boundary)
                 {
                     continue;
                 }
-                if line.matches(query.levels, query.search) {
+                if line.matches(query.levels, query.search, query.containers) {
                     lines.push(line);
                     if stop_primary.is_none()
                         && query.stop_after.is_some_and(|limit| lines.len() >= limit)
@@ -512,13 +560,22 @@ impl CloudWatchLogBackend {
         {
             anyhow::bail!("invalid log cursor boundary");
         }
+        // FilterLogEvents takes a single prefix, so only a one-container
+        // filter can be pushed down; wider filters narrow per line.
+        let request_prefixes = Self::request_prefixes(&prefix, &query.containers);
+        let request_prefix = match request_prefixes.as_slice() {
+            [single] => single.clone(),
+            _ => prefix.clone(),
+        };
         let result = self
             .scan(CloudWatchScan {
                 prefix: &prefix,
+                request_prefix: &request_prefix,
                 start,
                 end,
                 levels: &query.levels,
                 search: query.search.as_deref(),
+                containers: &query.containers,
                 stop_after: Some(tail),
                 before: cursor.as_ref().and_then(|cursor| cursor.before.as_ref()),
             })
@@ -558,11 +615,16 @@ impl CloudWatchLogBackend {
         use aws_sdk_cloudwatchlogs::types::StartLiveTailResponseStream;
 
         let prefix = self.stream_prefix(&deployment, &project);
-        let response = self
+        // Unlike FilterLogEvents, Live Tail takes a prefix list, so every
+        // requested container is pushed down to the session.
+        let mut request = self
             .client
             .start_live_tail()
-            .log_group_identifiers(&self.log_group_arn)
-            .log_stream_name_prefixes(&prefix)
+            .log_group_identifiers(&self.log_group_arn);
+        for request_prefix in Self::request_prefixes(&prefix, &query.containers) {
+            request = request.log_stream_name_prefixes(request_prefix);
+        }
+        let response = request
             .send()
             .await
             .context("Failed to start CloudWatch Live Tail")?;
@@ -597,6 +659,7 @@ impl CloudWatchLogBackend {
         let initial = self.backlog(&deployment, &project, &query).await?;
         let levels = query.levels.clone();
         let search = query.search.clone();
+        let containers = query.containers.clone();
         let timestamps = query.timestamps;
 
         let log_group = self.log_group.clone();
@@ -613,7 +676,12 @@ impl CloudWatchLogBackend {
             }
             for line in initial.lines {
                 let level = line.level().to_string();
-                yield LogEvent::Line { id: line.id.clone(), text: line.render(timestamps), level };
+                yield LogEvent::Line {
+                    id: line.id.clone(),
+                    text: line.render(timestamps),
+                    level,
+                    container: line.container.clone(),
+                };
             }
             yield LogEvent::BacklogLoaded { count: backlog_count, next_cursor: initial.next_cursor };
 
@@ -640,12 +708,18 @@ impl CloudWatchLogBackend {
                         if consume_backlog_overlap(&mut backlog_occurrences, &key) {
                             continue;
                         }
-                        if !line.matches(&levels, search.as_deref()) {
+                        line.attribute_container(&prefix);
+                        if !line.matches(&levels, search.as_deref(), &containers) {
                             continue;
                         }
                         line.assign_occurrence_id(occurrence);
                         let level = line.level().to_string();
-                        yield LogEvent::Line { id: line.id.clone(), text: line.render(timestamps), level };
+                        yield LogEvent::Line {
+                            id: line.id.clone(),
+                            text: line.render(timestamps),
+                            level,
+                            container: line.container.clone(),
+                        };
                     }
                 }
             }
@@ -704,6 +778,7 @@ impl RuntimeLogBackend for CloudWatchLogBackend {
                     id: line.id.clone(),
                     text: line.render(timestamps),
                     level,
+                    container: line.container.clone(),
                 })
             })
             .collect::<Vec<_>>();
@@ -753,13 +828,20 @@ impl RuntimeLogBackend for CloudWatchLogBackend {
             .context("CloudWatch volume end is outside the supported timestamp range")?;
 
         let prefix = self.stream_prefix(deployment, project);
+        let request_prefixes = Self::request_prefixes(&prefix, &query.containers);
+        let request_prefix = match request_prefixes.as_slice() {
+            [single] => single.clone(),
+            _ => prefix.clone(),
+        };
         let result = self
             .scan(CloudWatchScan {
                 prefix: &prefix,
+                request_prefix: &request_prefix,
                 start: query.start_time,
                 end: query.end_time,
                 levels: &query.levels,
                 search: query.search.as_deref(),
+                containers: &query.containers,
                 stop_after: None,
                 before: None,
             })
@@ -810,6 +892,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn container_is_read_from_the_stream_name_after_the_deployment_prefix() {
+        let prefix = "rise/project-uuid/deployment-uuid/";
+        assert_eq!(
+            container_from_stream(prefix, &format!("{prefix}web/task-1")),
+            Some("web".to_string())
+        );
+        // A stream from another deployment shares the log group but not the
+        // prefix, and must never be attributed to this one.
+        assert_eq!(
+            container_from_stream(prefix, "rise/project-uuid/other-uuid/web/task-1"),
+            None
+        );
+        assert_eq!(container_from_stream(prefix, prefix), None);
+    }
+
+    #[test]
+    fn request_prefixes_narrow_to_one_stream_prefix_per_container() {
+        let prefix = "rise/project-uuid/deployment-uuid/";
+        assert_eq!(
+            CloudWatchLogBackend::request_prefixes(prefix, &[]),
+            vec![prefix.to_string()]
+        );
+        assert_eq!(
+            CloudWatchLogBackend::request_prefixes(prefix, &["web".to_string(), "api".to_string()]),
+            vec![format!("{prefix}web/"), format!("{prefix}api/"),]
+        );
+    }
+
+    #[test]
+    fn container_filter_keeps_only_the_named_containers() {
+        let line = |container: &str| CloudWatchLine {
+            id: "event-1".into(),
+            pagination_id: "event-1".into(),
+            timestamp_millis: 1_700_000_000_000,
+            ingestion_time_millis: 1_700_000_000_100,
+            log_stream: format!("rise/project/deployment/{container}/task"),
+            message: "hello".into(),
+            container: Some(container.to_string()),
+        };
+        assert!(line("web").matches(&[], None, &["web".to_string()]));
+        assert!(!line("api").matches(&[], None, &["web".to_string()]));
+        // An unattributable line (a stream outside the deployment prefix)
+        // is dropped by a container filter rather than passed through.
+        let mut orphan = line("web");
+        orphan.container = None;
+        assert!(!orphan.matches(&[], None, &["web".to_string()]));
+        assert!(orphan.matches(&[], None, &[]));
+    }
+
+    #[test]
     fn filtered_line_uses_the_shared_classifier_and_search() {
         let line = CloudWatchLine {
             id: "event-1".into(),
@@ -818,11 +950,12 @@ mod tests {
             ingestion_time_millis: 1_700_000_000_100,
             log_stream: "rise/project/deployment/app/task".into(),
             message: "ERROR Database Unavailable".into(),
+            container: None,
         };
         assert_eq!(line.level(), "error");
-        assert!(line.matches(&["error".into()], Some("database")));
-        assert!(!line.matches(&["warn".into()], Some("database")));
-        assert!(!line.matches(&[], Some("missing")));
+        assert!(line.matches(&["error".into()], Some("database"), &[]));
+        assert!(!line.matches(&["warn".into()], Some("database"), &[]));
+        assert!(!line.matches(&[], Some("missing"), &[]));
     }
 
     #[test]
@@ -834,6 +967,7 @@ mod tests {
             ingestion_time_millis: 1_700_000_000_100,
             log_stream: "stream".into(),
             message: "hello".into(),
+            container: None,
         };
         assert_eq!(line.clone().render(false), "hello");
         assert_eq!(line.render(true), "2023-11-14T22:13:20+00:00 hello");
@@ -886,6 +1020,7 @@ mod tests {
             ingestion_time_millis: timestamp_millis,
             log_stream: "stream".into(),
             message: id.into(),
+            container: None,
         };
         let all = vec![
             line(500, "fifth"),
@@ -927,6 +1062,7 @@ mod tests {
             ingestion_time_millis: 600,
             log_stream: "stream".into(),
             message: id.into(),
+            container: None,
         };
         let all = vec![line("a"), line("b"), line("c")];
 
@@ -957,6 +1093,7 @@ mod tests {
             ingestion_time_millis: 600,
             log_stream: "stream".into(),
             message: "repeated".into(),
+            container: None,
         };
         let mut first = line();
         let mut second = line();

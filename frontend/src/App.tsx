@@ -15,6 +15,7 @@ import { Profile } from './features/profile';
 import { ProjectsList } from './features/projects-list';
 import { ProjectDetail } from './features/project-detail';
 import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployments';
+import { DeploymentLogsPage } from './features/logs/logs-page';
 import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
 import { usePrefs } from './lib/prefs';
@@ -219,8 +220,10 @@ export function App() {
         view = 'team-detail';
         params.teamName = route.split('/')[1];
     } else if (route.startsWith('deployment/')) {
-        view = 'deployment-detail';
         const parts = route.split('/');
+        // `/deployment/:project/:id/logs` is the full-screen log console; the
+        // bare form is the deployment detail page.
+        view = parts[3] === 'logs' ? 'deployment-logs' : 'deployment-detail';
         params.projectName = parts[1];
         params.deploymentId = parts[2];
     } else {
@@ -248,6 +251,12 @@ export function App() {
             { label: params.projectName, href: `/project/${params.projectName}` },
             { label: 'Environments', href: `/project/${params.projectName}/environments` },
             { label: params.environmentName + (params.groupName ? ` / ${params.groupName}` : '') },
+        ]; break;
+        case 'deployment-logs': breadcrumbs = [
+            { label: 'Projects', href: '/projects' },
+            { label: params.projectName, href: `/project/${params.projectName}` },
+            { label: params.deploymentId, href: `/deployment/${params.projectName}/${params.deploymentId}` },
+            { label: 'Logs' },
         ]; break;
         case 'deployment-detail': breadcrumbs = [
             { label: 'Projects', href: '/projects' },
@@ -294,7 +303,7 @@ export function App() {
 
     return (
         <>
-            <Shell route={pathname} breadcrumbs={breadcrumbs} user={user} onLogout={logout} onOpenPalette={() => setCommandPaletteOpen(true)}>
+            <Shell route={pathname} breadcrumbs={breadcrumbs} user={user} onLogout={logout} fullBleed={view === 'deployment-logs'} onOpenPalette={() => setCommandPaletteOpen(true)}>
                 <ErrorBoundary key={pathname}>
                     {view === 'home' && <Home user={user} />}
                     {view === 'profile' && <Profile user={user} />}
@@ -304,6 +313,7 @@ export function App() {
                     {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
                     {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} groupName={params.groupName} />}
                     {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
+                    {view === 'deployment-logs' && <DeploymentLogsPage projectName={params.projectName} deploymentId={params.deploymentId} />}
                     {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
                 </ErrorBoundary>
             </Shell>

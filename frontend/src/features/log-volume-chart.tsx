@@ -1,7 +1,8 @@
-// @ts-nocheck
-import { useMemo } from 'react';
-import { Bar, BarChart, CartesianGrid, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts';
 import { formatDate } from '../lib/utils';
+import { Tooltip } from '../components/r-ui';
+import type { TimelineCursor, TimelineCursorStore } from './logs/timeline-cursor';
 
 // Color for any level the backend advertises. Driven by CSS variables so
 // dark/light mode and design-token changes don't need code edits. Levels
@@ -17,6 +18,18 @@ const LEVEL_COLOR_VAR = {
     trace: '--r-log-chart-trace',
     unknown: '--r-log-chart-unknown',
 };
+
+const MARKER_COLOR = {
+    rollout: 'var(--accent)',
+    up: 'var(--ok)',
+    done: 'var(--ok)',
+    restart: 'var(--warn)',
+    failed: 'var(--err)',
+};
+
+function markerColor(kind) {
+    return MARKER_COLOR[kind] || 'var(--text-soft)';
+}
 
 function levelColor(level) {
     const v = LEVEL_COLOR_VAR[level] || '--r-log-chart-unknown';
@@ -64,7 +77,7 @@ function LogChartTooltip({ active, payload, stepSeconds, levels }: { active?: bo
     );
 }
 
-export default function LogVolumeChart({ counts, levels, loading, error, status, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs }) {
+export default function LogVolumeChart({ counts, levels, loading, error, status, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs, height = 96, markers = [], timelineCursor = null }) {
     // Flatten each bucket's `by_level` map into top-level keys so Recharts'
     // `<Bar dataKey="info">` can read them directly.
     const data = useMemo(
@@ -83,6 +96,69 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
         [counts],
     );
     const totalSum = useMemo(() => data.reduce((sum, b) => sum + (b.total || 0), 0), [data]);
+    // The x-axis domain is the data extent, not the picked range, so a marker
+    // outside it has nowhere to sit and would read as though it happened at
+    // whichever edge it was clamped to.
+    const domain = useMemo(() => (
+        data.length > 0 ? { min: data[0].ts, max: data[data.length - 1].ts } : null
+    ), [data]);
+    /**
+     * The marker lane and the reader cursor have to line up with the bars, and
+     * only Recharts knows where its plot area actually is: the YAxis reserves
+     * width for its tick labels, so the inset is not something the caller can
+     * compute. Read it off the rendered axis lines — the x-axis line spans
+     * exactly the plot width, the y-axis line its height.
+     */
+    const bodyRef = useRef(null);
+    const [plot, setPlot] = useState(null);
+    const measurePlot = useCallback(() => {
+        const body = bodyRef.current;
+        if (!body) return;
+        const axis = body.querySelector('.recharts-xAxis .recharts-cartesian-axis-line');
+        if (!axis) return;
+        const a = axis.getBoundingClientRect();
+        const b = body.getBoundingClientRect();
+        if (a.width <= 0) return;
+        // The vertical extent is optional: the marker lane only needs the
+        // horizontal one, so a chart rendered without a y-axis line still
+        // positions its markers and simply carries no cursor overlay.
+        const yAxis = body.querySelector('.recharts-yAxis .recharts-cartesian-axis-line');
+        const y = yAxis ? yAxis.getBoundingClientRect() : null;
+        setPlot((prev) => {
+            const next = {
+                left: a.left - b.left,
+                width: a.width,
+                top: y ? y.top - b.top : 0,
+                height: y ? y.height : 0,
+            };
+            const settled = prev
+                && Math.abs(prev.left - next.left) < 0.5
+                && Math.abs(prev.width - next.width) < 0.5
+                && Math.abs(prev.top - next.top) < 0.5
+                && Math.abs(prev.height - next.height) < 0.5;
+            return settled ? prev : next;
+        });
+    }, []);
+
+    useLayoutEffect(() => { measurePlot(); });
+
+    useEffect(() => {
+        const body = bodyRef.current;
+        if (!body || typeof ResizeObserver === 'undefined') return undefined;
+        const observer = new ResizeObserver(measurePlot);
+        observer.observe(body);
+        return () => observer.disconnect();
+    }, [measurePlot]);
+
+    const visibleMarkers = useMemo(() => {
+        if (!domain) return [];
+        // Bucket timestamps are right edges, so the first bar covers the step
+        // *before* `domain.min`. Rollout events cluster at the start of a
+        // window, so excluding that step would hide exactly the markers worth
+        // seeing; they are admitted and pinned to the leading edge instead.
+        const lowerBound = domain.min - stepSeconds * 1000;
+        return markers.filter((m) => m.ts >= lowerBound && m.ts <= domain.max);
+    }, [markers, domain, stepSeconds]);
     const rangeMs = (rangeEndMs || 0) - (rangeStartMs || 0);
 
     // Render bars for every advertised level, even when a bucket has 0 for
@@ -134,8 +210,9 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
             ) : !data.length || totalSum === 0 ? (
                 <div className="py-6 text-center text-xs text-[var(--text-soft)]">{statusMessage()}</div>
             ) : (
+                <div className="r-logc-chart-body" ref={bodyRef}>
                 <div role="img" aria-label={chartAriaLabel}>
-                <ResponsiveContainer width="100%" height={96}>
+                <ResponsiveContainer width="100%" height={height}>
                     <BarChart
                         data={data}
                         margin={{ top: 4, right: 6, bottom: 4, left: 4 }}
@@ -164,6 +241,16 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                             content={<LogChartTooltip stepSeconds={stepSeconds} levels={stackLevels} />}
                             cursor={{ fill: 'var(--r-logs-chart-cursor)' }}
                         />
+                        {visibleMarkers.map((marker, i) => (
+                            <ReferenceLine
+                                key={`marker-${marker.ts}-${i}`}
+                                x={marker.ts}
+                                stroke={markerColor(marker.kind)}
+                                strokeDasharray="3 2"
+                                strokeOpacity={0.85}
+                                ifOverflow="hidden"
+                            />
+                        ))}
                         {stackLevels.map((level) => (
                             <Bar
                                 key={level}
@@ -188,7 +275,159 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                     </BarChart>
                 </ResponsiveContainer>
                 </div>
+                {timelineCursor && domain && plot && plot.height > 0 && (
+                    <ChartTimelineCursor store={timelineCursor} domain={domain} plot={plot} />
+                )}
+                {visibleMarkers.length > 0 && domain && plot && (
+                    /* Its own lane under the chart rather than an overlay: the
+                       reference lines already carry the eye down through the
+                       bars, and a lane cannot collide with the axis labels. */
+                    <div
+                        className="r-logc-markers"
+                        style={{ left: plot.left, width: plot.width }}
+                    >
+                        {clusterMarkers(visibleMarkers, domain, plot.width).map((cluster, i) => {
+                            const marker = cluster.lead;
+                            const pct = cluster.pct;
+                            return (
+                                /* The slot carries the position so the tooltip's
+                                   own wrapper hugs the dot; anchoring a tooltip
+                                   to an absolutely positioned child leaves it
+                                   pointing at the lane's origin instead. */
+                                <span
+                                    key={`lane-${marker.ts}-${i}`}
+                                    className="r-logc-marker-slot"
+                                    style={{ left: `${pct}%` }}
+                                >
+                                    <Tooltip
+                                        content={cluster.markers.map((m) => (
+                                            <div key={`${m.ts}-${m.label}`}>
+                                                {m.label} · {formatMarkerTime(m.ts)}
+                                            </div>
+                                        ))}
+                                    >
+                                        <span
+                                            className={`r-logc-marker is-${marker.kind}${cluster.markers.length > 1 ? ' is-cluster' : ''}`}
+                                            style={{ background: markerColor(marker.kind) }}
+                                            aria-label={cluster.markers
+                                                .map((m) => `${m.label} at ${formatMarkerTime(m.ts)}`)
+                                                .join('; ')}
+                                        />
+                                    </Tooltip>
+                                </span>
+                            );
+                        })}
+                    </div>
+                )}
+            </div>
             )}
         </div>
     );
+}
+
+/**
+ * Marks where the reader currently is: a faint band over everything loaded, a
+ * stronger one over the rows on screen inside it, and a hairline at the row
+ * under the pointer.
+ *
+ * The two bands answer different questions. At a wide range the loaded buffer
+ * is often a thin slice of the window — the faint band shows how much of the
+ * chart scrolling alone can reach, which is what makes a narrow viewport band
+ * at the right-hand edge legible instead of puzzling.
+ *
+ * Its own subscriber rather than a prop on the chart. The span changes on every
+ * scroll frame, and re-rendering the Recharts tree that often to move two
+ * absolutely positioned elements would cost far more than it draws.
+ *
+ * Positions map linearly onto the x-axis domain, exactly as the marker lane
+ * does, so a timestamp lands where the axis says that moment is. Bars are
+ * centred on their bucket's right edge, so a line inside the newest bucket sits
+ * up to half a bar left of it — the same offset the axis tick labels carry.
+ */
+function ChartTimelineCursor({ store, domain, plot }: {
+    store: TimelineCursorStore;
+    domain: { min: number; max: number };
+    plot: { left: number; width: number; top: number; height: number };
+}) {
+    const cursor = useSyncExternalStore<TimelineCursor | null>(
+        store.subscribe,
+        store.get,
+        store.get,
+    );
+    if (!cursor) return null;
+
+    const span = Math.max(1, domain.max - domain.min);
+    const pct = (ms: number) => ((ms - domain.min) / span) * 100;
+    /**
+     * Clamp a span to the plot, or drop it when it falls wholly outside. Lines
+     * paged in from before the charted window have nothing to point at, and a
+     * band pinned to the edge would claim the reader is somewhere they are not.
+     */
+    const band = (startMs: number, endMs: number) => {
+        const from = pct(startMs);
+        const to = pct(endMs);
+        if (to < 0 || from > 100) return null;
+        const left = Math.max(0, Math.min(100, from));
+        const right = Math.max(0, Math.min(100, to));
+        return { left: `${left}%`, width: `${Math.max(0, right - left)}%` };
+    };
+    const buffer = band(cursor.bufferStartMs, cursor.bufferEndMs);
+    const view = band(cursor.viewStartMs, cursor.viewEndMs);
+    const hover = cursor.hoverMs === null ? null : pct(cursor.hoverMs);
+    const hoverVisible = hover !== null && hover >= 0 && hover <= 100;
+
+    return (
+        <div
+            className="r-logc-chart-cursor"
+            style={{ left: plot.left, top: plot.top, width: plot.width, height: plot.height }}
+            aria-hidden="true"
+        >
+            {buffer && <span className="r-logc-chart-cursor-buffer" style={buffer} />}
+            {view && <span className="r-logc-chart-cursor-span" style={view} />}
+            {hoverVisible && (
+                <span className="r-logc-chart-cursor-line" style={{ left: `${hover}%` }} />
+            )}
+        </div>
+    );
+}
+
+const MARKER_KIND_PRIORITY = ['failed', 'restart', 'up', 'rollout', 'done'];
+
+/**
+ * Merge markers that would land on the same few pixels.
+ *
+ * Deployment events happen seconds apart while a window spans hours, so at most
+ * ranges several markers collapse onto one spot. Stacked dots hide each other
+ * and only the topmost can be hovered, so a crowd becomes one dot whose tooltip
+ * lists everything in it. The dot takes the most severe kind present, so an
+ * OOMKill is never masked by a routine start alongside it.
+ */
+function clusterMarkers(markers, domain, laneWidth) {
+    const span = Math.max(1, domain.max - domain.min);
+    const threshold = 10;
+    const clusters = [];
+
+    for (const marker of markers) {
+        const pct = Math.min(100, Math.max(0, ((marker.ts - domain.min) / span) * 100));
+        const x = (pct / 100) * laneWidth;
+        const open = clusters[clusters.length - 1];
+        if (open && Math.abs(x - open.x) <= threshold) {
+            open.markers.push(marker);
+        } else {
+            clusters.push({ x, pct, markers: [marker] });
+        }
+    }
+
+    return clusters.map((cluster) => ({
+        ...cluster,
+        lead: [...cluster.markers].sort(
+            (a, b) => MARKER_KIND_PRIORITY.indexOf(a.kind) - MARKER_KIND_PRIORITY.indexOf(b.kind),
+        )[0],
+    }));
+}
+
+function formatMarkerTime(ms) {
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
