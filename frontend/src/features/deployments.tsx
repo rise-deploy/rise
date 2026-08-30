@@ -1019,7 +1019,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         { id: 'timeline', label: 'Timeline' },
         ...(hasControllerMetadata ? [{ id: 'controller', label: 'Controller' }] : []),
         ...(deployment.build_logs ? [{ id: 'build', label: 'Build output' }] : []),
-        { id: 'env', label: 'Environment' },
+        { id: 'variables', label: 'Variables' },
     ];
 
     // A `?tab=` naming a tab this deployment has no data for — a build-output
@@ -1295,7 +1295,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 </Panel>
             )}
 
-            {activeTab === 'env' && (
+            {activeTab === 'variables' && (
                 <Panel>
                     <PanelHead title="Environment variables" sub="Snapshot captured for this deployment" />
                     <PanelBody>
