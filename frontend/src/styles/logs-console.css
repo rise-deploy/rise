@@ -764,14 +764,26 @@
    read against what the deployment itself was doing at that moment. */
 .r-logc-chart-body { position: relative; }
 
-/* Where the reader is in the buffer, drawn over the bars: a band for the rows
-   on screen and a hairline for the hovered one. Purely indicative — it never
-   takes pointer events, so the chart's own bar tooltip and click-to-filter keep
-   working underneath it. */
+/* Where the reader is in the buffer, drawn over the bars: a faint band for
+   everything loaded, a stronger one for the rows on screen, and a hairline for
+   the hovered row. Purely indicative — it never takes pointer events, so the
+   chart's own bar tooltip and click-to-filter keep working underneath it. */
 .r-logc-chart-cursor {
     position: absolute;
     pointer-events: none;
     overflow: hidden;
+}
+
+/* The reachable-by-scrolling extent. Faint enough to read as ground the
+   viewport band sits on rather than as a second thing to look at. */
+.r-logc-chart-cursor-buffer {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    min-width: 2px;
+    background: color-mix(in oklch, var(--accent) 8%, transparent);
+    border-inline: 1px solid color-mix(in oklch, var(--accent) 25%, transparent);
+    box-shadow: inset 0 2px 0 color-mix(in oklch, var(--accent) 40%, transparent);
 }
 
 .r-logc-chart-cursor-span {
@@ -781,12 +793,13 @@
     /* A viewport of lines that arrived in the same second is far narrower than
        a pixel at most ranges; keep it wide enough to stay visible. */
     min-width: 2px;
-    background: color-mix(in oklch, var(--accent) 16%, transparent);
-    border-inline: 1px solid color-mix(in oklch, var(--accent) 50%, transparent);
-    /* A wash alone is hard to pick out against the stacked bars it covers, so
-       the band is capped by a solid rule along the plot's top edge — clear of
-       the bars, which grow from the bottom. */
-    box-shadow: inset 0 2px 0 var(--accent);
+    background: color-mix(in oklch, var(--accent) 18%, transparent);
+    border-inline: 1px solid color-mix(in oklch, var(--accent) 55%, transparent);
+    /* A wash alone is lost against the saturated stacked bars it covers, so
+       each band is capped by a rule along the plot's top edge. Together the
+       two caps read as a scrollbar over the timeline: a faint track for what
+       is loaded, a solid thumb for what is on screen. */
+    box-shadow: inset 0 3px 0 var(--accent);
 }
 
 .r-logc-chart-cursor-line {

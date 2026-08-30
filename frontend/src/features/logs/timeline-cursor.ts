@@ -10,9 +10,15 @@
  */
 
 export interface TimelineCursor {
+    /**
+     * Time span of every loaded row — the part of the timeline the reader can
+     * reach by scrolling alone, without fetching another page.
+     */
+    bufferStartMs: number;
+    bufferEndMs: number;
     /** Time span covered by the rows currently on screen. */
-    startMs: number;
-    endMs: number;
+    viewStartMs: number;
+    viewEndMs: number;
     /** Timestamp of the row under the pointer, or `null` when none is hovered. */
     hoverMs: number | null;
 }
@@ -26,7 +32,11 @@ export interface TimelineCursorStore {
 function same(a: TimelineCursor | null, b: TimelineCursor | null): boolean {
     if (a === b) return true;
     if (!a || !b) return false;
-    return a.startMs === b.startMs && a.endMs === b.endMs && a.hoverMs === b.hoverMs;
+    return a.bufferStartMs === b.bufferStartMs
+        && a.bufferEndMs === b.bufferEndMs
+        && a.viewStartMs === b.viewStartMs
+        && a.viewEndMs === b.viewEndMs
+        && a.hoverMs === b.hoverMs;
 }
 
 export function createTimelineCursorStore(): TimelineCursorStore {

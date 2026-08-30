@@ -182,15 +182,34 @@ export function LogStream({
     const cursorFrameRef = useRef(0);
 
     /**
-     * Publish the visible span. Rows are oldest-first, so the span runs from
-     * the first timestamped row on screen to the last one; rows whose line
-     * carried no parseable timestamp are skipped rather than reported as the
-     * epoch.
+     * Time span of the whole buffer. Rows are oldest-first, so this is the
+     * first and last timestamped row; a line whose text carried no parseable
+     * timestamp is skipped rather than reported as the epoch. Memoized on the
+     * buffer rather than recomputed per frame — it only moves when a page
+     * loads or the tail advances, not when the reader scrolls.
+     */
+    const bufferSpan = useMemo(() => {
+        let startMs = 0;
+        for (let i = 0; i < entries.length; i++) {
+            if (entries[i].timestampMs > 0) { startMs = entries[i].timestampMs; break; }
+        }
+        let endMs = 0;
+        for (let i = entries.length - 1; i >= 0; i--) {
+            if (entries[i].timestampMs > 0) { endMs = entries[i].timestampMs; break; }
+        }
+        return startMs > 0 && endMs > 0 ? { startMs, endMs } : null;
+    }, [entries]);
+
+    /**
+     * Publish where the reader is: the span of the rows on screen, inside the
+     * span of everything loaded. Both are required — without a viewport span
+     * there is no reader position to mark, and the buffer band alone would
+     * only be half the answer.
      */
     const publishCursor = useCallback(() => {
         if (!timelineCursor) return;
         const el = scrollRef.current;
-        if (!el || entries.length === 0) {
+        if (!el || entries.length === 0 || !bufferSpan) {
             timelineCursor.set(null);
             return;
         }
@@ -200,23 +219,29 @@ export function LogStream({
             timelineCursor.set(null);
             return;
         }
-        let startMs = 0;
+        let viewStartMs = 0;
         for (let i = first.index; i <= last.index; i++) {
-            if (entries[i]?.timestampMs > 0) { startMs = entries[i].timestampMs; break; }
+            if (entries[i]?.timestampMs > 0) { viewStartMs = entries[i].timestampMs; break; }
         }
-        let endMs = 0;
+        let viewEndMs = 0;
         for (let i = last.index; i >= first.index; i--) {
-            if (entries[i]?.timestampMs > 0) { endMs = entries[i].timestampMs; break; }
+            if (entries[i]?.timestampMs > 0) { viewEndMs = entries[i].timestampMs; break; }
         }
-        if (startMs === 0 || endMs === 0) {
+        if (viewStartMs === 0 || viewEndMs === 0) {
             timelineCursor.set(null);
             return;
         }
-        timelineCursor.set({ startMs, endMs, hoverMs: hoverMsRef.current });
+        timelineCursor.set({
+            bufferStartMs: bufferSpan.startMs,
+            bufferEndMs: bufferSpan.endMs,
+            viewStartMs,
+            viewEndMs,
+            hoverMs: hoverMsRef.current,
+        });
         // `virtualizer` is a new object every render; its scroll geometry is
         // read live above, so it does not belong in the dependency list.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [entries, timelineCursor]);
+    }, [entries, bufferSpan, timelineCursor]);
 
     /**
      * Coalesce the scroll/hover bursts into at most one publish per frame.

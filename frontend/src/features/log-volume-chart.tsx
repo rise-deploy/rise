@@ -326,8 +326,14 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
 }
 
 /**
- * Marks where the reader currently is: a band over the time span the visible
- * log rows cover, and a hairline at the row under the pointer.
+ * Marks where the reader currently is: a faint band over everything loaded, a
+ * stronger one over the rows on screen inside it, and a hairline at the row
+ * under the pointer.
+ *
+ * The two bands answer different questions. At a wide range the loaded buffer
+ * is often a thin slice of the window — the faint band shows how much of the
+ * chart scrolling alone can reach, which is what makes a narrow viewport band
+ * at the right-hand edge legible instead of puzzling.
  *
  * Its own subscriber rather than a prop on the chart. The span changes on every
  * scroll frame, and re-rendering the Recharts tree that often to move two
@@ -352,14 +358,21 @@ function ChartTimelineCursor({ store, domain, plot }: {
 
     const span = Math.max(1, domain.max - domain.min);
     const pct = (ms: number) => ((ms - domain.min) / span) * 100;
-    const from = pct(cursor.startMs);
-    const to = pct(cursor.endMs);
-    // A buffer scrolled outside the charted window (older lines paged in past
-    // the range start) has nothing to point at; drawing it clamped to an edge
-    // would claim the reader is somewhere they are not.
-    const visible = to >= 0 && from <= 100;
-    const left = Math.max(0, Math.min(100, from));
-    const right = Math.max(0, Math.min(100, to));
+    /**
+     * Clamp a span to the plot, or drop it when it falls wholly outside. Lines
+     * paged in from before the charted window have nothing to point at, and a
+     * band pinned to the edge would claim the reader is somewhere they are not.
+     */
+    const band = (startMs: number, endMs: number) => {
+        const from = pct(startMs);
+        const to = pct(endMs);
+        if (to < 0 || from > 100) return null;
+        const left = Math.max(0, Math.min(100, from));
+        const right = Math.max(0, Math.min(100, to));
+        return { left: `${left}%`, width: `${Math.max(0, right - left)}%` };
+    };
+    const buffer = band(cursor.bufferStartMs, cursor.bufferEndMs);
+    const view = band(cursor.viewStartMs, cursor.viewEndMs);
     const hover = cursor.hoverMs === null ? null : pct(cursor.hoverMs);
     const hoverVisible = hover !== null && hover >= 0 && hover <= 100;
 
@@ -369,12 +382,8 @@ function ChartTimelineCursor({ store, domain, plot }: {
             style={{ left: plot.left, top: plot.top, width: plot.width, height: plot.height }}
             aria-hidden="true"
         >
-            {visible && (
-                <span
-                    className="r-logc-chart-cursor-span"
-                    style={{ left: `${left}%`, width: `${Math.max(0, right - left)}%` }}
-                />
-            )}
+            {buffer && <span className="r-logc-chart-cursor-buffer" style={buffer} />}
+            {view && <span className="r-logc-chart-cursor-span" style={view} />}
             {hoverVisible && (
                 <span className="r-logc-chart-cursor-line" style={{ left: `${hover}%` }} />
             )}
