@@ -1,4 +1,4 @@
--- An append-only log of what happened to a deployment (ADR-0006).
+-- An append-only log of what happened to a deployment.
 --
 -- Distinct from `deployments.status` (one value) and
 -- `deployments.controller_metadata` (a snapshot rewritten each reconcile tick):
@@ -12,20 +12,21 @@ CREATE TABLE deployment_events (
     -- first. Readers page on (recorded_at, id) and tolerate that.
     id            BIGSERIAL   PRIMARY KEY,
     deployment_id UUID        NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
-    -- When it happened, per the runtime's clock; capped at `recorded_at` by the
-    -- writer, with the raw value preserved in `attributes.clock_skew`.
+    -- When it happened, per the clock of whatever observed it. Not necessarily
+    -- trustworthy or monotonic, which is why nothing pages on it.
     occurred_at   TIMESTAMPTZ NOT NULL,
-    -- When Rise found out. Drives retention and pagination, because it is the
-    -- only one of the two clocks Rise controls.
+    -- When Rise found out. Pagination cuts on this, because it is the only one
+    -- of the two clocks Rise controls.
     recorded_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     kind          TEXT        NOT NULL,
     severity      TEXT        NOT NULL,
     source        TEXT        NOT NULL,
     message       TEXT,
     attributes    JSONB       NOT NULL DEFAULT '{}'::jsonb,
-    -- Set only for events derived from an observation, where re-deriving the
-    -- same edge must not write twice. Status events leave it NULL: a repeated
-    -- transition is legitimate and must not be collapsed.
+    -- Reserved for events derived from a repeated observation, where
+    -- re-deriving the same edge must not write twice. Nothing sets it yet:
+    -- status transitions leave it NULL, because a repeated transition is
+    -- legitimate and must not be collapsed.
     dedupe_key    TEXT,
 
     CONSTRAINT deployment_events_severity_known
@@ -47,7 +48,8 @@ CREATE TABLE deployment_events (
 CREATE INDEX deployment_events_by_recorded
     ON deployment_events (deployment_id, recorded_at DESC, id DESC);
 
--- The age sweep is global, so `recorded_at` leads.
+-- Reserved for a global age sweep, which does not exist yet: `recorded_at`
+-- leads because a sweep cuts across deployments.
 CREATE INDEX deployment_events_sweep ON deployment_events (recorded_at);
 
 CREATE UNIQUE INDEX deployment_events_dedupe
@@ -55,7 +57,7 @@ CREATE UNIQUE INDEX deployment_events_dedupe
     WHERE dedupe_key IS NOT NULL;
 
 -- With the log in place, the controller-observed pod snapshot is no longer
--- produced (ADR-0006 D1): a deployment's observability is its event log.
+-- produced: a deployment's observability is its event log.
 -- Existing rows still carry the last snapshot each controller wrote, and
 -- `controller_metadata` is surfaced verbatim for introspection, so leaving them
 -- would display state that stopped advancing at upgrade time.

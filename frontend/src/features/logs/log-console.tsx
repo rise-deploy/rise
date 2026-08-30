@@ -80,7 +80,6 @@ export interface LogConsoleProps {
     deploymentCreated?: string | null;
     /** Container names declared by the deployment, for the container filter. */
     containers?: string[];
-    /** Deployment events drawn on the volume rail's time axis. */
     /** Deployment metadata panels, shown in the slide-over details drawer. */
     details?: React.ReactNode;
     /** `page` fills the viewport; `embedded` sits inside the deployment tab. */
@@ -149,7 +148,6 @@ export function LogConsole({
                 if (err instanceof Error && err.name === 'AbortError') return;
                 // The rail simply has no markers on failure, which is the
                 // honest rendering of "we could not read the log".
-                // here degrades the timeline rather than breaking the console.
                 console.warn('Could not load deployment events:', err);
             }
         })();

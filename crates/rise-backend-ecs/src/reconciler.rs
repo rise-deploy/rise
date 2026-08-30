@@ -27,8 +27,7 @@ use rise_backend_core::{
     effective_health_path, hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash,
     resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
     should_have_infrastructure, spec_key, DeploymentStore, DeploymentUrlBuilder, DesiredContainer,
-    DesiredRoute, EncryptionProvider, InspectedContainer, ResolvedDeploymentEnvVars,
-    DEPLOYING_TIMEOUT_MINUTES,
+    DesiredRoute, EncryptionProvider, ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES,
 };
 use rise_backend_traefik::{replica_ready, ReadyVerdict, TraefikApiClient};
 use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
@@ -1911,7 +1910,6 @@ impl EcsReconciler {
         let mut rolling_but_serving = true;
         let now = chrono::Utc::now();
         let mut reasons: Vec<String> = Vec::new();
-        let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
 
         for spec in &container_specs {
             let key = spec_key(
@@ -1924,7 +1922,6 @@ impl EcsReconciler {
                 all_ready = false;
                 rolling_but_serving = false;
                 reasons.push(format!("service for '{}' not found", spec.name));
-                pods.push((spec.name.clone(), None));
                 continue;
             };
 
@@ -2034,8 +2031,6 @@ impl EcsReconciler {
                     format!("{}[{}]", spec.name, idx)
                 };
                 let task = current.get(idx);
-                let inspected = task.map(|t| t.inspected.clone());
-
                 let verdict = match task {
                     None => ReadyVerdict::NotReady(format!("'{label}' task not running")),
                     Some(task) => verdict_for(task, &label),
@@ -2048,7 +2043,6 @@ impl EcsReconciler {
                 }
                 // Always recorded, even when the verdict short-circuits, so the
                 // Pods tab shows the full picture rather than a truncated one.
-                pods.push((task.map(|t| t.name.clone()).unwrap_or(label), inspected));
             }
 
             // Whether the revision being replaced is still answering for this
@@ -2236,30 +2230,11 @@ impl EcsReconciler {
                     .find(|d| d.name() == Some("privateIPv4Address"))
                     .and_then(|d| d.value())
                     .map(str::to_string);
-                let container = task.containers().first();
-
                 views.push(TaskView {
                     name: name.clone(),
                     task_definition_arn: task.task_definition_arn().unwrap_or_default().to_string(),
                     running,
                     ip,
-                    inspected: InspectedContainer {
-                        // ECS status strings are uppercase; the shared readiness
-                        // mapper expects Docker's lowercase vocabulary.
-                        status: Some(ecs_status_to_container_state(&last_status).to_string()),
-                        running,
-                        started_at: task.started_at().map(|t| t.to_string()),
-                        finished_at: task.stopped_at().map(|t| t.to_string()),
-                        exit_code: container.and_then(|c| c.exit_code()).map(|c| c as i64),
-                        restart_count: None,
-                        health: task.health_status().map(|h| h.as_str().to_lowercase()),
-                        error: task
-                            .stopped_reason()
-                            .filter(|r| !r.is_empty())
-                            .map(str::to_string),
-                        ip: None,
-                        published_host_port: None,
-                    },
                 });
             }
         }
@@ -2305,7 +2280,6 @@ struct TaskView {
     /// The task's ENI private IP — the key Traefik's `serverStatus` uses
     /// (`http://{ip}:{port}`).
     ip: Option<String>,
-    inspected: InspectedContainer,
 }
 
 /// Collapse a `describe_service_tasks` pass into a single readiness-relevant
@@ -2338,20 +2312,6 @@ fn primary_rollout_start(
         .find(|d| d.status() == Some("PRIMARY"))
         .and_then(|d| d.created_at())
         .and_then(|t| chrono::DateTime::from_timestamp(t.secs(), 0))
-}
-
-/// Map an ECS task `lastStatus` onto the shared container-state vocabulary, so
-/// readiness is decided the same way on every backend.
-pub(crate) fn ecs_status_to_container_state(last_status: &str) -> &'static str {
-    match last_status {
-        "RUNNING" => "running",
-        // Everything before RUNNING is a pending state; none of them are ready
-        // as "waiting", which is what a user expects while a task starts.
-        "PROVISIONING" | "PENDING" | "ACTIVATING" => "created",
-        "DEACTIVATING" | "STOPPING" | "DEPROVISIONING" => "restarting",
-        "STOPPED" => "exited",
-        _ => "",
-    }
 }
 
 /// Whether a configured controller class matches an Organization's.
@@ -2391,10 +2351,7 @@ pub(crate) fn clamp_replicas(requested: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        persisted_td_hash, tasks_or_indeterminate, with_persisted_td_hash, InspectedContainer,
-        TaskView,
-    };
+    use super::{persisted_td_hash, tasks_or_indeterminate, with_persisted_td_hash, TaskView};
 
     fn task_view(name: &str) -> TaskView {
         TaskView {
@@ -2402,18 +2359,6 @@ mod tests {
             task_definition_arn: "arn:aws:ecs:task-def/foo:1".to_string(),
             running: true,
             ip: None,
-            inspected: InspectedContainer {
-                status: Some("running".to_string()),
-                running: true,
-                started_at: None,
-                finished_at: None,
-                exit_code: None,
-                restart_count: None,
-                health: None,
-                error: None,
-                ip: None,
-                published_host_port: None,
-            },
         }
     }
 
@@ -2792,21 +2737,6 @@ mod tests {
             !controller_class_matches("default", None),
             "an Organization with no class belongs to no controller"
         );
-    }
-
-    #[test]
-    fn ecs_task_states_map_onto_the_shared_container_state_vocabulary() {
-        // The Pods tab is rendered from one shared JSON shape across all
-        // backends. ECS reports uppercase lifecycle states that mean nothing to
-        // that mapper — leaving them unmapped would show every task as "Unknown"
-        // for its entire life.
-        assert_eq!(ecs_status_to_container_state("RUNNING"), "running");
-        assert_eq!(ecs_status_to_container_state("PENDING"), "created");
-        assert_eq!(ecs_status_to_container_state("PROVISIONING"), "created");
-        assert_eq!(ecs_status_to_container_state("STOPPED"), "exited");
-        assert_eq!(ecs_status_to_container_state("STOPPING"), "restarting");
-        // An unrecognised state must not masquerade as running.
-        assert_eq!(ecs_status_to_container_state("SOMETHING_NEW"), "");
     }
 
     #[test]

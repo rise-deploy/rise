@@ -3,7 +3,7 @@
 //! Docker has no Metacontroller, so this loop replicates the webhook's
 //! responsibilities against the Docker daemon: status-machine transitions,
 //! desired-vs-actual container diffing, GC, HTTP health probing, supersession,
-//! and `controller_metadata` snapshots.
+//! and readiness verdicts.
 //!
 //! The diff itself ([`diff_desired_vs_actual`]) is a pure function so it can be
 //! unit-tested without a daemon.
@@ -1847,11 +1847,6 @@ impl DockerReconciler {
             .iter()
             .filter_map(|a| a.identity().map(|id| (id, a)))
             .collect();
-        // One pod entry per REPLICA container, in (spec, replica) order. Each
-        // carries the live container's REAL (generation-ful) name where present,
-        // else a replica-distinct stable fallback for a not-yet-created replica.
-        // Fed straight into `build_controller_metadata` (no re-derivation).
-        let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
         // Every REPLICA of every spec must be ready for the deployment to be
         // healthy:
         //   - HTTP containers WITH a `health_check` are ready only once Traefik's
@@ -1952,22 +1947,9 @@ impl DockerReconciler {
                 );
                 // Resolve this replica to its live container. When present,
                 // inspect by the actual generation-ful name; when absent (not yet
-                // created / mid-recreate), synthesize a replica-distinct pod name
-                // (the replica-free stable name + `_r{n}`) and skip the inspect.
+                // created / mid-recreate), there is nothing to inspect and the
+                // replica is definitively not ready.
                 let actual = actual_by_identity.get(&identity).copied();
-                let name = match actual {
-                    Some(a) => a.name.clone(),
-                    None => format!(
-                        "{}_r{replica}",
-                        container_builder::stable_identity_name(
-                            &self.config.container_prefix,
-                            &project.name,
-                            &deployment.deployment_group,
-                            &deployment.deployment_id,
-                            &spec.name,
-                        )
-                    ),
-                };
                 let inspected = match actual {
                     Some(a) => self.inspect_for_reconcile(&a.name, spec.port).await,
                     None => None,
@@ -2047,7 +2029,6 @@ impl DockerReconciler {
                         }
                     }
                 };
-                pods.push((name, inspected));
                 if !ready {
                     all_ready = false;
                     // Keep inspecting the remaining replicas so the readiness

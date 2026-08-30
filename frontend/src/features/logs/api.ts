@@ -186,7 +186,7 @@ export async function fetchLogVolume(request: LogVolumeRequest): Promise<LogVolu
     return (await response.json()) as LogVolumeResponse;
 }
 
-/** One row of the deployment event log (ADR-0006). */
+/** One row of the deployment event log. */
 export interface DeploymentEvent {
     id: number;
     deployment_id: string;

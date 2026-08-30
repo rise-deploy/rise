@@ -1,7 +1,7 @@
-//! Queries over the deployment event log (ADR-0006).
+//! Queries over the deployment event log.
 //!
-//! Events are append-only: nothing here updates or deletes an individual row.
-//! Retention operates in bulk and is the only writer that removes anything.
+//! Events are append-only: nothing here updates or deletes a row, and
+//! nothing prunes them yet — the table grows with the deployments it records.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};

@@ -204,7 +204,18 @@ fn validate_reported_attributes(
         return Ok(None);
     }
 
-    let size = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(0);
+    // Postgres `jsonb` cannot store a NUL, and serde_json will happily carry one
+    // through. Rejecting it here turns a 500 that also rolls the transition back
+    // into a 400 that says what is wrong.
+    if contains_nul(&value) {
+        return Err(ServerError::bad_request(
+            "Status attributes must not contain NUL characters".to_string(),
+        ));
+    }
+
+    let size = serde_json::to_vec(&value)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
     if size > MAX_REPORTED_ATTRIBUTES_BYTES {
         return Err(ServerError::bad_request(format!(
             "Status attributes are {size} bytes, over the {MAX_REPORTED_ATTRIBUTES_BYTES} byte limit"
@@ -212,6 +223,18 @@ fn validate_reported_attributes(
     }
 
     Ok(Some(value))
+}
+
+/// Whether any string anywhere in the value contains a NUL character.
+fn contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, v)| key.contains('\0') || contains_nul(v)),
+        _ => false,
+    }
 }
 
 /// Convert API DeploymentStatus to DB DeploymentStatus
@@ -2901,7 +2924,7 @@ pub struct EventListResponse {
     pub next_cursor: Option<String>,
 }
 
-/// Read a deployment's event log (ADR-0006).
+/// Read a deployment's event log.
 ///
 /// GET /projects/{project_name}/deployments/{deployment_id}/events
 ///

@@ -62,7 +62,16 @@ function readRangeFromUrl(): string {
     const value = new URLSearchParams(window.location.search).get('range');
     // An unrecognised range is treated as absent: a stale or hand-edited link
     // should open a working view, not an empty one.
-    return value && RANGE_VALUES.has(value) ? value : DEFAULT_RANGE;
+    if (!value || !RANGE_VALUES.has(value)) return DEFAULT_RANGE;
+    // `custom` without a usable pair of instants resolves to no window at all,
+    // which stops the stream and shows an error. A truncated paste is exactly
+    // the case the line above exists to survive, so it falls back too.
+    if (value === 'custom') {
+        const start = readInstantFromUrl('from');
+        const end = readInstantFromUrl('to');
+        if (!start || !end || start >= end) return DEFAULT_RANGE;
+    }
+    return value;
 }
 
 function readInstantFromUrl(key: 'from' | 'to'): Date | null {

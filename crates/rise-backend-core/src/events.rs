@@ -1,4 +1,4 @@
-//! The deployment event vocabulary (ADR-0006).
+//! The deployment event vocabulary.
 //!
 //! An event records something that *happened* to a deployment, as distinct from
 //! [`DeploymentStatus`](crate::models::DeploymentStatus) and the

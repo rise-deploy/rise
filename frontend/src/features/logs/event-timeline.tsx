@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { navigate } from '../../lib/navigation';
 import { Empty, Panel, PanelBody, PanelHead } from '../../components/r-ui';
 import { fetchDeploymentEvents, type DeploymentEvent } from './api';
 
@@ -21,6 +22,9 @@ export function EventTimeline({
 }) {
     const [events, setEvents] = useState<DeploymentEvent[] | null>(null);
     const [error, setError] = useState<string | null>(null);
+    // The API pages; this view reads one page, so say so rather than implying
+    // the count is the deployment's whole history.
+    const [truncated, setTruncated] = useState(false);
 
     const load = useCallback(async (signal: AbortSignal) => {
         try {
@@ -30,8 +34,16 @@ export function EventTimeline({
                 limit: 200,
                 signal,
             });
-            // The API pages newest-first by write order; a timeline reads down.
-            setEvents([...page.events].reverse());
+            // The API pages newest-first by WRITE order, which is not the order
+            // things happened: an event derived from a late observation carries
+            // an older `occurred_at` than one already returned. A timeline reads
+            // by when it happened, so sort rather than merely reversing.
+            setEvents(
+                [...page.events].sort(
+                    (a, b) => Date.parse(a.occurred_at) - Date.parse(b.occurred_at),
+                ),
+            );
+            setTruncated(page.next_cursor !== null && page.next_cursor !== undefined);
             setError(null);
         } catch (err) {
             if (err instanceof Error && err.name === 'AbortError') return;
@@ -49,7 +61,9 @@ export function EventTimeline({
         <Panel>
             <PanelHead
                 title="Deployment timeline"
-                sub={events ? `${events.length} recorded ${events.length === 1 ? 'event' : 'events'}` : undefined}
+                sub={events
+                    ? `${truncated ? 'latest ' : ''}${events.length} recorded ${events.length === 1 ? 'event' : 'events'}`
+                    : undefined}
             />
             <PanelBody>
                 {error ? (
@@ -170,7 +184,7 @@ function EventAttributes({
     projectName: string;
 }) {
     const entries = Object.entries(event.attributes ?? {})
-        .filter(([key, value]) => !RESERVED_KEYS.has(key) && value !== null && value !== '')
+        .filter(([key, value]) => !RESERVED_KEYS.has(key) && !isEmptyValue(value))
         .sort(([a], [b]) => orderOf(a) - orderOf(b) || a.localeCompare(b));
 
     if (entries.length === 0) return null;
@@ -227,13 +241,46 @@ function isObjectList(value: unknown): boolean {
     );
 }
 
+/** `{}` and `[]` carry nothing; rendering them shows a label with no value. */
+function isEmptyValue(value: unknown): boolean {
+    if (value === null || value === '') return true;
+    if (Array.isArray(value)) return value.length === 0;
+    if (typeof value === 'object') return Object.keys(value as object).length === 0;
+    return false;
+}
+
 /**
- * A value, linked when it names something reachable.
+ * A value that points at something else in Rise.
  *
- * Only deployment references are linked: "superseded by X" is the one thing a
- * reader of a dead deployment always wants next, and following it should not
- * mean copying an id into the URL bar.
+ * Emitters describe their own references — `{kind, name}` — rather than the
+ * reader recognising particular key names. A backend can link to something this
+ * build has never heard of and it still renders; only the href needs a `kind`
+ * it knows, and an unknown one degrades to plain text rather than a dead link.
  */
+interface AttributeRef {
+    kind: string;
+    name: string;
+}
+
+function asRef(value: unknown): AttributeRef | null {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const { kind, name } = value as Record<string, unknown>;
+    return typeof kind === 'string' && typeof name === 'string' ? { kind, name } : null;
+}
+
+/** Where a reference of each kind lives. Unknown kinds render unlinked. */
+function hrefForRef(ref: AttributeRef, projectName: string): string | null {
+    switch (ref.kind) {
+        case 'deployment':
+            return `/deployment/${encodeURIComponent(projectName)}/${encodeURIComponent(ref.name)}`;
+        case 'project':
+            return `/project/${encodeURIComponent(ref.name)}`;
+        default:
+            return null;
+    }
+}
+
+/** A value, linked when it names something reachable. */
 function AttributeValue({
     name,
     value,
@@ -243,15 +290,34 @@ function AttributeValue({
     value: unknown;
     projectName: string;
 }) {
-    const text = formatValue(name, value);
-
-    if (name === 'superseded_by' || name === 'rolled_back_from') {
-        return <a className="r-evt-link" href={`/deployment/${projectName}/${text}`}>{text}</a>;
+    const ref = asRef(value);
+    if (ref) {
+        const href = hrefForRef(ref, projectName);
+        return href ? <InternalLink href={href}>{ref.name}</InternalLink> : <>{ref.name}</>;
     }
+
+    const text = formatValue(name, value);
     if (name.endsWith('_url') && typeof value === 'string' && /^https?:\/\//.test(value)) {
         return <a className="r-evt-link" href={value} target="_blank" rel="noreferrer">{text}</a>;
     }
     return <>{text}</>;
+}
+
+/** An in-app link: a real href for middle-click and copy, routed on plain click. */
+function InternalLink({ href, children }: { href: string; children: React.ReactNode }) {
+    return (
+        <a
+            className="r-evt-link"
+            href={href}
+            onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+                e.preventDefault();
+                navigate(href);
+            }}
+        >
+            {children}
+        </a>
+    );
 }
 
 /**

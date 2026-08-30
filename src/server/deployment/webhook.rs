@@ -735,7 +735,6 @@ async fn check_deployment_health_from_observed(
 }
 
 /// Result of checking pod status via kube-rs API.
-/// Result of checking pod status via kube-rs API.
 struct PodCheckResult {
     /// Whether any pod has an irrecoverable error
     has_error: bool,
