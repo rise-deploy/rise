@@ -21,6 +21,14 @@ CREATE TABLE deployment_events (
     kind          TEXT        NOT NULL,
     severity      TEXT        NOT NULL,
     source        TEXT        NOT NULL,
+    -- What inside the deployment the event is about — a container replica, as
+    -- the runtime labels it (`web[0]`). NULL means the deployment itself, which
+    -- is every event today.
+    --
+    -- A column rather than an attribute because it is the axis reads filter on:
+    -- "everything that happened to `web[0]`" is the question a crash-looping
+    -- replica prompts, and answering it from JSON would mean scanning.
+    subject       TEXT,
     message       TEXT,
     attributes    JSONB       NOT NULL DEFAULT '{}'::jsonb,
     -- Reserved for events derived from a repeated observation, where
@@ -47,6 +55,12 @@ CREATE TABLE deployment_events (
 -- Reads and the per-(deployment, kind) cap, which filters `kind` in the scan.
 CREATE INDEX deployment_events_by_recorded
     ON deployment_events (deployment_id, recorded_at DESC, id DESC);
+
+-- Narrowing to one replica. Partial, because the column is NULL for every
+-- deployment-level event and those are found by the index above.
+CREATE INDEX deployment_events_by_subject
+    ON deployment_events (deployment_id, subject, recorded_at DESC, id DESC)
+    WHERE subject IS NOT NULL;
 
 -- Reserved for a global age sweep, which does not exist yet: `recorded_at`
 -- leads because a sweep cuts across deployments.

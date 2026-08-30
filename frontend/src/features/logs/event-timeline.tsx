@@ -109,7 +109,10 @@ function EventRow({
             <span className="r-evt-dot" aria-hidden="true" />
             <span className="r-evt-time mono">{ts.toLocaleTimeString()}</span>
             <span className="r-evt-body">
-                <span className="r-evt-label">{describe(event)}</span>
+                <span className="r-evt-label">
+                    {event.subject && <span className="r-evt-subject">{event.subject}</span>}
+                    {describe(event)}
+                </span>
                 {reason && <span className="r-evt-reason">{reason}</span>}
                 <EventAttributes event={event} projectName={projectName} />
             </span>
@@ -377,14 +380,34 @@ function formatBytes(bytes: number): string {
     return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }
 
-/** A one-line reading of the event, from its own attributes. */
+/**
+ * A one-line reading of the event, from its own attributes.
+ *
+ * `from`/`to` are read for any kind that carries them, not only status
+ * changes: a restart count going `0 → 1` is the same shape of fact as a status
+ * going `Healthy → Unhealthy`, and reserving the keys while interpreting them
+ * for one kind would swallow the other's only content.
+ */
 function describe(event: DeploymentEvent): string {
+    const from = scalar(event.attributes?.from);
+    const to = scalar(event.attributes?.to);
+
+    const transition = to !== null ? (from !== null ? `${from} → ${to}` : to) : null;
     if (event.kind === 'status_changed') {
-        const from = typeof event.attributes?.from === 'string' ? event.attributes.from : null;
-        const to = typeof event.attributes?.to === 'string' ? event.attributes.to : '?';
-        return from ? `${from} → ${to}` : to;
+        return transition ?? event.kind.replace(/_/g, ' ');
     }
-    return event.message || event.kind.replace(/_/g, ' ');
+
+    // Another kind names itself first — "replica restarted" — and then says
+    // what moved, if anything did.
+    const name = event.message || event.kind.replace(/_/g, ' ');
+    return transition ? `${name} ${transition}` : name;
+}
+
+/** A `from`/`to` endpoint, which may be a status name or a count. */
+function scalar(value: unknown): string | null {
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+    return null;
 }
 
 /**

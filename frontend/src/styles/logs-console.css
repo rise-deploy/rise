@@ -1037,3 +1037,16 @@
 }
 
 .r-evt-link:hover { text-decoration: underline; }
+
+/* Which replica an event is about, when it is about one rather than the
+   deployment as a whole. */
+.r-evt-subject {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 10.5px;
+    color: var(--text-muted);
+}

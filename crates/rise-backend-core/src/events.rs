@@ -189,6 +189,24 @@ impl EventSeverity {
             _ => return None,
         })
     }
+
+    /// Quietest to loudest. The single definition of the ordering: a reader
+    /// filtering by severity selects from this rather than ranking severities
+    /// again in SQL, so there is one place the order can be wrong.
+    pub const ALL: &'static [Self] = &[Self::Debug, Self::Info, Self::Warning, Self::Error];
+
+    /// The stored values at or above `self`, for a `severity = ANY(...)` filter.
+    ///
+    /// An equality test against a known set rather than a rank comparison, so
+    /// a severity the database holds but this build does not know is excluded
+    /// rather than silently sorted somewhere in the middle.
+    pub fn at_least(self) -> Vec<&'static str> {
+        Self::ALL
+            .iter()
+            .filter(|s| **s >= self)
+            .map(|s| s.as_str())
+            .collect()
+    }
 }
 
 impl fmt::Display for EventSeverity {
@@ -199,32 +217,39 @@ impl fmt::Display for EventSeverity {
 
 /// Which component observed the event. Recorded so a parity gap is legible in
 /// the data rather than only in documentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EventSource {
     ControlPlane,
     Kubernetes,
     Docker,
     Ecs,
+    /// A source this build does not know — a backend added since, or an
+    /// external controller. Parsing is total on purpose: rows outlive the code
+    /// that wrote them, and a reader that cannot name a source must still be
+    /// able to show the event rather than discard it.
+    Other(String),
 }
 
 impl EventSource {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::ControlPlane => "control-plane",
             Self::Kubernetes => "kubernetes",
             Self::Docker => "docker",
             Self::Ecs => "ecs",
+            Self::Other(value) => value,
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
+    /// Never fails. See [`EventSource::Other`].
+    pub fn parse(value: &str) -> Self {
+        match value {
             "control-plane" => Self::ControlPlane,
             "kubernetes" => Self::Kubernetes,
             "docker" => Self::Docker,
             "ecs" => Self::Ecs,
-            _ => return None,
-        })
+            other => Self::Other(other.to_string()),
+        }
     }
 }
 
@@ -282,7 +307,7 @@ mod tests {
     #[test]
     fn every_source_round_trips_through_its_stored_form() {
         for source in ALL_SOURCES {
-            assert_eq!(EventSource::parse(source.as_str()), Some(*source));
+            assert_eq!(&EventSource::parse(source.as_str()), source);
         }
     }
 
@@ -290,7 +315,24 @@ mod tests {
     fn unknown_values_are_rejected_rather_than_mapped_to_a_catch_all() {
         assert_eq!(EventKind::parse("became_healthy"), None);
         assert_eq!(EventSeverity::parse("critical"), None);
-        assert_eq!(EventSource::parse("nomad"), None);
+        // A source is the exception: an unknown one is carried, not rejected.
+        assert_eq!(
+            EventSource::parse("nomad"),
+            EventSource::Other("nomad".to_string()),
+        );
+        assert_eq!(EventSource::parse("nomad").as_str(), "nomad");
+    }
+
+    #[test]
+    fn at_least_selects_the_severities_a_reader_asked_for() {
+        // The read filter is built from this, so an off-by-one here is an
+        // off-by-one in every severity-filtered query.
+        assert_eq!(
+            EventSeverity::Debug.at_least(),
+            vec!["debug", "info", "warning", "error"],
+        );
+        assert_eq!(EventSeverity::Warning.at_least(), vec!["warning", "error"]);
+        assert_eq!(EventSeverity::Error.at_least(), vec!["error"]);
     }
 
     #[test]

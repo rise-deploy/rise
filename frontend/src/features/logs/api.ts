@@ -197,6 +197,9 @@ export interface DeploymentEvent {
     kind: string;
     severity: string;
     source: string;
+    /** What inside the deployment this is about — a container replica — or
+     *  `null` for the deployment itself. */
+    subject: string | null;
     message: string | null;
     attributes: Record<string, unknown>;
 }
@@ -209,9 +212,9 @@ export interface DeploymentEventPage {
 /**
  * Read a page of the deployment event log.
  *
- * The log is a history, so it can express things the pod-status snapshot
- * cannot — a deployment that went healthy, unhealthy and healthy again shows
- * three moves here and one status there.
+ * The log is a history, so it records what a current-state view cannot: a
+ * deployment that went healthy, unhealthy and healthy again contributes three
+ * moves here where its status shows one.
  */
 export async function fetchDeploymentEvents(request: {
     projectName: string;

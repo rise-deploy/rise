@@ -23,6 +23,9 @@ pub struct DeploymentEvent {
     pub kind: String,
     pub severity: String,
     pub source: String,
+    /// What inside the deployment the event is about, or `None` for the
+    /// deployment itself.
+    pub subject: Option<String>,
     pub message: Option<String>,
     pub attributes: serde_json::Value,
 }
@@ -41,45 +44,43 @@ pub struct EventCursor {
 
 /// Read one deployment's events, newest first by write order.
 ///
-/// `after` continues a previous page. `min_severity` and `kinds` filter; empty
-/// or `None` means no filter on that dimension.
+/// `after` continues a previous page. `kinds`, `severities` and `subject`
+/// filter; empty or `None` means no filter on that dimension.
+///
+/// `severities` is the exact set to accept, built by
+/// [`EventSeverity::at_least`](rise_backend_core::events::EventSeverity::at_least)
+/// — the ordering lives there and is not restated here.
 pub async fn list_for_deployment(
     pool: &PgPool,
     deployment_id: Uuid,
     limit: i64,
     after: Option<EventCursor>,
     kinds: &[String],
-    min_severity_rank: Option<i32>,
+    severities: Option<&[&str]>,
+    subject: Option<&str>,
 ) -> Result<Vec<DeploymentEvent>> {
-    // `severity_rank` keeps the ordering in one place: the CASE mirrors
-    // `EventSeverity`'s ordering, and a value outside it sorts as the loudest
-    // so an unrecognised severity is never silently filtered out.
     let events = sqlx::query_as!(
         DeploymentEvent,
         r#"
         SELECT
             id, deployment_id, occurred_at, recorded_at,
-            kind, severity, source, message,
+            kind, severity, source, subject, message,
             attributes as "attributes: serde_json::Value"
         FROM deployment_events
         WHERE deployment_id = $1
           AND ($2::timestamptz IS NULL OR (recorded_at, id) < ($2, $3))
           AND ($4::text[] IS NULL OR kind = ANY($4))
-          AND ($5::int IS NULL OR CASE severity
-                WHEN 'debug' THEN 0
-                WHEN 'info' THEN 1
-                WHEN 'warning' THEN 2
-                WHEN 'error' THEN 3
-                ELSE 3
-              END >= $5)
+          AND ($5::text[] IS NULL OR severity = ANY($5))
+          AND ($6::text IS NULL OR subject = $6)
         ORDER BY recorded_at DESC, id DESC
-        LIMIT $6
+        LIMIT $7
         "#,
         deployment_id,
         after.map(|c| c.recorded_at),
         after.map(|c| c.id).unwrap_or_default(),
         if kinds.is_empty() { None } else { Some(kinds) },
-        min_severity_rank,
+        severities as Option<&[&str]>,
+        subject,
         limit,
     )
     .fetch_all(pool)

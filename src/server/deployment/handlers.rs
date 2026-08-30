@@ -20,6 +20,7 @@ use crate::server::auth::context::AuthContext;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::registry::ImageTagType;
 use crate::server::state::AppState;
+use rise_backend_core::events::EventSeverity;
 
 /// Validate group name format: must be 'default' or match [a-z0-9][a-z0-9/-]*[a-z0-9]
 /// with additional constraints:
@@ -2909,8 +2910,12 @@ pub struct EventListParams {
     #[serde(default, rename = "kind")]
     pub kind: Vec<String>,
     /// Lowest severity to return. Defaults to `info`, so `debug` detail is
-    /// opt-in rather than filling the default view.
+    /// opt-in rather than filling the default view. `all` disables the filter.
     pub min_severity: Option<String>,
+    /// Restrict to events about one thing inside the deployment — a container
+    /// replica as the runtime labels it. Omitted returns every event, including
+    /// the deployment-level ones.
+    pub subject: Option<String>,
 }
 
 const DEFAULT_EVENT_PAGE: i64 = 100;
@@ -2982,18 +2987,20 @@ pub async fn list_deployment_events(
         .limit
         .unwrap_or(DEFAULT_EVENT_PAGE)
         .clamp(1, MAX_EVENT_PAGE);
-    let min_severity_rank = match params.min_severity.as_deref() {
-        None => Some(severity_rank("info")),
+    // The accepted set, not a rank: `EventSeverity` owns the ordering and this
+    // asks it which severities qualify.
+    let severities = match params.min_severity.as_deref() {
+        None => Some(EventSeverity::Info.at_least()),
         Some("all") => None,
         Some(value) => Some(
-            rise_backend_core::events::EventSeverity::parse(value)
-                .map(|s| severity_rank(s.as_str()))
+            EventSeverity::parse(value)
                 .ok_or_else(|| {
                     ServerError::bad_request(format!(
                         "Unknown severity '{}'. Expected debug, info, warning, error, or all.",
                         value
                     ))
-                })?,
+                })?
+                .at_least(),
         ),
     };
 
@@ -3011,7 +3018,8 @@ pub async fn list_deployment_events(
         limit + 1,
         after,
         &params.kind,
-        min_severity_rank,
+        severities.as_deref(),
+        params.subject.as_deref(),
     )
     .await
     .internal_err("Failed to list deployment events")?;
@@ -3029,15 +3037,6 @@ pub async fn list_deployment_events(
         events,
         next_cursor,
     }))
-}
-
-fn severity_rank(severity: &str) -> i32 {
-    match severity {
-        "debug" => 0,
-        "info" => 1,
-        "warning" => 2,
-        _ => 3,
-    }
 }
 
 /// The cursor is a position, not a capability: `deployment_id` is always taken
