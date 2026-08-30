@@ -4,6 +4,7 @@ import { NOTABLE_LEVELS, levelSeverityRank } from './format';
 import { LOG_FOLLOW_THRESHOLD_PX } from './use-log-feed';
 import { LogRow } from './log-row';
 import type { LogEntry, LogWindow } from './types';
+import type { TimelineCursorStore } from './timeline-cursor';
 
 /** Row height guess before measurement; a single unwrapped line at 12px/1.55. */
 const ESTIMATED_ROW_PX = 20;
@@ -44,6 +45,11 @@ export interface LogStreamProps {
     /** Character offset of the focused match, keyed by entry id. */
     activeMatch: { id: string; offset: number } | null;
     focusRequest: FocusRequest | null;
+    /**
+     * Receives the time span the visible rows cover, and the timestamp of the
+     * hovered row, so the volume rail can mark where the reader is.
+     */
+    timelineCursor?: TimelineCursorStore;
     /** Rendered when there are no entries at all. */
     empty: React.ReactNode;
 }
@@ -66,6 +72,7 @@ export function LogStream({
     activeMatch,
     focusRequest,
     empty,
+    timelineCursor,
 }: LogStreamProps) {
     const scrollRef = useRef<HTMLDivElement>(null);
     // Distance from the bottom captured before a prepend, so scroll position
@@ -166,9 +173,119 @@ export function LogStream({
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [focusRequest?.token]);
 
+    /**
+     * Timestamp of the row under the pointer. Kept in a ref rather than state:
+     * it only ever feeds the store, so re-rendering the list on hover would
+     * buy nothing.
+     */
+    const hoverMsRef = useRef<number | null>(null);
+    const cursorFrameRef = useRef(0);
+
+    /**
+     * Publish the visible span. Rows are oldest-first, so the span runs from
+     * the first timestamped row on screen to the last one; rows whose line
+     * carried no parseable timestamp are skipped rather than reported as the
+     * epoch.
+     */
+    const publishCursor = useCallback(() => {
+        if (!timelineCursor) return;
+        const el = scrollRef.current;
+        if (!el || entries.length === 0) {
+            timelineCursor.set(null);
+            return;
+        }
+        const first = virtualizer.getVirtualItemForOffset(el.scrollTop);
+        const last = virtualizer.getVirtualItemForOffset(el.scrollTop + el.clientHeight);
+        if (!first || !last) {
+            timelineCursor.set(null);
+            return;
+        }
+        let startMs = 0;
+        for (let i = first.index; i <= last.index; i++) {
+            if (entries[i]?.timestampMs > 0) { startMs = entries[i].timestampMs; break; }
+        }
+        let endMs = 0;
+        for (let i = last.index; i >= first.index; i--) {
+            if (entries[i]?.timestampMs > 0) { endMs = entries[i].timestampMs; break; }
+        }
+        if (startMs === 0 || endMs === 0) {
+            timelineCursor.set(null);
+            return;
+        }
+        timelineCursor.set({ startMs, endMs, hoverMs: hoverMsRef.current });
+        // `virtualizer` is a new object every render; its scroll geometry is
+        // read live above, so it does not belong in the dependency list.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [entries, timelineCursor]);
+
+    /**
+     * Coalesce the scroll/hover bursts into at most one publish per frame.
+     *
+     * Reads the publisher through a ref so this callback keeps one identity for
+     * the life of the component: a live tail hands `entries` a new array on
+     * every batch, and a `scheduleCursor` that changed with it would tear down
+     * and re-create the observer below on each one.
+     */
+    const publishCursorRef = useRef(publishCursor);
+    useLayoutEffect(() => { publishCursorRef.current = publishCursor; });
+    const scheduleCursor = useCallback(() => {
+        if (cursorFrameRef.current) return;
+        cursorFrameRef.current = requestAnimationFrame(() => {
+            cursorFrameRef.current = 0;
+            publishCursorRef.current();
+        });
+    }, []);
+
+    /** Republish when the buffer changes under a stationary viewport. */
+    useEffect(() => { scheduleCursor(); }, [scheduleCursor, entries, totalSize]);
+
+    /** A resized viewport shows a different set of rows without scrolling. */
+    useEffect(() => {
+        const el = scrollRef.current;
+        if (!el || typeof ResizeObserver === 'undefined') return undefined;
+        const observer = new ResizeObserver(scheduleCursor);
+        observer.observe(el);
+        return () => observer.disconnect();
+    }, [scheduleCursor]);
+
+    useEffect(() => () => {
+        if (cursorFrameRef.current) cancelAnimationFrame(cursorFrameRef.current);
+        // Clearing the handle matters as much as cancelling it: a remount
+        // reuses the same ref, and a stale id left behind makes every later
+        // `scheduleCursor` believe a frame is already pending.
+        cursorFrameRef.current = 0;
+        timelineCursor?.set(null);
+    }, [timelineCursor]);
+
+    /**
+     * Hover is tracked by delegation off the rows container. Per-row handlers
+     * would give every one of them a fresh callback identity on each render
+     * and defeat `LogRow`'s memoization.
+     */
+    const handleRowHover = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+        if (!timelineCursor) return;
+        const slot = (event.target as HTMLElement).closest?.('[data-index]');
+        const index = slot ? Number(slot.getAttribute('data-index')) : NaN;
+        const ms = Number.isNaN(index) ? null : entries[index]?.timestampMs ?? null;
+        const next = ms && ms > 0 ? ms : null;
+        if (hoverMsRef.current === next) return;
+        hoverMsRef.current = next;
+        scheduleCursor();
+    }, [entries, scheduleCursor, timelineCursor]);
+
+    const handleRowsLeave = useCallback(() => {
+        if (!timelineCursor || hoverMsRef.current === null) return;
+        hoverMsRef.current = null;
+        scheduleCursor();
+    }, [scheduleCursor, timelineCursor]);
+
     const handleScroll = useCallback(() => {
         const el = scrollRef.current;
-        if (!el || programmaticScrollRef.current) return;
+        if (!el) return;
+        // Programmatic scrolls still move the reader, so the rail follows them
+        // even though they must not switch follow mode off.
+        scheduleCursor();
+        if (programmaticScrollRef.current) return;
 
         const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
         const atBottom = distanceFromBottom <= LOG_FOLLOW_THRESHOLD_PX;
@@ -178,7 +295,7 @@ export function LogStream({
             anchorFromBottomRef.current = el.scrollHeight - el.scrollTop;
             onLoadOlder();
         }
-    }, [following, onFollowingChange, hasMore, loadingMore, onLoadOlder]);
+    }, [following, onFollowingChange, hasMore, loadingMore, onLoadOlder, scheduleCursor]);
 
     const jumpToTick = useCallback((pct: number) => {
         const index = Math.min(entries.length - 1, Math.floor((pct / 100) * entries.length));
@@ -214,7 +331,12 @@ export function LogStream({
                                 </>
                             ) : 'Scroll up for older lines'}
                         </div>
-                        <div className="r-logc-rows" style={{ height: totalSize }}>
+                        <div
+                            className="r-logc-rows"
+                            style={{ height: totalSize }}
+                            onMouseOver={handleRowHover}
+                            onMouseLeave={handleRowsLeave}
+                        >
                             {items.map((item) => {
                                 const entry = entries[item.index];
                                 const outOfRange = rangeWindow !== null

@@ -1,8 +1,8 @@
-// @ts-nocheck
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts';
 import { formatDate } from '../lib/utils';
 import { Tooltip } from '../components/r-ui';
+import type { TimelineCursor, TimelineCursorStore } from './logs/timeline-cursor';
 
 // Color for any level the backend advertises. Driven by CSS variables so
 // dark/light mode and design-token changes don't need code edits. Levels
@@ -77,7 +77,7 @@ function LogChartTooltip({ active, payload, stepSeconds, levels }: { active?: bo
     );
 }
 
-export default function LogVolumeChart({ counts, levels, loading, error, status, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs, height = 96, markers = [] }) {
+export default function LogVolumeChart({ counts, levels, loading, error, status, rangeStartMs, rangeEndMs, stepSeconds, onSelectBucket, selectedBucketTs, height = 96, markers = [], timelineCursor = null }) {
     // Flatten each bucket's `by_level` map into top-level keys so Recharts'
     // `<Bar dataKey="info">` can read them directly.
     const data = useMemo(
@@ -103,10 +103,11 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
         data.length > 0 ? { min: data[0].ts, max: data[data.length - 1].ts } : null
     ), [data]);
     /**
-     * The marker lane has to line up with the bars, and only Recharts knows
-     * where its plot area actually starts: the YAxis reserves width for its
-     * tick labels, so the inset is not something the caller can compute. Read
-     * it off the rendered x-axis line, which spans exactly the plot width.
+     * The marker lane and the reader cursor have to line up with the bars, and
+     * only Recharts knows where its plot area actually is: the YAxis reserves
+     * width for its tick labels, so the inset is not something the caller can
+     * compute. Read it off the rendered axis lines — the x-axis line spans
+     * exactly the plot width, the y-axis line its height.
      */
     const bodyRef = useRef(null);
     const [plot, setPlot] = useState(null);
@@ -118,12 +119,24 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
         const a = axis.getBoundingClientRect();
         const b = body.getBoundingClientRect();
         if (a.width <= 0) return;
+        // The vertical extent is optional: the marker lane only needs the
+        // horizontal one, so a chart rendered without a y-axis line still
+        // positions its markers and simply carries no cursor overlay.
+        const yAxis = body.querySelector('.recharts-yAxis .recharts-cartesian-axis-line');
+        const y = yAxis ? yAxis.getBoundingClientRect() : null;
         setPlot((prev) => {
-            const next = { left: a.left - b.left, width: a.width };
-            if (prev && Math.abs(prev.left - next.left) < 0.5 && Math.abs(prev.width - next.width) < 0.5) {
-                return prev;
-            }
-            return next;
+            const next = {
+                left: a.left - b.left,
+                width: a.width,
+                top: y ? y.top - b.top : 0,
+                height: y ? y.height : 0,
+            };
+            const settled = prev
+                && Math.abs(prev.left - next.left) < 0.5
+                && Math.abs(prev.width - next.width) < 0.5
+                && Math.abs(prev.top - next.top) < 0.5
+                && Math.abs(prev.height - next.height) < 0.5;
+            return settled ? prev : next;
         });
     }, []);
 
@@ -262,6 +275,9 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                     </BarChart>
                 </ResponsiveContainer>
                 </div>
+                {timelineCursor && domain && plot && plot.height > 0 && (
+                    <ChartTimelineCursor store={timelineCursor} domain={domain} plot={plot} />
+                )}
                 {visibleMarkers.length > 0 && domain && plot && (
                     /* Its own lane under the chart rather than an overlay: the
                        reference lines already carry the eye down through the
@@ -304,6 +320,63 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                     </div>
                 )}
             </div>
+            )}
+        </div>
+    );
+}
+
+/**
+ * Marks where the reader currently is: a band over the time span the visible
+ * log rows cover, and a hairline at the row under the pointer.
+ *
+ * Its own subscriber rather than a prop on the chart. The span changes on every
+ * scroll frame, and re-rendering the Recharts tree that often to move two
+ * absolutely positioned elements would cost far more than it draws.
+ *
+ * Positions map linearly onto the x-axis domain, exactly as the marker lane
+ * does, so a timestamp lands where the axis says that moment is. Bars are
+ * centred on their bucket's right edge, so a line inside the newest bucket sits
+ * up to half a bar left of it — the same offset the axis tick labels carry.
+ */
+function ChartTimelineCursor({ store, domain, plot }: {
+    store: TimelineCursorStore;
+    domain: { min: number; max: number };
+    plot: { left: number; width: number; top: number; height: number };
+}) {
+    const cursor = useSyncExternalStore<TimelineCursor | null>(
+        store.subscribe,
+        store.get,
+        store.get,
+    );
+    if (!cursor) return null;
+
+    const span = Math.max(1, domain.max - domain.min);
+    const pct = (ms: number) => ((ms - domain.min) / span) * 100;
+    const from = pct(cursor.startMs);
+    const to = pct(cursor.endMs);
+    // A buffer scrolled outside the charted window (older lines paged in past
+    // the range start) has nothing to point at; drawing it clamped to an edge
+    // would claim the reader is somewhere they are not.
+    const visible = to >= 0 && from <= 100;
+    const left = Math.max(0, Math.min(100, from));
+    const right = Math.max(0, Math.min(100, to));
+    const hover = cursor.hoverMs === null ? null : pct(cursor.hoverMs);
+    const hoverVisible = hover !== null && hover >= 0 && hover <= 100;
+
+    return (
+        <div
+            className="r-logc-chart-cursor"
+            style={{ left: plot.left, top: plot.top, width: plot.width, height: plot.height }}
+            aria-hidden="true"
+        >
+            {visible && (
+                <span
+                    className="r-logc-chart-cursor-span"
+                    style={{ left: `${left}%`, width: `${Math.max(0, right - left)}%` }}
+                />
+            )}
+            {hoverVisible && (
+                <span className="r-logc-chart-cursor-line" style={{ left: `${hover}%` }} />
             )}
         </div>
     );

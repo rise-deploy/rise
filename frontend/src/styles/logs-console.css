@@ -764,6 +764,40 @@
    read against what the deployment itself was doing at that moment. */
 .r-logc-chart-body { position: relative; }
 
+/* Where the reader is in the buffer, drawn over the bars: a band for the rows
+   on screen and a hairline for the hovered one. Purely indicative — it never
+   takes pointer events, so the chart's own bar tooltip and click-to-filter keep
+   working underneath it. */
+.r-logc-chart-cursor {
+    position: absolute;
+    pointer-events: none;
+    overflow: hidden;
+}
+
+.r-logc-chart-cursor-span {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    /* A viewport of lines that arrived in the same second is far narrower than
+       a pixel at most ranges; keep it wide enough to stay visible. */
+    min-width: 2px;
+    background: color-mix(in oklch, var(--accent) 16%, transparent);
+    border-inline: 1px solid color-mix(in oklch, var(--accent) 50%, transparent);
+    /* A wash alone is hard to pick out against the stacked bars it covers, so
+       the band is capped by a solid rule along the plot's top edge — clear of
+       the bars, which grow from the bottom. */
+    box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.r-logc-chart-cursor-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    margin-left: -0.5px;
+    background: var(--accent);
+}
+
 .r-logc-markers {
     position: relative;
     height: 11px;

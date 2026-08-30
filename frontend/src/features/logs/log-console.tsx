@@ -15,6 +15,7 @@ import { LogStream, type FocusRequest } from './log-stream';
 import { useLogFeed } from './use-log-feed';
 import type { LogEntry } from './types';
 import type { LifecycleMarker } from './lifecycle';
+import { createTimelineCursorStore } from './timeline-cursor';
 
 // Recharts and react-day-picker are heavy and each pull their own CSS; keep
 // them out of the main bundle until the console actually needs them.
@@ -115,6 +116,9 @@ export function LogConsole({
     const [detailsOpen, setDetailsOpen] = useState(false);
     const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
     const [matchCursor, setMatchCursor] = useState(0);
+    // Written by the stream on scroll/hover, read by the volume rail's cursor
+    // overlay. Created once so both sides keep the same store across renders.
+    const [timelineCursor] = useState(createTimelineCursorStore);
     const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
     const focusTokenRef = useRef(0);
     const queryInputRef = useRef<HTMLInputElement>(null);
@@ -372,6 +376,7 @@ export function LogConsole({
                                 selectedBucketTs={feed.selectedBucket?.endMs ?? null}
                                 height={72}
                                 markers={markers}
+                                timelineCursor={timelineCursor}
                             />
                         </Suspense>
                     </div>
@@ -467,6 +472,7 @@ export function LogConsole({
                 activeMatch={activeMatch ? { id: activeMatch.id, offset: activeMatch.offset } : null}
                 focusRequest={focusRequest}
                 empty={emptyMessage}
+                timelineCursor={timelineCursor}
             />
 
             {details && detailsOpen && (
