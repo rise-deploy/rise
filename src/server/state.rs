@@ -36,6 +36,10 @@ pub struct ControllerState {
     pub db_pool: PgPool,
     #[allow(dead_code)]
     pub encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    /// How much deployment history to keep. Carried here rather than read from
+    /// a global because the retention pass runs in a controller, and a
+    /// controller's inputs should be visible in the state it was handed.
+    pub deployment_retention: crate::server::settings::DeploymentRetentionSettings,
 }
 
 /// Full state for HTTP server

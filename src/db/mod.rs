@@ -11,6 +11,7 @@ pub mod organization_links;
 pub mod postgres_admin;
 pub mod project_app_users;
 pub mod projects;
+pub mod retention;
 pub mod service_accounts;
 pub mod teams;
 pub mod users;

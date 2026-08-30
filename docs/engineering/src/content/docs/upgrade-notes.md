@@ -59,16 +59,28 @@ Merged to `develop`:
     install expect the migration to take proportionally longer; it runs inside
     the usual startup transaction.
 
-- **Action required if you run deployments that flap — `deployment_events`
-  grows without bound.** One row is written per status transition per
-  deployment, roughly 250 bytes, and rows are removed only when their deployment
-  row is (`ON DELETE CASCADE`). A normal deployment
-  contributes about six rows for its whole life, so ordinary use adds little. A
-  deployment that oscillates between `Healthy` and `Unhealthy` contributes two
-  rows per flap indefinitely — a probe flipping every 30 seconds is ~5,700 rows
-  a day for that one deployment. There is no retention knob yet. Monitor
-  `pg_total_relation_size('deployment_events')` if you have a persistently
-  unhealthy deployment.
+- **Config change — deployment history retention.** A new
+  `deployment_retention` section bounds how much history Rise keeps.
+
+  - `max_events_per_deployment` (default `1000`) caps the events kept for any
+    one deployment. A normal deployment records about six for its whole life, so
+    the cap only engages for a deployment that oscillates between `Healthy` and
+    `Unhealthy`, which would otherwise accumulate two rows per flap forever. A
+    deployment's first event is always kept, so its timeline still shows where
+    it began.
+  - `delete_aged_deployments` (default `false`) deletes finished deployments
+    older than `max_deployment_age_days` (default `90`). **Off by default and
+    irreversible**: deleting a deployment takes its event log and its
+    environment-variable snapshot with it, which is what makes it
+    re-deployable. Turn it on only if you want that.
+  - `keep_primary_deployments_per_environment` (default `10`) protects each
+    environment's most recent finished deployments in its primary deployment
+    group from the age rule, so rollback targets survive. The active deployment
+    and anything still running are never deleted, whatever the settings say.
+
+  Both passes run hourly on the elected leader. Deletion is batched, so the
+  first run after enabling it works through a backlog over several hours rather
+  than in one transaction.
 
 - **Docker installs restart the containers of non-public projects once, on the
   first reconcile after upgrade.** The Traefik router's forwardAuth middleware

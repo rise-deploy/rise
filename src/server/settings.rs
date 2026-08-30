@@ -20,6 +20,10 @@ pub struct Settings {
     pub deployment_controller: Option<DeploymentControllerSettings>,
     #[serde(default)]
     pub deployment_logs: DeploymentLogsSettings,
+    /// Bounds the growth of deployment history. Omitting the section keeps the
+    /// event cap on and deletion of old deployments off.
+    #[serde(default)]
+    pub deployment_retention: DeploymentRetentionSettings,
     #[serde(default)]
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
@@ -51,6 +55,67 @@ pub struct Settings {
     /// them.
     #[serde(default)]
     pub quickstart: Option<QuickstartSettings>,
+}
+
+/// Bounds on how much deployment history Rise keeps.
+///
+/// The two halves have deliberately different defaults. Capping a single
+/// deployment's events discards only the middle of a flap it already summarises,
+/// so it is on. Deleting a deployment discards its event log *and* the
+/// environment-variable snapshot that makes it re-deployable, and no amount of
+/// care makes that reversible — so it is off until an operator asks for it.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DeploymentRetentionSettings {
+    /// Most events kept for one deployment. Its first event — the creation
+    /// event, which anchors the timeline — is always kept regardless.
+    #[serde(default = "default_max_events_per_deployment")]
+    pub max_events_per_deployment: i64,
+
+    /// Delete finished deployments once they are older than
+    /// `max_deployment_age_days`. Off by default: this is irreversible, and an
+    /// upgrade must not start deleting history nobody asked it to.
+    #[serde(default)]
+    pub delete_aged_deployments: bool,
+
+    /// How old a finished deployment must be before deletion considers it.
+    /// Only consulted when `delete_aged_deployments` is on.
+    #[serde(default = "default_max_deployment_age_days")]
+    pub max_deployment_age_days: u32,
+
+    /// How many of each environment's most recent *finished* primary-group
+    /// deployments survive deletion regardless of age. These are what a
+    /// rollback reaches for, so an environment that has not deployed in a long
+    /// time keeps a usable history rather than being emptied by the age rule.
+    ///
+    /// Counts finished deployments only. The active deployment and anything
+    /// still running are never deleted, so spending these slots on them would
+    /// leave no rollback history at all.
+    #[serde(default = "default_keep_primary_deployments_per_environment")]
+    pub keep_primary_deployments_per_environment: i64,
+}
+
+impl Default for DeploymentRetentionSettings {
+    fn default() -> Self {
+        Self {
+            max_events_per_deployment: default_max_events_per_deployment(),
+            delete_aged_deployments: false,
+            max_deployment_age_days: default_max_deployment_age_days(),
+            keep_primary_deployments_per_environment:
+                default_keep_primary_deployments_per_environment(),
+        }
+    }
+}
+
+fn default_max_events_per_deployment() -> i64 {
+    1000
+}
+
+fn default_max_deployment_age_days() -> u32 {
+    90
+}
+
+fn default_keep_primary_deployments_per_environment() -> i64 {
+    10
 }
 
 fn default_reserved_project_names() -> Vec<String> {

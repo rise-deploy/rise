@@ -113,6 +113,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let controller_state = ControllerState {
         db_pool: state.db_pool.clone(),
         encryption_provider: state.encryption_provider.clone(),
+        deployment_retention: settings.deployment_retention.clone(),
     };
 
     // Reconcile RiseProject CRDs as a background task — see

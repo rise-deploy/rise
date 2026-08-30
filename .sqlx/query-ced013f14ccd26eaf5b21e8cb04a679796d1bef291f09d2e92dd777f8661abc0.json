@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH over_cap AS (\n            SELECT deployment_id\n            FROM deployment_events\n            GROUP BY deployment_id\n            HAVING count(*) > $1\n        ),\n        cutoff AS (\n            -- The id of the cap-th newest event for each over-cap deployment;\n            -- everything below it goes. A lateral keeps this an index scan per\n            -- deployment rather than a sort of the whole table.\n            SELECT o.deployment_id, c.id AS cutoff_id, f.first_id\n            FROM over_cap o\n            CROSS JOIN LATERAL (\n                SELECT id FROM deployment_events e\n                WHERE e.deployment_id = o.deployment_id\n                ORDER BY e.id DESC\n                -- `OFFSET cap - 1` is the cap-th newest, and everything\n                -- strictly below it goes — so exactly `cap` survive.\n                OFFSET $1 - 1 LIMIT 1\n            ) c\n            CROSS JOIN LATERAL (\n                SELECT min(id) AS first_id FROM deployment_events e\n                WHERE e.deployment_id = o.deployment_id\n            ) f\n        )\n        DELETE FROM deployment_events e\n        USING cutoff\n        WHERE e.deployment_id = cutoff.deployment_id\n          AND e.id < cutoff.cutoff_id\n          AND e.id > cutoff.first_id\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ced013f14ccd26eaf5b21e8cb04a679796d1bef291f09d2e92dd777f8661abc0"
+}
