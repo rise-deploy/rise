@@ -31,6 +31,45 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **The Pods tab is gone, and a deployment's history is now an event log.**
+  Every backend used to write a Kubernetes-shaped `pod_status` snapshot into
+  `controller_metadata` on each reconcile, and the UI read into its keys. That
+  made a controller's internal note a public interface, and let two sources
+  disagree about the same rollout. Deployments now record what happened as
+  append-only events, read by the Timeline tab and the log console's rail.
+
+  What this means in practice:
+
+  - **Deployments created before the upgrade have no events**, so their Timeline
+    reads "No events recorded" and their rail has nothing to draw. Their logs,
+    status and everything else are unaffected. New deployments record from the
+    moment they are created.
+  - **Per-replica detail is not yet recorded on any backend.** Container start,
+    exit and restart used to be visible in the Pods tab on Kubernetes and are
+    currently visible nowhere. This is a gap being closed, not a backend
+    difference — see the [deployment backends](/operator-docs/deployment-backends/)
+    matrix.
+  - **A "Controller" tab replaces it**, rendering `controller_metadata`
+    verbatim for introspection. It appears only when a backend writes something
+    there, which today is ECS alone (its task-definition hash). Nothing should
+    read into its keys: the shape belongs to whichever controller wrote it and
+    carries no compatibility promise.
+  - The migration removes the now-unwritten `pod_status` and `health` keys from
+    existing rows. It rewrites every deployment row that has them, so on a large
+    install expect the migration to take proportionally longer; it runs inside
+    the usual startup transaction.
+
+- **Action required if you run deployments that flap — `deployment_events`
+  grows without bound.** One row is written per status transition per
+  deployment, roughly 250 bytes, and rows are removed only when their deployment
+  row is (`ON DELETE CASCADE`). A normal deployment
+  contributes about six rows for its whole life, so ordinary use adds little. A
+  deployment that oscillates between `Healthy` and `Unhealthy` contributes two
+  rows per flap indefinitely — a probe flipping every 30 seconds is ~5,700 rows
+  a day for that one deployment. There is no retention knob yet. Monitor
+  `pg_total_relation_size('deployment_events')` if you have a persistently
+  unhealthy deployment.
+
 - **Docker installs restart the containers of non-public projects once, on the
   first reconcile after upgrade.** The Traefik router's forwardAuth middleware
   was referenced as `{router}-auth@docker`. Naming a provider is wrong for any
