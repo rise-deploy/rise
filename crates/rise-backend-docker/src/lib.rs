@@ -20,7 +20,7 @@ pub mod reconciler;
 // Traefik routing machinery in `rise-backend-traefik` — shared with the ECS
 // backend rather than duplicated. These re-exports keep every existing
 // `rise_backend_docker::{diff,env,labels,…}` path resolving unchanged.
-pub use rise_backend_core::{diff, env, naming, pod_status, rolling};
+pub use rise_backend_core::{diff, env, naming, rolling};
 pub use rise_backend_traefik::{api as traefik_api, readiness, render as traefik_render};
 
 /// The label vocabulary, from both homes: bookkeeping labels are backend-agnostic

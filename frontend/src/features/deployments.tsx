@@ -1,7 +1,7 @@
 import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
-import { navigate } from '../lib/navigation';
+import { navigate, useQueryParam } from '../lib/navigation';
 import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, formatTimeRemaining, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { usePolling } from '../lib/polling';
 import { useToast } from '../components/toast';
@@ -11,7 +11,6 @@ import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { LogConsole } from './logs/log-console';
-import { buildLifecycleMarkers } from './logs/lifecycle';
 import { EventTimeline } from './logs/event-timeline';
 
 const STATUS_TONES = {
@@ -810,397 +809,25 @@ function formatDurationDelta(fromTs?: string | null, toTs?: string | null) {
 }
 
 
-// TypeScript interfaces matching Rust backend structs
-interface ContainerState {
-    state_type: 'waiting' | 'running' | 'terminated';
-    reason?: string;
-    message?: string;
-    exit_code?: number;
-    started_at?: string;
-    finished_at?: string;
-}
 
-interface ContainerStatusInfo {
-    name: string;
-    ready: boolean;
-    restart_count: number;
-    state?: ContainerState;
-    last_state?: ContainerState;
-}
-
-interface PodCondition {
-    type: string;
-    status: string;
-    reason?: string;
-    message?: string;
-}
-
-interface PodInfo {
-    name: string;
-    phase: 'Pending' | 'Running' | 'Succeeded' | 'Failed' | 'Unknown';
-    terminating?: boolean;
-    terminated?: boolean;
-    conditions?: PodCondition[];
-    containers?: ContainerStatusInfo[];
-}
-
-interface PodStatus {
-    desired_replicas: number;
-    ready_replicas: number;
-    current_replicas: number;
-    pods: PodInfo[];
-    last_checked: string;
-}
-
-/** Returns the notable reason from a container's last_state (e.g. "OOMKilled").
- *  Falls back to "Exit N" when the previous run terminated with a non-zero exit
- *  code but Kubernetes didn't supply a named reason — so crash-loops with bare
- *  exit codes still get a visible badge without expanding the row. */
-function getLastStateReason(container: ContainerStatusInfo): string | undefined {
-    const last = container.last_state;
-    if (last?.state_type !== 'terminated') return undefined;
-    if (last.reason) return last.reason;
-    if (last.exit_code !== undefined && last.exit_code !== 0) return `Exit ${last.exit_code}`;
-    return undefined;
-}
-
-function PodInfoRow({ pod }: { pod: PodInfo }) {
-    const [expanded, setExpanded] = useState(false);
-    const detailsId = `pod-details-${pod.name.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
-
-    const isGone = pod.terminating || pod.terminated;
-
-    // One badge per unique last_state reason across containers (e.g. OOMKilled).
-    // Keep the most-recent finished_at so the pill can show how long ago it happened.
-    const lastStateBadges: { reason: string; finishedAt?: string }[] = [];
-    if (!isGone && pod.containers) {
-        for (const c of pod.containers) {
-            const reason = getLastStateReason(c);
-            if (!reason) continue;
-            const finishedAt = c.last_state?.finished_at;
-            const existing = lastStateBadges.find(b => b.reason === reason);
-            if (!existing) {
-                lastStateBadges.push({ reason, finishedAt });
-            } else if (finishedAt && (!existing.finishedAt || Date.parse(finishedAt) > Date.parse(existing.finishedAt))) {
-                existing.finishedAt = finishedAt;
-            }
-        }
-    }
-
-    const phaseStatus = {
-        Running: 'running',
-        Pending: 'pending',
-        Failed: 'failed',
-        Succeeded: 'succeeded',
-        Unknown: 'stopped',
-    };
-
-    const displayPhase = pod.terminated ? 'Terminated' : pod.terminating ? 'Terminating' : pod.phase;
-    const statusKey = isGone ? 'stopped' : (phaseStatus[pod.phase] || 'stopped');
-
-    return (
-        <div
-            style={{
-                borderBottom: '1px solid var(--border-faint)',
-                opacity: isGone ? 0.6 : 1,
-            }}
-        >
-            <button
-                type="button"
-                onClick={() => setExpanded(!expanded)}
-                aria-expanded={expanded}
-                aria-controls={detailsId}
-                style={{
-                    all: 'unset',
-                    cursor: 'pointer',
-                    display: 'block',
-                    width: '100%',
-                    padding: '12px 16px',
-                    boxSizing: 'border-box',
-                }}
-            >
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-                    <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                        <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{pod.name}</span>
-                        <span className={`r-status ${statusKey}`}>
-                            <span className="dot" />
-                            <span>{displayPhase}</span>
-                        </span>
-                        {lastStateBadges.map(({ reason, finishedAt }) => (
-                            <span
-                                key={reason}
-                                className="r-status bad"
-                                title={finishedAt ? formatISO8601(finishedAt) : undefined}
-                            >
-                                <span className="dot" />
-                                <span>
-                                    {reason}
-                                    {finishedAt && ` · ${formatRelativeTimeRounded(finishedAt)}`}
-                                </span>
-                            </span>
-                        ))}
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
-                        <div style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}>
-                            {pod.containers?.filter(c => c.ready).length || 0}/{pod.containers?.length || 0} ready
-                        </div>
-                        <span
-                            className="chev"
-                            style={{
-                                display: 'inline-flex',
-                                transform: expanded ? 'rotate(90deg)' : 'none',
-                                transition: 'transform .15s',
-                                color: 'var(--text-soft)',
-                            }}
-                        >
-                            <Icon name="chev" size={12} />
-                        </span>
-                    </div>
-                </div>
-            </button>
-
-            {expanded && (
-                <div id={detailsId} style={{ padding: '0 16px 14px', background: 'var(--surface-2)' }}>
-                    {/* Container statuses */}
-                    {pod.containers && pod.containers.length > 0 && (
-                        <div style={{ marginBottom: 12, paddingTop: 12 }}>
-                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                                Containers
-                            </div>
-                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 10 }}>
-                                {pod.containers.map((container) => {
-                                    const lastStateReason = getLastStateReason(container);
-                                    const lastFinishedAt = container.last_state?.finished_at;
-                                    const hasLastStateIssue = lastStateReason != null || (
-                                        container.last_state?.state_type === 'terminated' &&
-                                        container.last_state.exit_code !== undefined &&
-                                        container.last_state.exit_code !== 0
-                                    );
-                                    const runningSince = container.state?.state_type === 'running' ? container.state.started_at : undefined;
-                                    return (
-                                        <div
-                                            key={container.name}
-                                            style={{
-                                                fontSize: 12,
-                                                padding: 10,
-                                                background: 'var(--surface)',
-                                                border: `1px solid ${hasLastStateIssue ? 'var(--err)' : 'var(--border-faint)'}`,
-                                                borderRadius: 'var(--radius-sm)',
-                                            }}
-                                        >
-                                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4, gap: 8 }}>
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
-                                                    <span className="mono">{container.name}</span>
-                                                    {lastStateReason && (
-                                                        <span
-                                                            className="r-status bad"
-                                                            title={lastFinishedAt ? formatISO8601(lastFinishedAt) : undefined}
-                                                        >
-                                                            <span className="dot" />
-                                                            <span>
-                                                                {lastStateReason}
-                                                                {lastFinishedAt && ` · ${formatRelativeTimeRounded(lastFinishedAt)}`}
-                                                            </span>
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <span style={{ color: container.ready ? 'var(--ok)' : 'var(--err)', fontWeight: 500 }}>
-                                                    {container.ready ? '✓ Ready' : '✗ Not ready'}
-                                                </span>
-                                            </div>
-                                            {container.restart_count > 0 && (
-                                                <div style={{ color: 'var(--warn)' }}>
-                                                    Restarts: {container.restart_count}
-                                                </div>
-                                            )}
-                                            {container.state && (
-                                                <div style={{ color: 'var(--text-muted)' }}>
-                                                    State: {container.state.state_type}
-                                                    {container.state.reason && ` (${container.state.reason})`}
-                                                </div>
-                                            )}
-                                            {runningSince && (
-                                                <div style={{ color: 'var(--text-muted)' }} title={formatISO8601(runningSince)}>
-                                                    Started {formatRelativeTimeRounded(runningSince)}
-                                                </div>
-                                            )}
-                                            {container.state?.message && (
-                                                <div className="mono" style={{ marginTop: 4, color: 'var(--err)' }}>
-                                                    {container.state.message}
-                                                </div>
-                                            )}
-                                            {container.state?.exit_code !== undefined && (
-                                                <div style={{ color: 'var(--text-muted)' }}>
-                                                    Exit code: {container.state.exit_code}
-                                                </div>
-                                            )}
-                                            {container.last_state && (
-                                                <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid var(--border-faint)' }}>
-                                                    <div style={{ fontWeight: 600, marginBottom: 4, color: 'var(--text-soft)', textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: 11 }}>
-                                                        Last state
-                                                    </div>
-                                                    <div style={{ color: hasLastStateIssue ? 'var(--err)' : 'var(--text-muted)' }}>
-                                                        {container.last_state.state_type}
-                                                        {container.last_state.reason && ` (${container.last_state.reason})`}
-                                                    </div>
-                                                    {lastFinishedAt && (
-                                                        <div style={{ color: 'var(--text-muted)' }} title={formatISO8601(lastFinishedAt)}>
-                                                            Ended {formatRelativeTimeRounded(lastFinishedAt)}
-                                                        </div>
-                                                    )}
-                                                    {container.last_state.exit_code !== undefined && (
-                                                        <div style={{ color: 'var(--text-muted)' }}>
-                                                            Exit code: {container.last_state.exit_code}
-                                                        </div>
-                                                    )}
-                                                    {container.last_state.message && (
-                                                        <div className="mono" style={{ marginTop: 4, color: 'var(--err)' }}>
-                                                            {container.last_state.message}
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            )}
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        </div>
-                    )}
-
-                    {/* Pod conditions: one pill per condition (green=True, red=False),
-                        with reason/message expanded below for any False condition. */}
-                    {pod.conditions && pod.conditions.length > 0 && (
-                        <div style={{ marginBottom: 12 }}>
-                            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-soft)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
-                                Conditions
-                            </div>
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                {pod.conditions.map((condition) => {
-                                    const ok = condition.status === 'True';
-                                    return (
-                                        <span
-                                            key={condition.type}
-                                            className={`r-status ${ok ? 'ok' : 'bad'}`}
-                                            title={condition.message || condition.reason || undefined}
-                                        >
-                                            <span className="dot" />
-                                            <span>
-                                                {condition.type}
-                                                {!ok && ` (${condition.status})`}
-                                            </span>
-                                        </span>
-                                    );
-                                })}
-                            </div>
-                            {pod.conditions.filter(c => c.status !== 'True' && (c.reason || c.message)).map((condition) => (
-                                <div key={`detail-${condition.type}`} style={{ fontSize: 12, color: 'var(--err)', marginTop: 6, paddingLeft: 2 }}>
-                                    <span style={{ fontWeight: 600 }}>{condition.type}</span>
-                                    {condition.reason && <span> · {condition.reason}</span>}
-                                    {condition.message && <div className="mono" style={{ color: 'var(--text-muted)', marginTop: 2 }}>{condition.message}</div>}
-                                </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
-            )}
-        </div>
-    );
-}
-
-// Scoped 1s ticker for the "Updated Xs ago" indicator so re-renders stay
-// inside this tiny component instead of triggering the whole pod panel.
-function UpdatedAgo({ timestamp }: { timestamp: string }) {
-    const [, setTick] = useState(0);
-    useEffect(() => {
-        const id = setInterval(() => setTick(t => t + 1), 1000);
-        return () => clearInterval(id);
-    }, []);
-    return (
-        <span
-            style={{ fontSize: 11.5, color: 'var(--text-soft)', whiteSpace: 'nowrap' }}
-            title={formatISO8601(timestamp)}
-        >
-            Updated {formatRelativeTimeRounded(timestamp)}
-        </span>
-    );
-}
-
-function PodStatusSection({ podStatus }: { podStatus: PodStatus }) {
-    const activePods = podStatus.pods?.filter(p => !p.terminating && !p.terminated) || [];
-    const inactivePods = podStatus.pods?.filter(p => p.terminating || p.terminated) || [];
-
-    const replicasMismatch = podStatus.ready_replicas < podStatus.desired_replicas;
-    const hasPodIssues = activePods.some(
-        (p) => p.containers?.some((c) => c.restart_count > 0) ?? false,
-    );
-
-    const hasIssues = replicasMismatch || hasPodIssues;
-
-    // Determine tone based on replica counts and pod-level issues
-    let replicaTone = 'ok';
-    if (podStatus.ready_replicas === 0) {
-        replicaTone = 'bad';
-    } else if (replicasMismatch || hasPodIssues) {
-        replicaTone = 'warn';
-    }
-
-    const sectionHeading = (label: string) => (
-        <div
-            className="r-group-bar"
-            style={{ fontWeight: 600, color: 'var(--text)', textTransform: 'uppercase', letterSpacing: '0.06em', fontSize: 11 }}
-        >
-            <span>{label}</span>
-        </div>
-    );
-
+/**
+ * The controller's own bookkeeping, rendered verbatim.
+ *
+ * Each deployment backend writes whatever it needs to track convergence, and
+ * the shape is its business alone — it changes when the controller changes, with
+ * no compatibility promise. This is deliberately a JSON dump rather than a
+ * parsed view: parsing it here would turn an internal note into an interface,
+ * and the interface for what happened to a deployment is its event log.
+ */
+function ControllerMetadataSection({ metadata }: { metadata: unknown }) {
     return (
         <Panel>
             <PanelHead
-                title="Pod status"
-                right={
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <UpdatedAgo timestamp={podStatus.last_checked} />
-                        <span className={`r-status ${replicaTone === 'ok' ? 'running' : replicaTone === 'warn' ? 'warn' : 'failed'}`}>
-                            <span className="dot" />
-                            <span>{podStatus.ready_replicas}/{podStatus.desired_replicas} ready</span>
-                        </span>
-                    </div>
-                }
+                title="Controller metadata"
+                sub="Internal bookkeeping — shape is not stable"
             />
-            <PanelBody style={{ padding: 0 }}>
-                {hasIssues && (
-                    <div className="r-alert warn" style={{ margin: 16, fontSize: 12.5 }}>
-                        <Icon name="info" size={14} />
-                        <div style={{ flex: 1 }}>
-                            {activePods.length} active{inactivePods.length > 0 && ` · ${inactivePods.length} previous`} ·
-                            {replicasMismatch ? ' replica count below desired' : ' pod-level issues detected'}.
-                        </div>
-                    </div>
-                )}
-
-                {/* Active pods */}
-                {activePods.length > 0 && (
-                    <>
-                        {sectionHeading(`Active (${activePods.length})`)}
-                        <div>
-                            {activePods.map((pod, idx) => (
-                                <PodInfoRow key={pod.name || `pod-${idx}`} pod={pod} />
-                            ))}
-                        </div>
-                    </>
-                )}
-
-                {/* Terminating / terminated pods */}
-                {inactivePods.length > 0 && (
-                    <>
-                        {sectionHeading(`Previous (${inactivePods.length})`)}
-                        <div>
-                            {inactivePods.map((pod, idx) => (
-                                <PodInfoRow key={pod.name || `prev-${idx}`} pod={pod} />
-                            ))}
-                        </div>
-                    </>
-                )}
+            <PanelBody>
+                <pre className="r-ctrl-meta">{JSON.stringify(metadata, null, 2)}</pre>
             </PanelBody>
         </Panel>
     );
@@ -1274,7 +901,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const [stopDialogOpen, setStopDialogOpen] = useState(false);
     const [stopping, setStopping] = useState(false);
     const [detailActionStatus, setDetailActionStatus] = useState('');
-    const [activeTab, setActiveTab] = useState('logs');
+    const [tabParam, setTabParam] = useQueryParam('tab');
     const [breakdownOpen, setBreakdownOpen] = useState(false);
     const { showToast } = useToast();
     const handleCopy = useCallback(async (value, label) => {
@@ -1369,7 +996,11 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     if (error) return <ErrorState message={`Error loading deployment: ${error}`} onRetry={loadDeployment} />;
     if (!deployment) return <EmptyState message="Deployment not found." />;
 
-    const podStatus = deployment.controller_metadata?.pod_status;
+    // Opaque by contract: whatever the controller is tracking, shown verbatim.
+    // Nothing here reads into it — see `ControllerMetadataSection`.
+    const controllerMetadata = deployment.controller_metadata;
+    const hasControllerMetadata =
+        !!controllerMetadata && Object.keys(controllerMetadata).length > 0;
     // Prefer the backend-deduplicated all_urls (deployment-group URL, env URL,
     // production URL, custom domains). Fall back to the older fields for stale
     // payloads; dedupe so a custom domain set as primary isn't shown twice.
@@ -1385,10 +1016,16 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         // No count: the timeline's length is only known once the event log
         // is fetched, and the tab should not block on that to render.
         { id: 'timeline', label: 'Timeline' },
-        ...(podStatus ? [{ id: 'pods', label: 'Pods', count: podStatus.pods?.length || 0 }] : []),
+        ...(hasControllerMetadata ? [{ id: 'controller', label: 'Controller' }] : []),
         ...(deployment.build_logs ? [{ id: 'build', label: 'Build output' }] : []),
         { id: 'env', label: 'Environment' },
     ];
+
+    // A `?tab=` naming a tab this deployment has no data for — a build-output
+    // link to a deployment with no build logs — falls back rather than showing
+    // an empty page. Writing `null` for the default keeps a plain link clean.
+    const activeTab = tabs.some((t) => t.id === tabParam) ? (tabParam as string) : 'logs';
+    const setActiveTab = (id: string) => setTabParam(id === 'logs' ? null : id);
 
     const buildKv = (
         <Panel>
@@ -1449,7 +1086,6 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const isMultiContainer = !!containers && containers.length > 0;
     // Populates the log console's container filter without a second request.
     const containerNames = (containers || []).map((c) => c.name).filter(Boolean);
-    const lifecycleMarkers = buildLifecycleMarkers(deployment, containerNames);
     const totals = isMultiContainer
         ? aggregateContainerResources(containers)
         : { replicas: deployment.replicas, cpu: deployment.cpu, memory: deployment.memory };
@@ -1609,7 +1245,6 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     deploymentCompletedAt={deployment.completed_at}
                     deploymentCreated={deployment.created}
                     containers={containerNames}
-                    markers={lifecycleMarkers}
                     lead={
                         <a
                             className="r-logc-expand"
@@ -1642,8 +1277,8 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 />
             )}
 
-            {activeTab === 'pods' && podStatus && (
-                <PodStatusSection podStatus={podStatus} />
+            {activeTab === 'controller' && hasControllerMetadata && (
+                <ControllerMetadataSection metadata={controllerMetadata} />
             )}
 
             {activeTab === 'build' && deployment.build_logs && (

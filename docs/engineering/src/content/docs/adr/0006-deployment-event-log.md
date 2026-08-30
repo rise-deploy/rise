@@ -41,12 +41,11 @@ response at all — `src/server/deployment/handlers.rs` omits them. But it holds
 one value per column: a deployment that went `Healthy → Unhealthy → Healthy`
 looks exactly like one that never wavered.
 
-**`controller_metadata.pod_status`** holds observed state. Every backend
-produces it: Kubernetes builds its own in `src/server/deployment/webhook.rs`,
-Docker and ECS through the shared builder in
-`crates/rise-backend-core/src/pod_status.rs`, which produces the Kubernetes
-shape the Pods tab consumes. It carries replica counts, per-container phase,
-`restart_count`, and `state` with `started_at`, `finished_at` and `exit_code`.
+**`controller_metadata.pod_status`** held observed state, and is what this
+decision removes. Every backend produced it — Kubernetes hand-built its own in
+the sync webhook, Docker and ECS went through a shared builder emitting the same
+Kubernetes shape — carrying replica counts, per-container phase, `restart_count`,
+and `state` with `started_at`, `finished_at` and `exit_code`.
 
 The snapshot is a **level, not an edge** — what is true at the last observation,
 which is a different thing from what happened:
@@ -69,12 +68,37 @@ that it is written at tick rate; the value cannot be recovered at read time.**
 
 ## Decision
 
-### D1. An append-only event log, alongside the snapshot
+### D1. An append-only event log, replacing the snapshot as an interface
 
 Rise persists `deployment_events`: an ordered, append-only record of things that
-happened to a deployment. `controller_metadata.pod_status` stays exactly as it
-is and keeps serving the Pods tab — it is the right shape for "what is true now"
-and the wrong shape for "what happened".
+happened to a deployment. It is the **only** interface to a deployment's
+observability — `controller_metadata.pod_status` is removed, not kept alongside.
+
+Keeping both was the original intent, on the reasoning that the snapshot is the
+right shape for "what is true now". The reason it does not survive is that two
+sources describing one deployment disagree, and a reader has no way to know
+which to believe. The Timeline tab and the log console's rail had already drifted
+into showing different histories of the same rollout precisely because one read
+each. Removing the snapshot leaves one answer.
+
+It also makes the remaining gaps legible. Replica-level detail is not yet
+recorded, and while the snapshot stayed, that absence was masked — the rail
+showed container starts the log had never captured. With the snapshot gone, what
+the log does not record is simply not shown, which is the honest rendering and
+the thing that tells us what to build next.
+
+**What the controllers keep.** `controller_metadata` remains as controller-owned
+bookkeeping — the ECS reconciler records the task-definition hash its service
+converged to there, and that is a real drift decision, not a display concern. It
+stays exposed on the deployment API and is rendered verbatim in a Controller tab
+for introspection. What it must never again be is an *interface*: its shape
+belongs to whichever controller wrote it and carries no compatibility promise, so
+nothing outside that controller may read into its keys.
+
+Container-level inspection returns later as a deliberate API with its own shape
+(see the canonical observation work), rather than by re-exposing a controller's
+internal notes. This supersedes ADR-0005's description of `pod_status` as the
+shared cross-backend observability shape.
 
 ### D2. One table, owned by `rise-deploy`
 
@@ -434,7 +458,9 @@ something needs sub-second delivery.
 
 The lifecycle rail reads events instead of deriving markers from `pod_status`.
 The Timeline tab renders the log directly, and the client-side timeline
-synthesis is deleted. The Pods tab is untouched — it wants current state.
+synthesis is deleted. The Pods tab is deleted with it: it read the snapshot's
+shape directly, which is exactly the coupling D1 removes. A Controller tab
+renders `controller_metadata` verbatim in its place, for introspection only.
 
 ### D9. Events are not log lines
 

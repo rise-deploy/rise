@@ -5,7 +5,6 @@ import { usePolling } from '../../lib/polling';
 import { ErrorState, LoadingState } from '../../components/states';
 import { Icon } from '../../components/icon';
 import { LogConsole } from './log-console';
-import { buildLifecycleMarkers } from './lifecycle';
 
 /** Statuses that will not change again, so polling can stop. */
 const TERMINAL_STATUSES = new Set([
@@ -17,7 +16,6 @@ interface DeploymentSummary {
     completed_at?: string | null;
     created?: string | null;
     containers?: { name?: string }[] | null;
-    controller_metadata?: { pod_status?: unknown } | null;
 }
 
 /**
@@ -59,11 +57,6 @@ export function DeploymentLogsPage({
         [deployment],
     );
 
-    const markers = useMemo(
-        () => buildLifecycleMarkers(deployment, containers),
-        [deployment, containers],
-    );
-
     if (error) return <ErrorState message={error} onRetry={load} />;
     if (!deployment) return <LoadingState label="Loading deployment…" />;
 
@@ -78,7 +71,6 @@ export function DeploymentLogsPage({
             deploymentCompletedAt={deployment.completed_at}
             deploymentCreated={deployment.created}
             containers={containers}
-            markers={markers}
             lead={(
                 <a
                     className="r-logc-back"

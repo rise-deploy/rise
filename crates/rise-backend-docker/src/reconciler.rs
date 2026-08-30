@@ -34,7 +34,6 @@ use super::diff::{
 use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
-use super::pod_status::build_controller_metadata;
 use super::rolling::filter_rolling_actions;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
@@ -2051,7 +2050,7 @@ impl DockerReconciler {
                 pods.push((name, inspected));
                 if !ready {
                     all_ready = false;
-                    // Keep inspecting the remaining replicas so the pod_status
+                    // Keep inspecting the remaining replicas so the readiness
                     // snapshot stays complete; only the readiness verdict short-
                     // circuits below via `all_ready`.
                 }
@@ -2067,21 +2066,6 @@ impl DockerReconciler {
                 not_ready_reasons.join("; ")
             )
         };
-
-        // Snapshot controller_metadata in a K8s-pod-status-shaped blob so the
-        // existing status APIs/UI render unchanged. Built from the per-replica
-        // inspections captured above (no second inspect).
-        let metadata = build_controller_metadata(&pods, &deployment.status, is_ready);
-        if let Err(e) = self
-            .store
-            .update_deployment_controller_metadata(deployment.id, &metadata)
-            .await
-        {
-            warn!(
-                deployment_id = %deployment.deployment_id,
-                "Failed to update controller metadata: {:?}", e
-            );
-        }
 
         match deployment.status {
             DeploymentStatus::Deploying if is_ready => {
@@ -2260,7 +2244,7 @@ impl DockerReconciler {
     }
 
     /// Single `inspect_container` for the reconcile pass: returns an owned
-    /// snapshot reused by BOTH the health probe and the `pod_status` builder, so
+    /// snapshot reused by BOTH the health probe and the readiness verdict, so
     /// each container is inspected once per tick. `port` is the container's
     /// app port (if any), used to resolve the published loopback host port from
     /// the `network_settings.ports["{port}/tcp"]` mapping. Returns `None` when
@@ -2284,7 +2268,7 @@ impl DockerReconciler {
         let state = inspect.state.clone();
         // The bollard `ContainerStateStatusEnum` Displays as the lowercase API
         // string ("running", "exited", …), matching what we map on in the
-        // pod_status builder.
+        // readiness verdict.
         let status = state
             .as_ref()
             .and_then(|s| s.status.as_ref())

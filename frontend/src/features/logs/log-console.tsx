@@ -81,7 +81,6 @@ export interface LogConsoleProps {
     /** Container names declared by the deployment, for the container filter. */
     containers?: string[];
     /** Deployment events drawn on the volume rail's time axis. */
-    markers?: LifecycleMarker[];
     /** Deployment metadata panels, shown in the slide-over details drawer. */
     details?: React.ReactNode;
     /** `page` fills the viewport; `embedded` sits inside the deployment tab. */
@@ -97,7 +96,6 @@ export function LogConsole({
     deploymentCompletedAt,
     deploymentCreated,
     containers = [],
-    markers = [],
     details,
     variant = 'embedded',
     lead,
@@ -112,11 +110,10 @@ export function LogConsole({
     const { showToast } = useToast();
 
     /**
-     * Markers the event log supplies. These are a history, so they carry moves
-     * the pod-status snapshot has already overwritten — a deployment that
-     * flapped shows every transition here and only its current state there.
-     * Merged with, rather than replacing, the snapshot-derived markers: the
-     * backend does not emit replica-level events yet.
+     * Markers from the event log — the rail's only source. Being a history, a
+     * deployment that flapped contributes every transition rather than just the
+     * state it ended in. Replica-level markers appear once the backends emit
+     * replica events.
      */
     const [eventMarkers, setEventMarkers] = useState<LifecycleMarker[]>([]);
 
@@ -150,7 +147,8 @@ export function LogConsole({
                 setEventMarkers(markersFromEvents(page.events));
             } catch (err) {
                 if (err instanceof Error && err.name === 'AbortError') return;
-                // The rail still has its snapshot-derived markers, so a failure
+                // The rail simply has no markers on failure, which is the
+                // honest rendering of "we could not read the log".
                 // here degrades the timeline rather than breaking the console.
                 console.warn('Could not load deployment events:', err);
             }
@@ -158,18 +156,8 @@ export function LogConsole({
         return () => controller.abort();
     }, [projectName, deploymentId, deploymentStatus]);
 
-    const railMarkers = useMemo(() => {
-        // The two sources overlap at the deployment level: the snapshot infers
-        // a rollout from `created` and an ending from `completed_at`, while the
-        // log records the transitions themselves. The log is both more accurate
-        // and able to show repeats, so where it has anything to say the
-        // inferred deployment-level markers step aside. Replica-level markers
-        // are snapshot-only until the reconcilers derive them.
-        const inferred = eventMarkers.length > 0
-            ? markers.filter((m) => m.kind === 'up' || m.kind === 'restart')
-            : markers;
-        return [...inferred, ...eventMarkers].sort((a, b) => a.ts - b.ts);
-    }, [markers, eventMarkers]);
+    // One source, so nothing to merge: the rail shows what was recorded.
+    const railMarkers = eventMarkers;
 
     /**
      * The rail is the time axis, and log volume is only one thing that can sit

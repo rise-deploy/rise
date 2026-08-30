@@ -51,3 +51,50 @@ export function maybeMigrateLegacyHashRoute(): void {
   window.history.replaceState({}, '', toPath(hash));
   window.dispatchEvent(new Event('rise:navigate'));
 }
+
+/**
+ * Read and write a single URL search parameter.
+ *
+ * View state that survives a reload and a paste — which tab is open, which time
+ * window the logs are showing — belongs in the URL: it is what makes "look at
+ * this" a link rather than a set of instructions. Writes use `replaceState`, so
+ * switching tabs does not build a history stack the Back button has to walk
+ * through before leaving the page.
+ *
+ * Passing `null` removes the parameter, keeping a default state's URL clean.
+ */
+export function useQueryParam(
+    key: string,
+): [string | null, (value: string | null) => void] {
+    const read = () => new URLSearchParams(window.location.search).get(key);
+    const [value, setValue] = useState<string | null>(read);
+
+    useEffect(() => {
+        const onChange = () => setValue(read());
+        window.addEventListener('popstate', onChange);
+        window.addEventListener('rise:navigate', onChange as EventListener);
+        return () => {
+            window.removeEventListener('popstate', onChange);
+            window.removeEventListener('rise:navigate', onChange as EventListener);
+        };
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- `read` closes over `key` only
+    }, [key]);
+
+    const write = (next: string | null) => {
+        const params = new URLSearchParams(window.location.search);
+        if (next === null || next === '') {
+            params.delete(key);
+        } else {
+            params.set(key, next);
+        }
+        const query = params.toString();
+        window.history.replaceState(
+            {},
+            '',
+            window.location.pathname + (query ? `?${query}` : '') + window.location.hash,
+        );
+        setValue(next === '' ? null : next);
+    };
+
+    return [value, write];
+}

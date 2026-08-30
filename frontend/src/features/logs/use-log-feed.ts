@@ -54,6 +54,54 @@ export const LOG_FOLLOW_THRESHOLD_PX = 24;
 const LOG_TERMINATED_END_CUSHION_MS = 10 * 60 * 1000;
 
 const AUTO_REFRESH_STORAGE_KEY = 'rise.deploymentLogs.autoRefreshSeconds';
+/** Preset windows the range control offers, plus `custom`. */
+const RANGE_VALUES = new Set(['15m', '1h', '6h', '24h', '7d', 'custom']);
+const DEFAULT_RANGE = '6h';
+
+function readRangeFromUrl(): string {
+    const value = new URLSearchParams(window.location.search).get('range');
+    // An unrecognised range is treated as absent: a stale or hand-edited link
+    // should open a working view, not an empty one.
+    return value && RANGE_VALUES.has(value) ? value : DEFAULT_RANGE;
+}
+
+function readInstantFromUrl(key: 'from' | 'to'): Date | null {
+    const value = new URLSearchParams(window.location.search).get(key);
+    if (!value) return null;
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/**
+ * Mirror the selected window into the URL.
+ *
+ * `replaceState`, not `pushState`: dragging a custom range would otherwise
+ * leave one history entry per adjustment for the Back button to walk through.
+ * The default preset writes no parameter at all, so an unmodified view links
+ * cleanly.
+ */
+function writeRangeToUrl(range: string, start: Date | null, end: Date | null): void {
+    const params = new URLSearchParams(window.location.search);
+
+    if (range === DEFAULT_RANGE) params.delete('range');
+    else params.set('range', range);
+
+    if (range === 'custom' && start && end) {
+        params.set('from', start.toISOString());
+        params.set('to', end.toISOString());
+    } else {
+        params.delete('from');
+        params.delete('to');
+    }
+
+    const query = params.toString();
+    window.history.replaceState(
+        {},
+        '',
+        window.location.pathname + (query ? `?${query}` : '') + window.location.hash,
+    );
+}
+
 const DEFAULT_AUTO_REFRESH_SECONDS = 300;
 
 /** A chart bucket the user clicked, narrowing the log query to its span. */
@@ -144,9 +192,12 @@ export function useLogFeed({
         max_tail: null,
     });
 
-    const [rangeValue, setRangeValue] = useState('6h');
-    const [customStart, setCustomStart] = useState<Date | null>(null);
-    const [customEnd, setCustomEnd] = useState<Date | null>(null);
+    // The selected window lives in the URL: a link to a deployment's logs is
+    // only useful if it carries *which* logs. `from`/`to` are ISO instants and
+    // only present for a custom range; a preset is just its own name.
+    const [rangeValue, setRangeValue] = useState(readRangeFromUrl);
+    const [customStart, setCustomStart] = useState<Date | null>(() => readInstantFromUrl('from'));
+    const [customEnd, setCustomEnd] = useState<Date | null>(() => readInstantFromUrl('to'));
     // Bumped on refresh to re-anchor a preset window's end at "now". Without
     // it, lines that streamed in after page load stay marked out-of-range.
     const [rangeNowTick, setRangeNowTick] = useState(0);
@@ -155,6 +206,13 @@ export function useLogFeed({
     const [loadingMore, setLoadingMore] = useState(false);
     const [selectedBucket, setSelectedBucket] = useState<SelectedBucket | null>(null);
     const [autoRefreshSeconds, setAutoRefreshSeconds] = useState(readStoredAutoRefresh);
+
+    // Read by `changeRange` when switching to a custom window, without making
+    // the callback depend on values that change as the user drags the range.
+    const customStartRef = useRef(customStart);
+    const customEndRef = useRef(customEnd);
+    customStartRef.current = customStart;
+    customEndRef.current = customEnd;
 
     const streamAbortRef = useRef<AbortController | null>(null);
     const countsAbortRef = useRef<AbortController | null>(null);
@@ -610,15 +668,21 @@ export function useLogFeed({
         setRangeValue(value);
         setSelectedBucket(null);
         if (value === 'custom') {
-            setCustomStart((prev) => prev ?? new Date(Date.now() - 6 * 60 * 60 * 1000));
-            setCustomEnd((prev) => prev ?? new Date());
+            const start = customStartRef.current ?? new Date(Date.now() - 6 * 60 * 60 * 1000);
+            const end = customEndRef.current ?? new Date();
+            setCustomStart(start);
+            setCustomEnd(end);
+            writeRangeToUrl(value, start, end);
+            return;
         }
+        writeRangeToUrl(value, null, null);
     }, []);
 
     const changeCustomRange = useCallback((start: Date | null, end: Date | null) => {
         setCustomStart(start);
         setCustomEnd(end);
         setSelectedBucket(null);
+        writeRangeToUrl('custom', start, end);
     }, []);
 
     return {

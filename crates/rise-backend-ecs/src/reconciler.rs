@@ -15,7 +15,7 @@
 //!    second and service modifications 5; a naive port of the Docker loop (which
 //!    lists twice per tick and inspects every container) would throttle a
 //!    moderately sized install. So each tick makes one listing pass and shares it
-//!    between drift detection, readiness and `pod_status`, and a task definition
+//!    between drift detection and readiness, and a task definition
 //!    is registered only when its content hash actually moves.
 
 use std::collections::{HashMap, HashSet};
@@ -24,11 +24,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::{
-    build_controller_metadata, effective_health_path, hash_env, merge_container_env,
-    pin_system_env, redact_secrets_for_hash, resolve_deployment_env_vars,
-    resolve_runtime_containers, rise_system_env_vars, should_have_infrastructure, spec_key,
-    DeploymentStore, DeploymentUrlBuilder, DesiredContainer, DesiredRoute, EncryptionProvider,
-    InspectedContainer, ResolvedDeploymentEnvVars, DEPLOYING_TIMEOUT_MINUTES,
+    effective_health_path, hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash,
+    resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
+    should_have_infrastructure, spec_key, DeploymentStore, DeploymentUrlBuilder, DesiredContainer,
+    DesiredRoute, EncryptionProvider, InspectedContainer, ResolvedDeploymentEnvVars,
+    DEPLOYING_TIMEOUT_MINUTES,
 };
 use rise_backend_traefik::{replica_ready, ReadyVerdict, TraefikApiClient};
 use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
@@ -167,8 +167,8 @@ fn persisted_td_hash(controller_metadata: &serde_json::Value) -> Option<String> 
 }
 
 /// Fold the converged task-definition hash into a controller-metadata object,
-/// leaving the health/pod-status keys untouched. A no-op if `hash` is `None` or
-/// the metadata is not a JSON object.
+/// leaving any sibling keys untouched. A no-op if `hash` is `None` or the
+/// metadata is not a JSON object.
 fn with_persisted_td_hash(
     mut metadata: serde_json::Value,
     hash: Option<&str>,
@@ -2088,10 +2088,10 @@ impl EcsReconciler {
             persisted_td_hash(&deployment.controller_metadata)
         };
 
-        let metadata = with_persisted_td_hash(
-            build_controller_metadata(&pods, &deployment.status, all_ready),
-            converged_hash.as_deref(),
-        );
+        // `controller_metadata` carries exactly one thing: the task-definition
+        // hash the service has converged to. It is the authoritative drift
+        // marker, so it is written even when there is nothing else to record.
+        let metadata = with_persisted_td_hash(serde_json::json!({}), converged_hash.as_deref());
         if let Err(e) = self
             .store
             .update_deployment_controller_metadata(deployment.id, &metadata)
@@ -2162,7 +2162,7 @@ impl EcsReconciler {
     }
 
     /// Describe a service's tasks, projecting each onto the backend-agnostic
-    /// [`InspectedContainer`] the shared `pod_status` builder consumes and
+    /// [`InspectedContainer`] the shared readiness verdict consumes and
     /// tagging it with the revision it runs.
     ///
     /// Every task is returned, both revisions' during a roll: the caller needs
@@ -2244,7 +2244,7 @@ impl EcsReconciler {
                     running,
                     ip,
                     inspected: InspectedContainer {
-                        // ECS status strings are uppercase; the shared pod_status
+                        // ECS status strings are uppercase; the shared readiness
                         // mapper expects Docker's lowercase vocabulary.
                         status: Some(ecs_status_to_container_state(&last_status).to_string()),
                         running,
@@ -2295,7 +2295,7 @@ impl rise_backend_core::lifecycle::SupersededHook for EcsReconciler {
     }
 }
 
-/// One observed ECS task, reduced to what readiness and `pod_status` need.
+/// One observed ECS task, reduced to what the readiness verdict needs.
 struct TaskView {
     name: String,
     /// ARN of the task definition this task runs. During a roll a service owns
@@ -2340,13 +2340,12 @@ fn primary_rollout_start(
         .and_then(|t| chrono::DateTime::from_timestamp(t.secs(), 0))
 }
 
-/// Map an ECS task `lastStatus` onto the Docker-shaped container state the
-/// shared `pod_status` builder understands, so the frontend's Pods tab renders
-/// identically on every backend.
+/// Map an ECS task `lastStatus` onto the shared container-state vocabulary, so
+/// readiness is decided the same way on every backend.
 pub(crate) fn ecs_status_to_container_state(last_status: &str) -> &'static str {
     match last_status {
         "RUNNING" => "running",
-        // Everything before RUNNING is a pending state; the Pods tab shows these
+        // Everything before RUNNING is a pending state; none of them are ready
         // as "waiting", which is what a user expects while a task starts.
         "PROVISIONING" | "PENDING" | "ACTIVATING" => "created",
         "DEACTIVATING" | "STOPPING" | "DEPROVISIONING" => "restarting",
@@ -2440,22 +2439,19 @@ mod tests {
 
     #[test]
     fn converged_hash_round_trips_through_controller_metadata() {
-        let base = serde_json::json!({
-            "pod_status": { "ready_replicas": 1 },
-            "health": { "healthy": true },
-        });
+        // The reconciler writes only the hash today, but the stamp must stay
+        // additive: whatever else comes to share this column survives it.
+        let base = serde_json::json!({ "other": { "kept": true } });
         assert_eq!(persisted_td_hash(&base), None);
 
         let stamped = with_persisted_td_hash(base.clone(), Some("abc123"));
         assert_eq!(persisted_td_hash(&stamped).as_deref(), Some("abc123"));
-        // The health/pod-status keys survive the stamp untouched.
-        assert_eq!(stamped["pod_status"]["ready_replicas"], 1);
-        assert_eq!(stamped["health"]["healthy"], true);
+        assert_eq!(stamped["other"]["kept"], true);
     }
 
     #[test]
     fn stamping_none_leaves_the_metadata_unchanged() {
-        let base = serde_json::json!({ "health": { "healthy": false } });
+        let base = serde_json::json!({ "other": { "kept": false } });
         assert_eq!(with_persisted_td_hash(base.clone(), None), base);
     }
 
@@ -2799,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn ecs_task_states_map_onto_the_shared_pod_status_vocabulary() {
+    fn ecs_task_states_map_onto_the_shared_container_state_vocabulary() {
         // The Pods tab is rendered from one shared JSON shape across all
         // backends. ECS reports uppercase lifecycle states that mean nothing to
         // that mapper — leaving them unmapped would show every task as "Unknown"

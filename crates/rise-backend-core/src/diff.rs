@@ -112,7 +112,7 @@ impl ActualContainer {
 }
 
 /// Owned snapshot of one `inspect_container` call, captured once per reconcile
-/// tick and reused by both the health probe and the `pod_status` builder. All
+/// tick and reused by both the health probe and the readiness verdict. All
 /// fields are owned so the value can be stored in a map and unit-tested without
 /// a live daemon.
 #[derive(Debug, Clone)]

@@ -78,6 +78,13 @@ pub struct Deployment {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_logs: Option<String>,
+    /// Opaque controller bookkeeping, surfaced for introspection only.
+    ///
+    /// Each backend writes whatever it needs to track its own convergence — the
+    /// ECS reconciler records the task-definition hash its service settled on.
+    /// The shape is the controller's business and changes with it, so nothing
+    /// outside the controller may depend on the keys inside: read it to see what
+    /// a controller is thinking, never to drive behaviour.
     #[serde(default)]
     pub controller_metadata: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
