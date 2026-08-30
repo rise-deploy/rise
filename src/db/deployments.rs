@@ -334,10 +334,19 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
                     'cpu', ins.cpu,
                     'memory', ins.memory,
                     'image', ins.image,
-                    'containers', (
-                        SELECT jsonb_agg(c->>'name')
-                        FROM jsonb_array_elements(ins.containers) c
-                    ),
+                    -- `containers` is a versioned side-data envelope
+                    -- ({version, items}), not a bare array. The type guard is
+                    -- not defensive dressing: jsonb_array_elements raises on a
+                    -- non-array, and this runs inside the INSERT, so a shape
+                    -- this does not expect would fail the deployment itself.
+                    -- Recording nothing is the only acceptable failure mode for
+                    -- an event describing a write.
+                    'containers', CASE
+                        WHEN jsonb_typeof(ins.containers->'items') = 'array' THEN (
+                            SELECT jsonb_agg(c->>'name')
+                            FROM jsonb_array_elements(ins.containers->'items') c
+                        )
+                    END,
                     'rolled_back_from', ins.rolled_back_from_deployment_id,
                     'job_url', ins.job_url,
                     'pull_request_url', ins.pull_request_url
@@ -1803,7 +1812,12 @@ mod tests {
     #[sqlx::test]
     async fn creating_a_deployment_opens_its_log(pool: PgPool) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
-        let containers = serde_json::json!([{"name": "web"}, {"name": "worker"}]);
+        // The real stored shape: a versioned side-data envelope, not a bare
+        // array. `encode_side_data` produces this.
+        let containers = serde_json::json!({
+            "version": 1,
+            "items": [{"name": "web"}, {"name": "worker"}],
+        });
 
         let created = create(
             &pool,
@@ -1880,6 +1894,67 @@ mod tests {
             attributes.get("job_url").is_none(),
             "absent optionals are omitted, not stored as null",
         );
+    }
+
+    /// The creation event describes the write it rides along with, so nothing
+    /// about assembling it may be able to fail that write. A `containers` value
+    /// this does not recognise costs the event one attribute, not the
+    /// deployment.
+    #[sqlx::test]
+    async fn an_unreadable_container_shape_still_creates_the_deployment(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+
+        for (label, containers) in [
+            (
+                "an envelope with no items",
+                serde_json::json!({"version": 1}),
+            ),
+            ("a bare array", serde_json::json!([{"name": "web"}])),
+            ("a scalar", serde_json::json!("web")),
+        ] {
+            let deployment_id = format!("20260830-0000{}", containers.to_string().len());
+            let created = create(
+                &pool,
+                CreateDeploymentParams {
+                    deployment_id: &deployment_id,
+                    project_id,
+                    created_by_id: user_id,
+                    status: DeploymentStatus::Pending,
+                    image: None,
+                    image_digest: None,
+                    rolled_back_from_deployment_id: None,
+                    deployment_group: "default",
+                    environment_id: None,
+                    expires_at: None,
+                    http_port: 8080,
+                    is_active: false,
+                    job_url: None,
+                    pull_request_url: None,
+                    git_repository_url: None,
+                    replicas: 1,
+                    cpu: "500m",
+                    memory: "256Mi",
+                    identity_audiences: serde_json::json!({}),
+                    containers: Some(&containers),
+                    routes: None,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label} must not fail deployment creation: {e:?}"));
+
+            let attributes: serde_json::Value = sqlx::query_scalar(
+                "SELECT attributes FROM deployment_events WHERE deployment_id = $1",
+            )
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(attributes["to"], "Pending", "{label} still opens the log");
+            assert!(
+                attributes.get("containers").is_none(),
+                "{label} contributes no container list",
+            );
+        }
     }
 
     async fn status_events(pool: &PgPool, id: Uuid) -> Vec<(String, String)> {
