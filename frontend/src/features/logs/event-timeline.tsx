@@ -143,6 +143,9 @@ const LABELS: Record<string, string> = {
     rolled_back_from: 'rolled back from',
     job_url: 'job',
     pull_request_url: 'pull request',
+    git_revision: 'revision',
+    git_branch: 'branch',
+    git_dirty: 'uncommitted changes',
 };
 
 /**
@@ -155,7 +158,8 @@ const ORDER = [
     // Who and what, before how much.
     'created_by', 'superseded_by', 'rolled_back_from', 'stopped_by',
     'container', 'containers', 'replicas', 'cpu', 'memory',
-    // Then the build, in the order it happened.
+    // Then what was built, and from what.
+    'git_branch', 'git_revision', 'git_dirty',
     'build_method', 'build_ms', 'push_ms', 'registry',
     'image', 'image_digest', 'image_size_bytes', 'group',
 ];
@@ -332,8 +336,19 @@ function formatValue(name: string, value: unknown): string {
     if (Array.isArray(value)) return value.map((v) => formatValue(name, v)).join(', ');
     if (typeof value === 'object' && value !== null) return JSON.stringify(value);
 
+    // "yes"/"no" rather than "true"/"false": these read as answers to the
+    // label beside them, and `false` is worth showing — "we looked, and the
+    // tree was clean" is not the same as saying nothing.
+    if (typeof value === 'boolean') return value ? 'yes' : 'no';
+
     if (name.endsWith('_ms') && typeof value === 'number') return formatMs(value);
     if (name.endsWith('_bytes') && typeof value === 'number') return formatBytes(value);
+    // A revision is identified by its first few characters everywhere else a
+    // person reads one; the full value stays in the event for anyone matching
+    // on it exactly.
+    if (name.endsWith('_revision') && typeof value === 'string' && /^[0-9a-f]{40}$/.test(value)) {
+        return value.slice(0, 12);
+    }
     if (name.endsWith('_at') && typeof value === 'string') {
         const date = new Date(value);
         if (!Number.isNaN(date.getTime())) return date.toLocaleString();

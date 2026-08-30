@@ -1228,7 +1228,7 @@ pub async fn create_deployment(
 
         // Step 3: Update status to 'building'
         let token = token_with_retry(&provider).await?;
-        update_deployment_status(
+        update_deployment_status_with(
             http_client,
             backend_url,
             &token,
@@ -1236,6 +1236,7 @@ pub async fn create_deployment(
             &deployment_info.deployment_id,
             "Building",
             None,
+            detect_git_provenance(),
         )
         .await?;
 
@@ -1362,7 +1363,7 @@ async fn build_and_push_multi_container(
     let token = token_with_retry(provider).await?;
     let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
 
-    update_deployment_status(
+    update_deployment_status_with(
         http_client,
         backend_url,
         &token,
@@ -1370,6 +1371,7 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
         "Building",
         None,
+        detect_git_provenance(),
     )
     .await?;
 
@@ -1756,6 +1758,53 @@ fn detect_ci_repository_url() -> Option<String> {
 ///
 /// Equivalent to the fetch URL reported by `git remote show origin`, but
 /// resolved offline via `git remote get-url origin`.
+/// Run a `git` command in the working directory, with a timeout.
+///
+/// Threaded and time-bounded for the same reason `detect_git_remote_url` is: a
+/// misconfigured credential helper or a filesystem-backed repository can block
+/// indefinitely, and reporting build provenance must never be able to hang a
+/// deploy.
+fn git_output(args: &'static [&'static str]) -> Option<String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new("git").args(args).output());
+    });
+
+    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// What the source tree was when the build started, or `None` outside a Git
+/// repository.
+///
+/// `dirty` is the part worth having: an image built from uncommitted changes is
+/// not reproducible from its revision, and that is exactly the thing someone
+/// tries to do when a deployment misbehaves.
+fn detect_git_provenance() -> Option<serde_json::Value> {
+    let revision = git_output(&["rev-parse", "HEAD"])?;
+    let mut provenance = serde_json::json!({ "git_revision": revision });
+
+    if let Some(branch) = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        // Detached HEAD reports the literal "HEAD", which names nothing.
+        if branch != "HEAD" {
+            provenance["git_branch"] = serde_json::json!(branch);
+        }
+    }
+    // `--porcelain` prints one line per changed path and nothing at all for a
+    // clean tree, so emptiness is the test.
+    if let Some(status) = git_output(&["status", "--porcelain"]) {
+        provenance["git_dirty"] = serde_json::json!(!status.is_empty());
+    }
+
+    Some(provenance)
+}
+
 fn detect_git_remote_url() -> Option<String> {
     use std::sync::mpsc;
     use std::time::Duration;

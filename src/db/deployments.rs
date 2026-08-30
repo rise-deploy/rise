@@ -344,9 +344,15 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
                     -- can be edited later, the event says what was requested.
                     'created_by', u.email,
                     'group', ins.deployment_group,
-                    'replicas', ins.replicas,
-                    'cpu', ins.cpu,
-                    'memory', ins.memory,
+                    -- `replicas`, `cpu` and `memory` are per container. The
+                    -- columns on `deployments` are the single-container view of
+                    -- them, so reporting them beside a list of container names
+                    -- would attribute one container's size to all of them.
+                    -- They are recorded here only when there is no per-container
+                    -- side data to be more precise than.
+                    'replicas', CASE WHEN NOT $22 THEN to_jsonb(ins.replicas) END,
+                    'cpu', CASE WHEN NOT $22 THEN to_jsonb(ins.cpu) END,
+                    'memory', CASE WHEN NOT $22 THEN to_jsonb(ins.memory) END,
                     'image', ins.image,
                     -- `containers` is a versioned side-data envelope
                     -- ({version, items}), not a bare array. The type guard is
@@ -355,9 +361,16 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
                     -- this does not expect would fail the deployment itself.
                     -- Recording nothing is the only acceptable failure mode for
                     -- an event describing a write.
+                    -- Each container with its own size, rather than a bare
+                    -- list of names beside one set of numbers.
                     'containers', CASE
-                        WHEN jsonb_typeof(ins.containers->'items') = 'array' THEN (
-                            SELECT jsonb_agg(c->>'name')
+                        WHEN $22 THEN (
+                            SELECT jsonb_agg(jsonb_strip_nulls(jsonb_build_object(
+                                'container', c->>'name',
+                                'replicas', c->'replicas',
+                                'cpu', c->>'cpu',
+                                'memory', c->>'memory'
+                            )))
                             FROM jsonb_array_elements(ins.containers->'items') c
                         )
                     END,
@@ -405,6 +418,12 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
         params.identity_audiences,
         params.containers,
         params.routes,
+        // Whether per-container side data exists, decided once in Rust rather
+        // than re-derived in three CASE arms.
+        params
+            .containers
+            .and_then(|c| c.get("items"))
+            .is_some_and(serde_json::Value::is_array),
     )
     .fetch_one(pool)
     .await
@@ -1846,7 +1865,10 @@ mod tests {
         // array. `encode_side_data` produces this.
         let containers = serde_json::json!({
             "version": 1,
-            "items": [{"name": "web"}, {"name": "worker"}],
+            "items": [
+                { "name": "web", "replicas": 2, "cpu": "500m", "memory": "256Mi" },
+                { "name": "worker", "replicas": 1, "cpu": "250m", "memory": "128Mi" },
+            ],
         });
 
         let created = create(
@@ -1906,15 +1928,25 @@ mod tests {
         // edited afterwards; the event keeps the ask.
         assert_eq!(attributes["to"], "Pending");
         assert_eq!(attributes["created_by"], format!("{user_id}@example.com"));
-        assert_eq!(attributes["replicas"], 2);
-        assert_eq!(attributes["cpu"], "500m");
-        assert_eq!(attributes["memory"], "256Mi");
         assert_eq!(attributes["group"], "default");
         assert_eq!(attributes["image"], "registry.test/app:v1");
+
+        // Size belongs to each container, not to the deployment: one set of
+        // numbers beside two container names would attribute one container's
+        // size to both.
         assert_eq!(
             attributes["containers"],
-            serde_json::json!(["web", "worker"])
+            serde_json::json!([
+                { "container": "web", "replicas": 2, "cpu": "500m", "memory": "256Mi" },
+                { "container": "worker", "replicas": 1, "cpu": "250m", "memory": "128Mi" },
+            ]),
         );
+        for absent in ["replicas", "cpu", "memory"] {
+            assert!(
+                attributes.get(absent).is_none(),
+                "{absent} is per-container here, so the row's value must not stand in for it",
+            );
+        }
         assert!(
             attributes.get("from").is_none(),
             "nothing preceded creation, and jsonb_strip_nulls drops the key rather \

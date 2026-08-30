@@ -133,6 +133,17 @@ pub mod attributes {
     /// actually lands on.
     pub const SUPERSEDED_BY: &str = "superseded_by";
 
+    /// What the source tree was when the build started, reported by the CLI on
+    /// the transition into `Building`. Absent outside a Git repository, and
+    /// absent for a pre-built image, which is built from nothing local.
+    ///
+    /// `git_dirty` is the one that earns its place: an image built from
+    /// uncommitted changes cannot be reproduced from its revision, which is
+    /// exactly what someone attempts when a deployment misbehaves.
+    pub const GIT_REVISION: &str = "git_revision";
+    pub const GIT_BRANCH: &str = "git_branch";
+    pub const GIT_DIRTY: &str = "git_dirty";
+
     /// Registry the images were pushed to, and the per-image breakdown: a list
     /// of objects, one per container, each carrying `container`, `image`,
     /// `build_method`, `build_ms` and — when a separate push makes it
