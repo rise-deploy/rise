@@ -901,7 +901,8 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const [stopDialogOpen, setStopDialogOpen] = useState(false);
     const [stopping, setStopping] = useState(false);
     const [detailActionStatus, setDetailActionStatus] = useState('');
-    const [tabParam, setTabParam] = useQueryParam('tab');
+    // Pushed, not replaced: switching tabs is a move the Back button undoes.
+    const [tabParam, setTabParam] = useQueryParam('tab', { history: 'push' });
     const [breakdownOpen, setBreakdownOpen] = useState(false);
     const { showToast } = useToast();
     const handleCopy = useCallback(async (value, label) => {

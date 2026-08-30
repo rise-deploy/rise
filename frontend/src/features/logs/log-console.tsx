@@ -400,7 +400,7 @@ export function LogConsole({
                         : 'Nothing to show on the timeline yet'}
                 >
                     <Icon name={railOpen ? 'chevd' : 'chev'} size={11} />
-                    <span>{feed.volumeSupported ? 'Volume' : 'Timeline'}</span>
+                    <span>Timeline</span>
                 </button>
                 {railHasContent && railOpen && (
                     <div className="r-logc-rail-body r-logs-chart">
