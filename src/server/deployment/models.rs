@@ -265,6 +265,16 @@ pub struct UpdateDeploymentStatusRequest {
     pub status: DeploymentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// What the reporter observed while making this transition — the build
+    /// method it chose, the registry it pushed to, per-image durations and
+    /// sizes. Recorded on the transition's event and nowhere else: this
+    /// describes one moment, not the deployment's state.
+    ///
+    /// Optional by design. The phases before `Pushed` are driven by the CLI,
+    /// so the backend cannot observe them and an older CLI simply sends
+    /// nothing — the transition is still recorded, just without detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

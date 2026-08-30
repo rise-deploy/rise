@@ -1380,6 +1380,12 @@ async fn build_and_push_multi_container(
     let min_remaining = registry_cred_min_remaining();
     let mut cached_creds: Option<TimedRegistryCredentials> = None;
 
+    // One entry per container, reported on the `Pushed` transition. A
+    // multi-container deployment builds every image inside a single `Building`
+    // state, so the transition timestamps only ever give the total — which
+    // image was slow is exactly what they cannot say.
+    let mut image_reports: Vec<serde_json::Value> = Vec::new();
+
     for container in &resolved.containers {
         let Some(image_tag) = container_images.get(&container.name) else {
             // Shouldn't happen — the backend populates every container.
@@ -1417,6 +1423,11 @@ async fn build_and_push_multi_container(
             BuildPushMode::Inline
         });
         let container_cli = options.container_cli.command().to_string();
+        // What the project asked for. `None` means the method was auto-detected
+        // from the build context, and the detected value is resolved inside
+        // `build_image` rather than surfaced here — so the attribute is omitted
+        // rather than guessed at.
+        let build_method = options.backend.clone();
 
         if !deploy_opts.build_args.separate_push {
             // Re-mint registry credentials only when the previous container's are
@@ -1458,6 +1469,7 @@ async fn build_and_push_multi_container(
         log_platform_choice(&options.platform, options.platform_source, "Building");
         info!("→ Building container '{}' as {}", container.name, image_tag);
 
+        let build_started = Instant::now();
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
             report_failed_status(
@@ -1471,6 +1483,10 @@ async fn build_and_push_multi_container(
             .await;
             return Err(e);
         }
+        let build_ms = build_started.elapsed().as_millis() as u64;
+
+        let mut push_ms: Option<u64> = None;
+        let push_started = Instant::now();
         if deploy_opts.build_args.separate_push {
             if let Err(e) = push_with_fresh_registry_credentials(
                 http_client,
@@ -1495,12 +1511,29 @@ async fn build_and_push_multi_container(
                 .await;
                 return Err(e);
             }
+            push_ms = Some(push_started.elapsed().as_millis() as u64);
         }
+
+        let mut report = serde_json::json!({
+            "container": container.name,
+            "image": image_tag,
+            "build_ms": build_ms,
+        });
+        if let Some(method) = &build_method {
+            report["build_method"] = serde_json::json!(method);
+        }
+        // Omitted, not null, when the push was folded into the build: an inline
+        // push has no separately observable duration, and a stored null reads
+        // as "measured, and the answer was nothing".
+        if let Some(push_ms) = push_ms {
+            report["push_ms"] = serde_json::json!(push_ms);
+        }
+        image_reports.push(report);
         info!("  ✓ Pushed container '{}'", container.name);
     }
 
     let token = token_with_retry(provider).await?;
-    update_deployment_status(
+    update_deployment_status_with(
         http_client,
         backend_url,
         &token,
@@ -1508,6 +1541,12 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
         "Pushed",
         None,
+        (!image_reports.is_empty()).then(|| {
+            serde_json::json!({
+                "registry": deployment_info.credentials.registry_url,
+                "images": image_reports,
+            })
+        }),
     )
     .await?;
 
@@ -1985,6 +2024,37 @@ async fn update_deployment_status(
     status: &str,
     error_message: Option<&str>,
 ) -> Result<()> {
+    update_deployment_status_with(
+        http_client,
+        backend_url,
+        token,
+        project_name,
+        deployment_id,
+        status,
+        error_message,
+        None,
+    )
+    .await
+}
+
+/// Report a transition along with what was observed while making it.
+///
+/// The phases up to `Pushed` happen here, not in the backend, so this is the
+/// only place their detail exists — which build method ran, what was pushed
+/// where, how long each image took. A backend that does not understand
+/// `attributes` ignores them, and passing `None` is always valid, so nothing
+/// depends on the two sides being upgraded together.
+#[allow(clippy::too_many_arguments)]
+async fn update_deployment_status_with(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project_name: &str,
+    deployment_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+    attributes: Option<serde_json::Value>,
+) -> Result<()> {
     let url = format!(
         "{}/api/v1/projects/{}/deployments/{}/status",
         backend_url, project_name, deployment_id
@@ -1995,6 +2065,10 @@ async fn update_deployment_status(
 
     if let Some(error) = error_message {
         payload["error_message"] = serde_json::json!(error);
+    }
+
+    if let Some(attributes) = attributes {
+        payload["attributes"] = attributes;
     }
 
     debug!("Updating deployment {} status to {}", deployment_id, status);

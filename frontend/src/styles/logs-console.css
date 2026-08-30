@@ -988,3 +988,30 @@
     overflow-x: auto;
     white-space: pre;
 }
+
+/* Per-image build/push detail on a transition. Indented under the facts row:
+   these belong to the event but are a level down from it. */
+.r-evt-images {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 3px;
+}
+
+.r-evt-image {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 11.5px;
+}
+
+.r-evt-image-name {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text);
+}
+
+.r-evt-image-meta {
+    color: var(--text-soft);
+}

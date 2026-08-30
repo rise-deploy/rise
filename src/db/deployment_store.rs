@@ -97,7 +97,7 @@ impl DeploymentStore for PgDeploymentStore {
         id: Uuid,
         status: DeploymentStatus,
     ) -> Result<Deployment> {
-        crate::db::deployments::update_status(&self.pool, id, status).await
+        crate::db::deployments::update_status(&self.pool, id, status, None).await
     }
 
     async fn update_deployment_controller_metadata(

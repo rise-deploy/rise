@@ -95,6 +95,7 @@ function EventRow({
                 <span className="r-evt-label">{describe(event)}</span>
                 {reason && <span className="r-evt-reason">{reason}</span>}
                 <EventFacts event={event} />
+                <EventImages event={event} />
             </span>
             <span className="r-evt-delta mono">{sincePrevious(event, previous)}</span>
         </div>
@@ -139,6 +140,59 @@ function EventFacts({ event }: { event: DeploymentEvent }) {
             ))}
         </span>
     );
+}
+
+/** One image the reporter built or pushed during this transition. */
+interface ReportedImage {
+    container?: string;
+    image?: string;
+    build_method?: string;
+    build_ms?: number;
+    push_ms?: number;
+    size_bytes?: number;
+}
+
+/**
+ * Per-image detail, when the reporter supplied any.
+ *
+ * A multi-container deployment builds every image inside one `Building` state,
+ * so the gap between transitions only gives the total. This is the breakdown
+ * that says *which* image took it.
+ */
+function EventImages({ event }: { event: DeploymentEvent }) {
+    const images = event.attributes?.images;
+    if (!Array.isArray(images) || images.length === 0) return null;
+
+    return (
+        <span className="r-evt-images">
+            {(images as ReportedImage[]).map((image, i) => (
+                <span key={image.container ?? i} className="r-evt-image">
+                    <span className="r-evt-image-name">{image.container ?? image.image ?? '?'}</span>
+                    {image.build_method && (
+                        <span className="r-evt-image-meta">{image.build_method}</span>
+                    )}
+                    {typeof image.build_ms === 'number' && (
+                        <span className="r-evt-image-meta">build {formatMs(image.build_ms)}</span>
+                    )}
+                    {typeof image.push_ms === 'number' && (
+                        <span className="r-evt-image-meta">push {formatMs(image.push_ms)}</span>
+                    )}
+                    {typeof image.size_bytes === 'number' && (
+                        <span className="r-evt-image-meta">{formatBytes(image.size_bytes)}</span>
+                    )}
+                </span>
+            ))}
+        </span>
+    );
+}
+
+function formatMs(ms: number): string {
+    if (!Number.isFinite(ms)) return '';
+    if (ms < 1000) return `${Math.round(ms)}ms`;
+    const seconds = ms / 1000;
+    if (seconds < 60) return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)}s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${Math.round(seconds % 60)}s`;
 }
 
 function formatBytes(bytes: number): string {

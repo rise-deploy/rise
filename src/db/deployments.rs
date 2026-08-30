@@ -405,10 +405,17 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
 ///
 /// Validates state transition using the state machine before updating.
 /// Returns error if the transition is invalid or if the deployment doesn't exist.
+/// Move a deployment to `status`, recording the transition.
+///
+/// `attributes` is reporter-supplied detail about *this* transition, merged
+/// into the event. `None` records the transition alone — every caller that does
+/// not observe anything worth reporting, and every CLI too old to send it,
+/// lands here and stays correct.
 pub async fn update_status(
     pool: &PgPool,
     id: Uuid,
     status: DeploymentStatus,
+    attributes: Option<&serde_json::Value>,
 ) -> Result<Deployment> {
     // Fetch current deployment to validate state transition
     let current = sqlx::query_as!(
@@ -491,7 +498,10 @@ pub async fn update_status(
                     ELSE 'info'
                 END,
                 'control-plane',
-                jsonb_build_object(
+                -- Reporter detail first, so `from`/`to` cannot be shadowed by
+                -- a caller sending those keys: the transition is the one thing
+                -- the log must be able to state on its own authority.
+                COALESCE($3::jsonb, '{}'::jsonb) || jsonb_build_object(
                     'from', from_status, 'to', status,
                     'reason', error_message
                 )
@@ -517,7 +527,8 @@ pub async fn update_status(
         FROM upd
         "#,
         id,
-        status_str
+        status_str,
+        attributes
     )
     .fetch_optional(pool)
     .await
@@ -1957,6 +1968,73 @@ mod tests {
         }
     }
 
+    /// Reported detail rides along with the transition it describes.
+    #[sqlx::test]
+    async fn reported_attributes_are_merged_into_the_transition(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Pushing").await;
+        let reported = serde_json::json!({
+            "registry": "registry.test",
+            "images": [{ "container": "web", "build_ms": 8123, "push_ms": 1400 }],
+        });
+
+        update_status(&pool, id, DeploymentStatus::Pushed, Some(&reported))
+            .await
+            .unwrap();
+
+        let attributes: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(attributes["from"], "Pushing");
+        assert_eq!(attributes["to"], "Pushed");
+        assert_eq!(attributes["registry"], "registry.test");
+        assert_eq!(attributes["images"][0]["container"], "web");
+        assert_eq!(attributes["images"][0]["build_ms"], 8123);
+    }
+
+    /// A reporter cannot rewrite what actually happened. The transition is the
+    /// one claim the log makes on its own authority.
+    #[sqlx::test]
+    async fn reported_attributes_cannot_overwrite_the_transition(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Pushing").await;
+        let lying = serde_json::json!({ "from": "Healthy", "to": "Healthy" });
+
+        update_status(&pool, id, DeploymentStatus::Pushed, Some(&lying))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status_events(&pool, id).await,
+            vec![("Pushing".to_string(), "Pushed".to_string())],
+        );
+    }
+
+    /// A CLI too old to report anything still records a correct transition.
+    #[sqlx::test]
+    async fn a_transition_without_reported_detail_is_still_recorded(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Pushing").await;
+
+        update_status(&pool, id, DeploymentStatus::Pushed, None)
+            .await
+            .unwrap();
+
+        let attributes: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(attributes["to"], "Pushed");
+        assert!(
+            attributes.get("images").is_none(),
+            "nothing is invented when nothing was reported",
+        );
+    }
+
     async fn status_events(pool: &PgPool, id: Uuid) -> Vec<(String, String)> {
         sqlx::query_as::<_, (String, String)>(
             "SELECT attributes->>'from', attributes->>'to'
@@ -2044,7 +2122,7 @@ mod tests {
             DeploymentStatus::Pushed,
             DeploymentStatus::Deploying,
         ] {
-            update_status(&pool, id, status).await.unwrap();
+            update_status(&pool, id, status, None).await.unwrap();
         }
 
         assert_eq!(
@@ -2363,7 +2441,7 @@ mod tests {
         assert!(deployment.deploying_started_at.is_none());
 
         // Transition to Deploying
-        let deployment = update_status(&pool, deployment.id, DeploymentStatus::Deploying)
+        let deployment = update_status(&pool, deployment.id, DeploymentStatus::Deploying, None)
             .await
             .unwrap();
 
@@ -2375,7 +2453,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         // Transition to Deploying again (same-state transition is valid and should not overwrite)
-        let deployment = update_status(&pool, deployment.id, DeploymentStatus::Deploying)
+        let deployment = update_status(&pool, deployment.id, DeploymentStatus::Deploying, None)
             .await
             .unwrap();
 
@@ -2383,7 +2461,7 @@ mod tests {
         assert_eq!(deployment.deploying_started_at, Some(first_timestamp));
 
         // Transition to Healthy (valid transition from Deploying)
-        let deployment = update_status(&pool, deployment.id, DeploymentStatus::Healthy)
+        let deployment = update_status(&pool, deployment.id, DeploymentStatus::Healthy, None)
             .await
             .unwrap();
 

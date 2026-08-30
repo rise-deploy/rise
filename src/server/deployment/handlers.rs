@@ -173,6 +173,47 @@ async fn resolve_image_digest(
     Ok(digest_ref)
 }
 
+/// Largest reporter-supplied attribute payload accepted on a status update.
+///
+/// The column's own CHECK caps a stored event at 16 KiB, and the transition
+/// adds its own keys, so the incoming half is bounded well below that. This is
+/// deliberately not enough room for a build log: that is a separate, larger
+/// artifact and belongs behind its own endpoint.
+const MAX_REPORTED_ATTRIBUTES_BYTES: usize = 8 * 1024;
+
+/// Check reporter-supplied event attributes before they reach the database.
+///
+/// Only a JSON object is accepted: the value is merged into the event's
+/// attributes, and merging an array or scalar has no meaning. An explicit
+/// `null` or an empty object is treated as "nothing reported", which is the
+/// normal case for a CLI that predates the field.
+fn validate_reported_attributes(
+    attributes: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ServerError> {
+    let Some(value) = attributes else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let object = value.as_object().ok_or_else(|| {
+        ServerError::bad_request("Status attributes must be a JSON object".to_string())
+    })?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+
+    let size = serde_json::to_vec(&value).map(|v| v.len()).unwrap_or(0);
+    if size > MAX_REPORTED_ATTRIBUTES_BYTES {
+        return Err(ServerError::bad_request(format!(
+            "Status attributes are {size} bytes, over the {MAX_REPORTED_ATTRIBUTES_BYTES} byte limit"
+        )));
+    }
+
+    Ok(Some(value))
+}
+
 /// Convert API DeploymentStatus to DB DeploymentStatus
 fn convert_status_to_db(status: DeploymentStatus) -> DbDeploymentStatus {
     match status {
@@ -1975,6 +2016,12 @@ async fn perform_status_update(
             })?;
     }
 
+    // Reporter-supplied detail is untrusted: it comes from whatever CLI made
+    // the call and is rendered back in the UI. Reject it rather than storing
+    // something unreadable — a malformed payload should tell the reporter it is
+    // malformed, not silently vanish.
+    let reported = validate_reported_attributes(payload.attributes.clone())?;
+
     // Update status in database
     let status_copy = payload.status.clone();
     let updated_deployment = match payload.status {
@@ -1999,19 +2046,23 @@ async fn perform_status_update(
         _ => {
             // update_status will validate the state transition
             let db_status = convert_status_to_db(payload.status);
-            let deployment =
-                db_deployments::update_status(&state.db_pool, deployment.id, db_status)
-                    .await
-                    .map_err(|e| {
-                        // State transition validation errors are returned as anyhow errors
-                        // Return BAD_REQUEST for validation errors, INTERNAL_SERVER_ERROR otherwise
-                        let error_msg = e.to_string();
-                        if error_msg.contains("Invalid deployment state transition") {
-                            ServerError::bad_request(error_msg)
-                        } else {
-                            ServerError::internal_anyhow(e, "Failed to update deployment")
-                        }
-                    })?;
+            let deployment = db_deployments::update_status(
+                &state.db_pool,
+                deployment.id,
+                db_status,
+                reported.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                // State transition validation errors are returned as anyhow errors
+                // Return BAD_REQUEST for validation errors, INTERNAL_SERVER_ERROR otherwise
+                let error_msg = e.to_string();
+                if error_msg.contains("Invalid deployment state transition") {
+                    ServerError::bad_request(error_msg)
+                } else {
+                    ServerError::internal_anyhow(e, "Failed to update deployment")
+                }
+            })?;
 
             // Update project status (e.g., to Deploying)
             projects::update_calculated_status(&state.db_pool, project.id)
@@ -3406,7 +3457,8 @@ mod tests {
     use super::{
         check_log_containers, normalize_env_override_is_protected, resolve_resource_check_inputs,
         validate_container_resource_names, validate_env_override, validate_env_override_key,
-        validate_identity_audiences, validate_log_stream_query, LogStreamParams,
+        validate_identity_audiences, validate_log_stream_query, validate_reported_attributes,
+        LogStreamParams, MAX_REPORTED_ATTRIBUTES_BYTES,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
@@ -4054,5 +4106,44 @@ mod tests {
                 .unwrap();
         assert_eq!(group, "mr/123");
         assert_eq!(env.unwrap().name, "staging");
+    }
+
+    /// Absence, an explicit null and an empty object all mean the same thing:
+    /// the reporter had nothing to add. Every CLI predating the field is in
+    /// this case, so it must stay indistinguishable from a deliberate no-op.
+    #[test]
+    fn nothing_reported_is_accepted_as_nothing() {
+        assert!(validate_reported_attributes(None).unwrap().is_none());
+        assert!(validate_reported_attributes(Some(serde_json::Value::Null))
+            .unwrap()
+            .is_none());
+        assert!(validate_reported_attributes(Some(serde_json::json!({})))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reported_attributes_must_be_an_object() {
+        // The value is merged into the event's attributes, so anything that is
+        // not a set of keys has no meaning to merge.
+        for bad in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("build ok"),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                validate_reported_attributes(Some(bad.clone())).is_err(),
+                "{bad} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_reported_attributes_are_rejected() {
+        let big = serde_json::json!({ "log": "x".repeat(MAX_REPORTED_ATTRIBUTES_BYTES) });
+        assert!(validate_reported_attributes(Some(big)).is_err());
+
+        let ok = serde_json::json!({ "images": [{ "container": "web", "build_ms": 1 }] });
+        assert!(validate_reported_attributes(Some(ok)).unwrap().is_some());
     }
 }

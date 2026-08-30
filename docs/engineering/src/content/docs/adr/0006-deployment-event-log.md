@@ -100,6 +100,36 @@ Container-level inspection returns later as a deliberate API with its own shape
 internal notes. This supersedes ADR-0005's description of `pod_status` as the
 shared cross-backend observability shape.
 
+### D1b. Reporters may describe the transition they report
+
+The phases up to `Pushed` happen in the CLI, not the backend: the control plane
+receives `PATCH .../status` and has no other view of the build. So the status
+request carries an optional `attributes` object, merged into the event that
+transition writes.
+
+Optional is the whole design. A CLI that predates the field sends nothing, the
+transition is still recorded, and the detail is simply absent — the two sides
+never have to be upgraded together, and a deployment from an older CLI stays
+readable rather than looking broken.
+
+Three properties hold it together:
+
+- **The transition is not negotiable.** `from`/`to` are applied *after* the
+  reporter's keys, so a caller sending them cannot rewrite what happened. The
+  reporter describes; the log states.
+- **It is untrusted input**, capped at 8 KiB and required to be a JSON object,
+  rejected at the edge rather than stored unreadable. That cap deliberately
+  excludes build logs: those are a larger artifact and want their own endpoint.
+- **It never rides on the row.** Reported detail lands on the event and nowhere
+  else, because it describes one moment rather than the deployment's state.
+
+**Why per-image durations, when the log already encodes durations.** The gap
+between two events is the duration of the state between them, so recording a
+total would duplicate what the timestamps already say. A multi-container build
+is the case where that stops being true: every image is built inside a single
+`Building` state, so the transitions can only ever give the sum. Which image was
+slow is not derivable from them, and that is exactly the question being asked.
+
 ### D2. One table, owned by `rise-deploy`
 
 ```sql
