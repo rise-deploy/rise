@@ -890,7 +890,13 @@
 }
 
 .r-evt-row {
+    /* Height of the label's line box. The dot centres on it, so the two must
+       agree — a row that grows downwards must not drag the dot with it. */
+    --evt-line: 19.5px;
+
     display: flex;
+    /* Baseline, so the timestamp and the delta pin to the label's first line
+       however tall the body below it grows. */
     align-items: baseline;
     gap: 12px;
     padding: 7px 0;
@@ -905,7 +911,13 @@
     height: 7px;
     border-radius: 50%;
     background: var(--text-soft);
-    align-self: center;
+    /* Pinned to the first line rather than the row's middle: an event with
+       facts or per-image detail is several lines tall, and a centred dot drifts
+       away from the moment it marks. A baseline-aligned block would sit on the
+       baseline by its bottom edge, so it is placed from the top instead and
+       nudged to the line's optical centre. */
+    align-self: flex-start;
+    margin-top: calc((var(--evt-line) - 7px) / 2);
 }
 
 .r-evt-row.sev-debug   .r-evt-dot { background: var(--text-soft); opacity: 0.6; }
@@ -928,7 +940,10 @@
     gap: 2px;
 }
 
-.r-evt-label { font-size: 13px; }
+.r-evt-label {
+    font-size: 13px;
+    line-height: var(--evt-line);
+}
 
 /* A failure's message belongs with the failure, not in a separate panel. */
 .r-evt-reason {
