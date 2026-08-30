@@ -14,7 +14,8 @@ import { QueryLine } from './query-line';
 import { LogStream, type FocusRequest } from './log-stream';
 import { useLogFeed } from './use-log-feed';
 import type { LogEntry } from './types';
-import type { LifecycleMarker } from './lifecycle';
+import { markersFromEvents, type LifecycleMarker } from './lifecycle';
+import { fetchDeploymentEvents } from './api';
 import { createTimelineCursorStore } from './timeline-cursor';
 
 // Recharts and react-day-picker are heavy and each pull their own CSS; keep
@@ -110,6 +111,15 @@ export function LogConsole({
     });
     const { showToast } = useToast();
 
+    /**
+     * Markers the event log supplies. These are a history, so they carry moves
+     * the pod-status snapshot has already overwritten — a deployment that
+     * flapped shows every transition here and only its current state there.
+     * Merged with, rather than replacing, the snapshot-derived markers: the
+     * backend does not emit replica-level events yet.
+     */
+    const [eventMarkers, setEventMarkers] = useState<LifecycleMarker[]>([]);
+
     const [wrap, setWrap] = useState(true);
     const [following, setFollowing] = useState(true);
     const [railOpen, setRailOpen] = useState(true);
@@ -124,6 +134,50 @@ export function LogConsole({
     const queryInputRef = useRef<HTMLInputElement>(null);
 
     const { entries, searchActive, rangeWindow, capabilities } = feed;
+
+    // Refetched when the deployment's status changes, which is exactly when a
+    // new status event exists to read.
+    useEffect(() => {
+        const controller = new AbortController();
+        void (async () => {
+            try {
+                const page = await fetchDeploymentEvents({
+                    projectName,
+                    deploymentId,
+                    limit: 200,
+                    signal: controller.signal,
+                });
+                setEventMarkers(markersFromEvents(page.events));
+            } catch (err) {
+                if (err instanceof Error && err.name === 'AbortError') return;
+                // The rail still has its snapshot-derived markers, so a failure
+                // here degrades the timeline rather than breaking the console.
+                console.warn('Could not load deployment events:', err);
+            }
+        })();
+        return () => controller.abort();
+    }, [projectName, deploymentId, deploymentStatus]);
+
+    const railMarkers = useMemo(() => {
+        // The two sources overlap at the deployment level: the snapshot infers
+        // a rollout from `created` and an ending from `completed_at`, while the
+        // log records the transitions themselves. The log is both more accurate
+        // and able to show repeats, so where it has anything to say the
+        // inferred deployment-level markers step aside. Replica-level markers
+        // are snapshot-only until the reconcilers derive them.
+        const inferred = eventMarkers.length > 0
+            ? markers.filter((m) => m.kind === 'up' || m.kind === 'restart')
+            : markers;
+        return [...inferred, ...eventMarkers].sort((a, b) => a.ts - b.ts);
+    }, [markers, eventMarkers]);
+
+    /**
+     * The rail is the time axis, and log volume is only one thing that can sit
+     * on it. Deployment events come from a different source entirely, so gating
+     * the whole rail on `supports_volume` would hide the deployment's timeline
+     * on every backend without a historical log store — which is most of them.
+     */
+    const railHasContent = feed.volumeSupported || railMarkers.length > 0;
 
     // Reset expansion when the underlying set of lines is replaced wholesale.
     useEffect(() => {
@@ -352,15 +406,15 @@ export function LogConsole({
                     className="r-logc-rail-toggle"
                     onClick={() => setRailOpen((v) => !v)}
                     aria-expanded={railOpen}
-                    disabled={!feed.volumeSupported}
-                    title={feed.volumeSupported
-                        ? 'Toggle the log volume rail'
-                        : 'The configured log backend cannot report log volume'}
+                    disabled={!railHasContent}
+                    title={railHasContent
+                        ? 'Toggle the timeline'
+                        : 'Nothing to show on the timeline yet'}
                 >
                     <Icon name={railOpen ? 'chevd' : 'chev'} size={11} />
-                    <span>Volume</span>
+                    <span>{feed.volumeSupported ? 'Volume' : 'Timeline'}</span>
                 </button>
-                {feed.volumeSupported && railOpen && (
+                {railHasContent && railOpen && (
                     <div className="r-logc-rail-body r-logs-chart">
                         <Suspense fallback={<div className="r-logc-rail-fallback">Loading chart…</div>}>
                             <LogVolumeChart
@@ -375,7 +429,7 @@ export function LogConsole({
                                 onSelectBucket={feed.setSelectedBucket}
                                 selectedBucketTs={feed.selectedBucket?.endMs ?? null}
                                 height={72}
-                                markers={markers}
+                                markers={railMarkers}
                                 timelineCursor={timelineCursor}
                             />
                         </Suspense>

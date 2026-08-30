@@ -846,3 +846,128 @@
     height: 9px;
     box-shadow: 0 0 0 2px color-mix(in oklch, var(--text-soft) 30%, transparent);
 }
+
+/* ---------- timeline without a volume chart ---------- */
+
+/* Backends with no historical log store report no counts, but the deployment
+   still has a timeline. The rail keeps its axis and its markers. */
+.r-logc-bare-axis {
+    position: relative;
+    padding: 10px 0 0;
+}
+
+.r-logc-bare-line {
+    height: 1px;
+    background: var(--border);
+}
+
+.r-logc-bare-ticks {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 3px;
+}
+
+.r-logc-bare-tick {
+    font-size: 10px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The lane sits on the baseline rather than below the labels. */
+.r-logc-bare-axis .r-logc-markers {
+    position: absolute;
+    top: 5px;
+    height: 11px;
+}
+
+/* ---------- deployment event timeline ---------- */
+
+/* The same log the rail draws on, read as a list. Severity is a dot on the
+   spine rather than coloured text, matching how the stream marks its rows. */
+.r-evt {
+    display: flex;
+    flex-direction: column;
+}
+
+.r-evt-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 7px 0;
+    position: relative;
+}
+
+.r-evt-row + .r-evt-row { border-top: 1px solid var(--border-faint); }
+
+.r-evt-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-soft);
+    align-self: center;
+}
+
+.r-evt-row.sev-debug   .r-evt-dot { background: var(--text-soft); opacity: 0.6; }
+.r-evt-row.sev-info    .r-evt-dot { background: var(--ok); }
+.r-evt-row.sev-warning .r-evt-dot { background: var(--warn); }
+.r-evt-row.sev-error   .r-evt-dot { background: var(--err); }
+
+.r-evt-time {
+    flex: 0 0 96px;
+    font-size: 12px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+.r-evt-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.r-evt-label { font-size: 13px; }
+
+/* A failure's message belongs with the failure, not in a separate panel. */
+.r-evt-reason {
+    font-size: 12px;
+    color: var(--text-muted);
+    word-break: break-word;
+}
+
+/* The gap between events is what a timeline is read for. */
+.r-evt-delta {
+    flex: none;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+[data-density="compact"] .r-evt-row { padding: 5px 0; }
+
+/* Attributes carried by an event, beside the transition it describes. */
+.r-evt-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin-top: 2px;
+}
+
+.r-evt-fact {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-size: 11.5px;
+}
+
+.r-evt-fact-k {
+    color: var(--text-soft);
+}
+
+.r-evt-fact-v {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11px;
+}

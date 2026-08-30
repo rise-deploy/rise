@@ -308,9 +308,44 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-        RETURNING
+        WITH ins AS (
+            INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+            RETURNING *
+        ),
+        ev AS (
+            -- A deployment's first status is set by this INSERT, so there is
+            -- no transition into it and nothing else would record that the
+            -- deployment was accepted. Without this the timeline begins at
+            -- the second thing that happened.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                ins.id, ins.created_at, 'status_changed', 'info', 'control-plane',
+                jsonb_strip_nulls(jsonb_build_object(
+                    'from', NULL,
+                    'to', ins.status,
+                    -- What was asked for, recorded where it is known: the row
+                    -- can be edited later, the event says what was requested.
+                    'created_by', u.email,
+                    'group', ins.deployment_group,
+                    'replicas', ins.replicas,
+                    'cpu', ins.cpu,
+                    'memory', ins.memory,
+                    'image', ins.image,
+                    'containers', (
+                        SELECT jsonb_agg(c->>'name')
+                        FROM jsonb_array_elements(ins.containers) c
+                    ),
+                    'rolled_back_from', ins.rolled_back_from_deployment_id,
+                    'job_url', ins.job_url,
+                    'pull_request_url', ins.pull_request_url
+                ))
+            FROM ins
+            LEFT JOIN users u ON u.id = ins.created_by_id
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -326,6 +361,7 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM ins
         "#,
         params.deployment_id,
         params.project_id,
@@ -405,23 +441,55 @@ pub async fn update_status(
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET status = $2,
-            deploying_started_at = CASE
-                WHEN $2 = 'Deploying' AND deploying_started_at IS NULL THEN NOW()
-                ELSE deploying_started_at
-            END,
-            first_healthy_at = CASE
-                WHEN $2 = 'Healthy' AND first_healthy_at IS NULL THEN NOW()
-                ELSE first_healthy_at
-            END,
-            completed_at = CASE
-                WHEN $2 IN ('Cancelled', 'Stopped', 'Superseded', 'Expired', 'Failed')
-                    AND completed_at IS NULL THEN NOW()
-                ELSE completed_at
-            END
-        WHERE id = $1 AND is_valid_transition(status, $2)
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET status = $2,
+                deploying_started_at = CASE
+                    WHEN $2 = 'Deploying' AND deploying_started_at IS NULL THEN NOW()
+                    ELSE deploying_started_at
+                END,
+                first_healthy_at = CASE
+                    WHEN $2 = 'Healthy' AND first_healthy_at IS NULL THEN NOW()
+                    ELSE first_healthy_at
+                END,
+                completed_at = CASE
+                    WHEN $2 IN ('Cancelled', 'Stopped', 'Superseded', 'Expired', 'Failed')
+                        AND completed_at IS NULL THEN NOW()
+                    ELSE completed_at
+                END
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, $2)
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- This writer owns the build path and the handoff into
+            -- `Deploying`, so it is where a rollout's first event comes
+            -- from. Severity is derived here rather than passed in: the
+            -- target is a bind parameter, so the caller does not know it
+            -- as a literal.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed',
+                CASE
+                    WHEN status = 'Failed' THEN 'error'
+                    WHEN status = 'Unhealthy' THEN 'warning'
+                    ELSE 'info'
+                END,
+                'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', error_message
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -437,6 +505,7 @@ pub async fn update_status(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id,
         status_str
@@ -472,10 +541,34 @@ pub async fn mark_failed(
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET status = 'Failed', completed_at = COALESCE(completed_at, NOW()), error_message = $2
-        WHERE id = $1 AND is_valid_transition(status, 'Failed')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET status = 'Failed', completed_at = COALESCE(completed_at, NOW()), error_message = $2
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Failed')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'error', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', error_message
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -491,6 +584,7 @@ pub async fn mark_failed(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id,
         error_message
@@ -562,15 +656,39 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Cancelled',
-            termination_reason = 'Cancelled',
-            controller_metadata = '{}',
-            completed_at = COALESCE(completed_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Cancelled')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Cancelled',
+                termination_reason = 'Cancelled',
+                controller_metadata = '{}',
+                completed_at = COALESCE(completed_at, NOW()),
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Cancelled')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -586,6 +704,7 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id
     )
@@ -605,15 +724,39 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Stopped',
-            termination_reason = 'UserStopped',
-            controller_metadata = '{}',
-            completed_at = COALESCE(completed_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Stopped')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Stopped',
+                termination_reason = 'UserStopped',
+                controller_metadata = '{}',
+                completed_at = COALESCE(completed_at, NOW()),
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Stopped')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -629,6 +772,7 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id
     )
@@ -648,15 +792,39 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Superseded',
-            termination_reason = 'Superseded',
-            controller_metadata = '{}',
-            completed_at = COALESCE(completed_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Superseded')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Superseded',
+                termination_reason = 'Superseded',
+                controller_metadata = '{}',
+                completed_at = COALESCE(completed_at, NOW()),
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Superseded')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -672,6 +840,7 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id
     )
@@ -691,15 +860,39 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Expired',
-            termination_reason = 'Expired',
-            controller_metadata = '{}',
-            completed_at = COALESCE(completed_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Expired')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Expired',
+                termination_reason = 'Expired',
+                controller_metadata = '{}',
+                completed_at = COALESCE(completed_at, NOW()),
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Expired')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -715,6 +908,7 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id
     )
@@ -801,13 +995,37 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<O
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Unhealthy',
-            error_message = $2,
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Unhealthy')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Unhealthy',
+                error_message = $2,
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Unhealthy')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'warning', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', error_message
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -823,6 +1041,7 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<O
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id,
         reason
@@ -847,13 +1066,37 @@ pub async fn mark_terminating(
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Terminating',
-            termination_reason = $2,
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Terminating')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Terminating',
+                termination_reason = $2,
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Terminating')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -869,6 +1112,7 @@ pub async fn mark_terminating(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id,
         reason as TerminationReason
@@ -888,13 +1132,37 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Cancelling',
-            termination_reason = 'Cancelled',
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Cancelling')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Cancelling',
+                termination_reason = 'Cancelled',
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Cancelling')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            -- Only a real move is an event: `is_valid_transition` admits
+            -- `from = to` so a writer can refresh `updated_at` without the
+            -- status having moved, and several of these run per tick.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -910,6 +1178,7 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         id
     )
@@ -1305,14 +1574,32 @@ pub async fn mark_healthy_and_supersede(
     let healthy = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Healthy',
-            error_message = NULL,
-            first_healthy_at = COALESCE(first_healthy_at, NOW()),
-            updated_at = NOW()
-        WHERE id = $1 AND is_valid_transition(status, 'Healthy')
-        RETURNING
+        WITH prev AS (
+            SELECT status FROM deployments WHERE id = $1
+        ),
+        upd AS (
+            UPDATE deployments
+            SET
+                status = 'Healthy',
+                error_message = NULL,
+                first_healthy_at = COALESCE(first_healthy_at, NOW()),
+                updated_at = NOW()
+            FROM prev
+            WHERE deployments.id = $1
+              AND is_valid_transition(deployments.status, 'Healthy')
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object('from', from_status, 'to', status)
+            FROM upd
+            WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -1328,6 +1615,7 @@ pub async fn mark_healthy_and_supersede(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         deployment_id
     )
@@ -1355,21 +1643,38 @@ pub async fn mark_healthy_and_supersede(
     let superseded = sqlx::query_as!(
         Deployment,
         r#"
-        UPDATE deployments
-        SET
-            status = 'Terminating',
-            termination_reason = 'Superseded',
-            updated_at = NOW()
-        WHERE id = (
-            SELECT id FROM deployments
-            WHERE project_id = $2
-              AND deployment_group = $3
-              AND id != $1
-              AND status = 'Healthy'
-            ORDER BY created_at DESC
-            LIMIT 1
+        WITH upd AS (
+            UPDATE deployments
+            SET
+                status = 'Terminating',
+                termination_reason = 'Superseded',
+                updated_at = NOW()
+            WHERE id = (
+                SELECT id FROM deployments
+                WHERE project_id = $2
+                  AND deployment_group = $3
+                  AND id != $1
+                  AND status = 'Healthy'
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            RETURNING deployments.*, 'Healthy'::text AS from_status
+        ),
+        ev AS (
+            -- The subquery above already restricts this to a row that was
+            -- `Healthy`, so `from` is known without re-reading it.
+            INSERT INTO deployment_events (
+                deployment_id, occurred_at, kind, severity, source, attributes
+            )
+            SELECT
+                id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object(
+                    'from', from_status, 'to', status,
+                    'reason', termination_reason::text
+                )
+            FROM upd
         )
-        RETURNING
+        SELECT
             id, deployment_id, project_id, created_by_id,
             status as "status: DeploymentStatus",
             deployment_group, environment_id, expires_at,
@@ -1385,6 +1690,7 @@ pub async fn mark_healthy_and_supersede(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value"
+        FROM upd
         "#,
         deployment_id,
         project_id,
@@ -1491,6 +1797,91 @@ mod tests {
         .unwrap()
     }
 
+    /// Creation is the first thing that happened to a deployment, so it is the
+    /// first row in its log. Recording it as a transition out of nothing means a
+    /// reader walks one uniform sequence rather than special-casing the origin.
+    #[sqlx::test]
+    async fn creating_a_deployment_opens_its_log(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let containers = serde_json::json!([{"name": "web"}, {"name": "worker"}]);
+
+        let created = create(
+            &pool,
+            CreateDeploymentParams {
+                deployment_id: "20260830-000009",
+                project_id,
+                created_by_id: user_id,
+                status: DeploymentStatus::Pending,
+                image: Some("registry.test/app:v1"),
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: "default",
+                environment_id: None,
+                expires_at: None,
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 2,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: Some(&containers),
+                routes: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let opened: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT attributes->>'from', attributes->>'to'
+             FROM deployment_events
+             WHERE deployment_id = $1 AND kind = 'status_changed'
+             ORDER BY id",
+        )
+        .bind(created.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            opened,
+            vec![(None, "Pending".to_string())],
+            "the log opens with the status the deployment was created in, \
+             out of no prior status",
+        );
+
+        let attributes: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // What was *requested*, captured where it is still known. The row can be
+        // edited afterwards; the event keeps the ask.
+        assert_eq!(attributes["to"], "Pending");
+        assert_eq!(attributes["created_by"], format!("{user_id}@example.com"));
+        assert_eq!(attributes["replicas"], 2);
+        assert_eq!(attributes["cpu"], "500m");
+        assert_eq!(attributes["memory"], "256Mi");
+        assert_eq!(attributes["group"], "default");
+        assert_eq!(attributes["image"], "registry.test/app:v1");
+        assert_eq!(
+            attributes["containers"],
+            serde_json::json!(["web", "worker"])
+        );
+        assert!(
+            attributes.get("from").is_none(),
+            "nothing preceded creation, and jsonb_strip_nulls drops the key rather \
+             than storing a null that reads as a real prior status",
+        );
+        assert!(
+            attributes.get("job_url").is_none(),
+            "absent optionals are omitted, not stored as null",
+        );
+    }
+
     async fn status_events(pool: &PgPool, id: Uuid) -> Vec<(String, String)> {
         sqlx::query_as::<_, (String, String)>(
             "SELECT attributes->>'from', attributes->>'to'
@@ -1555,16 +1946,63 @@ mod tests {
             .unwrap();
         mark_healthy(&pool, id).await.unwrap();
 
-        // `mark_unhealthy` is not converted yet, so only the two healthy edges
-        // are recorded; both are present and neither collapsed the other.
-        let events = status_events(&pool, id).await;
         assert_eq!(
-            events,
+            status_events(&pool, id).await,
             vec![
                 ("Deploying".to_string(), "Healthy".to_string()),
+                ("Healthy".to_string(), "Unhealthy".to_string()),
                 ("Unhealthy".to_string(), "Healthy".to_string()),
             ],
+            "every real move is recorded; a snapshot could show only the last",
         );
+    }
+
+    /// The whole build path runs through `update_status`, so a rollout's first
+    /// events come from a different writer than the `mark_*` family.
+    #[sqlx::test]
+    async fn the_build_path_records_each_phase(pool: PgPool) {
+        let id = seed_deployment_for_events(&pool, "Pending").await;
+
+        for status in [
+            DeploymentStatus::Building,
+            DeploymentStatus::Pushing,
+            DeploymentStatus::Pushed,
+            DeploymentStatus::Deploying,
+        ] {
+            update_status(&pool, id, status).await.unwrap();
+        }
+
+        assert_eq!(
+            status_events(&pool, id).await,
+            vec![
+                ("Pending".to_string(), "Building".to_string()),
+                ("Building".to_string(), "Pushing".to_string()),
+                ("Pushing".to_string(), "Pushed".to_string()),
+                ("Pushed".to_string(), "Deploying".to_string()),
+            ],
+        );
+    }
+
+    /// Severity is a property of the occurrence: the same writer family
+    /// produces `error` for a failure and `info` for a routine stop.
+    #[sqlx::test]
+    async fn severity_reflects_what_happened(pool: PgPool) {
+        let failed = seed_deployment_for_events(&pool, "Deploying").await;
+        mark_failed(&pool, failed, "image pull backoff")
+            .await
+            .unwrap();
+
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT severity, attributes->>'reason' FROM deployment_events
+             WHERE deployment_id = $1 AND kind = 'status_changed'",
+        )
+        .bind(failed)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.0, "error");
+        assert_eq!(row.1.as_deref(), Some("image pull backoff"));
     }
 
     /// Test that PostgreSQL is_terminal() function matches Rust is_terminal() function

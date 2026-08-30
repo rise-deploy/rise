@@ -185,3 +185,58 @@ export async function fetchLogVolume(request: LogVolumeRequest): Promise<LogVolu
     if (!response.ok) throw new Error(await readHttpErrorMessage(response));
     return (await response.json()) as LogVolumeResponse;
 }
+
+/** One row of the deployment event log (ADR-0006). */
+export interface DeploymentEvent {
+    id: number;
+    deployment_id: string;
+    /** When it happened, per the runtime's clock. What the rail plots. */
+    occurred_at: string;
+    /** When Rise recorded it. What pages are cut on. */
+    recorded_at: string;
+    kind: string;
+    severity: string;
+    source: string;
+    message: string | null;
+    attributes: Record<string, unknown>;
+}
+
+export interface DeploymentEventPage {
+    events: DeploymentEvent[];
+    next_cursor?: string;
+}
+
+/**
+ * Read a page of the deployment event log.
+ *
+ * The log is a history, so it can express things the pod-status snapshot
+ * cannot — a deployment that went healthy, unhealthy and healthy again shows
+ * three moves here and one status there.
+ */
+export async function fetchDeploymentEvents(request: {
+    projectName: string;
+    deploymentId: string;
+    limit?: number;
+    cursor?: string;
+    kinds?: string[];
+    /** `all` includes `debug`; omitted means `info` and above. */
+    minSeverity?: string;
+    signal?: AbortSignal;
+}): Promise<DeploymentEventPage> {
+    const params = new URLSearchParams();
+    if (request.limit) params.set('limit', String(request.limit));
+    if (request.cursor) params.set('cursor', request.cursor);
+    if (request.minSeverity) params.set('min_severity', request.minSeverity);
+    for (const kind of request.kinds ?? []) params.append('kind', kind);
+
+    const response = await fetch(
+        `${deploymentBase(request.projectName, request.deploymentId)}/events?${params}`,
+        {
+            headers: { Accept: 'application/json' },
+            credentials: 'include',
+            signal: request.signal,
+        },
+    );
+    if (!response.ok) throw new Error(await readHttpErrorMessage(response));
+    return (await response.json()) as DeploymentEventPage;
+}

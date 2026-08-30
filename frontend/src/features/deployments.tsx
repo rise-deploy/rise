@@ -12,6 +12,7 @@ import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { LogConsole } from './logs/log-console';
 import { buildLifecycleMarkers } from './logs/lifecycle';
+import { EventTimeline } from './logs/event-timeline';
 
 const STATUS_TONES = {
     Healthy: 'ok',
@@ -792,14 +793,6 @@ export function DeploymentsList({ projectName }) {
     );
 }
 
-function getPhaseForEvent(event: string) {
-    const e = event.toLowerCase();
-    if (e.includes('build')) return 'build';
-    if (e.includes('push') || e.includes('image')) return 'push';
-    if (e.includes('rollout') || e.includes('deploy')) return 'rollout';
-    if (e.includes('health') || e.includes('ready') || e.includes('active')) return 'health';
-    return 'other';
-}
 
 function formatDurationDelta(fromTs?: string | null, toTs?: string | null) {
     if (!fromTs || !toTs) return '--';
@@ -816,49 +809,6 @@ function formatDurationDelta(fromTs?: string | null, toTs?: string | null) {
     return `${hours}h ${mins}m`;
 }
 
-function buildDeploymentTimeline(deployment: any) {
-    const events: Array<{ label: string; ts: string | null; phase: string }> = [
-        { label: 'Deployment requested', ts: deployment.created || null, phase: 'build' },
-        { label: 'Image prepared', ts: deployment.created || null, phase: 'push' },
-        { label: 'Rollout started', ts: deployment.created || null, phase: 'rollout' },
-    ];
-
-    if (deployment.completed_at) {
-        events.push({
-            label: deployment.status === 'Failed' ? 'Deployment failed' : 'Deployment completed',
-            ts: deployment.completed_at,
-            phase: deployment.status === 'Failed' ? 'rollout' : 'health',
-        });
-    }
-
-    const healthLastCheck = deployment.controller_metadata?.health?.last_check || null;
-    if (healthLastCheck) {
-        events.push({
-            label: deployment.controller_metadata?.health?.healthy ? 'Health check healthy' : 'Health check degraded',
-            ts: healthLastCheck,
-            phase: 'health',
-        });
-    }
-
-    const statusEventTime = deployment.completed_at || deployment.created || null;
-    events.push({
-        label: `Current status: ${deployment.status}`,
-        ts: statusEventTime,
-        phase: getPhaseForEvent(deployment.status || ''),
-    });
-
-    const sorted = events
-        .filter((e) => e.ts)
-        .sort((a, b) => new Date(a.ts || '').getTime() - new Date(b.ts || '').getTime());
-
-    return sorted.map((event, index) => {
-        const prev = index > 0 ? sorted[index - 1] : null;
-        return {
-            ...event,
-            delta: prev ? formatDurationDelta(prev.ts, event.ts) : '--',
-        };
-    });
-}
 
 // TypeScript interfaces matching Rust backend structs
 interface ContainerState {
@@ -1419,12 +1369,6 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     if (error) return <ErrorState message={`Error loading deployment: ${error}`} onRetry={loadDeployment} />;
     if (!deployment) return <EmptyState message="Deployment not found." />;
 
-    const timeline = buildDeploymentTimeline(deployment);
-    const phases = ['build', 'push', 'rollout', 'health', 'other'];
-    const groupedTimeline = phases
-        .map((phase) => ({ phase, events: timeline.filter((e) => e.phase === phase) }))
-        .filter((group) => group.events.length > 0);
-
     const podStatus = deployment.controller_metadata?.pod_status;
     // Prefer the backend-deduplicated all_urls (deployment-group URL, env URL,
     // production URL, custom domains). Fall back to the older fields for stale
@@ -1438,7 +1382,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
     const tabs = [
         { id: 'logs', label: 'Logs' },
-        { id: 'timeline', label: 'Timeline', count: timeline.length },
+        // No count: the timeline's length is only known once the event log
+        // is fetched, and the tab should not block on that to render.
+        { id: 'timeline', label: 'Timeline' },
         ...(podStatus ? [{ id: 'pods', label: 'Pods', count: podStatus.pods?.length || 0 }] : []),
         ...(deployment.build_logs ? [{ id: 'build', label: 'Build output' }] : []),
         { id: 'env', label: 'Environment' },
@@ -1689,51 +1635,11 @@ export function DeploymentDetail({ projectName, deploymentId }) {
             )}
 
             {activeTab === 'timeline' && (
-                <Panel>
-                    <PanelHead title="Deployment timeline" />
-                    <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-                        {groupedTimeline.length === 0 ? (
-                            <Empty>No timeline events recorded.</Empty>
-                        ) : (
-                            groupedTimeline.map((group) => (
-                                <div key={group.phase}>
-                                    <div
-                                        style={{
-                                            fontSize: 11,
-                                            fontWeight: 600,
-                                            color: 'var(--text-soft)',
-                                            textTransform: 'uppercase',
-                                            letterSpacing: '0.06em',
-                                            marginBottom: 8,
-                                        }}
-                                    >
-                                        {group.phase}
-                                    </div>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                                        {group.events.map((event, idx) => (
-                                            <div
-                                                key={`${group.phase}-${idx}`}
-                                                style={{
-                                                    display: 'flex',
-                                                    alignItems: 'baseline',
-                                                    gap: 14,
-                                                    fontSize: 12.5,
-                                                    padding: '6px 0',
-                                                }}
-                                            >
-                                                <span className="mono" style={{ color: 'var(--text-soft)', flex: '0 0 170px' }}>
-                                                    {formatDate(event.ts || '')}
-                                                </span>
-                                                <span style={{ flex: 1 }}>{event.label}</span>
-                                                <span className="mono" style={{ color: 'var(--text-muted)' }}>+{event.delta}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            ))
-                        )}
-                    </PanelBody>
-                </Panel>
+                <EventTimeline
+                    projectName={projectName}
+                    deploymentId={deploymentId}
+                    deploymentStatus={deployment.status}
+                />
             )}
 
             {activeTab === 'pods' && podStatus && (

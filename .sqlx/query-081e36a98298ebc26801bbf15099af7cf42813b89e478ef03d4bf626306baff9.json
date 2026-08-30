@@ -1,0 +1,247 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH ins AS (\n            INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)\n            RETURNING *\n        ),\n        ev AS (\n            -- A deployment's first status is set by this INSERT, so there is\n            -- no transition into it and nothing else would record that the\n            -- deployment was accepted. Without this the timeline begins at\n            -- the second thing that happened.\n            INSERT INTO deployment_events (\n                deployment_id, occurred_at, kind, severity, source, attributes\n            )\n            SELECT\n                ins.id, ins.created_at, 'status_changed', 'info', 'control-plane',\n                jsonb_strip_nulls(jsonb_build_object(\n                    'from', NULL,\n                    'to', ins.status,\n                    -- What was asked for, recorded where it is known: the row\n                    -- can be edited later, the event says what was requested.\n                    'created_by', u.email,\n                    'group', ins.deployment_group,\n                    'replicas', ins.replicas,\n                    'cpu', ins.cpu,\n                    'memory', ins.memory,\n                    'image', ins.image,\n                    'containers', (\n                        SELECT jsonb_agg(c->>'name')\n                        FROM jsonb_array_elements(ins.containers) c\n                    ),\n                    'rolled_back_from', ins.rolled_back_from_deployment_id,\n                    'job_url', ins.job_url,\n                    'pull_request_url', ins.pull_request_url\n                ))\n            FROM ins\n            LEFT JOIN users u ON u.id = ins.created_by_id\n        )\n        SELECT\n            id, deployment_id, project_id, created_by_id,\n            status as \"status: DeploymentStatus\",\n            deployment_group, environment_id, expires_at,\n            termination_reason as \"termination_reason: _\",\n            completed_at, error_message, build_logs,\n            controller_metadata as \"controller_metadata: serde_json::Value\",\n            image, image_digest, rolled_back_from_deployment_id,\n            http_port, needs_reconcile, is_active,\n            deploying_started_at,\n            first_healthy_at, job_url, pull_request_url, git_repository_url,\n            replicas, cpu, memory,\n            created_at, updated_at, identity_credential_hash,\n            identity_audiences as \"identity_audiences: serde_json::Value\",\n            containers as \"containers: serde_json::Value\",\n            routes as \"routes: serde_json::Value\"\n        FROM ins\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "status: DeploymentStatus",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "deployment_group",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "environment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "termination_reason: _",
+        "type_info": {
+          "Custom": {
+            "name": "termination_reason",
+            "kind": {
+              "Enum": [
+                "UserStopped",
+                "Superseded",
+                "Cancelled",
+                "Failed",
+                "Expired"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "build_logs",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "controller_metadata: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 13,
+        "name": "image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "image_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "rolled_back_from_deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "http_port",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "needs_reconcile",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 19,
+        "name": "deploying_started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
+        "name": "first_healthy_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
+        "name": "job_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "pull_request_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 23,
+        "name": "git_repository_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "replicas",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 25,
+        "name": "cpu",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 26,
+        "name": "memory",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 28,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 29,
+        "name": "identity_credential_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 30,
+        "name": "identity_audiences: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 31,
+        "name": "containers: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 32,
+        "name": "routes: serde_json::Value",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Timestamptz",
+        "Int4",
+        "Bool",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "081e36a98298ebc26801bbf15099af7cf42813b89e478ef03d4bf626306baff9"
+}
