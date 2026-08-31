@@ -24,9 +24,25 @@ rise login
 
 Tokens are stored in `~/.config/rise/config.json` (plain JSON).
 
+### Multiple Profiles
+
+To manage more than one Rise account or backend side by side, log in with a
+named `--profile`:
+
+```bash
+rise login --profile work --url https://rise.work.example.com
+```
+
+`rise login --profile <name>` registers the profile automatically if it
+doesn't already exist. Subsequent commands pick it up via `--profile <name>`
+or the `RISE_PROFILE` environment variable; `rise profile list` shows every
+registered profile. See [Login Profiles](../configuration#login-profiles) for
+details.
+
 ### Environment Variables
 
 - `RISE_URL` — default backend URL
+- `RISE_PROFILE` — login profile to use (see [Login Profiles](../configuration#login-profiles))
 - `RISE_TOKEN` — authentication token (bypasses interactive login)
 
 ### API Usage

@@ -81,6 +81,12 @@ fn resolve_project_name_with_config(
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
+    /// Login profile to use, letting you manage multiple Rise accounts or
+    /// backends side by side. Falls back to the RISE_PROFILE environment
+    /// variable, then the default profile. `rise login --profile <name>`
+    /// registers a new profile if it doesn't already exist.
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -223,6 +229,9 @@ enum Commands {
         #[arg(long, conflicts_with = "browser")]
         device: bool,
     },
+    /// Manage CLI login profiles (see the global --profile flag / RISE_PROFILE)
+    #[command(subcommand)]
+    Profile(ProfileCommands),
     /// Project management commands
     #[command(subcommand)]
     #[command(visible_alias = "p")]
@@ -417,6 +426,19 @@ enum SkillCommands {
         /// Directory to remove from. Defaults to ~/.claude/skills
         #[arg(long)]
         target: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileCommands {
+    /// List registered login profiles
+    #[command(visible_alias = "ls")]
+    List,
+    /// Remove a profile's saved login/config
+    #[command(visible_alias = "rm")]
+    Remove {
+        /// Profile name to remove ("default" removes the default profile)
+        name: String,
     },
 }
 
@@ -1137,6 +1159,19 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // Resolve the active login profile once, up front: an explicit --profile
+    // normalizes into the RISE_PROFILE environment variable (or clears it, for
+    // the literal value "default") so every independent config load later in
+    // the process — not just the one below — agrees on the same profile.
+    if let Some(profile) = &cli.profile {
+        config::validate_profile_name(profile).context("Invalid --profile value")?;
+        if profile == "default" {
+            std::env::remove_var("RISE_PROFILE");
+        } else {
+            std::env::set_var("RISE_PROFILE", profile);
+        }
+    }
+
     // Transform Deploy command to Deployment::Create for zero-duplication aliasing
     let cli_command = match cli.command {
         Commands::Deploy { args } => Commands::Deployment(DeploymentCommands::Create { args }),
@@ -1197,6 +1232,10 @@ async fn main() -> Result<()> {
         Commands::Encrypt { plaintext } => {
             cli::encrypt::encrypt_command(&config, plaintext.clone()).await?;
         }
+        Commands::Profile(profile_cmd) => match profile_cmd {
+            ProfileCommands::List => profile::list_profiles()?,
+            ProfileCommands::Remove { name } => profile::remove_profile(name)?,
+        },
         Commands::Project(project_cmd) => match project_cmd {
             ProjectCommands::Create {
                 name,

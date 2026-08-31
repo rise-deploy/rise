@@ -126,6 +126,51 @@ fn probe_runtime(command: &str) -> Option<ContainerRuntime> {
 // - Linux: Secret Service API / libsecret
 // - Windows: Credential Manager
 
+/// Only ASCII letters, digits, `-` and `_` are allowed in a profile name — it
+/// is used verbatim as a file name under `~/.config/rise/profiles/`.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("Profile name cannot be empty");
+    }
+    if name.len() > 63 {
+        anyhow::bail!("Profile name '{}' is too long (max 63 characters)", name);
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        anyhow::bail!(
+            "Invalid profile name '{}': only ASCII letters, digits, '-' and '_' are allowed",
+            name
+        );
+    }
+    Ok(())
+}
+
+/// Create `dir` with `0700` permissions on Unix if it doesn't already exist.
+fn ensure_config_dir(dir: &std::path::Path) -> Result<()> {
+    if !dir.exists() {
+        #[cfg(unix)]
+        {
+            // Create parent directories with default permissions
+            if let Some(parent) = dir.parent() {
+                fs::create_dir_all(parent).context("Failed to create config parent directory")?;
+            }
+            // Create the target directory with 0700 atomically
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir)
+                .context("Failed to create config directory")?;
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(dir).context("Failed to create config directory")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     pub token: Option<String>,
@@ -135,40 +180,103 @@ pub struct Config {
 }
 
 impl Config {
-    /// Get the path to the config file
-    pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Failed to get home directory")?;
-
-        let config_dir = home.join(".config").join("rise");
-
-        // Create directory if it doesn't exist, with restrictive permissions on Unix
-        if !config_dir.exists() {
-            #[cfg(unix)]
-            {
-                // Create parent directories with default permissions
-                if let Some(parent) = config_dir.parent() {
-                    fs::create_dir_all(parent)
-                        .context("Failed to create config parent directory")?;
-                }
-                // Create the rise config directory with 0700 atomically
-                use std::os::unix::fs::DirBuilderExt;
-                fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&config_dir)
-                    .context("Failed to create config directory")?;
+    /// The active login profile, i.e. the one selected via `--profile` /
+    /// `RISE_PROFILE` for the lifetime of this process, or `None` for the
+    /// default profile.
+    ///
+    /// `--profile` is resolved once in `main()`, which normalizes it into the
+    /// `RISE_PROFILE` environment variable (removing it for the literal value
+    /// `"default"`) so every independent config load in the process — not
+    /// just the one in `main()` — agrees on the same active profile.
+    pub fn active_profile() -> Result<Option<String>> {
+        #[cfg(not(test))]
+        if let Ok(val) = std::env::var("RISE_PROFILE") {
+            let trimmed = val.trim();
+            if trimmed.is_empty() || trimmed == "default" {
+                return Ok(None);
             }
-            #[cfg(not(unix))]
-            {
-                fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
-            }
+            validate_profile_name(trimmed)?;
+            return Ok(Some(trimmed.to_string()));
         }
-
-        Ok(config_dir.join("config.json"))
+        Ok(None)
     }
 
-    /// Load configuration from disk
+    /// The active profile's name for display purposes (`"default"` when unset).
+    pub fn active_profile_label() -> Result<String> {
+        Ok(Self::active_profile()?.unwrap_or_else(|| "default".to_string()))
+    }
+
+    /// List the names of all registered non-default profiles, i.e. every
+    /// profile a `rise login --profile <name>` has ever saved.
+    pub fn list_profiles() -> Result<Vec<String>> {
+        let home = dirs::home_dir().context("Failed to get home directory")?;
+        let profiles_dir = home.join(".config").join("rise").join("profiles");
+
+        let mut names = Vec::new();
+        if profiles_dir.exists() {
+            for entry in fs::read_dir(&profiles_dir).context("Failed to read profiles directory")? {
+                let entry = entry.context("Failed to read profile directory entry")?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        names.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Remove a profile's saved configuration file. `"default"` removes the
+    /// base `config.json`.
+    pub fn remove_profile(name: &str) -> Result<()> {
+        let path = if name == "default" {
+            Self::path_for(None)?
+        } else {
+            Self::path_for(Some(name))?
+        };
+
+        if !path.exists() {
+            anyhow::bail!("Profile '{}' does not exist", name);
+        }
+
+        fs::remove_file(&path).context("Failed to remove profile config file")?;
+        Ok(())
+    }
+
+    /// The config file path for a given profile (`None` = default profile).
+    pub fn path_for(profile: Option<&str>) -> Result<PathBuf> {
+        let home = dirs::home_dir().context("Failed to get home directory")?;
+        let config_dir = home.join(".config").join("rise");
+        ensure_config_dir(&config_dir)?;
+
+        match profile {
+            None => Ok(config_dir.join("config.json")),
+            Some(name) => {
+                validate_profile_name(name)?;
+                let profiles_dir = config_dir.join("profiles");
+                ensure_config_dir(&profiles_dir)?;
+                Ok(profiles_dir.join(format!("{name}.json")))
+            }
+        }
+    }
+
+    /// Get the path to the active profile's config file
+    pub fn config_path() -> Result<PathBuf> {
+        Self::path_for(Self::active_profile()?.as_deref())
+    }
+
+    /// Load the active profile's configuration from disk
     pub fn load() -> Result<Self> {
-        let config_path = Self::config_path()?;
+        Self::load_named(Self::active_profile()?.as_deref())
+    }
+
+    /// Load a specific profile's configuration from disk, independent of the
+    /// active profile. Used to inspect other profiles (e.g. `rise profile list`)
+    /// without switching the active one.
+    pub fn load_named(profile: Option<&str>) -> Result<Self> {
+        let config_path = Self::path_for(profile)?;
 
         if !config_path.exists() {
             return Ok(Config::default());
@@ -366,6 +474,41 @@ mod tests {
     fn test_token_from_config() {
         let c = config(|c| c.token = Some("config-token".to_string()));
         assert_eq!(c.stored_token(), Some("config-token".to_string()));
+    }
+
+    #[test]
+    fn test_active_profile_is_default_in_tests() {
+        // RISE_PROFILE reads are disabled under #[cfg(test)] (like the other
+        // env-checking getters), so this only exercises the "unset" path.
+        assert_eq!(Config::active_profile().unwrap(), None);
+        assert_eq!(Config::active_profile_label().unwrap(), "default");
+    }
+
+    #[test]
+    fn test_validate_profile_name_accepts_alnum_dash_underscore() {
+        assert!(validate_profile_name("work").is_ok());
+        assert!(validate_profile_name("work-2").is_ok());
+        assert!(validate_profile_name("work_2").is_ok());
+        assert!(validate_profile_name("default").is_ok());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_empty() {
+        assert!(validate_profile_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_path_separators() {
+        assert!(validate_profile_name("../escape").is_err());
+        assert!(validate_profile_name("a/b").is_err());
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_too_long() {
+        let long_name = "a".repeat(64);
+        assert!(validate_profile_name(&long_name).is_err());
+        let ok_name = "a".repeat(63);
+        assert!(validate_profile_name(&ok_name).is_ok());
     }
 
     #[test]

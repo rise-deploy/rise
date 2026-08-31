@@ -10,6 +10,7 @@ pub mod environment;
 pub mod extension;
 pub mod identity;
 pub mod login;
+pub mod profile;
 pub mod project;
 pub mod run;
 pub mod service_account;

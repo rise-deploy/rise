@@ -740,10 +740,13 @@ pub fn select_token_provider(
         Arc::new(StaticToken::new(token, "stored login token"))
     } else {
         // 5. Nothing.
-        return Err(TokenSourceError::NoSource(
-            "Not authenticated. Run 'rise login' first.".to_string(),
-        )
-        .into());
+        let message = match Config::active_profile().ok().flatten() {
+            Some(profile) => format!(
+                "Not authenticated for profile '{profile}'. Run 'rise login --profile {profile}' first."
+            ),
+            None => "Not authenticated. Run 'rise login' first.".to_string(),
+        };
+        return Err(TokenSourceError::NoSource(message).into());
     };
 
     // `RISE_IDENTITY` set → exchange the resolved token for that identity,

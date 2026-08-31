@@ -329,6 +329,7 @@ pub async fn handle_authorization_code_flow(
         .context("Failed to save authentication token")?;
 
     println!("✓ Login successful!");
+    println!("  Profile: {}", Config::active_profile_label()?);
     println!("  Token saved to: {}", Config::config_path()?.display());
 
     // Display token expiration
