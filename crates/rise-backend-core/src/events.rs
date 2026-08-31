@@ -28,8 +28,18 @@ pub enum EventKind {
     ReplicaStarted,
     /// A container's run ended. `attributes` carries `exit_code` and `reason`.
     ReplicaTerminated,
-    /// A container's restart counter advanced. `attributes` carries `from` and
-    /// `to` counts, so a jump of more than one stays visible.
+    /// A container's restart counter advanced. `attributes` carries `to`, the
+    /// new total — a count worth having, because eleven restarts and one read
+    /// the same otherwise.
+    ///
+    /// `from` is set **only when the counter advanced by more than one**. A
+    /// restart increments it by one, so `from` would otherwise always be
+    /// `to - 1` and say nothing. It advances by more than one when several
+    /// restarts happen between two observations, and then it is the only thing
+    /// recording that restarts happened which no event describes. Emitting it
+    /// conditionally means the reader needs no rule of its own: the generic
+    /// "`from → to` when both are present, `to` alone otherwise" already
+    /// renders both cases correctly.
     ReplicaRestarted,
     /// The desired replica count changed.
     Scaled,
