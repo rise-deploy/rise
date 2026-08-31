@@ -145,6 +145,35 @@ The CLI stores global configuration in `~/.config/rise/config.json`, including:
 
 This file is created automatically on first `rise login`.
 
+## Login Profiles
+
+By default, `rise login` stores credentials in the config file above (the
+**default profile**). To manage more than one Rise account or backend side by
+side — e.g. a personal account and a work account — use a named profile:
+
+```bash
+# Log in and register a new profile named "work" (created if it doesn't exist)
+rise login --profile work --url https://rise.work.example.com
+
+# Use it for a single command
+rise project list --profile work
+
+# ...or for a whole shell session
+export RISE_PROFILE=work
+rise project list
+
+# See every registered profile and which one is active
+rise profile list
+
+# Remove a profile's stored credentials
+rise profile remove work
+```
+
+`--profile` takes precedence over the `RISE_PROFILE` environment variable;
+passing `--profile default` (or unsetting `RISE_PROFILE`) switches back to the
+default profile. A named profile's config is stored separately, at
+`~/.config/rise/profiles/<name>.json`.
+
 ## Backend Configuration Schema
 
 If you're operating a Rise deployment, a JSON Schema for backend configuration (`rise.yaml`) is available at [`backend-settings.schema.json`](/docs/schemas/backend-settings.schema.json). See the [Operator Configuration guide](https://rise-deploy.github.io/rise/operator/configuration/) for details.
