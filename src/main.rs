@@ -1160,15 +1160,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Resolve the active login profile once, up front: an explicit --profile
-    // normalizes into the RISE_PROFILE environment variable (or clears it, for
-    // the literal value "default") so every independent config load later in
-    // the process — not just the one below — agrees on the same profile.
+    // sets a process-wide override (cleared for the literal value "default")
+    // so every independent config load later in the process — not just the
+    // one below — agrees on the same profile. This deliberately avoids
+    // std::env::set_var, which is unsound to mutate concurrently with reads
+    // from other threads once the async runtime's workers are running.
     if let Some(profile) = &cli.profile {
         config::validate_profile_name(profile).context("Invalid --profile value")?;
         if profile == "default" {
-            std::env::remove_var("RISE_PROFILE");
+            config::set_profile_override(None);
         } else {
-            std::env::set_var("RISE_PROFILE", profile);
+            config::set_profile_override(Some(profile.clone()));
         }
     }
 

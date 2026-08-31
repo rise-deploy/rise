@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 pub fn normalize_backend_url(url: &str) -> String {
     url.trim_end_matches('/').to_string()
@@ -179,16 +180,39 @@ pub struct Config {
     pub managed_buildkit: Option<bool>,
 }
 
+/// Process-wide override for the active profile, set at most once by `main()`
+/// from an explicit `--profile` flag. The outer `Option` tracks whether an
+/// override was set at all (unset = no `--profile` flag was given, so
+/// `RISE_PROFILE` should be consulted instead); the inner `Option` is the
+/// resolved profile itself (`None` = the default profile, i.e. `--profile
+/// default`).
+///
+/// Using a `OnceLock` here — rather than round-tripping through
+/// `std::env::set_var`/`remove_var` — avoids mutating the process
+/// environment after the async runtime's worker threads are running, which
+/// is unsound if anything else reads the environment concurrently.
+static PROFILE_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Set the process-wide profile override. Must be called at most once, before
+/// any other profile resolution — `main()` does this immediately after
+/// parsing CLI args, when `--profile` was passed.
+pub fn set_profile_override(profile: Option<String>) {
+    let _ = PROFILE_OVERRIDE.set(profile);
+}
+
 impl Config {
     /// The active login profile, i.e. the one selected via `--profile` /
     /// `RISE_PROFILE` for the lifetime of this process, or `None` for the
     /// default profile.
     ///
-    /// `--profile` is resolved once in `main()`, which normalizes it into the
-    /// `RISE_PROFILE` environment variable (removing it for the literal value
-    /// `"default"`) so every independent config load in the process — not
-    /// just the one in `main()` — agrees on the same active profile.
+    /// `--profile` is resolved once in `main()` into [`set_profile_override`],
+    /// so every independent config load in the process — not just the one in
+    /// `main()` — agrees on the same active profile. Absent that override,
+    /// falls back to the `RISE_PROFILE` environment variable.
     pub fn active_profile() -> Result<Option<String>> {
+        if let Some(overridden) = PROFILE_OVERRIDE.get() {
+            return Ok(overridden.clone());
+        }
         #[cfg(not(test))]
         if let Ok(val) = std::env::var("RISE_PROFILE") {
             let trimmed = val.trim();
