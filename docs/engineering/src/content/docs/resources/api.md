@@ -21,8 +21,10 @@ A path always names the **leaf** collection first as `{group}/{version}/{plural}
 | `{group}/{version}/{plural}/{ancestor}…/{name}` (`D+1`) | GET, PUT, DELETE | Get / update / delete an item |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/status` (`D+2`) | PUT | Status subresource update |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/finalizers` (`D+2`) | PUT | Finalizer subresource update |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/deletion-blockers` (`D+2`) | GET | Deletion-blocker diagnostics |
 | `{group}/{version}/{plural}/uid:{uuid}` | GET, PUT, DELETE | Item by UID |
 | `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT | `status` or `finalizers` by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/deletion-blockers` | GET | Deletion-blocker diagnostics by UID |
 | `pending-deletion` | GET | List tombstoned resources awaiting GC |
 
 Ancestor segments are bare resource *names*; the ancestor *kinds* are derived from the leaf's `ResourceDefinition` parent chain and never appear in the URL. `pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion` without ambiguity.
@@ -35,22 +37,167 @@ The leaf identifier may be given as `uid:{uuid}` instead of a name. A UID is glo
 
 UID addressing skips the ancestor-chain resolution entirely — it works even if an ancestor's `ResourceDefinition` has been removed. This is the intended disaster-recovery path: if a RD is deleted while instances still exist, named addressing fails, but operators and controllers can still reach the orphaned rows by UID.
 
-When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL — but it still must match the stored resource name (resources cannot be renamed via PUT).
+When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` is not validated against the URL — but it still must match the stored resource name. Resource names are immutable.
 
-## Auth tiers
+## Authorization
 
-| Tier | Credentials | Permitted operations |
+Every user-authenticated request is authorized by the ADR-0001 engine: one
+`(verb, ResourceKind, subresource?)` decision per resource, evaluated against
+that resource's own ancestry and effective labels. There is no operator gate in
+front of the API any more. An operator reaches everything because the seeded
+`PlatformRoleBinding/system-admin` says so and because an operator's request
+ignores every `Deny`; anyone else reaches exactly what stored policy grants them.
+
+| Caller | How it is authorized |
+|---|---|
+| Operator (`auth.operator_users`, `auth.operator_idp_groups`) | Expands to `system:operators`, whose seeded binding allows every verb on every kind and subresource |
+| Any other authenticated user | Live RBAC: bindings that name them, one of their Groups, `org:<name>`, or `system:authenticated`, plus dynamic ownership bindings resolved from `rise.dev/owner` |
+| Controller (`auth.controllers` JWT) | PUT `status` and `finalizers` only, gated by the collection's `allowedStatusControllerIds` |
+
+The verbs map onto the HTTP surface directly: `list` and `get` for reads,
+`create` for POST, `update` for item PUT and for the `status`/`finalizers`
+subresources, `delete` for DELETE. Subresource permissions are separate from the
+main resource — a statement with no `subresources` field permits the main
+resource only.
+
+Two read granularities exist, and they are independent grants:
+
+- **`list` without `get`** returns each item projected onto an allowlist —
+  `apiVersion`, `kind`, and the `metadata` fields `name`, `labels`,
+  `effectiveLabels`, and `deletionTimestamp`. `spec`, `status`, and any other
+  top-level field are absent, and so are `uid`, `revision`, and `discriminator`.
+- **`list` and `get`** returns the full stored object for that item.
+
+Every masked answer is byte-identical to the genuine one: status `404` and the
+body `{"error": "resource not found"}`, whether the resource is absent, an
+ancestor is absent, the row belongs to another collection, or the caller simply
+may not read it. Authorization runs before the request body is inspected, so a
+malformed body against an invisible resource is masked too rather than answered
+with a `400`. On the create path the body checks run *first* instead — they read
+only the request and the collection registry, so the same `400` comes back
+whether or not the parent exists, and the parent is reached only once the answer
+can no longer depend on the body.
+
+The masking is on status and body, not on timing: an existing-but-invisible
+resource costs an ancestry walk and a policy evaluation that an absent one does
+not. Treat the difference as observable by anyone who can measure it.
+
+Items the caller cannot `list` are omitted, and their existence is masked: a
+caller with no applicable grant receives an empty collection, never a `403`
+confirming the scope is populated. Addressing one resource by name is masked the
+same way — a caller who holds no `get` on it receives the `404` a name that does
+not exist receives, on every verb, so the item path cannot hand back one name at
+a time what the listing withholds. A caller who *can* read the resource is told
+which verb they are short instead, with a `403`: they already know it exists, and
+masking would only make the refusal harder to act on. Which *collections* exist
+stays visible to every caller who reaches the API at all, matching discovery
+being a property of the registry rather than of any one resource. Who reaches it is the platform-access policy's question rather than
+authorization's: these routes sit behind `auth.platform_access`, which under its
+default `allow_all` admits every authenticated user.
+
+`metadata.effectiveLabels` is on every response, resolved live by walking the
+ancestor chain nearest-wins: a child with no value of its own reports the one it
+inherits, and a child that sets the key shadows its ancestor rather than unioning
+with it. It is the same walk a binding's `labelSelector` matches against, so the
+value a client sees and the value authorization used can never disagree. Note the
+corollary: granting broad `list` beneath an ancestor exposes that ancestor's
+inherited label values on every listed child.
+
+`auth.admin_users` are admins within the default Organization for typed APIs
+only; they do **not** receive Operator and are not implicitly granted anything
+here. Access for anyone other than an operator comes from a binding.
+
+### Authorization-changing writes
+
+Changing the `metadata.ownerReferences` set is authorized separately, because
+the edge is not inert: deleting the owner starts deletion of the dependent.
+Attaching or removing a reference both require `use` on the owner — §2's verb
+for referencing a resource from another resource's fields. Attaching
+additionally requires `delete` on the dependent when it already exists, since
+the edge is what makes it deletable through someone else's resource; and
+`blockOwnerDeletion: true` requires `delete` on the *owner*, because that flag
+is not a reference but a hold on the owner's own deletion. Removing a reference
+whose owner is already gone or draining is ungated — the store will not accept
+such a reference back, so gating its removal would leave the dependent with no
+legal write at all. Re-sending references that are already stored is an ordinary
+read-modify-write.
+
+A write that changes who can do what — a `Role` or `PlatformRole` body, a
+binding, a `GroupMembership`, an identity or trust mapping, a `User` create or
+activation, or a label some binding selects on — additionally passes ADR-0001
+§5's **grant gate**: the
+authority the change would confer must already be held by the writer, over the
+same domain. Holding `create` on `PlatformRoleBinding` therefore does not let a
+caller bind a Role granting more than they have; the refusal is a `403`.
+
+How much that refusal says depends on where its parts came from. A recipient or a
+domain the caller supplied in this request is named; one read out of stored policy
+is not, because a refusal that echoes it is a read of policy the caller may hold
+nothing on. So a refused binding create names the subject and scope it asked for,
+while a refused `Role` edit or label write names neither. What the recipient would
+have *gained* is never named: the gate compares their whole effective policy over
+the domain, so a witness tuple can come from any binding delivering policy to them
+— including ones the caller has never seen. The full comparison is in the
+`rise::audit` `resource.grant_gate` record.
+
+The check and the mutation are one `SERIALIZABLE` transaction with bounded
+retry, so a concurrent revocation either precedes the check or forces the write
+to be replayed against fresh facts.
+
+Two writes reach the gate because of what they *schedule* rather than what they
+say. Attaching an owner reference to a policy resource is a scheduled delete of
+it — the cascade tombstones the dependent, and a tombstoned binding stops
+applying at once — so it is diffed as that delete. Deleting an Organization is
+diffed as the deletion of every `Role` and `RoleBinding` beneath it, for the
+same reason. In both cases removing a `Deny` is a grant, and routing it through
+a cascade must not be cheaper than asking for it directly. A write that keeps losing that race returns
+`503` with a retryable message rather than committing on stale assumptions.
+
+Three consequences worth knowing:
+
+- An unbound `Role` body confers nothing, so authoring one is ungated. Binding it
+  is what the gate weighs.
+- Deleting a binding or narrowing a `Role` is also a grant when it removes a
+  `Deny`, and passes the same check.
+- Removing a membership is not gated — ADR-0001 §4 puts it outside — and a
+  platform-tier `Deny` subjected to `org:<name>` or `group:<org>/<name>` stops
+  matching a caller who drops that affiliation. So granting `delete` on
+  `GroupMembership` lets those users shed such a cap along with the membership.
+  Shipped policy grants it to nobody: the seeded owner binding is label-selected,
+  so leaving is an explicit per-organization grant. Grant it where self-service
+  exit is wanted, not where a subject-scoped platform `Deny` is load-bearing.
+  Re-entry stays gated, so a caller who leaves cannot readmit themselves to
+  recover what the affiliation carried.
+
+### Seeded baseline policy
+
+Startup seeds five root policy resources described by [ADR-0001](../adr/0001-unified-permission-model). These are the whole of the shipped policy: an install that adds no bindings of its own grants nothing to anyone but operators and the subjects a `rise.dev/owner` label names.
+
+| Resource | Grants | Mutability |
 |---|---|---|
-| Operator | Listed in `auth.operator_users` | GET, POST, item PUT, DELETE, PUT `status` and `finalizers` |
-| Controller | Configured `auth.controllers` JWT | PUT `status` and `finalizers`, gated by `allowed_status_controller_ids` |
+| `PlatformRole/system-admin` | every verb on every kind and subresource | immutable |
+| `PlatformRoleBinding/system-admin` | `system-admin` to `system:operators` | immutable |
+| `PlatformRole/org-admin` | the global org-admin baseline | operator-editable |
+| `PlatformRole/resource-owner` | `get`, `list`, `update`, `delete` — no `create`, no subresources | operator-editable |
+| `PlatformRoleBinding/resource-owner` | `resource-owner` to whoever `rise.dev/owner` names | operator-editable |
 
-Controller tokens cannot perform item-level PUT or any other operator operation. A non-operator user receives `403` on every endpoint — including paths that would resolve to a non-existent collection, so collection existence is not probeable by non-operators.
+The two immutable rows are not the source of operator authority — the evaluator hardcodes that, so the guarantee survives a bad restore or a direct database write. They are its only inspectable record, which is why the store rejects `PUT` and `DELETE` on both, and why a startup finding either diverged from its shipped definition fails with the row named and remediation instructions rather than silently rewriting it. Seeding never overwrites the three editable rows, so an operator edit survives every restart and a deleted one is re-created on the next.
 
-Operators have unrestricted access to subresources. When an operator writes finalizers, the per-controller ownership check is bypassed (the operator path is the deadlock-break for stuck cascade deletions). The `system.rise.dev/*` reserved-prefix guard still applies — operators cannot manipulate the cascade-deletion finalizer.
+Editing `org-admin` changes what administrators may do in every organization, never *who* they are: admin standing comes from an exact org-root, scope-only `RoleBinding`, so no label or Group name can confer it. Editing `resource-owner` changes what ownership means platform-wide; an organization can instead override the default for itself with its own binding on the same `(subject, label key)` pair.
 
-`auth.admin_users` are admins within the default Organization for typed APIs only; they do **not** receive Operator and cannot access the generic API unless also listed in `auth.operator_users`.
+`system:operators` is reserved: no binding of either kind may name it except the seeded root `PlatformRoleBinding/system-admin`, and only carrying its shipped body.
 
-All write operations are audit-logged on the `rise::audit` target. Events: `resource.created`, `resource.updated`, `resource.deleted`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.operator_status_updated`, `resource.operator_finalizers_updated`, `resource.pending_deletion_listed`.
+An org `RoleBinding`'s subject must belong to the Organization the binding sits in. A subject that names its own organization — `group:`, `serviceaccount:`, `org:` — is checked at write time and refused on a mismatch: both organizations are fixed once the row exists, so such a binding would read as a cross-org grant while granting nothing, forever. `user:` and `system:authenticated` subjects are accepted, because their affiliation is a live membership question rather than a property of the identifier.
+
+Because the Organization is implied by placement, that subject also accepts the relative form `group:<name>`, expanded against the parent before the row is stored:
+
+```json
+{ "subject": "group:platform", "roleRef": { "kind": "Role", "name": "viewer" } }
+```
+
+under `acme` stores `group:acme/platform`. `PlatformRoleBinding` has no parent Organization and so takes absolute subjects only.
+
+Resource lifecycle operations are audit-logged on the `rise::audit` target. Records include `resource.created`, `resource.updated`, `resource.deleted`, `resource.deletion_cascaded`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.user_status_updated`, `resource.user_finalizers_updated`, `resource.pending_deletion_listed`, `resource.deletion_blockers_listed`, `resource.access_denied` (a refused authorization decision), and `resource.grant_gate` (what the grant gate compared, including the operator short-circuit that produces no claims). Cascade records are best-effort after commit; durable delivery would require a transactional outbox or Event resource.
 
 ### Controller authorization
 
@@ -75,7 +222,14 @@ Authorization: Bearer <operator-jwt>
   "metadata": {
     "name": "my-widget",
     "annotations": {"team": "platform"},
-    "finalizers": []
+    "finalizers": [],
+    "ownerReferences": [{
+      "apiVersion": "rise.dev/v1alpha1",
+      "kind": "Organization",
+      "name": "acme",
+      "uid": "6e999cac-9c0b-4a94-a844-546ce8d508fb",
+      "blockOwnerDeletion": false
+    }]
   },
   "spec": {"color": "blue"}
 }
@@ -84,6 +238,20 @@ Authorization: Bearer <operator-jwt>
 - The body's `apiVersion` must be a *served* version of the collection.
 - The body's `kind` must match the collection's kind.
 - `metadata.name` is the resource's name within its scope.
+- `metadata.ownerReferences` is optional lifecycle metadata. Every entry must
+  identify the same live resource by API group/kind, name, and UID. References
+  do not change the resource URL or grant authorization. Deleting an owner
+  always starts dependent deletion. Optional `blockOwnerDeletion` defaults to
+  `false`; when `true`, that dependent also keeps the owner visible until the
+  dependent is collected.
+- A built-in `Organization` or `ResourceDefinition` cannot currently be the
+  dependent side of an owner reference: requests that put
+  `metadata.ownerReferences` on either kind are rejected. Owner-driven deletion
+  tombstones dependents through the generic garbage collector, which would
+  bypass the additional deletion safety checks for legacy Organization-owned
+  records and resources that still use a ResourceDefinition. Both kinds may
+  still be referenced as owners. A custom `Organization` kind in another API
+  group is unaffected.
 - Server-controlled fields (`uid`, `revision`, `discriminator`, `deletionTimestamp`) are rejected on create.
 - `status` is rejected on create.
 - Response: `201 Created` with the created resource (envelope projected to the URL's served version).
@@ -102,7 +270,8 @@ Authorization: Bearer <operator-jwt>
     "name": "my-widget",
     "revision": 7,
     "annotations": {"team": "platform"},
-    "finalizers": ["controller.example.com/cleanup"]
+    "finalizers": ["controller.example.com/cleanup"],
+    "ownerReferences": []
   },
   "spec": {"color": "red"}
 }
@@ -110,11 +279,13 @@ Authorization: Bearer <operator-jwt>
 
 - `metadata.revision` is required; omitting it is `400`.
 - A revision mismatch is `409 Conflict`.
-- `metadata.name` must equal the URL name (or the stored row's name when addressed by UID) — resources cannot be renamed.
+- `metadata.name` must equal the URL name (or the stored row's name when addressed by UID); resource names are immutable.
+- `metadata.ownerReferences` replaces the complete owner-reference set. Omitting
+  it is equivalent to an empty set.
 - `status` is rejected on update (use the `status` subresource).
 - Reads (GET/LIST) work for any *served* version. Writes (POST/PUT) must use the *storage* version — a write targeting a served non-storage version is rejected with `422 Unprocessable Entity` (version conversion is not yet implemented).
 
-### Status subresource (controllers and operators)
+### Status subresource (controllers and users)
 
 ```http
 PUT /api/v1/resources/example.dev/v1/widgets/acme/my-widget/status
@@ -124,11 +295,11 @@ Authorization: Bearer <controller-jwt>
 {"status": {"phase": "Ready", "message": "all good"}}
 ```
 
-The body's `status` is stored under `status.controllers[<id>]` where `<id>` is the caller's `identity_id` (for controller tokens) or `operator:<email>` (for operator-user writes). Other controller slots in `status.controllers` are unaffected. A controller can only write its own slot; operators can write any slot via the operator path.
+The body's `status` is stored under `status.controllers[<id>]` where `<id>` is the caller's `identity_id` (for controller tokens) or `operator:<email>` (for user writes, authorized by `(update, Kind, status)`). Other controller slots in `status.controllers` are unaffected. A controller can only write its own slot; a user write lands in its own writer-keyed slot and never overwrites a controller's.
 
 The status update applies unconditionally to the latest row (no revision needed) and increments `revision`.
 
-### Finalizer subresource (controllers and operators)
+### Finalizer subresource (controllers and users)
 
 ```http
 PUT /api/v1/resources/example.dev/v1/widgets/acme/my-widget/finalizers
@@ -138,7 +309,7 @@ Authorization: Bearer <controller-jwt>
 {"add": ["controller.example.com/cleanup"], "remove": []}
 ```
 
-`add` and `remove` are applied in a single transaction. Both lists may be empty. Adding or removing a `system.rise.dev/*` finalizer is rejected with `400`. Controllers can only add or remove finalizers whose name corresponds to a controller-owned token; operators bypass the controller-ownership check (but the reserved-prefix guard still applies).
+`add` and `remove` are applied in a single transaction. Both lists may be empty. Adding or removing a `system.rise.dev/*` finalizer is rejected with `400`. Controllers can only add or remove finalizers whose name corresponds to a controller-owned token; a user write authorized by `(update, Kind, finalizers)` bypasses the controller-ownership check — that path is the deadlock-break for stuck cascade deletions — but the reserved-prefix guard still applies.
 
 ### Delete (cascade)
 
@@ -147,9 +318,10 @@ DELETE /api/v1/resources/rise.dev/v1alpha1/organizations/acme
 Authorization: Bearer <operator-jwt>
 ```
 
-`DELETE` always cascades to the subtree (see [Storage Model](./storage)). Two response shapes:
+`DELETE` always cascades through structural children and owner-reference
+dependents (see [Storage Model](./storage)). Two response shapes:
 
-- `200 OK` with `{"deleted": true, "uid": "..."}` — row had no finalizers and no children, hard-deleted in place.
+- `200 OK` with `{"deleted": true, "uid": "..."}` — row had no finalizers or blocking dependents, hard-deleted in place. Non-blocking owner-reference dependents have already been tombstoned and continue draining asynchronously.
 - `202 Accepted` with `{"deleted": false, "markedForDeletion": true, "resource": ...}` — row tombstoned, cascade in progress. The returned envelope carries the row at its post-stamp state (`metadata.deletionTimestamp` set, `metadata.finalizers` may include `system.rise.dev/cascade-deletion`).
 
 ### Pending-deletion listing
@@ -161,6 +333,35 @@ Authorization: Bearer <operator-jwt>
 
 Returns tombstoned rows oldest-first, up to `limit` (1–1000, default 100). Useful for spotting deletions stuck on a finalizer.
 
+### Deletion-blockers subresource
+
+```http
+GET /api/v1/resources/rise.dev/v1alpha1/organizations/acme/deletion-blockers
+Authorization: Bearer <operator-jwt>
+```
+
+Returns the concrete resources currently preventing the addressed resource
+from being collected. Structural children are always blockers;
+owner-reference dependents appear only when their matching reference carries
+`blockOwnerDeletion: true`. Each item identifies the relationship and resource,
+including its deletion timestamp and finalizers. The response also reports
+whether `system.rise.dev/cascade-deletion` is currently present. This
+subresource is authorized by `(get, Kind, deletion-blockers)` on the resource
+being blocked, and computed from the canonical resource rows; it does not
+maintain a separate blocker table. The blockers are filtered per item like any
+other collection, on `get` rather than `list` because each item carries more
+than list granularity projects (its UID and its finalizers): one the caller
+cannot `get` is counted in `hiddenBlockers` rather than named, so the report
+never reads as "nothing is blocking this" while something is.
+
+`hiddenBlockers` is itself a deliberate disclosure: it is a live count of
+resources the caller may not read, so a principal holding only
+`(get, Kind, deletion-blockers)` can watch it move as others create and delete
+children. That is accepted rather than overlooked — a blocker report that
+silently omits blockers is worse than one that says how many it withheld — but
+grant the subresource on that basis, not on the assumption that it reveals
+nothing about a subtree the caller cannot list.
+
 ## Status codes
 
 | Code | Meaning |
@@ -168,8 +369,8 @@ Returns tombstoned rows oldest-first, up to `limit` (1–1000, default 100). Use
 | 200 / 201 / 202 | Operation succeeded (200 read/update, 201 create, 202 cascade tombstoned) |
 | 400 | Malformed path, body validation, reserved finalizer prefix, wrong version |
 | 401 | No credentials or JWT verification failed |
-| 403 | Authenticated, but not an operator (or controller not in the allowlist) |
-| 404 | Unknown collection, unknown resource, kind/version mismatch on `uid:` |
+| 403 | Authorized to read the resource but not to perform this verb, or refused by the grant gate |
+| 404 | Unknown collection, unknown resource, kind/version mismatch on `uid:`, or a resource the caller may not read |
 | 405 | Method not valid for the addressed path (e.g. GET on `/status`) |
 | 409 | Name conflict on create, revision conflict on update |
 | 422 | Write targeting a served non-storage version (no conversion yet) |

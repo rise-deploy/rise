@@ -414,7 +414,7 @@ async fn check_project_access(
     project_id: uuid::Uuid,
 ) -> Result<bool, ServerError> {
     // Check if user is admin
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 

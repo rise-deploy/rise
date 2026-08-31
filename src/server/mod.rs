@@ -1,5 +1,7 @@
 pub mod auth;
 #[cfg(feature = "backend")]
+pub mod authz;
+#[cfg(feature = "backend")]
 pub mod bootstrap;
 pub mod custom_domains;
 pub mod deployment;
@@ -14,6 +16,8 @@ pub mod frontend;
 pub mod middleware;
 pub mod oci;
 pub mod platform;
+#[cfg(feature = "backend")]
+pub mod policy_seed;
 pub mod project;
 pub mod quickstart;
 pub mod rate_limit;
@@ -109,6 +113,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let controller_state = ControllerState {
         db_pool: state.db_pool.clone(),
         encryption_provider: state.encryption_provider.clone(),
+        deployment_retention: settings.deployment_retention.clone(),
     };
 
     // Reconcile RiseProject CRDs as a background task — see
@@ -126,12 +131,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             _ => 1000,
         };
         let kube_client = kube_client.clone();
-        let db_pool = state.db_pool.clone();
+        let deployment_store = state.deployment_store.clone();
         let controller_class = state.deployment_controller_class_name.clone();
         tokio::spawn(async move {
             if let Err(e) = deployment::crd::backfill_rise_projects(
                 &kube_client,
-                &db_pool,
+                deployment_store.as_ref(),
                 controller_class.as_deref(),
                 std::time::Duration::from_millis(interval_ms),
             )

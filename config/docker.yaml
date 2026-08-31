@@ -67,13 +67,21 @@ auth:
   issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
   client_id: "${OIDC_CLIENT_ID:-rise-backend}"
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
+  # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
+  idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
   admin_users: ["${ADMIN_EMAIL:-admin@example.com}"]
+  # Grant the admin role to everyone in an IdP group instead of listing emails.
+  # Blank entries are filtered out, so an unset var collapses to an empty list.
+  admin_idp_groups:
+    - "${RISE_ADMIN_IDP_GROUP:-}"
   # Operators have full access to the generic resource API (/api/v1/resources)
   # and always bypass platform_access. Defaults to none — set RISE_OPERATOR_EMAIL
   # to grant a single operator (mount a config override for several). The blank
   # entry is filtered out when the var is unset, so this collapses to an empty list.
   operator_users:
     - "${RISE_OPERATOR_EMAIL:-}"
+  operator_idp_groups:
+    - "${RISE_OPERATOR_IDP_GROUP:-}"
   allow_team_creation: true
   allow_list_all_teams: true
   # Who may use the CLI/API/dashboard (the "platform"), as opposed to merely
@@ -100,8 +108,13 @@ registry:
   namespace: "rise-apps"
   # Public URL the CLI PUSHES to. Local default is the loopback-published
   # registry (localhost:5000); prod sets registry.${RISE_DOMAIN} (behind Traefik
-  # basicauth). The CLI does its own `docker login`; oci-client-auth mints none.
+  # basicauth).
   client_registry_url: "${RISE_CLIENT_REGISTRY_URL:-localhost:5000}"
+  # Optional static credentials. When set, Rise returns these through the
+  # authenticated, deployment-scoped credentials endpoint so the CLI can log in
+  # automatically. This deliberately trusts every user allowed to deploy.
+  username: "${RISE_REGISTRY_USERNAME:-}"
+  password: "${RISE_REGISTRY_PASSWORD:-}"
 deployment_controller:
   type: "docker"
   traefik_network: "rise_default"

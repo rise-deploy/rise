@@ -42,7 +42,28 @@ jobs:
       short_sha: ${{ steps.meta.outputs.short_sha }}
       is_trusted_pr: ${{ steps.meta.outputs.is_trusted_pr }}
       should_publish: ${{ steps.meta.outputs.should_publish }}
+      latest_stable: ${{ steps.tags.outputs.latest_stable }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Compute latest stable release tag
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The newest published stable release (vMAJOR.MINOR.PATCH, no -rc suffix)
+          # — the version the upgrade E2E starts from. Empty if none exists yet, in
+          # which case the upgrade jobs skip.
+          latest=$(git tag -l 'v*' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1 || true)
+          echo "latest_stable=${latest#v}" >> "$GITHUB_OUTPUT"
+          echo "Latest stable release: ${latest:-<none>}"
+
       - name: Compute metadata
         id: meta
         shell: bash
@@ -100,7 +121,7 @@ jobs:
     name: Quality / Rust
     runs-on: ubuntu-latest
     needs: prepare
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -138,8 +159,12 @@ jobs:
         env:
           SQLX_OFFLINE: true
 
-      - name: Run Clippy (resource API crate)
-        run: cargo clippy --package rise-resource-api --all-targets -- -D warnings
+      # Workspace-wide, so support crates and their test targets are covered
+      # without a hand-maintained package list that drifts as crates are added.
+      - name: Run Clippy (workspace)
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        env:
+          SQLX_OFFLINE: true
 
       - name: Run cargo audit
         run: cargo audit
@@ -308,6 +333,26 @@ jobs:
   # verification is security-critical (it must fail closed on forged/invalid
   # tokens), so its negative-path tests run on every CI — the Docker build of the
   # fixture in the e2e jobs does not execute them.
+  terraform-check:
+    name: Quality / Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+
+      # `validate` and `test` only; `plan` against real infrastructure would
+      # need credentials, and these run on untrusted pull requests. The module
+      # tests override the identity data sources for the same reason.
+      - name: Check Terraform modules
+        run: mise run terraform:check
+
   fixture-go-test:
     name: Quality / identity fixture (Go)
     runs-on: ubuntu-latest
@@ -329,17 +374,27 @@ jobs:
 # Stage 2 · Build — image builds in parallel with Quality; chart gated on Quality
 # ==========================================================================
 
-  package-image:
-    name: Build / Image
-    runs-on: ubuntu-latest
+  package-image-arch:
+    name: Build / Image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     # Builds in parallel with the quality gates to keep the image (and therefore
     # all e2e) off the critical path. It only *publishes* when should_publish,
-    # tagged by sha/ci-version (never a release/latest tag), so building before
-    # the tests finish is safe — the chart publish and the e2e jobs stay gated on
-    # the quality jobs below.
+    # using architecture-specific SHA tags, so building before the tests finish
+    # is safe. The package-image job combines those images into the public
+    # multi-platform tags before the chart and e2e jobs consume them.
     needs:
       - prepare
-    timeout-minutes: 40
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: blacksmith-8vcpu-ubuntu-2204
+          - arch: arm64
+            platform: linux/arm64
+            runner: blacksmith-8vcpu-ubuntu-2204-arm
     permissions:
       contents: read
       packages: write
@@ -347,8 +402,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Set up Blacksmith Docker builder
+        uses: useblacksmith/setup-docker-builder@v2
+        with:
+          cache-key: rise-images-${{ matrix.arch }}
 
       - name: Log in to GHCR
         if: needs.prepare.outputs.should_publish == 'true'
@@ -359,34 +416,78 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and optionally push image
-        uses: docker/build-push-action@v7
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: ./Dockerfile
           target: rise
           push: ${{ needs.prepare.outputs.should_publish == 'true' }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.image_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
           provenance: false
 
       - name: Build and optionally push builder image
-        uses: docker/build-push-action@v7
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: ./Dockerfile
           target: rise-builder
           push: ${{ needs.prepare.outputs.should_publish == 'true' }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:${{ needs.prepare.outputs.image_tag }}
-            ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          platforms: linux/amd64
+          tags: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
           provenance: false
+
+  package-image:
+    name: Build / Image manifest
+    runs-on: blacksmith
+    needs:
+      - prepare
+      - package-image-arch
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        if: needs.prepare.outputs.should_publish == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: needs.prepare.outputs.should_publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and verify multi-platform manifests
+        if: needs.prepare.outputs.should_publish == 'true'
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+
+          publish_manifest() {
+            local image="$1"
+
+            docker buildx imagetools create \
+              --tag "${image}:${IMAGE_TAG}" \
+              --tag "${image}:sha-${SHORT_SHA}" \
+              "${image}:sha-${SHORT_SHA}-amd64" \
+              "${image}:sha-${SHORT_SHA}-arm64"
+
+            docker buildx imagetools inspect --raw "${image}:${IMAGE_TAG}" \
+              | jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]'
+          }
+
+          publish_manifest "${REGISTRY}/${IMAGE_NAME}"
+          publish_manifest "${REGISTRY}/${BUILDER_IMAGE_NAME}"
+
+      - name: Skip manifest publishing
+        if: needs.prepare.outputs.should_publish != 'true'
+        run: echo "Images were built without publishing for this untrusted pull request."
 
   package-helm:
     name: Build / Helm chart
@@ -509,6 +610,33 @@ jobs:
       - name: Run e2e build tests (with proxy)
         run: RISE_BIN=./target/release/rise bash tests/e2e-build/run.sh --only-proxy
 
+  e2e-compose:
+    name: E2E / Compose
+    runs-on: ubuntu-latest
+    needs: prepare
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust + tools
+        uses: ./.github/actions/setup-rust
+        with:
+          rust-version: ${{ env.RUST_VERSION }}
+          cache-key: e2e-compose
+
+      - name: Build Rise CLI
+        run: cargo build --release --package rise-deploy --features cli
+
+      - name: Run rise compose e2e suite
+        env:
+          RISE_E2E_SUITE: compose
+          RISE_BIN: ./target/release/rise
+        run: cargo run --manifest-path tests/e2e/Cargo.toml
+
+  # Self-provisions its own compose stack and runs every Docker scenario
+  # (public deploy, SA token exchange, private/forwardAuth, health-rolling
+  # cutover, workload identity).
   e2e-docker:
     name: E2E / Docker
     runs-on: ubuntu-latest
@@ -526,31 +654,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
-      # Self-provisions its own compose stack and runs every Docker scenario
-      # (public deploy, SA token exchange, private/forwardAuth, health-rolling
-      # cutover, workload identity).
       - name: Run e2e harness (docker backend)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_BACKEND: docker
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: docker
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # Typed cross-backend harness (crate rise-e2e) on Kubernetes: it self-provisions
   # its own minikube cluster + Helm release (default oci-client-auth mode) and runs
@@ -571,37 +682,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
       - name: Run e2e harness (minikube backend)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_BACKEND: minikube
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: minikube
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   # rise-e2e harness in jfrog-vault mode: self-provisions JFrog + Vault + a minikube
   # cluster whose registry pulls from JFrog, then runs the workload-identity scenario
@@ -625,39 +713,59 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup mise
-        uses: jdx/mise-action@v4
-        with:
-          cache: true
-          experimental: true
-
-      - name: Install mise tools
-        run: mise use -g minikube kubectl helm
-
-      - name: Download e2e harness binary
-        uses: actions/download-artifact@v5
-        with:
-          name: rise-e2e-harness
-          path: harness
-
       - name: Run e2e harness (minikube, jfrog-vault)
-        env:
-          RISE_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          RISE_CLI_IMAGE_REPOSITORY: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
-          RISE_IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
-          RISE_E2E_BACKEND: minikube
-          RISE_E2E_REGISTRY_MODE: jfrog-vault
-        run: |
-          chmod +x harness/rise-e2e
-          ./harness/rise-e2e
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: minikube
+          registry-mode: jfrog-vault
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          cli-image-repository: ${{ env.REGISTRY }}/${{ env.BUILDER_IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Upgrade test: stand the stack up on the latest published stable release, seed a
+  # project + deployment, then upgrade in place to this build (running the DB
+  # migrations against the seeded data) and assert the project survived and a fresh
+  # deploy still works. Skipped when no stable release exists yet (latest_stable
+  # empty). The minikube job builds the OLD chart from its source at the release tag
+  # (with that version's own values-ci.yaml) and `helm upgrade`s to the in-repo
+  # chart on the new image — a clean in-place upgrade (same chart name throughout).
+  #
+  # NOTE: there is deliberately no Docker upgrade job yet. The Docker deployment
+  # backend (docker-compose.standalone.yaml + config/docker.yaml) landed after the
+  # latest stable release, so no released version has a Docker stack to upgrade
+  # *from*. The harness keeps the Docker `upgrade()` path (DockerBackend::upgrade),
+  # so a Docker upgrade job can be added here once the Docker backend ships in a
+  # stable release. Tracked as a parity gap (see tests/e2e/README.md).
+  e2e-upgrade-minikube:
+    name: E2E / Upgrade (Minikube)
+    runs-on: ubuntu-latest
+    if: >-
+      needs.prepare.outputs.latest_stable != '' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+       (github.event_name == 'pull_request' && needs.prepare.outputs.is_trusted_pr == 'true'))
+    needs:
+      - prepare
+      - package-image
+      - package-helm
+      - e2e-harness-build
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Run e2e upgrade harness (minikube backend)
+        uses: ./.github/actions/run-e2e-harness
+        with:
+          backend: minikube
+          upgrade-from: ${{ needs.prepare.outputs.latest_stable }}
+          image-repository: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          image-tag: ${{ needs.prepare.outputs.image_tag }}
+          github-actor: ${{ github.actor }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
 # ==========================================================================
 # Stage 4 · Docs — GitHub Pages (serialized via the pages-deploy concurrency group)
@@ -697,6 +805,12 @@ jobs:
       - name: Install docs dependencies
         working-directory: docs
         run: npm ci
+
+      - name: Generate LLM documentation
+        env:
+          RISE_USER_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/user
+          RISE_OPERATOR_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/operator
+        run: node docs/scripts/generate-llms.mjs
 
       - name: Build user docs
         working-directory: docs/user
@@ -857,6 +971,12 @@ jobs:
       - name: Install docs dependencies
         working-directory: docs
         run: npm ci
+
+      - name: Generate LLM documentation preview
+        env:
+          RISE_USER_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/user
+          RISE_OPERATOR_DOCS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/preview/pr-${{ github.event.pull_request.number }}/operator
+        run: node docs/scripts/generate-llms.mjs
 
       - name: Build user docs preview
         working-directory: docs/user
@@ -1051,60 +1171,3 @@ jobs:
             } catch (error) {
               core.warning(`Unable to create or update docs preview comment: ${error.message}`);
             }
-
-# ==========================================================================
-# Stage 5 · Publish — tag pushes only
-# ==========================================================================
-
-  publish-crates:
-    name: Publish / crates.io
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs:
-      - rust-quality
-      - unit-tests-linux
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Set up Rust + tools
-        uses: ./.github/actions/setup-rust
-        with:
-          rust-version: ${{ env.RUST_VERSION }}
-          cache: "false"
-
-      - name: Verify version matches tag
-        run: |
-          TAG_VERSION=${GITHUB_REF#refs/tags/v}
-          CARGO_VERSION=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].version')
-          echo "Tag version: $TAG_VERSION"
-          echo "Cargo version: $CARGO_VERSION"
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag version ($TAG_VERSION) doesn't match Cargo version ($CARGO_VERSION)"
-            exit 1
-          fi
-
-      - name: Authenticate with crates.io
-        uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-
-      - name: Strip path-only workspace deps from Cargo.toml
-        # `rise-resource-api`/`rise-resource-store` are path-only workspace
-        # crates and aren't published. Cargo refuses to publish a manifest
-        # with path-only deps, so strip them and their `dep:` references
-        # before invoking `cargo publish`. Other backend deps come from
-        # crates.io and stay in the manifest (unreachable but harmless).
-        run: |
-          sed -i \
-            -e '/# --- BEGIN BACKEND/,/# --- END BACKEND/d' \
-            -e '/# strip-on-publish$/d' \
-            Cargo.toml
-
-      - name: Publish to crates.io
-        run: cargo publish --features cli --allow-dirty
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

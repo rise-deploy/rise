@@ -32,6 +32,41 @@ pub fn validate_http_url(url: &str) -> Result<String, String> {
     }
 }
 
+/// Validate a project name as a DNS-1123 label: the name becomes a subdomain
+/// (`<name>.<domain>`) and part of Kubernetes resource names, so it must be
+/// lowercase alphanumeric plus hyphens, start and end alphanumeric, contain no
+/// dots or spaces, and be at most 63 characters.
+pub fn validate_project_name(
+    name: &str,
+    reserved_project_names: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if name.len() > 63 {
+        return Err("must be at most 63 characters".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(
+            "must contain only lowercase letters, digits, and hyphens (no dots or spaces)"
+                .to_string(),
+        );
+    }
+    // Safe to unwrap: non-empty checked above.
+    let starts_ok = name.chars().next().unwrap().is_ascii_alphanumeric();
+    let ends_ok = name.chars().last().unwrap().is_ascii_alphanumeric();
+    if !starts_ok || !ends_ok {
+        return Err("must start and end with a letter or digit".to_string());
+    }
+    if reserved_project_names.contains(name) {
+        return Err("is reserved for a control-plane hostname".to_string());
+    }
+    Ok(())
+}
+
 /// List available access classes for the deployment controller
 pub async fn list_access_classes(
     State(state): State<AppState>,
@@ -51,52 +86,50 @@ pub async fn list_access_classes(
     Ok(Json(ListAccessClassesResponse { access_classes }))
 }
 
-/// Resolve user identifier (UUID or email) to user ID
-async fn resolve_user_identifier(
-    pool: &sqlx::PgPool,
+/// Resolve user identifier (UUID or email) to user ID.
+///
+/// Takes an executor rather than the pool so a caller that already holds a
+/// transaction resolves on *its* connection. Asking the pool for a second
+/// connection while holding one deadlocks the pool against itself once enough
+/// requests do it at once — and these resolvers are called once per entry in a
+/// caller-supplied `app_users` / `app_teams` list, so "enough" is not many.
+async fn resolve_user_identifier<'a, E>(
+    executor: E,
     identifier: &str,
-) -> Result<uuid::Uuid, ServerError> {
+) -> Result<uuid::Uuid, ServerError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     use crate::server::error::ServerErrorExt;
 
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        // Valid UUID - verify user exists
-        db_users::find_by_id(pool, uuid)
-            .await
-            .internal_err("Failed to lookup user")?
-            .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
-            .map(|u| u.id)
-    } else {
-        // Treat as email - look up user
-        db_users::find_by_email(pool, identifier)
-            .await
-            .internal_err("Failed to lookup user")?
-            .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
-            .map(|u| u.id)
-    }
+    let found = match uuid::Uuid::parse_str(identifier) {
+        Ok(uuid) => db_users::find_by_id(executor, uuid).await,
+        Err(_) => db_users::find_by_email(executor, identifier).await,
+    };
+    found
+        .internal_err("Failed to lookup user")?
+        .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
+        .map(|u| u.id)
 }
 
 /// Resolve team identifier (UUID or name) to team ID
-async fn resolve_team_identifier(
-    pool: &sqlx::PgPool,
+async fn resolve_team_identifier<'a, E>(
+    executor: E,
     identifier: &str,
-) -> Result<uuid::Uuid, ServerError> {
+) -> Result<uuid::Uuid, ServerError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     use crate::server::error::ServerErrorExt;
 
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        // Valid UUID - verify team exists
-        db_teams::find_by_id(pool, uuid)
-            .await
-            .internal_err("Failed to lookup team")?
-            .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
-            .map(|t| t.id)
-    } else {
-        // Treat as team name - look up team
-        db_teams::find_by_name(pool, identifier)
-            .await
-            .internal_err("Failed to lookup team")?
-            .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
-            .map(|t| t.id)
-    }
+    let found = match uuid::Uuid::parse_str(identifier) {
+        Ok(uuid) => db_teams::find_by_id(executor, uuid).await,
+        Err(_) => db_teams::find_by_name(executor, identifier).await,
+    };
+    found
+        .internal_err("Failed to lookup team")?
+        .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
+        .map(|t| t.id)
 }
 
 pub async fn create_project(
@@ -105,6 +138,10 @@ pub async fn create_project(
     Json(payload): Json<CreateProjectRequest>,
 ) -> Result<Json<CreateProjectResponse>, ServerError> {
     let user = auth.user()?;
+    // Validate the project name (becomes a subdomain + K8s resource names).
+    validate_project_name(&payload.name, &state.reserved_project_names).map_err(|e| {
+        ServerError::bad_request(format!("Invalid project name '{}': {e}", payload.name))
+    })?;
     // Validate access_class against configured access classes
     let is_valid_access_class = state.access_classes.contains_key(&payload.access_class);
 
@@ -233,7 +270,7 @@ pub async fn create_project(
 
     // Add app users if provided
     for user_identifier in &payload.app_users {
-        let user_id = resolve_user_identifier(&state.db_pool, user_identifier).await?;
+        let user_id = resolve_user_identifier(&mut *tx, user_identifier).await?;
         crate::db::project_app_users::add_user(&mut *tx, project.id, user_id)
             .await
             .internal_err("Failed to add app user")?;
@@ -241,7 +278,7 @@ pub async fn create_project(
 
     // Add app teams if provided
     for team_identifier in &payload.app_teams {
-        let team_id = resolve_team_identifier(&state.db_pool, team_identifier).await?;
+        let team_id = resolve_team_identifier(&mut *tx, team_identifier).await?;
         crate::db::project_app_users::add_team(&mut *tx, project.id, team_id)
             .await
             .internal_err("Failed to add app team")?;
@@ -303,7 +340,7 @@ pub async fn list_projects(
 
     let user = auth.user()?;
     // Admins can see all projects, others only see projects they have access to
-    let projects = if state.is_admin(&user.email) {
+    let projects = if state.is_admin(user).await {
         projects::list(&state.db_pool, None)
             .await
             .internal_err("Failed to list projects")?
@@ -460,7 +497,7 @@ pub async fn list_team_projects(
     // the resolved team — otherwise we'd leak team existence by distinguishing
     // 200-empty from 404-not-found. Service-account access does not count,
     // matching the boundary intended for this endpoint.
-    if !state.is_admin(&user.email) {
+    if !state.is_admin(user).await {
         let is_member = db_teams::is_member(&state.db_pool, team_id, user.id)
             .await
             .internal_err("Failed to check team membership")?;
@@ -749,7 +786,7 @@ pub async fn update_project(
 
         // Add new app users
         for user_identifier in &app_users {
-            let user_id = resolve_user_identifier(&state.db_pool, user_identifier).await?;
+            let user_id = resolve_user_identifier(&mut *tx, user_identifier).await?;
 
             crate::db::project_app_users::add_user(&mut *tx, updated_project.id, user_id)
                 .await
@@ -782,7 +819,7 @@ pub async fn update_project(
 
         // Add new app teams
         for team_identifier in &app_teams {
-            let team_id = resolve_team_identifier(&state.db_pool, team_identifier).await?;
+            let team_id = resolve_team_identifier(&mut *tx, team_identifier).await?;
 
             crate::db::project_app_users::add_team(&mut *tx, updated_project.id, team_id)
                 .await
@@ -1184,7 +1221,7 @@ pub async fn ensure_project_access_or_admin(
     user: &User,
     project: &crate::db::models::Project,
 ) -> Result<(), ServerError> {
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(());
     }
 
@@ -1208,7 +1245,7 @@ pub async fn check_read_permission(
     user: &User,
 ) -> Result<bool, String> {
     // Admins have full access
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 
@@ -1225,7 +1262,7 @@ pub async fn check_write_permission(
     user: &User,
 ) -> Result<bool, String> {
     // Admins have full access
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 
@@ -1233,4 +1270,69 @@ pub async fn check_write_permission(
     projects::user_can_access(&state.db_pool, project.id, user.id)
         .await
         .map_err(|e| format!("Failed to check access: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_project_name;
+
+    fn reserved_project_names() -> std::collections::HashSet<String> {
+        ["rise", "dex", "registry", "www"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn accepts_dns_label_names() {
+        let reserved = reserved_project_names();
+        for ok in ["app", "my-app", "web1", "a", "a1-b2-c3"] {
+            assert!(
+                validate_project_name(ok, &reserved).is_ok(),
+                "{ok} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_dns_names() {
+        let reserved = reserved_project_names();
+        for bad in [
+            "",       // empty
+            "My-App", // uppercase
+            "my app", // space
+            "my.app", // dot
+            "-app",   // leading hyphen
+            "app-",   // trailing hyphen
+            "app_1",  // underscore
+        ] {
+            assert!(
+                validate_project_name(bad, &reserved).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        // Over 63 chars.
+        assert!(validate_project_name(&"a".repeat(64), &reserved).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_control_plane_names() {
+        let reserved = reserved_project_names();
+
+        for name in ["rise", "dex", "registry", "www"] {
+            assert_eq!(
+                validate_project_name(name, &reserved),
+                Err("is reserved for a control-plane hostname".to_string()),
+                "{name} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_operator_configured_reserved_names() {
+        let reserved = ["grafana".to_string()].into_iter().collect();
+
+        assert!(validate_project_name("grafana", &reserved).is_err());
+        assert!(validate_project_name("rise", &reserved).is_ok());
+    }
 }

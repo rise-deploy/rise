@@ -1,10 +1,15 @@
 [workspace]
 members = [
     ".",
+    "crates/rise-authz",
     "crates/rise-backend-auth",
     "crates/rise-backend-core",
+    "crates/rise-backend-docker",
+    "crates/rise-backend-ecs",
+    "crates/rise-backend-traefik",
+    "crates/rise-deployment-spec",
     "crates/rise-resource-api",
-    "crates/rise-resource-store",
+    "crates/rise-resource-store-postgres",
     "crates/rise-runtime-sync",
 ]
 # The rise-e2e harness is its own standalone workspace (tests/e2e/Cargo.toml) so
@@ -28,12 +33,16 @@ sha2 = "0.11"
 sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "migrate", "json"] }
 thiserror = "2.0"
 tokio = { version = "1.48.0", features = ["full"] }
+rise-deployment-spec = { path = "crates/rise-deployment-spec" }
 tracing = "0.1.43"
+regex = "1.11"
+url = "2.5"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [package]
 name = "rise-deploy"
-version = "0.23.0-rc4"
+version = "0.23.0-rc12"
+publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rise-deploy/rise"
@@ -44,6 +53,7 @@ description = "A simple and powerful CLI for deploying containerized application
 always_include_features = ["cli"]
 
 [package.metadata.dist]
+dist = true
 cargo-dist-version = "0.31.0"
 ci = []
 installers = []
@@ -70,14 +80,19 @@ cli = [
     "dep:webbrowser",
     "dep:serde_ignored",
     "dep:async-trait",
+    "dep:serde_yaml",
 ]
 backend = [
     # Server core (former "server" feature)
-    "dep:rise-backend-auth", # strip-on-publish
-    "dep:rise-backend-core", # strip-on-publish
-    "dep:rise-resource-api", # strip-on-publish
-    "dep:rise-resource-store", # strip-on-publish
-    "dep:rise-runtime-sync", # strip-on-publish
+    "dep:rise-authz",
+    "dep:rise-backend-auth",
+    "dep:rise-backend-core",
+    "dep:rise-backend-docker",
+    "dep:rise-backend-ecs",
+    "dep:rise-backend-traefik",
+    "dep:rise-resource-api",
+    "dep:rise-resource-store-postgres",
+    "dep:rise-runtime-sync",
     "dep:config",
     "dep:openssl",
     "dep:rsa",
@@ -99,6 +114,8 @@ backend = [
     "dep:schemars",
     "dep:serde_yaml",
     "dep:tokio-tungstenite",
+    "rise-deployment-spec/schema",
+    "rise-backend-core/schema",
     # Kubernetes (former "k8s" feature)
     "dep:kube",
     "dep:k8s-openapi",
@@ -109,6 +126,9 @@ backend = [
     # AWS services (former "aws" feature)
     "dep:aws-config",
     "dep:aws-sdk-ecr",
+    "dep:aws-sdk-ecs",
+    "dep:aws-sdk-cloudwatchlogs",
+    "dep:aws-sdk-ssm",
     "dep:aws-sdk-iam",
     "dep:aws-sdk-kms",
     "dep:aws-sdk-rds",
@@ -119,17 +139,20 @@ backend = [
 ]
 
 [dependencies]
-# --- BEGIN BACKEND (stripped before `cargo publish` in CI; see .github/workflows/ci.yml) ---
 # Workspace crates (backend only)
+rise-authz = { path = "crates/rise-authz", optional = true }
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
+rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
+rise-backend-ecs = { path = "crates/rise-backend-ecs", optional = true }
+rise-backend-traefik = { path = "crates/rise-backend-traefik", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
-rise-resource-store = { path = "crates/rise-resource-store", optional = true }
+rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }
 rise-runtime-sync = { path = "crates/rise-runtime-sync", optional = true }
-# --- END BACKEND ---
 
 # Common (always enabled - shared across features)
 anyhow = "1.0.100"
+rise-deployment-spec = { workspace = true }
 async-stream = "0.3"
 base64 = { workspace = true }
 bytes = "1.9"
@@ -157,7 +180,7 @@ comfy-table = { version = "7.1", optional = true }
 dirs = { version = "6.0", optional = true }
 tempfile = { version = "3.0", optional = true }
 toml = { version = "1", optional = true }
-url = { version = "2.5", optional = true }
+url = { workspace = true, optional = true }
 webbrowser = { version = "1.0.2", optional = true }
 serde_ignored = { version = "0.1", optional = true }
 
@@ -168,7 +191,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "u
 tower = { version = "0.5.2", optional = true }
 tower-http = { version = "0.6.7", features = ["trace", "cors"], optional = true }
 tokio-util = { version = "0.7", optional = true }
-regex = { version = "1.11", optional = true }
+regex = { workspace = true, optional = true }
 rsa = { workspace = true, optional = true }
 
 # Server: Encryption (non-KMS mode)
@@ -189,6 +212,9 @@ tera = { version = "1.20", optional = true }
 # AWS feature dependencies
 aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
 aws-sdk-ecr = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-ecs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-cloudwatchlogs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
+aws-sdk-ssm = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-iam = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-kms = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-rds = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }

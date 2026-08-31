@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::backend::{Backend, BackendKind, CliAuth};
+use crate::backend::{Backend, BackendKind, CliAuth, SampleApp};
 use crate::cli::CliOutput;
 use crate::dex;
 use crate::http;
@@ -24,15 +24,17 @@ pub trait Scenario {
     fn run(&self, b: &dyn Backend) -> Result<()>;
 }
 
-/// The scenarios the harness runs. Workload-identity, health-rolling cutover and
-/// private/forwardAuth are tracked as follow-ups (ROADMAP).
+/// Every scenario the harness knows. Which ones actually run against a given
+/// backend is decided per scenario by [`Scenario::applies_to`], not here.
 pub fn all() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(PublicDeploy),
+        Box::new(RegistryBuildPushPull),
         Box::new(SaTokenExchange),
         Box::new(PrivateIngressAuth),
+        Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
-        Box::new(LokiLogRetention),
+        Box::new(PersistentLogRetention),
         Box::new(HelmIdempotency),
         // Last: on Docker it recreates the backend with the identity overlay, so
         // it must run after the scenarios that expect the default config.
@@ -86,7 +88,7 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
 }
 
 /// Unique-enough project name per run (DNS-safe), so a stale stack can't collide.
-fn unique(prefix: &str) -> String {
+pub(crate) fn unique(prefix: &str) -> String {
     // Process id + per-process atomic counter: two scenarios in one process can't
     // collide, and separate runs differ by pid. DNS-safe (starts with the letter
     // prefix, lowercase alphanumeric + hyphens).
@@ -98,7 +100,7 @@ fn unique(prefix: &str) -> String {
     )
 }
 
-fn expect_ok(out: CliOutput, what: &str) -> Result<CliOutput> {
+pub(crate) fn expect_ok(out: CliOutput, what: &str) -> Result<CliOutput> {
     anyhow::ensure!(
         out.success(),
         "{what} failed (exit {:?}):\n{}",
@@ -106,6 +108,95 @@ fn expect_ok(out: CliOutput, what: &str) -> Result<CliOutput> {
         out.combined()
     );
     Ok(out)
+}
+
+/// Create a public-access project with no rise.toml side effects. Shared by the
+/// scenarios and the upgrade suite.
+pub(crate) fn create_public_project(b: &dyn Backend, project: &str) -> Result<()> {
+    expect_ok(
+        b.rise_cli(
+            &[
+                "project",
+                "create",
+                project,
+                "--access-class",
+                "public",
+                "--no-rise-toml",
+            ],
+            None,
+        )?,
+        "project create",
+    )?;
+    Ok(())
+}
+
+/// Deploy a prebuilt image at one replica for `project`.
+pub(crate) fn deploy_image(b: &dyn Backend, project: &str, app: &SampleApp) -> Result<()> {
+    expect_ok(
+        b.rise_cli(
+            &[
+                "deploy",
+                "--project",
+                project,
+                "--image",
+                app.image,
+                "--http-port",
+                app.http_port,
+                "--replicas",
+                "1",
+            ],
+            None,
+        )?,
+        "deploy",
+    )?;
+    Ok(())
+}
+
+/// Assert the app answers 200 (and carries its body marker, if any) through the
+/// backend's reach path, or log a declared gap when app-HTTP reach isn't wired.
+/// `label` prefixes the messages so a caller running several reach checks (e.g.
+/// the upgrade suite's pre-/post-upgrade phases) can tell which one spoke.
+pub(crate) fn assert_app_reachable(
+    b: &dyn Backend,
+    app: &SampleApp,
+    project: &str,
+    label: &str,
+) -> Result<()> {
+    match b.reach_app(project, "/")? {
+        Some(resp) => {
+            anyhow::ensure!(
+                resp.status == 200,
+                "{label}: expected 200 from app, got {}",
+                resp.status
+            );
+            if let Some(marker) = app.body_marker {
+                anyhow::ensure!(
+                    resp.body.contains(marker),
+                    "{label}: response body missing expected marker {marker:?}:\n{}",
+                    resp.body
+                );
+            }
+        }
+        None => eprintln!(
+            "[e2e] {label}: app-HTTP reach not wired for {} — asserted via Healthy only",
+            b.name()
+        ),
+    }
+    Ok(())
+}
+
+/// Number of deployments the API reports for `project`.
+pub(crate) fn deployment_count(b: &dyn Backend, project: &str) -> Result<usize> {
+    let resp = b.api_get(&format!("/api/v1/projects/{project}/deployments"))?;
+    anyhow::ensure!(
+        resp.status == 200,
+        "deployments API returned {} :\n{}",
+        resp.status,
+        resp.body
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&resp.body).context("parse deployments response")?;
+    Ok(parsed.as_array().map(|a| a.len()).unwrap_or(0))
 }
 
 // ---- (a) public deploy + reachable -----------------------------------------
@@ -124,60 +215,92 @@ impl Scenario for PublicDeploy {
     fn run(&self, b: &dyn Backend) -> Result<()> {
         let project = unique("e2e-pub");
         let app = b.sample_app();
+        create_public_project(b, &project)?;
+        deploy_image(b, &project, &app)?;
+        b.wait_healthy(&project)?;
+        assert_app_reachable(b, &app, &project, self.id())?;
+        Ok(())
+    }
+}
+
+// ---- (a2) build -> push -> pull through the configured registry ------------
+
+struct RegistryBuildPushPull;
+
+impl Scenario for RegistryBuildPushPull {
+    fn id(&self) -> &'static str {
+        "registry-build-push-pull"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            // ECS is the backend where the registry path is load-bearing and
+            // unlike the others: the runtime authenticates the pull itself with
+            // the task execution role, so nothing Rise does at deploy time
+            // proves the pull will work. Only a real push and a real pull does.
+            BackendKind::Ecs => Applicability::Run,
+            BackendKind::Docker => {
+                Applicability::Skip("docker pulls with credentials Rise hands the daemon")
+            }
+            BackendKind::Minikube => {
+                Applicability::Skip("covered by workload-identity in jfrog-vault mode")
+            }
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-reg");
+        create_public_project(b, &project)?;
+        // Repository provisioning is asynchronous on ECR; pushing before it
+        // lands fails with a repository-not-found that reads like a permissions
+        // problem.
+        b.wait_registry_ready(&project)?;
+
+        // Build locally and push with the credentials Rise mints for this
+        // project, then let the runtime pull it back.
         expect_ok(
-            b.rise_cli(
-                &[
-                    "project",
-                    "create",
-                    &project,
-                    "--access-class",
-                    "public",
-                    "--no-rise-toml",
-                ],
-                None,
-            )?,
-            "project create",
-        )?;
-        expect_ok(
-            b.rise_cli(
+            b.rise_cli_build(
                 &[
                     "deploy",
                     "--project",
                     &project,
-                    "--image",
-                    app.image,
+                    "--backend",
+                    "docker:build",
+                    "--container-cli",
+                    "docker",
                     "--http-port",
-                    app.http_port,
+                    "8000",
                     "--replicas",
                     "1",
+                    "tests/e2e-build/fixture",
                 ],
                 None,
             )?,
-            "deploy",
+            "build and deploy from source",
         )?;
         b.wait_healthy(&project)?;
 
-        match b.reach_app(&project, "/")? {
-            Some(resp) => {
-                anyhow::ensure!(
-                    resp.status == 200,
-                    "expected 200 from app, got {}",
-                    resp.status
-                );
-                if let Some(marker) = app.body_marker {
-                    anyhow::ensure!(
-                        resp.body.contains(marker),
-                        "response body missing expected marker {marker:?}:\n{}",
-                        resp.body
-                    );
-                }
-            }
+        // Healthy means the runtime pulled the image. Confirm it pulled the one
+        // we pushed: a fallback to some other reference would otherwise pass.
+        match b.deployed_image(&project)? {
+            Some(image) => anyhow::ensure!(
+                image.contains(&project),
+                "{}: deployed image {image:?} is not this project's pushed image",
+                self.id()
+            ),
             None => eprintln!(
-                "[e2e] {}: app-HTTP reach not wired for {} — asserted via Healthy only",
+                "[e2e] {}: deployed-image readback not wired for {} — asserted via Healthy only",
                 self.id(),
                 b.name()
             ),
         }
+
+        let app = SampleApp {
+            image: "",
+            http_port: "8000",
+            body_marker: Some("rise-e2e-ok"),
+        };
+        assert_app_reachable(b, &app, &project, self.id())?;
         Ok(())
     }
 }
@@ -201,20 +324,7 @@ impl Scenario for SaTokenExchange {
         let dexep = b.dex().context("backend exposes no reachable Dex")?;
         let project = unique("e2e-sa");
 
-        expect_ok(
-            b.rise_cli(
-                &[
-                    "project",
-                    "create",
-                    &project,
-                    "--access-class",
-                    "public",
-                    "--no-rise-toml",
-                ],
-                None,
-            )?,
-            "project create",
-        )?;
+        create_public_project(b, &project)?;
 
         // Register an SA on this project trusting Dex, keyed on the email claim.
         expect_ok(
@@ -294,13 +404,13 @@ impl Scenario for SaTokenExchange {
     }
 }
 
-// ---- (d) Loki log retention -----------------------------------------------
+// ---- (d) persistent runtime-log retention ---------------------------------
 
-struct LokiLogRetention;
+struct PersistentLogRetention;
 
-impl Scenario for LokiLogRetention {
+impl Scenario for PersistentLogRetention {
     fn id(&self) -> &'static str {
-        "loki-log-retention"
+        "persistent-log-retention"
     }
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
@@ -309,46 +419,18 @@ impl Scenario for LokiLogRetention {
             BackendKind::Docker => {
                 Applicability::Skip("the docker compose stack has no Loki log backend")
             }
+            BackendKind::Ecs => Applicability::Run,
         }
     }
 
     fn run(&self, b: &dyn Backend) -> Result<()> {
-        let project = unique("e2e-loki");
+        let project = unique("e2e-logs");
         let app = b.sample_app();
-        expect_ok(
-            b.rise_cli(
-                &[
-                    "project",
-                    "create",
-                    &project,
-                    "--access-class",
-                    "public",
-                    "--no-rise-toml",
-                ],
-                None,
-            )?,
-            "project create",
-        )?;
-        expect_ok(
-            b.rise_cli(
-                &[
-                    "deploy",
-                    "--project",
-                    &project,
-                    "--image",
-                    app.image,
-                    "--http-port",
-                    app.http_port,
-                    "--replicas",
-                    "1",
-                ],
-                None,
-            )?,
-            "deploy",
-        )?;
+        create_public_project(b, &project)?;
+        deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
-        // Generate an access-log line, then give the log agent a window to scrape
-        // before the pod is removed.
+        // Generate an access-log line, then give the persistent store a window
+        // to ingest before the workload is removed.
         let _ = b.reach_app(&project, "/")?;
         std::thread::sleep(std::time::Duration::from_secs(5));
 
@@ -370,7 +452,7 @@ impl Scenario for LokiLogRetention {
             .to_string();
 
         // Stop the deployment and wait for the workload to actually be gone — with
-        // the pod removed, logs can only come from Loki (not live kubelet).
+        // the workload removed, logs can only come from the persistent backend.
         expect_ok(
             b.rise_cli(
                 &[
@@ -387,8 +469,8 @@ impl Scenario for LokiLogRetention {
         )?;
         b.wait_workload_removed(&project)?;
 
-        // Query the log-volume API over a window around now; retry while Loki
-        // finishes ingesting.
+        // Query the log-volume API over a window around now; retry while the
+        // backend finishes ingesting.
         let now = chrono::Utc::now();
         let start = (now - chrono::Duration::minutes(10))
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -424,14 +506,14 @@ impl Scenario for LokiLogRetention {
         }
         anyhow::ensure!(
             total > 0,
-            "expected /logs/volume total>0 after pod removal; last response:\n{last}"
+            "expected /logs/volume total>0 after workload removal; last response:\n{last}"
         );
         anyhow::ensure!(
             levels >= 1,
             "expected /logs/volume to report >=1 level; last response:\n{last}"
         );
 
-        // The SSE log stream (non-follow) must still return backlog from Loki.
+        // The SSE log stream (non-follow) must still return retained backlog.
         let logs = expect_ok(
             b.rise_cli(
                 &[
@@ -468,6 +550,7 @@ impl Scenario for HelmIdempotency {
         match b.kind() {
             BackendKind::Minikube => Applicability::Run,
             BackendKind::Docker => Applicability::Skip("docker backend has no Helm release"),
+            BackendKind::Ecs => Applicability::Skip("ecs backend has no Helm release"),
         }
     }
 
@@ -501,20 +584,7 @@ impl Scenario for WorkloadIdentity {
         // + scoped registry); minikube's values-ci already configures it (no-op).
         b.prepare_workload_identity()?;
         let project = unique("e2e-id");
-        expect_ok(
-            b.rise_cli(
-                &[
-                    "project",
-                    "create",
-                    &project,
-                    "--access-class",
-                    "public",
-                    "--no-rise-toml",
-                ],
-                None,
-            )?,
-            "project create",
-        )?;
+        create_public_project(b, &project)?;
         // Build & deploy the identity fixture from source (needs the docker socket).
         expect_ok(
             b.rise_cli_build(
@@ -699,8 +769,10 @@ impl Scenario for PrivateIngressAuth {
 
     fn applies_to(&self, _b: &dyn Backend) -> Applicability {
         // The ingress-auth contract — block unauthenticated, allow authenticated —
-        // holds on both backends; only the wiring + reach differ, behind the trait
-        // (Traefik forwardAuth labels on docker; nginx auth annotations on K8s).
+        // holds on every backend; only the wiring + reach differ, behind the trait
+        // (Traefik forwardAuth labels on docker and ECS; nginx auth annotations on
+        // K8s). Runs on ECS because the e2e stack puts the Rise control plane in
+        // the cluster, so Traefik can actually reach it for the subrequest.
         Applicability::Run
     }
 
@@ -721,23 +793,7 @@ impl Scenario for PrivateIngressAuth {
             )?,
             "project create",
         )?;
-        expect_ok(
-            b.rise_cli(
-                &[
-                    "deploy",
-                    "--project",
-                    &project,
-                    "--image",
-                    app.image,
-                    "--http-port",
-                    app.http_port,
-                    "--replicas",
-                    "1",
-                ],
-                None,
-            )?,
-            "deploy",
-        )?;
+        deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
 
         // Per-backend wiring check (Traefik forwardAuth labels / nginx annotations).
@@ -793,7 +849,130 @@ impl Scenario for PrivateIngressAuth {
     }
 }
 
-// ---- (g) health-rolling cutover (docker only) ------------------------------
+// ---- per-route access override ---------------------------------------------
+
+/// A private project whose `[routes].access` opens one path to the public and
+/// leaves another inheriting the gated project default. Exercises the per-route
+/// override end to end through the real ingress on both backends (nginx
+/// per-requirement-group Ingress split; Traefik per-router forwardAuth).
+struct RouteAccessOverride;
+
+impl Scenario for RouteAccessOverride {
+    fn id(&self) -> &'static str {
+        "route-access-override"
+    }
+
+    fn applies_to(&self, _b: &dyn Backend) -> Applicability {
+        // Per-route access is enforced by proxy-native routing on every backend,
+        // so the loosen-one-path contract holds on each. As with
+        // `private-ingress-auth`, this needs Traefik to reach Rise — which the
+        // ECS stack arranges by running the control plane in the cluster.
+        Applicability::Run
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let project = unique("e2e-routeacc");
+        let app = b.sample_app();
+
+        // Base access class = private (gated), with `/public` opened via
+        // `[routes].access`. Both routes target the same container — each router
+        // binds its own Traefik service, so a single container can serve
+        // multiple routes.
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &project,
+                    "--access-class",
+                    "private",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+
+        // Write the generated project under the repo root so the CLI can read it
+        // on both backends — the Minikube harness runs the CLI in a container
+        // that mounts the repo root, not `/tmp`. `target/` is gitignored.
+        let dir = b.cli_visible_path(&format!("target/e2e-scratch/{}", unique("routeacc")));
+        std::fs::create_dir_all(&dir).context("create route-access project dir")?;
+        std::fs::write(
+            std::path::Path::new(&dir).join("rise.toml"),
+            format!(
+                // `/` inherits the project's private access; `/public` is opened.
+                // Keeping the public route narrower than the catch-all lets the
+                // scenario prove segment-bounded matching: `/publicity` must still
+                // select the private `/` route rather than the public `/public`.
+                "[project]\nname = \"{project}\"\n\n\
+                 [containers.app]\nimage = \"{img}\"\nport = {port}\n\n\
+                 [routes]\n\
+                 \"/\" = {{ container = \"app\" }}\n\
+                 \"/public\" = {{ container = \"app\", access = \"public\" }}\n",
+                img = app.image,
+                port = app.http_port
+            ),
+        )
+        .context("write route-access rise.toml")?;
+
+        expect_ok(
+            b.rise_cli(&["deploy", &dir, "--project", &project], None)?,
+            "deploy",
+        )?;
+        b.wait_healthy(&project)?;
+
+        // A neighboring path must NOT be captured by the public `/public`
+        // route. Polling for its private-route redirect also ensures the ingress
+        // configuration is live before checking the exact public path.
+        let mut boundary_status = 0;
+        let mut location = None;
+        for _ in 0..45 {
+            match b.ingress_get(&project, "/publicity", false, None) {
+                Ok(r) if r.status == 302 => {
+                    boundary_status = 302;
+                    location = r.location;
+                    break;
+                }
+                Ok(r) => boundary_status = r.status,
+                Err(_) => {}
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        anyhow::ensure!(
+            boundary_status == 302,
+            "expected neighboring /publicity to inherit private access and redirect, got {boundary_status}"
+        );
+        let location = location.context("302 had no Location header")?;
+        anyhow::ensure!(
+            location.contains("/.rise/auth/signin"),
+            "neighboring private path did not redirect to signin: {location}"
+        );
+
+        // The exact public route must bypass the gate. The sample app may return
+        // 404 for `/public`; the contract under test is that the ingress forwards
+        // it instead of producing an auth response.
+        let public = b.ingress_get(&project, "/public", false, None)?;
+        anyhow::ensure!(
+            !matches!(public.status, 302 | 401 | 403),
+            "expected the exact `access = \"public\"` route to bypass auth, got {}",
+            public.status
+        );
+
+        // An authenticated request to the inherited root route passes the gate
+        // and reaches the sample app's known-good `/` path.
+        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
+        anyhow::ensure!(
+            authed.status == 200,
+            "expected the gate to admit an authed request to /, got {}",
+            authed.status
+        );
+        Ok(())
+    }
+}
+
+// ---- (g) health-rolling cutover (docker + ECS) -----------------------------
 
 /// Sanitize to a Traefik router/service base name (lowercase; non-alnum runs → `-`).
 fn sanitize_router_name(s: &str) -> String {
@@ -820,8 +999,13 @@ impl Scenario for HealthRollingCutover {
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
         match b.kind() {
-            // Reads Traefik serverStatus + per-container env; Traefik/docker-specific.
+            // Reads Traefik serverStatus + per-container env; Traefik-specific.
             BackendKind::Docker => Applicability::Run,
+            // ECS is Traefik-fronted too and the driver implements both hooks.
+            // Each app task rounds up to 0.5 vCPU, so two replicas plus an
+            // overlapping cutover need ~2 extra vCPU on top of the base stack —
+            // comfortably inside the scratch account's raised Fargate quota.
+            BackendKind::Ecs => Applicability::Run,
             BackendKind::Minikube => {
                 Applicability::Skip("cutover probe reads the Traefik API (docker-specific)")
             }
@@ -846,20 +1030,7 @@ impl Scenario for HealthRollingCutover {
         .context("write cutover rise.toml")?;
         let dir = dir.to_string_lossy().to_string();
 
-        expect_ok(
-            b.rise_cli(
-                &[
-                    "project",
-                    "create",
-                    &project,
-                    "--access-class",
-                    "public",
-                    "--no-rise-toml",
-                ],
-                None,
-            )?,
-            "project create",
-        )?;
+        create_public_project(b, &project)?;
         expect_ok(
             b.rise_cli(
                 &["deploy", &dir, "--project", &project, "--env", "REV=1"],
@@ -902,7 +1073,10 @@ impl Scenario for HealthRollingCutover {
         let mut status_ok = false;
         let mut last = String::new();
         for _ in 0..30 {
-            let resp = b.traefik_api(&format!("/api/http/services/{svc}@docker"))?;
+            let resp = b.traefik_api(&format!(
+                "/api/http/services/{svc}@{}",
+                b.traefik_provider()
+            ))?;
             last = resp.body.clone();
             if resp.status == 200 {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&resp.body) {
@@ -932,7 +1106,8 @@ impl Scenario for HealthRollingCutover {
         }
         anyhow::ensure!(
             status_ok,
-            "Traefik API never exposed a valid non-empty serverStatus for {svc}@docker; last:\n{last}"
+            "Traefik API never exposed a valid non-empty serverStatus for {svc}@{}; last:\n{last}",
+            b.traefik_provider()
         );
 
         // Force a cutover (changed env → new revision) and assert NO 5xx gap across

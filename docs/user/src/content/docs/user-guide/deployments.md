@@ -191,9 +191,12 @@ rise deployment logs -p my-app 20241205-1234 --since 5m
 
 # Show timestamps
 rise deployment logs -p my-app 20241205-1234 --timestamps
+
+# Show only one container of a multi-container deployment (repeat for several)
+rise deployment logs -p my-app 20241205-1234 --container web
 ```
 
-When Rise is configured with the Kubernetes log backend, runtime logs are available only while deployment Pods still exist. When Rise is configured with the Loki log backend, runtime logs can also be shown for past deployments until the Loki retention policy removes them. If no historical logs are found, Rise will indicate whether they may have expired based on the operator-configured retention hint.
+When Rise is configured with the Kubernetes log backend, runtime logs are available only while deployment Pods still exist. Loki and CloudWatch retain runtime logs independently of the workload, so past deployments remain readable until the backing service's retention policy removes their events. If no historical logs are found, Rise indicates whether they may have expired based on the operator-configured retention hint.
 
 ## Rollback
 
@@ -282,11 +285,36 @@ Notes:
 - A container's resource settings live in `[containers.<name>.deploy]`, mirroring the top-level `[deploy]` table exactly (same fields, same syntax).
 - Containers without `port` get no `Service` and no HTTP probes — exactly what you want for workers / batch jobs.
 - HTTP probes are **disabled by default**. Set a `[containers.<name>.deploy].health_check` block to enable them (with a path and optional timing), or `health_check = false` to explicitly mark them disabled. A `health_check` default set at the top level only applies to containers that have a `port`; port-less workers never get a probe. Containers with a `port` but no `health_check` get a `Service` but no probe.
-- Routes are matched longest-prefix-first by the ingress, so `/api` shadows `/` correctly. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
+- Routes are matched longest-prefix-first on path-segment boundaries, so `/api` matches `/api` and `/api/users`, but not `/apiculture`, and shadows `/` correctly. Trailing slashes are ignored for matching, so `/api` and `/api/` are equivalent and cannot both be declared. If `[routes]` is omitted and exactly one container has a `port`, Rise synthesises `/` → that container.
 - Platform and environment **replica limits apply to the deployment's total** replicas summed across all containers, not per container — e.g. with a cap of 10, `frontend = 4` + `backend = 3` + `worker = 4` (sum 11) is rejected. CPU and memory limits, by contrast, are enforced per container.
 - Every container receives a `RISE_CONTAINER` env var set to its own name (e.g. `"frontend"`, `"api"`).
 - Each container's `PORT` env var is set to **that container's own `port`** (e.g. `frontend` gets `PORT=8080`, `backend` gets `PORT=9090`) — not a single deployment-wide value. Containers without a `port` (workers) keep whatever deployment-wide `PORT` was set, if any.
 - When a deployment has two or more containers, each is also given a `RISE_CONTAINER_HOST__<NAME>` env var for every sibling that exposes a `port` (including a port-having container that isn't routed, such as a database) — pointing at that sibling's in-cluster Service. See [Environment Variables](../environment-variables#auto-injected-variables).
+
+#### Per-route access
+
+By default every route inherits the project's access class — the whole app is
+public, or the whole app is gated. A route may override **only the auth
+requirement** for its path with `access`, letting you open one path on an
+otherwise-private app or lock one path down on an otherwise-public one:
+
+```toml
+[routes]
+"/"        = { container = "frontend" }                            # inherits the project's access
+"/healthz" = { container = "frontend", access = "public" }        # always reachable, no login
+"/account" = { container = "frontend", access = "authenticated" } # any signed-in user
+"/admin"   = { container = "backend",  access = "member" }        # only project members
+```
+
+`access` accepts `public` (no authentication), `authenticated` (any signed-in
+user), or `member` (project owner/team member). Omit it to inherit the project
+default. Only the auth gate varies per route — the ingress class and any custom
+ingress annotations from the access class still apply to the whole app. This
+works identically on the Kubernetes and Docker backends. Route access follows
+the same segment-bounded matching: opening `/health` also opens `/health/live`,
+but does not open `/healthcare`.
+
+To run this project locally as a stack, use `rise compose up`; to run just one container, use `rise run --container <name>`. See [Local Development](../local-development#compose-stacks).
 
 ## CPU & Memory
 

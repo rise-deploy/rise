@@ -15,6 +15,7 @@ mod error;
 mod matchers;
 mod signer;
 mod verify;
+mod workload;
 
 pub use claims::{
     AccessClaims, ExternalClaims, PrincipalClaims, RiseClaims, Scope, WorkloadClaims,
@@ -28,6 +29,10 @@ pub use matchers::{
 };
 pub use signer::{compute_key_id, RiseTokenSigner, RISE_ACCESS_TYP};
 pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
+pub use workload::{
+    generate_bootstrap_credential, sha256_hex, sign_audience_tokens, workload_subject,
+    NO_ENVIRONMENT,
+};
 
 /// Check whether a JWT issuer is Rise-issued.
 ///

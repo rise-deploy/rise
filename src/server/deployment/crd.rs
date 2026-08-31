@@ -6,7 +6,6 @@ use kube::CustomResource;
 use kube::ResourceExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 /// CRD spec for RiseProject — intentionally empty.
@@ -32,6 +31,14 @@ pub struct RiseProjectStatus {
     /// Set by Metacontroller to track which generation of the spec has been observed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// Earliest time (RFC 3339) at which one of this project's deployments needs
+    /// its workload-identity token Secret re-minted (~2/3 of
+    /// `identity_token_ttl_seconds` after the last mint). Written by the sync
+    /// webhook; read by the identity-refresh controller, which resyncs the
+    /// project once this is due so the webhook re-mints before the token expires.
+    /// Absent when no deployment has identity tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_refresh_due_at: Option<String>,
 }
 
 /// Annotation key used to trigger an immediate Metacontroller resync.
@@ -192,7 +199,7 @@ pub async fn trigger_resync(client: &Client, project_name: &str) -> anyhow::Resu
 /// projects.
 pub async fn backfill_rise_projects(
     client: &Client,
-    db_pool: &PgPool,
+    store: &dyn rise_backend_core::DeploymentStore,
     controller_class: Option<&str>,
     interval: std::time::Duration,
 ) -> anyhow::Result<()> {
@@ -216,7 +223,7 @@ pub async fn backfill_rise_projects(
         })
         .collect();
 
-    let active_projects = crate::db::projects::list_active(db_pool).await?;
+    let active_projects = store.list_active_projects().await?;
 
     let total = active_projects.len();
     info!(

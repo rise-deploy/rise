@@ -1,0 +1,20 @@
+[package]
+name = "rise-authz"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+description = "Database-free authorization policy algebra for Rise"
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+rise-resource-api = { path = "../rise-resource-api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+tokio = { workspace = true }

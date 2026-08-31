@@ -5,9 +5,12 @@
 #   docker compose -f docker-compose.standalone.yaml \
 #                  -f docker-compose.standalone.local.yaml up -d
 #
+# To validate a tagged release candidate, set RISE_IMAGE_TAG to its exact GHCR
+# tag (the Git release tag without its leading `v`) before running this command.
+#
 # Effect: plain HTTP on *.rise.localhost, no TLS, no Let's Encrypt. This is what
-# the e2e (scripts/ci/e2e-docker.sh) and a quick local try use. No RISE_DOMAIN /
-# ACME_EMAIL needed.
+# the tests/e2e Docker backend harness and a quick local try use. No RISE_DOMAIN
+# / ACME_EMAIL needed.
 #
 #   * Traefik: single `web` (:80) entrypoint — NO websecure, NO ACME, NO HTTP->
 #     HTTPS redirect. The label-based routers in the base file that target the
@@ -53,6 +56,8 @@ services:
       - "127.0.0.1:5000:5000"
 
   rise:
+    # Mirrors the base file's stable default while honoring an exact
+    # RISE_IMAGE_TAG override for CI/e2e and release-candidate validation.
     image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
     # Re-publish the backend on loopback so the CLI/e2e reach the control plane
     # directly at http://rise.localhost:3000 (prod goes through Traefik instead).

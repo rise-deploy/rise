@@ -1,0 +1,85 @@
+name: Run E2E harness
+description: >-
+  Log in to GHCR, install the Kubernetes toolchain for the minikube backend,
+  download the prebuilt rise-e2e harness binary, and run it against the selected
+  backend. Assumes the repository is already checked out and an upstream job has
+  uploaded the `rise-e2e-harness` artifact (so these jobs need no Rust toolchain).
+  The harness self-provisions its own stack (compose / minikube) at run time.
+
+inputs:
+  backend:
+    description: Harness backend (docker | minikube).
+    required: true
+  image-repository:
+    description: Server image repository (RISE_IMAGE_REPOSITORY).
+    required: true
+  image-tag:
+    description: Image tag under test (RISE_IMAGE_TAG).
+    required: true
+  registry-mode:
+    description: "RISE_E2E_REGISTRY_MODE (e.g. jfrog-vault); empty for the default."
+    required: false
+    default: ""
+  upgrade-from:
+    description: "RISE_E2E_UPGRADE_FROM old version tag; empty runs the scenario matrix instead of the upgrade suite."
+    required: false
+    default: ""
+  cli-image-repository:
+    description: "RISE_CLI_IMAGE_REPOSITORY (jfrog-vault source builds); empty defaults to the server image repository."
+    required: false
+    default: ""
+  github-actor:
+    description: Actor for GHCR / Helm login (pass github.actor; contexts aren't inherited by composites).
+    required: true
+  github-token:
+    description: Token for GHCR / Helm login (pass secrets.GITHUB_TOKEN).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to GHCR
+      uses: docker/login-action@v4
+      with:
+        registry: ghcr.io
+        username: ${{ inputs.github-actor }}
+        password: ${{ inputs.github-token }}
+
+    # The minikube backend drives a real cluster and (in the upgrade flow) pulls
+    # the old released chart from the Helm OCI registry; the docker backend needs
+    # neither.
+    - name: Setup mise
+      if: ${{ inputs.backend == 'minikube' }}
+      uses: jdx/mise-action@v4
+      with:
+        cache: true
+        experimental: true
+
+    - name: Install Kubernetes tools
+      if: ${{ inputs.backend == 'minikube' }}
+      shell: bash
+      run: mise use -g minikube kubectl helm
+
+    - name: Log in to GHCR for Helm OCI pull
+      if: ${{ inputs.backend == 'minikube' }}
+      shell: bash
+      run: echo "${{ inputs.github-token }}" | helm registry login ghcr.io -u "${{ inputs.github-actor }}" --password-stdin
+
+    - name: Download e2e harness binary
+      uses: actions/download-artifact@v5
+      with:
+        name: rise-e2e-harness
+        path: harness
+
+    - name: Run e2e harness
+      shell: bash
+      env:
+        RISE_E2E_BACKEND: ${{ inputs.backend }}
+        RISE_IMAGE_REPOSITORY: ${{ inputs.image-repository }}
+        RISE_IMAGE_TAG: ${{ inputs.image-tag }}
+        RISE_E2E_REGISTRY_MODE: ${{ inputs.registry-mode }}
+        RISE_E2E_UPGRADE_FROM: ${{ inputs.upgrade-from }}
+        RISE_CLI_IMAGE_REPOSITORY: ${{ inputs.cli-image-repository }}
+      run: |
+        chmod +x harness/rise-e2e
+        ./harness/rise-e2e

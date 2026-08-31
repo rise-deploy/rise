@@ -17,6 +17,18 @@ use crate::models::{
     TerminationReason,
 };
 
+/// Result of [`DeploymentStore::mark_deployment_healthy_and_supersede`].
+#[derive(Debug, Clone)]
+pub struct SupersessionOutcome {
+    /// Whether the deployment was actually marked healthy. `false` means the
+    /// atomic write was rejected (the deployment had already moved to a
+    /// protected status) and nothing in the group was touched.
+    pub became_healthy: bool,
+    /// The previously-active deployment in the group, now `Terminating`, if
+    /// there was one.
+    pub superseded: Option<Deployment>,
+}
+
 /// Persistence operations the deployment controllers depend on.
 ///
 /// Method names and signatures mirror the `rise-deploy` `db` helpers they wrap,
@@ -30,6 +42,12 @@ pub trait DeploymentStore: Send + Sync {
 
     /// Look up a project by its primary key.
     async fn find_project(&self, id: Uuid) -> Result<Option<Project>>;
+
+    /// Look up a project by its (unique) name.
+    async fn find_project_by_name(&self, name: &str) -> Result<Option<Project>>;
+
+    /// List active (non-terminated) projects — used by the CRD backfill.
+    async fn list_active_projects(&self) -> Result<Vec<Project>>;
 
     /// Recompute and persist a project's status from its deployments.
     async fn update_project_calculated_status(&self, project_id: Uuid) -> Result<Project>;
@@ -66,13 +84,6 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<Deployment>>;
 
-    /// Find the active deployment for a project's deployment group, if any.
-    async fn find_active_deployment_for_project_and_group(
-        &self,
-        project_id: Uuid,
-        group: &str,
-    ) -> Result<Option<Deployment>>;
-
     /// List the non-terminal deployments in a project's deployment group.
     async fn find_non_terminal_deployments_for_project_and_group(
         &self,
@@ -97,32 +108,82 @@ pub trait DeploymentStore: Send + Sync {
     ) -> Result<Deployment>;
 
     /// Mark a deployment failed with an error message.
-    async fn mark_deployment_failed(&self, id: Uuid, error_message: &str) -> Result<Deployment>;
+    ///
+    /// Guarded by the store's own transition validation: returns `None`
+    /// (no-op) rather than overwriting a status this write must not touch —
+    /// e.g. a deployment a concurrent request already moved on from.
+    /// Callers on a routine/opportunistic path should treat `None` as a
+    /// benign race and skip any follow-up (no error, no status recompute);
+    /// callers driven by an explicit user request should surface it as
+    /// "modified concurrently, please retry".
+    async fn mark_deployment_failed(
+        &self,
+        id: Uuid,
+        error_message: &str,
+    ) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment cancelled.
-    async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment>;
+    /// Transition a deployment into the cancelling state. See
+    /// `mark_deployment_failed` for the `None` contract.
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment stopped.
-    async fn mark_deployment_stopped(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment cancelled. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment superseded.
-    async fn mark_deployment_superseded(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment stopped. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_stopped(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment expired.
-    async fn mark_deployment_expired(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment superseded. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_superseded(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment healthy.
-    async fn mark_deployment_healthy(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment expired. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_expired(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment unhealthy with a reason.
-    async fn mark_deployment_unhealthy(&self, id: Uuid, reason: String) -> Result<Deployment>;
+    /// Mark a deployment healthy. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_healthy(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment terminating with a termination reason.
+    /// Mark a deployment unhealthy with a reason. See `mark_deployment_failed`
+    /// for the `None` contract.
+    async fn mark_deployment_unhealthy(
+        &self,
+        id: Uuid,
+        reason: String,
+    ) -> Result<Option<Deployment>>;
+
+    /// Mark a deployment terminating with a termination reason. See
+    /// `mark_deployment_failed` for the `None` contract.
+    ///
+    /// `superseded_by` names the replacement deployment (by its
+    /// `deployment_id`) and is only meaningful with
+    /// [`TerminationReason::Superseded`]. It is taken here because this is the
+    /// only point where the replacement is in scope.
     async fn mark_deployment_terminating(
         &self,
         id: Uuid,
         reason: TerminationReason,
-    ) -> Result<Deployment>;
+        superseded_by: Option<&str>,
+    ) -> Result<Option<Deployment>>;
+
+    /// Atomically mark a deployment healthy and, if some other deployment is
+    /// currently the group's active (`Healthy`) deployment, mark that one
+    /// `Terminating(Superseded)` in the same database transaction — so a
+    /// crash between the two writes can never leave both non-terminal.
+    ///
+    /// `became_healthy` is `false` (no row touched at all) when the
+    /// deployment had already moved to a status this write must not
+    /// overwrite (e.g. a concurrent stop request already moved it to
+    /// `Terminating`) — the caller should stop there: no hook, no straggler
+    /// cleanup, no activation.
+    async fn mark_deployment_healthy_and_supersede(
+        &self,
+        deployment_id: Uuid,
+        project_id: Uuid,
+        deployment_group: &str,
+    ) -> Result<SupersessionOutcome>;
 
     /// Mark a deployment as the single active deployment of its project group.
     async fn mark_deployment_as_active(
@@ -131,4 +192,8 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
         deployment_group: &str,
     ) -> Result<()>;
+
+    /// Persist the hash of a deployment's workload-identity bootstrap credential
+    /// once it has been delivered to a running container.
+    async fn set_identity_credential_hash(&self, id: Uuid, hash: &str) -> Result<()>;
 }

@@ -43,6 +43,7 @@ deployment_logs:
   labels:                            # optional — override Loki label names
     project: "rise_project"          #   defaults shown
     deployment_id: "rise_deployment_id"
+    container: "container"
 ```
 
 Note the casing difference between the two surfaces: the backend YAML
@@ -57,11 +58,17 @@ stream labels — `project` and `deployment_id` by default. The pair must
 uniquely identify a deployment's log stream; `deployment_id` is already
 unique within a project, so no further uniqueness label is required.
 
+`container` is the third label Rise reads. It carries the deployment's
+container name (`app` for a single-container deployment) and backs both
+the `?container=` filter and the per-line container attribution the logs
+UI renders. A stack that does not emit it serves unattributed lines, and
+a container filter then matches nothing.
+
 If your Loki/Alloy stack already labels log lines with different names
 (e.g. an operator-managed stack that uses `app` / `instance`), set
-`labels.project` / `labels.deployment_id` to match. Names must be valid
-LogQL identifiers (`[a-zA-Z_][a-zA-Z0-9_]*`); the backend rejects
-invalid names at startup.
+`labels.project` / `labels.deployment_id` / `labels.container` to match.
+Names must be valid LogQL identifiers (`[a-zA-Z_][a-zA-Z0-9_]*`); the
+backend rejects invalid names at startup.
 
 ## Bundled Loki + Alloy subcharts
 
@@ -80,7 +87,9 @@ logs:
 
 The bundled Alloy is configured to scrape only Pods labelled
 `app.kubernetes.io/managed-by=rise` and writes the same label names the
-backend selects on, so query and ingest stay in sync automatically.
+backend selects on, so query and ingest stay in sync automatically. The
+Kubernetes container name it ships as `container` is the Rise container
+name, because every container of a deployment runs in its own Pod.
 
 ### Alloy RBAC scope
 

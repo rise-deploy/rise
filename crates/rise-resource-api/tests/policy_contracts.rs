@@ -1,0 +1,448 @@
+use jsonschema::validator_for;
+use rise_resource_api::{
+    BindingSubject, PlatformRoleBindingSpec, RoleBindingSpec, SubjectMembership,
+    API_VERSION_V1ALPHA1, ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND,
+    POLICY_KIND_DEFINITIONS, ROLE_BINDING_KIND, ROLE_KIND,
+};
+use schemars::{schema_for, JsonSchema};
+use serde_json::{json, Value};
+
+fn schema_accepts<T: JsonSchema>(value: Value) -> bool {
+    let schema = serde_json::to_value(schema_for!(T)).unwrap();
+    validator_for(&schema).unwrap().is_valid(&value)
+}
+
+fn platform_binding(subject: &str) -> Value {
+    json!({
+        "subject": subject,
+        "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+    })
+}
+
+#[test]
+fn role_statement_contract_is_closed_and_non_empty() {
+    let valid = json!({
+        "statements": [{
+            "effect": "Allow",
+            "kinds": ["rise.dev/Deployment", "widgets.example/Widget", "rise.dev/*"],
+            "verbs": ["get", "use"],
+            "subresources": ["status"]
+        }]
+    });
+    assert!(serde_json::from_value::<rise_resource_api::RoleSpec>(valid.clone()).is_ok());
+    assert!(schema_accepts::<rise_resource_api::RoleSpec>(valid));
+
+    for invalid in [
+        json!({"statements":[{"effect":"allow","kinds":"*","verbs":"*"}]}),
+        json!({"statements":[{"effect":"Allow","kinds":[],"verbs":"*"}]}),
+        json!({"statements":[{"effect":"Allow","kinds":["Deployment"],"verbs":"*"}]}),
+        json!({"statements":[{"effect":"Allow","kinds":"*","verbs":[]}]}),
+        json!({"statements":[{"effect":"Allow","kinds":"*","verbs":["read"]}]}),
+        json!({"statements":[{"effect":"Allow","kinds":"*","verbs":"*","subresources":[]}]}),
+        json!({"statements":[{"effect":"Allow","kinds":"*","verbs":"*","subresources":null}]}),
+        json!({"statements":[{"effect":"Allow","kinds":"*","verbs":"*","extra":true}]}),
+        json!({"statements":[],"extra":true}),
+    ] {
+        assert!(
+            serde_json::from_value::<rise_resource_api::RoleSpec>(invalid.clone()).is_err(),
+            "serde accepted {invalid}"
+        );
+        assert!(
+            !schema_accepts::<rise_resource_api::RoleSpec>(invalid.clone()),
+            "schema accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn matcher_sets_reject_duplicates_and_serialize_canonically() {
+    let duplicate = json!({
+        "statements": [{
+            "effect": "Allow",
+            "kinds": ["rise.dev/Deployment", "rise.dev/Deployment"],
+            "verbs": "*"
+        }]
+    });
+    assert!(serde_json::from_value::<rise_resource_api::RoleSpec>(duplicate).is_err());
+
+    let role: rise_resource_api::RoleSpec = serde_json::from_value(json!({
+        "statements": [{
+            "effect": "Deny",
+            "kinds": ["widgets.example/Widget", "rise.dev/Deployment"],
+            "verbs": ["use", "get"]
+        }]
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(role).unwrap(),
+        json!({
+            "statements": [{
+                "effect": "Deny",
+                "kinds": ["rise.dev/Deployment", "widgets.example/Widget"],
+                "verbs": ["get", "use"]
+            }]
+        })
+    );
+}
+
+#[test]
+fn platform_membership_omission_normalizes_but_null_fails() {
+    let parsed: PlatformRoleBindingSpec =
+        serde_json::from_value(platform_binding("user:alice")).unwrap();
+    assert_eq!(parsed.subject_membership, SubjectMembership::Any);
+    assert_eq!(
+        serde_json::to_value(parsed).unwrap()["subjectMembership"],
+        json!("Any")
+    );
+
+    let mut null_membership = platform_binding("user:alice");
+    null_membership["subjectMembership"] = Value::Null;
+    assert!(serde_json::from_value::<PlatformRoleBindingSpec>(null_membership.clone()).is_err());
+    assert!(!schema_accepts::<PlatformRoleBindingSpec>(null_membership));
+
+    let mut invalid_membership = platform_binding("user:alice");
+    invalid_membership["subjectMembership"] = json!("Organization");
+    assert!(serde_json::from_value::<PlatformRoleBindingSpec>(invalid_membership).is_err());
+}
+
+#[test]
+fn binding_shapes_reject_plural_wrong_case_and_wrong_reference_direction() {
+    for invalid in [
+        json!({
+            "subjects": ["user:alice"],
+            "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+        }),
+        json!({
+            "Subject": "user:alice",
+            "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+        }),
+        json!({
+            "subject": "user:alice",
+            "subjectMembership": "Any",
+            "roleRef": { "kind": "Role", "name": "viewer" }
+        }),
+        json!({
+            "subject": "user:alice",
+            "scope": null,
+            "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+        }),
+        json!({
+            "subject": "user:alice",
+            "labelSelector": { "key": "rise.dev/owner", "value": null },
+            "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+        }),
+    ] {
+        assert!(serde_json::from_value::<RoleBindingSpec>(invalid.clone()).is_err());
+    }
+
+    let wrong_platform_ref = json!({
+        "subject": "user:alice",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    });
+    assert!(serde_json::from_value::<PlatformRoleBindingSpec>(wrong_platform_ref).is_err());
+}
+
+#[test]
+fn binding_subject_grammar_is_closed() {
+    for value in [
+        "user:alice",
+        "group:acme/platform",
+        "user:${ref.name}",
+        "group:${ref.name}",
+        "${ref.subject}",
+    ] {
+        let parsed: BindingSubject = serde_json::from_value(json!(value)).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), json!(value));
+    }
+    for value in [
+        "serviceaccount:${ref.name}",
+        "controller:${ref.name}",
+        "group:${label.value}",
+        "${ref.name}",
+    ] {
+        assert!(serde_json::from_value::<BindingSubject>(json!(value)).is_err());
+    }
+}
+
+#[test]
+fn binding_normalization_is_contextual_and_fail_closed() {
+    let org: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "user:alice",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        org.normalize("acme").unwrap().scope().to_string(),
+        "rise.dev/Organization/acme"
+    );
+
+    let group: PlatformRoleBindingSpec =
+        serde_json::from_value(platform_binding("group:acme/platform")).unwrap();
+    assert_eq!(
+        group.normalize().unwrap().scope().to_string(),
+        "rise.dev/Organization/acme"
+    );
+
+    let user: PlatformRoleBindingSpec =
+        serde_json::from_value(platform_binding("user:alice")).unwrap();
+    assert!(user.normalize().unwrap().scope().is_wildcard());
+
+    let explicit_wildcard: PlatformRoleBindingSpec = serde_json::from_value(json!({
+        "subject": "serviceaccount:acme/ci",
+        "scope": "*",
+        "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+    }))
+    .unwrap();
+    assert!(explicit_wildcard.normalize().is_err());
+
+    let dynamic_without_selector: PlatformRoleBindingSpec =
+        serde_json::from_value(platform_binding("${ref.subject}")).unwrap();
+    assert!(dynamic_without_selector.normalize().is_err());
+
+    let static_exists_selector: PlatformRoleBindingSpec = serde_json::from_value(json!({
+        "subject": "user:alice",
+        "labelSelector": { "key": "rise.dev/owner" },
+        "roleRef": { "kind": "PlatformRole", "name": "viewer" }
+    }))
+    .unwrap();
+    assert!(static_exists_selector.normalize().is_err());
+
+    // `system:operators` parses and normalizes on both binding kinds: it is the
+    // subject of the seeded bootstrap binding, which has to be writable through
+    // this same contract. Reserving it to that one root `PlatformRoleBinding`
+    // needs the resource's name and placement, which this context-free step
+    // cannot see, so the reservation lives in transaction-scoped admission — and
+    // covers *both* kinds there, which the store's integration suite pins.
+    let reserved_platform: PlatformRoleBindingSpec =
+        serde_json::from_value(platform_binding("system:operators")).unwrap();
+    let normalized = reserved_platform
+        .normalize()
+        .expect("parses and normalizes");
+    assert_eq!(normalized.subject().to_string(), "system:operators");
+
+    let reserved_org: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "system:operators",
+        "roleRef": { "kind": "PlatformRole", "name": "system-admin" }
+    }))
+    .unwrap();
+    assert!(reserved_org.normalize("acme").is_ok());
+}
+
+/// The shipped defaults must round-trip through the closed contracts they are
+/// written against, so a default that drifts out of the grammar fails here
+/// rather than becoming a row nothing can read back.
+#[test]
+fn shipped_policy_defaults_parse_and_normalize() {
+    use rise_resource_api::{
+        is_immutable_policy_seed, org_admin_role_spec, resource_owner_binding_spec,
+        resource_owner_role_spec, system_admin_binding_spec, system_admin_role_spec,
+        PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, RESOURCE_OWNER_PLATFORM_ROLE,
+        SYSTEM_ADMIN_PLATFORM_ROLE,
+    };
+
+    // Both bindings normalize, which is the form the store persists.
+    let system_admin = system_admin_binding_spec().normalize().unwrap();
+    assert_eq!(system_admin.scope().as_ref(), "*");
+    assert_eq!(system_admin.role_ref().name, SYSTEM_ADMIN_PLATFORM_ROLE);
+
+    let owner = resource_owner_binding_spec().normalize().unwrap();
+    assert_eq!(owner.scope().as_ref(), "*");
+    assert_eq!(
+        owner
+            .label_selector()
+            .map(|selector| selector.key.to_string()),
+        Some("rise.dev/owner".to_owned())
+    );
+    assert_eq!(owner.role_ref().name, RESOURCE_OWNER_PLATFORM_ROLE);
+
+    // The Role bodies are non-empty, or the seeds would grant nothing.
+    for spec in [
+        system_admin_role_spec(),
+        org_admin_role_spec(),
+        resource_owner_role_spec(),
+    ] {
+        assert!(!spec.statements.is_empty());
+    }
+
+    // Only the operator pair is reserved.
+    assert!(is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+    assert!(is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
+        PLATFORM_ROLE_BINDING_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+    assert!(!is_immutable_policy_seed(
+        API_VERSION_V1ALPHA1,
+        PLATFORM_ROLE_KIND,
+        RESOURCE_OWNER_PLATFORM_ROLE
+    ));
+    // The API group is part of the identity, and the cascade's SQL exemption
+    // pins it too. A kind registered under another group is ordinary data.
+    assert!(!is_immutable_policy_seed(
+        "example.dev/v1",
+        PLATFORM_ROLE_KIND,
+        SYSTEM_ADMIN_PLATFORM_ROLE
+    ));
+}
+
+#[test]
+fn generated_binding_schemas_match_omission_and_null_rules() {
+    let omitted = platform_binding("user:alice");
+    assert!(schema_accepts::<PlatformRoleBindingSpec>(omitted));
+
+    let org = json!({
+        "subject": "user:alice",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    });
+    assert!(schema_accepts::<RoleBindingSpec>(org));
+
+    let null_scope = json!({
+        "subject": "user:alice",
+        "scope": null,
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    });
+    assert!(!schema_accepts::<RoleBindingSpec>(null_scope));
+
+    // The relative Group form is org-`RoleBinding`-only, so the two subject
+    // grammars must differ in exactly that one spelling.
+    let relative = json!({
+        "subject": "group:platform",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    });
+    assert!(schema_accepts::<RoleBindingSpec>(relative));
+    assert!(!schema_accepts::<PlatformRoleBindingSpec>(
+        platform_binding("group:platform")
+    ));
+}
+
+/// An org `RoleBinding` already sits in exactly one Organization, so its subject
+/// may name a Group relatively. Resolution happens at normalization, where the
+/// parent is known — parsing a subject never becomes context-sensitive.
+#[test]
+fn a_relative_group_subject_resolves_against_the_parent_organization() {
+    let relative: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "group:platform",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        relative.normalize("acme").unwrap().subject().to_string(),
+        "group:acme/platform"
+    );
+
+    // Absolute subjects and the closed templates pass through untouched, so the
+    // short form is an addition to the grammar rather than a reinterpretation.
+    for subject in [
+        "group:beta/platform",
+        "user:alice",
+        "serviceaccount:acme/ci",
+        "org:acme",
+        "system:authenticated",
+        "controller:builder",
+    ] {
+        let spec: RoleBindingSpec = serde_json::from_value(json!({
+            "subject": subject,
+            "roleRef": { "kind": "Role", "name": "viewer" }
+        }))
+        .unwrap();
+        assert_eq!(
+            spec.normalize("acme").unwrap().subject().to_string(),
+            subject
+        );
+    }
+
+    let template: RoleBindingSpec = serde_json::from_value(json!({
+        "subject": "group:${ref.name}",
+        "labelSelector": { "key": "rise.dev/owner", "value": "x" },
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .unwrap();
+    assert_eq!(
+        template.normalize("acme").unwrap().subject().to_string(),
+        "group:${ref.name}"
+    );
+
+    // The relative form is still a resource name, and the platform binding's
+    // subject grammar is unchanged.
+    assert!(serde_json::from_value::<RoleBindingSpec>(json!({
+        "subject": "group:Not A Name",
+        "roleRef": { "kind": "Role", "name": "viewer" }
+    }))
+    .is_err());
+    assert!(
+        serde_json::from_value::<PlatformRoleBindingSpec>(platform_binding("group:platform"))
+            .is_err()
+    );
+}
+
+/// The write-time half of ADR-0001 §1's recipient boundary: a subject that names
+/// its own organization decides membership from the identifier alone, so a
+/// mismatch is permanent. Every other kind stays contingent and admissible.
+#[test]
+fn subject_organization_membership_is_decidable_only_when_the_subject_names_one() {
+    use rise_resource_api::SubjectId;
+
+    for subject in ["group:acme/platform", "serviceaccount:acme/ci", "org:acme"] {
+        let subject: SubjectId = subject.parse().unwrap();
+        assert!(subject.may_belong_to("acme"));
+        assert!(!subject.may_belong_to("beta"));
+    }
+
+    for subject in [
+        "user:alice",
+        "system:authenticated",
+        "system:operators",
+        "controller:builder",
+    ] {
+        let subject: SubjectId = subject.parse().unwrap();
+        assert!(subject.may_belong_to("acme"));
+        assert!(subject.may_belong_to("beta"));
+    }
+}
+
+#[test]
+fn policy_collections_are_reserved_against_external_definitions() {
+    for collection in [
+        rise_resource_api::ROLE_COLLECTION,
+        rise_resource_api::ROLE_BINDING_COLLECTION,
+        rise_resource_api::PLATFORM_ROLE_COLLECTION,
+        rise_resource_api::PLATFORM_ROLE_BINDING_COLLECTION,
+    ] {
+        assert!(rise_resource_api::is_reserved_collection_name(collection));
+    }
+}
+
+#[test]
+fn policy_kind_definitions_capture_fixed_adr_placement() {
+    // Two same-shaped pairs, one per placement level: the org pair hangs under
+    // an Organization, the platform pair at the root (ADR-0001 §3).
+    let definitions: Vec<_> = POLICY_KIND_DEFINITIONS
+        .iter()
+        .map(|definition| {
+            (
+                definition.kind,
+                definition.collection,
+                definition.parent.map(|parent| parent.kind),
+            )
+        })
+        .collect();
+    assert_eq!(
+        definitions,
+        vec![
+            (ROLE_KIND, "roles", Some(ORGANIZATION_KIND)),
+            (ROLE_BINDING_KIND, "rolebindings", Some(ORGANIZATION_KIND)),
+            (PLATFORM_ROLE_KIND, "platformroles", None),
+            (PLATFORM_ROLE_BINDING_KIND, "platformrolebindings", None),
+        ]
+    );
+    for definition in POLICY_KIND_DEFINITIONS {
+        assert_eq!(definition.api_version, API_VERSION_V1ALPHA1);
+        if let Some(parent) = definition.parent {
+            assert_eq!(parent.api_version, API_VERSION_V1ALPHA1);
+        }
+    }
+}

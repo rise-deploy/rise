@@ -13,6 +13,7 @@ use crate::http::HttpResponse;
 pub use crate::BackendKind;
 
 mod docker;
+mod ecs;
 mod minikube;
 
 /// Auth override for a single CLI invocation. Passing `None` to
@@ -54,6 +55,14 @@ pub trait Backend {
         self.rise_cli(args, auth)
     }
 
+    /// Absolute path to `rel` under the repo root, as the CLI sees it. Both
+    /// backends run the CLI with the repo root as cwd — the Minikube harness runs
+    /// it in a container that bind-mounts the repo root at the same path — so a
+    /// path under the repo root is readable by the CLI on either backend, unlike
+    /// `/tmp` (which the Minikube CLI container does not mount). Use this for
+    /// dir-based deploys (a generated `rise.toml`) that must run on both backends.
+    fn cli_visible_path(&self, rel: &str) -> String;
+
     /// GET an app path through this backend's ingress. `Ok(None)` means app-HTTP
     /// reach isn't wired for this backend yet — a *declared* gap the scenario
     /// logs, never silent drift.
@@ -77,6 +86,29 @@ pub trait Backend {
 
     /// A small HTTP app to deploy for the public-deploy scenario.
     fn sample_app(&self) -> SampleApp;
+
+    /// Block until the registry has a repository ready for `project`, for
+    /// backends whose registry provisions them asynchronously.
+    ///
+    /// Default: nothing to wait for. ECS with an ECR registry overrides it —
+    /// repositories are created by a leader-elected controller on a 10-second
+    /// poll, not at project-create time, so a create-then-deploy inside that
+    /// window pushes against a repository that does not exist yet.
+    fn wait_registry_ready(&self, project: &str) -> Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// The image reference the runtime was actually told to run for `project`.
+    ///
+    /// `Ok(None)` means the backend does not expose it — a declared gap, never a
+    /// silent pass. ECS reads it back off the running service's task definition,
+    /// which is the only evidence that the pull went through the configured
+    /// registry rather than somewhere else.
+    fn deployed_image(&self, project: &str) -> Result<Option<String>> {
+        let _ = project;
+        Ok(None)
+    }
 
     /// Whether this backend can build & deploy an app from source
     /// (`deploy --backend docker:build`) — i.e. it has a registry the runtime can
@@ -121,12 +153,20 @@ pub trait Backend {
         )
     }
 
-    /// GET the Traefik API (e.g. `/api/http/services/...`). Docker only.
+    /// GET the Traefik API (e.g. `/api/http/services/...`). Traefik-fronted
+    /// backends only (Docker, ECS).
     fn traefik_api(&self, _path: &str) -> Result<HttpResponse> {
         anyhow::bail!(
             "the Traefik API is not available on the {} backend",
             self.name()
         )
+    }
+
+    /// Traefik provider name a service is registered under, for the `@<provider>`
+    /// suffix the API keys services by. `docker` for the Docker daemon provider,
+    /// `ecs` for the ECS provider.
+    fn traefik_provider(&self) -> &'static str {
+        "docker"
     }
 
     /// The app's ingress hostname for this backend (Traefik host on docker, the
@@ -169,6 +209,21 @@ pub trait Backend {
     fn reapply_chart(&self) -> Result<()> {
         anyhow::bail!(
             "chart reapply is not supported by the {} backend",
+            self.name()
+        )
+    }
+
+    /// Upgrade the running stack in place to the target version (`RISE_IMAGE_TAG`)
+    /// and make the CLI usable again, then wait for the control plane to be
+    /// healthy. Only meaningful in the upgrade flow, where `bring_up` first stood
+    /// the stack up at the older `RISE_E2E_UPGRADE_FROM` version: Docker recreates
+    /// the `rise` service on the new image (the DB volume — and its data — is kept,
+    /// so the new server runs its migrations against it); Kubernetes `helm
+    /// upgrade`s from the old released chart to the in-repo chart on the new image.
+    /// Default: unsupported.
+    fn upgrade(&mut self) -> Result<()> {
+        anyhow::bail!(
+            "in-place upgrade is not supported by the {} backend",
             self.name()
         )
     }
@@ -221,5 +276,6 @@ pub fn create(kind: BackendKind) -> Result<Box<dyn Backend>> {
     Ok(match kind {
         BackendKind::Docker => Box::new(docker::DockerBackend::new()?),
         BackendKind::Minikube => Box::new(minikube::MinikubeBackend::new()?),
+        BackendKind::Ecs => Box::new(ecs::EcsBackend::new()?),
     })
 }

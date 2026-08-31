@@ -33,13 +33,21 @@ auth:
   issuer: "http://rise-dex:5556/dex"
   client_id: "rise-backend"
   client_secret: "rise-backend-secret"
+  # ID-token claim containing group names (default: "groups").
+  # idp_group_claim: "cognito:groups"
   admin_users:
     - "admin@example.com"
+  # Grant the admin role by IdP group instead of listing every email. A user
+  # matches when the IdP puts them in a group of this name.
+  # admin_idp_groups:
+  #   - "platform-admins"
   # Operator role allowlist. Separate from admin_users — an Operator must
   # also be listed in admin_users or platform_access.allowed_user_emails to
   # use the typed CLI/UI (e.g. to log in via the frontend).
   operator_users:
     - "ops@example.com"
+  # operator_idp_groups:
+  #   - "platform-operators"
   # Allow all users to create teams (default: true). Set to false to restrict team creation to admins only.
   allow_team_creation: true
   # Allow all users to list all teams (default: true). Set to false so non-admins only see their own teams.

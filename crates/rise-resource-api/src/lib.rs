@@ -4,6 +4,49 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+mod builtin_kind;
+mod identity;
+mod owner_reference;
+mod policy;
+mod resource_kind;
+mod resource_row;
+mod scope;
+mod store;
+mod subject_id;
+mod subject_ref;
+
+pub use builtin_kind::{BuiltInKindDefinition, BuiltInKindParent};
+pub use identity::{
+    ControllerSpec, ControllerTrustPolicySpec, ExternalSubject, GroupMembershipSpec, GroupSpec,
+    Issuer, ServiceAccountSpec, ServiceAccountTrustPolicySpec, TrustPolicyClaims, UserIdentitySpec,
+    UserSpec, IDENTITY_KIND_DEFINITIONS, MAX_EXTERNAL_SUBJECT_CHARS, MAX_ISSUER_BYTES,
+};
+pub use owner_reference::OwnerReference;
+pub use policy::{
+    is_immutable_policy_seed, org_admin_role_spec, resource_owner_binding_spec,
+    resource_owner_role_spec, system_admin_binding_spec, system_admin_role_spec, BindingSubject,
+    Effect, KindMatcher, LabelKey, LabelSelector, LocallyNormalizedPlatformRoleBindingSpec,
+    LocallyNormalizedRoleBindingSpec, PlatformRoleBindingSpec, PlatformRoleRef,
+    PlatformRoleRefKind, PolicyStatement, ResourceKindPattern, RoleBindingSpec, RoleBindingSubject,
+    RoleRef, RoleRefKind, RoleSpec, SubjectMembership, SubresourceMatcher, SubresourceName, Verb,
+    VerbMatcher, IMMUTABLE_POLICY_SEEDS, OPERATORS_SUBJECT, ORG_ADMIN_PLATFORM_ROLE,
+    OWNER_LABEL_KEY, POLICY_KIND_DEFINITIONS, RESOURCE_OWNER_PLATFORM_ROLE,
+    SYSTEM_ADMIN_PLATFORM_ROLE,
+};
+pub use resource_kind::ResourceKind;
+pub use resource_row::ResourceRow;
+pub use scope::Scope;
+pub use store::{
+    CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlocker,
+    DeletionBlockerRelationship, DeletionBlockerReport, NoOpValidator, PathSegment, ResourceApi,
+    ResourceStore, SpecValidator, StoreError, UpdateResourceParams, CASCADE_DELETION_FINALIZER,
+    MAX_PARENT_CHAIN_DEPTH, SYSTEM_FINALIZER_PREFIX,
+};
+pub use subject_id::SubjectId;
+pub use subject_ref::SubjectRef;
+
+/// API group reserved for Rise-owned built-in resources.
+pub const API_GROUP: &str = "rise.dev";
 pub const API_VERSION_V1ALPHA1: &str = "rise.dev/v1alpha1";
 
 pub const ORGANIZATION_KIND: &str = "Organization";
@@ -12,15 +55,56 @@ pub const ORGANIZATION_COLLECTION: &str = "organizations";
 pub const RESOURCE_DEFINITION_KIND: &str = "ResourceDefinition";
 pub const RESOURCE_DEFINITION_COLLECTION: &str = "resourcedefinitions";
 
+// Policy resources are reserved here before store registration so a custom
+// ResourceDefinition cannot claim a collection that the built-in admission
+// path will own in a later increment.
+pub const ROLE_KIND: &str = "Role";
+pub const ROLE_COLLECTION: &str = "roles";
+pub const ROLE_BINDING_KIND: &str = "RoleBinding";
+pub const ROLE_BINDING_COLLECTION: &str = "rolebindings";
+pub const PLATFORM_ROLE_KIND: &str = "PlatformRole";
+pub const PLATFORM_ROLE_COLLECTION: &str = "platformroles";
+pub const PLATFORM_ROLE_BINDING_KIND: &str = "PlatformRoleBinding";
+pub const PLATFORM_ROLE_BINDING_COLLECTION: &str = "platformrolebindings";
+
+// Identity resources are reserved for the runtime built-in registrations, so
+// custom ResourceDefinitions cannot claim the API identities admission owns.
+pub const USER_KIND: &str = "User";
+pub const USER_COLLECTION: &str = "users";
+pub const USER_IDENTITY_KIND: &str = "UserIdentity";
+pub const USER_IDENTITY_COLLECTION: &str = "useridentities";
+pub const CONTROLLER_KIND: &str = "Controller";
+pub const CONTROLLER_COLLECTION: &str = "controllers";
+pub const CONTROLLER_TRUST_POLICY_KIND: &str = "ControllerTrustPolicy";
+pub const CONTROLLER_TRUST_POLICY_COLLECTION: &str = "controllertrustpolicies";
+pub const GROUP_KIND: &str = "Group";
+pub const GROUP_COLLECTION: &str = "groups";
+pub const GROUP_MEMBERSHIP_KIND: &str = "GroupMembership";
+pub const GROUP_MEMBERSHIP_COLLECTION: &str = "groupmemberships";
+pub const SERVICE_ACCOUNT_KIND: &str = "ServiceAccount";
+pub const SERVICE_ACCOUNT_COLLECTION: &str = "serviceaccounts";
+pub const SERVICE_ACCOUNT_TRUST_POLICY_KIND: &str = "ServiceAccountTrustPolicy";
+pub const SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION: &str = "serviceaccounttrustpolicies";
+
 pub const RESERVED_COLLECTION_NAMES: &[&str] = &[
     ORGANIZATION_COLLECTION,
     RESOURCE_DEFINITION_COLLECTION,
+    ROLE_COLLECTION,
+    ROLE_BINDING_COLLECTION,
+    PLATFORM_ROLE_COLLECTION,
+    PLATFORM_ROLE_BINDING_COLLECTION,
+    USER_COLLECTION,
+    USER_IDENTITY_COLLECTION,
+    CONTROLLER_COLLECTION,
+    CONTROLLER_TRUST_POLICY_COLLECTION,
+    GROUP_COLLECTION,
+    GROUP_MEMBERSHIP_COLLECTION,
+    SERVICE_ACCOUNT_COLLECTION,
+    SERVICE_ACCOUNT_TRUST_POLICY_COLLECTION,
     "projects",
-    "users",
     "teams",
     "environments",
     "deployments",
-    "serviceaccounts",
 ];
 
 pub type JsonObject = BTreeMap<String, serde_json::Value>;
@@ -47,10 +131,27 @@ pub struct ResourceMetadata {
     pub revision: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discriminator: Option<String>,
+    /// Targeting metadata. A key becomes access-relevant exactly when some
+    /// policy binding's `labelSelector` references it (ADR-0001 §6.1); no key
+    /// carries authorization meaning on its own.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    /// Every label key in force on this resource, resolved nearest-wins down its
+    /// ancestry (ADR-0001 §6.1).
+    ///
+    /// Computed on read from the ancestor chain, never stored: this is the same
+    /// walk authorization performs, so the value a client sees and the value a
+    /// `labelSelector` matches can never disagree. Responses built without an
+    /// ancestor chain leave it empty rather than repeating `labels`, which would
+    /// claim an inheritance answer nobody resolved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effective_labels: BTreeMap<String, String>,
     #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deletion_timestamp: Option<DateTime<Utc>>,
 }
@@ -73,9 +174,13 @@ pub struct CreateResourceRequest<TSpec: Default = JsonObject> {
 pub struct CreateResourceMetadata {
     pub name: String,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -94,9 +199,13 @@ pub struct UpdateResourceMetadata {
     pub name: String,
     pub revision: i64,
     #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default)]
     pub annotations: BTreeMap<String, String>,
     #[serde(default)]
     pub finalizers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -170,7 +279,8 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Construct a validation error from a concrete validator.
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -187,6 +297,45 @@ impl std::error::Error for ValidationError {}
 
 pub fn validate_resource_name(value: &str) -> Result<(), ValidationError> {
     validate_dns_label(value, 63, "resource name")
+}
+
+/// Validate a resource name carried in a reference.
+///
+/// Most resources use a single DNS label, while `ResourceDefinition` names
+/// use `{plural}.{group}`. References can target either, so they accept the
+/// DNS-subdomain form shared by every persisted resource identity.
+pub fn validate_resource_reference_name(value: &str) -> Result<(), ValidationError> {
+    validate_dns_subdomain(value, "resource reference name")
+}
+
+/// Maximum bytes accepted in one label value, matching Kubernetes.
+pub const MAX_LABEL_VALUE_BYTES: usize = 63;
+
+/// Validate a resource's label map.
+///
+/// Keys use the same Kubernetes-shaped grammar a binding's `labelSelector`
+/// parses through, so a key that can be written can always be selected on.
+/// Values are bounded and single-line: a label is a targeting handle, not a
+/// place to store payload.
+pub fn validate_labels(labels: &BTreeMap<String, String>) -> Result<(), ValidationError> {
+    for (key, value) in labels {
+        key.parse::<LabelKey>()
+            .map_err(|error| ValidationError::new(format!("invalid label key '{key}': {error}")))?;
+        if value.len() > MAX_LABEL_VALUE_BYTES {
+            return Err(ValidationError::new(format!(
+                "label '{key}' value must not exceed {MAX_LABEL_VALUE_BYTES} bytes"
+            )));
+        }
+        // Every Unicode control character, not just the newline family: a label
+        // value is echoed into selectors, audit records, and explain output,
+        // and no legitimate targeting handle contains one.
+        if value.chars().any(char::is_control) {
+            return Err(ValidationError::new(format!(
+                "label '{key}' value must not contain control characters"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_discriminator(value: &str) -> Result<(), ValidationError> {
@@ -206,6 +355,11 @@ pub fn is_reserved_collection_name(value: &str) -> bool {
     RESERVED_COLLECTION_NAMES
         .iter()
         .any(|reserved| reserved.eq_ignore_ascii_case(value))
+}
+
+/// Whether a custom ResourceDefinition would claim Rise's reserved API group.
+pub fn is_reserved_resource_kind(group: &str, _kind: &str) -> bool {
+    group == API_GROUP
 }
 
 pub fn validate_resource_group(value: &str) -> Result<(), ValidationError> {
@@ -339,6 +493,49 @@ mod tests {
         assert!(validate_discriminator("abc123d-").is_err());
         assert!(validate_discriminator("abc123d").is_err());
         assert!(validate_discriminator("abc123def").is_err());
+    }
+
+    #[test]
+    fn validates_labels_against_the_selector_key_grammar() {
+        let ok = BTreeMap::from([
+            ("rise.dev/owner".to_string(), "group:platform".to_string()),
+            ("squad".to_string(), String::new()),
+            ("a.b.c/d_e.f-g".to_string(), "v".to_string()),
+        ]);
+        assert!(validate_labels(&ok).is_ok());
+        assert!(validate_labels(&BTreeMap::new()).is_ok());
+
+        // Any key a resource can carry must also be expressible as a binding's
+        // labelSelector key, so both parse through `LabelKey`.
+        for key in ["", "not a domain/owner", "rise.dev/owner-", "rise.dev/a/b"] {
+            let labels = BTreeMap::from([(key.to_string(), "v".to_string())]);
+            assert!(
+                validate_labels(&labels).is_err(),
+                "unexpectedly accepted key '{key}'"
+            );
+            assert!(key.parse::<LabelKey>().is_err(), "'{key}' must not parse");
+        }
+
+        for value in [
+            "v".repeat(MAX_LABEL_VALUE_BYTES + 1),
+            "line\nbreak".to_string(),
+            "carriage\rreturn".to_string(),
+            "nul\0byte".to_string(),
+            "tab\tseparated".to_string(),
+            "escape\u{001b}[0m".to_string(),
+            "delete\u{007f}char".to_string(),
+            "c1\u{0085}next-line".to_string(),
+        ] {
+            let labels = BTreeMap::from([("squad".to_string(), value.clone())]);
+            assert!(
+                validate_labels(&labels).is_err(),
+                "unexpectedly accepted value {value:?}"
+            );
+        }
+
+        // Exactly at the limit is fine.
+        let at_limit = BTreeMap::from([("squad".to_string(), "v".repeat(MAX_LABEL_VALUE_BYTES))]);
+        assert!(validate_labels(&at_limit).is_ok());
     }
 
     #[test]

@@ -37,7 +37,7 @@
       "type": "object"
     },
     "AccessRequirement": {
-      "description": "Access requirement level for project ingress",
+      "description": "Access requirement level for ingress authentication.\n\nThis is the internal/wire representation: the `access_requirement` of a\nserver-configured access class, the per-route requirement carried on a\ndeployment's route side-data, and the `access` query param the reconciler\nstamps into the auth-url. Spelled PascalCase to match the access-class\nsettings. The `.rise.toml` surface uses [`RouteAccess`] instead, whose\n`public` reads more naturally on a route than `None`.",
       "oneOf": [
         {
           "const": "None",
@@ -86,6 +86,14 @@
           ],
           "description": "Optional active sync source for pulling users and groups from an external IdP.\nWhen configured, Rise will periodically query the IdP for users and groups\nassigned to the app and sync them as Rise teams."
         },
+        "admin_idp_groups": {
+          "default": [],
+          "description": "IdP groups whose members are admins, as an alternative to listing every\nadmin email in `admin_users`. A user matches when they belong to an\nIdP-managed team of that name (matching is case-insensitive). Blank\nentries are filtered out so an unset `${VAR}` default collapses to an\nempty list.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "admin_users": {
           "default": [],
           "description": "List of admin user emails for the default organization. Admins do NOT\nimplicitly receive the Operator role — list the email in\n`operator_users` separately if needed.",
@@ -101,7 +109,7 @@
         },
         "allow_raw_external_tokens": {
           "default": true,
-          "description": "Accept raw external OIDC tokens directly at request time (default: true).\n\nWhen `true`, a CI service account may present its external OIDC token\ndirectly to project-scoped endpoints, and Rise resolves the service\naccount per request (the legacy two-phase path). When `false`, callers\nmust first exchange their token at `POST /api/v1/auth/token` for a Rise\naccess token.\n\nLeaving this `true` keeps the legacy attack surface and forfeits the\nsecurity benefits of the exchange (no service-account DB lookups in the\nrequest hot path, and an authenticated `platform/capabilities`). It is\nslated to default to `false` in a future release; migrate CI to\npre-exchange before then.",
+          "description": "Accept raw external OIDC tokens directly at request time (default: true).\n\nWhen `true`, a CI service account may present its external OIDC token\ndirectly to project-scoped endpoints, and Rise resolves the service\naccount per request (the legacy two-phase path). When `false`, callers\nmust first exchange their token at `POST /api/v1/auth/token` for a Rise\naccess token.\n\nLeaving this `true` keeps the legacy attack surface and forfeits the\nsecurity benefits of the exchange (no service-account DB lookups in the\nrequest hot path, and an authenticated `platform/capabilities`). While it\nis `true`, every *accepted* raw-token request emits one\n`rise::deprecation` `tracing` event carrying the validated `issuer`/`sub`,\nso operators can aggregate it in their log pipeline to see which workload\nidentities still need migrating. Defaults to `false` starting in 0.25.0;\nmigrate CI to pre-exchange before upgrading.",
           "type": "boolean"
         },
         "allow_team_creation": {
@@ -131,13 +139,26 @@
           },
           "type": "array"
         },
+        "idp_group_claim": {
+          "default": "groups",
+          "description": "Claim in the IdP ID token that contains group names (default: \"groups\").\nFor example, AWS Cognito commonly exposes groups as \"cognito:groups\".",
+          "type": "string"
+        },
         "idp_group_sync_enabled": {
           "default": true,
-          "description": "Enable IdP group synchronization (default: true)\nWhen enabled, user team memberships are automatically synced from IdP groups claim on login",
+          "description": "Enable IdP group synchronization (default: true).\nWhen enabled, user team memberships are synchronized from the configured\nIdP group claim on login.",
           "type": "boolean"
         },
         "issuer": {
           "type": "string"
+        },
+        "operator_idp_groups": {
+          "default": [],
+          "description": "IdP groups whose members hold the Operator role, as an alternative to\nlisting every Operator email in `operator_users`. Matches the same way\nas `admin_idp_groups`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "operator_users": {
           "default": [],
@@ -725,6 +746,262 @@
             "traefik_network"
           ],
           "type": "object"
+        },
+        {
+          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service and lets Traefik's ECS\nprovider route to the tasks via labels Rise stamps on the container\ndefinition. No Kubernetes, no Metacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0005 for the design and its deliberate v1 limitations.",
+          "properties": {
+            "access_classes": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AccessClass"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "default": {
+                "public": {
+                  "access_requirement": "None",
+                  "custom_annotations": {},
+                  "description": "Fully public — no authentication required.",
+                  "display_name": "Public",
+                  "ingress_class": "traefik"
+                }
+              },
+              "description": "Access classes defining ingress authentication levels. For classes\nwhose `access_requirement` is `Authenticated`/`Member` the controller\nstamps Traefik forwardAuth labels, which requires `auth_backend_url`;\nthe backend refuses to start otherwise rather than serve those\nprojects publicly with no auth enforced.",
+              "type": "object"
+            },
+            "access_key_id": {
+              "default": null,
+              "description": "Static credentials, for a control plane running outside AWS. Leave\nunset in production so the standard chain (task role / instance\nprofile) applies.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "assign_public_ip": {
+              "default": false,
+              "description": "Assign a public IP to each task. Required when the subnets are public\n(no NAT gateway), since Fargate must reach ECR and CloudWatch to start.",
+              "type": "boolean"
+            },
+            "auth_backend_url": {
+              "default": "",
+              "description": "Internal URL Traefik uses to reach the Rise backend for the forwardAuth\nsubrequest. Must be resolvable **from inside the cluster** — a Cloud Map\nname or an internal load balancer, not the public URL.",
+              "type": "string"
+            },
+            "auth_signin_url": {
+              "default": "",
+              "description": "Browser-facing base URL for the login redirect. Falls back to the\nserver `public_url` when empty.",
+              "type": "string"
+            },
+            "cluster": {
+              "description": "ECS cluster name that carries the deployed workloads.",
+              "type": "string"
+            },
+            "controller_class_name": {
+              "default": "default",
+              "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
+              "type": "string"
+            },
+            "cpu_architecture": {
+              "default": "X86_64",
+              "description": "Fargate CPU architecture: `X86_64` or `ARM64`. Defaults to `X86_64`.",
+              "type": "string"
+            },
+            "deployment_constraints": {
+              "$ref": "#/$defs/DeploymentConstraints",
+              "description": "Platform-level constraints for deployment resources."
+            },
+            "deployment_defaults": {
+              "$ref": "#/$defs/DeploymentDefaults",
+              "description": "Default resource values for new deployments when not specified."
+            },
+            "endpoint_url": {
+              "default": null,
+              "description": "Override the AWS service endpoint (VPC/PrivateLink or FIPS endpoints).\nThe AWS SDK also honours `AWS_ENDPOINT_URL`; this is the explicit form.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "environment_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution_role_arn": {
+              "default": null,
+              "description": "IAM role ECS itself assumes to pull images and resolve SSM secrets.\nRequired whenever a project uses secret env vars or a private registry.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "health_probes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HealthProbeConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Health probe configuration."
+            },
+            "identity_token_ttl_seconds": {
+              "default": 3600,
+              "description": "Lifetime in seconds of workload identity tokens. Accepted for\nforward-compatibility; ECS v1 does not deliver identity material and\nrejects deployments that request it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ingress_port": {
+              "default": null,
+              "description": "Optional port appended to all generated ingress URLs.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "ingress_schema": {
+              "default": "https",
+              "description": "URL scheme for generated ingress URLs. Defaults to `https`.",
+              "type": "string"
+            },
+            "label_namespace": {
+              "default": "rise.dev",
+              "description": "Label namespace prefix for Rise bookkeeping tags. Defaults to `rise.dev`.",
+              "type": "string"
+            },
+            "log_group": {
+              "default": null,
+              "description": "CloudWatch log group for app containers (`awslogs` driver). When\nunset, containers get no log driver and runtime logs are unavailable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "production_ingress_url_template": {
+              "description": "Ingress URL template for the production (default) deployment group.\nSame semantics as the other backends. Must contain `{project_name}`.",
+              "type": "string"
+            },
+            "reconcile_interval_secs": {
+              "default": 30,
+              "description": "Interval in seconds between reconcile ticks. Defaults to 30 — ECS is\na throttled API, unlike a local Docker daemon.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "region": {
+              "description": "AWS region hosting the cluster.",
+              "type": "string"
+            },
+            "repository_credentials_secret_arn": {
+              "default": null,
+              "description": "ARN of a Secrets Manager secret holding `{\"username\": …, \"password\": …}`\nfor a private registry that is not ECR.\n\nECS re-authenticates on every task start and cannot take inline\ncredentials, so a static-credential registry needs the credentials\nparked somewhere ECS can read them itself. The ARN is stamped onto\neach container definition as `repositoryCredentials`; the execution\nrole needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`\nwhen the secret uses a customer-managed key).\n\nLeave unset for ECR (the execution role authenticates the pull) and\nfor anonymous registries.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resource_prefix": {
+              "default": "rise",
+              "description": "Prefix for generated ECS resource names. Defaults to `rise`.",
+              "type": "string"
+            },
+            "secret_access_key": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "security_groups": {
+              "default": [],
+              "description": "Security groups applied to the tasks' ENIs. ECS caps this at 5.\nAccepts a YAML sequence or a comma-separated string.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "ssm_kms_key_id": {
+              "default": null,
+              "description": "KMS key for the `SecureString` parameters. Unset uses the AWS-managed\n`alias/aws/ssm` key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ssm_parameter_prefix": {
+              "default": "rise",
+              "description": "Root of the SSM hierarchy holding secret env vars. Defaults to `rise`.",
+              "type": "string"
+            },
+            "staging_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subnets": {
+              "description": "Subnets for the tasks' `awsvpc` ENIs. At least one is required; ECS\ncaps an `awsvpcConfiguration` at 16. Accepts a YAML sequence or a\ncomma-separated string so it can come straight from an env var.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "task_role_arn": {
+              "default": null,
+              "description": "IAM role the application containers run as (their AWS identity).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_api_url": {
+              "default": null,
+              "description": "Base URL of Traefik's API. Read for per-server `serverStatus`, the\nauthoritative readiness signal (no fallback), so this is **required\nfor projects that set a `health_check`** — without it such a\ndeployment never becomes Healthy.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_certresolver": {
+              "default": null,
+              "description": "Optional Traefik certresolver name for automatic TLS.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_entrypoint": {
+              "default": "web",
+              "description": "Traefik entrypoint name routers bind to. Defaults to `web`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "ecs",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "region",
+            "cluster",
+            "subnets",
+            "production_ingress_url_template"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -757,7 +1034,7 @@
           "properties": {
             "max_tail_lines": {
               "default": 100000,
-              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,\npaging stops yielding new lines — the same outcome as when the\nkubelet's own ring buffer is exhausted. Default: 100000.",
+              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines` through an opaque continuation; paging stops at this\nceiling or when the kubelet's own ring buffer is exhausted. Default:\n100000.",
               "format": "int64",
               "type": "integer"
             },
@@ -776,6 +1053,40 @@
           "properties": {
             "type": {
               "const": "docker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read deployment logs from the CloudWatch log group configured by the\nactive ECS deployment controller. AWS connection settings and the log\ngroup stay single-sourced on that controller so the writer and reader\ncannot point at different regions or groups.",
+          "properties": {
+            "retention_hint": {
+              "default": null,
+              "description": "Display-only retention hint used to explain an empty historical\nresult. An empty env-interpolated value is treated as unset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "cloudwatch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "No runtime log backend.\n\nThe API answers with `historical_backend_not_configured` and the UI\nrenders its empty state.",
+          "properties": {
+            "type": {
+              "const": "none",
               "type": "string"
             }
           },
@@ -832,6 +1143,36 @@
           "type": "object"
         }
       ]
+    },
+    "DeploymentRetentionSettings": {
+      "description": "Bounds on how much deployment history Rise keeps.\n\nThe two halves have deliberately different defaults. Capping a single\ndeployment's events discards only the middle of a flap it already summarises,\nso it is on. Deleting a deployment discards its event log *and* the\nenvironment-variable snapshot that makes it re-deployable, and no amount of\ncare makes that reversible — so it is off until an operator asks for it.",
+      "properties": {
+        "delete_aged_deployments": {
+          "default": false,
+          "description": "Delete finished deployments once they are older than\n`max_deployment_age_days`. Off by default: this is irreversible, and an\nupgrade must not start deleting history nobody asked it to.",
+          "type": "boolean"
+        },
+        "keep_primary_deployments_per_environment": {
+          "default": 10,
+          "description": "How many of each environment's most recent *finished* primary-group\ndeployments survive deletion regardless of age. These are what a\nrollback reaches for, so an environment that has not deployed in a long\ntime keeps a usable history rather than being emptied by the age rule.\n\nCounts finished deployments only. The active deployment and anything\nstill running are never deleted, so spending these slots on them would\nleave no rollback history at all.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "max_deployment_age_days": {
+          "default": 90,
+          "description": "How old a finished deployment must be before deletion considers it.\nOnly consulted when `delete_aged_deployments` is on.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events_per_deployment": {
+          "default": 1000,
+          "description": "Most events kept for one deployment. Its first event — the creation\nevent, which anchors the timeline — is always kept regardless.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "EncryptionSettings": {
       "description": "Encryption provider configuration",
@@ -1319,6 +1660,11 @@
     },
     "LokiLabels": {
       "properties": {
+        "container": {
+          "default": "container",
+          "description": "Loki stream label that carries the deployment's container name, used\nby the `?container=` filter and for per-line attribution. The bundled\nAlloy config writes the Kubernetes container name here, which is the\nRise container name (`app` for a single-container deployment).",
+          "type": "string"
+        },
         "deployment_id": {
           "default": "rise_deployment_id",
           "description": "Loki stream label that carries the Rise deployment id (e.g.\n\"20241205-1234\"). Together with `project`, this must uniquely\nidentify a deployment's log stream.",
@@ -1425,7 +1771,7 @@
       "properties": {
         "allowed_idp_groups": {
           "default": [],
-          "description": "IdP groups whose members get platform access",
+          "description": "IdP groups whose members get platform access. A user matches when they\nbelong to an IdP-managed team of that name (case-insensitive).",
           "items": {
             "type": "string"
           },
@@ -1599,11 +1945,21 @@
               "default": "",
               "type": "string"
             },
+            "password": {
+              "default": "",
+              "description": "Optional static registry password. Intended for small trusted-user setups.",
+              "type": "string"
+            },
             "registry_url": {
               "type": "string"
             },
             "type": {
               "const": "oci-client-auth",
+              "type": "string"
+            },
+            "username": {
+              "default": "",
+              "description": "Optional static registry username. When set with `password`, Rise returns\nthe credentials to authorized clients instead of relying on prior docker login.",
               "type": "string"
             }
           },
@@ -2082,6 +2438,16 @@
     "deployment_logs": {
       "$ref": "#/$defs/DeploymentLogsSettings"
     },
+    "deployment_retention": {
+      "$ref": "#/$defs/DeploymentRetentionSettings",
+      "default": {
+        "delete_aged_deployments": false,
+        "keep_primary_deployments_per_environment": 10,
+        "max_deployment_age_days": 90,
+        "max_events_per_deployment": 1000
+      },
+      "description": "Bounds the growth of deployment history. Omitting the section keeps the\nevent cap on and deletion of old deployments off."
+    },
     "encryption": {
       "anyOf": [
         {
@@ -2111,7 +2477,7 @@
           "type": "null"
         }
       ],
-      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or `local.yaml`) *replaces* it entirely. Operators\nwho want to add to the defaults must re-include them."
+      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or the local configuration layer) *replaces* it\nentirely. Operators who want to add to the defaults must re-include\nthem."
     },
     "registry": {
       "anyOf": [
@@ -2122,6 +2488,19 @@
           "type": "null"
         }
       ]
+    },
+    "reserved_project_names": {
+      "default": [
+        "rise",
+        "dex",
+        "registry",
+        "www"
+      ],
+      "description": "Project names that are reserved for control-plane hostnames and cannot\nbe used when creating a project. Later config layers replace this list\nas a whole. Default: [\"rise\", \"dex\", \"registry\", \"www\"].",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "resource_gc": {
       "anyOf": [

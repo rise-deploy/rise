@@ -10,6 +10,11 @@
 #   docker compose -f docker-compose.standalone.yaml \
 #                  -f docker-compose.standalone.local.yaml up -d
 #
+#   # Tagged release candidate — use its exact published GHCR tag (without `v`):
+#   export RISE_IMAGE_TAG="$(git describe --tags --exact-match --match 'v*' HEAD | sed 's/^v//')"
+#   docker compose -f docker-compose.standalone.yaml \
+#                  -f docker-compose.standalone.local.yaml up -d
+#
 # This file is fully self-contained — it does NOT layer on top of the dev
 # docker-compose.yml. It brings up everything Rise needs to deploy apps through
 # the `docker` deployment controller: Postgres for state, Dex as the OIDC
@@ -40,9 +45,9 @@
 #     it for real certs. The Dex client secret must stay in sync with
 #     dev/dex/config.yaml.
 #   * REGISTRY AUTH. The registry is exposed at registry.${RISE_DOMAIN} behind
-#     a Traefik basicauth middleware (htpasswd via REGISTRY_BASIC_AUTH). The CLI
-#     does its own `docker login` against that URL (oci-client-auth mints no
-#     creds). See the operator docs for the full login/push flow.
+#     a Traefik basicauth middleware (htpasswd via REGISTRY_BASIC_AUTH). Set the
+#     matching plaintext RISE_REGISTRY_USERNAME / RISE_REGISTRY_PASSWORD if Rise
+#     should log trusted users in automatically. See the operator docs.
 #   * PIN A REAL IMAGE TAG. RISE_IMAGE_TAG below is a manual pin; bump it on
 #     upgrade (there is no automatic 'latest released' resolution).
 #   * PLATFORM ACCESS. By default any authenticated IdP user may use the
@@ -60,7 +65,8 @@
 #     goes through Traefik. (The local overlay re-publishes them on 127.0.0.1 for
 #     direct dev access.)
 #
-# Image tag is overridable for CI via RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
+# Image source is overridable for CI and prerelease validation via
+# RISE_IMAGE_REPOSITORY / RISE_IMAGE_TAG.
 # =============================================================================
 
 # Fixed project name so the network is always "rise_default", regardless of the
@@ -137,8 +143,7 @@ services:
           - rise-dex
 
   # OCI registry for images pushed by the rise CLI. Exposed publicly via Traefik
-  # at registry.${RISE_DOMAIN} behind a basicauth middleware (the CLI does its
-  # own `docker login`; oci-client-auth mints no credentials). No host port: the
+  # at registry.${RISE_DOMAIN} behind a basicauth middleware. No host port: the
   # backend's docker daemon pulls over rise_default (rise-registry:5000); remote
   # `rise deploy` pushes go through the registry.${RISE_DOMAIN} Traefik router.
   registry:
@@ -177,7 +182,7 @@ services:
   # version 1.24 is too old"), and Traefik then 404s every route. v3.7.1
   # negotiates the API directly over the raw socket — no socket-proxy/relay.
   traefik:
-    image: traefik:v3.7.4
+    image: traefik:v3.7.12
     container_name: rise-traefik
     restart: unless-stopped
     command:
@@ -221,9 +226,10 @@ services:
   # the real domain. The host Docker socket is mounted so it can create/route app
   # containers.
   rise:
-    # RISE_IMAGE_TAG is MANUALLY PINNED to a known-good released version; bump on
+    # RISE_IMAGE_TAG is MANUALLY PINNED to a known-good stable version; bump on
     # upgrade — there is no automatic 'latest released' resolution. Override with
-    # RISE_IMAGE_TAG (CI/e2e does this) or RISE_IMAGE_REPOSITORY for a fork/mirror.
+    # the exact published tag for CI/e2e or prerelease validation (release tags
+    # drop their leading `v` on GHCR), or use RISE_IMAGE_REPOSITORY for a mirror.
     image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
     container_name: rise-backend
     restart: unless-stopped
@@ -268,6 +274,10 @@ services:
       # loopback (127.0.0.1:5000) or the public registry.${RISE_DOMAIN} per the
       # "Pull" section in docs/.../docker/index.md. Passed through only when set.
       - RISE_REGISTRY_URL
+      # Optional static registry credentials returned to authenticated users
+      # during deploy. Pass through only when explicitly set.
+      - RISE_REGISTRY_USERNAME
+      - RISE_REGISTRY_PASSWORD
       - RISE_COOKIE_SECURE=true
       # Single OIDC issuer. Defaults to dex.${RISE_DOMAIN} — which is only
       # reachable if you opt into the demo-idp overlay (the base file does NOT
@@ -285,6 +295,9 @@ services:
       - RISE_JWT_SIGNING_SECRET
       - RISE_ENCRYPTION_KEY
       - OIDC_CLIENT_SECRET
+      # Optional ID-token claim containing group names. Defaults to `groups`;
+      # AWS Cognito users can set OIDC_GROUP_CLAIM=cognito:groups.
+      - OIDC_GROUP_CLAIM
       - ADMIN_EMAIL
       # Operator access to the generic resource API (/api/v1/resources). Defaults
       # to none — set RISE_OPERATOR_EMAIL to grant a single operator (mount a

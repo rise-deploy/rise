@@ -1,5 +1,41 @@
 {
   "$defs": {
+    "OwnerReference": {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "pattern": "^(?=.{1,253}\\/)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\\/[a-z0-9]+$",
+          "type": "string"
+        },
+        "blockOwnerDeletion": {
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "pattern": "^[A-Z][A-Za-z0-9]*$",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 253,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$",
+          "type": "string"
+        },
+        "uid": {
+          "format": "uuid",
+          "not": {
+            "const": "00000000-0000-0000-0000-000000000000"
+          },
+          "type": "string"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "name",
+        "uid"
+      ],
+      "type": "object"
+    },
     "ResourceDefinitionSpec": {
       "properties": {
         "allowedStatusControllerIds": {
@@ -95,6 +131,13 @@
             "null"
           ]
         },
+        "effectiveLabels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Every label key in force on this resource, resolved nearest-wins down its\nancestry (ADR-0001 §6.1).\n\nComputed on read from the ancestor chain, never stored: this is the same\nwalk authorization performs, so the value a client sees and the value a\n`labelSelector` matches can never disagree. Responses built without an\nancestor chain leave it empty rather than repeating `labels`, which would\nclaim an inheritance answer nobody resolved.",
+          "type": "object"
+        },
         "finalizers": {
           "default": [],
           "items": {
@@ -102,8 +145,21 @@
           },
           "type": "array"
         },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Targeting metadata. A key becomes access-relevant exactly when some\npolicy binding's `labelSelector` references it (ADR-0001 §6.1); no key\ncarries authorization meaning on its own.",
+          "type": "object"
+        },
         "name": {
           "type": "string"
+        },
+        "ownerReferences": {
+          "items": {
+            "$ref": "#/$defs/OwnerReference"
+          },
+          "type": "array"
         },
         "revision": {
           "format": "int64",

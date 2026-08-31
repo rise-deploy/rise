@@ -214,14 +214,8 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
         }
     };
 
-    // Allow redirects to the same host as public_url
-    if redirect_host == public_host {
-        return redirect_url.to_string();
-    }
-
-    // Allow redirects to subdomains of the public domain
-    // e.g., if public_url is "https://rise.dev", allow "https://app.rise.dev"
-    if redirect_host.ends_with(&format!(".{}", public_host)) {
+    // Allow the public host and its dot-anchored subdomains.
+    if crate::server::auth::redirect::host_is_same_or_subdomain(redirect_host, public_host) {
         return redirect_url.to_string();
     }
 
@@ -232,23 +226,19 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
     // (case-insensitive) against the project's canonical + deployment hosts —
     // never a string prefix and never the whole parent domain — so a sibling
     // project's host or a lookalike (`secret.example.com.evil.com`) is rejected.
-    if allowed_hosts
-        .iter()
-        .any(|h| redirect_host.eq_ignore_ascii_case(h))
-    {
+    if allowed_hosts.iter().any(|allowed_host| {
+        // This policy requires exact host equality, so check the shared
+        // same-or-subdomain primitive in both directions.
+        crate::server::auth::redirect::host_is_same_or_subdomain(redirect_host, allowed_host)
+            && crate::server::auth::redirect::host_is_same_or_subdomain(allowed_host, redirect_host)
+    }) {
         return redirect_url.to_string();
     }
 
-    // Allow localhost and 127.0.0.1 for development (only if public_url is also local)
-    // Extract host without port for comparison
-    let redirect_host_base = redirect_host.split(':').next().unwrap_or(redirect_host);
-    let public_host_base = public_host.split(':').next().unwrap_or(public_host);
-
-    let is_redirect_localhost =
-        redirect_host_base == "localhost" || redirect_host_base == "127.0.0.1";
-    let is_public_localhost = public_host_base == "localhost" || public_host_base == "127.0.0.1";
-
-    if is_redirect_localhost && is_public_localhost {
+    // Allow loopback redirects for development only when Rise itself is local.
+    if crate::server::auth::redirect::is_loopback_host(redirect_host)
+        && crate::server::auth::redirect::is_loopback_host(public_host)
+    {
         return redirect_url.to_string();
     }
 
@@ -291,14 +281,17 @@ async fn sync_groups_after_login(
         })?;
 
     // Parse claims
-    let claims: crate::server::auth::jwt::Claims =
-        serde_json::from_value(claims_value).map_err(|e| {
-            tracing::warn!("Failed to parse claims for group sync: {:#}", e);
-            (
-                StatusCode::UNAUTHORIZED,
-                format!("Invalid token claims: {}", e),
-            )
-        })?;
+    let claims = crate::server::auth::jwt::Claims::from_value_with_group_claim(
+        claims_value,
+        &state.auth_settings.idp_group_claim,
+    )
+    .map_err(|e| {
+        tracing::warn!("Failed to parse claims for group sync: {:#}", e);
+        (
+            StatusCode::UNAUTHORIZED,
+            format!("Invalid token claims: {}", e),
+        )
+    })?;
 
     // Get or create user. Always pairs the user row with a default-Org
     // membership so bootstrap validation never observes a half-created user.
@@ -762,8 +755,8 @@ pub async fn me(
     let user = auth.user().map_err(|e| (e.status, e.message))?;
     // User is injected by auth middleware
     tracing::debug!("GET /me: user_id={}, email={}", user.id, user.email);
-    let is_admin = state.is_admin(&user.email);
-    let is_operator = state.is_operator(&user.email);
+    let is_admin = state.is_admin(user).await;
+    let is_operator = state.is_operator(user).await;
     let can_create_teams = is_admin || state.auth_settings.allow_team_creation;
     Ok(Json(MeResponse {
         id: user.id.to_string(),
@@ -1558,6 +1551,15 @@ pub struct IngressAuthQuery {
     /// byte-identical — nginx itself performs the auth-signin redirect.
     #[serde(default, deserialize_with = "deserialize_bool_flag")]
     pub signin_redirect: bool,
+    /// Per-route access requirement, stamped into the `auth-url` / `forwardAuth`
+    /// address by the reconciler for the route group this ingress/router serves.
+    /// When present it is enforced instead of the project's access-class default,
+    /// so a single route can be opened or tightened. Control-plane input only —
+    /// the client never influences which `auth-url` the proxy calls; it supplies
+    /// only the path, and the proxy selects the matching route group. When absent,
+    /// the project's access-class requirement applies (unchanged behavior).
+    #[serde(default)]
+    pub access: Option<crate::server::settings::AccessRequirement>,
 }
 
 /// Deserialize a query flag that may be `1`/`true`/`0`/`false` (or absent).
@@ -1778,14 +1780,23 @@ pub async fn ingress_auth(
             )
         })?;
 
+    // The effective requirement is the per-route `access` override stamped into
+    // the auth-url by the reconciler (control-plane input), falling back to the
+    // project's access-class requirement. The proxy — not the client — selects
+    // which route group's auth-url is called, so trusting this param is safe.
+    let requirement = params
+        .access
+        .clone()
+        .unwrap_or_else(|| access_class.access_requirement.clone());
+
     // Handle different access requirements
-    match access_class.access_requirement {
+    match requirement {
         AccessRequirement::None => {
-            // Should never be called - None means no nginx auth annotations
+            // Should never be called - None means no auth annotations/middleware
             // But if it is called, deny access as a safety measure
             tracing::warn!(
                 project = %params.project,
-                "Auth endpoint called for AccessRequirement::None project"
+                "Auth endpoint called for AccessRequirement::None route"
             );
             Err((
                 StatusCode::FORBIDDEN,
@@ -2103,6 +2114,19 @@ mod tests {
         let q: IngressAuthQuery =
             serde_urlencoded::from_str("project=app&signin_redirect=0").unwrap();
         assert!(!q.signin_redirect);
+    }
+
+    #[test]
+    fn ingress_auth_query_parses_reconciler_stamped_access_param() {
+        use crate::server::settings::AccessRequirement;
+        // The reconciler stamps `&access=<PascalCase>` into the auth-url; the
+        // handler must parse it back to override the project's requirement.
+        let q: IngressAuthQuery =
+            serde_urlencoded::from_str("project=app&access=Member&signin_redirect=1").unwrap();
+        assert_eq!(q.access, Some(AccessRequirement::Member));
+        // Absent → None → project default applies (unchanged behavior).
+        let q: IngressAuthQuery = serde_urlencoded::from_str("project=app").unwrap();
+        assert_eq!(q.access, None);
     }
 
     #[test]

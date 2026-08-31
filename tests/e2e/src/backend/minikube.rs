@@ -154,9 +154,17 @@ fn err_detail(stderr: &mut impl Read) -> String {
 
 pub struct MinikubeBackend {
     image_repository: String,
+    /// The image tag the release currently runs. In the upgrade flow this starts
+    /// at the older `RISE_E2E_UPGRADE_FROM` version and `upgrade` flips it to the
+    /// target; otherwise it's always the target (`RISE_IMAGE_TAG`).
     image_tag: String,
+    /// Repository the CLI image is pulled from (used to recompute `cli_image` on
+    /// upgrade).
+    cli_repo: String,
     /// `repo:tag` for the CLI image (defaults to the server image).
     cli_image: String,
+    /// The target tag to switch to on `upgrade`; `Some` only in the upgrade flow.
+    upgrade_target: Option<String>,
     registry_mode: RegistryMode,
     cpus: String,
     memory: String,
@@ -176,10 +184,22 @@ impl MinikubeBackend {
     pub fn new() -> Result<Self> {
         let image_repository = std::env::var("RISE_IMAGE_REPOSITORY")
             .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise".to_string());
-        let image_tag = std::env::var("RISE_IMAGE_TAG")
+        let target_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the minikube backend")?;
-        let cli_repo =
-            std::env::var("RISE_CLI_IMAGE_REPOSITORY").unwrap_or_else(|_| image_repository.clone());
+        // In the upgrade flow the release first comes up on the older version and
+        // `upgrade` switches it to the target tag (and the in-repo chart).
+        let upgrade_from = std::env::var("RISE_E2E_UPGRADE_FROM")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let (image_tag, upgrade_target) = match upgrade_from {
+            Some(old) => (old, Some(target_tag)),
+            None => (target_tag, None),
+        };
+        // Treat an empty value as unset (CI passes "" when not overriding it).
+        let cli_repo = std::env::var("RISE_CLI_IMAGE_REPOSITORY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| image_repository.clone());
         let registry_mode = RegistryMode::from_env();
         // The CI token's iss/aud must equal the server's public_url, which differs
         // by mode (jfrog-vault deploys must reach the issuer from inside the cluster).
@@ -197,6 +217,8 @@ impl MinikubeBackend {
             cli_image: format!("{cli_repo}:{image_tag}"),
             image_repository,
             image_tag,
+            cli_repo,
+            upgrade_target,
             registry_mode,
             cpus: std::env::var("MINIKUBE_CPUS").unwrap_or_else(|_| "4".to_string()),
             memory: std::env::var("MINIKUBE_MEMORY").unwrap_or_else(|_| "6144".to_string()),
@@ -218,15 +240,79 @@ impl MinikubeBackend {
         self.repo_root.join(rel).to_string_lossy().into_owned()
     }
 
+    /// Export `helm/rise` at the old release tag (`v<image_tag>`, e.g. `v0.22.1`)
+    /// into a temp dir and return the chart path, so the upgrade flow installs the
+    /// OLD chart from its own source (matching that version's values-ci.yaml)
+    /// rather than the renamed published OCI artifact. `image_tag` is the old
+    /// version at this point in the flow (before `upgrade()` swaps it).
+    fn materialize_old_chart(&self) -> Result<String> {
+        // Accept the version with or without a leading `v`: CI passes a bare
+        // `0.22.1` (prepare strips it), but a hand-set RISE_E2E_UPGRADE_FROM may
+        // include the `v`. Always normalize to the `vX.Y.Z` git tag.
+        let old_tag = format!("v{}", self.image_tag.trim_start_matches('v'));
+        let dest = self.old_chart_dir();
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).context("create old-chart dir")?;
+
+        // Make sure the tag is present (no-op on a full clone; a shallow CI
+        // checkout fetches just it). Keep the outcome: a failed fetch is the most
+        // likely reason the export below can't find the tag, so fold it into that
+        // error rather than letting it surface as an opaque "unknown revision".
+        let mut fetch = Command::new("git");
+        fetch
+            .current_dir(&self.repo_root)
+            .args(["fetch", "--depth", "1", "origin", "tag", &old_tag]);
+        let fetch_out = cli::run(fetch)?;
+
+        let tar = dest.join("chart.tar");
+        let mut archive = Command::new("git");
+        archive
+            .current_dir(&self.repo_root)
+            .args(["archive", "--format=tar", "-o"])
+            .arg(&tar)
+            .args([&old_tag, "helm/rise"]);
+        let archive_out = cli::run(archive)?;
+        anyhow::ensure!(
+            archive_out.success(),
+            "git archive {old_tag} helm/rise failed (exit {:?}):\n{}\n(prior `git fetch` {})",
+            archive_out.status,
+            archive_out.combined(),
+            if fetch_out.success() {
+                "succeeded".to_string()
+            } else {
+                format!("also failed:\n{}", fetch_out.combined())
+            }
+        );
+
+        let mut untar = Command::new("tar");
+        untar.arg("-xf").arg(&tar).arg("-C").arg(&dest);
+        cli::run_checked(untar).context("untar old chart")?;
+
+        Ok(dest
+            .join("helm")
+            .join("rise")
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    /// Temp dir the upgrade flow exports the old chart into (cleaned in `tear_down`).
+    fn old_chart_dir(&self) -> PathBuf {
+        self.repo_root
+            .join("target")
+            .join(format!("e2e-old-chart-{}", std::process::id()))
+    }
+
     /// The `helm upgrade --install` flags, including the jfrog-vault registry
-    /// overrides when that mode is selected.
-    fn helm_args(&self) -> Vec<String> {
+    /// overrides when that mode is selected. `values` is the values file to apply
+    /// (the in-repo `values-ci.yaml` normally; the old release's own values file
+    /// during the upgrade flow's initial install).
+    fn helm_args(&self, values: &str) -> Vec<String> {
         let mut args = vec![
             "--namespace".into(),
             NAMESPACE.into(),
             "--create-namespace".into(),
             "--values".into(),
-            self.repo_path("helm/rise/values-ci.yaml"),
+            values.to_string(),
             "--set".into(),
             format!("image.repository={}", self.image_repository),
             "--set".into(),
@@ -438,11 +524,117 @@ impl MinikubeBackend {
         c.args(args);
         cli::run(c)
     }
+
+    /// Wait for the Rise release to roll out, then (re-)establish the long-lived
+    /// server + Dex port-forwards and confirm both answer. Shared by `bring_up`
+    /// and `upgrade` (after a `helm upgrade` the server pod is recreated, so the
+    /// existing forwards are stale and must be replaced).
+    fn await_control_plane(&mut self) -> Result<()> {
+        // Wait for each workload's rollout to complete. `kubectl rollout status`
+        // tracks the rollout by revision rather than snapshotting pods by name, so
+        // it's immune to the race that breaks `kubectl wait pod` during a
+        // `helm upgrade` (old pods get deleted mid-wait → "pods ... not found").
+        // A completed rollout means the new replicas are Available/Ready, so this
+        // also subsumes a separate pod-readiness wait.
+        report::step("wait rollouts complete (≤8m each)", || {
+            let mut get = Command::new("kubectl");
+            get.args([
+                "get",
+                "deployment,statefulset,daemonset",
+                "--namespace",
+                NAMESPACE,
+                "-l",
+                &format!("app.kubernetes.io/instance={RELEASE}"),
+                "-o",
+                "name",
+            ]);
+            let workloads = cli::run_checked(get).context("kubectl get workloads")?;
+            let names: Vec<&str> = workloads
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            anyhow::ensure!(
+                !names.is_empty(),
+                "no workloads found for release {RELEASE} — helm install/upgrade may not have created them"
+            );
+            for res in names {
+                let mut st = Command::new("kubectl");
+                st.args([
+                    "rollout",
+                    "status",
+                    "--namespace",
+                    NAMESPACE,
+                    res,
+                    "--timeout=8m",
+                ]);
+                cli::run_checked(st).with_context(|| format!("kubectl rollout status {res}"))?;
+            }
+            Ok(())
+        })?;
+
+        // (Re-)forward the server and Dex for the whole run (killed in
+        // tear_down/drop). Clearing first drops any stale forwards to a pod the
+        // upgrade replaced.
+        report::step("port-forward server :3000 + dex :5556", || {
+            self.forwards.clear();
+            self.forwards.push(PortForward::spawn(
+                NAMESPACE,
+                &format!("svc/{SERVER_SVC}"),
+                "3000:3000",
+                "rise server",
+            )?);
+            self.forwards.push(PortForward::spawn(
+                NAMESPACE,
+                &format!("svc/{DEX_SVC}"),
+                "5556:5556",
+                "dex",
+            )?);
+            Ok(())
+        })?;
+
+        // The forwards take a moment to establish — swallow connection errors.
+        report::step_value("rise /health", || {
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                "rise server /health (port-forward)",
+                || {
+                    Ok(http::get(&format!("{RISE_URL}/health"), None)
+                        .map(|r| r.status == 200)
+                        .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
+        report::step_value("dex discovery", || {
+            http::poll(
+                Duration::from_secs(60),
+                Duration::from_secs(2),
+                "dex discovery (port-forward)",
+                || {
+                    Ok(http::get(
+                        &format!("{DEX_LOCAL_URL}/.well-known/openid-configuration"),
+                        None,
+                    )
+                    .map(|r| r.status == 200)
+                    .unwrap_or(false))
+                },
+            )?;
+            Ok("200")
+        })?;
+        Ok(())
+    }
 }
 
 impl Backend for MinikubeBackend {
     fn kind(&self) -> BackendKind {
         BackendKind::Minikube
+    }
+
+    fn cli_visible_path(&self, rel: &str) -> String {
+        self.repo_path(rel)
     }
 
     fn bring_up(&mut self) -> Result<()> {
@@ -501,101 +693,56 @@ impl Backend for MinikubeBackend {
             })?;
         }
 
-        report::step("helm upgrade --install", || {
-            let mut helm = Command::new("helm");
-            helm.args([
-                "upgrade",
-                "--install",
-                RELEASE,
-                &self.repo_path("helm/rise"),
-            ]);
-            helm.args(self.helm_args());
-            cli::run_checked(helm).context("helm upgrade --install")
-        })?;
+        if self.upgrade_target.is_some() {
+            // Upgrade flow: come up on the OLD release, built from its source chart
+            // at the old tag with that version's own values-ci.yaml, pinned to the
+            // old image. The published chart is renamed (`rise-helm`) and the values
+            // files assume the in-repo name (`chart`), so installing from source —
+            // not the OCI artifact — keeps the chart name `chart` and the
+            // `rise-ci-chart-*` resource names consistent across the upgrade.
+            let old_chart = report::step_value("materialize old chart from git", || {
+                self.materialize_old_chart()
+            })?;
+            let old_values = format!("{old_chart}/values-ci.yaml");
+            report::step("helm dependency update (old chart)", || {
+                // The old chart doesn't vendor its deps (metacontroller), so pull
+                // them; the in-repo chart vendors them under charts/. This resolves
+                // the OLD chart's dependency repositories as they were at the release
+                // tag — if a dependency's upstream repo has since moved or gone, this
+                // step fails. That's a property of how old the upgrade-from release
+                // is, not the upgrade itself; bump RISE_E2E_UPGRADE_FROM if it does.
+                let mut dep = Command::new("helm");
+                dep.args(["dependency", "update", &old_chart]);
+                cli::run_checked(dep).context("helm dependency update (old chart)")
+            })?;
+            report::step("helm install (old release)", || {
+                let mut helm = Command::new("helm");
+                helm.args(["upgrade", "--install", RELEASE, &old_chart]);
+                helm.args(self.helm_args(&old_values));
+                cli::run_checked(helm).context("helm install (old release)")
+            })?;
+        } else {
+            report::step("helm upgrade --install", || {
+                let mut helm = Command::new("helm");
+                helm.args([
+                    "upgrade",
+                    "--install",
+                    RELEASE,
+                    &self.repo_path("helm/rise"),
+                ]);
+                helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
+                cli::run_checked(helm).context("helm upgrade --install")
+            })?;
+        }
 
-        report::step("wait deployments Available (≤10m)", || {
-            let mut wait_dep = Command::new("kubectl");
-            wait_dep.args([
-                "wait",
-                "--namespace",
-                NAMESPACE,
-                "--for=condition=Available",
-                "deployment",
-                "-l",
-                &format!("app.kubernetes.io/instance={RELEASE}"),
-                "--timeout=10m",
-            ]);
-            cli::run_checked(wait_dep).context("kubectl wait deployments Available")
-        })?;
-
-        report::step("wait pods Ready (≤10m)", || {
-            let mut wait_pod = Command::new("kubectl");
-            wait_pod.args([
-                "wait",
-                "--namespace",
-                NAMESPACE,
-                "--for=condition=Ready",
-                "pod",
-                "-l",
-                &format!("app.kubernetes.io/instance={RELEASE}"),
-                "--timeout=10m",
-            ]);
-            cli::run_checked(wait_pod).context("kubectl wait pods Ready")
-        })?;
-
-        // Forward the server and Dex for the whole run (killed in tear_down/drop).
-        report::step("port-forward server :3000 + dex :5556", || {
-            self.forwards.push(PortForward::spawn(
-                NAMESPACE,
-                &format!("svc/{SERVER_SVC}"),
-                "3000:3000",
-                "rise server",
-            )?);
-            self.forwards.push(PortForward::spawn(
-                NAMESPACE,
-                &format!("svc/{DEX_SVC}"),
-                "5556:5556",
-                "dex",
-            )?);
-            Ok(())
-        })?;
-
-        // The forwards take a moment to establish — swallow connection errors.
-        report::step_value("rise /health", || {
-            http::poll(
-                Duration::from_secs(60),
-                Duration::from_secs(2),
-                "rise server /health (port-forward)",
-                || {
-                    Ok(http::get(&format!("{RISE_URL}/health"), None)
-                        .map(|r| r.status == 200)
-                        .unwrap_or(false))
-                },
-            )?;
-            Ok("200")
-        })?;
-        report::step_value("dex discovery", || {
-            http::poll(
-                Duration::from_secs(60),
-                Duration::from_secs(2),
-                "dex discovery (port-forward)",
-                || {
-                    Ok(http::get(
-                        &format!("{DEX_LOCAL_URL}/.well-known/openid-configuration"),
-                        None,
-                    )
-                    .map(|r| r.status == 200)
-                    .unwrap_or(false))
-                },
-            )?;
-            Ok("200")
-        })?;
-        Ok(())
+        self.await_control_plane()
     }
 
     fn tear_down(&mut self) {
         // Drop the port-forwards (kills the kubectl children), then nuke the cluster.
         self.forwards.clear();
+        // Remove the old-chart export (no-op outside the upgrade flow).
+        let _ = std::fs::remove_dir_all(self.old_chart_dir());
         let mut del = Command::new("minikube");
         del.arg("delete");
         let _ = cli::run(del);
@@ -781,9 +928,38 @@ impl Backend for MinikubeBackend {
         // chart applies cleanly a second time.
         let mut helm = Command::new("helm");
         helm.args(["upgrade", RELEASE, &self.repo_path("helm/rise")]);
-        helm.args(self.helm_args());
+        helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
         cli::run_checked(helm).context("helm upgrade (idempotency)")?;
         Ok(())
+    }
+
+    fn upgrade(&mut self) -> Result<()> {
+        let target = self
+            .upgrade_target
+            .take()
+            .context("minikube backend is not in upgrade mode (RISE_E2E_UPGRADE_FROM unset)")?;
+        self.image_tag = target;
+        self.cli_image = format!("{}:{}", self.cli_repo, self.image_tag);
+
+        // Helm does not upgrade CRDs on `helm upgrade`, so apply the in-repo CRDs
+        // first — the same step an operator runs to pick up new CRD fields.
+        report::step("apply in-repo CRDs", || {
+            let mut apply = Command::new("kubectl");
+            apply.args(["apply", "-f", &self.repo_path("helm/rise/crds")]);
+            cli::run_checked(apply).context("kubectl apply CRDs")
+        })?;
+
+        // Upgrade the same release (chart name `chart`) to the in-repo chart on the
+        // new image and current values — a clean in-place upgrade (resource names
+        // are unchanged from the old install).
+        report::step("helm upgrade (to in-repo chart + target image)", || {
+            let mut helm = Command::new("helm");
+            helm.args(["upgrade", RELEASE, &self.repo_path("helm/rise")]);
+            helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
+            cli::run_checked(helm).context("helm upgrade (target)")
+        })?;
+
+        self.await_control_plane()
     }
 
     fn wait_workload_removed(&self, project: &str) -> Result<()> {

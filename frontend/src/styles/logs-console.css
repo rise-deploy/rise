@@ -1,0 +1,1052 @@
+/* ============================================================
+   Deployment log console
+   ------------------------------------------------------------
+   The stream is the focal element: it takes every pixel left over
+   after the chrome, and it is the only inset surface on the page.
+   Everything above it (status bar, volume rail, query line) sits on
+   the page background so it reads as chrome, not content.
+
+   Severity is carried by a 2px spine at the row's leading edge, not
+   by tinting the whole line — a wall of coloured prose is unreadable,
+   and a spine is legible in peripheral vision while scrolling. Only
+   error/critical/fatal additionally tint the message text.
+   ============================================================ */
+
+.r-logc {
+    /* One height for every control in the status bar. The pieces come from
+       three different families (split button, icon buttons, r-ui Button), each
+       with its own padding, so the row only lines up if it is stated once. */
+    --r-logc-control-h: 28px;
+    /* And one height for the query row: the Combobox trigger, the query
+       line and Refresh are three more families that must agree. */
+    --r-logc-field-h: 34px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    gap: 10px;
+}
+
+/* Fills whatever the shell gives it. `.r-content.is-full` (see rise.css) turns
+   the page container into a non-scrolling flex column, so no viewport maths is
+   needed and the stream simply absorbs the slack. */
+.r-logc-page {
+    flex: 1;
+    min-height: 0;
+}
+
+/* Inside the deployment tab the page still scrolls, so the console needs a
+   height. Anchor it to the viewport rather than the tab so a taller screen
+   gives the stream more room. */
+.r-logc-embedded {
+    height: calc(100vh - 260px);
+    min-height: 420px;
+}
+
+/* ---------- status bar ---------- */
+
+.r-logc-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    flex-wrap: wrap;
+    row-gap: 8px;
+}
+
+.r-logc-bar-left,
+.r-logc-bar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.r-logc-bar-left { gap: 12px; }
+
+.r-logc-count {
+    font-size: 11.5px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+}
+
+.r-logc-icon-btn {
+    all: unset;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* Square at the shared control height; the pseudo-element below carries
+       the larger hit area. */
+    width: var(--r-logc-control-h);
+    height: var(--r-logc-control-h);
+    position: relative;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.14s, border-color 0.14s, color 0.14s;
+}
+
+.r-logc-icon-btn::after {
+    content: "";
+    position: absolute;
+    inset: -6px;
+}
+
+/* Normalise the two borrowed control families to the shared height. Scoped to
+   the bar so the split button and Button keep their own sizing elsewhere. */
+.r-logc-bar .r-split-btn,
+.r-logc-bar .r-btn {
+    height: var(--r-logc-control-h);
+    box-sizing: border-box;
+}
+
+/* Let the shared height drive the box; the segments keep their horizontal
+   padding. Qualified with the element for the same reason as the rules in
+   rise.css that set it. */
+.r-logc-bar .r-btn { padding-top: 0; padding-bottom: 0; }
+.r-logc-bar .r-split-btn button.r-split-btn-main,
+.r-logc-bar .r-split-btn button.r-split-btn-side { padding-top: 0; padding-bottom: 0; }
+
+.r-logc-icon-btn:hover { background: var(--hover); color: var(--text); }
+.r-logc-icon-btn.is-on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.r-logc-icon-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.r-logc-icon-btn[disabled] { opacity: 0.45; cursor: default; }
+
+.r-logc-alert { font-size: 12.5px; }
+
+/* ---------- volume rail ---------- */
+
+.r-logc-rail {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: none;
+}
+
+.r-logc-rail-toggle {
+    all: unset;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    align-self: flex-start;
+    padding: 2px 4px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-soft);
+    cursor: pointer;
+}
+
+.r-logc-rail-toggle:hover:not([disabled]) { color: var(--text); }
+.r-logc-rail-toggle[disabled] { cursor: default; opacity: 0.5; }
+.r-logc-rail-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* The chart draws its own bordered box and is sized by its `height` prop, so
+   the rail just wraps it. */
+.r-logc-rail-body { min-height: 0; }
+.r-logc-rail-fallback {
+    height: 68px;
+    display: grid;
+    place-items: center;
+    font-size: 11.5px;
+    color: var(--text-soft);
+}
+
+/* ---------- query line ---------- */
+
+.r-logc-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex: none;
+}
+
+.r-logc-controls .r-cbox-trigger,
+.r-logc-controls .r-btn {
+    min-height: var(--r-logc-field-h);
+    height: var(--r-logc-field-h);
+    box-sizing: border-box;
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+.r-logc-query {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1 1 320px;
+    min-width: 220px;
+    min-height: var(--r-logc-field-h);
+    box-sizing: border-box;
+    /* Vertical padding is left to the shared height so a row of chips grows the
+       field instead of overflowing it. */
+    padding: 3px 8px 3px 4px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface);
+    transition: border-color 0.14s, box-shadow 0.14s;
+}
+
+.r-logc-query:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in oklch, var(--accent) 16%, transparent);
+}
+
+.r-logc-query-menu-btn {
+    all: unset;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 3px;
+    color: var(--text-soft);
+    cursor: pointer;
+    flex: none;
+}
+
+.r-logc-query-menu-btn:hover,
+.r-logc-query-menu-btn.is-open { background: var(--hover); color: var(--text); }
+.r-logc-query-menu-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.r-logc-query-input {
+    all: unset;
+    flex: 1;
+    min-width: 80px;
+    font-size: 12.5px;
+    color: var(--text);
+}
+
+.r-logc-query-input::placeholder { color: var(--text-soft); }
+
+/* Filter chips. The field name is the quiet half; the value is what you read. */
+.r-logc-chip {
+    display: inline-flex;
+    align-items: stretch;
+    flex: none;
+    border: 1px solid var(--border-faint);
+    border-radius: 3px;
+    overflow: hidden;
+    font-size: 11px;
+    line-height: 1.6;
+    background: var(--surface-2);
+    white-space: nowrap;
+}
+
+.r-logc-chip-field {
+    padding: 0 5px;
+    background: var(--surface-3);
+    color: var(--text-soft);
+}
+
+.r-logc-chip-value {
+    padding: 0 5px;
+    color: var(--text);
+    font-weight: 500;
+}
+
+.r-logc-chip button {
+    all: unset;
+    display: inline-flex;
+    align-items: center;
+    padding: 0 4px 0 0;
+    color: var(--text-soft);
+    cursor: pointer;
+}
+
+.r-logc-chip button:hover { color: var(--err); }
+.r-logc-chip button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.r-logc-matches {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex: none;
+    font-size: 11px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+.r-logc-matches button {
+    all: unset;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.r-logc-matches button:hover:not([disabled]) { background: var(--hover); color: var(--text); }
+.r-logc-matches button[disabled] { opacity: 0.4; cursor: default; }
+
+.r-logc-query-menu {
+    position: fixed;
+    z-index: 120;
+    min-width: 176px;
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--surface);
+    box-shadow: var(--shadow-md);
+}
+
+.r-logc-query-menu-group {
+    padding: 6px 8px 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-soft);
+}
+
+.r-logc-query-menu-item {
+    all: unset;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 5px 8px;
+    border-radius: 3px;
+    font-size: 12.5px;
+    color: var(--text);
+    cursor: pointer;
+}
+
+.r-logc-query-menu-item:hover { background: var(--hover); }
+.r-logc-query-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.r-logc-query-menu-item.on { box-shadow: inset 2px 0 0 var(--accent); font-weight: 500; }
+
+.r-logc-level-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--r-log-chart-unknown);
+}
+
+/* One source of level colour for every swatch in the console: the menu dots
+   and the heat-track ticks. Levels not listed keep the neutral fallback. */
+.r-logc-level-dot.lv-info,
+.r-logc-heat-tick.lv-info      { background: var(--r-log-chart-info); }
+.r-logc-level-dot.lv-notice,
+.r-logc-heat-tick.lv-notice    { background: var(--r-log-chart-info); }
+.r-logc-level-dot.lv-warn,
+.r-logc-heat-tick.lv-warn      { background: var(--r-log-chart-warn); }
+.r-logc-level-dot.lv-error,
+.r-logc-heat-tick.lv-error     { background: var(--r-log-chart-error); }
+.r-logc-level-dot.lv-critical,
+.r-logc-heat-tick.lv-critical  { background: var(--r-log-chart-critical); }
+.r-logc-level-dot.lv-fatal,
+.r-logc-heat-tick.lv-fatal     { background: var(--r-log-chart-fatal); }
+.r-logc-level-dot.lv-debug,
+.r-logc-heat-tick.lv-debug     { background: var(--r-log-chart-debug); }
+.r-logc-level-dot.lv-trace,
+.r-logc-heat-tick.lv-trace     { background: var(--r-log-chart-trace); }
+
+.r-logc-range { width: 148px; }
+.r-logc-autorefresh { width: 116px; }
+
+.r-logc-anchor {
+    font-size: 11.5px;
+    color: var(--text-soft);
+    white-space: nowrap;
+}
+
+.r-logc-bucket {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex: none;
+    padding: 5px 10px;
+    border: 1px solid var(--border-faint);
+    border-radius: 4px;
+    background: var(--accent-soft);
+    font-size: 11.75px;
+    color: var(--text);
+}
+
+.r-logc-bucket button {
+    all: unset;
+    display: inline-flex;
+    padding: 2px;
+    border-radius: 3px;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.r-logc-bucket button:hover { color: var(--text); background: var(--hover); }
+
+/* ---------- the stream ---------- */
+
+.r-logc-stream-wrap {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+}
+
+.r-logc-stream {
+    flex: 1;
+    min-width: 0;
+    overflow: auto;
+    overscroll-behavior: contain;
+    /* Inset, like an input: this surface receives content. */
+    background: var(--r-logs-bg);
+    border: 1px solid var(--border-faint);
+    border-radius: 5px;
+    padding: 8px 0;
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-variant-ligatures: none;
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text);
+}
+
+.r-logc-stream:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.r-logc-rows {
+    position: relative;
+    width: 100%;
+}
+
+.r-logc-slot {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+}
+
+.r-logc-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 1px 12px 1px 0;
+    position: relative;
+}
+
+.r-logc-row:hover { background: var(--r-logs-bg-hover); }
+.r-logc-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+/* A JSON line expands on click, so it has to read as clickable. The caret is
+   the only standing hint; text stays selectable, and a drag is not a toggle. */
+.r-logc-row.is-expandable { cursor: pointer; }
+.r-logc-row.is-expandable .r-logc-msg::before {
+    content: "\203A";
+    display: inline-block;
+    width: 0.75em;
+    margin-left: -0.75em;
+    color: var(--text-soft);
+    transition: transform 0.12s cubic-bezier(0.23, 1, 0.32, 1);
+}
+.r-logc-row.is-expandable.is-expanded .r-logc-msg::before {
+    transform: rotate(90deg);
+}
+/* The caret sits in the gutter the message column already has, so it must not
+   push the text: reserve its width on every row in the stream. */
+.r-logc-msg { padding-left: 0.75em; }
+
+@media (prefers-reduced-motion: reduce) {
+    .r-logc-row.is-expandable .r-logc-msg::before { transition: none; }
+}
+
+/* Severity spine — the scan channel. Neutral levels stay invisible so the
+   loud ones are the only thing the eye catches. */
+.r-logc-spine {
+    flex: none;
+    width: 2px;
+    align-self: stretch;
+    min-height: 1.55em;
+    margin-right: 8px;
+    background: transparent;
+}
+
+.r-logc-row.lv-warn     .r-logc-spine { background: var(--r-log-chart-warn); }
+.r-logc-row.lv-error    .r-logc-spine { background: var(--r-log-chart-error); }
+.r-logc-row.lv-critical .r-logc-spine { background: var(--r-log-chart-critical); }
+.r-logc-row.lv-fatal    .r-logc-spine { background: var(--r-log-chart-fatal); }
+.r-logc-row.lv-debug    .r-logc-spine { background: var(--r-log-chart-debug); }
+.r-logc-row.lv-trace    .r-logc-spine { background: var(--r-log-chart-trace); }
+
+.r-logc-ts {
+    flex: none;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+    white-space: nowrap;
+}
+
+/* Paginated in from outside the selected window — still readable, but the
+   timestamp fades so it is clear the line sits outside the chart's range. */
+.r-logc-row.is-out-of-range .r-logc-ts { opacity: 0.45; }
+
+.r-logc-src {
+    flex: none;
+    max-width: 12ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    user-select: none;
+}
+
+/* The message is body text at body weight. Wrapped lines hang under the
+   message column because it is its own flex item. */
+.r-logc-msg {
+    flex: 1;
+    min-width: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.r-logc-stream.is-nowrap .r-logc-msg { white-space: pre; }
+.r-logc-stream.is-nowrap .r-logc-row { width: max-content; min-width: 100%; }
+
+/* Only the levels that mean "stop reading and look" tint their text. */
+.r-logc-row.lv-error    .r-logc-msg { color: var(--r-log-chart-error); }
+.r-logc-row.lv-critical .r-logc-msg { color: var(--r-log-chart-critical); }
+.r-logc-row.lv-fatal    .r-logc-msg { color: var(--r-log-chart-fatal); }
+
+.r-logc-hit {
+    background: color-mix(in oklch, var(--accent) 26%, transparent);
+    color: inherit;
+    border-radius: 2px;
+}
+
+.r-logc-hit.is-active {
+    background: var(--accent);
+    color: var(--accent-fg);
+}
+
+.r-logc-json {
+    margin: 2px 0 6px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font: inherit;
+}
+
+.r-logc-json .json-key { color: oklch(0.62 0.12 250); }
+.r-logc-json .json-str { color: oklch(0.58 0.11 150); }
+.r-logc-json .json-num { color: oklch(0.60 0.14 40); }
+.r-logc-json .json-bool,
+.r-logc-json .json-null { color: oklch(0.55 0.12 300); }
+
+.dark .r-logc-json .json-key { color: oklch(0.78 0.10 250); }
+.dark .r-logc-json .json-str { color: oklch(0.80 0.11 150); }
+.dark .r-logc-json .json-num { color: oklch(0.80 0.12 60); }
+.dark .r-logc-json .json-bool,
+.dark .r-logc-json .json-null { color: oklch(0.78 0.11 300); }
+
+/* Per-line actions stay out of the way until the row is hovered. */
+.r-logc-actions {
+    position: absolute;
+    right: 10px;
+    top: 1px;
+    display: none;
+    gap: 4px;
+}
+
+.r-logc-row:hover .r-logc-actions,
+.r-logc-row:focus-within .r-logc-actions { display: inline-flex; }
+
+.r-logc-line-btn {
+    all: unset;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--surface);
+    color: var(--text-muted);
+    font-size: 10.5px;
+    line-height: 1.5;
+    cursor: pointer;
+}
+
+.r-logc-line-btn:hover { background: var(--hover); color: var(--text); }
+.r-logc-line-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.r-logc-empty,
+.r-logc-loader {
+    padding: 22px 16px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-soft);
+}
+
+.r-logc-loader {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 16px;
+}
+
+.r-logc-loader.is-end { opacity: 0.55; }
+
+/* ---------- heat track ---------- */
+
+/* One tick per warn/error across the whole buffer, at its proportional
+   offset — the way to find the red band in 50k lines without reading them. */
+.r-logc-heat {
+    position: relative;
+    flex: none;
+    width: 10px;
+    margin-left: 3px;
+    border-radius: 3px;
+    background: var(--surface-2);
+    cursor: pointer;
+}
+
+.r-logc-heat-tick {
+    position: absolute;
+    left: 2px;
+    right: 2px;
+    height: 2px;
+    border-radius: 1px;
+    background: var(--r-log-chart-unknown);
+}
+
+.r-logc-jump {
+    all: unset;
+    position: absolute;
+    bottom: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 11.5px;
+    font-weight: 500;
+    box-shadow: var(--shadow-md);
+    cursor: pointer;
+    transition: transform 0.12s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.r-logc-jump:hover { transform: translateX(-50%) translateY(-1px); }
+.r-logc-jump:active { transform: translateX(-50%) scale(0.97); }
+.r-logc-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ---------- details drawer ---------- */
+
+.r-logc-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: rgba(20, 20, 15, 0.28);
+}
+
+.dark .r-logc-scrim { background: rgba(0, 0, 0, 0.5); }
+
+.r-logc-details {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 91;
+    width: min(360px, 92vw);
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    box-shadow: var(--shadow-lg);
+    animation: r-logc-slide-in 200ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@keyframes r-logc-slide-in {
+    from { transform: translateX(16px); opacity: 0; }
+    to   { transform: translateX(0); opacity: 1; }
+}
+
+.r-logc-details-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border-faint);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.r-logc-details-head button {
+    all: unset;
+    display: inline-flex;
+    padding: 4px;
+    border-radius: 3px;
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.r-logc-details-head button:hover { background: var(--hover); color: var(--text); }
+
+.r-logc-details-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* ---------- compact density ---------- */
+
+[data-density="compact"] .r-logc { gap: 8px; --r-logc-control-h: 24px; --r-logc-field-h: 30px; }
+[data-density="compact"] .r-logc-stream { font-size: 11.5px; line-height: 1.5; padding: 6px 0; }
+[data-density="compact"] .r-logc-row { gap: 8px; }
+[data-density="compact"] .r-logc-spine { margin-right: 6px; }
+[data-density="compact"] .r-logc-rail-fallback { height: 56px; }
+[data-density="compact"] .r-logc-query { padding: 2px 6px 2px 3px; }
+[data-density="compact"] .r-logc-embedded { height: calc(100vh - 220px); }
+
+/* ---------- reduced motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+    .r-logc-details { animation: none; }
+    .r-logc-jump { transition: none; }
+    .r-logc-jump:hover,
+    .r-logc-jump:active { transform: translateX(-50%); }
+}
+
+/* ---------- narrow viewports ---------- */
+
+@media (max-width: 880px) {
+    /* Container names and the heat track are the first things to go: at this
+       width the message needs every column it can get. */
+    .r-logc-src { display: none; }
+    .r-logc-heat { display: none; }
+    /* The query line takes its own row; range, refresh and cadence share the
+       next one rather than stacking three deep. */
+    .r-logc-query { flex: 1 1 100%; }
+    .r-logc-range,
+    .r-logc-autorefresh { flex: 1 1 40%; width: auto; }
+}
+
+/* ---------- navigation affordances in the status bar ---------- */
+
+.r-logc-back,
+.r-logc-expand {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-decoration: none;
+    padding: 3px 6px;
+    margin-left: -6px;
+    border-radius: 4px;
+    white-space: nowrap;
+}
+
+.r-logc-back:hover,
+.r-logc-expand:hover { color: var(--text); background: var(--hover); }
+.r-logc-back:focus-visible,
+.r-logc-expand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Text that preceded a JSON payload on the same line. Kept above the formatted
+   block so expanding never hides part of the line. */
+.r-logc-json-prefix {
+    display: block;
+    color: var(--text-muted);
+}
+
+/* ---------- lifecycle markers on the volume rail ---------- */
+
+/* Deployment events share the chart's time axis, so a burst of errors can be
+   read against what the deployment itself was doing at that moment. */
+.r-logc-chart-body { position: relative; }
+
+/* Where the reader is in the buffer, drawn over the bars: a faint band for
+   everything loaded, a stronger one for the rows on screen, and a hairline for
+   the hovered row. Purely indicative — it never takes pointer events, so the
+   chart's own bar tooltip and click-to-filter keep working underneath it. */
+.r-logc-chart-cursor {
+    position: absolute;
+    pointer-events: none;
+    overflow: hidden;
+}
+
+/* The reachable-by-scrolling extent. Faint enough to read as ground the
+   viewport band sits on rather than as a second thing to look at. */
+.r-logc-chart-cursor-buffer {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    min-width: 2px;
+    background: color-mix(in oklch, var(--accent) 8%, transparent);
+    border-inline: 1px solid color-mix(in oklch, var(--accent) 25%, transparent);
+    box-shadow: inset 0 2px 0 color-mix(in oklch, var(--accent) 40%, transparent);
+}
+
+.r-logc-chart-cursor-span {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    /* A viewport of lines that arrived in the same second is far narrower than
+       a pixel at most ranges; keep it wide enough to stay visible. */
+    min-width: 2px;
+    background: color-mix(in oklch, var(--accent) 18%, transparent);
+    border-inline: 1px solid color-mix(in oklch, var(--accent) 55%, transparent);
+    /* A wash alone is lost against the saturated stacked bars it covers, so
+       each band is capped by a rule along the plot's top edge. Together the
+       two caps read as a scrollbar over the timeline: a faint track for what
+       is loaded, a solid thumb for what is on screen. */
+    box-shadow: inset 0 3px 0 var(--accent);
+}
+
+.r-logc-chart-cursor-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    margin-left: -0.5px;
+    background: var(--accent);
+}
+
+.r-logc-markers {
+    position: relative;
+    height: 11px;
+    margin-top: 1px;
+    pointer-events: none;
+}
+
+/* The slot owns the position; the dot inside it stays in normal flow so the
+   tooltip wrapper can hug it. */
+.r-logc-marker-slot {
+    position: absolute;
+    top: 2px;
+    margin-left: -3.5px;
+    line-height: 0;
+    pointer-events: auto;
+}
+
+.r-logc-marker {
+    display: block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: 1px solid var(--surface);
+    cursor: default;
+}
+
+[data-density="compact"] .r-logc-markers { height: 8px; }
+
+/* A dot standing for several coincident events reads slightly heavier, so it
+   is clear there is more here than one moment. */
+.r-logc-marker.is-cluster {
+    width: 9px;
+    height: 9px;
+    box-shadow: 0 0 0 2px color-mix(in oklch, var(--text-soft) 30%, transparent);
+}
+
+/* ---------- timeline without a volume chart ---------- */
+
+/* Backends with no historical log store report no counts, but the deployment
+   still has a timeline. The rail keeps its axis and its markers. */
+.r-logc-bare-axis {
+    position: relative;
+    padding: 10px 0 0;
+}
+
+.r-logc-bare-line {
+    height: 1px;
+    background: var(--border);
+}
+
+.r-logc-bare-ticks {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 3px;
+}
+
+.r-logc-bare-tick {
+    font-size: 10px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The lane sits on the baseline rather than below the labels. */
+.r-logc-bare-axis .r-logc-markers {
+    position: absolute;
+    top: 5px;
+    height: 11px;
+}
+
+/* ---------- deployment event timeline ---------- */
+
+/* The same log the rail draws on, read as a list. Severity is a dot on the
+   spine rather than coloured text, matching how the stream marks its rows. */
+.r-evt {
+    display: flex;
+    flex-direction: column;
+}
+
+.r-evt-row {
+    /* Height of the label's line box. The dot centres on it, so the two must
+       agree — a row that grows downwards must not drag the dot with it. */
+    --evt-line: 19.5px;
+
+    display: flex;
+    /* Baseline, so the timestamp and the delta pin to the label's first line
+       however tall the body below it grows. */
+    align-items: baseline;
+    gap: 12px;
+    padding: 7px 0;
+    position: relative;
+}
+
+.r-evt-row + .r-evt-row { border-top: 1px solid var(--border-faint); }
+
+.r-evt-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-soft);
+    /* Pinned to the first line rather than the row's middle: an event with
+       facts or per-image detail is several lines tall, and a centred dot drifts
+       away from the moment it marks. A baseline-aligned block would sit on the
+       baseline by its bottom edge, so it is placed from the top instead and
+       nudged to the line's optical centre. */
+    align-self: flex-start;
+    margin-top: calc((var(--evt-line) - 7px) / 2);
+}
+
+.r-evt-row.sev-debug   .r-evt-dot { background: var(--text-soft); opacity: 0.6; }
+.r-evt-row.sev-info    .r-evt-dot { background: var(--ok); }
+.r-evt-row.sev-warning .r-evt-dot { background: var(--warn); }
+.r-evt-row.sev-error   .r-evt-dot { background: var(--err); }
+
+.r-evt-time {
+    flex: 0 0 96px;
+    font-size: 12px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+.r-evt-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.r-evt-label {
+    font-size: 13px;
+    line-height: var(--evt-line);
+}
+
+/* A failure's message belongs with the failure, not in a separate panel. */
+.r-evt-reason {
+    font-size: 12px;
+    color: var(--text-muted);
+    word-break: break-word;
+}
+
+/* The gap between events is what a timeline is read for. */
+.r-evt-delta {
+    flex: none;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+[data-density="compact"] .r-evt-row { padding: 5px 0; }
+
+/* Attributes carried by an event, beside the transition it describes. */
+.r-evt-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin-top: 2px;
+}
+
+.r-evt-fact {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-size: 11.5px;
+}
+
+.r-evt-fact-k {
+    color: var(--text-soft);
+}
+
+.r-evt-fact-v {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11px;
+}
+
+/* Controller bookkeeping, dumped verbatim. Deliberately plain: it is a
+   diagnostic, not a designed view, and dressing it up would suggest a
+   stability the shape does not have. */
+.r-ctrl-meta {
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11.5px;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+/* Per-image build/push detail on a transition. Indented under the facts row:
+   these belong to the event but are a level down from it. */
+.r-evt-images {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 3px;
+}
+
+.r-evt-image {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 11.5px;
+}
+
+.r-evt-image-name {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text);
+}
+
+.r-evt-image-meta {
+    color: var(--text-soft);
+}
+
+.r-evt-link {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.r-evt-link:hover { text-decoration: underline; }
+
+/* Which replica an event is about, when it is about one rather than the
+   deployment as a whole. */
+.r-evt-subject {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 10.5px;
+    color: var(--text-muted);
+}

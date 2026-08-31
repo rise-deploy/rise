@@ -16,27 +16,19 @@ RUN apt-get update && apt-get install -y \
 # Stage 2: Generate recipe file for dependencies
 FROM chef AS planner
 
-# Copy workspace project files
+# Copy the whole workspace, not a hand-listed set of manifests.
+#
+# `cargo chef prepare` reads every workspace member's Cargo.toml, so a list has
+# to name all of them — and a crate added without a matching line here fails the
+# build on a missing manifest, far from the change that caused it. Copying
+# sources into this stage costs nothing downstream: its only output is
+# recipe.json, and the expensive `cargo chef cook` layer in the builder is keyed
+# on that file's content, which changes only when dependencies change.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/rise-resource-api/Cargo.toml ./crates/rise-resource-api/Cargo.toml
-COPY crates/rise-resource-store/Cargo.toml ./crates/rise-resource-store/Cargo.toml
-COPY crates/rise-backend-auth/Cargo.toml ./crates/rise-backend-auth/Cargo.toml
-COPY crates/rise-backend-core/Cargo.toml ./crates/rise-backend-core/Cargo.toml
-COPY crates/rise-runtime-sync/Cargo.toml ./crates/rise-runtime-sync/Cargo.toml
+COPY crates ./crates
 
-# Create dummy sources for cargo to be happy
-RUN mkdir -p src && \
-    echo "fn main() {}" > src/main.rs && \
-    mkdir -p crates/rise-resource-api/src && \
-    echo "" > crates/rise-resource-api/src/lib.rs && \
-    mkdir -p crates/rise-resource-store/src && \
-    echo "" > crates/rise-resource-store/src/lib.rs && \
-    mkdir -p crates/rise-backend-auth/src && \
-    echo "" > crates/rise-backend-auth/src/lib.rs && \
-    mkdir -p crates/rise-backend-core/src && \
-    echo "" > crates/rise-backend-core/src/lib.rs && \
-    mkdir -p crates/rise-runtime-sync/src && \
-    echo "" > crates/rise-runtime-sync/src/lib.rs
+# Cargo wants a source file for the root binary; the recipe needs only manifests.
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -60,7 +52,9 @@ COPY docs/engineering/package.json ./engineering/
 RUN npm ci
 
 COPY docs/ ./
-RUN npm run build --workspace=rise-user-docs
+COPY skills/rise-app-builder /usr/src/skills/rise-app-builder
+RUN RISE_USER_DOCS_URL=/docs node scripts/generate-llms.mjs && \
+    npm run build --workspace=rise-user-docs
 
 # Stage 3: Build dependencies (cached separately from source code)
 FROM chef AS builder
@@ -68,7 +62,9 @@ FROM chef AS builder
 COPY --from=planner /usr/src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo chef cook --release --all-features --recipe-path recipe.json
+    --mount=type=cache,target=/usr/src/target,sharing=locked \
+    cargo chef cook --release --all-features --recipe-path recipe.json && \
+    date +%s%N > target/.rise-cargo-chef-generation
 
 # Copy project files
 COPY Cargo.toml Cargo.lock ./
@@ -78,17 +74,28 @@ COPY migrations ./migrations
 COPY static ./static
 COPY --from=frontend-builder /usr/src/frontend/dist/ ./static/
 COPY .sqlx ./.sqlx
+COPY scripts/refresh-cargo-source-mtimes.sh ./scripts/refresh-cargo-source-mtimes.sh
 
 # Build the application with server features
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/target,sharing=locked \
+    scripts/refresh-cargo-source-mtimes.sh \
+        target/.rise-source-checksums \
+        /tmp/rise-source-checksums \
+        target/.rise-cargo-chef-generation \
+        target/.rise-built-cargo-chef-generation && \
     SQLX_OFFLINE=true cargo build --release --all-features --bin rise && \
+    cp /tmp/rise-source-checksums target/.rise-source-checksums && \
+    cp target/.rise-cargo-chef-generation target/.rise-built-cargo-chef-generation && \
     cp target/release/rise /usr/local/bin/rise
 
 # Stage 4: Create the final, smaller image (match builder's Debian version)
 FROM debian:trixie-slim AS rise
 
-# Install runtime dependencies
+# Runtime dependencies. Deliberately no HTTP client: the ECS health check runs
+# `rise backend health`, which probes the server over loopback using the binary
+# that is already here, so the image needs no curl or wget for it.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
@@ -156,6 +163,7 @@ ARG DOCKER_CLI_VERSION=29.0.4
 ARG RAILPACK_VERSION=0.15.1
 ARG BUILDX_VERSION=0.34.1
 ARG BUILDKIT_VERSION=0.28.0
+ARG TARGETARCH
 
 RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
     /root/.local/bin/mise use -g docker-cli@${DOCKER_CLI_VERSION} && \
@@ -164,11 +172,11 @@ RUN /root/.local/bin/mise use -g pack@${PACK_VERSION} && \
 
 # Install Docker buildx plugin manually (pinned).
 RUN mkdir -p /root/.docker/cli-plugins && \
-    curl -sSL "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-amd64" -o /root/.docker/cli-plugins/docker-buildx && \
+    curl -sSL "https://github.com/docker/buildx/releases/download/v${BUILDX_VERSION}/buildx-v${BUILDX_VERSION}.linux-${TARGETARCH}" -o /root/.docker/cli-plugins/docker-buildx && \
     chmod +x /root/.docker/cli-plugins/docker-buildx
 
 # Install buildctl from buildkit (pinned).
-RUN curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-amd64.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
+RUN curl -sSL "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${TARGETARCH}.tar.gz" | tar -xz -C /usr/local bin/buildctl && \
     chmod +x /usr/local/bin/buildctl
 
 # Verify installations

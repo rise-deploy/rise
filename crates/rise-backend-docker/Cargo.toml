@@ -1,0 +1,36 @@
+[package]
+name = "rise-backend-docker"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+description = "Docker deployment backend for Rise (in-process reconcile loop over the Docker daemon)"
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+bollard = "0.18"
+chrono = { workspace = true }
+futures = "0.3"
+reqwest = { version = "0.13.0", features = ["json", "stream", "form"] }
+rise-backend-auth = { path = "../rise-backend-auth" }
+rise-backend-core = { path = "../rise-backend-core" }
+rise-backend-traefik = { path = "../rise-backend-traefik" }
+rise-deployment-spec = { path = "../rise-deployment-spec" }
+rise-resource-api = { path = "../rise-resource-api" }
+rise-runtime-sync = { path = "../rise-runtime-sync" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tar = "0.4"
+tokio = { workspace = true }
+tokio-util = "0.7"
+tracing = { workspace = true }
+url = "2.5"
+urlencoding = "2.1"
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

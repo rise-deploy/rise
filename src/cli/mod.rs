@@ -1,5 +1,6 @@
 #[cfg(feature = "backend")]
 pub mod backend;
+pub mod compose;
 pub mod config;
 pub mod deployment;
 pub mod domain;
@@ -12,6 +13,7 @@ pub mod login;
 pub mod project;
 pub mod run;
 pub mod service_account;
+pub mod skill;
 pub mod team;
 pub mod token_source;
 pub mod version;

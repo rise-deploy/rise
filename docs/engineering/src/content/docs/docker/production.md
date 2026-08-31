@@ -51,6 +51,15 @@ export RISE_DOMAIN=rise.example.com ACME_EMAIL=ops@example.com
 docker compose -f docker-compose.standalone.yaml up -d
 ```
 
+This uses the Compose file's pinned stable image. For a release candidate, set
+`RISE_IMAGE_TAG` to its exact published GHCR tag (without the Git tag's leading
+`v`) before bringing up the stack. From an exact tagged checkout:
+
+```bash
+export RISE_IMAGE_TAG="$(git describe --tags --exact-match --match 'v*' HEAD | sed 's/^v//')"
+docker compose -f docker-compose.standalone.yaml up -d
+```
+
 Traefik requests certificates via the HTTP-01 challenge on the `web` entrypoint
 (`certificatesresolvers.le`); all plain HTTP is redirected to HTTPS.
 
@@ -69,13 +78,16 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `ACME_EMAIL` | — | Contact for Let's Encrypt. |
 | `ACME_CA_SERVER` | LE production | Set to LE staging while testing. |
 | `REGISTRY_BASIC_AUTH` | empty | htpasswd users for the public registry (see [Container registry](/operator-docs/docker/registry/)). |
+| `RISE_REGISTRY_USERNAME` | empty | Optional static registry username returned to trusted users during deploy. |
+| `RISE_REGISTRY_PASSWORD` | empty | Optional static registry password returned to trusted users during deploy. |
 | `DEX_ISSUER` | `https://dex.${RISE_DOMAIN}` | OIDC issuer (see [Authentication / Dex](/operator-docs/docker/authentication/)). |
-| `RISE_IMAGE_TAG` | `0.23.0` | **Manual** image pin — bump on upgrade. There is no automatic "latest released" resolution. |
+| `RISE_IMAGE_TAG` | `0.23.0` | **Manual stable image pin** — bump on upgrade; set an exact published tag for a prerelease. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
 | `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`. `openssl rand -base64 32`. |
 | `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key. `openssl rand -base64 32`. |
 | `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it.** Keep in sync with the Dex client secret in `dev/dex/config.yaml`. |
+| `OIDC_GROUP_CLAIM` | `groups` | ID-token claim containing group names. Set to `cognito:groups` for AWS Cognito. |
 | `ADMIN_EMAIL` | `admin@example.com` | Initial admin user. |
 | `RISE_PLATFORM_ACCESS_POLICY` | `allow_all` | Who may use the CLI/API/dashboard. `allow_all` = any authenticated user; `restrictive` = allowlist only (see [Platform access](#platform-access)). |
 | `RISE_PLATFORM_ALLOWED_EMAIL` | empty | A single email granted platform access when the policy is `restrictive`. For several users, mount a config override. |
@@ -127,13 +139,22 @@ forwardAuth-protected app. It is controlled by `auth.platform_access` in
   only") from the platform-access middleware.
 
 `admin_users` (`ADMIN_EMAIL`) and `operator_users` (`RISE_OPERATOR_EMAIL`)
-always bypass this check. `operator_users` defaults to none — no operator is
-configured unless you set `RISE_OPERATOR_EMAIL` (a single email; mount a config
-override for several). Operators have full access to the generic resource API
-(`/api/v1/resources`), so grant the role deliberately.
+always bypass this check, as do the IdP groups in `admin_idp_groups`
+(`RISE_ADMIN_IDP_GROUP`) and `operator_idp_groups` (`RISE_OPERATOR_IDP_GROUP`).
+`operator_users` defaults to none — no operator is configured unless you set
+`RISE_OPERATOR_EMAIL` (a single email; mount a config override for several).
+Operators have full access to the generic resource API (`/api/v1/resources`), so
+grant the role deliberately.
 
 To run a restricted stack via env, set `RISE_PLATFORM_ACCESS_POLICY=restrictive`
 and grant one user with `RISE_PLATFORM_ALLOWED_EMAIL=you@example.com`. To grant
 several users (or IdP groups via `allowed_idp_groups`), mount a config override
 that replaces the `auth.platform_access` block instead of relying on the single
 env var.
+
+Group-based grants — `allowed_idp_groups`, `admin_idp_groups`,
+`operator_idp_groups` — match against the IdP-managed teams Rise syncs from the
+ID-token claim selected by `auth.idp_group_claim` (`OIDC_GROUP_CLAIM`, default
+`groups`) at login. Teams users create themselves never match, and a group
+removal in the IdP takes effect on the user's next login. See
+[Roles](/operator-docs/configuration/#authentication-auth) for details.

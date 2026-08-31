@@ -4,23 +4,27 @@ buildkit = "github:moby/buildkit"
 
 [tools]
 minikube = "1.38.1"
-pack = "0.40.6"
+pack = "0.40.9"
 railpack = "0.15.1"
 buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
 helm = "latest"
+# Pinned, not "latest": the modules' `terraform test` files use override_data and
+# check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
+# `mise run terraform:check` in the same change.
+terraform = "1.16.0"
 rust = { version = "1.95.0", profile = "default" }
 kubectl = "latest"
 k9s = "latest"
 vault = "latest"
 
 [tasks.setup]
-description = "One-stop dev environment setup (hosts, docker, cluster). Cross-platform (Linux + macOS). Run interactively."
+description = "One-stop dev environment setup (hosts, docker, cluster, optional /etc/hosts watcher). Cross-platform (Linux + macOS). Run interactively."
 run = "./scripts/dev-setup.sh"
 
 [tasks.down]
-description = "Tear down what 'mise setup' brought up (cluster, .env block, daemon.json registries, /etc/hosts block). Interactive."
+description = "Tear down what 'mise setup' brought up (hosts watcher, cluster, .env block, daemon.json registries, /etc/hosts block). Interactive."
 run = "./scripts/dev-setup.sh down"
 
 [tasks.dev]
@@ -77,13 +81,13 @@ run = "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-
 description = "Check that all SQLX queries are valid."
 run = "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets"
 
-[tasks."resource-store:sqlx:prepare"]
-description = "Prepare the SQLX query cache for rise-resource-store (requires running DB)."
-run = "cargo sqlx prepare -- --package rise-resource-store --all-targets"
+[tasks."resource-store-postgres:sqlx:prepare"]
+description = "Prepare the SQLX query cache for rise-resource-store-postgres (requires running DB)."
+run = "cargo sqlx prepare -- --package rise-resource-store-postgres --all-targets"
 
-[tasks."resource-store:sqlx:check"]
-description = "Verify the SQLX query cache for rise-resource-store is up to date."
-run = "cargo sqlx prepare --check -- --package rise-resource-store --all-targets"
+[tasks."resource-store-postgres:sqlx:check"]
+description = "Verify the SQLX query cache for rise-resource-store-postgres is up to date."
+run = "cargo sqlx prepare --check -- --package rise-resource-store-postgres --all-targets"
 
 [tasks."runtime-sync:db:migrate"]
 description = "Create the runtime_sync schema/tables in the dev DB (needed before runtime-sync:sqlx:prepare)."
@@ -109,26 +113,46 @@ run = "cargo sqlx prepare --check -- --all-targets"
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
+# `cargo all-features` covers rise-deploy's feature combinations — `cli` and
+# `cli,backend`, since `always_include_features = ["cli"]` means backend-alone
+# is never built; `--workspace` covers every crate and every test target.
+# Neither alone is enough: the first is package-scoped, the second only ever
+# builds the all-features combination.
 cargo all-features check --all-targets
-cargo check --package rise-resource-api --all-targets
-cargo check --package rise-resource-store --all-targets
-cargo check --package rise-backend-auth --all-targets
-cargo check --package rise-backend-core --all-targets
-cargo check --package rise-runtime-sync --all-targets
+cargo check --workspace --all-features --all-targets
 cargo all-features clippy --all-targets -- -D warnings
-cargo clippy --package rise-resource-api --all-targets -- -D warnings
-cargo clippy --package rise-resource-store --all-targets -- -D warnings
-cargo clippy --package rise-backend-auth --all-targets -- -D warnings
-cargo clippy --package rise-backend-core --all-targets -- -D warnings
-cargo clippy --package rise-runtime-sync --all-targets -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise resource:schema:check
 helm lint helm/rise
-cargo test --package rise-backend-auth --all-targets
-cargo test --package rise-backend-core --all-targets
+mise terraform:check
+# Every crate whose tests need no database. Expressed as exclusions so a new
+# crate is covered by default; only the three that require Postgres opt out.
+cargo test --workspace --all-features \
+  --exclude rise-deploy \
+  --exclude rise-resource-store-postgres \
+  --exclude rise-runtime-sync
 """
 env.SQLX_OFFLINE = true
+
+[tasks."terraform:check"]
+description = "Format-check, validate and unit-test the Terraform modules and e2e workspaces."
+run = """
+terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run
+# -backend=false so the e2e workspaces, which declare an S3 backend, check
+# without credentials or a bucket.
+for dir in modules/*/ tests/e2e/bootstrap tests/e2e/run; do
+  echo "==> $dir"
+  terraform -chdir="$dir" init -backend=false -input=false >/dev/null
+  terraform -chdir="$dir" validate
+  terraform -chdir="$dir" test
+done
+"""
+
+[tasks."terraform:fmt"]
+description = "Format the Terraform modules in place."
+run = "terraform fmt -recursive modules/"
 
 [tasks."helm:deps"]
 description = "Refresh vendored Helm chart dependencies under helm/rise/charts."
@@ -198,6 +222,10 @@ description = "Install documentation dependencies (shared workspace)."
 dir = "docs"
 run = "npm install"
 
+[tasks."docs:llms"]
+description = "Generate llms.txt, llms-full.txt, and per-page .md files for both doc sites (for LLM consumption)."
+run = "node docs/scripts/generate-llms.mjs"
+
 [tasks."docs:serve"]
 description = "Serve bundled user documentation with live reload on port 3001."
 depends = ["docs:install"]
@@ -206,7 +234,7 @@ run = "npm run dev"
 
 [tasks."docs:build"]
 description = "Build the bundled user documentation."
-depends = ["docs:install"]
+depends = ["docs:install", "docs:llms"]
 dir = "docs/user"
 run = "npm run build"
 
@@ -218,7 +246,7 @@ run = "npm run dev"
 
 [tasks."docs:engineering:build"]
 description = "Build the engineering documentation."
-depends = ["docs:install"]
+depends = ["docs:install", "docs:llms"]
 dir = "docs/engineering"
 run = "npm run build"
 

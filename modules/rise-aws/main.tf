@@ -1,6 +1,7 @@
 locals {
-  name        = var.name
-  repo_prefix = "${var.name}/"
+  name                 = var.name
+  controller_role_name = coalesce(var.controller_role_name, var.name)
+  repo_prefix          = coalesce(var.ecr_repository_prefix, "${var.name}/")
 
   # KMS key alias name - defaults to just the name, but can be overridden for backwards compatibility
   kms_key_alias = var.kms_key_alias != null ? var.kms_key_alias : var.name
@@ -31,11 +32,34 @@ locals {
 
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
+data "aws_partition" "current" {}
 
 locals {
-  region           = data.aws_region.current.id
+  region           = data.aws_region.current.region
   account_id       = data.aws_caller_identity.current.account_id
+  partition        = data.aws_partition.current.partition
   s3_bucket_prefix = var.s3_bucket_prefix != null ? var.s3_bucket_prefix : var.name
+
+  ecs_cluster_name        = coalesce(var.ecs_cluster_name, var.name)
+  ecs_log_group_name      = coalesce(var.ecs_log_group_name, "/${var.name}")
+  ecs_execution_role_name = coalesce(var.ecs_execution_role_name, "${var.name}-ecs-execution")
+  ecs_workload_role_name  = coalesce(var.ecs_workload_role_name, "${var.name}-app")
+  ecs_traefik_role_name   = coalesce(var.ecs_traefik_role_name, "${var.name}-traefik")
+  ecr_push_role_name      = coalesce(var.ecr_push_role_name, "${var.name}-ecr-push")
+  ecs_cluster_arn         = "arn:${local.partition}:ecs:${local.region}:${local.account_id}:cluster/${local.ecs_cluster_name}"
+
+  # Trailing slashes in the configured prefix would produce `parameter//rise//*`,
+  # which matches nothing.
+  ssm_prefix = trim(var.ssm_parameter_prefix, "/")
+
+  # enable_ecs implies the ecs-tasks trust rather than requiring the operator to
+  # set both: the control plane takes its credentials from this role as its ECS
+  # taskRoleArn, so an enable_ecs install that omitted it would fail at task
+  # start with "ECS was unable to assume the configured role" and no clue why.
+  assume_role_services = distinct(concat(
+    var.assume_role_services,
+    var.enable_ecs ? ["ecs-tasks.amazonaws.com"] : []
+  ))
 }
 
 # -----------------------------------------------------------------------------
@@ -235,9 +259,9 @@ data "aws_iam_policy_document" "backend" {
   dynamic "statement" {
     for_each = var.enable_s3 ? [1] : []
     content {
-      sid    = "DenyRemoveS3UserBoundary"
-      effect = "Deny"
-      actions = ["iam:DeleteUserPermissionsBoundary"]
+      sid       = "DenyRemoveS3UserBoundary"
+      effect    = "Deny"
+      actions   = ["iam:DeleteUserPermissionsBoundary"]
       resources = ["arn:aws:iam::${local.account_id}:user/${local.s3_bucket_prefix}-s3-*"]
     }
   }
@@ -280,9 +304,204 @@ data "aws_iam_policy_document" "backend" {
       ]
     }
   }
+
+  # ---------------------------------------------------------------------------
+  # ECS deployment controller (ADR-0005 D14)
+  #
+  # The deployment controller calls ECS, SSM and STS; its runtime-log reader
+  # also calls CloudWatch Logs. It needs no EC2 or service-discovery access:
+  # task IPs come from DescribeTasks attachment details, and workloads do not
+  # register with Cloud Map.
+  # ---------------------------------------------------------------------------
+
+  # Services and their tasks, in one cluster. CreateService is included here
+  # rather than with the list operations because its resource ARN is the service
+  # it is about to create, which the wildcard covers.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid    = "ManageECSServices"
+      effect = "Allow"
+      actions = [
+        "ecs:CreateService",
+        "ecs:UpdateService",
+        "ecs:DeleteService",
+        "ecs:DescribeServices",
+        "ecs:DescribeTasks"
+      ]
+      resources = [
+        "arn:${local.partition}:ecs:${local.region}:${local.account_id}:service/${local.ecs_cluster_name}/*",
+        "arn:${local.partition}:ecs:${local.region}:${local.account_id}:task/${local.ecs_cluster_name}/*"
+      ]
+      condition {
+        test     = "ArnEquals"
+        variable = "ecs:cluster"
+        values   = [local.ecs_cluster_arn]
+      }
+    }
+  }
+
+  # Runtime logs are read back through the control plane after project-scoped
+  # authorization. Both actions support a log-group resource, so the grant is
+  # confined to the one group named by the ECS controller.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid    = "ReadECSRuntimeLogs"
+      effect = "Allow"
+      actions = [
+        "logs:FilterLogEvents",
+        "logs:StartLiveTail"
+      ]
+      resources = [
+        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}:*"
+      ]
+    }
+  }
+
+  # TagResource is granted separately, without the cluster condition the
+  # statement above carries. It takes a resource ARN and tags, and no cluster
+  # parameter, so `ecs:cluster` is absent from the request context and an
+  # ArnEquals test on it can only fail -- including for the implicit tagging
+  # inside CreateService, which then fails with "no identity-based policy
+  # allows the ecs:TagResource action" however plainly the action is listed.
+  #
+  # Nothing is widened by dropping it: a service ARN embeds its cluster
+  # (`service/<cluster>/<name>`), so the resource list bounds this to the same
+  # cluster the condition did. Only service ARNs are tagged -- at creation, and
+  # again after an update to stamp the content hash -- but task ARNs stay in
+  # scope because tags propagate to tasks.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid     = "TagECSServices"
+      effect  = "Allow"
+      actions = ["ecs:TagResource"]
+      resources = [
+        "arn:${local.partition}:ecs:${local.region}:${local.account_id}:service/${local.ecs_cluster_name}/*",
+        "arn:${local.partition}:ecs:${local.region}:${local.account_id}:task/${local.ecs_cluster_name}/*"
+      ]
+    }
+  }
+
+  # DescribeClusters is the startup connectivity check.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid       = "DescribeECSCluster"
+      effect    = "Allow"
+      actions   = ["ecs:DescribeClusters"]
+      resources = [local.ecs_cluster_arn]
+    }
+  }
+
+  # ListServices and ListTasks take the cluster as a request parameter and
+  # support no resource-level permissions, so the cluster condition is the only
+  # thing bounding them.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid    = "ListECSWorkloads"
+      effect = "Allow"
+      actions = [
+        "ecs:ListServices",
+        "ecs:ListTasks"
+      ]
+      resources = ["*"]
+      condition {
+        test     = "ArnEquals"
+        variable = "ecs:cluster"
+        values   = [local.ecs_cluster_arn]
+      }
+    }
+  }
+
+  # RegisterTaskDefinition supports neither resource-level permissions nor the
+  # ecs:cluster condition key -- a task definition is not a cluster-scoped
+  # object. This one cannot be narrowed; it is not an oversight.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid       = "RegisterECSTaskDefinitions"
+      effect    = "Allow"
+      actions   = ["ecs:RegisterTaskDefinition"]
+      resources = ["*"]
+    }
+  }
+
+  # The most security-sensitive statement in this module. Every task definition
+  # the reconciler registers names an execution role and a task role, which
+  # requires iam:PassRole -- and an unscoped PassRole would let anyone who can
+  # create a Rise deployment run a task as any role in the account. Two ARNs,
+  # plus a condition confining the grant to launching ECS tasks so it cannot be
+  # redirected at another service.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid     = "PassECSTaskRoles"
+      effect  = "Allow"
+      actions = ["iam:PassRole"]
+      # Built by interpolation rather than referencing aws_iam_role.ecs_execution,
+      # so the whole policy document is known at plan time. A reviewer reading
+      # `terraform plan` on the most escalation-prone statement in the module
+      # should see the two ARNs, not "(known after apply)".
+      resources = [
+        "arn:${local.partition}:iam::${local.account_id}:role/${local.ecs_execution_role_name}",
+        "arn:${local.partition}:iam::${local.account_id}:role/${local.ecs_workload_role_name}"
+      ]
+      condition {
+        test     = "StringEquals"
+        variable = "iam:PassedToService"
+        values   = ["ecs-tasks.amazonaws.com"]
+      }
+    }
+  }
+
+  # Secret environment variables live as SSM SecureString parameters the
+  # controller writes and deletes per deployment. ECS resolves them at task
+  # start under the execution role, which is granted separately.
+  dynamic "statement" {
+    for_each = var.enable_ecs ? [1] : []
+    content {
+      sid    = "ManageECSSecretParameters"
+      effect = "Allow"
+      actions = [
+        "ssm:PutParameter",
+        "ssm:DeleteParameter",
+        "ssm:DeleteParameters",
+        "ssm:GetParametersByPath",
+        "ssm:AddTagsToResource"
+      ]
+      resources = [
+        "arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter/${local.ssm_prefix}/*"
+      ]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_ecs && var.ssm_kms_key_arn != null ? [1] : []
+    content {
+      sid    = "EncryptECSSecretParameters"
+      effect = "Allow"
+      actions = [
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey"
+      ]
+      resources = [var.ssm_kms_key_arn]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ssm.${local.region}.amazonaws.com"]
+      }
+    }
+  }
 }
 
 resource "aws_iam_policy" "backend" {
+  count = var.iam_policy_mode == "managed" ? 1 : 0
+
   name        = local.name
   description = "IAM policy for Rise backend to manage ECR repositories, RDS instances, and S3 buckets"
   policy      = data.aws_iam_policy_document.backend.json
@@ -302,6 +521,30 @@ data "aws_iam_policy_document" "assume_role_default" {
       identifiers = ["arn:aws:iam::${local.account_id}:root"]
     }
     actions = ["sts:AssumeRole"]
+  }
+
+  # Service principals, for runtimes that hand the role to a workload directly
+  # rather than through a federated identity. ECS is the case that needs it: the
+  # control plane takes its AWS credentials from the task role named on its own
+  # task definition, so without ecs-tasks.amazonaws.com here the role cannot be
+  # used as a taskRoleArn at all.
+  dynamic "statement" {
+    for_each = length(local.assume_role_services) > 0 ? [1] : []
+    content {
+      effect = "Allow"
+      principals {
+        type        = "Service"
+        identifiers = local.assume_role_services
+      }
+      actions = ["sts:AssumeRole"]
+      # Confused-deputy guard: the service may assume this role only on behalf
+      # of this account, never for a resource someone else owns.
+      condition {
+        test     = "StringEquals"
+        variable = "aws:SourceAccount"
+        values   = [local.account_id]
+      }
+    }
   }
 }
 
@@ -335,15 +578,26 @@ locals {
 }
 
 resource "aws_iam_role" "backend" {
-  name               = local.name
-  description        = "IAM role for Rise backend"
-  assume_role_policy = local.assume_role_policy
-  tags               = local.tags
+  name                 = local.controller_role_name
+  description          = "IAM role for Rise backend"
+  assume_role_policy   = local.assume_role_policy
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 resource "aws_iam_role_policy_attachment" "backend" {
+  count = var.iam_policy_mode == "managed" ? 1 : 0
+
   role       = aws_iam_role.backend.name
-  policy_arn = aws_iam_policy.backend.arn
+  policy_arn = aws_iam_policy.backend[0].arn
+}
+
+resource "aws_iam_role_policy" "backend" {
+  count = var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "controller"
+  role   = aws_iam_role.backend.id
+  policy = data.aws_iam_policy_document.backend.json
 }
 
 # -----------------------------------------------------------------------------
@@ -358,10 +612,18 @@ resource "aws_iam_user" "backend" {
 }
 
 resource "aws_iam_user_policy_attachment" "backend" {
-  count = var.create_iam_user ? 1 : 0
+  count = var.create_iam_user && var.iam_policy_mode == "managed" ? 1 : 0
 
   user       = aws_iam_user.backend[0].name
-  policy_arn = aws_iam_policy.backend.arn
+  policy_arn = aws_iam_policy.backend[0].arn
+}
+
+resource "aws_iam_user_policy" "backend" {
+  count = var.create_iam_user && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "controller"
+  user   = aws_iam_user.backend[0].name
+  policy = data.aws_iam_policy_document.backend.json
 }
 
 resource "aws_iam_access_key" "backend" {
@@ -411,9 +673,9 @@ data "aws_iam_policy_document" "push_role" {
 }
 
 resource "aws_iam_policy" "push_role" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
-  name        = "${var.name}-ecr-push"
+  name        = local.ecr_push_role_name
   description = "IAM policy for Rise ECR push operations"
   policy      = data.aws_iam_policy_document.push_role[0].json
   tags        = local.tags
@@ -450,17 +712,26 @@ data "aws_iam_policy_document" "push_role_assume" {
 resource "aws_iam_role" "push_role" {
   count = var.enable_ecr ? 1 : 0
 
-  name               = "${var.name}-ecr-push"
-  description        = "IAM role for Rise ECR push operations (assumed to generate scoped credentials)"
-  assume_role_policy = data.aws_iam_policy_document.push_role_assume[0].json
-  tags               = local.tags
+  name                 = local.ecr_push_role_name
+  description          = "IAM role for Rise ECR push operations (assumed to generate scoped credentials)"
+  assume_role_policy   = data.aws_iam_policy_document.push_role_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
 }
 
 resource "aws_iam_role_policy_attachment" "push_role" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   role       = aws_iam_role.push_role[0].name
   policy_arn = aws_iam_policy.push_role[0].arn
+}
+
+resource "aws_iam_role_policy" "push_role" {
+  count = var.enable_ecr && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "push"
+  role   = aws_iam_role.push_role[0].id
+  policy = data.aws_iam_policy_document.push_role[0].json
 }
 
 # The controller also needs permission to assume the push role
@@ -478,7 +749,7 @@ data "aws_iam_policy_document" "assume_push_role" {
 }
 
 resource "aws_iam_policy" "assume_push_role" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   name        = "${var.name}-ecr-assume-push"
   description = "Allow assuming the ECR push role"
@@ -487,17 +758,207 @@ resource "aws_iam_policy" "assume_push_role" {
 }
 
 resource "aws_iam_role_policy_attachment" "controller_assume_push" {
-  count = var.enable_ecr ? 1 : 0
+  count = var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   role       = aws_iam_role.backend.name
   policy_arn = aws_iam_policy.assume_push_role[0].arn
 }
 
+resource "aws_iam_role_policy" "controller_assume_push" {
+  count = var.enable_ecr && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "assume-ecr-push"
+  role   = aws_iam_role.backend.id
+  policy = data.aws_iam_policy_document.assume_push_role[0].json
+}
+
 resource "aws_iam_user_policy_attachment" "controller_assume_push" {
-  count = var.create_iam_user && var.enable_ecr ? 1 : 0
+  count = var.create_iam_user && var.enable_ecr && var.iam_policy_mode == "managed" ? 1 : 0
 
   user       = aws_iam_user.backend[0].name
   policy_arn = aws_iam_policy.assume_push_role[0].arn
+}
+
+resource "aws_iam_user_policy" "controller_assume_push" {
+  count = var.create_iam_user && var.enable_ecr && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "assume-ecr-push"
+  user   = aws_iam_user.backend[0].name
+  policy = data.aws_iam_policy_document.assume_push_role[0].json
+}
+
+# -----------------------------------------------------------------------------
+# ECS task execution role
+#
+# The identity ECS itself assumes -- to pull images and to resolve the secrets a
+# task definition references. It is created here rather than alongside the
+# cluster for one structural reason: it has to appear verbatim in the
+# iam:PassRole statement above, and a module that consumed its ARN from the
+# module that consumes this module's role ARNs would be a cycle Terraform
+# cannot plan.
+#
+# Rise never assumes this role. It only passes it.
+# -----------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ecs_execution_assume" {
+  count = var.enable_ecs ? 1 : 0
+
+  statement {
+    effect = "Allow"
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+    actions = ["sts:AssumeRole"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs_execution" {
+  count = var.enable_ecs ? 1 : 0
+
+  name                 = local.ecs_execution_role_name
+  description          = "ECS task execution role for Rise workloads (image pull + secret resolution)"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_execution_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
+}
+
+# ECR pull and CloudWatch Logs. This is the managed policy AWS maintains for
+# exactly this role; the ECS operator docs name it, so keep them in step.
+resource "aws_iam_role_policy_attachment" "ecs_execution_managed" {
+  count = var.enable_ecs ? 1 : 0
+
+  role       = aws_iam_role.ecs_execution[0].name
+  policy_arn = "arn:${local.partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+data "aws_iam_policy_document" "ecs_execution" {
+  count = var.enable_ecs ? 1 : 0
+
+  # Secret env vars: ECS reads the SecureStrings at every task start, so this is
+  # a read the *runtime* needs, not one the control plane does.
+  statement {
+    sid    = "ReadSecretParameters"
+    effect = "Allow"
+    actions = [
+      "ssm:GetParameters"
+    ]
+    resources = [
+      "arn:${local.partition}:ssm:${local.region}:${local.account_id}:parameter/${local.ssm_prefix}/*"
+    ]
+  }
+
+  dynamic "statement" {
+    for_each = var.ssm_kms_key_arn != null ? [1] : []
+    content {
+      sid       = "DecryptSecretParameters"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt"]
+      resources = [var.ssm_kms_key_arn]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ssm.${local.region}.amazonaws.com"]
+      }
+    }
+  }
+
+  # Values injected through the task definition's `secrets` block -- the control
+  # plane's own DATABASE_URL and signing keys, and repositoryCredentials for a
+  # private non-ECR registry.
+  dynamic "statement" {
+    for_each = length(var.ecs_secret_arns) > 0 ? [1] : []
+    content {
+      sid       = "ReadTaskSecrets"
+      effect    = "Allow"
+      actions   = ["secretsmanager:GetSecretValue"]
+      resources = var.ecs_secret_arns
+    }
+  }
+}
+
+resource "aws_iam_policy" "ecs_execution" {
+  count = var.enable_ecs && var.iam_policy_mode == "managed" ? 1 : 0
+
+  name        = "${local.ecs_execution_role_name}-secrets"
+  description = "Secret resolution for the Rise ECS task execution role"
+  policy      = data.aws_iam_policy_document.ecs_execution[0].json
+  tags        = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_execution" {
+  count = var.enable_ecs && var.iam_policy_mode == "managed" ? 1 : 0
+
+  role       = aws_iam_role.ecs_execution[0].name
+  policy_arn = aws_iam_policy.ecs_execution[0].arn
+}
+
+resource "aws_iam_role_policy" "ecs_execution" {
+  count = var.enable_ecs && var.iam_policy_mode == "inline" ? 1 : 0
+
+  name   = "secrets"
+  role   = aws_iam_role.ecs_execution[0].id
+  policy = data.aws_iam_policy_document.ecs_execution[0].json
+}
+
+# -----------------------------------------------------------------------------
+# Application and Traefik task roles
+#
+# These identities are deliberately separate from the controller. The module
+# supplies only Traefik's discovery policy; applications start with an empty
+# role and receive whatever their operator adds within the common boundary.
+# -----------------------------------------------------------------------------
+
+resource "aws_iam_role" "ecs_workload" {
+  count = var.enable_ecs ? 1 : 0
+
+  name                 = local.ecs_workload_role_name
+  description          = "Task role for applications deployed by Rise"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_execution_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
+}
+
+data "aws_iam_policy_document" "ecs_traefik" {
+  count = var.enable_ecs ? 1 : 0
+
+  statement {
+    sid = "DiscoverTasks"
+    actions = [
+      "ec2:DescribeInstances",
+      "ecs:DescribeClusters",
+      "ecs:DescribeContainerInstances",
+      "ecs:DescribeTaskDefinition",
+      "ecs:DescribeTasks",
+      "ecs:ListClusters",
+      "ecs:ListTasks",
+      "ssm:DescribeInstanceInformation",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role" "ecs_traefik" {
+  count = var.enable_ecs ? 1 : 0
+
+  name                 = local.ecs_traefik_role_name
+  description          = "Traefik ECS provider discovery"
+  assume_role_policy   = data.aws_iam_policy_document.ecs_execution_assume[0].json
+  permissions_boundary = var.permissions_boundary_arn
+  tags                 = local.tags
+}
+
+resource "aws_iam_role_policy" "ecs_traefik" {
+  count = var.enable_ecs ? 1 : 0
+
+  name   = "discovery"
+  role   = aws_iam_role.ecs_traefik[0].id
+  policy = data.aws_iam_policy_document.ecs_traefik[0].json
 }
 
 # -----------------------------------------------------------------------------
@@ -518,9 +979,9 @@ resource "aws_iam_policy" "s3_user_boundary" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "S3BucketAccess"
-        Effect   = "Allow"
-        Action   = ["s3:*"]
+        Sid    = "S3BucketAccess"
+        Effect = "Allow"
+        Action = ["s3:*"]
         Resource = [
           "arn:aws:s3:::${local.s3_bucket_prefix}-*",
           "arn:aws:s3:::${local.s3_bucket_prefix}-*/*",

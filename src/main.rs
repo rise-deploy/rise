@@ -232,6 +232,11 @@ enum Commands {
         /// Project name (optional, used to load environment variables)
         #[arg(long, short)]
         project: Option<String>,
+        /// Container to run (required for multi-container projects). Selects
+        /// which `[containers.X]` to build and run; use `rise compose up` to run
+        /// all containers together.
+        #[arg(long)]
+        container: Option<String>,
         /// Load environment variables from the associated Rise project (non-secret only). Defaults to true.
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         use_project_env: bool,
@@ -244,7 +249,8 @@ enum Commands {
         /// HTTP port the application listens on (also sets PORT env var)
         #[arg(long, default_value = "8080")]
         http_port: u16,
-        /// Port to expose on the host (defaults to same as http-port)
+        /// Port to publish on the host. Defaults to the selected container's
+        /// port for --container, otherwise to --http-port.
         #[arg(long)]
         expose: Option<u16>,
         /// Runtime environment variables (format: KEY=VALUE, can be specified multiple times)
@@ -253,6 +259,9 @@ enum Commands {
         #[command(flatten)]
         build_args: build::BuildArgs,
     },
+    /// Run a project locally via Docker Compose
+    #[command(subcommand)]
+    Compose(ComposeCommands),
     /// Service account (workload identity) management commands
     #[command(subcommand)]
     #[command(visible_alias = "sa")]
@@ -260,10 +269,107 @@ enum Commands {
     /// Workload identity token commands (run inside a Rise deployment)
     #[command(subcommand)]
     Identity(IdentityCommands),
+    /// Install and manage Rise skills for AI assistants (Crush, Claude Code)
+    #[command(subcommand)]
+    Skill(SkillCommands),
     /// Team management commands
     #[command(subcommand)]
     #[command(visible_alias = "t")]
     Team(TeamCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum ComposeCommands {
+    /// Build a project locally and run it via Docker Compose (ephemeral — no
+    /// file is written to disk).
+    Up {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to load environment variables)
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
+        #[arg(long, short = 'E')]
+        environment: Option<String>,
+        /// HTTP port a single-container application listens on (also sets PORT env var).
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
+        /// Host port the Traefik router publishes (replicates `[routes]`).
+        #[arg(long, default_value = "8080")]
+        router_port: u16,
+        /// Run in the background instead of streaming logs in the foreground.
+        #[arg(long, short = 'd')]
+        detach: bool,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// Tear down a stack started by `rise compose up`.
+    Down {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to derive the compose project name)
+        #[arg(long, short)]
+        project: Option<String>,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// List the containers of a running stack.
+    Ps {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to derive the compose project name)
+        #[arg(long, short)]
+        project: Option<String>,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// Show logs from a running stack.
+    Logs {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to derive the compose project name)
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Stream new log output until interrupted.
+        #[arg(long, short)]
+        follow: bool,
+        /// Number of lines to show from the end of each container's log.
+        #[arg(long)]
+        tail: Option<String>,
+        /// Restrict output to these containers (defaults to all).
+        #[arg(long = "container", short = 'c')]
+        containers: Vec<String>,
+        #[command(flatten)]
+        build_args: build::BuildArgs,
+    },
+    /// Write a persistent `compose.yaml` you can customize and run yourself.
+    Generate {
+        /// Path to the directory containing the application
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project name (optional, used to load environment variables)
+        #[arg(long, short)]
+        project: Option<String>,
+        /// Target environment (e.g., 'staging'). Resolved from rise.toml if not specified.
+        #[arg(long, short = 'E')]
+        environment: Option<String>,
+        /// HTTP port a single-container application listens on (also sets PORT env var).
+        #[arg(long, default_value = "8080")]
+        http_port: u16,
+        /// Host port the Traefik router publishes (replicates `[routes]`).
+        #[arg(long, default_value = "8080")]
+        router_port: u16,
+        /// Write to stdout instead of a file.
+        #[arg(long)]
+        stdout: bool,
+        /// Output file path (defaults to `<path>/compose.yaml`).
+        #[arg(long, short = 'o')]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -281,6 +387,36 @@ enum IdentityCommands {
         /// (default 900). Omitting this field uses the server maximum.
         #[arg(long)]
         ttl_seconds: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillCommands {
+    /// Install or update a Rise skill from GitHub into your AI assistant's skills directory
+    Install {
+        /// Skill name (defaults to the bundled 'rise-app-builder' skill)
+        name: Option<String>,
+        /// Git ref to fetch from (branch, tag, or sha). Defaults to 'develop'
+        #[arg(long)]
+        git_ref: Option<String>,
+        /// Directory to install into. Defaults to ~/.claude/skills
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+    },
+    /// List installed skills
+    List {
+        /// Directory to inspect. Defaults to ~/.claude/skills
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
+    },
+    /// Remove an installed skill
+    #[command(visible_alias = "rm")]
+    Uninstall {
+        /// Skill name to remove
+        name: String,
+        /// Directory to remove from. Defaults to ~/.claude/skills
+        #[arg(long)]
+        target: Option<std::path::PathBuf>,
     },
 }
 
@@ -537,6 +673,12 @@ enum DeploymentCommands {
         /// vocabulary.
         #[arg(long = "level")]
         level: Vec<String>,
+        /// Show only lines from the given container of the deployment.
+        /// Repeat to allow multiple (e.g. `--container web --container api`).
+        /// Omit for every container. A single-container deployment has one
+        /// implicit container, `app`.
+        #[arg(long = "container")]
+        container: Vec<String>,
     },
 }
 
@@ -947,14 +1089,50 @@ where
     Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
 }
 
+/// Whether to colour log output.
+///
+/// Colours by default, including when nothing is attached to a terminal:
+/// whether that renders depends on what reads the stream, not on this process.
+/// `kubectl logs` passes the bytes through to a terminal that renders them, so
+/// a Kubernetes install wants colour despite having no tty; the ECS console
+/// draws the same bytes literally, so an ECS install does not. Being
+/// non-terminal is what those two share, which is why it cannot decide this --
+/// `modules/rise-ecs` sets `never` for the console it knows it is logging to.
+///
+/// `RISE_LOG_COLOR` selects: `never` (`0`, `false`, `no`) never colours,
+/// `always` (`1`, `true`, `yes`) always does, and `auto` colours only a
+/// terminal, for a pipe or a file. `NO_COLOR` set to anything non-empty
+/// disables, per <https://no-color.org>.
+fn ansi_enabled(rise_log_color: Option<&str>, no_color: Option<&str>, is_terminal: bool) -> bool {
+    match rise_log_color.map(str::trim) {
+        Some("always" | "1" | "true" | "yes") => return true,
+        Some("never" | "0" | "false" | "no") => return false,
+        Some("auto") if no_color.is_none_or(str::is_empty) => return is_terminal,
+        // Anything else falls through to NO_COLOR and then the default: an
+        // unrecognised value must not be louder than NO_COLOR, and must not
+        // quietly drop colour that was on before it was misspelled.
+        _ => {}
+    }
+    no_color.is_none_or(|v| v.is_empty())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for all commands
+    let ansi = ansi_enabled(
+        std::env::var("RISE_LOG_COLOR").ok().as_deref(),
+        std::env::var("NO_COLOR").ok().as_deref(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    );
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
         ))
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(ansi),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -1482,6 +1660,7 @@ async fn main() -> Result<()> {
                 timestamps,
                 since,
                 level,
+                container,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
                 let token =
@@ -1498,6 +1677,7 @@ async fn main() -> Result<()> {
                         timestamps: *timestamps,
                         since: since.as_deref(),
                         levels: level,
+                        containers: container,
                     },
                 )
                 .await?;
@@ -1589,6 +1769,26 @@ async fn main() -> Result<()> {
                     *ttl_seconds,
                 )
                 .await?;
+            }
+        },
+        Commands::Skill(skill_cmd) => match skill_cmd {
+            SkillCommands::Install {
+                name,
+                git_ref,
+                target,
+            } => {
+                cli::skill::install_command(
+                    name.as_ref().cloned(),
+                    git_ref.as_ref().cloned(),
+                    target.as_ref().cloned(),
+                )
+                .await?;
+            }
+            SkillCommands::List { target } => {
+                cli::skill::list_command(target.clone())?;
+            }
+            SkillCommands::Uninstall { name, target } => {
+                cli::skill::uninstall_command(name.clone(), target.clone())?;
             }
         },
         Commands::Environment(env_cmd) => {
@@ -1840,6 +2040,7 @@ async fn main() -> Result<()> {
         }
         Commands::Run {
             project,
+            container,
             use_project_env,
             path,
             environment,
@@ -1848,8 +2049,6 @@ async fn main() -> Result<()> {
             run_env,
             build_args,
         } => {
-            let expose_port = expose.unwrap_or(*http_port);
-
             // Resolve environment from --environment flag or rise.toml default
             let toml_config = build::config::load_full_project_config(path)?;
             let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
@@ -1859,17 +2058,123 @@ async fn main() -> Result<()> {
                 &config,
                 cli::run::RunOptions {
                     project_name: project.as_deref(),
+                    container: container.as_deref(),
                     use_project_env: *use_project_env,
                     path,
                     environment: resolved_env.as_deref(),
                     http_port: *http_port,
-                    expose: expose_port,
+                    expose: *expose,
                     run_env,
                     build_args,
                 },
             )
             .await?;
         }
+        Commands::Compose(compose_cmd) => match compose_cmd {
+            ComposeCommands::Up {
+                path,
+                project,
+                environment,
+                http_port,
+                router_port,
+                detach,
+                build_args,
+            } => {
+                let toml_config = build::config::load_full_project_config(path)?;
+                let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
+                cli::compose::up(
+                    &http_client,
+                    &config,
+                    cli::compose::UpOptions {
+                        path,
+                        project: project.as_deref(),
+                        environment: resolved_env.as_deref(),
+                        http_port: *http_port,
+                        router_port: *router_port,
+                        detach: *detach,
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Down {
+                path,
+                project,
+                build_args,
+            } => {
+                cli::compose::down(
+                    &config,
+                    cli::compose::DownOptions {
+                        path,
+                        project: project.as_deref(),
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Ps {
+                path,
+                project,
+                build_args,
+            } => {
+                cli::compose::ps(
+                    &config,
+                    cli::compose::PsOptions {
+                        path,
+                        project: project.as_deref(),
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Logs {
+                path,
+                project,
+                follow,
+                tail,
+                containers,
+                build_args,
+            } => {
+                cli::compose::logs(
+                    &config,
+                    cli::compose::LogsOptions {
+                        path,
+                        project: project.as_deref(),
+                        follow: *follow,
+                        tail: tail.clone(),
+                        containers,
+                        build_args,
+                    },
+                )
+                .await?;
+            }
+            ComposeCommands::Generate {
+                path,
+                project,
+                environment,
+                http_port,
+                router_port,
+                stdout,
+                output,
+            } => {
+                let toml_config = build::config::load_full_project_config(path)?;
+                let resolved_env = resolve_environment(environment.clone(), toml_config.as_ref());
+                cli::compose::generate(
+                    &http_client,
+                    &config,
+                    cli::compose::GenerateOptions {
+                        path,
+                        project: project.as_deref(),
+                        environment: resolved_env.as_deref(),
+                        http_port: *http_port,
+                        router_port: *router_port,
+                        stdout: *stdout,
+                        output: output.as_deref(),
+                    },
+                )
+                .await?;
+            }
+        },
         Commands::Deploy { .. } => {
             // Already transformed to Deployment(Create) above
             unreachable!("Deploy command should have been transformed to Deployment(Create)")
@@ -1877,4 +2182,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod log_color_tests {
+    use super::ansi_enabled;
+
+    #[test]
+    fn colour_is_on_by_default_with_or_without_a_terminal() {
+        // A Kubernetes container has no tty and still wants colour, because
+        // `kubectl logs` hands the bytes to one.
+        assert!(ansi_enabled(None, None, true));
+        assert!(ansi_enabled(None, None, false));
+    }
+
+    #[test]
+    fn auto_defers_to_the_terminal() {
+        assert!(ansi_enabled(Some("auto"), None, true));
+        assert!(!ansi_enabled(Some("auto"), None, false));
+    }
+
+    #[test]
+    fn rise_log_color_overrides_both_the_terminal_and_no_color() {
+        assert!(ansi_enabled(Some("always"), Some("1"), false));
+        assert!(!ansi_enabled(Some("never"), None, true));
+    }
+
+    #[test]
+    fn no_color_disables_colour_on_a_terminal() {
+        assert!(!ansi_enabled(None, Some("1"), true));
+        // Set but empty is not "set", per the convention.
+        assert!(ansi_enabled(None, Some(""), true));
+    }
+
+    #[test]
+    fn an_unrecognised_override_defers_rather_than_forcing() {
+        assert!(!ansi_enabled(Some("banana"), Some("1"), true));
+        assert!(ansi_enabled(Some("banana"), None, false));
+    }
 }

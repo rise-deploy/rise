@@ -36,6 +36,10 @@ pub fn deployment_routes() -> Router<AppState> {
             post(super::handlers::stop_deployment),
         )
         .route(
+            "/projects/{project_name}/deployments/{deployment_id}/events",
+            get(super::handlers::list_deployment_events),
+        )
+        .route(
             "/projects/{project_name}/deployments/{deployment_id}/logs",
             get(super::handlers::stream_deployment_logs),
         )

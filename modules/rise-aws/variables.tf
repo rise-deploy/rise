@@ -4,6 +4,29 @@ variable "name" {
   default     = "rise-backend"
 }
 
+variable "controller_role_name" {
+  description = "Name for the Rise control-plane IAM role. Defaults to var.name."
+  type        = string
+  default     = null
+}
+
+variable "permissions_boundary_arn" {
+  description = "Optional permissions boundary attached to every IAM role this module creates."
+  type        = string
+  default     = null
+}
+
+variable "iam_policy_mode" {
+  description = "How this module attaches its generated policies. inline avoids iam:CreatePolicy in delegated installations; managed preserves the existing resource shape."
+  type        = string
+  default     = "managed"
+
+  validation {
+    condition     = contains(["inline", "managed"], var.iam_policy_mode)
+    error_message = "iam_policy_mode must be inline or managed."
+  }
+}
+
 variable "tags" {
   description = "Tags to apply to all resources"
   type        = map(string)
@@ -16,6 +39,18 @@ variable "create_iam_user" {
   description = "Create an IAM user with access keys for the Rise backend (use for non-AWS deployments)"
   type        = bool
   default     = false
+}
+
+variable "assume_role_services" {
+  description = <<-EOT
+    AWS service principals allowed to assume the backend role, e.g.
+    ["ecs-tasks.amazonaws.com"] when Rise runs as an ECS task and takes its
+    credentials from the task role. Empty means only the account root may
+    assume it. Ignored when irsa_oidc_provider_arn is set, which selects the
+    EKS federated trust policy instead.
+  EOT
+  type        = list(string)
+  default     = []
 }
 
 variable "irsa_oidc_provider_arn" {
@@ -42,6 +77,23 @@ variable "enable_ecr" {
   description = "Enable ECR permissions for the Rise backend. Set to true if using ECR for container registry."
   type        = bool
   default     = true
+}
+
+variable "ecr_repository_prefix" {
+  description = "Repository path prefix managed by Rise. Defaults to <name>/."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ecr_repository_prefix == null || endswith(var.ecr_repository_prefix, "/")
+    error_message = "ecr_repository_prefix must end in /."
+  }
+}
+
+variable "ecr_push_role_name" {
+  description = "Name for the scoped ECR publisher role. Defaults to <name>-ecr-push."
+  type        = string
+  default     = null
 }
 
 variable "enable_rds" {
@@ -123,4 +175,91 @@ variable "max_image_count" {
   description = "Maximum number of images to retain per repository"
   type        = number
   default     = 100
+}
+
+# -----------------------------------------------------------------------------
+# ECS deployment controller (ADR-0005 D14)
+#
+# This module makes IAM, not infrastructure: the cluster, namespace and log group
+# are created elsewhere (modules/rise-ecs, or by hand). It scopes its policies by
+# interpolating ARNs from *names* rather than accepting ARNs as inputs, exactly as
+# the ECR/RDS/S3 sections already do. That is what keeps the two modules free of a
+# dependency cycle -- rise-ecs consumes role ARNs from here, so nothing here may
+# consume a resource reference from there.
+# -----------------------------------------------------------------------------
+
+variable "enable_ecs" {
+  description = "Create the ECS task execution role and add the deployment-controller statements to the backend policy."
+  type        = bool
+  default     = false
+}
+
+variable "ecs_cluster_name" {
+  description = "Name of the ECS cluster Rise reconciles. Defaults to var.name; must match the cluster rise-ecs creates or the one you already run."
+  type        = string
+  default     = null
+}
+
+variable "ecs_log_group_name" {
+  description = "CloudWatch log group Rise reads for ECS runtime logs. Defaults to /<name>; must match deployment_controller.log_group."
+  type        = string
+  default     = null
+
+  validation {
+    condition = var.ecs_log_group_name == null ? true : can(regex(
+      "^[A-Za-z0-9._/#-]+$",
+      var.ecs_log_group_name
+    ))
+    error_message = "ecs_log_group_name must be a non-empty CloudWatch Logs group name."
+  }
+}
+
+variable "ecs_execution_role_name" {
+  description = "Name for the ECS task execution role this module creates. Defaults to \"<name>-ecs-execution\"."
+  type        = string
+  default     = null
+}
+
+variable "ecs_workload_role_name" {
+  description = "Name for the task role used by applications Rise deploys. Defaults to <name>-app."
+  type        = string
+  default     = null
+}
+
+variable "ecs_traefik_role_name" {
+  description = "Name for the discovery-only Traefik task role. Defaults to <name>-traefik."
+  type        = string
+  default     = null
+}
+
+variable "ssm_parameter_prefix" {
+  description = <<-EOT
+    Path prefix for the SSM SecureString parameters carrying secret environment
+    variables. Must equal deployment_controller.ssm_parameter_prefix, or the
+    controller loses access to the parameters it wrote itself.
+  EOT
+  type        = string
+  default     = "rise"
+}
+
+variable "ssm_kms_key_arn" {
+  description = <<-EOT
+    CMK the SSM SecureStrings are encrypted with. Null means the AWS-managed
+    alias/aws/ssm key, which needs no explicit grant.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "ecs_secret_arns" {
+  description = <<-EOT
+    Secrets Manager ARNs the task execution role may read, for values injected
+    into containers through the task definition's `secrets` block -- the control
+    plane's own DATABASE_URL and signing keys, and any
+    repository_credentials_secret_arn for a private non-ECR registry. Secrets
+    Manager appends a random suffix to every ARN, so these are usually prefix
+    patterns ending in `-*`.
+  EOT
+  type        = list(string)
+  default     = []
 }

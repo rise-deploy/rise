@@ -1,3 +1,4 @@
+use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
@@ -11,6 +12,10 @@ use crate::server::deployment::state_machine;
 use crate::server::state::ControllerState;
 use rise_runtime_sync::{leader_controller, LeaderElection};
 use tokio_util::sync::CancellationToken;
+
+/// Deployments deleted per retention pass. Bounded so one sweep cannot hold a
+/// long transaction over a large backlog on the first run after enabling it.
+const DEPLOYMENT_DELETE_BATCH: i64 = 500;
 
 /// Project controller handles project lifecycle operations.
 ///
@@ -51,6 +56,12 @@ impl ProjectController {
                 // `last_run_at`, not on any single replica's local state).
                 "rise-project-cleanup" every Duration::from_secs(3600)
                     => controller.cleanup_expired_transient_state().await,
+                // Deployment history retention. Hourly is far more often than
+                // the bounds it enforces need: the event cap tolerates a flap
+                // accumulating for an hour, and deployment deletion is measured
+                // in days.
+                "rise-deployment-retention" every Duration::from_secs(3600)
+                    => controller.enforce_deployment_retention(&election).await,
             },
         }
         .await
@@ -62,6 +73,54 @@ impl ProjectController {
         if n > 0 {
             debug!("Cleaned up {} expired OAuth transient state rows", n);
         }
+        Ok(())
+    }
+
+    /// Bound the growth of deployment history (leader-gated, hourly).
+    ///
+    /// The event cap always runs. Deleting whole deployments is opt-in, and
+    /// re-verifies leadership immediately before the write: it is irreversible,
+    /// so a replica that lost the lease mid-pass must not delete alongside the
+    /// new leader.
+    async fn enforce_deployment_retention(&self, election: &LeaderElection) -> anyhow::Result<()> {
+        let settings = &self.state.deployment_retention;
+
+        let trimmed = crate::db::retention::trim_deployment_events(
+            &self.state.db_pool,
+            settings.max_events_per_deployment,
+        )
+        .await?;
+        if trimmed > 0 {
+            info!(
+                "Trimmed {} deployment event(s) beyond the per-deployment cap of {}",
+                trimmed, settings.max_events_per_deployment
+            );
+        }
+
+        if !settings.delete_aged_deployments {
+            return Ok(());
+        }
+
+        let older_than =
+            Utc::now() - chrono::Duration::days(i64::from(settings.max_deployment_age_days));
+
+        // Bounded per pass so one sweep cannot hold a long transaction over a
+        // large backlog; the next hour picks up where this left off.
+        election.assert_leader().await?;
+        let deleted = crate::db::retention::delete_aged_deployments(
+            &self.state.db_pool,
+            older_than,
+            settings.keep_primary_deployments_per_environment,
+            DEPLOYMENT_DELETE_BATCH,
+        )
+        .await?;
+        if deleted > 0 {
+            info!(
+                "Deleted {} deployment(s) finished before {}",
+                deleted, older_than
+            );
+        }
+
         Ok(())
     }
 
@@ -122,6 +181,7 @@ impl ProjectController {
                             &self.state.db_pool,
                             deployment.id,
                             crate::db::models::TerminationReason::UserStopped,
+                            None,
                         )
                         .await?;
                     }

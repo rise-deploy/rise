@@ -112,6 +112,7 @@ fn build_multi_container_payload(
         .map(|r| RouteSpec {
             path: r.path.clone(),
             container: r.container.clone(),
+            access: r.access.clone(),
         })
         .collect();
 
@@ -1227,7 +1228,7 @@ pub async fn create_deployment(
 
         // Step 3: Update status to 'building'
         let token = token_with_retry(&provider).await?;
-        update_deployment_status(
+        update_deployment_status_with(
             http_client,
             backend_url,
             &token,
@@ -1235,6 +1236,7 @@ pub async fn create_deployment(
             &deployment_info.deployment_id,
             "Building",
             None,
+            detect_git_provenance(),
         )
         .await?;
 
@@ -1361,7 +1363,7 @@ async fn build_and_push_multi_container(
     let token = token_with_retry(provider).await?;
     let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
 
-    update_deployment_status(
+    update_deployment_status_with(
         http_client,
         backend_url,
         &token,
@@ -1369,6 +1371,7 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
         "Building",
         None,
+        detect_git_provenance(),
     )
     .await?;
 
@@ -1378,6 +1381,12 @@ async fn build_and_push_multi_container(
     // needless mint + login before every container.
     let min_remaining = registry_cred_min_remaining();
     let mut cached_creds: Option<TimedRegistryCredentials> = None;
+
+    // One entry per container, reported on the `Pushed` transition. A
+    // multi-container deployment builds every image inside a single `Building`
+    // state, so the transition timestamps only ever give the total — which
+    // image was slow is exactly what they cannot say.
+    let mut image_reports: Vec<serde_json::Value> = Vec::new();
 
     for container in &resolved.containers {
         let Some(image_tag) = container_images.get(&container.name) else {
@@ -1416,6 +1425,11 @@ async fn build_and_push_multi_container(
             BuildPushMode::Inline
         });
         let container_cli = options.container_cli.command().to_string();
+        // What the project asked for. `None` means the method was auto-detected
+        // from the build context, and the detected value is resolved inside
+        // `build_image` rather than surfaced here — so the attribute is omitted
+        // rather than guessed at.
+        let build_method = options.backend.clone();
 
         if !deploy_opts.build_args.separate_push {
             // Re-mint registry credentials only when the previous container's are
@@ -1457,6 +1471,7 @@ async fn build_and_push_multi_container(
         log_platform_choice(&options.platform, options.platform_source, "Building");
         info!("→ Building container '{}' as {}", container.name, image_tag);
 
+        let build_started = Instant::now();
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
             report_failed_status(
@@ -1470,6 +1485,10 @@ async fn build_and_push_multi_container(
             .await;
             return Err(e);
         }
+        let build_ms = build_started.elapsed().as_millis() as u64;
+
+        let mut push_ms: Option<u64> = None;
+        let push_started = Instant::now();
         if deploy_opts.build_args.separate_push {
             if let Err(e) = push_with_fresh_registry_credentials(
                 http_client,
@@ -1494,12 +1513,29 @@ async fn build_and_push_multi_container(
                 .await;
                 return Err(e);
             }
+            push_ms = Some(push_started.elapsed().as_millis() as u64);
         }
+
+        let mut report = serde_json::json!({
+            "container": container.name,
+            "image": image_tag,
+            "build_ms": build_ms,
+        });
+        if let Some(method) = &build_method {
+            report["build_method"] = serde_json::json!(method);
+        }
+        // Omitted, not null, when the push was folded into the build: an inline
+        // push has no separately observable duration, and a stored null reads
+        // as "measured, and the answer was nothing".
+        if let Some(push_ms) = push_ms {
+            report["push_ms"] = serde_json::json!(push_ms);
+        }
+        image_reports.push(report);
         info!("  ✓ Pushed container '{}'", container.name);
     }
 
     let token = token_with_retry(provider).await?;
-    update_deployment_status(
+    update_deployment_status_with(
         http_client,
         backend_url,
         &token,
@@ -1507,6 +1543,12 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
         "Pushed",
         None,
+        (!image_reports.is_empty()).then(|| {
+            serde_json::json!({
+                "registry": deployment_info.credentials.registry_url,
+                "images": image_reports,
+            })
+        }),
     )
     .await?;
 
@@ -1716,6 +1758,53 @@ fn detect_ci_repository_url() -> Option<String> {
 ///
 /// Equivalent to the fetch URL reported by `git remote show origin`, but
 /// resolved offline via `git remote get-url origin`.
+/// Run a `git` command in the working directory, with a timeout.
+///
+/// Threaded and time-bounded for the same reason `detect_git_remote_url` is: a
+/// misconfigured credential helper or a filesystem-backed repository can block
+/// indefinitely, and reporting build provenance must never be able to hang a
+/// deploy.
+fn git_output(args: &'static [&'static str]) -> Option<String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new("git").args(args).output());
+    });
+
+    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// What the source tree was when the build started, or `None` outside a Git
+/// repository.
+///
+/// `dirty` is the part worth having: an image built from uncommitted changes is
+/// not reproducible from its revision, and that is exactly the thing someone
+/// tries to do when a deployment misbehaves.
+fn detect_git_provenance() -> Option<serde_json::Value> {
+    let revision = git_output(&["rev-parse", "HEAD"])?;
+    let mut provenance = serde_json::json!({ "git_revision": revision });
+
+    if let Some(branch) = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        // Detached HEAD reports the literal "HEAD", which names nothing.
+        if branch != "HEAD" {
+            provenance["git_branch"] = serde_json::json!(branch);
+        }
+    }
+    // `--porcelain` prints one line per changed path and nothing at all for a
+    // clean tree, so emptiness is the test.
+    if let Some(status) = git_output(&["status", "--porcelain"]) {
+        provenance["git_dirty"] = serde_json::json!(!status.is_empty());
+    }
+
+    Some(provenance)
+}
+
 fn detect_git_remote_url() -> Option<String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1984,6 +2073,37 @@ async fn update_deployment_status(
     status: &str,
     error_message: Option<&str>,
 ) -> Result<()> {
+    update_deployment_status_with(
+        http_client,
+        backend_url,
+        token,
+        project_name,
+        deployment_id,
+        status,
+        error_message,
+        None,
+    )
+    .await
+}
+
+/// Report a transition along with what was observed while making it.
+///
+/// The phases up to `Pushed` happen here, not in the backend, so this is the
+/// only place their detail exists — which build method ran, what was pushed
+/// where, how long each image took. A backend that does not understand
+/// `attributes` ignores them, and passing `None` is always valid, so nothing
+/// depends on the two sides being upgraded together.
+#[allow(clippy::too_many_arguments)]
+async fn update_deployment_status_with(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project_name: &str,
+    deployment_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+    attributes: Option<serde_json::Value>,
+) -> Result<()> {
     let url = format!(
         "{}/api/v1/projects/{}/deployments/{}/status",
         backend_url, project_name, deployment_id
@@ -1994,6 +2114,10 @@ async fn update_deployment_status(
 
     if let Some(error) = error_message {
         payload["error_message"] = serde_json::json!(error);
+    }
+
+    if let Some(attributes) = attributes {
+        payload["attributes"] = attributes;
     }
 
     debug!("Updating deployment {} status to {}", deployment_id, status);
@@ -2034,6 +2158,10 @@ pub struct GetLogsParams<'a> {
     /// but the CLI doesn't validate — the server returns no matches for
     /// unknown values.
     pub levels: &'a [String],
+    /// Restrict to these containers of the deployment (repeated `?container=`
+    /// on the wire). Empty = every container. The server rejects a name the
+    /// deployment doesn't declare.
+    pub containers: &'a [String],
 }
 
 /// Get logs from a deployment
@@ -2067,6 +2195,9 @@ pub async fn get_logs(
     }
     for level in params.levels {
         query_params.push(format!("level={}", urlencoding::encode(level)));
+    }
+    for container in params.containers {
+        query_params.push(format!("container={}", urlencoding::encode(container)));
     }
 
     if !query_params.is_empty() {
@@ -2134,10 +2265,9 @@ pub async fn get_logs(
                                         print_log_status(data);
                                     } else if event_type == "log" || event_type == "message" {
                                         // `log` events are JSON-wrapped:
-                                        // {"line": "...", "level": "..."}.
-                                        // Other event types (`backlog_complete`)
-                                        // are ignored — they're meta-events
-                                        // the CLI has no use for.
+                                        // {"id": "...", "line": "...", "level": "..."}.
+                                        // Pagination and status metadata is
+                                        // ignored by this CLI view.
                                         print_log_event(data);
                                     }
                                 }
@@ -2439,10 +2569,9 @@ impl LogStream {
                         && (self.event_type == "log" || self.event_type == "message")
                     {
                         // `log` events are JSON-wrapped:
-                        // {"line": "...", "level": "..."}. Yield both so
-                        // the follow UI can colour the line by level.
-                        // Other event types (status, backlog_complete) are
-                        // ignored by the streaming follow UI.
+                        // {"id": "...", "line": "...", "level": "..."}.
+                        // Yield the rendered line and level; pagination and
+                        // status metadata is ignored by the follow UI.
                         return Some(Ok(extract_log_event(data)));
                     }
                     continue;
@@ -2547,7 +2676,10 @@ pub(super) async fn open_log_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_log_event, normalize_git_url, token_with_retry, ByteLineBuffer};
+    use super::{
+        build_multi_container_payload, extract_log_event, normalize_git_url, token_with_retry,
+        ByteLineBuffer,
+    };
     use crate::token_source::{TokenProvider, TokenSource, TokenSourceError};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -2774,6 +2906,103 @@ mod tests {
         assert_eq!(normalize_git_url(""), None);
         assert_eq!(normalize_git_url("not-a-url"), None);
         assert_eq!(normalize_git_url("/local/path/repo"), None);
+    }
+
+    #[test]
+    fn multi_container_payload_serializes_expected_request_shape() {
+        use crate::rise_toml::{
+            BuildConfig, ContainerConfig, DeployConfig, HealthCheckConfig, HealthCheckSetting,
+            ProjectBuildConfig, RouteConfig,
+        };
+        use std::collections::BTreeMap;
+
+        let mut config = ProjectBuildConfig {
+            build: Some(BuildConfig {
+                backend: Some("docker".to_string()),
+                ..Default::default()
+            }),
+            deploy: Some(DeployConfig {
+                replicas: Some(2),
+                cpu: Some("500m".to_string()),
+                memory: Some("256Mi".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        config.containers.insert(
+            "api".to_string(),
+            ContainerConfig {
+                port: Some(8080),
+                env: BTreeMap::from([("LOG_LEVEL".to_string(), "debug".to_string())]),
+                deploy: Some(DeployConfig {
+                    health_check: Some(HealthCheckSetting::Config(HealthCheckConfig {
+                        path: Some("/health".to_string()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config.containers.insert(
+            "worker".to_string(),
+            ContainerConfig {
+                image: Some("busybox:latest".to_string()),
+                ..Default::default()
+            },
+        );
+        config.routes.insert(
+            "/api".to_string(),
+            RouteConfig {
+                container: "api".to_string(),
+                access: None,
+            },
+        );
+
+        let (containers, routes) = build_multi_container_payload(Some(&config)).unwrap();
+        let json = serde_json::json!({
+            "containers": containers,
+            "routes": routes,
+        });
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "containers": [
+                    {
+                        "name": "api",
+                        "port": 8080,
+                        "replicas": 2,
+                        "cpu": "500m",
+                        "memory": "256Mi",
+                        "env_overrides": [ { "key": "LOG_LEVEL", "value": "debug", "is_secret": false, "source": "toml" } ],
+                        "health_check": { "disabled": false, "path": "/health" }
+                    },
+                    {
+                        "name": "worker",
+                        "image": "busybox:latest",
+                        "replicas": 2,
+                        "cpu": "500m",
+                        "memory": "256Mi"
+                    }
+                ],
+                "routes": [ { "path": "/api", "container": "api" } ]
+            })
+        );
+    }
+
+    #[test]
+    fn single_container_payload_preserves_legacy_request_shape() {
+        use crate::rise_toml::{BuildConfig, ProjectBuildConfig};
+
+        let config = ProjectBuildConfig {
+            build: Some(BuildConfig::default()),
+            ..Default::default()
+        };
+
+        let (containers, routes) = build_multi_container_payload(Some(&config)).unwrap();
+        assert!(containers.is_none());
+        assert!(routes.is_empty());
     }
 
     mod registry_credential_reuse {

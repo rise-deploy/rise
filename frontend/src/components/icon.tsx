@@ -29,6 +29,8 @@ const PATHS: Record<string, string> = {
     ext:        'M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6m4-4h6v6m-9 3 9-9',
     more:       'M12 12.5a.5.5 0 1 0 0-1 .5.5 0 0 0 0 1ZM19 12.5a.5.5 0 1 0 0-1 .5.5 0 0 0 0 1ZM5 12.5a.5.5 0 1 0 0-1 .5.5 0 0 0 0 1Z',
     arrow:      'M5 12h14M13 5l7 7-7 7',
+    download:   'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3',
+    wrap:       'M3 6h18M3 18h7M3 12h13a4 4 0 0 1 0 8h-3m0 0 2-2m-2 2 2 2',
     eye:        'M1 12s4-8 11-8 11 8 11 8-4 8-11 8S1 12 1 12Zm11 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z',
     eyeoff:     'M17.94 17.94A10 10 0 0 1 12 20c-7 0-11-8-11-8a18 18 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18 18 0 0 1-2.16 3.19M14.12 14.12A3 3 0 1 1 9.88 9.88M1 1l22 22',
     trash:      'M3 6h18m-2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6',
@@ -47,7 +49,7 @@ const STROKE_ONLY = new Set([
     'close', 'check', 'plus', 'chev', 'chevd', 'chevu', 'chevl', 'search', 'arrow', 'refresh',
     'sun', 'trash', 'edit', 'branch', 'git', 'activity', 'ext', 'copy', 'key', 'flame',
     'rocket', 'eye', 'eyeoff', 'bell', 'logout', 'user', 'info', 'home', 'cube', 'users',
-    'db', 'globe', 'lock', 'gear', 'layer', 'moon',
+    'db', 'globe', 'lock', 'gear', 'layer', 'moon', 'download', 'wrap',
 ]);
 
 export interface IconProps {

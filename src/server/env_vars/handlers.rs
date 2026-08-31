@@ -22,10 +22,10 @@ use std::collections::HashMap;
 /// silently normalised — if the key contains whitespace the caller likely made
 /// a mistake and should fix the request.
 ///
-// TODO(#344): reserve the `RISE_` prefix here so a user-supplied env var can't
-// collide with the Rise-injected `RISE_*` pod env (e.g. `RISE_APP_URL`,
-// `RISE_DEPLOYMENT_GROUP`, `RISE_CONTAINER_HOST__<NAME>`), which as explicit
-// pod env would silently shadow a same-named secret.
+/// The `RISE_` prefix is reserved for Rise-injected pod env vars (e.g.
+/// `RISE_APP_URL`, `RISE_DEPLOYMENT_GROUP`, `RISE_CONTAINER_HOST__<NAME>`).
+/// Those are set as explicit pod `env` and would silently shadow a same-named
+/// secret, so user-supplied keys in that namespace are rejected outright.
 fn validate_env_var_key(key: &str) -> Result<(), ServerError> {
     if key != key.trim() {
         return Err(ServerError::bad_request(format!(
@@ -41,6 +41,13 @@ fn validate_env_var_key(key: &str) -> Result<(), ServerError> {
         return Err(ServerError::bad_request(format!(
             "Invalid environment variable key {:?}: must consist of alphanumeric characters, '-', '_', or '.'",
             key
+        )));
+    }
+    if deployment_models::is_reserved_env_var_key(key) {
+        return Err(ServerError::bad_request(format!(
+            "Invalid environment variable key {:?}: the '{}' prefix is reserved for Rise-injected variables",
+            key,
+            deployment_models::RESERVED_ENV_VAR_PREFIX,
         )));
     }
     Ok(())
@@ -862,4 +869,46 @@ pub async fn preview_deployment_env_vars(
     env_vars.sort_by(|a, b| a.key.cmp(&b.key));
 
     Ok(Json(EnvVarsResponse { env_vars }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_env_var_key;
+
+    #[test]
+    fn accepts_valid_keys() {
+        for key in ["FOO", "MY_VAR", "foo.bar", "a-b_c.1", "rise_foo"] {
+            assert!(
+                validate_env_var_key(key).is_ok(),
+                "expected {key:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_reserved_rise_prefix() {
+        for key in [
+            "RISE_FOO",
+            "RISE_",
+            "RISE_APP_URL",
+            "RISE_CONTAINER_HOST__API",
+        ] {
+            let err =
+                validate_env_var_key(key).expect_err(&format!("expected {key:?} to be rejected"));
+            assert!(
+                err.message.contains("reserved"),
+                "unexpected error for {key:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_charset_and_whitespace() {
+        assert!(validate_env_var_key("").is_err());
+        assert!(validate_env_var_key(" FOO").is_err());
+        assert!(validate_env_var_key("FOO ").is_err());
+        assert!(validate_env_var_key("foo bar").is_err());
+        assert!(validate_env_var_key("foo$bar").is_err());
+    }
 }

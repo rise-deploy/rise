@@ -18,17 +18,30 @@ The contract was introduced together with multi-organization support: an Organiz
 | Built-in resources | `Organization`, `ResourceDefinition` |
 |---|---|
 | External custom resources | Yes, via `ResourceDefinition` |
-| HTTP API access tiers | Operator (full CRUD), Controller (own status/finalizers) |
-| Status writes by end users | No (operator-only API in v1) |
+| HTTP API authorization | Live ADR-0001 RBAC per resource; Controller (own status/finalizers) stays allowlist-gated |
+| Status writes by end users | Yes, with `(update, Kind, status)` |
 | Watch / change feed | Not yet — controllers poll `list` |
 | Pagination / selectors | Not yet — `list` returns everything |
 | Version conversion | Storage-version writes only; reads/lists project across served versions |
 
-End-user / Organization-scoped RBAC is deferred. The generic API is **operator-only** in v1; admins on the default Organization do *not* implicitly receive Operator. Controllers may use a dedicated controller-JWT auth context for status/finalizer writes, but cannot perform operator CRUD.
+Authorization is the ADR-0001 engine: every request is one
+`(verb, ResourceKind, subresource?)` decision against the resource's own ancestry
+and effective labels, and authorization-changing writes additionally pass the
+write-time grant gate inside a `SERIALIZABLE` transaction. Operators reach
+everything through the seeded `system-admin` binding; anyone else reaches what a
+binding grants them. `auth.admin_users` are admins on the default Organization
+for typed APIs only and are granted nothing here. Controllers still use a
+dedicated controller-JWT auth context for status/finalizer writes and cannot
+perform CRUD.
+
+Bindings naming a `user:` or `group:` subject need `User` and `Group` resources
+to exist, which arrives with identity resolution; until then the subjects that
+reach an ordinary caller are `system:authenticated`, `org:<name>`, and whoever a
+`rise.dev/owner` label names.
 
 ## Section guide
 
 - [Storage Model](./storage) — the `resources` table, finalizers, cascade deletion, garbage collection, revision/concurrency semantics, organization namespace-prefix behavior.
-- [HTTP API](./api) — path grammar, auth tiers, request/response envelopes, status and finalizer subresources.
+- [HTTP API](./api) — path grammar, authorization and the grant gate, request/response envelopes, status and finalizer subresources.
 - [Custom Resources](./custom-resources) — registering a `ResourceDefinition`, schema validation, version lifecycle, controller migration responsibilities.
 - [Schema Reference](./schemas) — generated JSON Schemas for `Resource`, `ResourceMetadata`, `Organization`, `ResourceDefinition`, and the controller status map.

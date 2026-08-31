@@ -179,6 +179,7 @@ logs:
     labels:
       project: rise_project
       deploymentId: rise_deployment_id
+      container: container
   alloy:
     # Installs the Grafana Alloy subchart when true. Alloy ships pod logs to
     # Loki and preserves Rise deployment labels for historical lookup.
@@ -254,7 +255,11 @@ config:
     issuer: "http://dex:5556/dex"
     client_id: "rise-backend"
     client_secret: ""  # Override with Secret or environment variable
+    # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
+    idp_group_claim: "groups"
     # admin_users: []  # Optional: List of admin user emails with full permissions
+    # admin_idp_groups: []  # Optional: IdP groups whose members are admins
+    # operator_idp_groups: []  # Optional: IdP groups whose members hold the Operator role
     # Optional: Custom OAuth2 endpoints (autodiscovered from issuer/.well-known/openid-configuration if not set)
     # For Entra ID/Azure AD:
     # authorize_url: "https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/authorize"

@@ -8,10 +8,8 @@ The registry is the part most likely to trip operators up, because the push path
 (a developer's machine) and the pull path (the Rise host's Docker daemon) can use
 **different URLs for the same registry**.
 
-The `oci-client-auth` registry provider **mints no credentials**
-(`src/server/registry/providers/docker.rs` returns empty user/pass for both push
-and pull). It assumes the relevant Docker client has already done `docker login`.
-The config carries two URLs:
+The `oci-client-auth` registry provider can either carry static credentials or
+rely on an existing `docker login`. The config carries two URLs:
 
 | Config key | Used by | Reference value |
 |------------|---------|-----------------|
@@ -30,20 +28,33 @@ htpasswd entry and pass it as `REGISTRY_BASIC_AUTH` (escape `$` as `$$` in a
 ```bash
 htpasswd -nbB ci 's3cret'
 # ci:$2y$05$....   →  REGISTRY_BASIC_AUTH='ci:$2y$05$....'  (or $$ in .env)
+export RISE_REGISTRY_USERNAME=ci
+export RISE_REGISTRY_PASSWORD=s3cret
 ```
 
 An internet-exposed registry **must** have auth — hence the basicauth
-middleware. The internal pull path can stay unauthenticated within the trusted
-host network.
+middleware. `REGISTRY_BASIC_AUTH` configures Traefik with the password hash;
+the optional plaintext `RISE_REGISTRY_USERNAME` / `RISE_REGISTRY_PASSWORD` pair
+lets Rise send the matching login to authorized users. Anyone allowed to deploy
+can retrieve this pair, so only configure it when all Rise users are trusted.
+The internal pull path can stay unauthenticated within the trusted host network.
 
 ### 2. Push (developer host, possibly remote)
 
-Log in with the basicauth credentials, then deploy. The CLI uses the stored
-`docker login` — `oci-client-auth` supplies no creds of its own.
+With `RISE_REGISTRY_USERNAME` and `RISE_REGISTRY_PASSWORD` configured, deploy
+directly; Rise returns the static pair from its authenticated, deployment-scoped
+credentials endpoint and the CLI runs `docker login` automatically.
 
 ```bash
-docker login registry.${RISE_DOMAIN}      # basicauth user/pass
 rise deploy --project myapp --image ...    # builds + pushes to client_registry_url
+```
+
+If the static pair is omitted, log in with the basicauth credentials first; the
+provider returns empty credentials and the CLI keeps using the stored login:
+
+```bash
+docker login registry.${RISE_DOMAIN}
+rise deploy --project myapp --image ...
 ```
 
 The push targets `client_registry_url` (`registry.${RISE_DOMAIN}`).
