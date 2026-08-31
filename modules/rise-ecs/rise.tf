@@ -63,10 +63,10 @@ resource "aws_ecs_task_definition" "rise" {
   tags = local.tags
 
   depends_on = [
-    aws_secretsmanager_secret_version.database_url_write_only,
-    aws_secretsmanager_secret_version.jwt_signing_secret_write_only,
-    aws_secretsmanager_secret_version.encryption_key_write_only,
-    aws_secretsmanager_secret_version.oidc_client_secret_write_only,
+    aws_secretsmanager_secret_version.database_url,
+    aws_secretsmanager_secret_version.jwt_signing_secret,
+    aws_secretsmanager_secret_version.encryption_key,
+    aws_secretsmanager_secret_version.oidc_client_secret,
   ]
 }
 

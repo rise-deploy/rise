@@ -38,7 +38,7 @@ resource "aws_secretsmanager_secret" "database_url" {
   tags                    = local.tags
 }
 
-resource "aws_secretsmanager_secret_version" "database_url_write_only" {
+resource "aws_secretsmanager_secret_version" "database_url" {
   count = local.create_database ? 1 : 0
 
   secret_id                = aws_secretsmanager_secret.database_url[0].id
@@ -53,7 +53,7 @@ resource "aws_secretsmanager_secret" "jwt_signing_secret" {
   tags                    = local.tags
 }
 
-resource "aws_secretsmanager_secret_version" "jwt_signing_secret_write_only" {
+resource "aws_secretsmanager_secret_version" "jwt_signing_secret" {
   secret_id                = aws_secretsmanager_secret.jwt_signing_secret.id
   secret_string_wo         = random_bytes.jwt_signing_secret.base64
   secret_string_wo_version = parseint(substr(sha256(random_bytes.jwt_signing_secret.base64), 0, 15), 16)
@@ -66,7 +66,7 @@ resource "aws_secretsmanager_secret" "encryption_key" {
   tags                    = local.tags
 }
 
-resource "aws_secretsmanager_secret_version" "encryption_key_write_only" {
+resource "aws_secretsmanager_secret_version" "encryption_key" {
   secret_id                = aws_secretsmanager_secret.encryption_key.id
   secret_string_wo         = random_bytes.encryption_key.base64
   secret_string_wo_version = parseint(substr(sha256(random_bytes.encryption_key.base64), 0, 15), 16)
@@ -79,7 +79,7 @@ resource "aws_secretsmanager_secret" "oidc_client_secret" {
   tags                    = local.tags
 }
 
-resource "aws_secretsmanager_secret_version" "oidc_client_secret_write_only" {
+resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
   secret_id                = aws_secretsmanager_secret.oidc_client_secret.id
   secret_string_wo         = local.oidc_client_secret
   secret_string_wo_version = parseint(substr(sha256(local.oidc_client_secret), 0, 15), 16)
@@ -93,41 +93,5 @@ resource "aws_secretsmanager_secret_version" "oidc_client_secret_write_only" {
       condition     = var.deploy_dex || var.oidc_client_secret != null
       error_message = "oidc_client_secret is required when deploy_dex = false; without it the module would store the well-known default 'rise-backend-secret' as the OIDC client secret."
     }
-  }
-}
-
-# Remove these blocks after every installation has applied a version that
-# publishes the replacement write-only resources. Forgetting the old bindings
-# prevents refresh from calling GetSecretValue; destroy=false leaves their AWS
-# versions intact until the write-only resources publish the same values.
-removed {
-  from = aws_secretsmanager_secret_version.database_url
-
-  lifecycle {
-    destroy = false
-  }
-}
-
-removed {
-  from = aws_secretsmanager_secret_version.jwt_signing_secret
-
-  lifecycle {
-    destroy = false
-  }
-}
-
-removed {
-  from = aws_secretsmanager_secret_version.encryption_key
-
-  lifecycle {
-    destroy = false
-  }
-}
-
-removed {
-  from = aws_secretsmanager_secret_version.oidc_client_secret
-
-  lifecycle {
-    destroy = false
   }
 }

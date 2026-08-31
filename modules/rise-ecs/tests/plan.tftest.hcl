@@ -76,8 +76,8 @@ run "creates_a_whole_install" {
 
   assert {
     condition = (
-      aws_secretsmanager_secret_version.oidc_client_secret_write_only.secret_string == null
-      && aws_secretsmanager_secret_version.oidc_client_secret_write_only.secret_string_wo_version == parseint(substr(sha256("s3cret"), 0, 15), 16)
+      aws_secretsmanager_secret_version.oidc_client_secret.secret_string == null
+      && aws_secretsmanager_secret_version.oidc_client_secret.secret_string_wo_version == parseint(substr(sha256("s3cret"), 0, 15), 16)
     )
     error_message = "managed secret versions must use a content-sensitive write-only version"
   }
