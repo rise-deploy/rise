@@ -503,6 +503,15 @@ mod tests {
             Ok(())
         }
 
+        async fn forward_backend_events(
+            &self,
+            _deployment_id: Uuid,
+            _source: crate::events::EventSource,
+            _events: &[crate::events::ForwardedEvent],
+        ) -> Result<u64> {
+            Ok(0)
+        }
+
         async fn mark_deployment_terminating(
             &self,
             id: Uuid,

@@ -172,6 +172,15 @@ impl DeploymentStore for PgDeploymentStore {
         .await
     }
 
+    async fn forward_backend_events(
+        &self,
+        deployment_id: Uuid,
+        source: rise_backend_core::events::EventSource,
+        events: &[rise_backend_core::events::ForwardedEvent],
+    ) -> Result<u64> {
+        crate::db::backend_events::forward(&self.pool, deployment_id, source, events).await
+    }
+
     async fn mark_deployment_terminating(
         &self,
         id: Uuid,

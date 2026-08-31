@@ -35,6 +35,16 @@ pub struct DesiredService {
     pub tags: ServiceTags,
 }
 
+/// One line of an ECS service's event narrative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceNarrative {
+    /// ECS's own id for the event — stable per occurrence, so it doubles as the
+    /// dedupe key when the same tick is seen twice.
+    pub id: String,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub message: String,
+}
+
 /// A service observed in the cluster, reduced to what the diff needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActualService {
@@ -64,6 +74,15 @@ pub struct ActualService {
     pub deployment_group: String,
     /// When ECS started rolling out the service's PRIMARY deployment, as
     /// `DescribeServices` reports it. `None` when ECS reports no primary.
+    /// The service's own narrative, newest first, as ECS returns it. Kept
+    /// because it explains what the task list cannot: a service with no tasks
+    /// looks the same whether the image is missing or the cluster is full, and
+    /// only this says which.
+    ///
+    /// Already in every `DescribeServices` response the reconciler makes, so
+    /// keeping it costs no additional API call — which matters against ECS's
+    /// read budget.
+    pub events: Vec<ServiceNarrative>,
     pub rollout_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -221,6 +240,51 @@ pub fn diff_services(
 
 #[cfg(test)]
 mod tests {
+
+    /// The messages worth waking someone for: the service wants tasks and
+    /// cannot get them. This is the case a task list cannot explain — no tasks
+    /// looks identical whether the image is missing or the cluster is full.
+    #[test]
+    fn placement_failures_are_errors() {
+        for m in [
+            "service rise-web was unable to place a task because no container instance met all of its requirements.",
+            "service rise-web is unable to consistently start tasks successfully.",
+        ] {
+            assert_eq!(super::narrative_severity(m), super::NarrativeSeverity::Error, "{m}");
+        }
+    }
+
+    #[test]
+    fn health_and_stop_messages_are_warnings() {
+        for m in [
+            "(service rise-web) (task abc) failed ELB health checks in (target-group tg).",
+            "(service rise-web) has stopped 1 running tasks: (task abc).",
+        ] {
+            assert_eq!(
+                super::narrative_severity(m),
+                super::NarrativeSeverity::Warning,
+                "{m}"
+            );
+        }
+    }
+
+    /// Routine progress, and — importantly — anything AWS rewords. An
+    /// unrecognised message must still be forwarded, just without an elevated
+    /// severity: silently dropping it would be worse than under-ranking it.
+    #[test]
+    fn routine_and_unrecognised_messages_are_info() {
+        for m in [
+            "(service rise-web) has reached a steady state.",
+            "(service rise-web) has started 1 tasks: (task abc).",
+            "something AWS has not said before",
+        ] {
+            assert_eq!(
+                super::narrative_severity(m),
+                super::NarrativeSeverity::Info,
+                "{m}"
+            );
+        }
+    }
     use super::*;
 
     fn tags(deployment_id: &str) -> ServiceTags {
@@ -251,6 +315,7 @@ mod tests {
 
     fn actual_for(d: &DesiredService, hash: &str, count: i32) -> ActualService {
         ActualService {
+            events: Vec::new(),
             name: d.name.clone(),
             arn: format!(
                 "arn:aws:ecs:eu-central-1:123456789012:service/rise/{}",
@@ -497,4 +562,44 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.contains("20260101-120000"));
     }
+}
+
+/// How much attention an ECS service message deserves.
+///
+/// ECS gives no severity of its own — every message is prose — so this reads the
+/// wording. Matching on phrases is unavoidable and will drift as AWS rewords
+/// things, so the default is `Info`: a message this does not recognise is still
+/// forwarded, just without an elevated severity. Losing an alarm is bad;
+/// silently dropping the message would be worse.
+pub fn narrative_severity(message: &str) -> NarrativeSeverity {
+    let m = message.to_ascii_lowercase();
+
+    // Placement failures. The service wants tasks and cannot get them, which is
+    // the case the periodic observation cannot explain on its own.
+    if m.contains("unable to place a task")
+        || m.contains("unable to consistently start tasks successfully")
+        || m.contains("was unable to place")
+    {
+        return NarrativeSeverity::Error;
+    }
+
+    // Something was running and stopped being healthy.
+    if m.contains("failed elb health checks")
+        || m.contains("failed container health checks")
+        || m.contains("deregistered") && m.contains("unhealthy")
+        || m.contains("has stopped")
+    {
+        return NarrativeSeverity::Warning;
+    }
+
+    NarrativeSeverity::Info
+}
+
+/// Severity of one service message, mirroring the event log's own levels
+/// without this crate depending on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrativeSeverity {
+    Info,
+    Warning,
+    Error,
 }

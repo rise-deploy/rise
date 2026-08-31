@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rise_backend_core::events::{EventSeverity, EventSource, ForwardedEvent};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::{
     effective_health_path, hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash,
@@ -154,6 +155,51 @@ const TASK_DEFINITION_HASH_SUFFIX: &str = "task-definition-hash";
 /// cannot fail independently of the update it records.
 const ECS_META_KEY: &str = "ecs";
 const TD_HASH_META_KEY: &str = "task_definition_hash";
+
+/// Turn one service message into a forwardable event.
+///
+/// ECS's id is the dedupe key, so re-reading the same window on the next tick
+/// records nothing new. The raw message is kept verbatim: it is the event, and
+/// paraphrasing would lose the placement reason that makes it worth having.
+fn forwarded_from_ecs(n: &crate::service::ServiceNarrative) -> Option<ForwardedEvent> {
+    let severity = match crate::service::narrative_severity(&n.message) {
+        crate::service::NarrativeSeverity::Error => EventSeverity::Error,
+        crate::service::NarrativeSeverity::Warning => EventSeverity::Warning,
+        crate::service::NarrativeSeverity::Info => EventSeverity::Info,
+    };
+    Some(ForwardedEvent {
+        dedupe_key: n.id.clone(),
+        occurred_at: n.created_at?,
+        severity,
+        message: n.message.clone(),
+        // ECS names a task in the prose but gives no structured handle, and a
+        // subject parsed out of a sentence would be wrong the first time AWS
+        // rewords it. Service-wide is the honest scope.
+        subject: None,
+        attributes: serde_json::json!({}),
+    })
+}
+
+/// Project an ECS service's event list onto the shape the reconciler keeps.
+///
+/// ECS returns roughly the last hour, newest first, and caps the list — so this
+/// is a window, not a history. Anything relying on having seen every message
+/// would be wrong; forwarding is deduplicated by id precisely because the same
+/// window is re-read on every tick.
+fn service_narrative(svc: &aws_sdk_ecs::types::Service) -> Vec<crate::service::ServiceNarrative> {
+    svc.events()
+        .iter()
+        .filter_map(|e| {
+            Some(crate::service::ServiceNarrative {
+                id: e.id()?.to_string(),
+                created_at: e
+                    .created_at()
+                    .and_then(|t| chrono::DateTime::from_timestamp(t.secs(), 0)),
+                message: e.message()?.to_string(),
+            })
+        })
+        .collect()
+}
 
 /// Read the converged task-definition hash a prior tick persisted for a
 /// deployment, if any.
@@ -1276,6 +1322,7 @@ impl EcsReconciler {
                         deployment_id: None,
                         project: String::new(),
                         deployment_group: String::new(),
+                        events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
                     });
                     continue;
@@ -1303,6 +1350,7 @@ impl EcsReconciler {
                         deployment_id: Some(parsed.deployment_id.clone()),
                         project: parsed.project.clone(),
                         deployment_group: parsed.deployment_group.clone(),
+                        events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
                     },
                     tags: parsed,
@@ -2082,6 +2130,45 @@ impl EcsReconciler {
             persisted_td_hash(&deployment.controller_metadata)
         };
 
+        // Forward what the services said about themselves this tick. Every
+        // message ECS has in its window is offered on every tick; the store
+        // deduplicates on ECS's own event id, so only the new ones land.
+        // Failing here must not fail the health pass — the deployment's status
+        // is the job, its narrative is a record of the job.
+        let narrated: Vec<ForwardedEvent> = container_specs
+            .iter()
+            .filter_map(|spec| {
+                let key = spec_key(
+                    &project.name,
+                    &deployment.deployment_group,
+                    &deployment.deployment_id,
+                    &spec.name,
+                );
+                by_key.get(key.as_str())
+            })
+            .flat_map(|svc| svc.events.iter())
+            .filter_map(forwarded_from_ecs)
+            .collect();
+        if !narrated.is_empty() {
+            match self
+                .store
+                .forward_backend_events(deployment.id, EventSource::Ecs, &narrated)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    debug!(
+                        deployment = %deployment.deployment_id,
+                        "Forwarded {n} new ECS service event(s)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    deployment = %deployment.deployment_id,
+                    "Failed to forward ECS service events: {:?}", e
+                ),
+            }
+        }
+
         // `controller_metadata` carries exactly one thing: the task-definition
         // hash the service has converged to. It is the authoritative drift
         // marker, so it is written even when there is nothing else to record.
@@ -2412,6 +2499,7 @@ mod tests {
     fn managed(project: &str, project_uuid: &str, deployment_id: &str) -> super::ManagedService {
         super::ManagedService {
             service: crate::service::ActualService {
+                events: Vec::new(),
                 name: format!("rise-{project}-{deployment_id}-web"),
                 arn: format!("arn:aws:ecs:eu-west-1:1:service/c/{project}-{deployment_id}"),
                 key: None,

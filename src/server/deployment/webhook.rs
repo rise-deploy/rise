@@ -646,6 +646,11 @@ async fn check_deployment_health_from_observed(
     // Deployment, not individual pods).
     let pod_check = check_pod_errors_via_kube(state, project, deployment, namespace_prefix).await;
 
+    // Forward what Kubernetes said about those pods. This is where a pod that
+    // will not schedule finally explains itself: its status says `Pending` and
+    // nothing more, while the Event carries the reason.
+    forward_pod_events(state, project, deployment, namespace_prefix).await;
+
     let is_ready = ready_replicas >= desired_replicas && desired_replicas > 0;
 
     match deployment.status {
@@ -732,6 +737,101 @@ async fn check_deployment_health_from_observed(
     }
 
     Ok(())
+}
+
+/// List the Events of this deployment's pods and forward the interesting ones.
+///
+/// Best-effort throughout: a failure here loses a diagnostic, and losing a
+/// diagnostic must never fail a sync that would otherwise have succeeded.
+async fn forward_pod_events(
+    state: &AppState,
+    project: &Project,
+    deployment: &Deployment,
+    namespace_prefix: &str,
+) {
+    let Some(kube_client) = &state.kube_client else {
+        return;
+    };
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
+
+    // Events are namespace-scoped and carry no deployment label, so they are
+    // narrowed by the pods they involve — which is the set this deployment owns.
+    let pod_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
+        kube::Api::namespaced(kube_client.clone(), &namespace);
+    let pods = match pod_api
+        .list(&kube::api::ListParams::default().labels(&format!(
+            "{}={}",
+            LABEL_DEPLOYMENT_ID, deployment.deployment_id
+        )))
+        .await
+    {
+        Ok(pods) => pods,
+        Err(e) => {
+            debug!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to list pods for event forwarding: {:?}", e
+            );
+            return;
+        }
+    };
+    let owned: std::collections::HashSet<String> = pods
+        .items
+        .iter()
+        .filter_map(|p| p.metadata.name.clone())
+        .collect();
+    if owned.is_empty() {
+        return;
+    }
+
+    let event_api: kube::Api<k8s_openapi::api::core::v1::Event> =
+        kube::Api::namespaced(kube_client.clone(), &namespace);
+    let events = match event_api.list(&kube::api::ListParams::default()).await {
+        Ok(events) => events,
+        Err(e) => {
+            debug!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to list events: {:?}", e
+            );
+            return;
+        }
+    };
+
+    let mine: Vec<k8s_openapi::api::core::v1::Event> = events
+        .items
+        .into_iter()
+        .filter(|e| {
+            e.involved_object.kind.as_deref() == Some("Pod")
+                && e.involved_object
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| owned.contains(n))
+        })
+        .collect();
+
+    let forwardable = super::pod_events::forwardable(&mine);
+    if forwardable.is_empty() {
+        return;
+    }
+
+    match state
+        .deployment_store
+        .forward_backend_events(
+            deployment.id,
+            rise_backend_core::events::EventSource::Kubernetes,
+            &forwardable,
+        )
+        .await
+    {
+        Ok(n) if n > 0 => debug!(
+            deployment_id = %deployment.deployment_id,
+            "Forwarded {n} new Kubernetes event(s)"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(
+            deployment_id = %deployment.deployment_id,
+            "Failed to forward Kubernetes events: {:?}", e
+        ),
+    }
 }
 
 /// Result of checking pod status via kube-rs API.

@@ -179,6 +179,20 @@ pub trait DeploymentStore: Send + Sync {
         events: &[crate::observation::DerivedEvent],
     ) -> Result<()>;
 
+    /// Forward runtime-native events into the deployment's log, skipping any
+    /// already recorded.
+    ///
+    /// Deduplicated on `dedupe_key`, because a backend re-reads the same window
+    /// on every tick: ECS returns roughly the last hour of service messages,
+    /// and a Kubernetes Event lives well beyond one sync. Re-reporting is the
+    /// normal case, not an error.
+    async fn forward_backend_events(
+        &self,
+        deployment_id: Uuid,
+        source: crate::events::EventSource,
+        events: &[crate::events::ForwardedEvent],
+    ) -> Result<u64>;
+
     /// Mark a deployment terminating with a termination reason. See
     /// `mark_deployment_failed` for the `None` contract.
     ///
