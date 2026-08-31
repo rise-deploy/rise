@@ -81,6 +81,16 @@ run "rejects_a_repo_prefix_without_a_trailing_slash" {
   expect_failures = [var.ecr_repo_prefix]
 }
 
+run "rejects_noncanonical_idp_group_sync_prefixes" {
+  command = plan
+
+  variables {
+    idp_group_sync_prefixes = ["Rise_"]
+  }
+
+  expect_failures = [var.idp_group_sync_prefixes]
+}
+
 # VPC endpoints reach AWS services only. Traefik's HTTP-01 challenge needs
 # Let's Encrypt, so the certificate would silently never arrive.
 run "rejects_acme_without_internet_egress" {

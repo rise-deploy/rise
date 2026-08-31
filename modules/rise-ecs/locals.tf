@@ -133,6 +133,7 @@ module "control_plane_env" {
   oidc_issuer                = local.oidc_issuer
   oidc_client_id             = var.oidc_client_id
   oidc_group_claim           = var.oidc_group_claim
+  idp_group_sync_prefixes    = var.idp_group_sync_prefixes
   admin_idp_group            = var.admin_idp_group
   platform_access_policy     = var.platform_access_policy
   platform_allowed_idp_group = var.platform_allowed_idp_group

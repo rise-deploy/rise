@@ -786,6 +786,11 @@ pub struct AuthSettings {
     /// For example, AWS Cognito commonly exposes groups as "cognito:groups".
     #[serde(default = "default_idp_group_claim")]
     pub idp_group_claim: String,
+    /// Optional prefixes limiting which canonical IdP group names are mirrored
+    /// into Rise teams during login. An empty list accepts every canonical
+    /// group name.
+    #[serde(default, deserialize_with = "deserialize_string_list_flexible")]
+    pub idp_group_sync_prefixes: Vec<String>,
     /// Optional active sync source for pulling users and groups from an external IdP.
     /// When configured, Rise will periodically query the IdP for users and groups
     /// assigned to the app and sync them as Rise teams.
@@ -2253,6 +2258,43 @@ impl Settings {
             ));
         }
 
+        if let Some(prefix) = settings
+            .auth
+            .idp_group_sync_prefixes
+            .iter()
+            .find(|prefix| !crate::db::teams::is_valid_team_name(prefix))
+        {
+            return Err(ConfigError::Message(format!(
+                "auth.idp_group_sync_prefixes contains invalid prefix {prefix:?}; use only lowercase ASCII letters, digits, and hyphens"
+            )));
+        }
+
+        for access_group in settings
+            .auth
+            .admin_idp_groups
+            .iter()
+            .chain(settings.auth.operator_idp_groups.iter())
+            .chain(settings.auth.platform_access.allowed_idp_groups.iter())
+        {
+            let canonical = access_group.to_ascii_lowercase();
+            if !crate::db::teams::is_valid_team_name(&canonical) {
+                return Err(ConfigError::Message(format!(
+                    "IdP access group {access_group:?} cannot be represented as a Rise team; use only ASCII letters, digits, and hyphens"
+                )));
+            }
+            if !settings.auth.idp_group_sync_prefixes.is_empty()
+                && !settings
+                    .auth
+                    .idp_group_sync_prefixes
+                    .iter()
+                    .any(|prefix| canonical.starts_with(prefix))
+            {
+                return Err(ConfigError::Message(format!(
+                    "IdP access group {access_group:?} cannot be synchronized by auth.idp_group_sync_prefixes"
+                )));
+            }
+        }
+
         // A password without a username would be silently treated by the CLI as
         // client-managed auth, while a username without a password would cause a
         // confusing login failure. Keep static registry auth explicitly paired.
@@ -2728,6 +2770,25 @@ mod tests {
         let settings: Settings = serde_json::from_value(json).unwrap();
 
         assert_eq!(settings.auth.idp_group_claim, "cognito:groups");
+    }
+
+    #[test]
+    fn idp_group_sync_prefixes_accept_a_sequence_or_comma_separated_string() {
+        let mut sequence = minimal_settings_json();
+        sequence["auth"]["idp_group_sync_prefixes"] = serde_json::json!(["rise-", "platform-"]);
+        let settings: Settings = serde_json::from_value(sequence).unwrap();
+        assert_eq!(
+            settings.auth.idp_group_sync_prefixes,
+            ["rise-", "platform-"]
+        );
+
+        let mut scalar = minimal_settings_json();
+        scalar["auth"]["idp_group_sync_prefixes"] = serde_json::json!("rise-, platform-");
+        let settings: Settings = serde_json::from_value(scalar).unwrap();
+        assert_eq!(
+            settings.auth.idp_group_sync_prefixes,
+            ["rise-", "platform-"]
+        );
     }
 
     #[test]
@@ -3474,6 +3535,7 @@ auth:
         env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
+        env.insert("RISE_IDP_GROUP_SYNC_PREFIXES", "rise-,platform-");
 
         let settings = load_shipped_ecs_config(&env).expect("shipped ecs.yaml must load");
 
@@ -3502,6 +3564,10 @@ auth:
         assert_eq!(resource_prefix, "rise");
         assert!(access_classes.contains_key("public"));
         assert!(access_classes.contains_key("private"));
+        assert_eq!(
+            settings.auth.idp_group_sync_prefixes,
+            ["rise-", "platform-"]
+        );
 
         assert!(matches!(
             settings.deployment_logs,
@@ -3589,6 +3655,47 @@ server:
         let err = load_shipped_ecs_config(&env).expect_err("must reject");
         assert!(
             err.to_string().contains("at least one subnet"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_rejects_a_noncanonical_group_sync_prefix() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_IDP_GROUP_SYNC_PREFIXES", "Rise_");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject invalid prefix");
+        assert!(
+            err.to_string()
+                .contains("auth.idp_group_sync_prefixes contains invalid prefix"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_rejects_an_access_group_outside_the_sync_prefixes() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_IDP_GROUP_SYNC_PREFIXES", "rise-");
+        env.insert("RISE_ADMIN_IDP_GROUP", "platform-admins");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject unreachable access group");
+        assert!(
+            err.to_string().contains(
+                "IdP access group \"platform-admins\" cannot be synchronized by auth.idp_group_sync_prefixes"
+            ),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_rejects_an_access_group_that_cannot_be_a_team() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_ADMIN_IDP_GROUP", "rise_admins");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject invalid access group");
+        assert!(
+            err.to_string()
+                .contains("cannot be represented as a Rise team"),
             "unhelpful message: {err}"
         );
     }

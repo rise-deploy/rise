@@ -31,6 +31,17 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Config change — login-time IdP group prefixes.**
+  `auth.idp_group_sync_prefixes` optionally limits which canonical group names
+  are mirrored into Rise teams. An empty list preserves synchronization of all
+  canonical names. Invalid claim values are skipped, and excluded memberships
+  are removed on the user's next login. ECS and Docker installs can supply the
+  prefixes as a comma-separated `RISE_IDP_GROUP_SYNC_PREFIXES` value.
+
+- **Snowflake private-key authentication accepts unencrypted PEM keys.** Rise
+  converts unencrypted PKCS#8 and RSA PKCS#1 keys to encrypted PKCS#8 in memory
+  for the connector. The generated passphrase is not persisted.
+
 - **The Pods tab is gone, and a deployment's history is now an event log.**
   Every backend used to write a Kubernetes-shaped `pod_status` snapshot into
   `controller_metadata` on each reconcile, and the UI read into its keys. That

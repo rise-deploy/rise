@@ -111,6 +111,11 @@ variable "oidc_group_claim" {
   default = "groups"
 }
 
+variable "idp_group_sync_prefixes" {
+  type    = list(string)
+  default = []
+}
+
 variable "admin_idp_group" {
   type    = string
   default = null
