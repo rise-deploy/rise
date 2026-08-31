@@ -4,6 +4,18 @@ use uuid::Uuid;
 
 use crate::db::models::{Team, TeamMember, TeamRole, User};
 
+/// Whether a name satisfies the database constraint carried by `teams.name`.
+///
+/// Keep claim-derived names on the same side of the boundary before opening a
+/// transaction: one malformed IdP group must not roll back every valid group in
+/// the same token.
+pub fn is_valid_team_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
 /// List all teams
 pub async fn list(pool: &PgPool) -> Result<Vec<Team>> {
     let teams = sqlx::query_as!(

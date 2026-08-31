@@ -148,9 +148,15 @@ run "alb_uses_https_and_group_restricted_auth" {
     rise_image_tag             = null
     rise_image_ref             = "ghcr.io/rise-deploy/rise@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     oidc_group_claim           = "cognito:groups"
+    idp_group_sync_prefixes    = ["rise-"]
     admin_idp_group            = "rise-admins"
     platform_access_policy     = "restrictive"
     platform_allowed_idp_group = "rise-platform-users"
+  }
+
+  assert {
+    condition     = local.rise_environment["RISE_IDP_GROUP_SYNC_PREFIXES"] == "rise-"
+    error_message = "IdP group sync prefixes must reach the shipped ECS configuration"
   }
 
   assert {

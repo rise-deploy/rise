@@ -132,8 +132,10 @@ is replaced, and there is no HA.
 
 For an IdP that publishes groups, set `oidc_group_claim`, `admin_idp_group`,
 `platform_access_policy = "restrictive"`, and `platform_allowed_idp_group`.
-These values are rendered through the ECS environment into the shipped
-configuration; no mounted override file is required.
+Set `idp_group_sync_prefixes` to limit which canonical group names are mirrored
+into Rise teams; an empty list accepts every canonical name. These values are
+rendered through the ECS environment into the shipped configuration; no mounted
+override file is required.
 
 Dex needs a bcrypt hash, since Terraform has no bcrypt function:
 

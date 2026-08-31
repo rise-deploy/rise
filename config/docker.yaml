@@ -69,6 +69,9 @@ auth:
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
   # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
   idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
+  # Optional comma-separated prefixes limiting which canonical group names are
+  # mirrored into Rise teams during login. Empty accepts every canonical name.
+  idp_group_sync_prefixes: "${RISE_IDP_GROUP_SYNC_PREFIXES:-}"
   admin_users: ["${ADMIN_EMAIL:-admin@example.com}"]
   # Grant the admin role to everyone in an IdP group instead of listing emails.
   # Blank entries are filtered out, so an unset var collapses to an empty list.

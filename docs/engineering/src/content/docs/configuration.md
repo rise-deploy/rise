@@ -228,6 +228,7 @@ auth:
                                 # such as Google reject it); add it here if needed.
   idp_group_claim: "groups"     # ID-token claim containing group names (default shown)
                                 # Use "cognito:groups" for AWS Cognito.
+  idp_group_sync_prefixes: []   # Optional prefixes limiting groups mirrored as teams.
   admin_users: ["email@..."]    # Default-organization admin emails (array)
   admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
@@ -260,7 +261,11 @@ by group bypass `platform_access` exactly as email-listed users do.
 by `auth.idp_group_claim` (default: `groups`) at login and mirrors it into
 IdP-managed teams (`sync_user_groups`, and the Entra active sync when enabled).
 For AWS Cognito, set `idp_group_claim: "cognito:groups"`. Those teams are what
-the group checks read. Two consequences:
+the group checks read. Login sync accepts only canonical team names containing
+lowercase ASCII letters, digits, and hyphens. Set `idp_group_sync_prefixes`
+(for example, `["rise-"]`) to mirror only matching groups; an empty list accepts
+every canonical name. The prefix filter does not apply to Entra active sync.
+Three consequences:
 
 - Only **IdP-managed** teams count. A team a user creates themselves never
   grants a role, even if its name matches a configured group — otherwise
@@ -268,6 +273,8 @@ the group checks read. Two consequences:
 - Membership refreshes at login. Removing a user from a group in the IdP takes
   effect on their next login (or on the next Entra active sync), not
   immediately. Revoke access that must take effect at once in the IdP itself.
+- Invalid or prefix-excluded claim values never create teams. Existing
+  memberships outside the filtered claim are removed at the next login.
 
 The same resolution backs `platform_access.allowed_idp_groups`.
 

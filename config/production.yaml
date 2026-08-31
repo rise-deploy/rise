@@ -28,6 +28,7 @@ auth:
   client_secret: "${OIDC_CLIENT_SECRET}"
   # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
   idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
+  idp_group_sync_prefixes: "${RISE_IDP_GROUP_SYNC_PREFIXES:-}"
   admin_users:
     - "${ADMIN_EMAIL:-admin@example.com}"
   # Optional: enable active sync to pull users/groups from Entra ID.

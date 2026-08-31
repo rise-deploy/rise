@@ -523,6 +523,19 @@ variable "oidc_group_claim" {
   default     = "groups"
 }
 
+variable "idp_group_sync_prefixes" {
+  description = "Optional lowercase prefixes limiting which canonical IdP group names are mirrored into Rise teams during login. Empty accepts every canonical name."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = alltrue([
+      for prefix in var.idp_group_sync_prefixes : can(regex("^[a-z0-9-]+$", prefix))
+    ])
+    error_message = "idp_group_sync_prefixes entries must contain only lowercase ASCII letters, digits, and hyphens."
+  }
+}
+
 variable "admin_idp_group" {
   description = "Identity-provider group whose members are Rise administrators. Null grants no group administrative access."
   type        = string

@@ -149,6 +149,14 @@
           "description": "Enable IdP group synchronization (default: true).\nWhen enabled, user team memberships are synchronized from the configured\nIdP group claim on login.",
           "type": "boolean"
         },
+        "idp_group_sync_prefixes": {
+          "default": [],
+          "description": "Optional prefixes limiting which canonical IdP group names are mirrored\ninto Rise teams during login. An empty list accepts every canonical\ngroup name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "issuer": {
           "type": "string"
         },

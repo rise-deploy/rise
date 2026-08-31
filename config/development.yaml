@@ -35,6 +35,8 @@ auth:
   client_secret: "rise-backend-secret"
   # ID-token claim containing group names (default: "groups").
   # idp_group_claim: "cognito:groups"
+  # Optional prefixes limiting which canonical groups become Rise teams.
+  # idp_group_sync_prefixes: ["rise-"]
   admin_users:
     - "admin@example.com"
   # Grant the admin role by IdP group instead of listing every email. A user

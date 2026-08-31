@@ -1,18 +1,47 @@
 use anyhow::{Context, Result};
 use sqlx::PgPool;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::db::{models::TeamRole, teams};
+
+fn filter_idp_groups<'a>(idp_groups: &'a [String], allowed_prefixes: &[String]) -> Vec<&'a str> {
+    let mut seen = HashSet::new();
+    idp_groups
+        .iter()
+        .filter_map(|group_name| {
+            if !teams::is_valid_team_name(group_name) {
+                tracing::warn!(
+                    group = %group_name,
+                    "Skipping IdP group whose name cannot be represented as a Rise team"
+                );
+                return None;
+            }
+            if !allowed_prefixes.is_empty()
+                && !allowed_prefixes
+                    .iter()
+                    .any(|prefix| group_name.starts_with(prefix))
+            {
+                tracing::debug!(
+                    group = %group_name,
+                    "Skipping IdP group outside the configured sync prefixes"
+                );
+                return None;
+            }
+            seen.insert(group_name.as_str())
+                .then_some(group_name.as_str())
+        })
+        .collect()
+}
 
 /// Synchronize a user's team memberships from the configured IdP group claim.
 ///
 /// This function implements the complete IdP group synchronization algorithm:
 /// 1. Creates teams that don't exist in Rise
 /// 2. Marks teams as IdP-managed
-/// 3. Updates team names to match IdP case (IdP is source of truth)
-/// 4. Removes every pre-existing membership when a team becomes IdP-managed
-/// 5. Adds user to all groups in the IdP claim
-/// 6. Removes user from IdP-managed teams NOT in the claim
+/// 3. Removes every pre-existing membership when a team becomes IdP-managed
+/// 4. Adds the user to canonical groups admitted by the configured prefixes
+/// 5. Removes the user from IdP-managed teams outside that filtered claim
 ///
 /// All operations are performed within a database transaction for atomicity.
 ///
@@ -20,10 +49,18 @@ use crate::db::{models::TeamRole, teams};
 /// * `pool` - Database connection pool
 /// * `user_id` - UUID of the user logging in
 /// * `idp_groups` - List of group names from the configured IdP group claim
+/// * `allowed_prefixes` - Optional prefixes limiting which canonical names sync
 ///
 /// # Errors
 /// Returns an error if database operations fail. The transaction will be rolled back.
-pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String]) -> Result<()> {
+pub async fn sync_user_groups(
+    pool: &PgPool,
+    user_id: Uuid,
+    idp_groups: &[String],
+    allowed_prefixes: &[String],
+) -> Result<()> {
+    let idp_groups = filter_idp_groups(idp_groups, allowed_prefixes);
+
     // Start transaction for atomicity - all operations succeed or all fail
     let mut tx = pool.begin().await.context("Failed to start transaction")?;
 
@@ -34,7 +71,7 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
     );
 
     // Phase 1: Process each group in the IdP claim
-    for group_name in idp_groups {
+    for group_name in &idp_groups {
         // Locked for the rest of the transaction: the membership API decides
         // whether a caller may write to a team by reading `idp_managed`, and at
         // `READ COMMITTED` that read can land between this takeover's purge and
@@ -44,20 +81,6 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
             .context("Failed to find team by name")?;
 
         let team_id = if let Some(team) = existing_team {
-            // Team exists - update if needed
-
-            // Update name if case differs (IdP is authoritative source for casing)
-            if team.name != *group_name {
-                tracing::info!(
-                    "Updating team name from '{}' to '{}' (IdP case correction)",
-                    team.name,
-                    group_name
-                );
-                teams::update_name(&mut *tx, team.id, group_name)
-                    .await
-                    .context("Failed to update team name")?;
-            }
-
             // If team wasn't IdP-managed before, convert it.
             //
             // Every existing membership goes, not just the owners. An
@@ -123,10 +146,7 @@ pub async fn sync_user_groups(pool: &PgPool, user_id: Uuid, idp_groups: &[String
         .context("Failed to list IdP-managed teams")?;
 
     for team in all_idp_teams {
-        // Case-insensitive check if team is in the IdP group claim
-        let in_claim = idp_groups
-            .iter()
-            .any(|g| g.eq_ignore_ascii_case(&team.name));
+        let in_claim = idp_groups.iter().any(|group| team.name == *group);
 
         if !in_claim {
             // User should not be in this IdP-managed team
@@ -159,6 +179,84 @@ mod tests {
     use super::*;
     use crate::db::users;
 
+    #[test]
+    fn claim_filter_keeps_only_unique_canonical_groups_under_allowed_prefixes() {
+        let groups = [
+            "eu-west-1_uV3yhZdtV_baliohq-google-workspace".to_string(),
+            "other-valid-group".to_string(),
+            "rise-users".to_string(),
+            "rise-users".to_string(),
+        ];
+        let prefixes = ["rise-".to_string()];
+
+        assert_eq!(filter_idp_groups(&groups, &prefixes), ["rise-users"]);
+    }
+
+    #[sqlx::test]
+    async fn login_sync_keeps_only_canonical_groups_with_an_allowed_prefix(pool: PgPool) {
+        let user = users::create(&pool, "member@example.com").await.unwrap();
+
+        sync_user_groups(
+            &pool,
+            user.id,
+            &["rise-stale".to_string()],
+            &["rise-".to_string()],
+        )
+        .await
+        .unwrap();
+
+        sync_user_groups(
+            &pool,
+            user.id,
+            &[
+                "eu-west-1_uV3yhZdtV_baliohq-google-workspace".to_string(),
+                "other-valid-group".to_string(),
+                "rise-users".to_string(),
+                "rise-users".to_string(),
+            ],
+            &["rise-".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            teams::list_idp_group_names_for_user(&pool, user.id)
+                .await
+                .unwrap(),
+            vec!["rise-users".to_string()]
+        );
+    }
+
+    #[sqlx::test]
+    async fn invalid_group_casing_cannot_claim_a_privileged_team(pool: PgPool) {
+        let user = users::create(&pool, "member@example.com").await.unwrap();
+
+        sync_user_groups(
+            &pool,
+            user.id,
+            &["rise-admins".to_string()],
+            &["rise-".to_string()],
+        )
+        .await
+        .unwrap();
+        sync_user_groups(
+            &pool,
+            user.id,
+            &["Rise-Admins".to_string()],
+            &["rise-".to_string()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            teams::list_idp_group_names_for_user(&pool, user.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an invalid group must remove stale access, not normalize into it"
+        );
+    }
+
     /// Taking over a self-service team must not leave its members behind.
     ///
     /// Team names are first-come, first-served while `allow_team_creation` is
@@ -190,7 +288,7 @@ mod tests {
         );
 
         // A real member of the IdP group logs in, and the team is taken over.
-        sync_user_groups(&pool, genuine.id, &["rise-operators".to_string()])
+        sync_user_groups(&pool, genuine.id, &["rise-operators".to_string()], &[])
             .await
             .unwrap();
 

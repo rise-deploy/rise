@@ -317,8 +317,13 @@ async fn sync_groups_after_login(
             user.email
         );
 
-        if let Err(e) =
-            crate::server::auth::group_sync::sync_user_groups(&state.db_pool, user.id, groups).await
+        if let Err(e) = crate::server::auth::group_sync::sync_user_groups(
+            &state.db_pool,
+            user.id,
+            groups,
+            &state.auth_settings.idp_group_sync_prefixes,
+        )
+        .await
         {
             // Log error but don't fail login
             tracing::error!(
