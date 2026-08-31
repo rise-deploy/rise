@@ -1463,8 +1463,9 @@ pub async fn create_deployment(
 
         // Determine http_port for the new deployment:
         // - If explicit http_port was provided in request, use it (already in effective_http_port)
-        // - If no explicit port, inherit from source deployment
-        let final_http_port = if payload.http_port.is_some() {
+        // - If PORT env override was provided, use it (already in effective_http_port)
+        // - If no explicit port or env override, inherit from source deployment
+        let final_http_port = if payload.http_port.is_some() || port_from_env_override.is_some() {
             effective_http_port
         } else {
             source_deployment.http_port as u16
