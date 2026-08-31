@@ -78,6 +78,13 @@ pub struct Deployment {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_logs: Option<String>,
+    /// Opaque controller bookkeeping, surfaced for introspection only.
+    ///
+    /// Each backend writes whatever it needs to track its own convergence — the
+    /// ECS reconciler records the task-definition hash its service settled on.
+    /// The shape is the controller's business and changes with it, so nothing
+    /// outside the controller may depend on the keys inside: read it to see what
+    /// a controller is thinking, never to drive behaviour.
     #[serde(default)]
     pub controller_metadata: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,6 +265,16 @@ pub struct UpdateDeploymentStatusRequest {
     pub status: DeploymentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// What the reporter observed while making this transition — the build
+    /// method it chose, the registry it pushed to, per-image durations and
+    /// sizes. Recorded on the transition's event and nowhere else: this
+    /// describes one moment, not the deployment's state.
+    ///
+    /// Optional by design. The phases before `Pushed` are driven by the CLI,
+    /// so the backend cannot observe them and an older CLI simply sends
+    /// nothing — the transition is still recorded, just without detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

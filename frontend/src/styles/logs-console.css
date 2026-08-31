@@ -846,3 +846,207 @@
     height: 9px;
     box-shadow: 0 0 0 2px color-mix(in oklch, var(--text-soft) 30%, transparent);
 }
+
+/* ---------- timeline without a volume chart ---------- */
+
+/* Backends with no historical log store report no counts, but the deployment
+   still has a timeline. The rail keeps its axis and its markers. */
+.r-logc-bare-axis {
+    position: relative;
+    padding: 10px 0 0;
+}
+
+.r-logc-bare-line {
+    height: 1px;
+    background: var(--border);
+}
+
+.r-logc-bare-ticks {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 3px;
+}
+
+.r-logc-bare-tick {
+    font-size: 10px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+/* The lane sits on the baseline rather than below the labels. */
+.r-logc-bare-axis .r-logc-markers {
+    position: absolute;
+    top: 5px;
+    height: 11px;
+}
+
+/* ---------- deployment event timeline ---------- */
+
+/* The same log the rail draws on, read as a list. Severity is a dot on the
+   spine rather than coloured text, matching how the stream marks its rows. */
+.r-evt {
+    display: flex;
+    flex-direction: column;
+}
+
+.r-evt-row {
+    /* Height of the label's line box. The dot centres on it, so the two must
+       agree — a row that grows downwards must not drag the dot with it. */
+    --evt-line: 19.5px;
+
+    display: flex;
+    /* Baseline, so the timestamp and the delta pin to the label's first line
+       however tall the body below it grows. */
+    align-items: baseline;
+    gap: 12px;
+    padding: 7px 0;
+    position: relative;
+}
+
+.r-evt-row + .r-evt-row { border-top: 1px solid var(--border-faint); }
+
+.r-evt-dot {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-soft);
+    /* Pinned to the first line rather than the row's middle: an event with
+       facts or per-image detail is several lines tall, and a centred dot drifts
+       away from the moment it marks. A baseline-aligned block would sit on the
+       baseline by its bottom edge, so it is placed from the top instead and
+       nudged to the line's optical centre. */
+    align-self: flex-start;
+    margin-top: calc((var(--evt-line) - 7px) / 2);
+}
+
+.r-evt-row.sev-debug   .r-evt-dot { background: var(--text-soft); opacity: 0.6; }
+.r-evt-row.sev-info    .r-evt-dot { background: var(--ok); }
+.r-evt-row.sev-warning .r-evt-dot { background: var(--warn); }
+.r-evt-row.sev-error   .r-evt-dot { background: var(--err); }
+
+.r-evt-time {
+    flex: 0 0 96px;
+    font-size: 12px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+}
+
+.r-evt-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.r-evt-label {
+    font-size: 13px;
+    line-height: var(--evt-line);
+}
+
+/* A failure's message belongs with the failure, not in a separate panel. */
+.r-evt-reason {
+    font-size: 12px;
+    color: var(--text-muted);
+    word-break: break-word;
+}
+
+/* The gap between events is what a timeline is read for. */
+.r-evt-delta {
+    flex: none;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+[data-density="compact"] .r-evt-row { padding: 5px 0; }
+
+/* Attributes carried by an event, beside the transition it describes. */
+.r-evt-facts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    margin-top: 2px;
+}
+
+.r-evt-fact {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    font-size: 11.5px;
+}
+
+.r-evt-fact-k {
+    color: var(--text-soft);
+}
+
+.r-evt-fact-v {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11px;
+}
+
+/* Controller bookkeeping, dumped verbatim. Deliberately plain: it is a
+   diagnostic, not a designed view, and dressing it up would suggest a
+   stability the shape does not have. */
+.r-ctrl-meta {
+    margin: 0;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11.5px;
+    line-height: 1.6;
+    overflow-x: auto;
+    white-space: pre;
+}
+
+/* Per-image build/push detail on a transition. Indented under the facts row:
+   these belong to the event but are a level down from it. */
+.r-evt-images {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 3px;
+}
+
+.r-evt-image {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 11.5px;
+}
+
+.r-evt-image-name {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--text);
+}
+
+.r-evt-image-meta {
+    color: var(--text-soft);
+}
+
+.r-evt-link {
+    color: var(--accent);
+    text-decoration: none;
+}
+
+.r-evt-link:hover { text-decoration: underline; }
+
+/* Which replica an event is about, when it is about one rather than the
+   deployment as a whole. */
+.r-evt-subject {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 10.5px;
+    color: var(--text-muted);
+}

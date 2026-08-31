@@ -18,26 +18,6 @@ struct ProjectInfo {
     primary_url: Option<String>,
 }
 
-// Legacy Docker controller metadata structures (for backward compatibility with old deployments)
-#[derive(Deserialize, Debug, Clone, PartialEq)]
-struct DockerMetadata {
-    #[serde(default)]
-    reconcile_phase: ReconcilePhase,
-    container_id: Option<String>,
-    container_name: Option<String>,
-    assigned_port: Option<u16>,
-}
-
-#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
-enum ReconcilePhase {
-    #[default]
-    NotStarted,
-    CreatingContainer,
-    StartingContainer,
-    WaitingForHealth,
-    Completed,
-}
-
 // ANSI escape codes for terminal manipulation
 mod ansi {
     pub const CLEAR_LINE: &str = "\x1B[2K";
@@ -60,10 +40,8 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 /// State tracking between polls
 struct FollowState {
     last_status: DeploymentStatus,
-    last_controller_phase: Option<ReconcilePhase>,
     last_error: Option<String>,
     last_url: Option<String>,
-    last_metadata: serde_json::Value,
     spinner_frame: usize,
     is_first_poll: bool,
 }
@@ -72,31 +50,21 @@ impl FollowState {
     fn new() -> Self {
         Self {
             last_status: DeploymentStatus::Pending,
-            last_controller_phase: None,
             last_error: None,
             last_url: None,
-            last_metadata: serde_json::Value::Null,
             spinner_frame: 0,
             is_first_poll: true,
         }
     }
 
-    fn should_log_state_change(
-        &self,
-        deployment: &Deployment,
-        controller_phase: &Option<ReconcilePhase>,
-    ) -> bool {
-        self.is_first_poll
-            || self.last_status != deployment.status
-            || self.last_controller_phase != *controller_phase
+    fn should_log_state_change(&self, deployment: &Deployment) -> bool {
+        self.is_first_poll || self.last_status != deployment.status
     }
 
-    fn update(&mut self, deployment: &Deployment, controller_phase: Option<ReconcilePhase>) {
+    fn update(&mut self, deployment: &Deployment) {
         self.last_status = deployment.status.clone();
-        self.last_controller_phase = controller_phase;
         self.last_error = deployment.error_message.clone();
         self.last_url = deployment.primary_url.clone();
-        self.last_metadata = deployment.controller_metadata.clone();
         self.is_first_poll = false;
     }
 }
@@ -127,12 +95,7 @@ impl LiveStatusSection {
         }
     }
 
-    fn render(
-        &mut self,
-        deployment: &Deployment,
-        state: &FollowState,
-        controller_phase: &Option<ReconcilePhase>,
-    ) -> String {
+    fn render(&mut self, deployment: &Deployment, state: &FollowState) -> String {
         // Clear previous output
         self.clear_previous();
 
@@ -148,12 +111,7 @@ impl LiveStatusSection {
             String::new()
         };
 
-        // Show deployment status + controller phase if available
-        let status_text = if let Some(phase) = controller_phase {
-            format!("{} ({})", deployment.status, format_controller_phase(phase))
-        } else {
-            format!("{}", deployment.status)
-        };
+        let status_text = format!("{}", deployment.status);
 
         output.push_str(&format!(
             "{}{} Status:    {}{}{}\n",
@@ -179,12 +137,6 @@ impl LiveStatusSection {
                 ansi::RESET,
                 error
             ));
-            line_count += 1;
-        }
-
-        // Controller metadata summary (container ID if available)
-        if let Some(container_id) = extract_container_id(&deployment.controller_metadata) {
-            output.push_str(&format!("   Container: {}\n", container_id));
             line_count += 1;
         }
 
@@ -260,46 +212,9 @@ fn is_terminal_state(status: &DeploymentStatus) -> bool {
     )
 }
 
-/// Parse controller metadata to extract deployment phase info (handles legacy Docker deployments)
-fn parse_controller_metadata(metadata: &serde_json::Value) -> Option<DockerMetadata> {
-    if metadata.is_null() || metadata == &serde_json::json!({}) {
-        return None;
-    }
-
-    // Try to parse as Docker metadata (for legacy deployments)
-    // For Kubernetes deployments, this will return None, which is fine
-    serde_json::from_value::<DockerMetadata>(metadata.clone()).ok()
-}
-
-/// Extract container ID from metadata for display
-fn extract_container_id(metadata: &serde_json::Value) -> Option<String> {
-    parse_controller_metadata(metadata)
-        .and_then(|m| m.container_id.map(|id| id[..12.min(id.len())].to_string()))
-}
-
-/// Format controller phase for display
-fn format_controller_phase(phase: &ReconcilePhase) -> String {
-    match phase {
-        ReconcilePhase::NotStarted => "not started".to_string(),
-        ReconcilePhase::CreatingContainer => "creating container".to_string(),
-        ReconcilePhase::StartingContainer => "starting container".to_string(),
-        ReconcilePhase::WaitingForHealth => "waiting for health".to_string(),
-        ReconcilePhase::Completed => "running".to_string(),
-    }
-}
-
 /// Log state change to tracing (appears in history)
-fn log_state_change(
-    project: &str,
-    deployment_id: &str,
-    status: &DeploymentStatus,
-    controller_phase: &Option<ReconcilePhase>,
-) {
-    let status_text = if let Some(phase) = controller_phase {
-        format!("{} ({})", status, format_controller_phase(phase))
-    } else {
-        format!("{}", status)
-    };
+fn log_state_change(project: &str, deployment_id: &str, status: &DeploymentStatus) {
+    let status_text = format!("{}", status);
 
     info!("Deployment {}:{} → {}", project, deployment_id, status_text);
 }
@@ -311,24 +226,11 @@ fn is_tty() -> bool {
 
 /// Print deployment snapshot (for non-follow mode)
 pub fn print_deployment_snapshot(deployment: &Deployment) {
-    // Parse controller metadata
-    let controller_phase =
-        parse_controller_metadata(&deployment.controller_metadata).map(|m| m.reconcile_phase);
-
     // Status line with icon and color
     let icon = status_icon(&deployment.status);
     let color = status_color(&deployment.status);
 
-    // Show deployment status + controller phase if available
-    let status_text = if let Some(phase) = controller_phase {
-        format!(
-            "{} ({})",
-            deployment.status,
-            format_controller_phase(&phase)
-        )
-    } else {
-        format!("{}", deployment.status)
-    };
+    let status_text = format!("{}", deployment.status);
 
     println!(
         "{} Status:         {}{}{}",
@@ -377,11 +279,6 @@ pub fn print_deployment_snapshot(deployment: &Deployment) {
     // URL if available
     if let Some(ref url) = deployment.primary_url {
         println!("   URL:            {}", url);
-    }
-
-    // Controller metadata summary (container ID if available)
-    if let Some(container_id) = extract_container_id(&deployment.controller_metadata) {
-        println!("   Container:      {}", container_id);
     }
 
     // Error message if present
@@ -646,25 +543,17 @@ pub async fn follow_deployment_with_ui(
             let deployment =
                 fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
-            let controller_phase = parse_controller_metadata(&deployment.controller_metadata)
-                .map(|m| m.reconcile_phase);
-
-            if state.should_log_state_change(&deployment, &controller_phase) {
+            if state.should_log_state_change(&deployment) {
                 live_section.clear_previous();
-                log_state_change(
-                    project,
-                    deployment_id,
-                    &deployment.status,
-                    &controller_phase,
-                );
+                log_state_change(project, deployment_id, &deployment.status);
                 live_section.last_line_count = 0;
             } else {
-                let output = live_section.render(&deployment, &state, &controller_phase);
+                let output = live_section.render(&deployment, &state);
                 print!("{}", output);
                 io::stdout().flush().unwrap();
             }
 
-            state.update(&deployment, controller_phase);
+            state.update(&deployment);
             state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
 
             // Terminal state reached before Deploying - skip to Phase 3
@@ -759,19 +648,11 @@ async fn follow_deployment_simple(
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
-        let controller_phase =
-            parse_controller_metadata(&deployment.controller_metadata).map(|m| m.reconcile_phase);
-
-        if state.should_log_state_change(&deployment, &controller_phase) {
-            log_state_change(
-                project,
-                deployment_id,
-                &deployment.status,
-                &controller_phase,
-            );
+        if state.should_log_state_change(&deployment) {
+            log_state_change(project, deployment_id, &deployment.status);
         }
 
-        state.update(&deployment, controller_phase);
+        state.update(&deployment);
 
         if is_terminal_state(&deployment.status) {
             break deployment;

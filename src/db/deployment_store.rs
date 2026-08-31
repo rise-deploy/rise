@@ -97,7 +97,7 @@ impl DeploymentStore for PgDeploymentStore {
         id: Uuid,
         status: DeploymentStatus,
     ) -> Result<Deployment> {
-        crate::db::deployments::update_status(&self.pool, id, status).await
+        crate::db::deployments::update_status(&self.pool, id, status, None).await
     }
 
     async fn update_deployment_controller_metadata(
@@ -152,8 +152,9 @@ impl DeploymentStore for PgDeploymentStore {
         &self,
         id: Uuid,
         reason: TerminationReason,
+        superseded_by: Option<&str>,
     ) -> Result<Option<Deployment>> {
-        crate::db::deployments::mark_terminating(&self.pool, id, reason).await
+        crate::db::deployments::mark_terminating(&self.pool, id, reason, superseded_by).await
     }
 
     async fn mark_deployment_healthy_and_supersede(

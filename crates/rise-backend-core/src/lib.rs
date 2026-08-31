@@ -22,6 +22,7 @@ pub mod custom_domain;
 pub mod desired;
 pub mod diff;
 pub mod env;
+pub mod events;
 pub mod group;
 pub mod health_path;
 pub mod identity;
@@ -29,7 +30,6 @@ pub mod labels;
 pub mod lifecycle;
 pub mod models;
 pub mod naming;
-pub mod pod_status;
 pub mod providers;
 pub mod quantity;
 pub mod rolling;
@@ -57,7 +57,6 @@ pub use lifecycle::{
     SupersededHook,
 };
 pub use naming::{container_name, group_app_name, sanitize_ecs_name, stable_identity_name};
-pub use pod_status::{build_controller_metadata, build_pod_status};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
 };

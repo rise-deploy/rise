@@ -20,6 +20,7 @@ use crate::server::auth::context::AuthContext;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::registry::ImageTagType;
 use crate::server::state::AppState;
+use rise_backend_core::events::EventSeverity;
 
 /// Validate group name format: must be 'default' or match [a-z0-9][a-z0-9/-]*[a-z0-9]
 /// with additional constraints:
@@ -171,6 +172,70 @@ async fn resolve_image_digest(
 
     info!("Resolved '{}' to digest '{}'", image_ref, digest_ref);
     Ok(digest_ref)
+}
+
+/// Largest reporter-supplied attribute payload accepted on a status update.
+///
+/// The column's own CHECK caps a stored event at 16 KiB, and the transition
+/// adds its own keys, so the incoming half is bounded well below that. This is
+/// deliberately not enough room for a build log: that is a separate, larger
+/// artifact and belongs behind its own endpoint.
+const MAX_REPORTED_ATTRIBUTES_BYTES: usize = 8 * 1024;
+
+/// Check reporter-supplied event attributes before they reach the database.
+///
+/// Only a JSON object is accepted: the value is merged into the event's
+/// attributes, and merging an array or scalar has no meaning. An explicit
+/// `null` or an empty object is treated as "nothing reported", which is the
+/// normal case for a CLI that predates the field.
+fn validate_reported_attributes(
+    attributes: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ServerError> {
+    let Some(value) = attributes else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let object = value.as_object().ok_or_else(|| {
+        ServerError::bad_request("Status attributes must be a JSON object".to_string())
+    })?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+
+    // Postgres `jsonb` cannot store a NUL, and serde_json will happily carry one
+    // through. Rejecting it here turns a 500 that also rolls the transition back
+    // into a 400 that says what is wrong.
+    if contains_nul(&value) {
+        return Err(ServerError::bad_request(
+            "Status attributes must not contain NUL characters".to_string(),
+        ));
+    }
+
+    let size = serde_json::to_vec(&value)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_REPORTED_ATTRIBUTES_BYTES {
+        return Err(ServerError::bad_request(format!(
+            "Status attributes are {size} bytes, over the {MAX_REPORTED_ATTRIBUTES_BYTES} byte limit"
+        )));
+    }
+
+    Ok(Some(value))
+}
+
+/// Whether any string anywhere in the value contains a NUL character.
+fn contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, v)| key.contains('\0') || contains_nul(v)),
+        _ => false,
+    }
 }
 
 /// Convert API DeploymentStatus to DB DeploymentStatus
@@ -1975,6 +2040,12 @@ async fn perform_status_update(
             })?;
     }
 
+    // Reporter-supplied detail is untrusted: it comes from whatever CLI made
+    // the call and is rendered back in the UI. Reject it rather than storing
+    // something unreadable — a malformed payload should tell the reporter it is
+    // malformed, not silently vanish.
+    let reported = validate_reported_attributes(payload.attributes.clone())?;
+
     // Update status in database
     let status_copy = payload.status.clone();
     let updated_deployment = match payload.status {
@@ -1999,19 +2070,23 @@ async fn perform_status_update(
         _ => {
             // update_status will validate the state transition
             let db_status = convert_status_to_db(payload.status);
-            let deployment =
-                db_deployments::update_status(&state.db_pool, deployment.id, db_status)
-                    .await
-                    .map_err(|e| {
-                        // State transition validation errors are returned as anyhow errors
-                        // Return BAD_REQUEST for validation errors, INTERNAL_SERVER_ERROR otherwise
-                        let error_msg = e.to_string();
-                        if error_msg.contains("Invalid deployment state transition") {
-                            ServerError::bad_request(error_msg)
-                        } else {
-                            ServerError::internal_anyhow(e, "Failed to update deployment")
-                        }
-                    })?;
+            let deployment = db_deployments::update_status(
+                &state.db_pool,
+                deployment.id,
+                db_status,
+                reported.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                // State transition validation errors are returned as anyhow errors
+                // Return BAD_REQUEST for validation errors, INTERNAL_SERVER_ERROR otherwise
+                let error_msg = e.to_string();
+                if error_msg.contains("Invalid deployment state transition") {
+                    ServerError::bad_request(error_msg)
+                } else {
+                    ServerError::internal_anyhow(e, "Failed to update deployment")
+                }
+            })?;
 
             // Update project status (e.g., to Deploying)
             projects::update_calculated_status(&state.db_pool, project.id)
@@ -2417,6 +2492,7 @@ pub async fn stop_deployments_by_group(
                 &state.db_pool,
                 deployment.id,
                 crate::db::models::TerminationReason::UserStopped,
+                None,
             )
             .await
             .map(|opt| opt.map(|_| "Terminating"))
@@ -2557,6 +2633,7 @@ pub async fn stop_deployment(
             &state.db_pool,
             deployment.id,
             crate::db::models::TerminationReason::UserStopped,
+            None,
         )
         .await
         .internal_err("Failed to stop deployment")?
@@ -2822,6 +2899,175 @@ pub struct LogVolumeParams {
 /// Stream logs from a deployment via Server-Sent Events
 ///
 /// GET /projects/{project_name}/deployments/{deployment_id}/logs
+/// Query parameters for the deployment event log.
+#[derive(serde::Deserialize)]
+pub struct EventListParams {
+    /// Page size. Clamped to `MAX_EVENT_PAGE`.
+    pub limit: Option<i64>,
+    /// Opaque continuation from a previous page's `next_cursor`.
+    pub cursor: Option<String>,
+    /// Restrict to these kinds. Repeated query param: `?kind=a&kind=b`.
+    #[serde(default, rename = "kind")]
+    pub kind: Vec<String>,
+    /// Lowest severity to return. Defaults to `info`, so `debug` detail is
+    /// opt-in rather than filling the default view. `all` disables the filter.
+    pub min_severity: Option<String>,
+    /// Restrict to events about one thing inside the deployment — a container
+    /// replica as the runtime labels it. Omitted returns every event, including
+    /// the deployment-level ones.
+    pub subject: Option<String>,
+}
+
+const DEFAULT_EVENT_PAGE: i64 = 100;
+const MAX_EVENT_PAGE: i64 = 500;
+
+#[derive(serde::Serialize)]
+pub struct EventListResponse {
+    pub events: Vec<crate::db::deployment_events::DeploymentEvent>,
+    /// Absent when the page reached the end of the log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Read a deployment's event log.
+///
+/// GET /projects/{project_name}/deployments/{deployment_id}/events
+///
+/// Pages are cut on `(recorded_at, id)` rather than on `occurred_at`: an event
+/// derived from a late observation carries an older `occurred_at` than one
+/// already returned, and a cursor over that would step past it permanently.
+/// Clients sort a page by `occurred_at` to display it.
+pub async fn list_deployment_events(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<EventListParams>,
+) -> Result<Json<EventListResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    // Mirrors the log endpoint: a caller who cannot see the project is told it
+    // does not exist, so existence itself does not leak.
+    let (user, is_sa) = auth
+        .resolve_for_project(
+            &state.db_pool,
+            &project,
+            state.controllers_by_issuer.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_EVENT_PAGE)
+        .clamp(1, MAX_EVENT_PAGE);
+    // The accepted set, not a rank: `EventSeverity` owns the ordering and this
+    // asks it which severities qualify.
+    let severities = match params.min_severity.as_deref() {
+        None => Some(EventSeverity::Info.at_least()),
+        Some("all") => None,
+        Some(value) => Some(
+            EventSeverity::parse(value)
+                .ok_or_else(|| {
+                    ServerError::bad_request(format!(
+                        "Unknown severity '{}'. Expected debug, info, warning, error, or all.",
+                        value
+                    ))
+                })?
+                .at_least(),
+        ),
+    };
+
+    let after = params
+        .cursor
+        .as_deref()
+        .map(decode_event_cursor)
+        .transpose()?;
+
+    // Fetch one extra row to learn whether another page exists without a
+    // second query.
+    let mut events = crate::db::deployment_events::list_for_deployment(
+        &state.db_pool,
+        deployment.id,
+        limit + 1,
+        after,
+        &params.kind,
+        severities.as_deref(),
+        params.subject.as_deref(),
+    )
+    .await
+    .internal_err("Failed to list deployment events")?;
+
+    let next_cursor = if events.len() as i64 > limit {
+        events.truncate(limit as usize);
+        events
+            .last()
+            .map(|e| encode_event_cursor(e.recorded_at, e.id))
+    } else {
+        None
+    };
+
+    Ok(Json(EventListResponse {
+        events,
+        next_cursor,
+    }))
+}
+
+/// The cursor is a position, not a capability: `deployment_id` is always taken
+/// from the path, so a forged cursor cannot page across deployments.
+fn encode_event_cursor(recorded_at: chrono::DateTime<chrono::Utc>, id: i64) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+        "{}:{}",
+        recorded_at.timestamp_micros(),
+        id
+    ))
+}
+
+fn decode_event_cursor(
+    cursor: &str,
+) -> Result<crate::db::deployment_events::EventCursor, ServerError> {
+    use base64::Engine;
+    let invalid = || ServerError::bad_request("The event cursor is invalid.");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| invalid())?;
+    let text = String::from_utf8(raw).map_err(|_| invalid())?;
+    let (micros, id) = text.split_once(':').ok_or_else(invalid)?;
+    let micros: i64 = micros.parse().map_err(|_| invalid())?;
+    let id: i64 = id.parse().map_err(|_| invalid())?;
+    Ok(crate::db::deployment_events::EventCursor {
+        recorded_at: chrono::DateTime::from_timestamp_micros(micros).ok_or_else(invalid)?,
+        id,
+    })
+}
+
 pub async fn stream_deployment_logs(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -3235,7 +3481,8 @@ mod tests {
     use super::{
         check_log_containers, normalize_env_override_is_protected, resolve_resource_check_inputs,
         validate_container_resource_names, validate_env_override, validate_env_override_key,
-        validate_identity_audiences, validate_log_stream_query, LogStreamParams,
+        validate_identity_audiences, validate_log_stream_query, validate_reported_attributes,
+        LogStreamParams, MAX_REPORTED_ATTRIBUTES_BYTES,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
@@ -3883,5 +4130,44 @@ mod tests {
                 .unwrap();
         assert_eq!(group, "mr/123");
         assert_eq!(env.unwrap().name, "staging");
+    }
+
+    /// Absence, an explicit null and an empty object all mean the same thing:
+    /// the reporter had nothing to add. Every CLI predating the field is in
+    /// this case, so it must stay indistinguishable from a deliberate no-op.
+    #[test]
+    fn nothing_reported_is_accepted_as_nothing() {
+        assert!(validate_reported_attributes(None).unwrap().is_none());
+        assert!(validate_reported_attributes(Some(serde_json::Value::Null))
+            .unwrap()
+            .is_none());
+        assert!(validate_reported_attributes(Some(serde_json::json!({})))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reported_attributes_must_be_an_object() {
+        // The value is merged into the event's attributes, so anything that is
+        // not a set of keys has no meaning to merge.
+        for bad in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("build ok"),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                validate_reported_attributes(Some(bad.clone())).is_err(),
+                "{bad} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_reported_attributes_are_rejected() {
+        let big = serde_json::json!({ "log": "x".repeat(MAX_REPORTED_ATTRIBUTES_BYTES) });
+        assert!(validate_reported_attributes(Some(big)).is_err());
+
+        let ok = serde_json::json!({ "images": [{ "container": "web", "build_ms": 1 }] });
+        assert!(validate_reported_attributes(Some(ok)).unwrap().is_some());
     }
 }

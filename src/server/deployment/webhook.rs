@@ -101,8 +101,6 @@ pub struct FinalizeResponse {
 
 /// Duration after which image pull secret is refreshed (6 hours)
 const SECRET_REFRESH_HOURS: i64 = 6;
-/// Maximum number of terminating/terminated pods to carry forward in controller_metadata
-const MAX_INACTIVE_PODS: usize = 5;
 
 #[derive(Debug)]
 struct PreparedDeploymentEnvSecret {
@@ -644,45 +642,9 @@ async fn check_deployment_health_from_observed(
             .unwrap_or(0);
     }
 
-    // Check for pod-level errors and collect full pod status via kube-rs
-    // (Metacontroller only gives us the Deployment, not individual pods)
-    let pod_check = check_pod_errors_via_kube(
-        state,
-        project,
-        deployment,
-        desired_replicas,
-        ready_replicas,
-        &deployment.controller_metadata,
-        namespace_prefix,
-    )
-    .await;
-
-    // Update controller_metadata with pod status
-    if let Some(ref pod_status) = pod_check.pod_status {
-        let is_healthy = deployment.status == DeploymentStatus::Healthy
-            || (deployment.status == DeploymentStatus::Deploying
-                && !pod_check.has_error
-                && ready_replicas >= desired_replicas
-                && desired_replicas > 0);
-
-        let metadata = serde_json::json!({
-            "pod_status": pod_status,
-            "health": {
-                "last_check": Utc::now().to_rfc3339(),
-                "healthy": is_healthy,
-            },
-        });
-        if let Err(e) = state
-            .deployment_store
-            .update_deployment_controller_metadata(deployment.id, &metadata)
-            .await
-        {
-            warn!(
-                deployment_id = %deployment.deployment_id,
-                "Failed to update controller metadata: {:?}", e
-            );
-        }
-    }
+    // Check for pod-level errors via kube-rs (Metacontroller only gives us the
+    // Deployment, not individual pods).
+    let pod_check = check_pod_errors_via_kube(state, project, deployment, namespace_prefix).await;
 
     let is_ready = ready_replicas >= desired_replicas && desired_replicas > 0;
 
@@ -778,34 +740,29 @@ struct PodCheckResult {
     has_error: bool,
     /// Error message if has_error is true
     error_message: Option<String>,
-    /// Full pod status for storing in controller_metadata
-    pod_status: Option<serde_json::Value>,
 }
 
-/// Check pods for errors via direct kube-rs API call and collect full pod status.
+/// Check pods for irrecoverable errors via a direct kube-rs API call.
 ///
-/// Compares the live pod list against the previous `controller_metadata` snapshot:
-/// pods that were `terminating` or `terminated` in the previous snapshot but no longer
-/// exist in K8s are carried forward as `terminated: true` so the frontend can show
-/// their last-known state instead of silently dropping them.
+/// Metacontroller hands us the Deployment, not the pods underneath it, so the
+/// conditions that make a rollout unrecoverable — an image that will never pull,
+/// a container failing faster than it can be restarted, an OOM kill — are only
+/// visible from a pod list. Terminating pods are skipped throughout: a pod on its
+/// way out is expected to fail, and treating that as a rollout error would fail
+/// every successful replacement.
 async fn check_pod_errors_via_kube(
     state: &AppState,
     project: &Project,
     deployment: &Deployment,
-    desired_replicas: i32,
-    ready_replicas: i32,
-    prev_controller_metadata: &serde_json::Value,
     namespace_prefix: &str,
 ) -> PodCheckResult {
-    let kube_client = match &state.kube_client {
-        Some(client) => client,
-        None => {
-            return PodCheckResult {
-                has_error: false,
-                error_message: None,
-                pod_status: None,
-            }
-        }
+    const NO_ERROR: PodCheckResult = PodCheckResult {
+        has_error: false,
+        error_message: None,
+    };
+
+    let Some(kube_client) = &state.kube_client else {
+        return NO_ERROR;
     };
 
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
@@ -821,251 +778,85 @@ async fn check_pod_errors_via_kube(
     {
         Ok(pods) => pods,
         Err(e) => {
+            // Not knowing is not the same as being broken: a failed list must not
+            // fail the deployment.
             debug!(
                 deployment_id = %deployment.deployment_id,
                 "Failed to list pods for health check: {:?}", e
             );
-            return PodCheckResult {
-                has_error: false,
-                error_message: None,
-                pod_status: None,
-            };
+            return NO_ERROR;
         }
     };
 
-    let mut has_error = false;
-    let mut error_message: Option<String> = None;
-    let mut pod_infos: Vec<serde_json::Value> = Vec::new();
-    let mut current_replicas: i32 = 0;
-
     for pod in &pods.items {
-        let is_terminating = pod.metadata.deletion_timestamp.is_some();
-        if !is_terminating {
-            current_replicas += 1;
+        if pod.metadata.deletion_timestamp.is_some() {
+            continue;
         }
-        let pod_name = pod
-            .metadata
-            .name
-            .as_deref()
-            .unwrap_or("unknown")
-            .to_string();
-        let pod_phase = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.as_deref())
-            .unwrap_or("Unknown")
-            .to_string();
-
-        // Collect pod conditions
-        let conditions: Vec<serde_json::Value> = pod
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .map(|conds| {
-                conds
-                    .iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "type": c.type_,
-                            "status": c.status,
-                            "reason": c.reason,
-                            "message": c.message,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Collect container statuses
-        let mut container_infos: Vec<serde_json::Value> = Vec::new();
-        if let Some(container_statuses) = pod
+        let Some(container_statuses) = pod
             .status
             .as_ref()
             .and_then(|s| s.container_statuses.as_ref())
-        {
-            for cs in container_statuses {
-                let state_info = if let Some(state) = &cs.state {
-                    if let Some(waiting) = &state.waiting {
-                        let reason = waiting.reason.as_deref().unwrap_or("");
-                        // Check for irrecoverable errors (skip for terminating pods)
-                        if !is_terminating
-                            && !has_error
-                            && IRRECOVERABLE_CONTAINER_REASONS.contains(&reason)
-                        {
-                            has_error = true;
-                            let message = waiting.message.as_deref().unwrap_or(reason);
-                            error_message = Some(format!("{}: {}", reason, message));
-                        }
-                        Some(serde_json::json!({
-                            "state_type": "waiting",
-                            "reason": waiting.reason,
-                            "message": waiting.message,
-                        }))
-                    } else if let Some(running) = &state.running {
-                        Some(serde_json::json!({
-                            "state_type": "running",
-                            "started_at": running.started_at.as_ref().map(|t| t.0.to_string()),
-                        }))
-                    } else if let Some(terminated) = &state.terminated {
-                        // Check terminated with too many restarts (skip for terminating pods)
-                        if !is_terminating
-                            && !has_error
-                            && terminated.exit_code != 0
-                            && cs.restart_count >= 3
-                        {
-                            has_error = true;
-                            let reason = terminated.reason.as_deref().unwrap_or("ContainerFailed");
-                            let default_msg = format!("Exit code: {}", terminated.exit_code);
-                            let message = terminated.message.as_deref().unwrap_or(&default_msg);
-                            error_message = Some(format!(
-                                "{}: {} (restarts: {})",
-                                reason, message, cs.restart_count
-                            ));
-                        }
-                        Some(serde_json::json!({
-                            "state_type": "terminated",
-                            "reason": terminated.reason,
-                            "message": terminated.message,
-                            "exit_code": terminated.exit_code,
-                            "started_at": terminated.started_at.as_ref().map(|t| t.0.to_string()),
-                            "finished_at": terminated.finished_at.as_ref().map(|t| t.0.to_string()),
-                        }))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+        else {
+            continue;
+        };
 
-                // Collect last_state info (the previous terminated state, e.g. OOMKilled)
-                let last_state_info = if let Some(last_state) = &cs.last_state {
-                    if let Some(terminated) = &last_state.terminated {
-                        // Surface OOMKilled or other bad exit in last_state as an error
-                        // when restarts are high and the current state didn't already trigger one.
-                        if !is_terminating
-                            && !has_error
-                            && (terminated.reason.as_deref() == Some("OOMKilled")
-                                || (terminated.exit_code != 0 && cs.restart_count >= 3))
-                        {
-                            has_error = true;
-                            let reason = terminated.reason.as_deref().unwrap_or("ContainerFailed");
-                            let default_msg = format!("Exit code: {}", terminated.exit_code);
-                            let message = terminated.message.as_deref().unwrap_or(&default_msg);
-                            error_message = Some(format!(
-                                "{}: {} (restarts: {})",
-                                reason, message, cs.restart_count
-                            ));
-                        }
-                        Some(serde_json::json!({
-                            "state_type": "terminated",
-                            "reason": terminated.reason,
-                            "message": terminated.message,
-                            "exit_code": terminated.exit_code,
-                            "started_at": terminated.started_at.as_ref().map(|t| t.0.to_string()),
-                            "finished_at": terminated.finished_at.as_ref().map(|t| t.0.to_string()),
-                        }))
-                    } else if let Some(waiting) = &last_state.waiting {
-                        Some(serde_json::json!({
-                            "state_type": "waiting",
-                            "reason": waiting.reason,
-                            "message": waiting.message,
-                        }))
-                    } else {
-                        last_state.running.as_ref().map(|running| {
-                            serde_json::json!({
-                                "state_type": "running",
-                                "started_at": running.started_at.as_ref().map(|t| t.0.to_string()),
-                            })
-                        })
-                    }
-                } else {
-                    None
-                };
-
-                container_infos.push(serde_json::json!({
-                    "name": cs.name,
-                    "ready": cs.ready,
-                    "restart_count": cs.restart_count,
-                    "state": state_info,
-                    "last_state": last_state_info,
-                }));
-            }
-        }
-
-        pod_infos.push(serde_json::json!({
-            "name": pod_name,
-            "phase": pod_phase,
-            "terminating": is_terminating,
-            "conditions": conditions,
-            "containers": container_infos,
-        }));
-    }
-
-    // Carry forward pods that were terminating/terminated in the previous snapshot
-    // but are no longer in the K8s pod list — mark them as fully terminated.
-    // Keep at most MAX_INACTIVE_PODS inactive (terminating + terminated) pods total.
-    if let Some(prev_pods) = prev_controller_metadata
-        .get("pod_status")
-        .and_then(|ps| ps.get("pods"))
-        .and_then(|p| p.as_array())
-    {
-        let live_pod_names: std::collections::HashSet<String> = pod_infos
-            .iter()
-            .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(String::from))
-            .collect();
-
-        // Count live terminating pods already in the list
-        let mut inactive_count = pod_infos
-            .iter()
-            .filter(|p| {
-                p.get("terminating")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            })
-            .count();
-
-        for prev_pod in prev_pods {
-            if inactive_count >= MAX_INACTIVE_PODS {
-                break;
-            }
-            let was_terminating = prev_pod
-                .get("terminating")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let was_terminated = prev_pod
-                .get("terminated")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let name = prev_pod.get("name").and_then(|n| n.as_str()).unwrap_or("");
-
-            if (was_terminating || was_terminated)
-                && !name.is_empty()
-                && !live_pod_names.contains(name)
-            {
-                // Pod is gone from K8s — carry forward with terminated: true
-                let mut carried = prev_pod.clone();
-                if let Some(obj) = carried.as_object_mut() {
-                    obj.insert("terminating".to_string(), serde_json::Value::Bool(false));
-                    obj.insert("terminated".to_string(), serde_json::Value::Bool(true));
+        for cs in container_statuses {
+            // A waiting container naming a reason we know never resolves on its
+            // own — ImagePullBackOff and friends.
+            if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) {
+                let reason = waiting.reason.as_deref().unwrap_or("");
+                if IRRECOVERABLE_CONTAINER_REASONS.contains(&reason) {
+                    let message = waiting.message.as_deref().unwrap_or(reason);
+                    return PodCheckResult {
+                        has_error: true,
+                        error_message: Some(format!("{}: {}", reason, message)),
+                    };
                 }
-                pod_infos.push(carried);
-                inactive_count += 1;
+            }
+
+            // A container that keeps exiting non-zero. The restart threshold is
+            // what separates a crash loop from one unlucky exit.
+            if let Some(terminated) = cs.state.as_ref().and_then(|s| s.terminated.as_ref()) {
+                if terminated.exit_code != 0 && cs.restart_count >= CRASH_LOOP_RESTARTS {
+                    return crashed(terminated, cs.restart_count);
+                }
+            }
+
+            // The current state can look fine while the *previous* one explains
+            // the restart — an OOM kill is worth reporting on its first occurrence,
+            // since the next one is not more informative.
+            if let Some(terminated) = cs.last_state.as_ref().and_then(|s| s.terminated.as_ref()) {
+                let oom_killed = terminated.reason.as_deref() == Some("OOMKilled");
+                if oom_killed
+                    || (terminated.exit_code != 0 && cs.restart_count >= CRASH_LOOP_RESTARTS)
+                {
+                    return crashed(terminated, cs.restart_count);
+                }
             }
         }
     }
 
-    let pod_status = serde_json::json!({
-        "desired_replicas": desired_replicas,
-        "ready_replicas": ready_replicas,
-        "current_replicas": current_replicas,
-        "pods": pod_infos,
-        "last_checked": Utc::now().to_rfc3339(),
-    });
+    NO_ERROR
+}
 
+/// Restarts tolerated before a non-zero exit is read as a crash loop rather than
+/// one bad start.
+const CRASH_LOOP_RESTARTS: i32 = 3;
+
+/// Render a terminated container state as a rollout error.
+fn crashed(
+    terminated: &k8s_openapi::api::core::v1::ContainerStateTerminated,
+    restart_count: i32,
+) -> PodCheckResult {
+    let reason = terminated.reason.as_deref().unwrap_or("ContainerFailed");
+    let default_msg = format!("Exit code: {}", terminated.exit_code);
+    let message = terminated.message.as_deref().unwrap_or(&default_msg);
     PodCheckResult {
-        has_error,
-        error_message,
-        pod_status: Some(pod_status),
+        has_error: true,
+        error_message: Some(format!(
+            "{}: {} (restarts: {})",
+            reason, message, restart_count
+        )),
     }
 }
 
@@ -2292,7 +2083,7 @@ async fn process_finalize(
                 }
             } else if state
                 .deployment_store
-                .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped)
+                .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped, None)
                 .await?
                 .is_some()
             {

@@ -104,6 +104,47 @@ mod tests {
     use crate::rise_toml::EnvironmentConfig;
     use std::collections::BTreeMap;
 
+    /// A resource key put on the container table instead of its `deploy` table
+    /// parses fine and does nothing, which is the shape of mistake most likely
+    /// to be made and least likely to be noticed. The path in the warning has
+    /// to name the container, or it does not help.
+    #[test]
+    fn a_misplaced_per_container_key_is_reported_with_its_path() {
+        let toml = r#"
+version = 1
+
+[project]
+name = "test-project"
+
+[containers.web]
+port = 80
+replicas = 3
+
+[containers.web.deploy]
+cpu = "250m"
+"#;
+        let mut ignored = Vec::new();
+        let deserializer = toml::Deserializer::parse(toml).unwrap();
+        let config: ProjectBuildConfig =
+            serde_ignored::deserialize(deserializer, |path| ignored.push(path.to_string()))
+                .expect("an unknown key is ignored, not fatal");
+
+        assert_eq!(
+            ignored,
+            vec!["containers.web.replicas".to_string()],
+            "the warning must say which container and which key",
+        );
+        // And the correctly-placed sibling still took effect, so the report is
+        // about the stray key rather than the whole table being dropped.
+        assert_eq!(
+            config.containers["web"]
+                .deploy
+                .as_ref()
+                .and_then(|d| d.cpu.as_deref()),
+            Some("250m"),
+        );
+    }
+
     #[test]
     fn test_load_config_with_unused_fields() {
         // Create a temporary directory for test

@@ -99,9 +99,16 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
     // The x-axis domain is the data extent, not the picked range, so a marker
     // outside it has nowhere to sit and would read as though it happened at
     // whichever edge it was clamped to.
-    const domain = useMemo(() => (
-        data.length > 0 ? { min: data[0].ts, max: data[data.length - 1].ts } : null
-    ), [data]);
+    const domain = useMemo(() => {
+        if (data.length > 0) return { min: data[0].ts, max: data[data.length - 1].ts };
+        // No volume to chart, but markers may still need an axis — a backend
+        // without a historical log store reports no counts and still has a
+        // deployment timeline.
+        if (rangeStartMs && rangeEndMs && rangeEndMs > rangeStartMs) {
+            return { min: rangeStartMs, max: rangeEndMs };
+        }
+        return null;
+    }, [data, rangeStartMs, rangeEndMs]);
     /**
      * The marker lane and the reader cursor have to line up with the bars, and
      * only Recharts knows where its plot area actually is: the YAxis reserves
@@ -207,8 +214,15 @@ export default function LogVolumeChart({ counts, levels, loading, error, status,
                 <div className="py-6 text-center text-xs text-[var(--text-soft)]">Loading chart…</div>
             ) : error ? (
                 <div className="py-6 text-center text-xs text-[var(--err)]">{error}</div>
-            ) : !data.length || totalSum === 0 ? (
+            ) : (!data.length || totalSum === 0) && visibleMarkers.length === 0 ? (
                 <div className="py-6 text-center text-xs text-[var(--text-soft)]">{statusMessage()}</div>
+            ) : (!data.length || totalSum === 0) ? (
+                // Markers without volume: render the lane against a bare axis
+                // rather than hiding the deployment's timeline behind a
+                // capability it does not depend on.
+                <div className="r-logc-chart-body" ref={bodyRef}>
+                    <MarkerOnlyAxis domain={domain} rangeMs={rangeMs} markers={visibleMarkers} />
+                </div>
             ) : (
                 <div className="r-logc-chart-body" ref={bodyRef}>
                 <div role="img" aria-label={chartAriaLabel}>
@@ -424,6 +438,57 @@ function clusterMarkers(markers, domain, laneWidth) {
             (a, b) => MARKER_KIND_PRIORITY.indexOf(a.kind) - MARKER_KIND_PRIORITY.indexOf(b.kind),
         )[0],
     }));
+}
+
+/**
+ * The timeline when the log backend reports no volume.
+ *
+ * Recharts is not involved, so there is no plot area to measure — the lane is
+ * the full width minus a small inset, and markers position by percentage
+ * against the same domain the chart would have used.
+ */
+function MarkerOnlyAxis({ domain, rangeMs, markers }) {
+    if (!domain) return null;
+    const span = Math.max(1, domain.max - domain.min);
+    const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => domain.min + span * f);
+
+    return (
+        <div className="r-logc-bare-axis">
+            <div className="r-logc-bare-line" />
+            <div className="r-logc-bare-ticks">
+                {ticks.map((ts, i) => (
+                    <span key={i} className="r-logc-bare-tick">
+                        {formatTickLabel(ts, rangeMs)}
+                    </span>
+                ))}
+            </div>
+            <div className="r-logc-markers" style={{ left: 0, right: 0 }}>
+                {clusterMarkers(markers, domain, 600).map((cluster, i) => (
+                    <span
+                        key={`bare-${cluster.pct}-${i}`}
+                        className="r-logc-marker-slot"
+                        style={{ left: `${cluster.pct}%` }}
+                    >
+                        <Tooltip
+                            content={cluster.markers.map((m) => (
+                                <div key={`${m.ts}-${m.label}`}>
+                                    {m.label} · {formatMarkerTime(m.ts)}
+                                </div>
+                            ))}
+                        >
+                            <span
+                                className={`r-logc-marker is-${cluster.lead.kind}${cluster.markers.length > 1 ? ' is-cluster' : ''}`}
+                                style={{ background: markerColor(cluster.lead.kind) }}
+                                aria-label={cluster.markers
+                                    .map((m) => `${m.label} at ${formatMarkerTime(m.ts)}`)
+                                    .join('; ')}
+                            />
+                        </Tooltip>
+                    </span>
+                ))}
+            </div>
+        </div>
+    );
 }
 
 function formatMarkerTime(ms) {

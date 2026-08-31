@@ -1144,6 +1144,36 @@
         }
       ]
     },
+    "DeploymentRetentionSettings": {
+      "description": "Bounds on how much deployment history Rise keeps.\n\nThe two halves have deliberately different defaults. Capping a single\ndeployment's events discards only the middle of a flap it already summarises,\nso it is on. Deleting a deployment discards its event log *and* the\nenvironment-variable snapshot that makes it re-deployable, and no amount of\ncare makes that reversible — so it is off until an operator asks for it.",
+      "properties": {
+        "delete_aged_deployments": {
+          "default": false,
+          "description": "Delete finished deployments once they are older than\n`max_deployment_age_days`. Off by default: this is irreversible, and an\nupgrade must not start deleting history nobody asked it to.",
+          "type": "boolean"
+        },
+        "keep_primary_deployments_per_environment": {
+          "default": 10,
+          "description": "How many of each environment's most recent *finished* primary-group\ndeployments survive deletion regardless of age. These are what a\nrollback reaches for, so an environment that has not deployed in a long\ntime keeps a usable history rather than being emptied by the age rule.\n\nCounts finished deployments only. The active deployment and anything\nstill running are never deleted, so spending these slots on them would\nleave no rollback history at all.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "max_deployment_age_days": {
+          "default": 90,
+          "description": "How old a finished deployment must be before deletion considers it.\nOnly consulted when `delete_aged_deployments` is on.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events_per_deployment": {
+          "default": 1000,
+          "description": "Most events kept for one deployment. Its first event — the creation\nevent, which anchors the timeline — is always kept regardless.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "EncryptionSettings": {
       "description": "Encryption provider configuration",
       "oneOf": [
@@ -2407,6 +2437,16 @@
     },
     "deployment_logs": {
       "$ref": "#/$defs/DeploymentLogsSettings"
+    },
+    "deployment_retention": {
+      "$ref": "#/$defs/DeploymentRetentionSettings",
+      "default": {
+        "delete_aged_deployments": false,
+        "keep_primary_deployments_per_environment": 10,
+        "max_deployment_age_days": 90,
+        "max_events_per_deployment": 1000
+      },
+      "description": "Bounds the growth of deployment history. Omitting the section keeps the\nevent cap on and deletion of old deployments off."
     },
     "encryption": {
       "anyOf": [

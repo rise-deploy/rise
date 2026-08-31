@@ -31,6 +31,57 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **The Pods tab is gone, and a deployment's history is now an event log.**
+  Every backend used to write a Kubernetes-shaped `pod_status` snapshot into
+  `controller_metadata` on each reconcile, and the UI read into its keys. That
+  made a controller's internal note a public interface, and let two sources
+  disagree about the same rollout. Deployments now record what happened as
+  append-only events, read by the Timeline tab and the log console's rail.
+
+  What this means in practice:
+
+  - **Deployments created before the upgrade have no events**, so their Timeline
+    reads "No events recorded" and their rail has nothing to draw. Their logs,
+    status and everything else are unaffected. New deployments record from the
+    moment they are created.
+  - **Per-replica detail is not yet recorded on any backend.** Container start,
+    exit and restart used to be visible in the Pods tab on Kubernetes and are
+    currently visible nowhere. This is a gap being closed, not a backend
+    difference — see the [deployment backends](/operator-docs/deployment-backends/)
+    matrix.
+  - **A "Controller" tab replaces it**, rendering `controller_metadata`
+    verbatim for introspection. It appears only when a backend writes something
+    there, which today is ECS alone (its task-definition hash). Nothing should
+    read into its keys: the shape belongs to whichever controller wrote it and
+    carries no compatibility promise.
+  - The migration removes the now-unwritten `pod_status` and `health` keys from
+    existing rows. It rewrites every deployment row that has them, so on a large
+    install expect the migration to take proportionally longer; it runs inside
+    the usual startup transaction.
+
+- **Config change — deployment history retention.** A new
+  `deployment_retention` section bounds how much history Rise keeps.
+
+  - `max_events_per_deployment` (default `1000`) caps the events kept for any
+    one deployment. A normal deployment records about six for its whole life, so
+    the cap only engages for a deployment that oscillates between `Healthy` and
+    `Unhealthy`, which would otherwise accumulate two rows per flap forever. A
+    deployment's first event is always kept, so its timeline still shows where
+    it began.
+  - `delete_aged_deployments` (default `false`) deletes finished deployments
+    older than `max_deployment_age_days` (default `90`). **Off by default and
+    irreversible**: deleting a deployment takes its event log and its
+    environment-variable snapshot with it, which is what makes it
+    re-deployable. Turn it on only if you want that.
+  - `keep_primary_deployments_per_environment` (default `10`) protects each
+    environment's most recent finished deployments in its primary deployment
+    group from the age rule, so rollback targets survive. The active deployment
+    and anything still running are never deleted, whatever the settings say.
+
+  Both passes run hourly on the elected leader. Deletion is batched, so the
+  first run after enabling it works through a backlog over several hours rather
+  than in one transaction.
+
 - **Docker installs restart the containers of non-public projects once, on the
   first reconcile after upgrade.** The Traefik router's forwardAuth middleware
   was referenced as `{router}-auth@docker`. Naming a provider is wrong for any

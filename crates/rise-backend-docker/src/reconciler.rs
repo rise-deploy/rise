@@ -3,7 +3,7 @@
 //! Docker has no Metacontroller, so this loop replicates the webhook's
 //! responsibilities against the Docker daemon: status-machine transitions,
 //! desired-vs-actual container diffing, GC, HTTP health probing, supersession,
-//! and `controller_metadata` snapshots.
+//! and readiness verdicts.
 //!
 //! The diff itself ([`diff_desired_vs_actual`]) is a pure function so it can be
 //! unit-tested without a daemon.
@@ -34,7 +34,6 @@ use super::diff::{
 use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
-use super::pod_status::build_controller_metadata;
 use super::rolling::filter_rolling_actions;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
@@ -1848,11 +1847,6 @@ impl DockerReconciler {
             .iter()
             .filter_map(|a| a.identity().map(|id| (id, a)))
             .collect();
-        // One pod entry per REPLICA container, in (spec, replica) order. Each
-        // carries the live container's REAL (generation-ful) name where present,
-        // else a replica-distinct stable fallback for a not-yet-created replica.
-        // Fed straight into `build_controller_metadata` (no re-derivation).
-        let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
         // Every REPLICA of every spec must be ready for the deployment to be
         // healthy:
         //   - HTTP containers WITH a `health_check` are ready only once Traefik's
@@ -1953,22 +1947,9 @@ impl DockerReconciler {
                 );
                 // Resolve this replica to its live container. When present,
                 // inspect by the actual generation-ful name; when absent (not yet
-                // created / mid-recreate), synthesize a replica-distinct pod name
-                // (the replica-free stable name + `_r{n}`) and skip the inspect.
+                // created / mid-recreate), there is nothing to inspect and the
+                // replica is definitively not ready.
                 let actual = actual_by_identity.get(&identity).copied();
-                let name = match actual {
-                    Some(a) => a.name.clone(),
-                    None => format!(
-                        "{}_r{replica}",
-                        container_builder::stable_identity_name(
-                            &self.config.container_prefix,
-                            &project.name,
-                            &deployment.deployment_group,
-                            &deployment.deployment_id,
-                            &spec.name,
-                        )
-                    ),
-                };
                 let inspected = match actual {
                     Some(a) => self.inspect_for_reconcile(&a.name, spec.port).await,
                     None => None,
@@ -2048,10 +2029,9 @@ impl DockerReconciler {
                         }
                     }
                 };
-                pods.push((name, inspected));
                 if !ready {
                     all_ready = false;
-                    // Keep inspecting the remaining replicas so the pod_status
+                    // Keep inspecting the remaining replicas so the readiness
                     // snapshot stays complete; only the readiness verdict short-
                     // circuits below via `all_ready`.
                 }
@@ -2067,21 +2047,6 @@ impl DockerReconciler {
                 not_ready_reasons.join("; ")
             )
         };
-
-        // Snapshot controller_metadata in a K8s-pod-status-shaped blob so the
-        // existing status APIs/UI render unchanged. Built from the per-replica
-        // inspections captured above (no second inspect).
-        let metadata = build_controller_metadata(&pods, &deployment.status, is_ready);
-        if let Err(e) = self
-            .store
-            .update_deployment_controller_metadata(deployment.id, &metadata)
-            .await
-        {
-            warn!(
-                deployment_id = %deployment.deployment_id,
-                "Failed to update controller metadata: {:?}", e
-            );
-        }
 
         match deployment.status {
             DeploymentStatus::Deploying if is_ready => {
@@ -2260,7 +2225,7 @@ impl DockerReconciler {
     }
 
     /// Single `inspect_container` for the reconcile pass: returns an owned
-    /// snapshot reused by BOTH the health probe and the `pod_status` builder, so
+    /// snapshot reused by BOTH the health probe and the readiness verdict, so
     /// each container is inspected once per tick. `port` is the container's
     /// app port (if any), used to resolve the published loopback host port from
     /// the `network_settings.ports["{port}/tcp"]` mapping. Returns `None` when
@@ -2284,7 +2249,7 @@ impl DockerReconciler {
         let state = inspect.state.clone();
         // The bollard `ContainerStateStatusEnum` Displays as the lowercase API
         // string ("running", "exited", …), matching what we map on in the
-        // pod_status builder.
+        // readiness verdict.
         let status = state
             .as_ref()
             .and_then(|s| s.status.as_ref())
