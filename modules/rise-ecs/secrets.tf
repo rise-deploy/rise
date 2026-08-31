@@ -18,6 +18,17 @@ resource "random_bytes" "encryption_key" {
   length = 32 # AES-GCM-256.
 }
 
+locals {
+  database_url = local.create_database ? format(
+    "postgres://%s:%s@%s/%s",
+    aws_db_instance.this[0].username,
+    random_password.database[0].result,
+    aws_db_instance.this[0].endpoint,
+    aws_db_instance.this[0].db_name
+  ) : null
+  oidc_client_secret = coalesce(var.oidc_client_secret, "rise-backend-secret")
+}
+
 resource "aws_secretsmanager_secret" "database_url" {
   count = local.create_database ? 1 : 0
 
@@ -30,14 +41,9 @@ resource "aws_secretsmanager_secret" "database_url" {
 resource "aws_secretsmanager_secret_version" "database_url" {
   count = local.create_database ? 1 : 0
 
-  secret_id = aws_secretsmanager_secret.database_url[0].id
-  secret_string = format(
-    "postgres://%s:%s@%s/%s",
-    aws_db_instance.this[0].username,
-    random_password.database[0].result,
-    aws_db_instance.this[0].endpoint,
-    aws_db_instance.this[0].db_name
-  )
+  secret_id                = aws_secretsmanager_secret.database_url[0].id
+  secret_string_wo         = local.database_url
+  secret_string_wo_version = parseint(substr(sha256(local.database_url), 0, 15), 16)
 }
 
 resource "aws_secretsmanager_secret" "jwt_signing_secret" {
@@ -48,8 +54,9 @@ resource "aws_secretsmanager_secret" "jwt_signing_secret" {
 }
 
 resource "aws_secretsmanager_secret_version" "jwt_signing_secret" {
-  secret_id     = aws_secretsmanager_secret.jwt_signing_secret.id
-  secret_string = random_bytes.jwt_signing_secret.base64
+  secret_id                = aws_secretsmanager_secret.jwt_signing_secret.id
+  secret_string_wo         = random_bytes.jwt_signing_secret.base64
+  secret_string_wo_version = parseint(substr(sha256(random_bytes.jwt_signing_secret.base64), 0, 15), 16)
 }
 
 resource "aws_secretsmanager_secret" "encryption_key" {
@@ -60,8 +67,9 @@ resource "aws_secretsmanager_secret" "encryption_key" {
 }
 
 resource "aws_secretsmanager_secret_version" "encryption_key" {
-  secret_id     = aws_secretsmanager_secret.encryption_key.id
-  secret_string = random_bytes.encryption_key.base64
+  secret_id                = aws_secretsmanager_secret.encryption_key.id
+  secret_string_wo         = random_bytes.encryption_key.base64
+  secret_string_wo_version = parseint(substr(sha256(random_bytes.encryption_key.base64), 0, 15), 16)
 }
 
 resource "aws_secretsmanager_secret" "oidc_client_secret" {
@@ -72,8 +80,9 @@ resource "aws_secretsmanager_secret" "oidc_client_secret" {
 }
 
 resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
-  secret_id     = aws_secretsmanager_secret.oidc_client_secret.id
-  secret_string = coalesce(var.oidc_client_secret, "rise-backend-secret")
+  secret_id                = aws_secretsmanager_secret.oidc_client_secret.id
+  secret_string_wo         = local.oidc_client_secret
+  secret_string_wo_version = parseint(substr(sha256(local.oidc_client_secret), 0, 15), 16)
 
   lifecycle {
     # The `rise-backend-secret` default is deliberate only for the bundled Dex

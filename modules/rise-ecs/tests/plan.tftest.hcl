@@ -56,6 +56,32 @@ run "creates_a_whole_install" {
     error_message = "Traefik must run one replica: its ACME file store is not multi-writer safe"
   }
 
+  assert {
+    condition = jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].healthCheck == {
+      command = [
+        "CMD",
+        "traefik",
+        "healthcheck",
+        "--ping=true",
+        "--entrypoints.ping.address=:8082",
+        "--ping.entrypoint=ping",
+      ]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 10
+    }
+    error_message = "Traefik must report ECS health through its dedicated ping entrypoint"
+  }
+
+  assert {
+    condition = (
+      aws_secretsmanager_secret_version.oidc_client_secret.secret_string == null
+      && aws_secretsmanager_secret_version.oidc_client_secret.secret_string_wo_version == parseint(substr(sha256("s3cret"), 0, 15), 16)
+    )
+    error_message = "managed secret versions must use a content-sensitive write-only version"
+  }
+
   # The backend asserts registry account == ECS credentials' account at startup,
   # because Rise writes no ECR repository policy.
   assert {

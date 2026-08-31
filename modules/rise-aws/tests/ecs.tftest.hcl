@@ -30,11 +30,12 @@ override_data {
 }
 
 variables {
-  name            = "rise-backend"
-  enable_ecr      = true
-  enable_ecs      = true
-  ssm_kms_key_arn = "arn:aws:kms:eu-central-1:123456789012:key/abc"
-  ecs_secret_arns = ["arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/db-*"]
+  name               = "rise-backend"
+  enable_ecr         = true
+  enable_ecs         = true
+  ecs_log_group_name = "/rise-backend"
+  ssm_kms_key_arn    = "arn:aws:kms:eu-central-1:123456789012:key/abc"
+  ecs_secret_arns    = ["arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/db-*"]
 }
 
 run "ecs_policy_grants_only_what_the_controller_calls" {
@@ -68,10 +69,23 @@ run "runtime_log_reads_are_confined_to_the_configured_group" {
       for s in jsondecode(data.aws_iam_policy_document.backend.json).Statement :
       s.Sid == "ReadECSRuntimeLogs"
       && toset(flatten([s.Action])) == toset(["logs:FilterLogEvents", "logs:StartLiveTail"])
-      && s.Resource == "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom:*"
+      && toset(flatten([s.Resource])) == toset([
+        "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom",
+        "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom:*"
+      ])
     ])
     error_message = "runtime log policy must grant only FilterLogEvents and StartLiveTail on the configured group"
   }
+}
+
+run "ecs_requires_an_explicit_runtime_log_group" {
+  command = plan
+
+  variables {
+    ecs_log_group_name = null
+  }
+
+  expect_failures = [aws_iam_role.backend]
 }
 
 run "passrole_is_scoped_to_the_two_task_roles" {

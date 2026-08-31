@@ -201,7 +201,7 @@ variable "ecs_cluster_name" {
 }
 
 variable "ecs_log_group_name" {
-  description = "CloudWatch log group Rise reads for ECS runtime logs. Defaults to /<name>; must match deployment_controller.log_group."
+  description = "CloudWatch log group Rise reads for ECS runtime logs. Required when enable_ecs is true; must match deployment_controller.log_group."
   type        = string
   default     = null
 

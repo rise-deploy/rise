@@ -184,6 +184,21 @@ resource "aws_ecs_task_definition" "traefik" {
         { sourceVolume = "acme", containerPath = "/acme", readOnly = false }
       ] : []
 
+      healthCheck = {
+        command = [
+          "CMD",
+          "traefik",
+          "healthcheck",
+          "--ping=true",
+          "--entrypoints.ping.address=:8082",
+          "--ping.entrypoint=ping",
+        ]
+        interval    = 30
+        timeout     = 5
+        retries     = 3
+        startPeriod = 10
+      }
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
