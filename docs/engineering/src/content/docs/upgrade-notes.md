@@ -31,6 +31,23 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Terraform requirements and secret-version state migration for `rise-ecs`.**
+  The module requires Terraform 1.11+ and AWS provider 6.50+. Its managed
+  Secrets Manager versions use write-only values, so plan and refresh need no
+  `secretsmanager:GetSecretValue` permission. Existing installs must apply a
+  release containing the included `removed` blocks once; that apply forgets the
+  readable resource bindings without deleting their AWS versions and publishes
+  the same values through write-only resources.
+
+- **ECS runtime log access names the exact log group.** `rise-aws` requires
+  `ecs_log_group_name` whenever `enable_ecs = true`, and grants
+  `FilterLogEvents`/`StartLiveTail` on the bare log-group ARN required by those
+  APIs. Set it to the same value as `rise-ecs.log_group_name`.
+
+- **Rise Traefik reports ECS container health.** The task definition runs
+  Traefik's health command against its dedicated ping entrypoint, so ECS reports
+  `HEALTHY` or `UNHEALTHY` instead of `UNKNOWN`.
+
 - **Config change — login-time IdP group prefixes.**
   `auth.idp_group_sync_prefixes` optionally limits which canonical group names
   are mirrored into Rise teams. An empty list preserves synchronization of all

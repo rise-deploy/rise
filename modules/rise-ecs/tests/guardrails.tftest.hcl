@@ -157,7 +157,7 @@ run "a_real_idp_install_must_supply_its_own_oidc_client_secret" {
 
   # Without this the module would write the repo-published `rise-backend-secret`
   # constant as the client secret; that default is only for the bundled Dex demo.
-  expect_failures = [aws_secretsmanager_secret_version.oidc_client_secret]
+  expect_failures = [aws_secretsmanager_secret_version.oidc_client_secret_write_only]
 }
 
 run "deploy_dex_uses_a_browser_reachable_issuer" {

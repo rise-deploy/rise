@@ -22,6 +22,7 @@ module "rise_aws" {
   # interpolating ARNs from names, which is what keeps the two free of a
   # dependency cycle.
   ecs_cluster_name     = "rise"
+  ecs_log_group_name   = "/rise"
   ssm_parameter_prefix = "rise"
 
   # Names are deterministic, which avoids a module dependency cycle while
@@ -34,6 +35,7 @@ module "rise_ecs" {
 
   name           = "rise"
   ingress_domain = "rise.example.com"
+  log_group_name = "/rise"
   rise_image_tag = "0.23.0"
   admin_email    = "ops@example.com"
   acme_email     = "ops@example.com"
@@ -148,6 +150,10 @@ $ htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
 `DATABASE_URL`, the JWT signing key, the encryption key and the OIDC client
 secret live in Secrets Manager and reach the task through the task definition's
 `secrets` block, so they never appear in a `DescribeTaskDefinition` response.
+The secret-version resources use write-only arguments: planning and refresh do
+not call `GetSecretValue`, and the provider does not retain those values on the
+secret-version resources in state. This requires Terraform 1.11 or newer and
+AWS provider 6.50 or newer.
 
 Set `control_plane_local_config_secret_arn` when the control plane needs an
 operator-specific YAML overlay, for example extension-provider configuration.
@@ -171,10 +177,14 @@ module "rise_ecs" {
 }
 ```
 
-**The generated database password is in Terraform state.** Use an encrypted
-remote backend with restricted access. To keep it out entirely, create the
-secret yourself and pass `database_url_secret_arn` — the module then creates no
-database at all. That is the better production path.
+**Generated source values remain in Terraform state.** The database password,
+JWT signing key and encryption key are outputs of persistent `random` resources;
+an OIDC client secret supplied as an ordinary Terraform input can also reach the
+calling configuration's state. Write-only secret versions prevent provider
+reads and duplicate plaintext storage, but do not make their source values
+ephemeral. Use an encrypted remote backend with restricted access. To keep the
+database URL out entirely, create its secret yourself and pass
+`database_url_secret_arn` — the module then creates no database at all.
 
 Rotating the database password out of band will not read as drift (the instance
 ignores changes to it), but you must update the secret to match.

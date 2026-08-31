@@ -71,6 +71,7 @@ module "rise_aws" {
   ecr_repository_prefix   = "rise-prod/"
   ecr_push_role_name      = "rise-prod-ecr-push"
   ecs_cluster_name        = "platform"
+  ecs_log_group_name      = "/rise-prod"
   ecs_execution_role_name = "rise-prod-execution"
   ecs_workload_role_name  = "rise-prod-app"
   ecs_traefik_role_name   = "rise-prod-traefik"
@@ -223,6 +224,7 @@ This makes it easy to reference in your configuration management tool (e.g., usi
 | scan_on_push | Enable image scanning on push | `bool` | `true` | no |
 | max_image_count | Max images to retain per repository | `number` | `100` | no |
 | enable_ecs | Enable ECS controller identities and policies | `bool` | `false` | no |
+| ecs_log_group_name | CloudWatch log group read by the ECS controller | `string` | `null` | when `enable_ecs` |
 | ecs_cluster_name | Existing cluster Rise reconciles | `string` | `<name>` | no |
 | ecs_execution_role_name | ECS execution role name | `string` | `<name>-ecs-execution` | no |
 | ecs_workload_role_name | Application task role name | `string` | `<name>-app` | no |

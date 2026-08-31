@@ -41,7 +41,7 @@ locals {
   s3_bucket_prefix = var.s3_bucket_prefix != null ? var.s3_bucket_prefix : var.name
 
   ecs_cluster_name        = coalesce(var.ecs_cluster_name, var.name)
-  ecs_log_group_name      = coalesce(var.ecs_log_group_name, "/${var.name}")
+  ecs_log_group_name      = var.ecs_log_group_name != null ? var.ecs_log_group_name : ""
   ecs_execution_role_name = coalesce(var.ecs_execution_role_name, "${var.name}-ecs-execution")
   ecs_workload_role_name  = coalesce(var.ecs_workload_role_name, "${var.name}-app")
   ecs_traefik_role_name   = coalesce(var.ecs_traefik_role_name, "${var.name}-traefik")
@@ -60,6 +60,13 @@ locals {
     var.assume_role_services,
     var.enable_ecs ? ["ecs-tasks.amazonaws.com"] : []
   ))
+}
+
+check "ecs_log_group_name" {
+  assert {
+    condition     = !var.enable_ecs || var.ecs_log_group_name != null
+    error_message = "ecs_log_group_name is required when enable_ecs = true; it must match deployment_controller.log_group."
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -354,7 +361,7 @@ data "aws_iam_policy_document" "backend" {
         "logs:StartLiveTail"
       ]
       resources = [
-        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}:*"
+        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}"
       ]
     }
   }
