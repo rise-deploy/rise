@@ -162,6 +162,65 @@ pub enum LogEvent {
 
 pub type LogEventStream = futures::stream::BoxStream<'static, Result<LogEvent>>;
 
+/// One container's lines, each carrying the timestamp the merge orders on.
+type TimestampedLineStream = futures::stream::BoxStream<'static, Result<(DateTime<Utc>, LogEvent)>>;
+
+/// Merge per-container line streams into the one stream the API returns.
+///
+/// The two modes differ because the guarantees available differ, not for
+/// convenience:
+///
+/// - **Following**, lines are emitted as they arrive. A live merge cannot be
+///   globally ordered without buffering, and buffering a follow holds back the
+///   output that is the point of following. `docker compose logs -f` and
+///   `kubectl logs -f --all-containers` make the same trade; the container named
+///   on each line is what lets a reader put them back together.
+/// - **Not following**, the whole range is in hand, so it is sorted by
+///   timestamp before anything is emitted.
+///
+/// `tail_limit` is applied *after* the merge. It asks for N lines from the
+/// deployment, but each container's stream was asked for N of its own, so
+/// without this a four-container deployment returns four times what was asked.
+fn merge_container_streams(
+    streams: Vec<TimestampedLineStream>,
+    follow: bool,
+    tail_limit: Option<usize>,
+) -> LogEventStream {
+    if follow {
+        return futures::stream::select_all(streams)
+            .map(|item| item.map(|(_, event)| event))
+            .boxed();
+    }
+
+    async_stream::stream! {
+        let mut collected: Vec<(DateTime<Utc>, LogEvent)> = Vec::new();
+        let mut merged = futures::stream::select_all(streams);
+        while let Some(item) = merged.next().await {
+            match item {
+                Ok(line) => collected.push(line),
+                // A container that failed has said so; the lines the others
+                // produced are still worth returning.
+                Err(e) => yield Err(e),
+            }
+        }
+
+        // Stable, so lines sharing a timestamp keep the order their own
+        // container produced them in rather than being shuffled.
+        collected.sort_by_key(|(timestamp, _)| *timestamp);
+        if let Some(limit) = tail_limit {
+            if collected.len() > limit {
+                collected.drain(..collected.len() - limit);
+            }
+        }
+
+        for (_, event) in collected {
+            yield Ok(event);
+        }
+        yield Ok(LogEvent::PageLoaded { next_cursor: None });
+    }
+    .boxed()
+}
+
 pub(super) fn encode_log_cursor<T: Serialize>(cursor: &T) -> Result<String> {
     let bytes = serde_json::to_vec(cursor).context("Failed to encode log cursor")?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
@@ -887,11 +946,10 @@ struct DockerLogBackend {
 }
 
 impl DockerLogBackend {
-    /// Find the most relevant container for a deployment by its
+    /// Find every container of a deployment by its
     /// `<label_namespace>/deployment-id` label, scoped to the owning project,
-    /// and return its id alongside the deployment container name it runs.
-    /// Prefers a running container. `wanted` restricts the choice to those
-    /// deployment containers; empty means "any".
+    /// each paired with the deployment container name it runs. Running
+    /// containers come first. `wanted` restricts the set; empty means "all".
     ///
     /// `deployment_id` is a `YYYYMMDD-HHMMSS` timestamp that is unique only
     /// *per project* (DB constraint `UNIQUE (deployment_id, project_id)`), so
@@ -900,12 +958,12 @@ impl DockerLogBackend {
     /// label (matching `project.name`, exactly as the reconciler stamps it)
     /// plus `managed-by=rise` for defense-in-depth, mirroring
     /// `list_actual_containers`.
-    async fn resolve_container(
+    async fn resolve_containers(
         &self,
         deployment: &Deployment,
         project: &Project,
         wanted: &[String],
-    ) -> Result<Option<(String, Option<String>)>> {
+    ) -> Result<Vec<(String, Option<String>)>> {
         use crate::server::deployment::controller::docker::labels::{
             self, SUFFIX_CONTAINER, SUFFIX_DEPLOYMENT_ID, SUFFIX_MANAGED_BY, SUFFIX_PROJECT,
         };
@@ -953,12 +1011,20 @@ impl DockerLogBackend {
             })
             .collect::<Vec<_>>();
 
-        // Prefer a running container; fall back to any.
-        let chosen = candidates
-            .iter()
-            .find(|c| c.state.as_deref() == Some("running"))
-            .or_else(|| candidates.first());
-        Ok(chosen.and_then(|summary| summary.id.clone().map(|id| (id, container_name(summary)))))
+        // Every match, not one: returning a single container would show one
+        // container's output with no sign the others exist. Running first, so a
+        // deployment mid-recreate leads with what is actually serving.
+        let (running, stopped): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|c| c.state.as_deref() == Some("running"));
+        Ok(running
+            .into_iter()
+            .chain(stopped)
+            .filter_map(|summary| {
+                let name = container_name(&summary);
+                summary.id.clone().map(|id| (id, name))
+            })
+            .collect())
     }
 }
 
@@ -1003,10 +1069,10 @@ impl RuntimeLogBackend for DockerLogBackend {
             anyhow::bail!("invalid log cursor for the configured backend");
         }
 
-        let Some((container_id, container)) = self
-            .resolve_container(deployment, project, &query.containers)
-            .await?
-        else {
+        let containers = self
+            .resolve_containers(deployment, project, &query.containers)
+            .await?;
+        if containers.is_empty() {
             return Ok(status_stream(LogStatus {
                 reason: LogStatusReason::HistoricalBackendNotConfigured,
                 message: Some(
@@ -1016,7 +1082,7 @@ impl RuntimeLogBackend for DockerLogBackend {
                 ),
                 retention_hint: None,
             }));
-        };
+        }
 
         let tail = match query.tail_lines {
             Some(t) => t.max(1).to_string(),
@@ -1047,70 +1113,97 @@ impl RuntimeLogBackend for DockerLogBackend {
             tail,
         };
 
-        let log_stream = self.docker.logs(&container_id, Some(options));
         let levels = query.levels.clone();
         let search = query.search.clone();
         let follow = query.follow && is_followable_status(&deployment.status);
         let render_timestamps = query.timestamps;
         let start_time = query.start_time;
         let end_time = query.end_time;
-        let container_id_for_lines = container_id.clone();
-        let stream = async_stream::stream! {
-            let mut seen_ids = HashMap::new();
-            futures::pin_mut!(log_stream);
-            while let Some(item) = log_stream.next().await {
-                let output = match item {
-                    Ok(output) => output,
-                    Err(e) => {
-                        yield Err(anyhow::anyhow!("Docker log stream error: {}", e));
-                        break;
-                    }
-                };
-                let raw = output.to_string();
-                for line in raw.split('\n') {
-                    let line = line.trim_end_matches('\r');
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let Some((timestamp, content, timestamp_text)) = split_timestamped_log_line(line) else {
-                        continue;
-                    };
-                    if content.is_empty() { continue; }
-                    if start_time.is_some_and(|start| timestamp < start)
-                        || end_time.is_some_and(|end| timestamp >= end)
-                    {
-                        continue;
-                    }
-                    let level = classify_k8s_line(content);
-                    if !levels.is_empty() && !levels.iter().any(|l| l == level) {
-                        continue;
-                    }
-                    if !line_matches_search(content, search.as_deref()) {
-                        continue;
-                    }
-                    let base_id = stable_log_id(
-                        "docker",
-                        [
-                            container_id_for_lines.as_bytes(),
-                            timestamp_text.as_bytes(),
-                            content.as_bytes(),
-                        ],
-                    );
-                    let id = distinct_log_id(&mut seen_ids, base_id);
-                    yield Ok(LogEvent::Line {
-                        id,
-                        text: if render_timestamps { line.to_string() } else { content.to_string() },
-                        level: level.to_string(),
-                        container: container.clone(),
-                    });
-                }
-            }
-            if !follow {
-                yield Ok(LogEvent::PageLoaded { next_cursor: None });
-            }
-        };
+        let tail_limit = query.tail_lines.map(|t| t.max(1) as usize);
 
-        Ok(stream.boxed())
+        // One stream per container: the Engine API has no multi-container logs
+        // endpoint, so the fan-out and the merge are ours to do — exactly what
+        // `docker compose logs` does for the same reason.
+        let per_container: Vec<TimestampedLineStream> = containers
+            .into_iter()
+            .map(|(container_id, container)| {
+                let log_stream = self.docker.logs(&container_id, Some(options.clone()));
+                let levels = levels.clone();
+                let search = search.clone();
+                async_stream::stream! {
+                    let mut seen_ids = HashMap::new();
+                    futures::pin_mut!(log_stream);
+                    while let Some(item) = log_stream.next().await {
+                        let output = match item {
+                            Ok(output) => output,
+                            Err(e) => {
+                                // One container failing is not the deployment
+                                // failing. Name it and stop this stream; the
+                                // others keep going.
+                                yield Err(anyhow::anyhow!(
+                                    "Docker log stream error for container {}: {}",
+                                    container.as_deref().unwrap_or("unknown"),
+                                    e
+                                ));
+                                break;
+                            }
+                        };
+                        let raw = output.to_string();
+                        for line in raw.split('\n') {
+                            let line = line.trim_end_matches('\r');
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let Some((timestamp, content, timestamp_text)) =
+                                split_timestamped_log_line(line)
+                            else {
+                                continue;
+                            };
+                            if content.is_empty() {
+                                continue;
+                            }
+                            if start_time.is_some_and(|start| timestamp < start)
+                                || end_time.is_some_and(|end| timestamp >= end)
+                            {
+                                continue;
+                            }
+                            let level = classify_k8s_line(content);
+                            if !levels.is_empty() && !levels.iter().any(|l| l == level) {
+                                continue;
+                            }
+                            if !line_matches_search(content, search.as_deref()) {
+                                continue;
+                            }
+                            let base_id = stable_log_id(
+                                "docker",
+                                [
+                                    container_id.as_bytes(),
+                                    timestamp_text.as_bytes(),
+                                    content.as_bytes(),
+                                ],
+                            );
+                            let id = distinct_log_id(&mut seen_ids, base_id);
+                            yield Ok((
+                                timestamp,
+                                LogEvent::Line {
+                                    id,
+                                    text: if render_timestamps {
+                                        line.to_string()
+                                    } else {
+                                        content.to_string()
+                                    },
+                                    level: level.to_string(),
+                                    container: container.clone(),
+                                },
+                            ));
+                        }
+                    }
+                }
+                .boxed()
+            })
+            .collect();
+
+        Ok(merge_container_streams(per_container, follow, tail_limit))
     }
 
     async fn query_volume(
@@ -2452,6 +2545,155 @@ pub(super) fn parse_duration_hint(value: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
+
+    fn line_at(secs: i64, container: &str, text: &str) -> (DateTime<Utc>, LogEvent) {
+        (
+            DateTime::from_timestamp(secs, 0).unwrap(),
+            LogEvent::Line {
+                id: format!("{container}-{secs}-{text}"),
+                text: text.to_string(),
+                level: "info".to_string(),
+                container: Some(container.to_string()),
+            },
+        )
+    }
+
+    fn stream_of(lines: Vec<(DateTime<Utc>, LogEvent)>) -> TimestampedLineStream {
+        futures::stream::iter(lines.into_iter().map(Ok)).boxed()
+    }
+
+    async fn drain(stream: LogEventStream) -> Vec<LogEvent> {
+        stream
+            .filter_map(|item| async move { item.ok() })
+            .collect()
+            .await
+    }
+
+    fn texts(events: &[LogEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LogEvent::Line {
+                    container, text, ..
+                } => Some((container.clone().unwrap_or_default(), text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The whole point: a deployment's containers each have their own stream,
+    /// and a range query returns all of them in the order things happened.
+    #[tokio::test]
+    async fn a_range_query_merges_every_container_in_time_order() {
+        let web = stream_of(vec![line_at(10, "web", "w1"), line_at(30, "web", "w2")]);
+        let worker = stream_of(vec![
+            line_at(20, "worker", "k1"),
+            line_at(40, "worker", "k2"),
+        ]);
+
+        let events = drain(merge_container_streams(vec![web, worker], false, None)).await;
+
+        assert_eq!(
+            texts(&events),
+            vec![
+                ("web".to_string(), "w1".to_string()),
+                ("worker".to_string(), "k1".to_string()),
+                ("web".to_string(), "w2".to_string()),
+                ("worker".to_string(), "k2".to_string()),
+            ],
+        );
+    }
+
+    /// Exactly one `PageLoaded`, however many containers were merged — it marks
+    /// the end of the page, not the end of a stream.
+    #[tokio::test]
+    async fn a_merged_range_reports_one_page_end() {
+        let a = stream_of(vec![line_at(10, "web", "w")]);
+        let b = stream_of(vec![line_at(20, "worker", "k")]);
+
+        let events = drain(merge_container_streams(vec![a, b], false, None)).await;
+
+        let ends = events
+            .iter()
+            .filter(|e| matches!(e, LogEvent::PageLoaded { .. }))
+            .count();
+        assert_eq!(ends, 1);
+        assert!(matches!(events.last(), Some(LogEvent::PageLoaded { .. })));
+    }
+
+    /// `tail` asks for N lines from the deployment, but each container's stream
+    /// was asked for N of its own. Without trimming after the merge, a
+    /// two-container deployment returns twice what was requested — which is why
+    /// an unfiltered view and a filtered one could both report the same count.
+    #[tokio::test]
+    async fn tail_bounds_the_deployment_not_each_container() {
+        let web = stream_of(vec![
+            line_at(10, "web", "w1"),
+            line_at(30, "web", "w2"),
+            line_at(50, "web", "w3"),
+        ]);
+        let worker = stream_of(vec![
+            line_at(20, "worker", "k1"),
+            line_at(40, "worker", "k2"),
+            line_at(60, "worker", "k3"),
+        ]);
+
+        let events = drain(merge_container_streams(vec![web, worker], false, Some(3))).await;
+
+        // The newest three across both — k2(40), w3(50), k3(60) — not three
+        // from each.
+        assert_eq!(
+            texts(&events),
+            vec![
+                ("worker".to_string(), "k2".to_string()),
+                ("web".to_string(), "w3".to_string()),
+                ("worker".to_string(), "k3".to_string()),
+            ],
+        );
+    }
+
+    /// One container failing is not the deployment failing: its error surfaces
+    /// and the others' lines still arrive.
+    #[tokio::test]
+    async fn a_failing_container_does_not_take_the_others_down() {
+        let good = stream_of(vec![line_at(10, "web", "w1"), line_at(30, "web", "w2")]);
+        let bad: TimestampedLineStream =
+            futures::stream::iter(vec![Err(anyhow::anyhow!("boom"))]).boxed();
+
+        let merged = merge_container_streams(vec![good, bad], false, None);
+        let all: Vec<_> = merged.collect().await;
+
+        assert_eq!(all.iter().filter(|r| r.is_err()).count(), 1);
+        let ok: Vec<LogEvent> = all.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(texts(&ok).len(), 2, "the healthy container still reported");
+    }
+
+    /// Following cannot be globally ordered without buffering, and buffering a
+    /// follow withholds the output that is the point of it. Every line still
+    /// arrives, and each names its container so a reader can reassemble them.
+    #[tokio::test]
+    async fn following_emits_everything_without_waiting_to_sort() {
+        let web = stream_of(vec![line_at(30, "web", "w")]);
+        let worker = stream_of(vec![line_at(10, "worker", "k")]);
+
+        let events = drain(merge_container_streams(vec![web, worker], true, None)).await;
+
+        let mut seen = texts(&events);
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("web".to_string(), "w".to_string()),
+                ("worker".to_string(), "k".to_string()),
+            ],
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, LogEvent::PageLoaded { .. })),
+            "a follow has no page to end",
+        );
+    }
     use super::*;
 
     #[test]
