@@ -17,6 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment as K8sDeployment;
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::core::v1::{EnvVar, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::ByteString;
@@ -642,14 +643,29 @@ async fn check_deployment_health_from_observed(
             .unwrap_or(0);
     }
 
-    // Check for pod-level errors via kube-rs (Metacontroller only gives us the
-    // Deployment, not individual pods).
-    let pod_check = check_pod_errors_via_kube(state, project, deployment, namespace_prefix).await;
+    // Metacontroller hands us the Deployment, not the pods underneath it, so
+    // everything pod-level comes from one list: the error verdict that drives
+    // status, the observation that drives history, and the Events that explain
+    // both. Listed once and shared — three reads per sync would be three times
+    // the API traffic for the same answer.
+    let pods = list_deployment_pods(state, project, deployment, namespace_prefix).await;
 
-    // Forward what Kubernetes said about those pods. This is where a pod that
-    // will not schedule finally explains itself: its status says `Pending` and
-    // nothing more, while the Event carries the reason.
-    forward_pod_events(state, project, deployment, namespace_prefix).await;
+    let pod_check = match &pods {
+        Some(pods) => check_pod_errors(pods),
+        // Not knowing is not the same as being broken: a failed list must not
+        // fail the deployment.
+        None => PodCheckResult {
+            has_error: false,
+            error_message: None,
+        },
+    };
+
+    if let Some(pods) = &pods {
+        record_pod_observations(state, deployment, pods).await;
+        // Where a pod that will not schedule finally explains itself: its status
+        // says `Pending` and nothing more, while the Event carries the reason.
+        forward_pod_events(state, project, deployment, namespace_prefix, pods).await;
+    }
 
     let is_ready = ready_replicas >= desired_replicas && desired_replicas > 0;
 
@@ -739,43 +755,76 @@ async fn check_deployment_health_from_observed(
     Ok(())
 }
 
-/// List the Events of this deployment's pods and forward the interesting ones.
+/// Record what the pods look like now, and the events that implies.
+async fn record_pod_observations(state: &AppState, deployment: &Deployment, pods: &[Pod]) {
+    // The declared container name, so an observation says which container it is
+    // an instance of rather than repeating the pod's own name.
+    let container = deployment
+        .containers
+        .as_ref()
+        .and_then(|c| c.get("items"))
+        .and_then(|items| items.as_array())
+        .and_then(|items| items.first())
+        .and_then(|c| c.get("name"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("app")
+        .to_string();
+
+    let observed: Vec<_> = pods
+        .iter()
+        .filter_map(|p| super::pods::observe(p, &container))
+        .collect();
+
+    let previous = match state
+        .deployment_store
+        .list_container_observations(deployment.id)
+        .await
+    {
+        Ok(previous) => previous,
+        Err(e) => {
+            warn!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to read previous container observations: {:?}", e
+            );
+            return;
+        }
+    };
+
+    let events =
+        rise_backend_core::observation::derive_events(&previous, &observed, chrono::Utc::now());
+
+    if let Err(e) = state
+        .deployment_store
+        .record_container_observations(
+            deployment.id,
+            rise_backend_core::events::EventSource::Kubernetes,
+            &observed,
+            &events,
+        )
+        .await
+    {
+        warn!(
+            deployment_id = %deployment.deployment_id,
+            "Failed to record container observations: {:?}", e
+        );
+    }
+}
+
+/// Forward the Events Kubernetes raised about this deployment's pods.
 ///
-/// Best-effort throughout: a failure here loses a diagnostic, and losing a
-/// diagnostic must never fail a sync that would otherwise have succeeded.
+/// Best-effort throughout: losing a diagnostic must never fail a sync that would
+/// otherwise have succeeded.
 async fn forward_pod_events(
     state: &AppState,
     project: &Project,
     deployment: &Deployment,
     namespace_prefix: &str,
+    pods: &[Pod],
 ) {
     let Some(kube_client) = &state.kube_client else {
         return;
     };
-    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
-
-    // Events are namespace-scoped and carry no deployment label, so they are
-    // narrowed by the pods they involve — which is the set this deployment owns.
-    let pod_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
-        kube::Api::namespaced(kube_client.clone(), &namespace);
-    let pods = match pod_api
-        .list(&kube::api::ListParams::default().labels(&format!(
-            "{}={}",
-            LABEL_DEPLOYMENT_ID, deployment.deployment_id
-        )))
-        .await
-    {
-        Ok(pods) => pods,
-        Err(e) => {
-            debug!(
-                deployment_id = %deployment.deployment_id,
-                "Failed to list pods for event forwarding: {:?}", e
-            );
-            return;
-        }
-    };
     let owned: std::collections::HashSet<String> = pods
-        .items
         .iter()
         .filter_map(|p| p.metadata.name.clone())
         .collect();
@@ -783,6 +832,9 @@ async fn forward_pod_events(
         return;
     }
 
+    // Events are namespace-scoped and carry no deployment label, so they are
+    // narrowed by the pods they involve.
+    let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let event_api: kube::Api<k8s_openapi::api::core::v1::Event> =
         kube::Api::namespaced(kube_client.clone(), &namespace);
     let events = match event_api.list(&kube::api::ListParams::default()).await {
@@ -808,7 +860,7 @@ async fn forward_pod_events(
         })
         .collect();
 
-    let forwardable = super::pod_events::forwardable(&mine);
+    let forwardable = super::pods::forwardable(&mine);
     if forwardable.is_empty() {
         return;
     }
@@ -842,53 +894,47 @@ struct PodCheckResult {
     error_message: Option<String>,
 }
 
-/// Check pods for irrecoverable errors via a direct kube-rs API call.
+/// List this deployment's pods, or `None` if the answer is unknown./// List this deployment's pods, or `None` if the answer is unknown.
 ///
-/// Metacontroller hands us the Deployment, not the pods underneath it, so the
-/// conditions that make a rollout unrecoverable — an image that will never pull,
-/// a container failing faster than it can be restarted, an OOM kill — are only
-/// visible from a pod list. Terminating pods are skipped throughout: a pod on its
-/// way out is expected to fail, and treating that as a rollout error would fail
-/// every successful replacement.
-async fn check_pod_errors_via_kube(
+/// `None` means "could not see", which callers must treat differently from an
+/// empty list: an empty list says every pod is gone, and acting on a failed read
+/// as though it were emptiness would record terminations that never happened.
+async fn list_deployment_pods(
     state: &AppState,
     project: &Project,
     deployment: &Deployment,
     namespace_prefix: &str,
-) -> PodCheckResult {
-    const NO_ERROR: PodCheckResult = PodCheckResult {
-        has_error: false,
-        error_message: None,
-    };
-
-    let Some(kube_client) = &state.kube_client else {
-        return NO_ERROR;
-    };
-
+) -> Option<Vec<k8s_openapi::api::core::v1::Pod>> {
+    let kube_client = state.kube_client.as_ref()?;
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let pod_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
         kube::Api::namespaced(kube_client.clone(), &namespace);
 
-    let pods = match pod_api
+    match pod_api
         .list(&kube::api::ListParams::default().labels(&format!(
             "{}={}",
             LABEL_DEPLOYMENT_ID, deployment.deployment_id
         )))
         .await
     {
-        Ok(pods) => pods,
+        Ok(pods) => Some(pods.items),
         Err(e) => {
-            // Not knowing is not the same as being broken: a failed list must not
-            // fail the deployment.
             debug!(
                 deployment_id = %deployment.deployment_id,
-                "Failed to list pods for health check: {:?}", e
+                "Failed to list pods: {:?}", e
             );
-            return NO_ERROR;
+            None
         }
+    }
+}
+
+fn check_pod_errors(pods: &[k8s_openapi::api::core::v1::Pod]) -> PodCheckResult {
+    const NO_ERROR: PodCheckResult = PodCheckResult {
+        has_error: false,
+        error_message: None,
     };
 
-    for pod in &pods.items {
+    for pod in pods {
         if pod.metadata.deletion_timestamp.is_some() {
             continue;
         }

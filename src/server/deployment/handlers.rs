@@ -2918,6 +2918,135 @@ pub struct EventListParams {
     pub subject: Option<String>,
 }
 
+/// The wire version of the container-status response.
+///
+/// Bumped when the shape changes incompatibly, so a client can tell what it is
+/// reading rather than guessing from which fields happen to be present.
+const CONTAINER_STATUS_VERSION: u32 = 1;
+
+/// One replica, as the backend last saw it.
+///
+/// Deliberately not the storage row. The row carries `instance`, which exists so
+/// the derivation can tell a recreated container from a quiet one — a detail of
+/// how history is computed, not something a caller should build on. Serializing
+/// the row directly is how a storage format becomes a public contract by
+/// accident.
+#[derive(serde::Serialize)]
+pub struct ContainerStatus {
+    /// The backend's stable handle for this replica: `web[0]` on Docker, a pod
+    /// name on Kubernetes, a task id on ECS. Stable across ticks, and the same
+    /// value the event log uses as an event's `subject`.
+    pub subject: String,
+    /// The declared container this is an instance of.
+    pub container: String,
+    /// Replica ordinal, present only where the backend has a stable one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica: Option<u32>,
+    /// `pending` | `running` | `exited` | `unknown`.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    /// The runtime's restart counter, where it keeps one. Absent on ECS, which
+    /// replaces tasks rather than restarting containers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContainerStatusResponse {
+    pub version: u32,
+    pub containers: Vec<ContainerStatus>,
+}
+
+/// Read the current state of a deployment's replicas.
+///
+/// A snapshot, not a history: what each replica is doing now. The log at
+/// `/events` says how it got there, and the two share a vocabulary — a
+/// container's `subject` here is the same string an event carries.
+///
+/// Empty is a real answer. A deployment whose backend has not observed it yet,
+/// or one that has finished, has no replicas to report.
+pub async fn list_deployment_containers(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+) -> Result<Json<ContainerStatusResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    // Mirrors the log endpoint: a caller who cannot see the project is told it
+    // does not exist, so existence itself does not leak.
+    let (user, is_sa) = auth
+        .resolve_for_project(
+            &state.db_pool,
+            &project,
+            state.controllers_by_issuer.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let observations =
+        crate::db::container_observations::list_for_deployment(&state.db_pool, deployment.id)
+            .await
+            .internal_err("Failed to list container observations")?;
+
+    Ok(Json(ContainerStatusResponse {
+        version: CONTAINER_STATUS_VERSION,
+        containers: observations
+            .into_iter()
+            .map(|o| ContainerStatus {
+                subject: o.subject,
+                container: o.container,
+                replica: o.replica,
+                state: o.state.as_str().to_string(),
+                started_at: o.started_at.map(|t| t.to_rfc3339()),
+                finished_at: o.finished_at.map(|t| t.to_rfc3339()),
+                exit_code: o.exit_code,
+                restart_count: o.restart_count,
+                health: o.health,
+                reason: o.reason,
+                image: o.image,
+            })
+            .collect(),
+    }))
+}
+
 const DEFAULT_EVENT_PAGE: i64 = 100;
 const MAX_EVENT_PAGE: i64 = 500;
 

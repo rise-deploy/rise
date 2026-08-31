@@ -243,3 +243,47 @@ export async function fetchDeploymentEvents(request: {
     if (!response.ok) throw new Error(await readHttpErrorMessage(response));
     return (await response.json()) as DeploymentEventPage;
 }
+
+/** One replica, as the deployment's backend last saw it. */
+export interface ContainerStatus {
+    /** The backend's stable handle — `web[0]`, a pod name, an ECS task id. The
+     *  same string an event carries as its `subject`. */
+    subject: string;
+    container: string;
+    /** Present only where the backend has a stable replica ordinal. */
+    replica?: number;
+    state: 'pending' | 'running' | 'exited' | 'unknown';
+    started_at?: string;
+    finished_at?: string;
+    exit_code?: number;
+    /** Absent on ECS, which replaces tasks rather than restarting containers. */
+    restart_count?: number;
+    health?: string;
+    reason?: string;
+    image?: string;
+}
+
+export interface ContainerStatusPage {
+    version: number;
+    containers: ContainerStatus[];
+}
+
+/**
+ * Read the current state of a deployment's replicas.
+ *
+ * A snapshot, where the event log is a history. The two share a vocabulary: a
+ * container's `subject` here is the `subject` on its events.
+ */
+export async function fetchDeploymentContainers(request: {
+    projectName: string;
+    deploymentId: string;
+    signal?: AbortSignal;
+}): Promise<ContainerStatusPage> {
+    const { projectName, deploymentId, signal } = request;
+    const url = `${deploymentBase(projectName, deploymentId)}/containers`;
+    const response = await fetch(url, { credentials: 'include', signal });
+    if (!response.ok) {
+        throw new Error(`Failed to load containers (${response.status})`);
+    }
+    return response.json();
+}

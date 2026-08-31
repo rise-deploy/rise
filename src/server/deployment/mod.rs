@@ -9,7 +9,7 @@ pub mod ip_validator;
 #[cfg(feature = "backend")]
 pub mod logs;
 pub mod models;
-pub mod pod_events;
+pub mod pods;
 #[cfg(feature = "backend")]
 pub mod quantity;
 #[cfg(feature = "backend")]

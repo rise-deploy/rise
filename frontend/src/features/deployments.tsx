@@ -11,6 +11,7 @@ import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { LogConsole } from './logs/log-console';
+import { ContainerStatusPanel } from './logs/container-status';
 import { EventTimeline } from './logs/event-timeline';
 
 const STATUS_TONES = {
@@ -1017,6 +1018,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         // No count: the timeline's length is only known once the event log
         // is fetched, and the tab should not block on that to render.
         { id: 'timeline', label: 'Timeline' },
+        // No count: the number of replicas is only known once the snapshot is
+        // fetched, and the tab should not block on that to render.
+        { id: 'containers', label: 'Containers' },
         ...(hasControllerMetadata ? [{ id: 'controller', label: 'Controller' }] : []),
         ...(deployment.build_logs ? [{ id: 'build', label: 'Build output' }] : []),
         { id: 'variables', label: 'Variables' },
@@ -1267,6 +1271,14 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             {routingPanel}
                         </>
                     )}
+                />
+            )}
+
+            {activeTab === 'containers' && (
+                <ContainerStatusPanel
+                    projectName={projectName}
+                    deploymentId={deploymentId}
+                    deploymentStatus={deployment.status}
                 />
             )}
 

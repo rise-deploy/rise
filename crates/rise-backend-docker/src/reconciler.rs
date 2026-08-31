@@ -2550,7 +2550,12 @@ fn observe(
         state,
         started_at: parse_docker_time(i.started_at.as_deref()),
         finished_at: parse_docker_time(i.finished_at.as_deref()),
-        exit_code: i.exit_code,
+        // Docker reports `0` for a container that has not exited, so an exit
+        // code is only an exit code once there has been one. Carrying it while
+        // running would show every healthy replica as having exited cleanly.
+        exit_code: (state == ObservedState::Exited)
+            .then_some(i.exit_code)
+            .flatten(),
         restart_count: i.restart_count,
         health: i.health.clone(),
         reason: i.error.clone(),
@@ -2652,6 +2657,26 @@ mod tests {
             Some(&inspected("paused", false)),
         );
         assert_eq!(o.state, ObservedState::Unknown);
+    }
+
+    /// Docker reports exit code 0 for a container that has not exited, so
+    /// carrying it while running would show every healthy replica as having
+    /// exited cleanly.
+    #[test]
+    fn a_running_container_reports_no_exit_code() {
+        let mut i = inspected("running", true);
+        i.exit_code = Some(0);
+        assert_eq!(
+            super::observe("web[0]", "web", 0, Some("c_g1"), Some(&i)).exit_code,
+            None
+        );
+
+        let mut gone = inspected("exited", false);
+        gone.exit_code = Some(137);
+        assert_eq!(
+            super::observe("web[0]", "web", 0, Some("c_g1"), Some(&gone)).exit_code,
+            Some(137),
+        );
     }
 
     /// Docker writes a zero timestamp for "never", which is not a time and must
