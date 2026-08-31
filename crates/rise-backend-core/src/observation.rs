@@ -77,6 +77,19 @@ pub struct ContainerObservation {
     /// The declared container this is an instance of.
     pub container: String,
 
+    /// The runtime's identity for the *current incarnation* of this subject,
+    /// where the two differ.
+    ///
+    /// On Docker they do: `subject` is a slot that survives recreates, while
+    /// the container filling it is replaced wholesale — and a replacement
+    /// starts its restart counter at zero, so a recreate is otherwise
+    /// indistinguishable from nothing happening. The container name carries the
+    /// generation, so a change here is a replacement.
+    ///
+    /// On Kubernetes and ECS the subject already *is* the instance (a pod, a
+    /// task), so this equals `subject` and the comparison never fires.
+    pub instance: Option<String>,
+
     /// Replica ordinal, only where the backend has a stable one. `None` on
     /// Kubernetes and ECS, where any ordinal would be positional fiction.
     pub replica: Option<u32>,
@@ -114,6 +127,7 @@ impl ContainerObservation {
         Self {
             subject: subject.into(),
             container: container.into(),
+            instance: None,
             replica: None,
             state,
             started_at: None,
@@ -228,6 +242,23 @@ fn transition(
     now: DateTime<Utc>,
 ) -> Vec<DerivedEvent> {
     let mut events = Vec::new();
+
+    // The slot is the same but the thing filling it is not: the runtime
+    // replaced the container. Checked before the counter, because a replacement
+    // resets that counter to zero and would otherwise look like nothing at all.
+    if let (Some(before), Some(after)) = (was.instance.as_deref(), now_seen.instance.as_deref()) {
+        if before != after {
+            return vec![DerivedEvent::new(
+                EventKind::ReplicaRestarted,
+                EventSeverity::Warning,
+                &now_seen.subject,
+            )
+            .at(now_seen.started_at.or(Some(now)))
+            .with("container", serde_json::json!(now_seen.container))
+            .with("replaced", serde_json::json!(true))
+            .with("reason", json_str(&now_seen.reason))];
+        }
+    }
 
     // A counter that advanced is a restart the runtime performed in place, and
     // it is reported even when the state did not change — a container that
@@ -438,6 +469,58 @@ mod tests {
             kinds(&events),
             vec![(EventKind::ReplicaTerminated, "web[1]")]
         );
+    }
+
+    /// The gap live testing found: Rise recreates a container in the same slot,
+    /// so the subject and the state are unchanged and the fresh container's
+    /// counter starts at zero. Without the instance, a recreate looks exactly
+    /// like nothing having happened.
+    #[test]
+    fn a_recreated_container_in_the_same_slot_is_a_restart() {
+        let mut before = obs("web[0]", ObservedState::Running);
+        before.instance = Some("rise_app_web_r0_g1".to_string());
+        before.restart_count = Some(0);
+        let mut after = obs("web[0]", ObservedState::Running);
+        after.instance = Some("rise_app_web_r0_g2".to_string());
+        after.restart_count = Some(0);
+
+        let events = derive_events(&[before], &[after], at(10));
+        assert_eq!(
+            kinds(&events),
+            vec![(EventKind::ReplicaRestarted, "web[0]")]
+        );
+        assert_eq!(events[0].attributes["replaced"], true);
+    }
+
+    /// The identity must not change when the replica count does. If a
+    /// single-replica container's subject were the bare name, scaling to two
+    /// would rename replica 0 and read as a death plus two births.
+    #[test]
+    fn scaling_up_does_not_rename_the_replica_that_was_already_there() {
+        let before = vec![obs("web[0]", ObservedState::Running)];
+        let after = vec![
+            obs("web[0]", ObservedState::Running),
+            obs("web[1]", ObservedState::Running),
+        ];
+
+        let events = derive_events(&before, &after, at(10));
+        assert_eq!(
+            kinds(&events),
+            vec![(EventKind::ReplicaStarted, "web[1]")],
+            "only the new replica is news",
+        );
+    }
+
+    /// Where the subject already is the instance — a pod, a task — the check
+    /// must never fire on its own.
+    #[test]
+    fn an_unchanged_instance_reports_nothing() {
+        let mut before = obs("pod-abc", ObservedState::Running);
+        before.instance = Some("pod-abc".to_string());
+        let mut after = obs("pod-abc", ObservedState::Running);
+        after.instance = Some("pod-abc".to_string());
+
+        assert!(derive_events(&[before], &[after], at(10)).is_empty());
     }
 
     /// A restart *and* a state change in one tick are two different facts and

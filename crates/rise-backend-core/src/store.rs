@@ -154,6 +154,31 @@ pub trait DeploymentStore: Send + Sync {
         reason: String,
     ) -> Result<Option<Deployment>>;
 
+    // --- container observations ---
+
+    /// Every replica of a deployment as the backend last saw it, for the
+    /// derivation to compare against.
+    async fn list_container_observations(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Vec<crate::observation::ContainerObservation>>;
+
+    /// Replace the recorded observations and append the events they imply, in
+    /// one transaction — the events say what changed, the observations become
+    /// the baseline the next tick compares against, and a crash between the two
+    /// would either lose the events or write them twice.
+    ///
+    /// `observations` is the complete current set: replicas absent from it are
+    /// forgotten, which is how a scale-down or a replaced task leaves the
+    /// baseline as well as the timeline.
+    async fn record_container_observations(
+        &self,
+        deployment_id: Uuid,
+        source: crate::events::EventSource,
+        observations: &[crate::observation::ContainerObservation],
+        events: &[crate::observation::DerivedEvent],
+    ) -> Result<()>;
+
     /// Mark a deployment terminating with a termination reason. See
     /// `mark_deployment_failed` for the `None` contract.
     ///

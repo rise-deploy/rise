@@ -486,6 +486,23 @@ mod tests {
         ) -> Result<Option<Deployment>> {
             unimplemented!()
         }
+        async fn list_container_observations(
+            &self,
+            _deployment_id: Uuid,
+        ) -> Result<Vec<crate::observation::ContainerObservation>> {
+            Ok(Vec::new())
+        }
+
+        async fn record_container_observations(
+            &self,
+            _deployment_id: Uuid,
+            _source: crate::events::EventSource,
+            _observations: &[crate::observation::ContainerObservation],
+            _events: &[crate::observation::DerivedEvent],
+        ) -> Result<()> {
+            Ok(())
+        }
+
         async fn mark_deployment_terminating(
             &self,
             id: Uuid,
