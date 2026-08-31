@@ -460,7 +460,23 @@ impl Backend for DockerBackend {
         for name in names.stdout.lines().filter(|l| !l.trim().is_empty()) {
             let mut c = Command::new("docker");
             c.args(["inspect", name.trim(), "--format", "{{json .Config.Env}}"]);
-            envs.push(cli::run_checked(c)?.stdout);
+            let inspected = cli::run(c)?;
+            if inspected.success() {
+                envs.push(inspected.stdout);
+                continue;
+            }
+            // Callers poll this during a rolling cutover, which is exactly when
+            // the retiring generation's containers are being removed — so a name
+            // `docker ps` just listed can be gone by the time `inspect` asks
+            // about it. That is the convergence the caller is waiting for, not a
+            // failure of it. Any other error still is one.
+            if !inspected.stderr.contains("No such object") {
+                anyhow::bail!(
+                    "docker inspect {name} failed (exit {:?}): {}",
+                    inspected.status,
+                    inspected.stderr.trim()
+                );
+            }
         }
         Ok(envs)
     }
