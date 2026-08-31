@@ -3254,9 +3254,16 @@ pub async fn stream_deployment_logs(
     // Get log stream from configured runtime log backend.
     // Follow defaults to 1 line so active deployments start at the most
     // recent log entry, while non-follow requests keep the broader backlog.
+    // The backend's advertised ceiling is enforced here rather than trusted:
+    // `tail` sizes a server-side merge buffer, so an unclamped one is a
+    // memory request from the caller.
     let tail = params
         .tail
-        .or(Some(if params.follow && followable { 1 } else { 1000 }));
+        .or(Some(if params.follow && followable { 1 } else { 1000 }))
+        .map(|tail| match state.runtime_log_backend.max_tail() {
+            Some(max_tail) => tail.clamp(1, max_tail.max(1)),
+            None => tail.max(1),
+        });
     let follow = params.follow && followable;
 
     validate_log_levels(&params.level, state.runtime_log_backend.levels())?;

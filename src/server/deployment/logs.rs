@@ -5,7 +5,9 @@ use chrono::{DateTime, Duration, Utc};
 use futures::{Stream, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
@@ -28,6 +30,23 @@ pub const KUBERNETES_LEVELS: &[&str] = &["info", "warn", "error"];
 /// Server-side cap on `?tail=` passed to Loki's `query_range`. Advertised via
 /// `LogsCapabilities::max_tail` so the frontend can mirror the limit.
 pub const LOKI_MAX_TAIL: i64 = 5000;
+
+/// Ceiling on `?tail=` for the Docker backend, and on any merge buffer built
+/// without one.
+///
+/// The runtime backends fan out over a deployment's containers and merge the
+/// results here, in this process, so the buffer is the server's memory and the
+/// request that sizes it is a tenant's. Without a ceiling one request can name
+/// a tail large enough that the daemon returns whole retained logs for every
+/// container at once.
+pub const DOCKER_MAX_TAIL: i64 = 100_000;
+
+/// How many of a deployment's Pods the Kubernetes backend reads at once.
+///
+/// One HTTP request fans out to one log stream per Pod. Uncapped, a request
+/// against a large deployment opens that many simultaneous streams against the
+/// API server, and concurrent requests multiply it.
+const KUBERNETES_POD_READ_FANOUT: usize = 8;
 
 /// AWS context owned by the ECS deployment controller and shared with the
 /// CloudWatch runtime-log reader. The writer and reader therefore use the same
@@ -192,33 +211,113 @@ fn merge_container_streams(
             .boxed();
     }
 
+    // Only the newest `buffer_cap` lines can survive the trim below, so the
+    // buffer holds that many and no more. Collecting first and trimming after
+    // would size the server's memory from the request: N containers each
+    // answering a large `tail` at once.
+    let buffer_cap = tail_limit
+        .unwrap_or(DOCKER_MAX_TAIL as usize)
+        .clamp(1, DOCKER_MAX_TAIL as usize);
+
     async_stream::stream! {
-        let mut collected: Vec<(DateTime<Utc>, LogEvent)> = Vec::new();
+        let mut newest = BoundedNewest::new(buffer_cap);
+        let mut arrivals = 0usize;
         let mut merged = futures::stream::select_all(streams);
         while let Some(item) = merged.next().await {
             match item {
-                Ok(line) => collected.push(line),
+                Ok((timestamp, event)) => {
+                    // This page is not paginated (`next_cursor` is always
+                    // `None` below), so arrival order is a sufficient tiebreak
+                    // here — no later request has to agree with it.
+                    let key = MergeKey { timestamp, source: 0, sequence: arrivals };
+                    arrivals = arrivals.saturating_add(1);
+                    newest.push(key, event);
+                }
                 // A container that failed has said so; the lines the others
                 // produced are still worth returning.
                 Err(e) => yield Err(e),
             }
         }
 
-        // Stable, so lines sharing a timestamp keep the order their own
-        // container produced them in rather than being shuffled.
-        collected.sort_by_key(|(timestamp, _)| *timestamp);
-        if let Some(limit) = tail_limit {
-            if collected.len() > limit {
-                collected.drain(..collected.len() - limit);
-            }
-        }
-
-        for (_, event) in collected {
+        for event in newest.into_chronological() {
             yield Ok(event);
         }
         yield Ok(LogEvent::PageLoaded { next_cursor: None });
     }
     .boxed()
+}
+
+/// Total order for merged lines: time first, then a tiebreak that does not
+/// depend on which source happened to answer first.
+///
+/// The tiebreak carries pagination correctness. Two pages are two requests, and
+/// if lines sharing a timestamp sorted differently between them, one would be
+/// served twice and another skipped — so `source`/`sequence` identify the
+/// stream and the line's place within it, never its arrival.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct MergeKey {
+    timestamp: DateTime<Utc>,
+    source: usize,
+    sequence: usize,
+}
+
+/// The newest `capacity` lines seen across every source, in bounded memory.
+///
+/// A merge cannot know which lines are the newest until every source has been
+/// read, but it does know that anything older than the `capacity` newest so far
+/// can never become one. Dropping those as they arrive keeps the buffer the
+/// size of the answer rather than the size of the input — so it does not grow
+/// with the number of containers or Pods, and a deployment with fifty costs
+/// what one with two costs.
+struct BoundedNewest<T> {
+    capacity: usize,
+    heap: BinaryHeap<Reverse<Keyed<T>>>,
+}
+
+struct Keyed<T> {
+    key: MergeKey,
+    value: T,
+}
+
+impl<T> PartialEq for Keyed<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl<T> Eq for Keyed<T> {}
+impl<T> PartialOrd for Keyed<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for Keyed<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl<T> BoundedNewest<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            heap: BinaryHeap::new(),
+        }
+    }
+
+    fn push(&mut self, key: MergeKey, value: T) {
+        self.heap.push(Reverse(Keyed { key, value }));
+        if self.heap.len() > self.capacity {
+            // `Reverse` puts the oldest line at the heap's root, which is
+            // exactly the one that just stopped being a candidate.
+            self.heap.pop();
+        }
+    }
+
+    fn into_chronological(self) -> Vec<T> {
+        let mut kept = self.heap.into_vec();
+        kept.sort_by(|Reverse(left), Reverse(right)| left.key.cmp(&right.key));
+        kept.into_iter().map(|Reverse(keyed)| keyed.value).collect()
+    }
 }
 
 pub(super) fn encode_log_cursor<T: Serialize>(cursor: &T) -> Result<String> {
@@ -540,16 +639,22 @@ impl KubernetesLineFilter {
     }
 }
 
-/// One Pod's lines, each stamped with the timestamp the merge orders on.
-fn kubernetes_pod_line_stream(
+/// One Pod's lines, filtered, in the order the kubelet returned them.
+///
+/// `raw_high_water` collects the largest number of raw lines any one Pod
+/// returned. That is what tells the pager whether a wider window would find
+/// anything: the Pod that filled the tail it was given is the one still holding
+/// history behind the page.
+fn kubernetes_pod_lines(
     log_stream: impl futures::io::AsyncBufRead + Send + Unpin + 'static,
     pod_name: String,
     container: Option<String>,
     filter: KubernetesLineFilter,
-) -> TimestampedLineStream {
+    raw_high_water: Arc<AtomicUsize>,
+) -> futures::stream::BoxStream<'static, Result<KubernetesLine>> {
     async_stream::stream! {
         use futures::AsyncBufReadExt;
-        let mut seen_ids = HashMap::new();
+        let mut raw_count = 0usize;
         let mut lines = futures::io::BufReader::new(log_stream).lines();
         while let Some(line) = lines.next().await {
             let line = match line {
@@ -564,24 +669,48 @@ fn kubernetes_pod_line_stream(
             if line.is_empty() {
                 continue;
             }
+            raw_count = raw_count.saturating_add(1);
+            raw_high_water.fetch_max(raw_count, Ordering::Relaxed);
             match filter.apply(&pod_name, &container, line) {
                 KubernetesLineOutcome::EndOfRange => break,
                 KubernetesLineOutcome::Skip => continue,
-                KubernetesLineOutcome::Keep(kept) => {
-                    let id = distinct_log_id(&mut seen_ids, kept.id);
-                    yield Ok((
-                        kept.timestamp,
-                        LogEvent::Line {
-                            id,
-                            text: kept.rendered,
-                            level: kept.level.to_string(),
-                            container: kept.container,
-                        },
-                    ));
-                }
+                KubernetesLineOutcome::Keep(kept) => yield Ok(kept),
             }
         }
     }
+    .boxed()
+}
+
+/// One Pod's lines as follow events, each stamped with the timestamp the live
+/// merge orders on.
+fn kubernetes_pod_line_stream(
+    log_stream: impl futures::io::AsyncBufRead + Send + Unpin + 'static,
+    pod_name: String,
+    container: Option<String>,
+    filter: KubernetesLineFilter,
+) -> TimestampedLineStream {
+    kubernetes_pod_lines(
+        log_stream,
+        pod_name,
+        container,
+        filter,
+        Arc::new(AtomicUsize::new(0)),
+    )
+    .scan(HashMap::new(), |seen_ids, item| {
+        let mapped = item.map(|line| {
+            let id = distinct_log_id(seen_ids, line.id);
+            (
+                line.timestamp,
+                LogEvent::Line {
+                    id,
+                    text: line.rendered,
+                    level: line.level.to_string(),
+                    container: line.container,
+                },
+            )
+        });
+        futures::future::ready(Some(mapped))
+    })
     .boxed()
 }
 
@@ -680,43 +809,84 @@ fn kubernetes_merged_page(
     select_recent_page(merged, page_size, skip_recent)
 }
 
-/// Read one Pod's logs into the lines that pass `filter`.
+/// Read every Pod of a deployment and keep the newest `max_tail` lines across
+/// all of them.
 ///
-/// `max_lines` bounds the result from the newest end. An end-bounded request
-/// sends no `tailLines`, so without it the kubelet's entire retained log for
-/// the Pod would be held in memory.
-async fn collect_kubernetes_pod_lines(
+/// The bound is global, not per Pod. Holding `max_tail` lines for each Pod and
+/// merging afterwards would make one request's memory scale with the
+/// deployment's replica count — a fifteen-Pod deployment asking for a date
+/// range would buffer fifteen times what it can return.
+///
+/// Reads run concurrently but capped, so one request cannot open an unbounded
+/// number of simultaneous log streams against the API server.
+///
+/// Returns the kept lines in chronological order, the largest raw line count
+/// any single Pod returned, and any Pod that could not be read in full.
+async fn read_kubernetes_pods(
     pod_api: &kube::Api<k8s_openapi::api::core::v1::Pod>,
-    pod_name: &str,
-    container: &Option<String>,
+    sources: Vec<(String, Option<String>)>,
     log_params: &kube::api::LogParams,
     filter: &KubernetesLineFilter,
-    max_lines: usize,
-) -> Result<(VecDeque<KubernetesLine>, usize)> {
-    use futures::AsyncBufReadExt;
-
-    let log_stream = pod_api.log_stream(pod_name, log_params).await?;
-    let mut lines = futures::io::BufReader::new(log_stream).lines();
-    let mut kept: VecDeque<KubernetesLine> = VecDeque::new();
-    let mut raw_count = 0usize;
-    while let Some(line) = lines.next().await {
-        let line = line.map_err(|error| anyhow::anyhow!("Log stream error: {error}"))?;
-        if line.is_empty() {
-            continue;
-        }
-        raw_count = raw_count.saturating_add(1);
-        match filter.apply(pod_name, container, line) {
-            KubernetesLineOutcome::EndOfRange => break,
-            KubernetesLineOutcome::Skip => continue,
-            KubernetesLineOutcome::Keep(kept_line) => {
-                if kept.len() == max_lines {
-                    kept.pop_front();
+    max_tail: usize,
+) -> (Vec<KubernetesLine>, usize, Vec<anyhow::Error>) {
+    let raw_high_water = Arc::new(AtomicUsize::new(0));
+    let readers = sources
+        .into_iter()
+        .enumerate()
+        .map(|(pod_index, (pod_name, container))| {
+            let pod_api = pod_api.clone();
+            let log_params = log_params.clone();
+            let filter = filter.clone();
+            let raw_high_water = Arc::clone(&raw_high_water);
+            async_stream::stream! {
+                let log_stream = match pod_api.log_stream(&pod_name, &log_params).await {
+                    Ok(log_stream) => log_stream,
+                    Err(error) => {
+                        yield Err(anyhow::Error::new(error)
+                            .context(format!("reading logs for pod {pod_name}")));
+                        return;
+                    }
+                };
+                let mut sequence = 0usize;
+                let lines =
+                    kubernetes_pod_lines(log_stream, pod_name, container, filter, raw_high_water);
+                futures::pin_mut!(lines);
+                while let Some(line) = lines.next().await {
+                    match line {
+                        Ok(line) => {
+                            let key = MergeKey {
+                                timestamp: line.timestamp,
+                                source: pod_index,
+                                sequence,
+                            };
+                            sequence = sequence.saturating_add(1);
+                            yield Ok((key, line));
+                        }
+                        Err(error) => yield Err(error),
+                    }
                 }
-                kept.push_back(kept_line);
             }
+            .boxed()
+        })
+        .collect::<Vec<_>>();
+
+    let mut newest = BoundedNewest::new(max_tail);
+    let mut errors = Vec::new();
+    let mut merged = futures::stream::iter(readers).flatten_unordered(KUBERNETES_POD_READ_FANOUT);
+    while let Some(item) = merged.next().await {
+        match item {
+            Ok((key, line)) => newest.push(key, line),
+            // A Pod that could not be read says so against its own name; the
+            // lines the others produced are still worth returning.
+            Err(error) => errors.push(error),
         }
     }
-    Ok((kept, raw_count))
+
+    (
+        newest.into_chronological(),
+        raw_high_water.load(Ordering::Relaxed),
+        errors,
+    )
 }
 
 fn select_recent_page<T>(items: Vec<T>, page_size: usize, skip_recent: usize) -> (Vec<T>, bool) {
@@ -801,6 +971,10 @@ impl RuntimeLogBackend for KubernetesLogBackend {
 
     fn supports_volume(&self) -> bool {
         false
+    }
+
+    fn max_tail(&self) -> Option<i64> {
+        Some(self.config.max_tail_lines.max(1))
     }
 
     async fn stream_logs(
@@ -1008,40 +1182,8 @@ impl RuntimeLogBackend for KubernetesLogBackend {
             ));
         }
 
-        let reads = futures::future::join_all(sources.into_iter().map(|(pod_name, container)| {
-            let pod_api = pod_api.clone();
-            let log_params = log_params.clone();
-            let filter = filter.clone();
-            async move {
-                collect_kubernetes_pod_lines(
-                    &pod_api,
-                    &pod_name,
-                    &container,
-                    &log_params,
-                    &filter,
-                    max_tail,
-                )
-                .await
-                .with_context(|| format!("reading logs for pod {pod_name}"))
-            }
-        }))
-        .await;
-
-        let mut merged: Vec<KubernetesLine> = Vec::new();
-        let mut raw_count = 0usize;
-        let mut errors = Vec::new();
-        for read in reads {
-            match read {
-                Ok((pod_lines, pod_raw_count)) => {
-                    // A wider window only has more to find if *some* Pod filled
-                    // the tail it was given; that is the one still holding
-                    // history behind the page.
-                    raw_count = raw_count.max(pod_raw_count);
-                    merged.extend(pod_lines);
-                }
-                Err(error) => errors.push(error),
-            }
-        }
+        let (merged, raw_count, errors) =
+            read_kubernetes_pods(&pod_api, sources, &log_params, &filter, max_tail).await;
         let (page, has_older_in_window) =
             kubernetes_merged_page(merged, page_size, skip_recent, max_tail);
         let has_more = kubernetes_page_has_more(
@@ -1279,6 +1421,10 @@ impl RuntimeLogBackend for DockerLogBackend {
 
     fn supports_volume(&self) -> bool {
         false
+    }
+
+    fn max_tail(&self) -> Option<i64> {
+        Some(DOCKER_MAX_TAIL)
     }
 
     async fn stream_logs(
@@ -3630,6 +3776,81 @@ mod tests {
 
     fn rendered(page: &[KubernetesLine]) -> Vec<String> {
         page.iter().map(|line| line.rendered.clone()).collect()
+    }
+
+    fn at(second: u32) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(&format!("2026-08-31T12:00:{second:02}Z"))
+            .expect("valid timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn bounded_merge_keeps_the_newest_and_not_the_first_seen() {
+        // Sources are read concurrently, so the oldest line can arrive last.
+        // Keeping the first `capacity` would return whatever raced in first.
+        let mut newest = BoundedNewest::new(3);
+        for (source, second) in [(1, 9), (0, 1), (1, 7), (0, 3), (1, 5)] {
+            newest.push(
+                MergeKey {
+                    timestamp: at(second),
+                    source,
+                    sequence: 0,
+                },
+                format!("line-{second}"),
+            );
+        }
+
+        assert_eq!(
+            newest.into_chronological(),
+            vec!["line-5", "line-7", "line-9"]
+        );
+    }
+
+    #[test]
+    fn bounded_merge_does_not_grow_with_the_number_of_sources() {
+        // The property that keeps one request's memory off the replica count:
+        // twenty Pods of a hundred lines each still cost one page, not twenty.
+        let mut newest = BoundedNewest::new(10);
+        for source in 0..20 {
+            for sequence in 0..100 {
+                newest.push(
+                    MergeKey {
+                        timestamp: at((sequence % 60) as u32),
+                        source,
+                        sequence,
+                    },
+                    format!("{source}:{sequence}"),
+                );
+            }
+        }
+
+        assert_eq!(newest.into_chronological().len(), 10);
+    }
+
+    #[test]
+    fn bounded_merge_result_does_not_depend_on_arrival_order() {
+        // Two pages are two requests, and they must agree on how lines sharing
+        // a timestamp are ordered. If they disagreed, the page boundary would
+        // serve one line twice and step over another.
+        let lines = [(0, 0, 5), (1, 0, 5), (0, 1, 5), (1, 1, 5)];
+        let collect = |order: &[usize]| {
+            let mut newest = BoundedNewest::new(10);
+            for &index in order {
+                let (source, sequence, second) = lines[index];
+                newest.push(
+                    MergeKey {
+                        timestamp: at(second),
+                        source,
+                        sequence,
+                    },
+                    format!("{source}:{sequence}"),
+                );
+            }
+            newest.into_chronological()
+        };
+
+        assert_eq!(collect(&[0, 1, 2, 3]), collect(&[3, 1, 0, 2]));
+        assert_eq!(collect(&[0, 1, 2, 3]), vec!["0:0", "0:1", "1:0", "1:1"]);
     }
 
     #[test]
