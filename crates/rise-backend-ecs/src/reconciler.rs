@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use rise_backend_core::events::{EventSeverity, EventSource, ForwardedEvent};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
+use rise_backend_core::observation::{derive_events, ContainerObservation, ObservedState};
 use rise_backend_core::{
     effective_health_path, hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash,
     resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
@@ -154,6 +156,106 @@ const TASK_DEFINITION_HASH_SUFFIX: &str = "task-definition-hash";
 /// cannot fail independently of the update it records.
 const ECS_META_KEY: &str = "ecs";
 const TD_HASH_META_KEY: &str = "task_definition_hash";
+
+impl EcsReconciler {
+    /// Load the previous observations, derive what changed, and store both.
+    async fn record_observations(
+        &self,
+        deployment: &Deployment,
+        observed: &[ContainerObservation],
+    ) -> anyhow::Result<()> {
+        let previous = self
+            .store
+            .list_container_observations(deployment.id)
+            .await?;
+        let events = derive_events(&previous, observed, chrono::Utc::now());
+        self.store
+            .record_container_observations(deployment.id, EventSource::Ecs, observed, &events)
+            .await
+    }
+}
+
+/// Project one observed ECS task onto the shared observation shape.
+///
+/// The subject is the task id, not a replica ordinal. ECS has no per-replica
+/// identity — a service owns its replicas through `desiredCount`, and the task
+/// list comes back unordered — so an ordinal here would be positional fiction
+/// that moves whenever any task is replaced.
+///
+/// `restart_count` is left unset because Fargate has none: it replaces a task
+/// rather than restarting a container in place. That replacement is still
+/// observable, as this task's subject disappearing and another's appearing.
+fn observe_task(task: &TaskView, container: &str) -> ContainerObservation {
+    // ECS reports uppercase; everything before RUNNING is on its way up.
+    let state = match task.last_status.as_str() {
+        "RUNNING" => ObservedState::Running,
+        "PROVISIONING" | "PENDING" | "ACTIVATING" => ObservedState::Pending,
+        "DEACTIVATING" | "STOPPING" | "DEPROVISIONING" | "STOPPED" => ObservedState::Exited,
+        _ if task.running => ObservedState::Running,
+        _ => ObservedState::Unknown,
+    };
+
+    ContainerObservation {
+        subject: task.name.clone(),
+        container: container.to_string(),
+        // The subject already is the instance: a replaced task is a new task id.
+        instance: Some(task.name.clone()),
+        replica: None,
+        state,
+        started_at: task.started_at,
+        finished_at: task.stopped_at,
+        exit_code: task.exit_code,
+        restart_count: None,
+        health: task.health_status.clone(),
+        reason: task.stopped_reason.clone(),
+        image: task.image.clone(),
+    }
+}
+
+/// Turn one service message into a forwardable event.
+///
+/// ECS's id is the dedupe key, so re-reading the same window on the next tick
+/// records nothing new. The raw message is kept verbatim: it is the event, and
+/// paraphrasing would lose the placement reason that makes it worth having.
+fn forwarded_from_ecs(n: &crate::service::ServiceNarrative) -> Option<ForwardedEvent> {
+    let severity = match crate::service::narrative_severity(&n.message) {
+        crate::service::NarrativeSeverity::Error => EventSeverity::Error,
+        crate::service::NarrativeSeverity::Warning => EventSeverity::Warning,
+        crate::service::NarrativeSeverity::Info => EventSeverity::Info,
+    };
+    Some(ForwardedEvent {
+        dedupe_key: n.id.clone(),
+        occurred_at: n.created_at?,
+        severity,
+        message: n.message.clone(),
+        // ECS names a task in the prose but gives no structured handle, and a
+        // subject parsed out of a sentence would be wrong the first time AWS
+        // rewords it. Service-wide is the honest scope.
+        subject: None,
+        attributes: serde_json::json!({}),
+    })
+}
+
+/// Project an ECS service's event list onto the shape the reconciler keeps.
+///
+/// ECS returns roughly the last hour, newest first, and caps the list — so this
+/// is a window, not a history. Anything relying on having seen every message
+/// would be wrong; forwarding is deduplicated by id precisely because the same
+/// window is re-read on every tick.
+fn service_narrative(svc: &aws_sdk_ecs::types::Service) -> Vec<crate::service::ServiceNarrative> {
+    svc.events()
+        .iter()
+        .filter_map(|e| {
+            Some(crate::service::ServiceNarrative {
+                id: e.id()?.to_string(),
+                created_at: e
+                    .created_at()
+                    .and_then(|t| chrono::DateTime::from_timestamp(t.secs(), 0)),
+                message: e.message()?.to_string(),
+            })
+        })
+        .collect()
+}
 
 /// Read the converged task-definition hash a prior tick persisted for a
 /// deployment, if any.
@@ -1276,6 +1378,7 @@ impl EcsReconciler {
                         deployment_id: None,
                         project: String::new(),
                         deployment_group: String::new(),
+                        events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
                     });
                     continue;
@@ -1303,6 +1406,7 @@ impl EcsReconciler {
                         deployment_id: Some(parsed.deployment_id.clone()),
                         project: parsed.project.clone(),
                         deployment_group: parsed.deployment_group.clone(),
+                        events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
                     },
                     tags: parsed,
@@ -1911,6 +2015,15 @@ impl EcsReconciler {
         let now = chrono::Utc::now();
         let mut reasons: Vec<String> = Vec::new();
 
+        // One entry per task actually observed, across every spec.
+        let mut observed: Vec<ContainerObservation> = Vec::new();
+        // Whether every spec's task list came back cleanly. A spec whose
+        // `DescribeTasks` failed contributes no tasks, and an empty set is
+        // indistinguishable from "every task stopped" — which the derivation
+        // would record as a termination per replica. So a tick that could not
+        // see everything records nothing at all.
+        let mut observation_complete = true;
+
         for spec in &container_specs {
             let key = spec_key(
                 &project.name,
@@ -1922,6 +2035,9 @@ impl EcsReconciler {
                 all_ready = false;
                 rolling_but_serving = false;
                 reasons.push(format!("service for '{}' not found", spec.name));
+                // No service means nothing to observe *and* no evidence its
+                // tasks stopped, so the tick cannot claim a complete picture.
+                observation_complete = false;
                 continue;
             };
 
@@ -1986,6 +2102,17 @@ impl EcsReconciler {
             // report a replica flapping that never moved. The task id is stable
             // for a task's whole life, which is all a slot needs.
             current.sort_by(|a, b| a.name.cmp(&b.name));
+
+            // Both revisions' tasks are this deployment's: during a roll the
+            // outgoing ones are still running and still serving, so leaving
+            // them out would show a deployment as half its actual size and
+            // then report them terminating once the roll completed anyway.
+            observed.extend(
+                current
+                    .iter()
+                    .chain(outgoing.iter())
+                    .map(|t| observe_task(t, &spec.name)),
+            );
             let api_available = self.traefik_api.is_some() && server_status.is_some();
 
             let verdict_for = |task: &TaskView, label: &str| -> ReadyVerdict {
@@ -2081,6 +2208,62 @@ impl EcsReconciler {
         } else {
             persisted_td_hash(&deployment.controller_metadata)
         };
+
+        // Record what was seen, but only from a tick that saw everything. An
+        // incomplete pass would look like tasks having stopped, and the log
+        // would gain terminations that never happened.
+        if observation_complete {
+            if let Err(e) = self.record_observations(deployment, &observed).await {
+                warn!(
+                    deployment = %deployment.deployment_id,
+                    "Failed to record container observations: {:?}", e
+                );
+            }
+        } else {
+            debug!(
+                deployment = %deployment.deployment_id,
+                "Skipping container observations: this tick could not see every service"
+            );
+        }
+
+        // Forward what the services said about themselves this tick. Every
+        // message ECS has in its window is offered on every tick; the store
+        // deduplicates on ECS's own event id, so only the new ones land.
+        // Failing here must not fail the health pass — the deployment's status
+        // is the job, its narrative is a record of the job.
+        let narrated: Vec<ForwardedEvent> = container_specs
+            .iter()
+            .filter_map(|spec| {
+                let key = spec_key(
+                    &project.name,
+                    &deployment.deployment_group,
+                    &deployment.deployment_id,
+                    &spec.name,
+                );
+                by_key.get(key.as_str())
+            })
+            .flat_map(|svc| svc.events.iter())
+            .filter_map(forwarded_from_ecs)
+            .collect();
+        if !narrated.is_empty() {
+            match self
+                .store
+                .forward_backend_events(deployment.id, EventSource::Ecs, &narrated)
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    debug!(
+                        deployment = %deployment.deployment_id,
+                        "Forwarded {n} new ECS service event(s)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    deployment = %deployment.deployment_id,
+                    "Failed to forward ECS service events: {:?}", e
+                ),
+            }
+        }
 
         // `controller_metadata` carries exactly one thing: the task-definition
         // hash the service has converged to. It is the authoritative drift
@@ -2230,11 +2413,24 @@ impl EcsReconciler {
                     .find(|d| d.name() == Some("privateIPv4Address"))
                     .and_then(|d| d.value())
                     .map(str::to_string);
+                // The first container is the app's: Rise runs one container per
+                // task definition, so its exit code is the task's.
+                let container = task.containers().first();
                 views.push(TaskView {
                     name: name.clone(),
                     task_definition_arn: task.task_definition_arn().unwrap_or_default().to_string(),
                     running,
                     ip,
+                    last_status,
+                    started_at: task.started_at().and_then(aws_time),
+                    stopped_at: task.stopped_at().and_then(aws_time),
+                    stopped_reason: task
+                        .stopped_reason()
+                        .filter(|r| !r.is_empty())
+                        .map(str::to_string),
+                    health_status: task.health_status().map(|h| h.as_str().to_lowercase()),
+                    exit_code: container.and_then(|c| c.exit_code()).map(|c| c as i64),
+                    image: container.and_then(|c| c.image()).map(str::to_string),
                 });
             }
         }
@@ -2280,6 +2476,25 @@ struct TaskView {
     /// The task's ENI private IP — the key Traefik's `serverStatus` uses
     /// (`http://{ip}:{port}`).
     ip: Option<String>,
+
+    // Everything below is observation rather than readiness: it says what
+    // happened to the task, which the deployment's history needs and the
+    // ready/not-ready verdict does not.
+    /// ECS's own lifecycle string, uppercase (`RUNNING`, `PENDING`, `STOPPED`).
+    last_status: String,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    stopped_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Why ECS stopped it, in ECS's words. The only explanation that exists for
+    /// a task that went away.
+    stopped_reason: Option<String>,
+    health_status: Option<String>,
+    exit_code: Option<i64>,
+    image: Option<String>,
+}
+
+/// AWS timestamps are seconds-and-nanos; the observation stores `chrono`.
+fn aws_time(t: &aws_sdk_ecs::primitives::DateTime) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(t.secs(), t.subsec_nanos())
 }
 
 /// Collapse a `describe_service_tasks` pass into a single readiness-relevant
@@ -2359,6 +2574,13 @@ mod tests {
             task_definition_arn: "arn:aws:ecs:task-def/foo:1".to_string(),
             running: true,
             ip: None,
+            last_status: "RUNNING".to_string(),
+            started_at: None,
+            stopped_at: None,
+            stopped_reason: None,
+            health_status: None,
+            exit_code: None,
+            image: None,
         }
     }
 
@@ -2412,6 +2634,7 @@ mod tests {
     fn managed(project: &str, project_uuid: &str, deployment_id: &str) -> super::ManagedService {
         super::ManagedService {
             service: crate::service::ActualService {
+                events: Vec::new(),
                 name: format!("rise-{project}-{deployment_id}-web"),
                 arn: format!("arn:aws:ecs:eu-west-1:1:service/c/{project}-{deployment_id}"),
                 key: None,

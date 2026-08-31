@@ -164,6 +164,27 @@ pub mod attributes {
     pub const IMAGES: &str = "images";
 }
 
+/// A runtime-native event a backend wants forwarded into the log.
+///
+/// The runtime's own words, carried through rather than translated: what
+/// Kubernetes calls `FailedScheduling` and what ECS phrases as prose both say
+/// something no periodic observation can, and paraphrasing them would lose the
+/// detail that makes them worth having.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardedEvent {
+    /// The runtime's identifier for this occurrence. Stable for the same event
+    /// and distinct across events, so re-reading the same window cannot record
+    /// it twice.
+    pub dedupe_key: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub severity: EventSeverity,
+    pub message: String,
+    /// The replica it concerns, where the runtime names one. Events about the
+    /// deployment as a whole leave this unset.
+    pub subject: Option<String>,
+    pub attributes: serde_json::Value,
+}
+
 /// How much attention an occurrence deserves.
 ///
 /// A property of the occurrence, not of the kind: the same

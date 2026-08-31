@@ -1,3 +1,5 @@
+pub mod backend_events;
+pub mod container_observations;
 pub mod custom_domains;
 pub mod deployment_events;
 pub mod deployment_store;

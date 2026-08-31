@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO deployment_events (\n                deployment_id, occurred_at, kind, severity, source, subject,\n                message, attributes, dedupe_key\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            ON CONFLICT (deployment_id, kind, dedupe_key)\n                WHERE dedupe_key IS NOT NULL\n                DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c74f0f659d132a59bb2d138955570e1c7df06ab23c98071d38e62f8adcbd9a83"
+}

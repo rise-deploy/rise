@@ -154,6 +154,45 @@ pub trait DeploymentStore: Send + Sync {
         reason: String,
     ) -> Result<Option<Deployment>>;
 
+    // --- container observations ---
+
+    /// Every replica of a deployment as the backend last saw it, for the
+    /// derivation to compare against.
+    async fn list_container_observations(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Vec<crate::observation::ContainerObservation>>;
+
+    /// Replace the recorded observations and append the events they imply, in
+    /// one transaction — the events say what changed, the observations become
+    /// the baseline the next tick compares against, and a crash between the two
+    /// would either lose the events or write them twice.
+    ///
+    /// `observations` is the complete current set: replicas absent from it are
+    /// forgotten, which is how a scale-down or a replaced task leaves the
+    /// baseline as well as the timeline.
+    async fn record_container_observations(
+        &self,
+        deployment_id: Uuid,
+        source: crate::events::EventSource,
+        observations: &[crate::observation::ContainerObservation],
+        events: &[crate::observation::DerivedEvent],
+    ) -> Result<()>;
+
+    /// Forward runtime-native events into the deployment's log, skipping any
+    /// already recorded.
+    ///
+    /// Deduplicated on `dedupe_key`, because a backend re-reads the same window
+    /// on every tick: ECS returns roughly the last hour of service messages,
+    /// and a Kubernetes Event lives well beyond one sync. Re-reporting is the
+    /// normal case, not an error.
+    async fn forward_backend_events(
+        &self,
+        deployment_id: Uuid,
+        source: crate::events::EventSource,
+        events: &[crate::events::ForwardedEvent],
+    ) -> Result<u64>;
+
     /// Mark a deployment terminating with a termination reason. See
     /// `mark_deployment_failed` for the `None` contract.
     ///

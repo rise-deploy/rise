@@ -148,6 +148,39 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::deployments::mark_unhealthy(&self.pool, id, reason).await
     }
 
+    async fn list_container_observations(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Vec<rise_backend_core::observation::ContainerObservation>> {
+        crate::db::container_observations::list_for_deployment(&self.pool, deployment_id).await
+    }
+
+    async fn record_container_observations(
+        &self,
+        deployment_id: Uuid,
+        source: rise_backend_core::events::EventSource,
+        observations: &[rise_backend_core::observation::ContainerObservation],
+        events: &[rise_backend_core::observation::DerivedEvent],
+    ) -> Result<()> {
+        crate::db::container_observations::record_observations(
+            &self.pool,
+            deployment_id,
+            source,
+            observations,
+            events,
+        )
+        .await
+    }
+
+    async fn forward_backend_events(
+        &self,
+        deployment_id: Uuid,
+        source: rise_backend_core::events::EventSource,
+        events: &[rise_backend_core::events::ForwardedEvent],
+    ) -> Result<u64> {
+        crate::db::backend_events::forward(&self.pool, deployment_id, source, events).await
+    }
+
     async fn mark_deployment_terminating(
         &self,
         id: Uuid,

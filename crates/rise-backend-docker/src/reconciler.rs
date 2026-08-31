@@ -36,7 +36,9 @@ use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
 use super::rolling::filter_rolling_actions;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_core::events::EventSource;
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
+use rise_backend_core::observation::{derive_events, ContainerObservation, ObservedState};
 use rise_backend_core::rise_system_env_vars;
 use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
@@ -1857,6 +1859,8 @@ impl DockerReconciler {
         //   - workers (no port) must exist and be `running` on the daemon.
         // An empty spec set is never ready.
         let mut all_ready = !container_specs.is_empty();
+        // One entry per replica of every spec, in spec/replica order.
+        let mut observed: Vec<ContainerObservation> = Vec::new();
         // Per-container "why not ready" detail, surfaced into the Unhealthy status
         // reason (and logged) so an operator sees *what* was probed and *how* it
         // failed — not just a generic "health probe failing".
@@ -1938,6 +1942,13 @@ impl DockerReconciler {
                 } else {
                     spec.name.clone()
                 };
+                // The identity always carries the index, even at one replica.
+                // `label` is prose for a human reading a not-ready reason, and
+                // it drops the index when there is only one — reusing it here
+                // would rename replica 0 from `web` to `web[0]` the moment the
+                // container scaled up, which the derivation would read as one
+                // replica dying and two being born.
+                let subject = format!("{}[{}]", spec.name, replica);
                 let identity = identity_key(
                     &project.name,
                     &deployment.deployment_group,
@@ -2029,6 +2040,18 @@ impl DockerReconciler {
                         }
                     }
                 };
+                // The same inspection the verdict was taken from, kept rather
+                // than dropped. `label` is the subject: Docker stores the
+                // replica index in a label, so `web[0]` names the same slot
+                // across recreates.
+                observed.push(observe(
+                    &subject,
+                    &spec.name,
+                    replica,
+                    actual.map(|a| a.name.as_str()),
+                    inspected.as_ref(),
+                ));
+
                 if !ready {
                     all_ready = false;
                     // Keep inspecting the remaining replicas so the readiness
@@ -2037,6 +2060,18 @@ impl DockerReconciler {
                 }
             }
         }
+
+        // Compare against what the last tick saw and record both the difference
+        // and the new baseline. A failure here must not fail the health pass:
+        // the deployment's status is the reconciler's job, and its history is a
+        // record of that job, not a precondition for it.
+        if let Err(e) = self.record_observations(deployment, &observed).await {
+            warn!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to record container observations: {:?}", e
+            );
+        }
+
         let is_ready = all_ready;
         // Human-readable rollup of the not-ready reasons for the status message.
         let unhealthy_reason = if not_ready_reasons.is_empty() {
@@ -2230,6 +2265,22 @@ impl DockerReconciler {
     /// app port (if any), used to resolve the published loopback host port from
     /// the `network_settings.ports["{port}/tcp"]` mapping. Returns `None` when
     /// the container is missing / not yet created.
+    /// Load the previous observations, derive what changed, and store both.
+    async fn record_observations(
+        &self,
+        deployment: &Deployment,
+        observed: &[ContainerObservation],
+    ) -> anyhow::Result<()> {
+        let previous = self
+            .store
+            .list_container_observations(deployment.id)
+            .await?;
+        let events = derive_events(&previous, observed, chrono::Utc::now());
+        self.store
+            .record_container_observations(deployment.id, EventSource::Docker, observed, &events)
+            .await
+    }
+
     async fn inspect_for_reconcile(
         &self,
         container_name: &str,
@@ -2460,8 +2511,183 @@ fn identity_refresh_entry_expired(
     now.signed_duration_since(last_refresh) >= chrono::Duration::seconds(ttl_seconds.max(1) as i64)
 }
 
+/// Project one Docker inspection onto the shared observation shape.
+///
+/// A replica with no live container is `pending`, not `unknown`: Docker only
+/// fails to resolve one when it has not been created yet or is mid-recreate,
+/// and both are "on the way", not "we cannot tell".
+fn observe(
+    subject: &str,
+    container: &str,
+    replica: u32,
+    instance: Option<&str>,
+    inspected: Option<&InspectedContainer>,
+) -> ContainerObservation {
+    let Some(i) = inspected else {
+        let mut o = ContainerObservation::new(subject, container, ObservedState::Pending);
+        o.replica = Some(replica);
+        return o;
+    };
+
+    // Docker's own vocabulary, mapped onto the states every runtime shares.
+    // `restarting` is Pending rather than Running: the process is down at this
+    // instant, and calling it Running would hide a crash loop entirely.
+    let state = match i.status.as_deref() {
+        Some("running") => ObservedState::Running,
+        Some("created") | Some("restarting") => ObservedState::Pending,
+        Some("exited") | Some("dead") => ObservedState::Exited,
+        _ if i.running => ObservedState::Running,
+        _ => ObservedState::Unknown,
+    };
+
+    ContainerObservation {
+        subject: subject.to_string(),
+        container: container.to_string(),
+        // The generation-bearing container name: a recreate changes it, which
+        // is the only signal that the slot was refilled.
+        instance: instance.map(str::to_string),
+        replica: Some(replica),
+        state,
+        started_at: parse_docker_time(i.started_at.as_deref()),
+        finished_at: parse_docker_time(i.finished_at.as_deref()),
+        // Docker reports `0` for a container that has not exited, so an exit
+        // code is only an exit code once there has been one. Carrying it while
+        // running would show every healthy replica as having exited cleanly.
+        exit_code: (state == ObservedState::Exited)
+            .then_some(i.exit_code)
+            .flatten(),
+        restart_count: i.restart_count,
+        health: i.health.clone(),
+        reason: i.error.clone(),
+        image: None,
+    }
+}
+
+/// Docker reports a zero timestamp for "never", which is not a time.
+fn parse_docker_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = value?;
+    if raw.starts_with("0001-01-01") {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 #[cfg(test)]
 mod tests {
+
+    use rise_backend_core::observation::ObservedState;
+
+    fn inspected(status: &str, running: bool) -> InspectedContainer {
+        InspectedContainer {
+            status: Some(status.to_string()),
+            running,
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            restart_count: None,
+            health: None,
+            error: None,
+            ip: None,
+            published_host_port: None,
+        }
+    }
+
+    /// A replica Docker cannot resolve has not been created yet or is
+    /// mid-recreate. Both are "on the way" — calling it Unknown would make the
+    /// derivation refuse to reason about a perfectly ordinary rollout.
+    #[test]
+    fn a_replica_with_no_container_is_pending() {
+        let o = super::observe("web[0]", "web", 0, None, None);
+        assert_eq!(o.state, ObservedState::Pending);
+        assert_eq!(o.replica, Some(0));
+    }
+
+    /// `restarting` means the process is down at this instant. Reporting it as
+    /// Running would hide a crash loop completely.
+    #[test]
+    fn a_restarting_container_is_not_running() {
+        let o = super::observe(
+            "web[0]",
+            "web",
+            0,
+            Some("c_g1"),
+            Some(&inspected("restarting", false)),
+        );
+        assert_eq!(o.state, ObservedState::Pending);
+    }
+
+    #[test]
+    fn docker_states_map_onto_the_shared_vocabulary() {
+        for (status, expected) in [
+            ("running", ObservedState::Running),
+            ("created", ObservedState::Pending),
+            ("exited", ObservedState::Exited),
+            ("dead", ObservedState::Exited),
+        ] {
+            let o = super::observe(
+                "web[0]",
+                "web",
+                0,
+                Some("c_g1"),
+                Some(&inspected(status, status == "running")),
+            );
+            assert_eq!(o.state, expected, "{status}");
+        }
+    }
+
+    /// A status this build does not know must not be guessed at, unless the
+    /// daemon's own running flag settles it.
+    #[test]
+    fn an_unrecognised_status_falls_back_to_the_running_flag() {
+        let o = super::observe(
+            "web[0]",
+            "web",
+            0,
+            Some("c_g1"),
+            Some(&inspected("paused", true)),
+        );
+        assert_eq!(o.state, ObservedState::Running);
+        let o = super::observe(
+            "web[0]",
+            "web",
+            0,
+            Some("c_g1"),
+            Some(&inspected("paused", false)),
+        );
+        assert_eq!(o.state, ObservedState::Unknown);
+    }
+
+    /// Docker reports exit code 0 for a container that has not exited, so
+    /// carrying it while running would show every healthy replica as having
+    /// exited cleanly.
+    #[test]
+    fn a_running_container_reports_no_exit_code() {
+        let mut i = inspected("running", true);
+        i.exit_code = Some(0);
+        assert_eq!(
+            super::observe("web[0]", "web", 0, Some("c_g1"), Some(&i)).exit_code,
+            None
+        );
+
+        let mut gone = inspected("exited", false);
+        gone.exit_code = Some(137);
+        assert_eq!(
+            super::observe("web[0]", "web", 0, Some("c_g1"), Some(&gone)).exit_code,
+            Some(137),
+        );
+    }
+
+    /// Docker writes a zero timestamp for "never", which is not a time and must
+    /// not become one — a bogus `started_at` would date every derived event.
+    #[test]
+    fn dockers_zero_timestamp_is_not_a_time() {
+        assert_eq!(super::parse_docker_time(Some("0001-01-01T00:00:00Z")), None);
+        assert_eq!(super::parse_docker_time(Some("not a time")), None);
+        assert_eq!(super::parse_docker_time(None), None);
+        assert!(super::parse_docker_time(Some("2026-08-31T10:00:00Z")).is_some());
+    }
     use super::*;
 
     #[test]

@@ -1,0 +1,88 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT subject, container, instance, replica, state, started_at, finished_at,\n               exit_code, restart_count, health, reason, image\n        FROM deployment_container_observations\n        WHERE deployment_id = $1\n        ORDER BY container, replica NULLS LAST, subject\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "subject",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "container",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "instance",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "replica",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "finished_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "exit_code",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "restart_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "health",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "reason",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "image",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "06b358d4ad17aef657e5ff11e4863ba5cbf2f1d4f357a94945ff4213501d5db7"
+}
