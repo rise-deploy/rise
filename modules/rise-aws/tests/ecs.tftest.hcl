@@ -69,7 +69,10 @@ run "runtime_log_reads_are_confined_to_the_configured_group" {
       for s in jsondecode(data.aws_iam_policy_document.backend.json).Statement :
       s.Sid == "ReadECSRuntimeLogs"
       && toset(flatten([s.Action])) == toset(["logs:FilterLogEvents", "logs:StartLiveTail"])
-      && s.Resource == "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom"
+      && toset(flatten([s.Resource])) == toset([
+        "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom",
+        "arn:aws:logs:eu-central-1:123456789012:log-group:/rise/custom:*"
+      ])
     ])
     error_message = "runtime log policy must grant only FilterLogEvents and StartLiveTail on the configured group"
   }
@@ -82,7 +85,7 @@ run "ecs_requires_an_explicit_runtime_log_group" {
     ecs_log_group_name = null
   }
 
-  expect_failures = [check.ecs_log_group_name]
+  expect_failures = [aws_iam_role.backend]
 }
 
 run "passrole_is_scoped_to_the_two_task_roles" {

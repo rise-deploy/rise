@@ -62,13 +62,6 @@ locals {
   ))
 }
 
-check "ecs_log_group_name" {
-  assert {
-    condition     = !var.enable_ecs || var.ecs_log_group_name != null
-    error_message = "ecs_log_group_name is required when enable_ecs = true; it must match deployment_controller.log_group."
-  }
-}
-
 # -----------------------------------------------------------------------------
 # KMS Key (for encryption)
 # -----------------------------------------------------------------------------
@@ -349,8 +342,9 @@ data "aws_iam_policy_document" "backend" {
   }
 
   # Runtime logs are read back through the control plane after project-scoped
-  # authorization. Both actions support a log-group resource, so the grant is
-  # confined to the one group named by the ECS controller.
+  # authorization. Live Tail authorizes against the bare log-group ARN, while
+  # historical filtering authorizes against its :* form. Both identify the one
+  # group named by the ECS controller.
   dynamic "statement" {
     for_each = var.enable_ecs ? [1] : []
     content {
@@ -361,7 +355,8 @@ data "aws_iam_policy_document" "backend" {
         "logs:StartLiveTail"
       ]
       resources = [
-        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}"
+        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}",
+        "arn:${local.partition}:logs:${local.region}:${local.account_id}:log-group:${local.ecs_log_group_name}:*"
       ]
     }
   }
@@ -590,6 +585,13 @@ resource "aws_iam_role" "backend" {
   assume_role_policy   = local.assume_role_policy
   permissions_boundary = var.permissions_boundary_arn
   tags                 = local.tags
+
+  lifecycle {
+    precondition {
+      condition     = !var.enable_ecs || var.ecs_log_group_name != null
+      error_message = "ecs_log_group_name is required when enable_ecs = true; it must match deployment_controller.log_group."
+    }
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "backend" {
