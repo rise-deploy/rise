@@ -178,9 +178,18 @@ jobs:
     runs-on: ubuntu-latest
     needs: prepare
     timeout-minutes: 20
+    permissions:
+      # Only used to push a regenerated notices file back onto a Renovate
+      # branch (see the last step). Every other path is read-only.
+      contents: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          # Check out the PR's own branch rather than the merge commit, so the
+          # regeneration step below has somewhere to push to.
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
 
       - name: Set up Rust + tools
         uses: ./.github/actions/setup-rust
@@ -199,8 +208,37 @@ jobs:
       - name: Fetch dependencies
         run: cargo fetch --locked
 
+      - name: Regenerate third-party notices
+        run: mise notices:generate
+
+      # Dependency bumps legitimately change the notices, and Renovate opens a
+      # lot of them under `:automergeMinor`/`:automergePatch`. Failing those PRs
+      # would leave them permanently red and kill automerge, so regenerate for
+      # the bot instead of demanding a human do it.
+      #
+      # NOTE: pushes made with GITHUB_TOKEN do not trigger new workflow runs.
+      # If these checks are required by branch protection, the pushed commit
+      # will have no runs and auto-merge will wait. Set NOTICES_TOKEN to a
+      # GitHub App or PAT credential to make the push retrigger CI.
+      - name: Commit regenerated notices (bot branches only)
+        if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/')
+        env:
+          GH_TOKEN: ${{ secrets.NOTICES_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- THIRD-PARTY-NOTICES.md; then
+            echo "Notices already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add THIRD-PARTY-NOTICES.md
+          git commit -m "Update third-party notices for the dependency changes in this PR"
+          git push origin "HEAD:${{ github.head_ref }}"
+          echo "Regenerated and pushed; the updated file is on the PR branch."
+
       - name: Verify third-party notices are up to date
-        run: mise notices:check
+        run: git --no-pager diff --exit-code -- THIRD-PARTY-NOTICES.md
 
   rise-e2e-quality:
     name: Quality / rise-e2e harness
