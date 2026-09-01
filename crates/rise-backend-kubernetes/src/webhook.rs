@@ -25,20 +25,20 @@ use k8s_openapi::ByteString;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
-use crate::server::deployment::crd;
-use crate::server::deployment::resource_builder::{
+use crate::crd;
+use crate::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
     IDENTITY_CREDENTIAL_KEY, IDENTITY_TOKEN_KEY_PREFIX, IMAGE_PULL_SECRET_NAME,
     IRRECOVERABLE_CONTAINER_REASONS, LABEL_DEPLOYMENT_ID,
 };
-use crate::server::deployment::state_machine;
-use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
+use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
 use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
     ResolvedDeploymentEnvVars,
 };
+use rise_backend_core::state_machine;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -119,12 +119,11 @@ struct PreparedDeploymentEnvSecret {
 pub struct WebhookContext {
     pub kube_client: kube::Client,
     pub resource_builder: Arc<ResourceBuilder>,
-    pub ip_validator:
-        Option<Arc<crate::server::deployment::ip_validator::MetacontrollerIpValidator>>,
+    pub ip_validator: Option<Arc<crate::ip_validator::MetacontrollerIpValidator>>,
     pub deployment_store: Arc<dyn rise_backend_core::DeploymentStore>,
     pub org_view: Arc<dyn rise_backend_core::OrganizationView>,
     pub jwt_signer: Arc<rise_backend_auth::RiseTokenSigner>,
-    pub encryption_provider: Option<Arc<dyn crate::server::encryption::EncryptionProvider>>,
+    pub encryption_provider: Option<Arc<dyn rise_backend_core::EncryptionProvider>>,
     /// Only projects whose Organization names this class are reconciled here.
     pub controller_class_name: Option<String>,
     pub identity_token_ttl_seconds: u64,
@@ -667,7 +666,7 @@ async fn record_pod_observations(ctx: &WebhookContext, deployment: &Deployment, 
 
     let observed: Vec<_> = pods
         .iter()
-        .filter_map(|p| super::pods::observe(p, &container))
+        .filter_map(|p| crate::pods::observe(p, &container))
         .collect();
 
     let previous = match ctx
@@ -753,7 +752,7 @@ async fn forward_pod_events(
         })
         .collect();
 
-    let forwardable = super::pods::forwardable(&mine);
+    let forwardable = crate::pods::forwardable(&mine);
     if forwardable.is_empty() {
         return;
     }
@@ -921,7 +920,7 @@ async fn compute_desired_children(
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
-    let environments: HashMap<uuid::Uuid, crate::db::models::Environment> = ctx
+    let environments: HashMap<uuid::Uuid, rise_backend_core::models::Environment> = ctx
         .deployment_store
         .list_environments_for_project(project.id)
         .await?
@@ -1002,11 +1001,11 @@ async fn compute_desired_children(
     // avoids a duplicate DB roundtrip in phase 2.
     let mut container_specs_by_deployment: HashMap<
         uuid::Uuid,
-        Vec<crate::server::deployment::models::ContainerSpec>,
+        Vec<rise_deployment_spec::request_spec::ContainerSpec>,
     > = HashMap::new();
     let mut routes_by_deployment: HashMap<
         uuid::Uuid,
-        Vec<crate::server::deployment::models::RouteSpec>,
+        Vec<rise_deployment_spec::request_spec::RouteSpec>,
     > = HashMap::new();
     // `containers`/`routes` come folded onto each row. An unparseable (non-NULL
     // but corrupt) side-data column fails ONLY that deployment: mark it Failed,
@@ -1075,7 +1074,7 @@ async fn compute_desired_children(
         // has its synthesised `app`; a multi-container one has one entry per
         // `[containers.<name>]`. Computed here (before the env-secret guard) so
         // the guard can look up the per-container K8s Deployment names.
-        let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+        let container_specs: Vec<rise_deployment_spec::request_spec::ContainerSpec> =
             container_specs_by_deployment
                 .get(&deployment.id)
                 .cloned()
@@ -1274,7 +1273,7 @@ async fn compute_desired_children(
 
             let health_check = spec.health_check.clone();
 
-            let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
+            let runtime = crate::resource_builder::ContainerRuntime {
                 name: &spec.name,
                 // Synthesised `app` carries no image; fall back to the
                 // deployment's resolved image. Explicit containers always have one.
@@ -1335,7 +1334,7 @@ async fn compute_desired_children(
     let valid_custom_domains = resource_builder.filter_valid_custom_domains(&custom_domains);
 
     // Index custom domains by environment_id.
-    let mut domains_by_env: HashMap<uuid::Uuid, Vec<crate::db::models::CustomDomain>> =
+    let mut domains_by_env: HashMap<uuid::Uuid, Vec<rise_backend_core::models::CustomDomain>> =
         HashMap::new();
     for cd in &valid_custom_domains {
         domains_by_env
@@ -1347,7 +1346,8 @@ async fn compute_desired_children(
     // Index environments by the deployment group they're primary for. The schema
     // enforces (project_id, primary_deployment_group) uniqueness, so at most one
     // env per group.
-    let mut env_by_primary_group: HashMap<String, &crate::db::models::Environment> = HashMap::new();
+    let mut env_by_primary_group: HashMap<String, &rise_backend_core::models::Environment> =
+        HashMap::new();
     for env in environments.values() {
         if let Some(group) = env.primary_deployment_group.as_deref() {
             env_by_primary_group.insert(group.to_string(), env);
@@ -1363,13 +1363,13 @@ async fn compute_desired_children(
 
     // Full env list for `create_primary_ingress` to do cross-ingress host
     // collision checks (a DG URL that matches another env's URL is suppressed).
-    let all_environments: Vec<crate::db::models::Environment> =
+    let all_environments: Vec<rise_backend_core::models::Environment> =
         environments.values().cloned().collect();
 
     for (group, active_deployment) in &active_by_group {
         let env_name = env_name_for(active_deployment);
         let env_for_group = env_by_primary_group.get(group.as_str()).copied();
-        let domains_for_group: Vec<crate::db::models::CustomDomain> = env_for_group
+        let domains_for_group: Vec<rise_backend_core::models::CustomDomain> = env_for_group
             .and_then(|env| domains_by_env.get(&env.id).cloned())
             .unwrap_or_default();
 
@@ -1378,14 +1378,14 @@ async fn compute_desired_children(
         // map — so a new container declared by a rolling-out, not-yet-active
         // deployment gets its Service immediately (sibling pods can reach it
         // during probes). Here we only build the ingress route table.
-        let active_container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+        let active_container_specs: Vec<rise_deployment_spec::request_spec::ContainerSpec> =
             container_specs_by_deployment
                 .get(&active_deployment.id)
                 .cloned()
                 .unwrap_or_default();
 
         // Primary Ingress
-        let inline_domains: &[crate::db::models::CustomDomain] = if split_custom_domains {
+        let inline_domains: &[rise_backend_core::models::CustomDomain] = if split_custom_domains {
             &[]
         } else {
             &domains_for_group
@@ -1402,7 +1402,7 @@ async fn compute_desired_children(
             .collect();
         let service_name_base = ResourceBuilder::service_name(project, active_deployment);
         // Routable route specs: those targeting a container that exposes a port.
-        let routable_specs: Vec<&crate::server::deployment::models::RouteSpec> =
+        let routable_specs: Vec<&rise_deployment_spec::request_spec::RouteSpec> =
             routes_by_deployment
                 .get(&active_deployment.id)
                 .map(|route_specs| {
@@ -1421,17 +1421,14 @@ async fn compute_desired_children(
             // Carry each route's per-route `access` override; the builder resolves
             // the effective requirement (override, else the project default) and
             // partitions by it, gating each path group independently.
-            let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
-                routable_specs
-                    .iter()
-                    .map(
-                        |r| crate::server::deployment::resource_builder::IngressRoute {
-                            path: r.path.clone(),
-                            service_name: format!("{}-{}", service_name_base, r.container),
-                            access_override: r.access.clone(),
-                        },
-                    )
-                    .collect();
+            let routes: Vec<crate::resource_builder::IngressRoute> = routable_specs
+                .iter()
+                .map(|r| crate::resource_builder::IngressRoute {
+                    path: r.path.clone(),
+                    service_name: format!("{}-{}", service_name_base, r.container),
+                    access_override: r.access.clone(),
+                })
+                .collect();
 
             // One or more Ingresses (one per effective-requirement group). An
             // empty result means every candidate host collided with another env's
@@ -1488,7 +1485,7 @@ fn any_container_deployment_observed(
     observed: &ObservedChildren,
     namespace: &str,
     base_name: &str,
-    container_specs: &[crate::server::deployment::models::ContainerSpec],
+    container_specs: &[rise_deployment_spec::request_spec::ContainerSpec],
 ) -> bool {
     container_specs.iter().any(|spec| {
         let key = format!("{}/{}-{}", namespace, base_name, spec.name);
@@ -1544,7 +1541,7 @@ pub(crate) fn compute_service_owner_per_container(
     infra_deployments: &[&Deployment],
     container_specs_by_deployment: &HashMap<
         uuid::Uuid,
-        Vec<crate::server::deployment::models::ContainerSpec>,
+        Vec<rise_deployment_spec::request_spec::ContainerSpec>,
     >,
 ) -> HashMap<(String, String), uuid::Uuid> {
     let mut owner: HashMap<(String, String), uuid::Uuid> = HashMap::new();
@@ -1744,7 +1741,7 @@ async fn prepare_identity_secret(
             // a DB hash that does not match the Secret that actually got applied.
             // The hash is written on the next sync via the reuse path above, once
             // some replica's Secret has been applied and is observed by all.
-            crate::server::workload_tokens::generate_bootstrap_credential()
+            rise_backend_auth::generate_bootstrap_credential()
         }
     };
 
@@ -1784,7 +1781,7 @@ async fn prepare_identity_secret(
             .unwrap_or_default();
 
         let ttl_secs = ctx.identity_token_ttl_seconds;
-        let refresh_secs = crate::server::workload_tokens::remint_after_secs(ttl_secs) as i64;
+        let refresh_secs = rise_backend_core::remint_after_secs(ttl_secs) as i64;
 
         let fresh = observed_refresh
             .map(|ts| {
@@ -1804,7 +1801,7 @@ async fn prepare_identity_secret(
                 deployment_group: &deployment.deployment_group,
                 deployment_id: &deployment.deployment_id,
             };
-            let minted = crate::server::workload_tokens::sign_audience_tokens(
+            let minted = rise_backend_auth::sign_audience_tokens(
                 &ctx.jwt_signer,
                 &subject_info,
                 &audiences,
@@ -1827,11 +1824,9 @@ async fn prepare_identity_secret(
     } else {
         Some(
             refreshed_at
-                + chrono::Duration::seconds(
-                    crate::server::workload_tokens::refresh_due_after_secs(
-                        ctx.identity_token_ttl_seconds,
-                    ) as i64,
-                ),
+                + chrono::Duration::seconds(rise_backend_core::refresh_due_after_secs(
+                    ctx.identity_token_ttl_seconds,
+                ) as i64),
         )
     };
 
@@ -1936,7 +1931,7 @@ async fn add_backend_resources(
     project: &Project,
     rise_project_uid: Option<&str>,
     namespace: &str,
-    backend_address: &crate::server::settings::BackendAddress,
+    backend_address: &crate::config::BackendAddress,
 ) -> anyhow::Result<()> {
     if backend_address.is_ip_address() {
         // IP address → ClusterIP Service (as child) + EndpointSlice (applied directly)
@@ -2139,13 +2134,13 @@ async fn process_finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{DeploymentEnvVar, DeploymentStatus, Project, ProjectStatus};
-    use crate::server::deployment::resource_builder::ResourceBuilder;
-    use crate::server::encryption::EncryptionProvider;
-    use crate::server::registry::models::RegistryCredentials;
-    use crate::server::registry::{ImageTagType, RegistryProvider};
+    use crate::resource_builder::ResourceBuilder;
     use anyhow::Result;
     use async_trait::async_trait;
+    use rise_backend_core::models::{DeploymentEnvVar, DeploymentStatus, Project, ProjectStatus};
+    use rise_backend_core::providers::RegistryCredentials;
+    use rise_backend_core::providers::{ImageTagType, RegistryProvider};
+    use rise_backend_core::EncryptionProvider;
     use std::sync::Arc;
 
     struct TestRegistryProvider;
@@ -2277,11 +2272,7 @@ mod tests {
             test_env_var("PORT", "8080", false, false),
             test_env_var("SESSION_SECRET", "ciphertext-b", true, false),
         ];
-        // 32 zero bytes encoded as standard base64
-        let provider = crate::server::encryption::providers::local::LocalEncryptionProvider::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        )
-        .unwrap();
+        let provider = rise_backend_core::test_helpers::ReversibleEncryptionProvider;
 
         let mut encrypted_env_vars = Vec::new();
         for mut var in env_vars {
@@ -2465,7 +2456,7 @@ mod tests {
             namespace_annotations: HashMap::new(),
             ingress_annotations: HashMap::new(),
             ingress_tls_secret_name: None,
-            custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
+            custom_domain_tls_mode: crate::config::CustomDomainTlsMode::PerDomain,
             custom_domain_ingress_annotations: HashMap::new(),
             node_selector: HashMap::new(),
             image_pull_secret_name: None,
@@ -2473,7 +2464,7 @@ mod tests {
             host_aliases: HashMap::new(),
             extra_service_token_audiences: HashMap::new(),
             use_default_service_account_for_production: true,
-            network_policy: crate::server::settings::NetworkPolicyConfig {
+            network_policy: crate::config::NetworkPolicyConfig {
                 ingress: vec![],
                 egress: None,
             },
@@ -2593,10 +2584,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_deployment_env_vars_trims_whitespace_from_secret_keys() {
-        let provider = crate::server::encryption::providers::local::LocalEncryptionProvider::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        )
-        .unwrap();
+        let provider = rise_backend_core::test_helpers::ReversibleEncryptionProvider;
         let raw_value = "secret-value";
         let encrypted = provider.encrypt(raw_value).await.unwrap();
 
@@ -2616,8 +2604,8 @@ mod tests {
         );
     }
 
-    fn cspec(name: &str, port: Option<u16>) -> crate::server::deployment::models::ContainerSpec {
-        crate::server::deployment::models::ContainerSpec {
+    fn cspec(name: &str, port: Option<u16>) -> rise_deployment_spec::request_spec::ContainerSpec {
+        rise_deployment_spec::request_spec::ContainerSpec {
             name: name.to_string(),
             image: Some("img".to_string()),
             port,
