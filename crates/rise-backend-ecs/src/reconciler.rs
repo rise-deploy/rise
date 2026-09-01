@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::aws_error_detail;
+use crate::capacity::Capacity;
 use crate::service::{self, ActualService, DesiredService, ServiceAction};
 use crate::ssm;
 use crate::tags::ServiceTags;
@@ -246,7 +247,7 @@ fn resource_adjustment_event(
     container: &str,
     requested_cpu: &str,
     requested_memory: &str,
-    size: crate::sizing::FargateSize,
+    size: crate::sizing::TaskSize,
 ) -> ForwardedEvent {
     ForwardedEvent {
         dedupe_key: format!(
@@ -300,6 +301,75 @@ fn persisted_td_hash(controller_metadata: &serde_json::Value) -> Option<String> 
         .map(str::to_string)
 }
 
+/// The service-level shape ECS reports for a running service.
+///
+/// `None` when there is no `awsvpc` configuration to read. Unknown is not drift:
+/// a shape we cannot see is left alone rather than "corrected" into a rolling
+/// replacement on the strength of a missing field.
+fn observed_shape(svc: &aws_sdk_ecs::types::Service) -> Option<crate::service::ObservedShape> {
+    let vpc = svc.network_configuration()?.awsvpc_configuration()?;
+    Some(crate::service::ObservedShape {
+        subnets: vpc.subnets().iter().cloned().collect(),
+        security_groups: vpc.security_groups().iter().cloned().collect(),
+        assign_public_ip: matches!(
+            vpc.assign_public_ip(),
+            Some(aws_sdk_ecs::types::AssignPublicIp::Enabled)
+        ),
+        launch_type: svc.launch_type().map(|lt| lt.as_str().to_string()),
+        capacity_providers: svc
+            .capacity_provider_strategy()
+            .iter()
+            .map(|item| item.capacity_provider().to_string())
+            .collect(),
+    })
+}
+
+/// Place a service's tasks on the configured capacity.
+///
+/// `launchType` and `capacityProviderStrategy` are mutually exclusive on
+/// `CreateService`, so this matches exhaustively rather than setting both --
+/// which also means a new [`Capacity`] variant fails the build here instead of
+/// silently placing tasks on the default.
+fn apply_capacity(
+    req: aws_sdk_ecs::operation::create_service::builders::CreateServiceFluentBuilder,
+    capacity: &Capacity,
+) -> Result<aws_sdk_ecs::operation::create_service::builders::CreateServiceFluentBuilder> {
+    use aws_sdk_ecs::types as ecs_types;
+    Ok(match capacity {
+        Capacity::Fargate => req.launch_type(ecs_types::LaunchType::Fargate),
+        Capacity::Ec2 => req.launch_type(ecs_types::LaunchType::Ec2),
+        Capacity::Provider(provider) => {
+            let mut item = ecs_types::CapacityProviderStrategyItem::builder()
+                .capacity_provider(&provider.name);
+            if let Some(base) = provider.base {
+                item = item.base(base);
+            }
+            if let Some(weight) = provider.weight {
+                item = item.weight(weight);
+            }
+            req.capacity_provider_strategy(
+                item.build()
+                    .map_err(|e| anyhow::anyhow!("invalid capacity provider strategy: {e}"))?,
+            )
+        }
+    })
+}
+
+/// The `requiresCompatibilities` token for a capacity.
+///
+/// Matched rather than converted from a string: `Compatibility::from` maps an
+/// unrecognised value to an `Unknown` variant that serialises verbatim, so a
+/// drift between the two enums would reach `RegisterTaskDefinition` as an
+/// AWS-shaped error per deployment rather than a compile error here.
+fn compatibility_type(
+    compatibility: crate::capacity::Compatibility,
+) -> aws_sdk_ecs::types::Compatibility {
+    match compatibility {
+        crate::capacity::Compatibility::Fargate => aws_sdk_ecs::types::Compatibility::Fargate,
+        crate::capacity::Compatibility::Ec2 => aws_sdk_ecs::types::Compatibility::Ec2,
+    }
+}
+
 /// Fold the converged task-definition hash into a controller-metadata object,
 /// leaving any sibling keys untouched. A no-op if `hash` is `None` or the
 /// metadata is not a JSON object.
@@ -324,6 +394,9 @@ pub struct ReconcilerConfig {
     pub subnets: Vec<String>,
     pub security_groups: Vec<String>,
     pub assign_public_ip: bool,
+    /// Where workload tasks run. `awsvpc` either way -- see
+    /// [`crate::capacity`].
+    pub capacity: Capacity,
     pub execution_role_arn: Option<String>,
     pub task_role_arn: Option<String>,
     /// Secrets Manager secret ECS reads to authenticate pulls from a private
@@ -965,6 +1038,28 @@ impl EcsReconciler {
             desired.iter().map(|(d, _, _)| d.clone()).collect();
         let actions = service::diff_services(&desired_services, &actual, &protected_deployment_ids);
 
+        // Capacity is reported, never applied in place: ECS restricts which
+        // launch-type/capacity-provider transitions `UpdateService` performs,
+        // and the permitted ones need a forced new deployment. A retopology is
+        // the operator's call, and the next deploy carries it for free -- Rise
+        // creates one service per deployment, so those are new services.
+        let capacity_drift = service::capacity_drift(&desired_services, &actual);
+        if let Some(first) = capacity_drift.first() {
+            // One line for the whole project, not one per service: the condition
+            // persists until the project is redeployed, and this loop runs every
+            // `reconcile_interval_secs`.
+            warn!(
+                project = %project.name,
+                services = capacity_drift.len(),
+                "{} of this project's services run on {} but the install is configured \
+                 for {}. ECS cannot move a running service between capacities; the next \
+                 deployment of this project will use the configured one.",
+                capacity_drift.len(),
+                first.observed,
+                first.desired,
+            );
+        }
+
         if !actions.is_empty() && !self.confirm_leadership(election).await {
             return Ok(());
         }
@@ -1297,6 +1392,7 @@ impl EcsReconciler {
             &TaskDefinitionConfig {
                 resource_prefix: &self.config.resource_prefix,
                 cpu_architecture: &self.config.cpu_architecture,
+                compatibility: self.config.capacity.compatibility(),
                 execution_role_arn: self.config.execution_role_arn.as_deref(),
                 repository_credentials_secret_arn: self
                     .config
@@ -1348,6 +1444,7 @@ impl EcsReconciler {
             family: task_def.family.clone(),
             task_definition_hash: task_def.content_hash(),
             desired_count: replica_count as i32,
+            shape: self.desired_shape(),
             tags: ServiceTags {
                 project: project.name.clone(),
                 project_uuid: project.id.to_string(),
@@ -1461,6 +1558,7 @@ impl EcsReconciler {
                         deployment_group: String::new(),
                         events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
+                        shape: observed_shape(svc),
                     });
                     continue;
                 };
@@ -1489,6 +1587,7 @@ impl EcsReconciler {
                         deployment_group: parsed.deployment_group.clone(),
                         events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
+                        shape: observed_shape(svc),
                     },
                     tags: parsed,
                 });
@@ -1559,6 +1658,11 @@ impl EcsReconciler {
                         None => continue,
                     }
                 }
+                ServiceAction::UpdateServiceShape {
+                    name,
+                    desired_count,
+                    ..
+                } => self.update_service_shape(name, *desired_count).await,
                 ServiceAction::UpdateDesiredCount {
                     name,
                     desired_count,
@@ -1797,8 +1901,10 @@ impl EcsReconciler {
             .ecs
             .register_task_definition()
             .family(&spec.family)
+            // Not configurable: readiness keys Traefik's `serverStatus` on the
+            // task's own ENI address, which only `awsvpc` provides.
             .network_mode(ecs_types::NetworkMode::Awsvpc)
-            .requires_compatibilities(ecs_types::Compatibility::Fargate)
+            .requires_compatibilities(compatibility_type(self.config.capacity.compatibility()))
             .cpu(&spec.cpu)
             .memory(&spec.memory)
             .runtime_platform(
@@ -1841,15 +1947,36 @@ impl EcsReconciler {
             .context("RegisterTaskDefinition returned no ARN")
     }
 
+    /// The service-level shape this install wants: where the tasks' ENIs live
+    /// and what capacity places them.
+    fn desired_shape(&self) -> crate::service::DesiredShape {
+        crate::service::DesiredShape {
+            subnets: self.config.subnets.iter().cloned().collect(),
+            security_groups: self.config.security_groups.iter().cloned().collect(),
+            assign_public_ip: self.config.assign_public_ip,
+            capacity: self.config.capacity.clone(),
+        }
+    }
+
     fn network_configuration(&self) -> Result<aws_sdk_ecs::types::NetworkConfiguration> {
         use aws_sdk_ecs::types as ecs_types;
-        let mut vpc = ecs_types::AwsVpcConfiguration::builder().assign_public_ip(
-            if self.config.assign_public_ip {
+        let mut vpc = ecs_types::AwsVpcConfiguration::builder();
+        // Omitted entirely where the capacity does not support it: ECS rejects
+        // the field on EC2 rather than ignoring it. Settings validation already
+        // refuses `assign_public_ip: true` there, so nothing is silently
+        // dropped -- this only keeps the field off the wire.
+        if self
+            .config
+            .capacity
+            .compatibility()
+            .supports_assign_public_ip()
+        {
+            vpc = vpc.assign_public_ip(if self.config.assign_public_ip {
                 ecs_types::AssignPublicIp::Enabled
             } else {
                 ecs_types::AssignPublicIp::Disabled
-            },
-        );
+            });
+        }
         for subnet in &self.config.subnets {
             vpc = vpc.subnets(subnet);
         }
@@ -1899,12 +2026,12 @@ impl EcsReconciler {
             .service_name(name)
             .task_definition(&task_definition_arn)
             .desired_count(desired.desired_count)
-            .launch_type(aws_sdk_ecs::types::LaunchType::Fargate)
             .network_configuration(self.network_configuration()?)
             // Tags must propagate to the tasks: Traefik's ECS provider and any
             // operator debugging both look at task tags, not just service tags.
             .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)
             .enable_ecs_managed_tags(true);
+        req = apply_capacity(req, &self.config.capacity)?;
         for tag in self.service_tag_list(desired) {
             req = req.tags(tag);
         }
@@ -1993,6 +2120,39 @@ impl EcsReconciler {
                 )
             })?;
         info!(service = %name, desired_count, "Scaled ECS service");
+        Ok(())
+    }
+
+    /// Apply service-level configuration to a service whose task definition is
+    /// already current.
+    ///
+    /// Deliberately sends no task definition: nothing about the task changed, and
+    /// registering a revision to carry a network change would burn the 1 req/s
+    /// `RegisterTaskDefinition` budget for nothing. `desiredCount` rides along
+    /// because it is free here and the scale-only path omits the network
+    /// configuration, so a service needing both would otherwise take two ticks.
+    ///
+    /// Capacity is **not** applied here -- see [`crate::service::capacity_drift`].
+    async fn update_service_shape(&self, name: &str, desired_count: i32) -> Result<()> {
+        self.ecs
+            .update_service()
+            .cluster(&self.config.cluster)
+            .service(name)
+            .desired_count(desired_count)
+            .network_configuration(self.network_configuration()?)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "UpdateService (configuration) {:?} failed: {}",
+                    name,
+                    aws_error_detail(&e)
+                )
+            })?;
+        info!(
+            service = %name,
+            "Applied the configured network placement to ECS service"
+        );
         Ok(())
     }
 
@@ -2658,7 +2818,7 @@ mod tests {
             "app",
             "128m-500m",
             "192Mi-512Mi",
-            crate::sizing::FargateSize {
+            crate::sizing::TaskSize {
                 cpu_units: 512,
                 memory_mib: 1024,
                 rounded_up: true,
@@ -2755,6 +2915,7 @@ mod tests {
                 project: project.to_string(),
                 deployment_group: "main".to_string(),
                 rollout_started_at: None,
+                shape: None,
             },
             tags: crate::tags::ServiceTags {
                 project: project.to_string(),

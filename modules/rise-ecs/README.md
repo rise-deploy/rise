@@ -201,7 +201,12 @@ failing closed at deploy time rather than half-working:
   `<name>-dex`. This keeps multiple installs distinct when they bring the same
   Cloud Map namespace.
 - **Workload identity tokens.** There is no way to write files into a running
-  Fargate task; a sidecar on a shared volume is the intended mechanism.
+  ECS task; a sidecar on a shared volume is the intended mechanism.
+- **EC2 capacity.** The cluster this module creates is Fargate-only, and the
+  control plane, Traefik and Dex always run on Fargate. The backend's
+  `capacity: ec2` setting is for a cluster you **bring** — it places workload
+  tasks on container instances you already run, and this module provisions no
+  Auto Scaling group, launch template, or capacity provider for them.
 
 ## Teardown
 

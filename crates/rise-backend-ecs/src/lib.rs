@@ -1,4 +1,4 @@
-//! Amazon ECS deployment backend for Rise (Fargate launch type).
+//! Amazon ECS deployment backend for Rise.
 //!
 //! Like the Docker backend — and unlike Kubernetes, which delegates to
 //! Metacontroller — this backend owns an in-process reconcile loop
@@ -22,7 +22,12 @@
 //! - **Routing is Traefik's ECS provider**, reading the `dockerLabels` the
 //!   task-definition builder stamps, with readiness gated on Traefik's
 //!   `serverStatus` exactly as on Docker.
+//! - **Capacity is configurable** ([`capacity::Capacity`]) — Fargate or the
+//!   cluster's own EC2 container instances. Networking is not: every capacity
+//!   runs on `awsvpc`, because readiness keys Traefik's `serverStatus` on each
+//!   task's own ENI address.
 
+pub mod capacity;
 pub mod client;
 pub mod reconciler;
 pub mod service;

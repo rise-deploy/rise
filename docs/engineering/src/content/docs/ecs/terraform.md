@@ -87,6 +87,16 @@ Either can be brought independently. Brought subnets are checked against the VPC
 you named and a brought cluster is checked for `ACTIVE`, so a mismatch surfaces
 in `terraform plan` rather than several minutes into an apply.
 
+A brought cluster keeps whatever capacity providers it already has — the module
+attaches none, the same way it leaves `enable_container_insights` alone on a
+cluster it does not own. If that cluster runs **EC2 container instances**, set
+`capacity: ec2` on the backend (via `RISE_ECS_CAPACITY`) so workload services are
+placed on them, and enable ENI trunking on the instances: workloads run on
+`awsvpc` regardless of capacity, so each task takes an ENI and the per-instance
+attachment limit is what caps tasks per host. The module provisions no Auto
+Scaling group, launch template, or capacity provider; the instances are yours.
+Rise's own control plane, Traefik and Dex always run on Fargate.
+
 ## Where Rise itself answers
 
 By default Rise answers on `rise.<ingress_domain>` and each project on
@@ -186,7 +196,7 @@ Each of these is rejected by the backend at startup. The modules fail in
 | `registry_type` of `gitlab` or `jfrog` | Both issue short-lived scoped pull tokens that Rise refreshes on the puller's behalf. ECS re-authenticates at every task start with no refresh hook, so a deploy would succeed and break hours later. |
 | An ECR account other than the caller's | Rise writes no ECR repository policy, so cross-account pulls cannot work. The account is taken from `aws_caller_identity` and is not a variable. |
 | ECR without a push role | The CLI could not obtain push credentials. |
-| A `cpu_architecture` other than `X86_64`/`ARM64` | Fargate has exactly two. |
+| A `cpu_architecture` other than `X86_64`/`ARM64` | ECS's `runtimePlatform` has exactly two. |
 | An `ecr_repo_prefix` with no trailing slash | It is concatenated onto the project name literally — `"rise"` yields `risemyapp`. |
 | ACME with `nat_gateway_mode = "none"` | VPC endpoints reach AWS services only; an HTTP-01 challenge needs Let's Encrypt, so the certificate would silently never arrive. |
 | No identity provider of either kind | `oidc_issuer` or `deploy_dex` is required. |

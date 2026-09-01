@@ -7,6 +7,14 @@ use tracing::{debug, info};
 
 /// Push image to container registry
 pub(crate) fn docker_push(container_cli: &str, image_tag: &str) -> Result<()> {
+    docker_push_with_output(container_cli, image_tag, super::CommandOutput::Inherit)
+}
+
+pub(crate) fn docker_push_with_output(
+    container_cli: &str,
+    image_tag: &str,
+    output: super::CommandOutput,
+) -> Result<()> {
     info!("Pushing image to registry: {}", image_tag);
 
     let mut cmd = Command::new(container_cli);
@@ -14,9 +22,11 @@ pub(crate) fn docker_push(container_cli: &str, image_tag: &str) -> Result<()> {
 
     debug!("Executing command: {:?}", cmd);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute {} push", container_cli))?;
+    let status = super::run_command(
+        cmd,
+        &format!("Failed to execute {} push", container_cli),
+        output,
+    )?;
 
     if !status.success() {
         bail!("{} push failed with status: {}", container_cli, status);
@@ -26,7 +36,12 @@ pub(crate) fn docker_push(container_cli: &str, image_tag: &str) -> Result<()> {
 }
 
 /// Pull image from a registry
-pub(crate) fn docker_pull(container_cli: &str, image: &str, platform: &str) -> Result<()> {
+pub(crate) fn docker_pull_with_output(
+    container_cli: &str,
+    image: &str,
+    platform: &str,
+    output: super::CommandOutput,
+) -> Result<()> {
     info!("Pulling image: {} (platform: {})", image, platform);
 
     let mut cmd = Command::new(container_cli);
@@ -34,9 +49,11 @@ pub(crate) fn docker_pull(container_cli: &str, image: &str, platform: &str) -> R
 
     debug!("Executing command: {:?}", cmd);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute {} pull", container_cli))?;
+    let status = super::run_command(
+        cmd,
+        &format!("Failed to execute {} pull", container_cli),
+        output,
+    )?;
 
     if !status.success() {
         bail!("{} pull failed with status: {}", container_cli, status);
@@ -46,7 +63,12 @@ pub(crate) fn docker_pull(container_cli: &str, image: &str, platform: &str) -> R
 }
 
 /// Tag a container image
-pub(crate) fn docker_tag(container_cli: &str, source: &str, target: &str) -> Result<()> {
+pub(crate) fn docker_tag_with_output(
+    container_cli: &str,
+    source: &str,
+    target: &str,
+    output: super::CommandOutput,
+) -> Result<()> {
     info!("Tagging image: {} -> {}", source, target);
 
     let mut cmd = Command::new(container_cli);
@@ -54,9 +76,11 @@ pub(crate) fn docker_tag(container_cli: &str, source: &str, target: &str) -> Res
 
     debug!("Executing command: {:?}", cmd);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute {} tag", container_cli))?;
+    let status = super::run_command(
+        cmd,
+        &format!("Failed to execute {} tag", container_cli),
+        output,
+    )?;
 
     if !status.success() {
         bail!("{} tag failed with status: {}", container_cli, status);
@@ -138,33 +162,31 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// Login to container registry
-pub(crate) fn docker_login(
+pub(crate) fn docker_login_with_output(
     container_cli: &str,
     registry: &str,
     username: &str,
     password: &str,
+    output: super::CommandOutput,
 ) -> Result<()> {
     debug!(
         "Executing: {} login {} --username {} --password-stdin",
         container_cli, registry, username
     );
 
-    let status = Command::new(container_cli)
+    let mut command = Command::new(container_cli);
+    command
         .arg("login")
         .arg(registry)
         .arg("--username")
         .arg(username)
-        .arg("--password-stdin")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(password.as_bytes())?;
-            }
-            child.wait()
-        })
-        .with_context(|| format!("Failed to execute {} login", container_cli))?;
+        .arg("--password-stdin");
+    let status = super::run_command_with_stdin(
+        command,
+        password.as_bytes(),
+        &format!("Failed to execute {} login", container_cli),
+        output,
+    )?;
 
     if !status.success() {
         bail!("{} login failed with status: {}", container_cli, status);
