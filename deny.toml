@@ -1,0 +1,77 @@
+# Dependency license policy.
+#
+# This gate answers one question: may we ship this dependency? It is the single
+# source of truth for allowed licenses across both ecosystems — the npm notices
+# generator reads the `allow` list below rather than keeping its own copy, so a
+# license permitted for a crate is permitted for a package.
+#
+# Security advisories are deliberately NOT checked here. `cargo audit` already
+# owns that, with its own ignore list in `.cargo/audit.toml`; two tools
+# disagreeing about which advisories are waived would be worse than one.
+#
+# Run `mise run deny`.
+
+[graph]
+# The platforms we actually ship: the cargo-dist release targets plus the
+# Docker image's two architectures. Crates that only build for a target absent
+# from this list never reach a user, so their licenses are not our concern.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[licenses]
+# Permissive licenses only. Every entry here has been reviewed; adding one is a
+# deliberate act, which is the point of the gate.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    # The SIL Open Font License. No Rust crate uses it; it is here because the
+    # npm notices generator shares this list and the web UI self-hosts Inter and
+    # JetBrains Mono, whose .woff2 files ship in the image.
+    "OFL-1.1",
+    # Unicode's data license, carried by the ICU crates behind `idna`/`regex`.
+    # Permissive, and unavoidable for anything doing IDNA or Unicode casefolding.
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# Our own crates are `publish = false`, and two of them are BUSL-1.1. Without
+# this they would be checked against the allow list above and rejected — a
+# third-party license policy has nothing to say about first-party code.
+private = { ignore = true }
+
+confidence-threshold = 0.9
+
+# `OFL-1.1` above is for npm only, so cargo-deny will never encounter it in the
+# crate graph. That is expected, not a stale entry.
+unused-allowed-license = "allow"
+
+# Narrow, per-crate escapes from the allow list. Scoped to the exact crate so a
+# *new* dependency under the same license still fails the gate.
+[[licenses.exceptions]]
+# Weak, file-level copyleft: distributing the binary obliges us to make
+# option-ext's own source available. It
+# does not reach our code. Arrives as dirs -> dirs-sys -> option-ext, i.e. from
+# the CLI's config-directory lookup, and there is no permissive drop-in.
+allow = ["MPL-2.0"]
+crate = "option-ext"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

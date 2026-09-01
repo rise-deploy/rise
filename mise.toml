@@ -9,6 +9,10 @@ railpack = "0.15.1"
 buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
+# License gate + third-party attribution. See LICENSING.md and
+# THIRD-PARTY-NOTICES.md.
+"cargo:cargo-deny" = "latest"
+"cargo:cargo-about" = "latest"
 helm = "latest"
 # Pinned, not "latest": the modules' `terraform test` files use override_data and
 # check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
@@ -77,6 +81,10 @@ mise run backend:run "$backend"
 description = "Prepare the SQLX query cache that needs to be committed for building with SQLX_OFFLINE=true."
 run = "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets"
 
+[tasks.deny]
+description = "Check dependency licenses and sources against deny.toml."
+run = "cargo deny check licenses sources"
+
 [tasks."sqlx:check"]
 description = "Check that all SQLX queries are valid."
 run = "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets"
@@ -124,6 +132,7 @@ cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
+mise deny
 mise resource:schema:check
 helm lint helm/rise
 mise terraform:check
