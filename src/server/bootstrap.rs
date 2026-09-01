@@ -38,9 +38,7 @@ use crate::server::settings::{
 };
 use rise_runtime_sync::with_global_lock;
 
-/// Annotation key on the default Organization that the Kubernetes controller
-/// reads to determine its per-project namespace prefix.
-pub const NAMESPACE_PREFIX_ANNOTATION: &str = "kubernetes.rise.dev/namespace-prefix";
+use rise_backend_core::{resolve_namespace_prefix_fallback, NAMESPACE_PREFIX_ANNOTATION};
 
 /// Name of the install-wide advisory lock (taken via [`with_global_lock`]) that
 /// serializes the bootstrap pass across replicas. Scoped string
@@ -395,30 +393,6 @@ impl DefaultOrganizationView {
     }
 }
 
-/// Apply the `org-{discriminator}-` fallback when no namespace-prefix
-/// annotation is configured. Extracted so the per-request multi-org path
-/// (`webhook::load_org_view`) and the bootstrap-time
-/// `DefaultOrganizationView::resolved_namespace_prefix` agree by
-/// construction.
-pub fn resolve_namespace_prefix_fallback(discriminator: &str) -> String {
-    format!("org-{discriminator}-")
-}
-
-/// Resolve a project's Kubernetes namespace prefix from its Organization's
-/// annotation map and discriminator: the
-/// `kubernetes.rise.dev/namespace-prefix` annotation wins, otherwise fall
-/// back to `org-{discriminator}-`. The single source of truth shared by
-/// bootstrap and the webhook's per-sync cache loader.
-pub fn resolve_namespace_prefix(
-    annotations: &BTreeMap<String, String>,
-    discriminator: &str,
-) -> String {
-    annotations
-        .get(NAMESPACE_PREFIX_ANNOTATION)
-        .cloned()
-        .unwrap_or_else(|| resolve_namespace_prefix_fallback(discriminator))
-}
-
 /// Look up the default Organization row from the store and project the
 /// fields the Kubernetes controller needs. Returns `None` only when the
 /// resource is absent (controllers should fail startup in that case).
@@ -537,20 +511,6 @@ mod tests {
             controller_class_name_for_bootstrap(&settings),
             Some("my-docker")
         );
-    }
-
-    #[test]
-    fn resolve_namespace_prefix_uses_annotation_when_present() {
-        let mut annotations = BTreeMap::new();
-        annotations.insert(NAMESPACE_PREFIX_ANNOTATION.to_string(), "rise-".to_string());
-        // Discriminator is ignored when the annotation is set.
-        assert_eq!(resolve_namespace_prefix(&annotations, "abcd"), "rise-");
-    }
-
-    #[test]
-    fn resolve_namespace_prefix_falls_back_to_discriminator() {
-        let annotations = BTreeMap::new();
-        assert_eq!(resolve_namespace_prefix(&annotations, "abcd"), "org-abcd-");
     }
 
     /// Construct a minimal `Settings` for tests. Only `default_organization`

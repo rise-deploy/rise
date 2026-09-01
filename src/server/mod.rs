@@ -15,6 +15,8 @@ pub mod extensions;
 pub mod frontend;
 pub mod middleware;
 pub mod oci;
+#[cfg(feature = "backend")]
+pub mod organizations;
 pub mod platform;
 #[cfg(feature = "backend")]
 pub mod policy_seed;

@@ -4,7 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 # Business Source License 1.1, not the workspace default. See ../../LICENSING.md.
 license = "BUSL-1.1"
-license-file = "LICENSE"
 repository.workspace = true
 description = "Amazon ECS deployment backend for Rise (in-process reconcile loop over the ECS API)"
 publish = false
