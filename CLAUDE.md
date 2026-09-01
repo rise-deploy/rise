@@ -376,6 +376,7 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (us
 | Resource API types (`crates/rise-resource-api/`) | `mise run resource:schema:generate` | Regenerate the resource/organization/controller-status schemas under `docs/engineering/public/schemas/` (commit the result) |
 | CRD structs (`src/server/deployment/crd.rs`) | `mise run crd:generate` | Regenerate `helm/rise/crds/riseproject-crd.yaml` (commit the result) |
 | Helm chart (`helm/rise/`) | `helm lint helm/rise` | Validate chart templates |
+| `Cargo.lock` (or any dependency change) | `mise run notices:generate` | Regenerate `THIRD-PARTY-NOTICES.md` (commit the result); CI fails on drift |
 
 **Full CI-equivalent check** (slower, runs everything):
 
@@ -384,6 +385,7 @@ mise run lint                       # See below for what this covers
 mise run config:schema:check        # Verify backend config schema is up to date
 mise run rise-toml:schema:check     # Verify rise.toml schema is up to date
 mise run crd:check                  # Verify CRD YAML matches Rust definition
+mise run notices:check              # Verify third-party notices are up to date
 cargo audit                         # Dependency advisories
 cargo test --workspace --all-features  # Unit tests (all workspace crates)
 ```
@@ -398,8 +400,8 @@ and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`; `mise de
 test` excluding the three crates that need Postgres (`rise-deploy`,
 `rise-resource-store-postgres`, `rise-runtime-sync`) — so every other crate's
 tests run, and a new crate is covered without editing the list. It does **not** cover
-`config:schema:check`, `rise-toml:schema:check`, `crd:check`, `cargo audit`, or
-`tests/e2e` — CI does, so run those separately.
+`config:schema:check`, `rise-toml:schema:check`, `crd:check`, `notices:check`,
+`cargo audit`, or `tests/e2e` — CI does, so run those separately.
 
 ## Deployment Backend Parity (STRICT)
 

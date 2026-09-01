@@ -9,10 +9,11 @@ railpack = "0.15.1"
 buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
-# License gate + third-party attribution. See LICENSING.md and
-# THIRD-PARTY-NOTICES.md.
 "cargo:cargo-deny" = "latest"
-"cargo:cargo-about" = "latest"
+# Pinned exactly, unlike the tools above: cargo-about renders a file that is
+# committed and drift-checked, so a version bump would rewrite it out from under
+# a PR that touched nothing. Bump deliberately and regenerate in the same change.
+"cargo:cargo-about" = "0.9.2"
 helm = "latest"
 # Pinned, not "latest": the modules' `terraform test` files use override_data and
 # check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
@@ -177,6 +178,14 @@ helm dependency build helm/rise \
   --repository-config "$helm_repo_state/repositories.yaml" \
   --repository-cache "$helm_repo_state/cache"
 """
+
+[tasks."notices:generate"]
+description = "Regenerate THIRD-PARTY-NOTICES.md from the shipped dependencies."
+run = "node scripts/generate-notices.mjs"
+
+[tasks."notices:check"]
+description = "Verify THIRD-PARTY-NOTICES.md is up to date."
+run = "mise notices:generate && git --no-pager diff --exit-code -- THIRD-PARTY-NOTICES.md"
 
 [tasks."config:schema:generate"]
 description = "Generate the backend settings JSON schema."

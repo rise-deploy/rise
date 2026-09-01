@@ -1,0 +1,51 @@
+# Which license text to reproduce for each dependency.
+#
+# This is NOT the policy gate -- deny.toml decides what may ship, and this file
+# is never run with `--fail`. `accepted` is an ordered *preference*: for a crate
+# offered under `MIT OR Apache-2.0`, cargo-about elects the first entry below
+# that the crate offers and reproduces that text.
+#
+# MIT leads deliberately. Electing Apache-2.0 would pass its express patent
+# grant to recipients, which is a real benefit -- but they can obtain the
+# upstream dual license directly and lose nothing, while Apache-2.0 Section 4
+# would add NOTICE-propagation obligations on us. It also produces a smaller,
+# more reviewable file: 10.1k lines against 14.1k, because MIT texts differ only
+# in their copyright line whereas the long Apache text recurs in many variants.
+# Reversing the first two entries flips this; it is a licensing decision, not a
+# formatting one.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "MIT-0",
+    "BSL-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+
+# Rise's own crates are first-party and must never appear in a *third-party*
+# notices file. They are all `publish = false`, which is what this keys on.
+private = { ignore = true }
+
+# Build- and dev-dependencies are not distributed, so they carry no notice
+# obligation.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+# The image and the release binaries are built for these; a crate that builds
+# for none of them is not shipped. Mirrors deny.toml's list.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
