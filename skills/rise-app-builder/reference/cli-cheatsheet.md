@@ -144,7 +144,7 @@ Valid colors: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray`.
 | `rise env get <key>` | `g` | `-p`, `--path`, `-E/--environment` |
 | `rise env delete <key>` | `unset`, `rm`, `del` | `-p`, `--path`, `-E/--environment` |
 | `rise env import <file>` | `i` | `-p`, `--path`, `-E/--environment`. Format: `KEY=value` or `KEY=secret:value` |
-| `rise env export` | `x` | `-p`, `--path`, `-E/--environment`. Outputs `KEY=value` dotfile format |
+| `rise env export` | `x` | `-p`, `--path`, `-E/--environment`. Outputs shell-safe `export KEY=value` commands |
 
 Without `-E`, variables are global (apply to all environments). With `-E`, scoped to that environment (merged on top of globals).
 
