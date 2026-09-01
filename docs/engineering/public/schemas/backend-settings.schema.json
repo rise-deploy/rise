@@ -1,7 +1,7 @@
 {
   "$defs": {
     "AccessClass": {
-      "description": "Access class configuration for ingress authentication",
+      "description": "Named ingress access configuration, referenced by projects through their\naccess class. Shared by every backend: each maps `access_requirement` onto\nits own ingress mechanism (nginx annotations, Traefik forwardAuth).",
       "properties": {
         "access_requirement": {
           "$ref": "#/$defs/AccessRequirement",
@@ -12,7 +12,7 @@
             "type": "string"
           },
           "default": {},
-          "description": "Optional custom nginx annotations",
+          "description": "Optional custom annotations",
           "type": "object"
         },
         "description": {
