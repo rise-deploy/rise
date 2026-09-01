@@ -18,19 +18,7 @@ pub use rise_backend_core::logs::{
     TimestampedLineStream, DOCKER_MAX_TAIL, HEURISTIC_LEVELS, LOKI_LEVELS, LOKI_MAX_TAIL,
 };
 
-mod cloudwatch;
-use cloudwatch::CloudWatchLogBackend;
-
-/// AWS context owned by the ECS deployment controller and shared with the
-/// CloudWatch runtime-log reader. The writer and reader therefore use the same
-/// credential chain, region, endpoint, log group and resource prefix.
-#[derive(Clone)]
-pub struct EcsCloudWatchContext {
-    pub sdk_config: aws_config::SdkConfig,
-    pub region: String,
-    pub log_group: Option<String>,
-    pub resource_prefix: String,
-}
+pub use rise_backend_ecs::logs::EcsCloudWatchContext;
 
 pub async fn init_runtime_log_backend(
     settings: &DeploymentLogsSettings,
@@ -70,7 +58,7 @@ pub async fn init_runtime_log_backend(
                 .log_group
                 .context("CloudWatch log backend requires deployment_controller.log_group")?;
             Ok(Arc::new(
-                CloudWatchLogBackend::new(
+                rise_backend_ecs::logs::CloudWatchLogBackend::new(
                     context.sdk_config,
                     context.region,
                     log_group,

@@ -10,8 +10,13 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+async-stream = "0.3"
 async-trait = { workspace = true }
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-cloudwatchlogs = { version = "1.80", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-sdk-ecs = { version = "1.80", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
@@ -26,6 +31,7 @@ aws-sdk-sts = { version = "1.80", default-features = false, features = [
     "sigv4a",
 ] }
 chrono = { workspace = true }
+futures = "0.3"
 rise-backend-core = { path = "../rise-backend-core" }
 rise-backend-traefik = { path = "../rise-backend-traefik" }
 rise-deployment-spec = { path = "../rise-deployment-spec" }

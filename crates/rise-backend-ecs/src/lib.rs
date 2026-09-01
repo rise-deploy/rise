@@ -24,6 +24,7 @@
 //!   `serverStatus` exactly as on Docker.
 
 pub mod client;
+pub mod logs;
 pub mod reconciler;
 pub mod service;
 pub mod sizing;

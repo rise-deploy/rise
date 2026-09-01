@@ -7,14 +7,25 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::db::models::{Deployment, DeploymentStatus, Project};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 
-use super::{
+use rise_backend_core::logs::{
     classify_log_line, decode_log_cursor, encode_log_cursor, is_followable_status,
     line_matches_search, log_cursor_signature, parse_duration_hint, stable_log_id, status_stream,
     LogEvent, LogEventStream, LogQuery, LogStatus, LogStatusReason, LogVolumeBucket,
     LogVolumeQuery, LogVolumeResponse, RuntimeLogBackend, HEURISTIC_LEVELS,
 };
+
+/// AWS context owned by the ECS deployment controller and shared with the
+/// CloudWatch runtime-log reader. The writer and reader therefore use the same
+/// credential chain, region, endpoint, log group and resource prefix.
+#[derive(Clone)]
+pub struct EcsCloudWatchContext {
+    pub sdk_config: aws_config::SdkConfig,
+    pub region: String,
+    pub log_group: Option<String>,
+    pub resource_prefix: String,
+}
 
 const MAX_TAIL: i64 = 5_000;
 const MAX_SCAN_EVENTS: usize = 100_000;
@@ -26,7 +37,7 @@ const LIVE_TAIL_BUFFER_SIZE: usize = 16;
 // events.
 const DESCENDING_START_MIN_MILLIS: i64 = 1_704_067_200_000;
 
-pub(super) struct CloudWatchLogBackend {
+pub struct CloudWatchLogBackend {
     client: aws_sdk_cloudwatchlogs::Client,
     log_group: String,
     log_group_arn: String,
@@ -321,7 +332,7 @@ fn select_backlog_page(
 }
 
 impl CloudWatchLogBackend {
-    pub(super) async fn new(
+    pub async fn new(
         sdk_config: aws_config::SdkConfig,
         region: String,
         log_group: String,
