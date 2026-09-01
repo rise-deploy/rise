@@ -31,6 +31,41 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **ECS: a `capacity` setting, and service network configuration now converges.**
+  *Config change.* `deployment_controller.capacity` selects where workload tasks
+  run — `fargate` (the default, and what every existing install keeps doing) or
+  `ec2`, which places them on the container instances of a cluster you already
+  run. Networking is `awsvpc` on both, so `subnets` stays required; on `ec2`,
+  enable ENI trunking on the instances, because each task takes its own ENI and
+  the per-instance attachment limit — not CPU or memory — is what caps tasks per
+  host. `assign_public_ip` is unavailable there — ECS refuses it on EC2 capacity,
+  so the pair is rejected at startup and those subnets need a NAT gateway or VPC
+  endpoints instead. Rise does not provision the instances, an Auto Scaling group,
+  or a capacity provider, and its own control plane still runs on Fargate. On `ec2`,
+  `cpu`/`memory` are declared exactly as requested instead of being rounded up to
+  Fargate's size table. An unrecognised value is refused at startup rather than
+  defaulted.
+
+  **The behaviour change to know about is separate from the setting.** The ECS
+  reconciler previously compared only a service's task-definition hash and
+  desired count, so an edit to `subnets`, `security_groups` or `assign_public_ip`
+  never reached a running service — it landed only if something else happened to
+  trigger a task-definition update, and never on a scale change. Those are now
+  compared against what ECS reports and applied when they differ. **If your
+  running services were created with a configuration you have since changed, the
+  first reconcile tick after upgrading will apply it**, which ECS performs as a
+  rolling replacement, one service at a time. Check for the difference before
+  upgrading if that matters:
+
+  ```bash
+  aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" \
+    --query 'services[].networkConfiguration.awsvpcConfiguration'
+  ```
+
+  Changing `capacity` on an existing install does **not** move running services;
+  ECS cannot. Each project picks it up on its next deployment, and until then the
+  mismatch is logged once per service per tick.
+
 - **Terraform requirements and write-only secret state for `rise-ecs`.** The
   module requires Terraform 1.11+ and AWS provider 6.50+. Its managed Secrets
   Manager versions use write-only values at their stable resource addresses.

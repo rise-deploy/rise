@@ -968,6 +968,31 @@ fn default_cpu_architecture() -> String {
     "X86_64".to_string()
 }
 
+/// Fargate: an install that never sets the key keeps behaving exactly as it did
+/// before the key existed.
+#[cfg(feature = "backend")]
+fn default_ecs_capacity() -> String {
+    "FARGATE".to_string()
+}
+
+/// Canonicalise the configured ECS capacity at load.
+///
+/// Rejecting here rather than defaulting: an unrecognised capacity has no safe
+/// fallback. Quietly using Fargate would bill an operator who asked for their own
+/// container instances for serverless capacity they did not want, and passing the
+/// string through would surface as an AWS error on every deploy instead of once
+/// at startup.
+#[cfg(feature = "backend")]
+fn deserialize_ecs_capacity<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    rise_backend_ecs::capacity::canonical(&raw)
+        .map(str::to_string)
+        .map_err(|e| serde::de::Error::custom(format!("deployment_controller.{e}")))
+}
+
 /// Canonicalise the configured Fargate CPU architecture at load, so everything
 /// downstream — the task definition, the CLI's platform hint — sees exactly one
 /// of the two tokens ECS accepts.
@@ -1761,6 +1786,21 @@ pub enum DeploymentControllerSettings {
         )]
         cpu_architecture: String,
 
+        /// Which ECS capacity carries the workload services: `fargate` (AWS
+        /// schedules the tasks) or `ec2` (they are placed on the cluster's own
+        /// container instances).
+        ///
+        /// Networking is `awsvpc` either way — readiness keys Traefik's
+        /// `serverStatus` on each task's own ENI address — so `subnets` stays
+        /// required. On `ec2`, enable ENI trunking on the container instances or
+        /// the per-instance attachment limit becomes the real ceiling on how many
+        /// tasks a host can run.
+        #[serde(
+            default = "default_ecs_capacity",
+            deserialize_with = "deserialize_ecs_capacity"
+        )]
+        capacity: String,
+
         /// Ingress URL template for the production (default) deployment group.
         /// Same semantics as the other backends. Must contain `{project_name}`.
         production_ingress_url_template: String,
@@ -2496,6 +2536,8 @@ impl Settings {
             ref cluster,
             ref subnets,
             ref security_groups,
+            assign_public_ip,
+            ref capacity,
             ref execution_role_arn,
             ref repository_credentials_secret_arn,
             ..
@@ -2567,6 +2609,21 @@ impl Settings {
                     security_groups.len(),
                     MAX_SECURITY_GROUPS_PER_AWSVPC
                 )));
+            }
+            // ECS refuses `assignPublicIp` outright on the EC2 launch type
+            // ("Assign public IP is not supported for this launch type"), so this
+            // pair would fail every CreateService rather than degrade. An
+            // `awsvpc` task ENI on a container instance never gets a public
+            // address; egress is the subnet's job there.
+            if capacity == "EC2" && assign_public_ip {
+                return Err(ConfigError::Message(
+                    "deployment_controller.assign_public_ip is true, but ECS does not \
+                     support assigning a public IP on the EC2 capacity: an awsvpc task \
+                     ENI on a container instance never receives one. Give the workload \
+                     subnets a NAT gateway (or VPC endpoints for ECR, CloudWatch and \
+                     SSM) and set assign_public_ip to false."
+                        .to_string(),
+                ));
             }
             // ECS authenticates every image pull itself, at every task start —
             // scale-out, task replacement, AZ rebalance. It never receives a
@@ -3766,6 +3823,67 @@ server:
             err.to_string().contains("X86_64 or ARM64"),
             "should name the valid values: {err}"
         );
+    }
+
+    #[test]
+    fn capacity_defaults_to_fargate_and_ec2_is_accepted() {
+        // The key is new, so every install that predates it must keep placing
+        // tasks exactly where it did before.
+        let settings = load_shipped_ecs_config(&ecs_base_env()).expect("shipped config loads");
+        let Some(DeploymentControllerSettings::Ecs { capacity, .. }) =
+            settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(capacity, "FARGATE");
+
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "ec2");
+        let settings = load_shipped_ecs_config(&env).expect("ec2 must be accepted");
+        let Some(DeploymentControllerSettings::Ecs {
+            capacity, subnets, ..
+        }) = settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(capacity, "EC2");
+        // Both capacities run on awsvpc, so the subnets stay load-bearing --
+        // they are what the tasks' ENIs attach to either way.
+        assert!(!subnets.is_empty());
+    }
+
+    #[test]
+    fn a_public_ip_on_ec2_capacity_is_rejected_at_load() {
+        // ECS refuses `assignPublicIp` on the EC2 launch type outright, so this
+        // pair would fail every CreateService. Catching it at startup beats an
+        // InvalidParameterException on the first deploy.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "ec2");
+        env.insert("RISE_ECS_ASSIGN_PUBLIC_IP", "true");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("assign_public_ip"), "{msg}");
+        assert!(msg.contains("NAT gateway"), "should name the fix: {msg}");
+
+        // The same flag is exactly how a public-subnet Fargate install works.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_ASSIGN_PUBLIC_IP", "true");
+        load_shipped_ecs_config(&env).expect("public IP on Fargate is supported");
+    }
+
+    #[test]
+    fn an_unknown_capacity_is_rejected_at_load() {
+        // Defaulting would bill an operator who asked for their own container
+        // instances for serverless capacity they never wanted.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "spot");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fargate"),
+            "should name the valid values: {msg}"
+        );
+        assert!(msg.contains("ec2"), "should name the valid values: {msg}");
     }
 
     #[test]

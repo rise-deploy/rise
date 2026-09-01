@@ -804,6 +804,11 @@
               "description": "Browser-facing base URL for the login redirect. Falls back to the\nserver `public_url` when empty.",
               "type": "string"
             },
+            "capacity": {
+              "default": "FARGATE",
+              "description": "Which ECS capacity carries the workload services: `fargate` (AWS\nschedules the tasks) or `ec2` (they are placed on the cluster's own\ncontainer instances).\n\nNetworking is `awsvpc` either way — readiness keys Traefik's\n`serverStatus` on each task's own ENI address — so `subnets` stays\nrequired. On `ec2`, enable ENI trunking on the container instances or\nthe per-instance attachment limit becomes the real ceiling on how many\ntasks a host can run.",
+              "type": "string"
+            },
             "cluster": {
               "description": "ECS cluster name that carries the deployed workloads.",
               "type": "string"

@@ -1,11 +1,18 @@
 ---
 title: "Amazon ECS"
-description: "Running Rise's deployment backend on Amazon ECS with the Fargate launch type."
+description: "Running Rise's deployment backend on Amazon ECS, on Fargate or your own EC2 capacity."
 ---
 
-The ECS backend deploys apps as **Fargate tasks** routed by **Traefik's ECS
-provider**. There is no cluster to operate and no host to own: Rise's control
-plane talks to the ECS API, and AWS schedules the workloads.
+The ECS backend deploys apps as **ECS tasks** routed by **Traefik's ECS
+provider**. Rise's control plane talks to the ECS API and lets ECS place the
+workloads.
+
+On the default `capacity: fargate` there is no cluster to operate and no host to
+own — AWS schedules everything. Setting `capacity: ec2` places the same tasks on
+container instances you run, which is how Rise deploys into an ECS cluster you
+already have. Networking is `awsvpc` on both: readiness reads each task's own ENI
+address out of Traefik's `serverStatus`, so a `bridge`-networked cluster is not
+supported.
 
 The design, its rationale, and the two AWS behaviours it depends on (both
 verified against a real account) are recorded in
@@ -49,12 +56,24 @@ Two consequences are worth internalising before you operate it:
 
 ## Prerequisites
 
-- An ECS cluster, and subnets for the tasks' `awsvpc` ENIs. Public subnets need
-  `assign_public_ip: true` — a Fargate task must reach ECR and CloudWatch to
-  start at all, and a public subnet has no NAT gateway.
-- **A raised Fargate on-demand vCPU quota.** A fresh account gets **6**, and
-  every task rounds up to at least 0.25 vCPU (Rise's defaults resolve to 0.5).
-  This is the single most common cause of tasks that never leave `PROVISIONING`.
+- An ECS cluster, and subnets for the tasks' `awsvpc` ENIs. On
+  `capacity: fargate`, public subnets need `assign_public_ip: true` — a task must
+  reach ECR and CloudWatch to start at all, and a public subnet has no NAT
+  gateway. **On `capacity: ec2` that flag is unavailable**: ECS refuses it on that
+  capacity and an `awsvpc` task ENI on a container instance never receives a
+  public address, so the workload subnets need a NAT gateway (or VPC endpoints for
+  ECR, CloudWatch and SSM) instead. Setting both is refused at startup.
+- **On `capacity: fargate`, a raised Fargate on-demand vCPU quota.** A fresh
+  account gets **6**, and every task rounds up to at least 0.25 vCPU (Rise's
+  defaults resolve to 0.5). This is the single most common cause of tasks that
+  never leave `PROVISIONING`.
+- **On `capacity: ec2`, container instances with ENI trunking enabled.** Every
+  task takes its own ENI under `awsvpc`, and the per-instance attachment limit is
+  low — without trunking (the `awsvpcTrunking` account setting, on a supported
+  instance type) it is the ENI limit rather than CPU or memory that caps how many
+  tasks a host can run, and the cutover model transiently needs twice a
+  deployment's steady task count. Rise reconciles a cluster you bring; it does not
+  provision the instances, the Auto Scaling group, or a capacity provider.
 - A Traefik service in the cluster running the ECS provider with
   `--providers.ecs.exposedByDefault=false` (it defaults to **true**, which would
   give every task in the cluster a default router). If the cluster hosts more
@@ -187,12 +206,13 @@ credentials inside it needs no redeploy.
 |---|---|
 | `cluster`, `region` | which cluster to reconcile |
 | `subnets`, `security_groups` | accept a YAML list **or a comma-separated string**, so they can come straight from a Terraform output via an env var |
-| `assign_public_ip` | required on public subnets |
+| `assign_public_ip` | required on public subnets — **`capacity: fargate` only**; ECS refuses it on EC2 capacity, so the pair is rejected at startup |
 | `execution_role_arn`, `task_role_arn` | see IAM above; the execution role is also what pulls from ECR |
 | `repository_credentials_secret_arn` | Secrets Manager secret for a private non-ECR registry |
 | `log_group` | `awslogs` destination and CloudWatch runtime-log source; required by the shipped `deployment_logs.type: cloudwatch` configuration |
 | `ssm_parameter_prefix`, `ssm_kms_key_id` | where secret env vars live |
 | `cpu_architecture` | `X86_64` or `ARM64` — also the CLI's platform hint. Common spellings (`amd64`, `aarch64`, any case) are normalised; anything else is **refused at startup**, since defaulting would build images the tasks cannot execute |
+| `capacity` | `fargate` (default) or `ec2`. Also decides how `cpu`/`memory` are resolved — see the [feature matrix](/operator-docs/deployment-backends/). Anything else is **refused at startup**: quietly falling back to Fargate would bill an operator who asked for their own instances for serverless capacity. Changing it does **not** move running services (ECS cannot); the next deployment of each project picks it up, and until then the mismatch is logged per service |
 | `auth_backend_url` | **must be reachable from inside the cluster** (a Cloud Map name or internal load balancer), never the public URL |
 | `traefik_api_url` | required for projects using `health_check` |
 | `reconcile_interval_secs` | defaults to 30; ECS is a throttled API |
@@ -216,13 +236,19 @@ work:
 - **Multi-container deployments** — cross-container discovery needs Cloud Map
   registration, so `RISE_CONTAINER_HOST__*` would be absent.
 - **Workload identity tokens** (`[identity].audiences`) — there is no way to
-  write files into a running Fargate task; a sidecar on a shared task volume is
-  the intended mechanism.
+  write files into a running ECS task; a sidecar on a shared task volume is the
+  intended mechanism. `capacity: ec2` does not lift this on its own.
+- **Interruptible capacity** (Fargate Spot, a Spot-backed Auto Scaling group
+  capacity provider) — the placement machinery is capacity-provider-shaped
+  already, but nothing selects one yet.
 
 ## Troubleshooting
 
-**Tasks never leave `PROVISIONING`.** Almost always the Fargate vCPU quota.
-Check `aws ecs describe-services --services … --query 'services[].events'`.
+**Tasks never leave `PROVISIONING`.** On `capacity: fargate`, almost always the
+Fargate vCPU quota. On `capacity: ec2` it is a placement failure — no container
+instance has the CPU, memory, or (most often) a free ENI. Either way, ECS says
+which in the service's own events, and Rise forwards them to the deployment
+timeline: `aws ecs describe-services --services … --query 'services[].events'`.
 
 **A deployment stays `Deploying` forever.** If the project sets a
 `health_check`, confirm `traefik_api_url` is reachable — readiness comes from
@@ -240,7 +266,8 @@ the task can reach ECR at all (public IP, NAT, or all three VPC endpoints), and
 — for a private non-ECR registry — that `repository_credentials_secret_arn` is
 set and readable by that role.
 
-**Memory is higher than requested.** Expected — see the CPU/memory row of the
-[feature matrix](/operator-docs/deployment-backends/). Fargate accepts only a
-fixed table of sizes and Rise rounds up, never down. The resolved size is
-logged at reconcile.
+**Memory is higher than requested.** Expected on `capacity: fargate` — see the
+CPU/memory row of the [feature matrix](/operator-docs/deployment-backends/).
+Fargate accepts only a fixed table of sizes and Rise rounds up, never down. The
+resolved size is logged at reconcile. On `capacity: ec2` there is no table, so
+the request is used exactly as written.
