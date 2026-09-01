@@ -94,15 +94,10 @@ pub struct AppState {
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
-    /// Short-TTL cache of the per-Org fields the webhook reads on every
-    /// sync (`spec.deploymentControllerClass`, resolved namespace prefix).
-    /// 30s TTL means a change to either propagates within roughly one
-    /// resync window. Org-missing is treated as an error and is never
-    /// cached (`try_get_with` won't memoise an Err).
+    /// Per-Organization reads (controller class, namespace prefix) for the
+    /// deployment backends, cached behind a short TTL.
     #[cfg(feature = "backend")]
-    pub org_view_cache: Arc<
-        moka::future::Cache<uuid::Uuid, crate::server::deployment::webhook::CachedOrganizationView>,
-    >,
+    pub org_view: Arc<dyn rise_backend_core::OrganizationView>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -1822,19 +1817,12 @@ impl AppState {
         );
         tracing::info!("Initialized encrypt endpoint rate limiter (100 req/hour per user)");
 
-        // Combined per-Org view cache keyed by Org UID. Holds the fields
-        // the webhook reads on every sync (`spec.deploymentControllerClass`,
-        // resolved namespace prefix) so the controller hits the resource
-        // store at most once per Org per 30s window. 1024-entry cap is
-        // well above any realistic Org count and bounds memory if abused.
-        // Org-missing surfaces as `Err` and is not cached.
         #[cfg(feature = "backend")]
-        let org_view_cache = Arc::new(
-            moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(30))
-                .max_capacity(1024)
-                .build(),
-        );
+        let org_view: Arc<dyn rise_backend_core::OrganizationView> =
+            Arc::new(crate::server::organizations::CachedOrgView::new(
+                pg_resource_store.clone(),
+                deployment_store.clone(),
+            ));
 
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
@@ -1983,7 +1971,7 @@ impl AppState {
             #[cfg(feature = "backend")]
             deployment_controller_class_name,
             #[cfg(feature = "backend")]
-            org_view_cache,
+            org_view,
             auth_settings,
             server_settings,
             token_store,

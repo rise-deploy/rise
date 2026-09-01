@@ -35,9 +35,7 @@ use crate::server::deployment::state_machine;
 use crate::server::state::AppState;
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
-// Backend-agnostic runtime helpers live in `rise-backend-core`; re-exported here
-// so existing `crate::server::deployment::webhook::*` callers stay unchanged.
-pub(crate) use rise_backend_core::runtime::{
+use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
     ResolvedDeploymentEnvVars,
 };
@@ -253,7 +251,10 @@ async fn process_sync(
     // through the controller-class check and the namespace-prefix
     // lookup. Both of those used to re-read `project_organizations`
     // independently — one DB hit per sync now serves both.
-    let org_uid = resolve_project_organization_uid(state, &project).await?;
+    let org_uid = state
+        .org_view
+        .organization_uid_for_project(project.id)
+        .await?;
 
     // 1c. Verify the project's Organization is assigned to this controller.
     //
@@ -268,8 +269,8 @@ async fn process_sync(
     // 1d. Resolve the project's Org-scoped namespace prefix once. Every
     // helper below that names a namespace borrows this string, so the
     // miss-loader runs at most once per sync (the cache hits the second
-    // and subsequent times within the 30s TTL).
-    let namespace_prefix = resolve_project_namespace_prefix(state, &project, org_uid).await?;
+    // and subsequent times within its TTL).
+    let namespace_prefix = state.org_view.namespace_prefix(org_uid).await?;
 
     // 2. Load non-terminal deployments for this project (avoids loading full history)
     let non_terminal_deployments = state
@@ -370,111 +371,6 @@ impl From<anyhow::Error> for SyncError {
     }
 }
 
-/// Pure comparison of the configured controller class against the
-/// Organization's `spec.deploymentControllerClass`. Returns `Ok(())` when
-/// reconciliation should proceed (legacy `configured = None`, or both match)
-/// and `Err(())` when the controller should refuse this project.
-fn check_controller_class(configured: Option<&str>, org_class: Option<&str>) -> Result<(), ()> {
-    match configured {
-        None => Ok(()),
-        Some(c) => match org_class {
-            Some(o) if o == c => Ok(()),
-            _ => Err(()),
-        },
-    }
-}
-
-/// Snapshot of the per-Organization fields the Metacontroller webhook
-/// reads on every sync. Cached behind `AppState::org_view_cache` so the
-/// controller hits the resource store at most once per Org per 30s
-/// window — the previous design had two independent caches (one per
-/// field) and re-read the same row twice.
-#[derive(Debug, Clone)]
-pub struct CachedOrganizationView {
-    /// Value of `spec.deploymentControllerClass`. `None` when the
-    /// Organization exists but does not set the field.
-    pub controller_class: Option<String>,
-    /// Resolved Kubernetes namespace prefix
-    /// (`kubernetes.rise.dev/namespace-prefix` annotation, or
-    /// `org-{discriminator}-` fallback).
-    pub namespace_prefix: String,
-}
-
-/// Cache miss-loader for `AppState::org_view_cache`. Reads the
-/// Organization row once and projects both fields the webhook needs.
-/// Missing Organizations surface as `Err`, which prevents the cache from
-/// memoising a transient "not found" (`try_get_with` only retains
-/// successful loads).
-async fn load_org_view(
-    store: std::sync::Arc<dyn rise_resource_api::ResourceApi>,
-    uid: uuid::Uuid,
-) -> anyhow::Result<CachedOrganizationView> {
-    let row = store
-        .get(uid)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to load Organization {uid}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
-    let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
-        .map_err(|e| anyhow::anyhow!("Organization {uid} has malformed spec: {e}"))?;
-    let annotations: BTreeMap<String, String> =
-        serde_json::from_value(row.metadata.clone()).unwrap_or_default();
-    let namespace_prefix =
-        crate::server::bootstrap::resolve_namespace_prefix(&annotations, &row.discriminator);
-    Ok(CachedOrganizationView {
-        controller_class: spec.deployment_controller_class,
-        namespace_prefix,
-    })
-}
-
-/// Resolve the project's Organization UID, surfacing the "missing
-/// linkage" invariant as a structured error. Bootstrap validation
-/// refuses to start the server with unlinked projects, so a `None` here
-/// is a programmer error — logged at `error!` rather than letting the
-/// `None` propagate silently.
-pub async fn resolve_project_organization_uid(
-    state: &AppState,
-    project: &Project,
-) -> anyhow::Result<uuid::Uuid> {
-    state.deployment_store.organization_uid_for_project(project.id)
-        .await?
-        .ok_or_else(|| {
-            error!(
-                project = %project.name,
-                "Project has no organization linkage — bootstrap validation should have caught this; refusing to reconcile"
-            );
-            anyhow::anyhow!(
-                "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
-                project.name,
-            )
-        })
-}
-
-/// Look up the project's Org-scoped namespace prefix through
-/// `AppState::org_view_cache`. The caller resolves the Organization UID
-/// once per request (via `resolve_project_organization_uid`) and threads
-/// it through so the controller-class check and this lookup share a
-/// single DB and cache read.
-pub async fn resolve_project_namespace_prefix(
-    state: &AppState,
-    project: &Project,
-    org_uid: uuid::Uuid,
-) -> anyhow::Result<String> {
-    let view = state
-        .org_view_cache
-        .try_get_with(
-            org_uid,
-            load_org_view(state.resource_store.clone(), org_uid),
-        )
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to load Organization {org_uid} for project '{}': {e}",
-                project.name,
-            )
-        })?;
-    Ok(view.namespace_prefix)
-}
-
 /// Reject reconciliation when the project's Organization's
 /// `spec.deploymentControllerClass` does not match the controller's
 /// configured `controller_class_name`. Reads the Org through a short-TTL
@@ -490,12 +386,9 @@ async fn enforce_controller_class(
         return Ok(());
     };
 
-    let view = state
-        .org_view_cache
-        .try_get_with(
-            org_uid,
-            load_org_view(state.resource_store.clone(), org_uid),
-        )
+    let org_class = state
+        .org_view
+        .controller_class(org_uid)
         .await
         .map_err(|e| {
             SyncError::Internal(anyhow::anyhow!(
@@ -504,13 +397,14 @@ async fn enforce_controller_class(
             ))
         })?;
 
-    match check_controller_class(Some(configured), view.controller_class.as_deref()) {
-        Ok(()) => Ok(()),
-        Err(()) => Err(SyncError::WrongController {
+    if rise_backend_core::controller_class_matches(Some(configured), org_class.as_deref()) {
+        Ok(())
+    } else {
+        Err(SyncError::WrongController {
             project: project.name.clone(),
             configured: configured.to_string(),
-            org_class: view.controller_class,
-        }),
+            org_class,
+        })
     }
 }
 
@@ -2730,45 +2624,6 @@ mod tests {
             !resolved.secret_env_vars.contains_key(" SECRET_KEY"),
             "untrimmed key should not be present"
         );
-    }
-
-    // -----------------------------------------------------------------------------
-    // check_controller_class
-    // -----------------------------------------------------------------------------
-
-    #[test]
-    fn check_controller_class_unconfigured_always_passes() {
-        // Legacy installs (no controller class configured) reconcile every
-        // project regardless of what the Organization carries.
-        assert!(check_controller_class(None, None).is_ok());
-        assert!(check_controller_class(None, Some("kubernetes.rise.dev/default")).is_ok());
-        assert!(check_controller_class(None, Some("something-else")).is_ok());
-    }
-
-    #[test]
-    fn check_controller_class_matching_passes() {
-        assert!(check_controller_class(
-            Some("kubernetes.rise.dev/default"),
-            Some("kubernetes.rise.dev/default"),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn check_controller_class_mismatched_rejects() {
-        assert!(check_controller_class(
-            Some("kubernetes.rise.dev/default"),
-            Some("kubernetes.rise.dev/other"),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn check_controller_class_unset_on_org_rejects() {
-        // An Org that has no `spec.deploymentControllerClass` is not owned by
-        // this (or any) controller, even when the controller has a class
-        // configured. Refuse to reconcile.
-        assert!(check_controller_class(Some("kubernetes.rise.dev/default"), None).is_err());
     }
 
     fn cspec(name: &str, port: Option<u16>) -> crate::server::deployment::models::ContainerSpec {

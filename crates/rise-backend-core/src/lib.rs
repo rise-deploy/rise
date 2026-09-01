@@ -31,6 +31,7 @@ pub mod lifecycle;
 pub mod models;
 pub mod naming;
 pub mod observation;
+pub mod organization;
 pub mod providers;
 pub mod quantity;
 pub mod rolling;
@@ -59,6 +60,10 @@ pub use lifecycle::{
 };
 pub use naming::{container_name, group_app_name, sanitize_ecs_name, stable_identity_name};
 pub use observation::{derive_events, ContainerObservation, DerivedEvent, ObservedState};
+pub use organization::{
+    controller_class_matches, resolve_namespace_prefix, resolve_namespace_prefix_fallback,
+    OrganizationView, NAMESPACE_PREFIX_ANNOTATION,
+};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
 };
