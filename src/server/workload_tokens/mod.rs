@@ -13,11 +13,10 @@ pub mod routes;
 // `rise-backend-auth` (the home for auth-token logic), and the token-refresh TTL
 // math in `rise-backend-core`. Re-exported here so the HTTP token-exchange
 // endpoint and both deployment controllers keep their existing import paths.
+#[allow(unused_imports)]
 pub use rise_backend_auth::{
-    generate_bootstrap_credential, sha256_hex, sign_audience_tokens, workload_subject,
-    NO_ENVIRONMENT,
+    generate_bootstrap_credential, sha256_hex, workload_subject, NO_ENVIRONMENT,
 };
-pub use rise_backend_core::token_ttl::{refresh_due_after_secs, remint_after_secs};
 
 #[cfg(test)]
 mod tests {

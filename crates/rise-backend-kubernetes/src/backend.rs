@@ -5,13 +5,13 @@
 //! operations needed by HTTP handlers: log streaming, URL computation, and
 //! environment cleanup.
 
-use super::{DeploymentBackend, DeploymentUrls};
-use crate::db::models::{Deployment, Project};
-use crate::server::deployment::resource_builder::ResourceBuilder;
+use crate::resource_builder::ResourceBuilder;
 use anyhow::Result;
 use async_trait::async_trait;
+use rise_backend_core::models::{Deployment, Project};
 use rise_backend_core::BackendCapabilities;
 use rise_backend_core::DeploymentStore;
+use rise_backend_core::{DeploymentBackend, DeploymentUrls};
 use std::sync::Arc;
 
 /// Slim Kubernetes backend wrapping ResourceBuilder and kube client.
@@ -108,11 +108,11 @@ impl DeploymentBackend for KubernetesBackend {
     }
 
     async fn project_changed(&self, project: &Project) -> Result<()> {
-        crate::server::deployment::crd::trigger_resync(&self.kube_client, &project.name).await
+        crate::crd::trigger_resync(&self.kube_client, &project.name).await
     }
 
     async fn project_created(&self, project: &Project) -> Result<()> {
-        crate::server::deployment::crd::ensure_rise_project(
+        crate::crd::ensure_rise_project(
             &self.kube_client,
             &project.name,
             self.controller_class.as_deref(),
@@ -121,7 +121,7 @@ impl DeploymentBackend for KubernetesBackend {
     }
 
     async fn project_deleting(&self, project: &Project) -> Result<()> {
-        crate::server::deployment::crd::delete_rise_project(&self.kube_client, &project.name).await
+        crate::crd::delete_rise_project(&self.kube_client, &project.name).await
     }
 
     fn validate_container_names(
@@ -146,7 +146,7 @@ impl DeploymentBackend for KubernetesBackend {
                 .resource_builder
                 .node_selector
                 .get("kubernetes.io/arch")
-                .and_then(|arch| crate::server::platform::models::normalize_runtime_arch(arch)),
+                .and_then(|arch| rise_backend_core::normalize_runtime_arch(arch)),
             pod_security_enabled: Some(self.resource_builder.pod_security_enabled),
         }
     }

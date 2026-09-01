@@ -6,6 +6,7 @@ members = [
     "crates/rise-backend-core",
     "crates/rise-backend-docker",
     "crates/rise-backend-ecs",
+    "crates/rise-backend-kubernetes",
     "crates/rise-backend-traefik",
     "crates/rise-deployment-spec",
     "crates/rise-resource-api",
@@ -97,6 +98,8 @@ backend = [
     "dep:rise-backend-core",
     "dep:rise-backend-docker",
     "dep:rise-backend-ecs",
+    "dep:rise-backend-kubernetes",
+    "rise-backend-kubernetes/schema",
     "dep:rise-backend-traefik",
     "dep:rise-resource-api",
     "dep:rise-resource-store-postgres",
@@ -153,6 +156,7 @@ rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
 rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
 rise-backend-ecs = { path = "crates/rise-backend-ecs", optional = true }
+rise-backend-kubernetes = { path = "crates/rise-backend-kubernetes", optional = true }
 rise-backend-traefik = { path = "crates/rise-backend-traefik", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }

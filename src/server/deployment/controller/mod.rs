@@ -1,5 +1,11 @@
+/// The Kubernetes deployment backend lives in the `rise-backend-kubernetes`
+/// crate. Re-exported under this module path so existing
+/// `crate::server::deployment::controller::kubernetes::*` references keep
+/// working unchanged.
 #[cfg(feature = "backend")]
-mod kubernetes;
+pub mod kubernetes {
+    pub use rise_backend_kubernetes::*;
+}
 
 #[cfg(feature = "backend")]
 pub use kubernetes::KubernetesBackend;
@@ -20,4 +26,5 @@ pub use docker::DockerBackend;
 /// `rise-backend-core`; re-exported here so existing
 /// `crate::server::deployment::controller::{DeploymentBackend, DeploymentUrls}`
 /// references keep working.
+#[allow(unused_imports)]
 pub use rise_backend_core::{DeploymentBackend, DeploymentUrls};
