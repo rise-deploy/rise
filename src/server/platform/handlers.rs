@@ -11,14 +11,12 @@ use axum::{extract::State, Json};
 /// avoids the awkward middle ground of accepting any JWKS-valid token without
 /// the per-project claim validation that scoped endpoints perform.
 pub async fn platform_capabilities(State(state): State<AppState>) -> Json<PlatformCapabilities> {
-    let runtime_arch = state.runtime_arch.clone();
-    let pod_security_enabled = state
-        .resource_builder
-        .as_ref()
-        .map(|rb| rb.pod_security_enabled);
+    let capabilities = state.deployment_backend.capabilities();
 
     Json(PlatformCapabilities::new(
-        runtime_arch,
-        pod_security_enabled,
+        // `runtime_arch` is resolved at startup: some backends detect it from
+        // the runtime, which the backend itself cannot do synchronously here.
+        state.runtime_arch.clone(),
+        capabilities.pod_security_enabled,
     ))
 }

@@ -271,10 +271,11 @@ async fn init_kubernetes_backend(
     resource_builder: Arc<crate::server::deployment::resource_builder::ResourceBuilder>,
     kube_client: kube::Client,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
+    controller_class: Option<String>,
 ) -> Result<Arc<dyn DeploymentBackend>> {
     use crate::server::deployment::controller::KubernetesBackend;
 
-    let backend = KubernetesBackend::new(kube_client, resource_builder, store);
+    let backend = KubernetesBackend::new(kube_client, resource_builder, store, controller_class);
 
     // Test Kubernetes API connection
     backend.test_connection().await?;
@@ -1438,7 +1439,13 @@ impl AppState {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
                     (
-                        init_kubernetes_backend(rb, kc, deployment_store.clone()).await?,
+                        init_kubernetes_backend(
+                            rb,
+                            kc,
+                            deployment_store.clone(),
+                            deployment_controller_class_name.clone(),
+                        )
+                        .await?,
                         None,
                         None,
                         None,
@@ -1518,11 +1525,10 @@ impl AppState {
         // Docker daemon may be remote, so the backend process's compile-time or
         // host architecture is not authoritative.
         #[cfg(feature = "backend")]
-        let runtime_arch = if let Some(resource_builder) = resource_builder.as_ref() {
-            resource_builder
-                .node_selector
-                .get("kubernetes.io/arch")
-                .and_then(|arch| crate::server::platform::models::normalize_runtime_arch(arch))
+        let runtime_arch = if let Some(arch) = deployment_backend.capabilities().runtime_arch {
+            // Backends that pin an architecture by configuration report it
+            // directly; the rest are detected below.
+            Some(arch)
         } else if let Some(docker) = docker_client.as_ref() {
             let info = docker
                 .info()

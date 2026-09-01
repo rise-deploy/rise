@@ -10,6 +10,7 @@ use crate::db::models::{Deployment, Project};
 use crate::server::deployment::resource_builder::ResourceBuilder;
 use anyhow::Result;
 use async_trait::async_trait;
+use rise_backend_core::BackendCapabilities;
 use rise_backend_core::DeploymentStore;
 use std::sync::Arc;
 
@@ -22,6 +23,9 @@ pub struct KubernetesBackend {
     kube_client: kube::Client,
     resource_builder: Arc<ResourceBuilder>,
     store: Arc<dyn DeploymentStore>,
+    /// Stamped on the RiseProjects this backend creates, so a project is only
+    /// reconciled by the controller that owns its Organization.
+    controller_class: Option<String>,
 }
 
 impl KubernetesBackend {
@@ -29,11 +33,13 @@ impl KubernetesBackend {
         kube_client: kube::Client,
         resource_builder: Arc<ResourceBuilder>,
         store: Arc<dyn DeploymentStore>,
+        controller_class: Option<String>,
     ) -> Self {
         Self {
             kube_client,
             resource_builder,
             store,
+            controller_class,
         }
     }
 
@@ -96,17 +102,37 @@ impl DeploymentBackend for KubernetesBackend {
     async fn cleanup_environment(&self, project: &Project, _environment_name: &str) -> Result<()> {
         // With Metacontroller, environment cleanup is handled automatically:
         // the sync webhook won't return ServiceAccount resources for deleted
-        // environments, and Metacontroller will garbage-collect them.
-        // Trigger a resync to make this happen promptly.
-        if let Err(e) =
-            crate::server::deployment::crd::trigger_resync(&self.kube_client, &project.name).await
-        {
-            tracing::warn!(
-                "Failed to trigger CRD resync for environment cleanup on project '{}': {:?}",
-                project.name,
-                e
-            );
+        // environments, and Metacontroller will garbage-collect them. The
+        // resync just makes it happen promptly.
+        self.project_changed(project).await
+    }
+
+    async fn project_changed(&self, project: &Project) -> Result<()> {
+        crate::server::deployment::crd::trigger_resync(&self.kube_client, &project.name).await
+    }
+
+    async fn project_created(&self, project: &Project) -> Result<()> {
+        crate::server::deployment::crd::ensure_rise_project(
+            &self.kube_client,
+            &project.name,
+            self.controller_class.as_deref(),
+        )
+        .await
+    }
+
+    async fn project_deleting(&self, project: &Project) -> Result<()> {
+        crate::server::deployment::crd::delete_rise_project(&self.kube_client, &project.name).await
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            // The node selector pins the architecture pods are scheduled onto.
+            runtime_arch: self
+                .resource_builder
+                .node_selector
+                .get("kubernetes.io/arch")
+                .and_then(|arch| crate::server::platform::models::normalize_runtime_arch(arch)),
+            pod_security_enabled: Some(self.resource_builder.pod_security_enabled),
         }
-        Ok(())
     }
 }

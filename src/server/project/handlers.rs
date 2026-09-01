@@ -288,26 +288,14 @@ pub async fn create_project(
         .await
         .internal_err("Failed to commit transaction")?;
 
-    // Create RiseProject CRD for Metacontroller (best-effort). In PR5 every
-    // project links to the default Organization whose `deploymentControllerClass`
-    // equals this controller's own class, so the controller's configured
-    // class is the correct label value. Once orgs can carry different
-    // controller classes, this should look up the project's org's class
-    // from the resource store instead.
+    // Let the backend create whatever per-project runtime object it needs
+    // (best-effort; the reconcile loop converges regardless).
     #[cfg(feature = "backend")]
-    if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) = crate::server::deployment::crd::ensure_rise_project(
-            kube_client,
-            &project.name,
-            state.deployment_controller_class_name.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!(
-                project = %project.name,
-                "Failed to create RiseProject CRD: {:?}", e
-            );
-        }
+    if let Err(e) = state.deployment_backend.project_created(&project).await {
+        tracing::warn!(
+            project = %project.name,
+            "Failed to notify deployment backend of project creation: {:?}", e
+        );
     }
 
     let owner_info = resolve_owner_info(&state, &project)
@@ -749,18 +737,15 @@ pub async fn update_project(
         // Fire immediately after the DB write so a later validation error in
         // this same request can't leave the DB updated and the CRD stale.
         if access_class_changed {
-            if let Some(ref kube_client) = state.kube_client {
-                if let Err(e) = crate::server::deployment::crd::trigger_resync(
-                    kube_client,
-                    &updated_project.name,
-                )
+            if let Err(e) = state
+                .deployment_backend
+                .project_changed(&updated_project)
                 .await
-                {
-                    tracing::warn!(
-                        project = %updated_project.name,
-                        "Failed to trigger CRD resync after access class update: {:?}", e
-                    );
-                }
+            {
+                tracing::warn!(
+                    project = %updated_project.name,
+                    "Failed to notify deployment backend after access class update: {:?}", e
+                );
             }
         }
     }
@@ -904,17 +889,14 @@ pub async fn delete_project(
         .await
         .internal_err("Failed to mark project for deletion")?;
 
-    // Delete RiseProject CRD — Metacontroller will call the finalize webhook
+    // Tell the backend to start finalizing. Best-effort: the reconcile loop
+    // garbage-collects the project's workloads regardless.
     #[cfg(feature = "backend")]
-    if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) =
-            crate::server::deployment::crd::delete_rise_project(kube_client, &project.name).await
-        {
-            tracing::warn!(
-                project = %project.name,
-                "Failed to delete RiseProject CRD: {:?}", e
-            );
-        }
+    if let Err(e) = state.deployment_backend.project_deleting(&project).await {
+        tracing::warn!(
+            project = %project.name,
+            "Failed to notify deployment backend of project deletion: {:?}", e
+        );
     }
 
     tracing::info!("Project {} marked for deletion", project.name);
