@@ -1,3 +1,14 @@
+//! Deployment rows and the status transitions written against them.
+//!
+//! Every status writer here is a single statement in three parts: a `prev` CTE
+//! that locks the target row and reads its current status, the guarded
+//! `UPDATE`, and an `INSERT` into `deployment_events` captioning the move with
+//! `from`/`to`. `prev` exists because the event has to name the status the
+//! write moved *off*, and `FOR UPDATE` makes that read exact: a concurrent
+//! writer blocks on the lock, so nothing can change between the read and the
+//! update. `RETURNING OLD.status` would say the same thing in one clause, but
+//! it requires PostgreSQL 18 and the supported floor is 16.
+
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -488,7 +499,10 @@ pub async fn update_status(
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET status = $2,
                 deploying_started_at = CASE
@@ -504,9 +518,10 @@ pub async fn update_status(
                         AND completed_at IS NULL THEN NOW()
                     ELSE completed_at
                 END
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, $2)
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- This writer owns the build path and the handoff into
@@ -602,12 +617,16 @@ pub async fn mark_failed(
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET status = 'Failed', completed_at = COALESCE(completed_at, NOW()), error_message = $2
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Failed')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -713,7 +732,10 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Cancelled',
@@ -721,9 +743,10 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment
                 controller_metadata = '{}',
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Cancelled')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -777,7 +800,10 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Stopped',
@@ -785,9 +811,10 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
                 controller_metadata = '{}',
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Stopped')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -841,7 +868,10 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Superseded',
@@ -849,9 +879,10 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
                 controller_metadata = '{}',
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Superseded')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -920,7 +951,10 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Expired',
@@ -928,9 +962,10 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
                 controller_metadata = '{}',
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Expired')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -986,16 +1021,20 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Healthy',
                 error_message = NULL,
                 first_healthy_at = COALESCE(first_healthy_at, NOW()),
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Healthy')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event. `is_valid_transition` admits
@@ -1047,15 +1086,19 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<O
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Unhealthy',
                 error_message = $2,
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Unhealthy')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -1119,15 +1162,19 @@ pub async fn mark_terminating(
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Terminating',
                 termination_reason = $2,
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Terminating')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -1186,15 +1233,19 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Cancelling',
                 termination_reason = 'Cancelled',
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Cancelling')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             -- Only a real move is an event: `is_valid_transition` admits
@@ -1624,16 +1675,20 @@ pub async fn mark_healthy_and_supersede(
     let healthy = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Healthy',
                 error_message = NULL,
                 first_healthy_at = COALESCE(first_healthy_at, NOW()),
                 updated_at = NOW()
-            WHERE deployments.id = $1
+            FROM prev
+            WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, 'Healthy')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
             INSERT INTO deployment_events (
@@ -1689,31 +1744,33 @@ pub async fn mark_healthy_and_supersede(
     let superseded = sqlx::query_as!(
         Deployment,
         r#"
-        WITH upd AS (
+        WITH prev AS (
+            SELECT id, status FROM deployments
+            WHERE project_id = $2
+              AND deployment_group = $3
+              AND id != $1
+              AND status = 'Healthy'
+            ORDER BY created_at DESC
+            LIMIT 1
+            FOR UPDATE
+        ),
+        upd AS (
             UPDATE deployments
             SET
                 status = 'Terminating',
                 termination_reason = 'Superseded',
                 updated_at = NOW()
-            WHERE id = (
-                SELECT id FROM deployments
-                WHERE project_id = $2
-                  AND deployment_group = $3
-                  AND id != $1
-                  AND status = 'Healthy'
-                ORDER BY created_at DESC
-                LIMIT 1
-            )
-              -- The subquery is an InitPlan: evaluated once, and NOT re-checked
-              -- when a concurrent commit makes this row move on. Without this
-              -- guard a deployment that reached a terminal status between the
-              -- two would be resurrected into `Terminating`.
+            FROM prev
+            WHERE deployments.id = prev.id
+              -- `prev` holds the row lock, so nothing moves this deployment
+              -- between selecting it and updating it. The guard still stands
+              -- as the authoritative check on what the row may become.
               AND is_valid_transition(deployments.status, 'Terminating')
-            RETURNING deployments.*, OLD.status AS from_status
+            RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
-            -- `from` comes from the row the UPDATE locked, not from the
-            -- subquery's snapshot of it.
+            -- `from` comes from the locked row `prev` read, so it is the
+            -- status this write moved off.
             INSERT INTO deployment_events (
                 deployment_id, occurred_at, kind, severity, source, attributes
             )
