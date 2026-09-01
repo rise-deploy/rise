@@ -173,13 +173,14 @@ rise run --project my-app --http-port 3000
 **Run your app directly** with Rise env vars exported to your shell (no image build needed):
 
 ```bash
+eval "$(rise env export -p my-app)"
+npm run dev
+# Or save the commands and source them later:
 rise env export -p my-app > .env.rise
-# then load with your preferred tool, e.g.:
-export $(cat .env.rise | xargs)
-# or: direnv, dotenv, etc.
+source .env.rise
 ```
 
-`rise env export` fetches the resolved set of non-secret environment variables Rise would inject into a deployment, letting you run your app natively without Docker. This is useful when your local dev workflow builds and runs the app directly (e.g. `cargo run`, `npm run dev`).
+`rise env export` fetches the resolved set of loadable environment variables Rise would inject into a deployment as shell-safe `export` commands, letting you run your app natively without Docker. Protected secrets are omitted. This is useful when your local dev workflow builds and runs the app directly (e.g. `cargo run`, `npm run dev`).
 
 Note that variables sourced from extensions (e.g., database credentials from the RDS extension) are not included — use a local database for development instead.
 

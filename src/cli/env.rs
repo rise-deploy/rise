@@ -617,10 +617,29 @@ pub async fn list_deployment_env(
     Ok(())
 }
 
-/// Export environment variables in dotfile format (KEY=value per line).
+/// Quote a value as a POSIX shell single-quoted string.
+fn shell_quote(value: &str) -> anyhow::Result<String> {
+    if value.contains('\0') {
+        anyhow::bail!("Environment variable values cannot contain NUL bytes")
+    }
+
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+/// Check whether a key can be exported by a POSIX-compatible shell.
+fn is_shell_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(
+        chars.next(),
+        Some(c) if c.is_ascii_alphabetic() || c == '_'
+    ) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Export environment variables as shell commands (`export KEY='value'`).
 ///
-/// Output goes to stdout for clean piping (`rise env export > .env` or
-/// `eval $(rise env export)`). Warnings about protected secrets go to stderr.
+/// Output goes to stdout for clean piping (`eval "$(rise env export)"` or
+/// `rise env export > .env.rise && source .env.rise`). Warnings about protected
+/// secrets go to stderr.
 pub async fn export_env(
     http_client: &Client,
     backend_url: &str,
@@ -638,6 +657,16 @@ pub async fn export_env(
     )
     .await?;
 
+    for (key, value) in &loadable_vars {
+        if !is_shell_identifier(key) {
+            anyhow::bail!(
+                "Cannot export environment variable '{}': the key is not a valid shell identifier",
+                key
+            );
+        }
+        shell_quote(value)?;
+    }
+
     if !protected_keys.is_empty() {
         eprintln!(
             "warning: {} protected secret{} excluded (cannot be exported):",
@@ -650,7 +679,7 @@ pub async fn export_env(
     }
 
     for (key, value) in &loadable_vars {
-        println!("{}={}", key, value);
+        println!("export {}={}", key, shell_quote(value)?);
     }
 
     Ok(())
@@ -658,7 +687,36 @@ pub async fn export_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env_file, parse_env_string};
+    use super::{is_shell_identifier, parse_env_file, parse_env_string, shell_quote};
+
+    #[test]
+    fn shell_quote_preserves_shell_significant_values() {
+        assert_eq!(shell_quote("").unwrap(), "''");
+        assert_eq!(shell_quote("hello world").unwrap(), "'hello world'");
+        assert_eq!(shell_quote("it's").unwrap(), "'it'\\''s'");
+        assert_eq!(
+            shell_quote("line one\nline two").unwrap(),
+            "'line one\nline two'"
+        );
+        assert_eq!(
+            shell_quote("$(touch /tmp/pwned); *.txt").unwrap(),
+            "'$(touch /tmp/pwned); *.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_rejects_nul_bytes() {
+        assert!(shell_quote("before\0after").is_err());
+    }
+
+    #[test]
+    fn shell_identifier_requires_portable_variable_name() {
+        assert!(is_shell_identifier("FOO_2"));
+        assert!(is_shell_identifier("_private"));
+        assert!(!is_shell_identifier("2FOO"));
+        assert!(!is_shell_identifier("foo.bar"));
+        assert!(!is_shell_identifier("foo-bar"));
+    }
 
     #[test]
     fn parse_env_string_rejects_empty_keys() {
