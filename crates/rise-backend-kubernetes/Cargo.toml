@@ -8,12 +8,6 @@ repository.workspace = true
 description = "Kubernetes deployment backend for Rise (Metacontroller webhook, resource builder, RiseProject CRD)"
 publish = false
 
-[features]
-default = []
-# Enables `schemars::JsonSchema` derives on the controller settings types so
-# `rise-deploy` can include them in the generated backend-config schema.
-schema = ["dep:schemars", "k8s-openapi/schemars", "rise-backend-core/schema"]
-
 [dependencies]
 anyhow = { workspace = true }
 async-stream = "0.3"
@@ -24,14 +18,16 @@ axum = "0.8.7"
 base64 = { workspace = true }
 chrono = { workspace = true }
 futures = "0.3"
-k8s-openapi = { version = "0.27", features = ["v1_31"] }
+# `schemars` is not optional: the RiseProject CustomResource derive generates a
+# JSON schema, and NetworkPolicyConfig embeds k8s-openapi types in one.
+k8s-openapi = { version = "0.27", features = ["v1_31", "schemars"] }
 kube = { version = "3", features = ["client", "derive", "runtime"] }
 rise-backend-auth = { path = "../rise-backend-auth" }
 rise-backend-core = { path = "../rise-backend-core" }
 rise-deployment-spec = { workspace = true }
 rise-runtime-sync = { path = "../rise-runtime-sync" }
 rustls = { version = "0.23", features = ["ring"] }
-schemars = { workspace = true, optional = true }
+schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

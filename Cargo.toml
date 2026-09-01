@@ -99,7 +99,6 @@ backend = [
     "dep:rise-backend-docker",
     "dep:rise-backend-ecs",
     "dep:rise-backend-kubernetes",
-    "rise-backend-kubernetes/schema",
     "dep:rise-backend-traefik",
     "dep:rise-resource-api",
     "dep:rise-resource-store-postgres",
