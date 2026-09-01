@@ -1671,8 +1671,10 @@ async fn main() -> Result<()> {
                     &project_name,
                     group.as_deref(),
                     *limit,
-                    *json,
-                    status_file.as_deref(),
+                    deployment::DeploymentOutputOptions {
+                        json: *json,
+                        status_file: status_file.as_deref(),
+                    },
                 )
                 .await?;
             }

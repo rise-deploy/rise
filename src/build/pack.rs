@@ -7,17 +7,29 @@ use tracing::{debug, info};
 
 use super::ssl::{SSL_CERT_PATHS, SSL_ENV_VARS};
 
+pub(crate) struct BuildpackBuildOptions<'a> {
+    pub app_path: &'a str,
+    pub image_tag: &'a str,
+    pub builder: Option<&'a str>,
+    pub buildpacks: &'a [String],
+    pub env: &'a [String],
+    pub no_cache: bool,
+    pub platform: &'a str,
+    pub output: super::CommandOutput,
+}
+
 /// Build image using Cloud Native Buildpacks (pack CLI)
-pub(crate) fn build_image_with_buildpacks(
-    app_path: &str,
-    image_tag: &str,
-    builder: Option<&str>,
-    buildpacks: &[String],
-    env: &[String],
-    no_cache: bool,
-    platform: &str,
-    output: super::CommandOutput,
-) -> Result<()> {
+pub(crate) fn build_image_with_buildpacks(options: BuildpackBuildOptions<'_>) -> Result<()> {
+    let BuildpackBuildOptions {
+        app_path,
+        image_tag,
+        builder,
+        buildpacks,
+        env,
+        no_cache,
+        platform,
+        output,
+    } = options;
     // Check if pack CLI is available
     let pack_check = Command::new("pack").arg("version").output();
 

@@ -193,7 +193,7 @@ use tracing::{debug, info, warn};
 use buildkit::{check_ssl_cert_and_warn, ensure_managed_buildkit_daemon};
 use docker::{build_image_with_dockerfile, DockerBuildOptions};
 use method::{requires_buildkit, select_build_method};
-use pack::build_image_with_buildpacks;
+use pack::{build_image_with_buildpacks, BuildpackBuildOptions};
 use railpack::build_image_with_railpacks;
 
 /// Read an environment variable, treating empty strings as if the variable is not set.
@@ -362,16 +362,16 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
             if options.managed_buildkit.is_some() {
                 warn!("--managed-buildkit flag is ignored when using pack build method");
             }
-            build_image_with_buildpacks(
-                &options.app_path,
-                &options.image_tag,
-                options.builder.as_deref(),
-                &options.buildpacks,
-                &options.env,
-                options.no_cache,
-                &options.platform,
-                options.output,
-            )?;
+            build_image_with_buildpacks(BuildpackBuildOptions {
+                app_path: &options.app_path,
+                image_tag: &options.image_tag,
+                builder: options.builder.as_deref(),
+                buildpacks: &options.buildpacks,
+                env: &options.env,
+                no_cache: options.no_cache,
+                platform: &options.platform,
+                output: options.output,
+            })?;
 
             // Pack doesn't support push during build, so inline push falls back
             // to a separate push owned by the build module.
