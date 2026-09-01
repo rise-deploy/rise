@@ -94,15 +94,10 @@ pub struct AppState {
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
-    /// Short-TTL cache of the per-Org fields the webhook reads on every
-    /// sync (`spec.deploymentControllerClass`, resolved namespace prefix).
-    /// 30s TTL means a change to either propagates within roughly one
-    /// resync window. Org-missing is treated as an error and is never
-    /// cached (`try_get_with` won't memoise an Err).
+    /// Per-Organization reads (controller class, namespace prefix) for the
+    /// deployment backends, cached behind a short TTL.
     #[cfg(feature = "backend")]
-    pub org_view_cache: Arc<
-        moka::future::Cache<uuid::Uuid, crate::server::deployment::webhook::CachedOrganizationView>,
-    >,
+    pub org_view: Arc<dyn rise_backend_core::OrganizationView>,
     pub auth_settings: Arc<AuthSettings>,
     pub server_settings: Arc<ServerSettings>,
     pub token_store: Arc<dyn TokenStore>,
@@ -144,9 +139,6 @@ pub struct AppState {
     pub ingress_schema: String,
     /// Optional ingress port (for development environments)
     pub ingress_port: Option<u16>,
-    /// ResourceBuilder for Metacontroller webhook (builds K8s resource specs)
-    #[cfg(feature = "backend")]
-    pub resource_builder: Option<Arc<crate::server::deployment::resource_builder::ResourceBuilder>>,
     /// Native architecture accepted by the configured deployment runtime.
     ///
     /// Kubernetes derives this from its architecture node selector. Docker
@@ -157,13 +149,13 @@ pub struct AppState {
     /// Kubernetes client for direct API calls (pod health checks, log streaming)
     #[cfg(feature = "backend")]
     pub kube_client: Option<kube::Client>,
-    /// IP validator for Metacontroller webhook requests (None in dev mode)
-    #[cfg(feature = "backend")]
-    pub metacontroller_ip_validator:
-        Option<Arc<crate::server::deployment::ip_validator::MetacontrollerIpValidator>>,
     /// Port for the internal metacontroller webhook listener
     #[cfg(feature = "backend")]
     pub metacontroller_webhook_port: Option<u16>,
+    /// Everything the Metacontroller webhook handlers need, or `None` when the
+    /// Kubernetes controller is not configured.
+    #[cfg(feature = "backend")]
+    pub webhook_ctx: Option<Arc<crate::server::deployment::webhook::WebhookContext>>,
     /// Default resource values for new deployments
     #[cfg(feature = "backend")]
     pub deployment_defaults: Option<crate::server::settings::DeploymentDefaults>,
@@ -276,10 +268,11 @@ async fn init_kubernetes_backend(
     resource_builder: Arc<crate::server::deployment::resource_builder::ResourceBuilder>,
     kube_client: kube::Client,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
+    controller_class: Option<String>,
 ) -> Result<Arc<dyn DeploymentBackend>> {
     use crate::server::deployment::controller::KubernetesBackend;
 
-    let backend = KubernetesBackend::new(kube_client, resource_builder, store);
+    let backend = KubernetesBackend::new(kube_client, resource_builder, store, controller_class);
 
     // Test Kubernetes API connection
     backend.test_connection().await?;
@@ -1443,7 +1436,13 @@ impl AppState {
                         .clone()
                         .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
                     (
-                        init_kubernetes_backend(rb, kc, deployment_store.clone()).await?,
+                        init_kubernetes_backend(
+                            rb,
+                            kc,
+                            deployment_store.clone(),
+                            deployment_controller_class_name.clone(),
+                        )
+                        .await?,
                         None,
                         None,
                         None,
@@ -1523,11 +1522,10 @@ impl AppState {
         // Docker daemon may be remote, so the backend process's compile-time or
         // host architecture is not authoritative.
         #[cfg(feature = "backend")]
-        let runtime_arch = if let Some(resource_builder) = resource_builder.as_ref() {
-            resource_builder
-                .node_selector
-                .get("kubernetes.io/arch")
-                .and_then(|arch| crate::server::platform::models::normalize_runtime_arch(arch))
+        let runtime_arch = if let Some(arch) = deployment_backend.capabilities().runtime_arch {
+            // Backends that pin an architecture by configuration report it
+            // directly; the rest are detected below.
+            Some(arch)
         } else if let Some(docker) = docker_client.as_ref() {
             let info = docker
                 .info()
@@ -1822,19 +1820,33 @@ impl AppState {
         );
         tracing::info!("Initialized encrypt endpoint rate limiter (100 req/hour per user)");
 
-        // Combined per-Org view cache keyed by Org UID. Holds the fields
-        // the webhook reads on every sync (`spec.deploymentControllerClass`,
-        // resolved namespace prefix) so the controller hits the resource
-        // store at most once per Org per 30s window. 1024-entry cap is
-        // well above any realistic Org count and bounds memory if abused.
-        // Org-missing surfaces as `Err` and is not cached.
         #[cfg(feature = "backend")]
-        let org_view_cache = Arc::new(
-            moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(30))
-                .max_capacity(1024)
-                .build(),
-        );
+        let org_view: Arc<dyn rise_backend_core::OrganizationView> =
+            Arc::new(crate::server::organizations::CachedOrgView::new(
+                pg_resource_store.clone(),
+                deployment_store.clone(),
+            ));
+
+        // The Metacontroller webhook's own dependency bundle. `None` unless the
+        // Kubernetes controller is configured, which is also what gates the
+        // webhook listener in `server::run`.
+        #[cfg(feature = "backend")]
+        let webhook_ctx = match (resource_builder.as_ref(), webhook_kube_client.as_ref()) {
+            (Some(rb), Some(kc)) => Some(Arc::new(
+                crate::server::deployment::webhook::WebhookContext {
+                    kube_client: kc.clone(),
+                    resource_builder: rb.clone(),
+                    ip_validator: ip_validator.clone(),
+                    deployment_store: deployment_store.clone(),
+                    org_view: org_view.clone(),
+                    jwt_signer: jwt_signer.clone(),
+                    encryption_provider: encryption_provider.clone(),
+                    controller_class_name: deployment_controller_class_name.clone(),
+                    identity_token_ttl_seconds,
+                },
+            )),
+            _ => None,
+        };
 
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
@@ -1983,7 +1995,7 @@ impl AppState {
             #[cfg(feature = "backend")]
             deployment_controller_class_name,
             #[cfg(feature = "backend")]
-            org_view_cache,
+            org_view,
             auth_settings,
             server_settings,
             token_store,
@@ -2007,15 +2019,13 @@ impl AppState {
             ingress_schema,
             ingress_port,
             #[cfg(feature = "backend")]
-            resource_builder,
-            #[cfg(feature = "backend")]
             runtime_arch,
             #[cfg(feature = "backend")]
             kube_client: webhook_kube_client,
             #[cfg(feature = "backend")]
-            metacontroller_ip_validator: ip_validator,
-            #[cfg(feature = "backend")]
             metacontroller_webhook_port: webhook_port,
+            #[cfg(feature = "backend")]
+            webhook_ctx,
             #[cfg(feature = "backend")]
             deployment_defaults: deployment_defaults_opt,
             #[cfg(feature = "backend")]

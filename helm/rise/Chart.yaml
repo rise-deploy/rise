@@ -11,6 +11,9 @@ keywords:
 home: https://github.com/rise-deploy/rise
 sources:
   - https://github.com/rise-deploy/rise
+annotations:
+  # The chart deploys the Kubernetes backend and is licensed with it.
+  artifacthub.io/license: BUSL-1.1
 dependencies:
   - name: metacontroller-helm
     version: "4.17.2"

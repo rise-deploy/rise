@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::server::deployment::crd::{self, RiseProject};
+use crate::crd::{self, RiseProject};
 
 /// Floor/ceiling on the poll cadence regardless of the configured TTL, so a
 /// pathological TTL can't make the loop hammer the K8s API or sleep for too long.
@@ -91,7 +91,7 @@ impl IdentityRefreshController {
         // A short TTL can leave less re-mint margin than the kubelet takes to
         // project a refreshed Secret into the pod — warn the operator once.
         let margin = self.identity_token_ttl_seconds.saturating_sub(
-            crate::server::workload_tokens::refresh_due_after_secs(self.identity_token_ttl_seconds),
+            rise_backend_core::refresh_due_after_secs(self.identity_token_ttl_seconds),
         );
         if margin < KUBELET_SECRET_PROPAGATION_CEILING_SECS {
             warn!(

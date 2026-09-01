@@ -6,6 +6,7 @@ members = [
     "crates/rise-backend-core",
     "crates/rise-backend-docker",
     "crates/rise-backend-ecs",
+    "crates/rise-backend-kubernetes",
     "crates/rise-backend-traefik",
     "crates/rise-deployment-spec",
     "crates/rise-resource-api",
@@ -17,6 +18,14 @@ members = [
 # compiles this test-only crate. Excluded so cargo doesn't auto-discover it.
 exclude = ["tests/e2e"]
 resolver = "2"
+
+# Shared package metadata. Crates that are part of the permissively-licensed
+# core inherit `license` from here; the BSL-licensed backend crates state their
+# own. See LICENSING.md.
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -43,9 +52,9 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 name = "rise-deploy"
 version = "0.23.0-rc15"
 publish = false
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/rise-deploy/rise"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "A simple and powerful CLI for deploying containerized applications"
 
 [package.metadata.cargo-all-features]
@@ -89,6 +98,7 @@ backend = [
     "dep:rise-backend-core",
     "dep:rise-backend-docker",
     "dep:rise-backend-ecs",
+    "dep:rise-backend-kubernetes",
     "dep:rise-backend-traefik",
     "dep:rise-resource-api",
     "dep:rise-resource-store-postgres",
@@ -127,7 +137,6 @@ backend = [
     "dep:aws-config",
     "dep:aws-sdk-ecr",
     "dep:aws-sdk-ecs",
-    "dep:aws-sdk-cloudwatchlogs",
     "dep:aws-sdk-ssm",
     "dep:aws-sdk-iam",
     "dep:aws-sdk-kms",
@@ -145,6 +154,7 @@ rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
 rise-backend-docker = { path = "crates/rise-backend-docker", optional = true }
 rise-backend-ecs = { path = "crates/rise-backend-ecs", optional = true }
+rise-backend-kubernetes = { path = "crates/rise-backend-kubernetes", optional = true }
 rise-backend-traefik = { path = "crates/rise-backend-traefik", optional = true }
 rise-resource-api = { path = "crates/rise-resource-api", optional = true }
 rise-resource-store-postgres = { path = "crates/rise-resource-store-postgres", optional = true }
@@ -213,7 +223,6 @@ tera = { version = "1.20", optional = true }
 aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
 aws-sdk-ecr = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-ecs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
-aws-sdk-cloudwatchlogs = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-ssm = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-iam = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }
 aws-sdk-kms = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio"], optional = true }

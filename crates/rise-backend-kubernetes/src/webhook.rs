@@ -2,13 +2,14 @@
 //!
 //! Metacontroller calls the sync webhook periodically (every N seconds) and whenever
 //! the `RiseProject` CRD changes. The webhook inspects the database for the project's
-//! current state, performs health checks using observed K8s resources, updates DB
+//! current ctx, performs health checks using observed K8s resources, updates DB
 //! statuses, and returns the desired set of child K8s resources.
 //!
 //! Metacontroller then reconciles: it creates/updates resources that are returned
 //! and deletes resources that are NOT returned (garbage collection).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use anyhow::Context;
 use axum::extract::{ConnectInfo, State};
@@ -24,23 +25,20 @@ use k8s_openapi::ByteString;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
-use crate::db::models::{Deployment, DeploymentStatus, Project, TerminationReason};
-use crate::server::deployment::crd;
-use crate::server::deployment::resource_builder::{
+use crate::crd;
+use crate::resource_builder::{
     IdentityMount, ResourceBuilder, ANNOTATION_ENV_SECRET_HASH, ANNOTATION_LAST_REFRESH,
     IDENTITY_CREDENTIAL_KEY, IDENTITY_TOKEN_KEY_PREFIX, IMAGE_PULL_SECRET_NAME,
     IRRECOVERABLE_CONTAINER_REASONS, LABEL_DEPLOYMENT_ID,
 };
-use crate::server::deployment::state_machine;
-use crate::server::state::AppState;
-use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
-// Backend-agnostic runtime helpers live in `rise-backend-core`; re-exported here
-// so existing `crate::server::deployment::webhook::*` callers stay unchanged.
-pub(crate) use rise_backend_core::runtime::{
+use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
     ResolvedDeploymentEnvVars,
 };
+use rise_backend_core::state_machine;
 
 // ── Metacontroller webhook protocol types ──────────────────────────────
 
@@ -111,13 +109,33 @@ struct PreparedDeploymentEnvSecret {
     secret: Secret,
 }
 
+/// Everything the Metacontroller webhook handlers need.
+///
+/// The webhook listener only starts when the Kubernetes controller is
+/// configured, so the pieces that are optional on `AppState` — the kube client,
+/// the resource builder — are unconditional here and the handlers stop
+/// re-checking them. The IP validator stays optional: dev mode legitimately
+/// runs without one.
+pub struct WebhookContext {
+    pub kube_client: kube::Client,
+    pub resource_builder: Arc<ResourceBuilder>,
+    pub ip_validator: Option<Arc<crate::ip_validator::MetacontrollerIpValidator>>,
+    pub deployment_store: Arc<dyn rise_backend_core::DeploymentStore>,
+    pub org_view: Arc<dyn rise_backend_core::OrganizationView>,
+    pub jwt_signer: Arc<rise_backend_auth::RiseTokenSigner>,
+    pub encryption_provider: Option<Arc<dyn rise_backend_core::EncryptionProvider>>,
+    /// Only projects whose Organization names this class are reconciled here.
+    pub controller_class_name: Option<String>,
+    pub identity_token_ttl_seconds: u64,
+}
+
 // ── Webhook authentication ─────────────────────────────────────────────
 
 async fn validate_source_ip(
-    state: &AppState,
+    ctx: &WebhookContext,
     addr: std::net::SocketAddr,
 ) -> Result<(), (StatusCode, &'static str)> {
-    match &state.metacontroller_ip_validator {
+    match &ctx.ip_validator {
         Some(validator) => validator.validate(addr).await,
         None => Ok(()), // dev mode — no validation
     }
@@ -126,11 +144,11 @@ async fn validate_source_ip(
 // ── Sync webhook handler ───────────────────────────────────────────────
 
 pub async fn handle_sync(
-    State(state): State<AppState>,
+    State(ctx): State<Arc<WebhookContext>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<SyncRequest>,
 ) -> Response {
-    if let Err((status, msg)) = validate_source_ip(&state, addr).await {
+    if let Err((status, msg)) = validate_source_ip(&ctx, addr).await {
         return (status, msg).into_response();
     }
     let project_name = match request
@@ -164,7 +182,7 @@ pub async fn handle_sync(
         .map(|s| s.to_string());
 
     match process_sync(
-        &state,
+        &ctx,
         &project_name,
         project_uid.as_deref(),
         &request.children,
@@ -218,13 +236,13 @@ pub async fn handle_sync(
 }
 
 async fn process_sync(
-    state: &AppState,
+    ctx: &WebhookContext,
     project_name: &str,
     rise_project_uid: Option<&str>,
     observed: &ObservedChildren,
 ) -> Result<SyncResponse, SyncError> {
     // 1. Load project from DB
-    let project = match state
+    let project = match ctx
         .deployment_store
         .find_project_by_name(project_name)
         .await?
@@ -233,10 +251,8 @@ async fn process_sync(
         None => {
             warn!(project = %project_name, "Project not found in DB, deleting orphaned RiseProject CRD");
             // Auto-delete the orphaned CRD so Metacontroller stops syncing it
-            if let Some(ref kube_client) = state.kube_client {
-                if let Err(e) = crd::delete_rise_project(kube_client, project_name).await {
-                    error!(project = %project_name, "Failed to delete orphaned RiseProject CRD: {:?}", e);
-                }
+            if let Err(e) = crd::delete_rise_project(&ctx.kube_client, project_name).await {
+                error!(project = %project_name, "Failed to delete orphaned RiseProject CRD: {:?}", e);
             }
             return Ok(SyncResponse {
                 status: serde_json::json!({
@@ -253,7 +269,10 @@ async fn process_sync(
     // through the controller-class check and the namespace-prefix
     // lookup. Both of those used to re-read `project_organizations`
     // independently — one DB hit per sync now serves both.
-    let org_uid = resolve_project_organization_uid(state, &project).await?;
+    let org_uid = ctx
+        .org_view
+        .organization_uid_for_project(project.id)
+        .await?;
 
     // 1c. Verify the project's Organization is assigned to this controller.
     //
@@ -263,16 +282,16 @@ async fn process_sync(
     // different controller — return `SyncError::WrongController` so the
     // handler answers 400 (not 200 with empty children, which would let
     // Metacontroller GC resources owned by another controller).
-    enforce_controller_class(state, &project, org_uid).await?;
+    enforce_controller_class(ctx, &project, org_uid).await?;
 
     // 1d. Resolve the project's Org-scoped namespace prefix once. Every
     // helper below that names a namespace borrows this string, so the
     // miss-loader runs at most once per sync (the cache hits the second
-    // and subsequent times within the 30s TTL).
-    let namespace_prefix = resolve_project_namespace_prefix(state, &project, org_uid).await?;
+    // and subsequent times within its TTL).
+    let namespace_prefix = ctx.org_view.namespace_prefix(org_uid).await?;
 
     // 2. Load non-terminal deployments for this project (avoids loading full history)
-    let non_terminal_deployments = state
+    let non_terminal_deployments = ctx
         .deployment_store
         .list_non_terminal_deployments_for_project(project.id)
         .await?;
@@ -280,14 +299,14 @@ async fn process_sync(
     let non_terminal: Vec<&Deployment> = non_terminal_deployments.iter().collect();
 
     // 3. Perform status transitions based on observed K8s state
-    perform_status_transitions(state, &project, &non_terminal, observed, &namespace_prefix).await?;
+    perform_status_transitions(ctx, &project, &non_terminal, observed, &namespace_prefix).await?;
 
     // 4. Re-load non-terminal deployments since statuses may have changed
-    let all_deployments = state
+    let all_deployments = ctx
         .deployment_store
         .list_non_terminal_deployments_for_project(project.id)
         .await?;
-    let project = match state.deployment_store.find_project(project.id).await? {
+    let project = match ctx.deployment_store.find_project(project.id).await? {
         Some(p) => p,
         None => {
             // Project was deleted between initial lookup and now — return empty children
@@ -304,21 +323,11 @@ async fn process_sync(
         }
     };
 
-    // 5. Get ResourceBuilder — returning an error (HTTP 500) if not configured,
-    // so Metacontroller does NOT apply an empty children list which would
-    // garbage-collect all resources.
-    let resource_builder = match &state.resource_builder {
-        Some(rb) => rb,
-        None => {
-            return Err(SyncError::Internal(anyhow::anyhow!(
-                "No resource builder configured — cannot compute desired children"
-            )));
-        }
-    };
+    let resource_builder = &ctx.resource_builder;
 
     // 6. Compute desired children
     let (children, identity_refresh_due_at) = compute_desired_children(
-        state,
+        ctx,
         resource_builder,
         &project,
         rise_project_uid,
@@ -370,111 +379,6 @@ impl From<anyhow::Error> for SyncError {
     }
 }
 
-/// Pure comparison of the configured controller class against the
-/// Organization's `spec.deploymentControllerClass`. Returns `Ok(())` when
-/// reconciliation should proceed (legacy `configured = None`, or both match)
-/// and `Err(())` when the controller should refuse this project.
-fn check_controller_class(configured: Option<&str>, org_class: Option<&str>) -> Result<(), ()> {
-    match configured {
-        None => Ok(()),
-        Some(c) => match org_class {
-            Some(o) if o == c => Ok(()),
-            _ => Err(()),
-        },
-    }
-}
-
-/// Snapshot of the per-Organization fields the Metacontroller webhook
-/// reads on every sync. Cached behind `AppState::org_view_cache` so the
-/// controller hits the resource store at most once per Org per 30s
-/// window — the previous design had two independent caches (one per
-/// field) and re-read the same row twice.
-#[derive(Debug, Clone)]
-pub struct CachedOrganizationView {
-    /// Value of `spec.deploymentControllerClass`. `None` when the
-    /// Organization exists but does not set the field.
-    pub controller_class: Option<String>,
-    /// Resolved Kubernetes namespace prefix
-    /// (`kubernetes.rise.dev/namespace-prefix` annotation, or
-    /// `org-{discriminator}-` fallback).
-    pub namespace_prefix: String,
-}
-
-/// Cache miss-loader for `AppState::org_view_cache`. Reads the
-/// Organization row once and projects both fields the webhook needs.
-/// Missing Organizations surface as `Err`, which prevents the cache from
-/// memoising a transient "not found" (`try_get_with` only retains
-/// successful loads).
-async fn load_org_view(
-    store: std::sync::Arc<dyn rise_resource_api::ResourceApi>,
-    uid: uuid::Uuid,
-) -> anyhow::Result<CachedOrganizationView> {
-    let row = store
-        .get(uid)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to load Organization {uid}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("Organization {uid} is missing"))?;
-    let spec: rise_resource_api::OrganizationSpec = serde_json::from_value(row.spec.clone())
-        .map_err(|e| anyhow::anyhow!("Organization {uid} has malformed spec: {e}"))?;
-    let annotations: BTreeMap<String, String> =
-        serde_json::from_value(row.metadata.clone()).unwrap_or_default();
-    let namespace_prefix =
-        crate::server::bootstrap::resolve_namespace_prefix(&annotations, &row.discriminator);
-    Ok(CachedOrganizationView {
-        controller_class: spec.deployment_controller_class,
-        namespace_prefix,
-    })
-}
-
-/// Resolve the project's Organization UID, surfacing the "missing
-/// linkage" invariant as a structured error. Bootstrap validation
-/// refuses to start the server with unlinked projects, so a `None` here
-/// is a programmer error — logged at `error!` rather than letting the
-/// `None` propagate silently.
-pub async fn resolve_project_organization_uid(
-    state: &AppState,
-    project: &Project,
-) -> anyhow::Result<uuid::Uuid> {
-    state.deployment_store.organization_uid_for_project(project.id)
-        .await?
-        .ok_or_else(|| {
-            error!(
-                project = %project.name,
-                "Project has no organization linkage — bootstrap validation should have caught this; refusing to reconcile"
-            );
-            anyhow::anyhow!(
-                "project '{}' is missing organization_resource_uid; bootstrap must backfill before reconciliation",
-                project.name,
-            )
-        })
-}
-
-/// Look up the project's Org-scoped namespace prefix through
-/// `AppState::org_view_cache`. The caller resolves the Organization UID
-/// once per request (via `resolve_project_organization_uid`) and threads
-/// it through so the controller-class check and this lookup share a
-/// single DB and cache read.
-pub async fn resolve_project_namespace_prefix(
-    state: &AppState,
-    project: &Project,
-    org_uid: uuid::Uuid,
-) -> anyhow::Result<String> {
-    let view = state
-        .org_view_cache
-        .try_get_with(
-            org_uid,
-            load_org_view(state.resource_store.clone(), org_uid),
-        )
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to load Organization {org_uid} for project '{}': {e}",
-                project.name,
-            )
-        })?;
-    Ok(view.namespace_prefix)
-}
-
 /// Reject reconciliation when the project's Organization's
 /// `spec.deploymentControllerClass` does not match the controller's
 /// configured `controller_class_name`. Reads the Org through a short-TTL
@@ -482,35 +386,29 @@ pub async fn resolve_project_namespace_prefix(
 /// tick. When the controller has no configured class (legacy installs),
 /// this is a no-op.
 async fn enforce_controller_class(
-    state: &AppState,
+    ctx: &WebhookContext,
     project: &Project,
     org_uid: uuid::Uuid,
 ) -> Result<(), SyncError> {
-    let Some(configured) = state.deployment_controller_class_name.as_deref() else {
+    let Some(configured) = ctx.controller_class_name.as_deref() else {
         return Ok(());
     };
 
-    let view = state
-        .org_view_cache
-        .try_get_with(
-            org_uid,
-            load_org_view(state.resource_store.clone(), org_uid),
-        )
-        .await
-        .map_err(|e| {
-            SyncError::Internal(anyhow::anyhow!(
-                "Failed to load Organization {org_uid} for project '{}': {e}",
-                project.name,
-            ))
-        })?;
+    let org_class = ctx.org_view.controller_class(org_uid).await.map_err(|e| {
+        SyncError::Internal(anyhow::anyhow!(
+            "Failed to load Organization {org_uid} for project '{}': {e}",
+            project.name,
+        ))
+    })?;
 
-    match check_controller_class(Some(configured), view.controller_class.as_deref()) {
-        Ok(()) => Ok(()),
-        Err(()) => Err(SyncError::WrongController {
+    if rise_backend_core::controller_class_matches(Some(configured), org_class.as_deref()) {
+        Ok(())
+    } else {
+        Err(SyncError::WrongController {
             project: project.name.clone(),
             configured: configured.to_string(),
-            org_class: view.controller_class,
-        }),
+            org_class,
+        })
     }
 }
 
@@ -518,7 +416,7 @@ async fn enforce_controller_class(
 /// advance its status: Pushed → Deploying, Deploying → Healthy/Failed, timeouts,
 /// expiration, and cancellation.
 async fn perform_status_transitions(
-    state: &AppState,
+    ctx: &WebhookContext,
     project: &Project,
     non_terminal: &[&Deployment],
     observed: &ObservedChildren,
@@ -529,7 +427,7 @@ async fn perform_status_transitions(
         // part of the lifecycle that needs no runtime observation and is
         // identical on every backend.
         rise_backend_core::lifecycle::perform_status_transition(
-            state.deployment_store.as_ref(),
+            ctx.deployment_store.as_ref(),
             project,
             deployment,
         )
@@ -546,7 +444,7 @@ async fn perform_status_transitions(
             DeploymentStatus::Deploying | DeploymentStatus::Healthy | DeploymentStatus::Unhealthy
         ) {
             check_deployment_health_from_observed(
-                state,
+                ctx,
                 deployment,
                 project,
                 observed,
@@ -570,7 +468,7 @@ async fn perform_status_transitions(
 /// replicas across every container and only marks the Rise deployment Healthy
 /// when every K8s Deployment is fully ready.
 async fn check_deployment_health_from_observed(
-    state: &AppState,
+    ctx: &WebhookContext,
     deployment: &Deployment,
     project: &Project,
     observed: &ObservedChildren,
@@ -593,7 +491,7 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "container side-data could not be deserialized; marking deployment Failed: {:?}", e
             );
-            if state
+            if ctx
                 .deployment_store
                 .mark_deployment_failed(
                     deployment.id,
@@ -602,8 +500,7 @@ async fn check_deployment_health_from_observed(
                 .await?
                 .is_some()
             {
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .update_project_calculated_status(project.id)
                     .await?;
             }
@@ -648,7 +545,7 @@ async fn check_deployment_health_from_observed(
     // status, the observation that drives history, and the Events that explain
     // both. Listed once and shared — three reads per sync would be three times
     // the API traffic for the same answer.
-    let pods = list_deployment_pods(state, project, deployment, namespace_prefix).await;
+    let pods = list_deployment_pods(ctx, project, deployment, namespace_prefix).await;
 
     let pod_check = match &pods {
         Some(pods) => check_pod_errors(pods),
@@ -661,10 +558,10 @@ async fn check_deployment_health_from_observed(
     };
 
     if let Some(pods) = &pods {
-        record_pod_observations(state, deployment, pods).await;
+        record_pod_observations(ctx, deployment, pods).await;
         // Where a pod that will not schedule finally explains itself: its status
         // says `Pending` and nothing more, while the Event carries the reason.
-        forward_pod_events(state, project, deployment, namespace_prefix, pods).await;
+        forward_pod_events(ctx, project, deployment, namespace_prefix, pods).await;
     }
 
     let is_ready = ready_replicas >= desired_replicas && desired_replicas > 0;
@@ -679,14 +576,13 @@ async fn check_deployment_health_from_observed(
                     deployment_id = %deployment.deployment_id,
                     "Deployment has irrecoverable pod error: {}", error_msg
                 );
-                if state
+                if ctx
                     .deployment_store
                     .mark_deployment_failed(deployment.id, &error_msg)
                     .await?
                     .is_some()
                 {
-                    state
-                        .deployment_store
+                    ctx.deployment_store
                         .update_project_calculated_status(project.id)
                         .await?;
                 }
@@ -698,7 +594,7 @@ async fn check_deployment_health_from_observed(
                     desired_replicas
                 );
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
-                    state.deployment_store.as_ref(),
+                    ctx.deployment_store.as_ref(),
                     None,
                     project,
                     deployment,
@@ -718,14 +614,13 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Healthy deployment is now unhealthy: {}", msg
             );
-            if state
+            if ctx
                 .deployment_store
                 .mark_deployment_unhealthy(deployment.id, msg)
                 .await?
                 .is_some()
             {
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .update_project_calculated_status(project.id)
                     .await?;
             }
@@ -736,14 +631,13 @@ async fn check_deployment_health_from_observed(
                 deployment_id = %deployment.deployment_id,
                 "Unhealthy deployment has recovered, marking as Healthy"
             );
-            if state
+            if ctx
                 .deployment_store
                 .mark_deployment_healthy(deployment.id)
                 .await?
                 .is_some()
             {
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .update_project_calculated_status(project.id)
                     .await?;
             }
@@ -756,7 +650,7 @@ async fn check_deployment_health_from_observed(
 }
 
 /// Record what the pods look like now, and the events that implies.
-async fn record_pod_observations(state: &AppState, deployment: &Deployment, pods: &[Pod]) {
+async fn record_pod_observations(ctx: &WebhookContext, deployment: &Deployment, pods: &[Pod]) {
     // The declared container name, so an observation says which container it is
     // an instance of rather than repeating the pod's own name.
     let container = deployment
@@ -772,10 +666,10 @@ async fn record_pod_observations(state: &AppState, deployment: &Deployment, pods
 
     let observed: Vec<_> = pods
         .iter()
-        .filter_map(|p| super::pods::observe(p, &container))
+        .filter_map(|p| crate::pods::observe(p, &container))
         .collect();
 
-    let previous = match state
+    let previous = match ctx
         .deployment_store
         .list_container_observations(deployment.id)
         .await
@@ -793,7 +687,7 @@ async fn record_pod_observations(state: &AppState, deployment: &Deployment, pods
     let events =
         rise_backend_core::observation::derive_events(&previous, &observed, chrono::Utc::now());
 
-    if let Err(e) = state
+    if let Err(e) = ctx
         .deployment_store
         .record_container_observations(
             deployment.id,
@@ -815,15 +709,13 @@ async fn record_pod_observations(state: &AppState, deployment: &Deployment, pods
 /// Best-effort throughout: losing a diagnostic must never fail a sync that would
 /// otherwise have succeeded.
 async fn forward_pod_events(
-    state: &AppState,
+    ctx: &WebhookContext,
     project: &Project,
     deployment: &Deployment,
     namespace_prefix: &str,
     pods: &[Pod],
 ) {
-    let Some(kube_client) = &state.kube_client else {
-        return;
-    };
+    let kube_client = &ctx.kube_client;
     let owned: std::collections::HashSet<String> = pods
         .iter()
         .filter_map(|p| p.metadata.name.clone())
@@ -860,12 +752,12 @@ async fn forward_pod_events(
         })
         .collect();
 
-    let forwardable = super::pods::forwardable(&mine);
+    let forwardable = crate::pods::forwardable(&mine);
     if forwardable.is_empty() {
         return;
     }
 
-    match state
+    match ctx
         .deployment_store
         .forward_backend_events(
             deployment.id,
@@ -900,12 +792,12 @@ struct PodCheckResult {
 /// empty list: an empty list says every pod is gone, and acting on a failed read
 /// as though it were emptiness would record terminations that never happened.
 async fn list_deployment_pods(
-    state: &AppState,
+    ctx: &WebhookContext,
     project: &Project,
     deployment: &Deployment,
     namespace_prefix: &str,
 ) -> Option<Vec<k8s_openapi::api::core::v1::Pod>> {
-    let kube_client = state.kube_client.as_ref()?;
+    let kube_client = &ctx.kube_client;
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
     let pod_api: kube::Api<k8s_openapi::api::core::v1::Pod> =
         kube::Api::namespaced(kube_client.clone(), &namespace);
@@ -1012,7 +904,7 @@ fn crashed(
 ///
 /// Resources NOT returned will be deleted by Metacontroller (garbage collection).
 async fn compute_desired_children(
-    state: &AppState,
+    ctx: &WebhookContext,
     resource_builder: &ResourceBuilder,
     project: &Project,
     rise_project_uid: Option<&str>,
@@ -1028,7 +920,7 @@ async fn compute_desired_children(
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
     // Preload all environments for this project to avoid per-deployment DB lookups
-    let environments: HashMap<uuid::Uuid, crate::db::models::Environment> = state
+    let environments: HashMap<uuid::Uuid, rise_backend_core::models::Environment> = ctx
         .deployment_store
         .list_environments_for_project(project.id)
         .await?
@@ -1057,7 +949,7 @@ async fn compute_desired_children(
     // 3. Backend service + endpoints (if configured)
     if let Some(ref backend_address) = resource_builder.backend_address {
         add_backend_resources(
-            state,
+            ctx,
             &mut children,
             resource_builder,
             project,
@@ -1109,11 +1001,11 @@ async fn compute_desired_children(
     // avoids a duplicate DB roundtrip in phase 2.
     let mut container_specs_by_deployment: HashMap<
         uuid::Uuid,
-        Vec<crate::server::deployment::models::ContainerSpec>,
+        Vec<rise_deployment_spec::request_spec::ContainerSpec>,
     > = HashMap::new();
     let mut routes_by_deployment: HashMap<
         uuid::Uuid,
-        Vec<crate::server::deployment::models::RouteSpec>,
+        Vec<rise_deployment_spec::request_spec::RouteSpec>,
     > = HashMap::new();
     // `containers`/`routes` come folded onto each row. An unparseable (non-NULL
     // but corrupt) side-data column fails ONLY that deployment: mark it Failed,
@@ -1133,8 +1025,7 @@ async fn compute_desired_children(
                     deployment_id = %d.deployment_id,
                     "container side-data could not be deserialized; marking deployment Failed: {:?}", e
                 );
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .mark_deployment_failed(d.id, "container side-data could not be deserialized")
                     .await?;
                 failed_to_parse.insert(d.id);
@@ -1142,8 +1033,7 @@ async fn compute_desired_children(
         }
     }
     if !failed_to_parse.is_empty() {
-        state
-            .deployment_store
+        ctx.deployment_store
             .update_project_calculated_status(project.id)
             .await?;
         infra_deployments.retain(|d| !failed_to_parse.contains(&d.id));
@@ -1178,13 +1068,13 @@ async fn compute_desired_children(
     // K8s Deployments — one per non-terminal, infrastructure-bearing deployment
     for deployment in &infra_deployments {
         let env_name = env_name_for(deployment);
-        let env_vars = load_env_vars(state, project, deployment).await?;
+        let env_vars = load_env_vars(ctx, project, deployment).await?;
 
         // Container spec list for this deployment. A single-container deployment
         // has its synthesised `app`; a multi-container one has one entry per
         // `[containers.<name>]`. Computed here (before the env-secret guard) so
         // the guard can look up the per-container K8s Deployment names.
-        let container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+        let container_specs: Vec<rise_deployment_spec::request_spec::ContainerSpec> =
             container_specs_by_deployment
                 .get(&deployment.id)
                 .cloned()
@@ -1263,8 +1153,7 @@ async fn compute_desired_children(
         // Resolve image
         let source_deployment_id =
             if let Some(source_id) = deployment.rolled_back_from_deployment_id {
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .find_deployment(source_id)
                     .await?
                     .map(|d| d.deployment_id)
@@ -1295,7 +1184,7 @@ async fn compute_desired_children(
 
         // Workload identity Secret: bootstrap credential + auto-minted tokens.
         let identity = prepare_identity_secret(
-            state,
+            ctx,
             resource_builder,
             project,
             deployment,
@@ -1384,7 +1273,7 @@ async fn compute_desired_children(
 
             let health_check = spec.health_check.clone();
 
-            let runtime = crate::server::deployment::resource_builder::ContainerRuntime {
+            let runtime = crate::resource_builder::ContainerRuntime {
                 name: &spec.name,
                 // Synthesised `app` carries no image; fall back to the
                 // deployment's resolved image. Explicit containers always have one.
@@ -1438,14 +1327,14 @@ async fn compute_desired_children(
     }
 
     // Services, Ingresses, NetworkPolicies — one per group with an active deployment
-    let custom_domains = state
+    let custom_domains = ctx
         .deployment_store
         .list_project_custom_domains(project.id)
         .await?;
     let valid_custom_domains = resource_builder.filter_valid_custom_domains(&custom_domains);
 
     // Index custom domains by environment_id.
-    let mut domains_by_env: HashMap<uuid::Uuid, Vec<crate::db::models::CustomDomain>> =
+    let mut domains_by_env: HashMap<uuid::Uuid, Vec<rise_backend_core::models::CustomDomain>> =
         HashMap::new();
     for cd in &valid_custom_domains {
         domains_by_env
@@ -1457,7 +1346,8 @@ async fn compute_desired_children(
     // Index environments by the deployment group they're primary for. The schema
     // enforces (project_id, primary_deployment_group) uniqueness, so at most one
     // env per group.
-    let mut env_by_primary_group: HashMap<String, &crate::db::models::Environment> = HashMap::new();
+    let mut env_by_primary_group: HashMap<String, &rise_backend_core::models::Environment> =
+        HashMap::new();
     for env in environments.values() {
         if let Some(group) = env.primary_deployment_group.as_deref() {
             env_by_primary_group.insert(group.to_string(), env);
@@ -1473,13 +1363,13 @@ async fn compute_desired_children(
 
     // Full env list for `create_primary_ingress` to do cross-ingress host
     // collision checks (a DG URL that matches another env's URL is suppressed).
-    let all_environments: Vec<crate::db::models::Environment> =
+    let all_environments: Vec<rise_backend_core::models::Environment> =
         environments.values().cloned().collect();
 
     for (group, active_deployment) in &active_by_group {
         let env_name = env_name_for(active_deployment);
         let env_for_group = env_by_primary_group.get(group.as_str()).copied();
-        let domains_for_group: Vec<crate::db::models::CustomDomain> = env_for_group
+        let domains_for_group: Vec<rise_backend_core::models::CustomDomain> = env_for_group
             .and_then(|env| domains_by_env.get(&env.id).cloned())
             .unwrap_or_default();
 
@@ -1488,14 +1378,14 @@ async fn compute_desired_children(
         // map — so a new container declared by a rolling-out, not-yet-active
         // deployment gets its Service immediately (sibling pods can reach it
         // during probes). Here we only build the ingress route table.
-        let active_container_specs: Vec<crate::server::deployment::models::ContainerSpec> =
+        let active_container_specs: Vec<rise_deployment_spec::request_spec::ContainerSpec> =
             container_specs_by_deployment
                 .get(&active_deployment.id)
                 .cloned()
                 .unwrap_or_default();
 
         // Primary Ingress
-        let inline_domains: &[crate::db::models::CustomDomain] = if split_custom_domains {
+        let inline_domains: &[rise_backend_core::models::CustomDomain] = if split_custom_domains {
             &[]
         } else {
             &domains_for_group
@@ -1512,7 +1402,7 @@ async fn compute_desired_children(
             .collect();
         let service_name_base = ResourceBuilder::service_name(project, active_deployment);
         // Routable route specs: those targeting a container that exposes a port.
-        let routable_specs: Vec<&crate::server::deployment::models::RouteSpec> =
+        let routable_specs: Vec<&rise_deployment_spec::request_spec::RouteSpec> =
             routes_by_deployment
                 .get(&active_deployment.id)
                 .map(|route_specs| {
@@ -1531,17 +1421,14 @@ async fn compute_desired_children(
             // Carry each route's per-route `access` override; the builder resolves
             // the effective requirement (override, else the project default) and
             // partitions by it, gating each path group independently.
-            let routes: Vec<crate::server::deployment::resource_builder::IngressRoute> =
-                routable_specs
-                    .iter()
-                    .map(
-                        |r| crate::server::deployment::resource_builder::IngressRoute {
-                            path: r.path.clone(),
-                            service_name: format!("{}-{}", service_name_base, r.container),
-                            access_override: r.access.clone(),
-                        },
-                    )
-                    .collect();
+            let routes: Vec<crate::resource_builder::IngressRoute> = routable_specs
+                .iter()
+                .map(|r| crate::resource_builder::IngressRoute {
+                    path: r.path.clone(),
+                    service_name: format!("{}-{}", service_name_base, r.container),
+                    access_override: r.access.clone(),
+                })
+                .collect();
 
             // One or more Ingresses (one per effective-requirement group). An
             // empty result means every candidate host collided with another env's
@@ -1598,7 +1485,7 @@ fn any_container_deployment_observed(
     observed: &ObservedChildren,
     namespace: &str,
     base_name: &str,
-    container_specs: &[crate::server::deployment::models::ContainerSpec],
+    container_specs: &[rise_deployment_spec::request_spec::ContainerSpec],
 ) -> bool {
     container_specs.iter().any(|spec| {
         let key = format!("{}/{}-{}", namespace, base_name, spec.name);
@@ -1654,7 +1541,7 @@ pub(crate) fn compute_service_owner_per_container(
     infra_deployments: &[&Deployment],
     container_specs_by_deployment: &HashMap<
         uuid::Uuid,
-        Vec<crate::server::deployment::models::ContainerSpec>,
+        Vec<rise_deployment_spec::request_spec::ContainerSpec>,
     >,
 ) -> HashMap<(String, String), uuid::Uuid> {
     let mut owner: HashMap<(String, String), uuid::Uuid> = HashMap::new();
@@ -1809,7 +1696,7 @@ struct PreparedIdentitySecret {
 /// are re-minted only when the observed Secret is stale or its audience set
 /// changed, avoiding a Secret rewrite on every resync.
 async fn prepare_identity_secret(
-    state: &AppState,
+    ctx: &WebhookContext,
     resource_builder: &ResourceBuilder,
     project: &Project,
     deployment: &Deployment,
@@ -1840,8 +1727,7 @@ async fn prepare_identity_secret(
             // same applied Secret and writes the same hash.
             let credential_hash = sha256_hex(c.as_bytes());
             if deployment.identity_credential_hash.as_deref() != Some(credential_hash.as_str()) {
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .set_identity_credential_hash(deployment.id, &credential_hash)
                     .await
                     .context("Failed to persist identity credential hash")?;
@@ -1855,7 +1741,7 @@ async fn prepare_identity_secret(
             // a DB hash that does not match the Secret that actually got applied.
             // The hash is written on the next sync via the reuse path above, once
             // some replica's Secret has been applied and is observed by all.
-            crate::server::workload_tokens::generate_bootstrap_credential()
+            rise_backend_auth::generate_bootstrap_credential()
         }
     };
 
@@ -1894,8 +1780,8 @@ async fn prepare_identity_secret(
             })
             .unwrap_or_default();
 
-        let ttl_secs = state.identity_token_ttl_seconds;
-        let refresh_secs = crate::server::workload_tokens::remint_after_secs(ttl_secs) as i64;
+        let ttl_secs = ctx.identity_token_ttl_seconds;
+        let refresh_secs = rise_backend_core::remint_after_secs(ttl_secs) as i64;
 
         let fresh = observed_refresh
             .map(|ts| {
@@ -1915,8 +1801,8 @@ async fn prepare_identity_secret(
                 deployment_group: &deployment.deployment_group,
                 deployment_id: &deployment.deployment_id,
             };
-            let minted = crate::server::workload_tokens::sign_audience_tokens(
-                &state.jwt_signer,
+            let minted = rise_backend_auth::sign_audience_tokens(
+                &ctx.jwt_signer,
                 &subject_info,
                 &audiences,
                 ttl_secs,
@@ -1938,11 +1824,9 @@ async fn prepare_identity_secret(
     } else {
         Some(
             refreshed_at
-                + chrono::Duration::seconds(
-                    crate::server::workload_tokens::refresh_due_after_secs(
-                        state.identity_token_ttl_seconds,
-                    ) as i64,
-                ),
+                + chrono::Duration::seconds(rise_backend_core::refresh_due_after_secs(
+                    ctx.identity_token_ttl_seconds,
+                ) as i64),
         )
     };
 
@@ -2041,13 +1925,13 @@ fn prepare_deployment_env_secret(
 /// infinite loop. Since child resource types are all-or-nothing, we manage the
 /// `rise-backend` EndpointSlice outside of Metacontroller as well.
 async fn add_backend_resources(
-    state: &AppState,
+    ctx: &WebhookContext,
     children: &mut Vec<serde_json::Value>,
     resource_builder: &ResourceBuilder,
     project: &Project,
     rise_project_uid: Option<&str>,
     namespace: &str,
-    backend_address: &crate::server::settings::BackendAddress,
+    backend_address: &crate::config::BackendAddress,
 ) -> anyhow::Result<()> {
     if backend_address.is_ip_address() {
         // IP address → ClusterIP Service (as child) + EndpointSlice (applied directly)
@@ -2065,7 +1949,7 @@ async fn add_backend_resources(
             backend_address.port,
             rise_project_uid,
         );
-        apply_backend_endpoint_slice(state, &endpoint_slice, namespace).await;
+        apply_backend_endpoint_slice(ctx, &endpoint_slice, namespace).await;
     } else {
         // DNS name → ExternalName
         let svc = resource_builder.create_backend_service_externalname(
@@ -2086,13 +1970,11 @@ async fn add_backend_resources(
 /// 404s. That's expected and self-heals on the next resync, so the 404 is
 /// logged at debug instead of warning.
 async fn apply_backend_endpoint_slice(
-    state: &AppState,
+    ctx: &WebhookContext,
     endpoint_slice: &k8s_openapi::api::discovery::v1::EndpointSlice,
     namespace: &str,
 ) {
-    let Some(ref kube_client) = state.kube_client else {
-        return;
-    };
+    let kube_client = &ctx.kube_client;
     let api: kube::Api<k8s_openapi::api::discovery::v1::EndpointSlice> =
         kube::Api::namespaced(kube_client.clone(), namespace);
     let name = endpoint_slice
@@ -2123,25 +2005,25 @@ async fn apply_backend_endpoint_slice(
 
 /// Load and decrypt environment variables for a deployment
 async fn load_env_vars(
-    state: &AppState,
+    ctx: &WebhookContext,
     _project: &Project,
     deployment: &Deployment,
 ) -> anyhow::Result<ResolvedDeploymentEnvVars> {
-    let env_vars = state
+    let env_vars = ctx
         .deployment_store
         .list_deployment_env_vars(deployment.id)
         .await?;
-    resolve_deployment_env_vars(env_vars, state.encryption_provider.as_deref()).await
+    resolve_deployment_env_vars(env_vars, ctx.encryption_provider.as_deref()).await
 }
 
 // ── Finalize webhook handler ───────────────────────────────────────────
 
 pub async fn handle_finalize(
-    State(state): State<AppState>,
+    State(ctx): State<Arc<WebhookContext>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<FinalizeRequest>,
 ) -> Response {
-    if let Err((status, msg)) = validate_source_ip(&state, addr).await {
+    if let Err((status, msg)) = validate_source_ip(&ctx, addr).await {
         return (status, msg).into_response();
     }
 
@@ -2166,7 +2048,7 @@ pub async fn handle_finalize(
         }
     };
 
-    match process_finalize(&state, &project_name).await {
+    match process_finalize(&ctx, &project_name).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => {
             error!(project = %project_name, "Finalize webhook error: {:?}", e);
@@ -2189,18 +2071,18 @@ pub async fn handle_finalize(
 }
 
 async fn process_finalize(
-    state: &AppState,
+    ctx: &WebhookContext,
     project_name: &str,
 ) -> anyhow::Result<FinalizeResponse> {
     info!(project = %project_name, "Processing finalize webhook — marking all deployments as stopped");
 
-    if let Some(project) = state
+    if let Some(project) = ctx
         .deployment_store
         .find_project_by_name(project_name)
         .await?
     {
         // Mark all non-terminal deployments as Stopped
-        let deployments = state
+        let deployments = ctx
             .deployment_store
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
@@ -2216,31 +2098,28 @@ async fn process_finalize(
             // targeted user request, so a benign race is simply skipped.
             if state_machine::is_valid_transition(&deployment.status, &DeploymentStatus::Cancelling)
             {
-                if state
+                if ctx
                     .deployment_store
                     .mark_deployment_cancelling(deployment.id)
                     .await?
                     .is_some()
                 {
-                    state
-                        .deployment_store
+                    ctx.deployment_store
                         .mark_deployment_cancelled(deployment.id)
                         .await?;
                 }
-            } else if state
+            } else if ctx
                 .deployment_store
                 .mark_deployment_terminating(deployment.id, TerminationReason::UserStopped, None)
                 .await?
                 .is_some()
             {
-                state
-                    .deployment_store
+                ctx.deployment_store
                     .mark_deployment_stopped(deployment.id)
                     .await?;
             }
         }
-        state
-            .deployment_store
+        ctx.deployment_store
             .update_project_calculated_status(project.id)
             .await?;
     }
@@ -2255,13 +2134,13 @@ async fn process_finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::models::{DeploymentEnvVar, DeploymentStatus, Project, ProjectStatus};
-    use crate::server::deployment::resource_builder::ResourceBuilder;
-    use crate::server::encryption::EncryptionProvider;
-    use crate::server::registry::models::RegistryCredentials;
-    use crate::server::registry::{ImageTagType, RegistryProvider};
+    use crate::resource_builder::ResourceBuilder;
     use anyhow::Result;
     use async_trait::async_trait;
+    use rise_backend_core::models::{DeploymentEnvVar, DeploymentStatus, Project, ProjectStatus};
+    use rise_backend_core::providers::RegistryCredentials;
+    use rise_backend_core::providers::{ImageTagType, RegistryProvider};
+    use rise_backend_core::EncryptionProvider;
     use std::sync::Arc;
 
     struct TestRegistryProvider;
@@ -2393,11 +2272,7 @@ mod tests {
             test_env_var("PORT", "8080", false, false),
             test_env_var("SESSION_SECRET", "ciphertext-b", true, false),
         ];
-        // 32 zero bytes encoded as standard base64
-        let provider = crate::server::encryption::providers::local::LocalEncryptionProvider::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        )
-        .unwrap();
+        let provider = rise_backend_core::test_helpers::ReversibleEncryptionProvider;
 
         let mut encrypted_env_vars = Vec::new();
         for mut var in env_vars {
@@ -2581,7 +2456,7 @@ mod tests {
             namespace_annotations: HashMap::new(),
             ingress_annotations: HashMap::new(),
             ingress_tls_secret_name: None,
-            custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
+            custom_domain_tls_mode: crate::config::CustomDomainTlsMode::PerDomain,
             custom_domain_ingress_annotations: HashMap::new(),
             node_selector: HashMap::new(),
             image_pull_secret_name: None,
@@ -2589,7 +2464,7 @@ mod tests {
             host_aliases: HashMap::new(),
             extra_service_token_audiences: HashMap::new(),
             use_default_service_account_for_production: true,
-            network_policy: crate::server::settings::NetworkPolicyConfig {
+            network_policy: crate::config::NetworkPolicyConfig {
                 ingress: vec![],
                 egress: None,
             },
@@ -2709,10 +2584,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_deployment_env_vars_trims_whitespace_from_secret_keys() {
-        let provider = crate::server::encryption::providers::local::LocalEncryptionProvider::new(
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-        )
-        .unwrap();
+        let provider = rise_backend_core::test_helpers::ReversibleEncryptionProvider;
         let raw_value = "secret-value";
         let encrypted = provider.encrypt(raw_value).await.unwrap();
 
@@ -2732,47 +2604,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------------
-    // check_controller_class
-    // -----------------------------------------------------------------------------
-
-    #[test]
-    fn check_controller_class_unconfigured_always_passes() {
-        // Legacy installs (no controller class configured) reconcile every
-        // project regardless of what the Organization carries.
-        assert!(check_controller_class(None, None).is_ok());
-        assert!(check_controller_class(None, Some("kubernetes.rise.dev/default")).is_ok());
-        assert!(check_controller_class(None, Some("something-else")).is_ok());
-    }
-
-    #[test]
-    fn check_controller_class_matching_passes() {
-        assert!(check_controller_class(
-            Some("kubernetes.rise.dev/default"),
-            Some("kubernetes.rise.dev/default"),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn check_controller_class_mismatched_rejects() {
-        assert!(check_controller_class(
-            Some("kubernetes.rise.dev/default"),
-            Some("kubernetes.rise.dev/other"),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn check_controller_class_unset_on_org_rejects() {
-        // An Org that has no `spec.deploymentControllerClass` is not owned by
-        // this (or any) controller, even when the controller has a class
-        // configured. Refuse to reconcile.
-        assert!(check_controller_class(Some("kubernetes.rise.dev/default"), None).is_err());
-    }
-
-    fn cspec(name: &str, port: Option<u16>) -> crate::server::deployment::models::ContainerSpec {
-        crate::server::deployment::models::ContainerSpec {
+    fn cspec(name: &str, port: Option<u16>) -> rise_deployment_spec::request_spec::ContainerSpec {
+        rise_deployment_spec::request_spec::ContainerSpec {
             name: name.to_string(),
             image: Some("img".to_string()),
             port,

@@ -8,7 +8,7 @@
   },
   "keywords": ["hello", "world", "example"],
   "author": "",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "dependencies": {
     "express": "^5.0.0"
   },

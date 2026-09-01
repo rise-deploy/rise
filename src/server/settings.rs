@@ -221,10 +221,6 @@ fn default_loki_timeout_secs() -> u64 {
     10
 }
 
-fn default_kubernetes_max_tail_lines() -> i64 {
-    100_000
-}
-
 fn default_loki_project_label() -> String {
     "rise_project".to_string()
 }
@@ -261,25 +257,6 @@ impl Default for LokiLabels {
             project: default_loki_project_label(),
             deployment_id: default_loki_deployment_id_label(),
             container: default_loki_container_label(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KubernetesLogBackendSettings {
-    /// Upper bound on the number of lines the backend will ever request from
-    /// the kubelet in a single call. The frontend pages backward by widening
-    /// `tail_lines` through an opaque continuation; paging stops at this
-    /// ceiling or when the kubelet's own ring buffer is exhausted. Default:
-    /// 100000.
-    #[serde(default = "default_kubernetes_max_tail_lines")]
-    pub max_tail_lines: i64,
-}
-
-impl Default for KubernetesLogBackendSettings {
-    fn default() -> Self {
-        Self {
-            max_tail_lines: default_kubernetes_max_tail_lines(),
         }
     }
 }
@@ -839,56 +816,6 @@ fn default_node_selector() -> std::collections::HashMap<String, String> {
     selector
 }
 
-/// Backend address for routing /.rise/* traffic to the Rise backend
-#[derive(Debug, Clone)]
-pub struct BackendAddress {
-    pub host: String,
-    pub port: u16,
-}
-
-impl BackendAddress {
-    /// Parse backend address from a URL by extracting host and port
-    /// Example: "http://172.17.0.1:3000" -> BackendAddress { host: "172.17.0.1", port: 3000 }
-    pub fn from_url(url: &str) -> Result<Self, anyhow::Error> {
-        let parsed = url::Url::parse(url)
-            .map_err(|e| anyhow::anyhow!("Invalid URL for backend address: {}", e))?;
-
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("URL missing host"))?
-            .to_string();
-
-        let port = parsed
-            .port()
-            .or_else(|| {
-                // Default ports based on scheme
-                match parsed.scheme() {
-                    "http" => Some(80),
-                    "https" => Some(443),
-                    _ => None,
-                }
-            })
-            .ok_or_else(|| anyhow::anyhow!("URL missing port and no default for scheme"))?;
-
-        Ok(Self { host, port })
-    }
-
-    /// Check if the host is an IP address (vs a DNS name)
-    pub fn is_ip_address(&self) -> bool {
-        self.host.parse::<std::net::IpAddr>().is_ok()
-    }
-}
-
-/// TLS mode for custom domains
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub enum CustomDomainTlsMode {
-    /// All hosts (primary + custom domains) share the same TLS secret
-    Shared,
-    /// Each custom domain gets its own tls-{domain} secret (cert-manager integration)
-    PerDomain,
-}
-
 fn default_metacontroller_webhook_port() -> u16 {
     3001
 }
@@ -1004,25 +931,13 @@ fn default_custom_domain_tls_mode() -> CustomDomainTlsMode {
 
 pub use rise_backend_core::AccessRequirement;
 
-/// Access class configuration for ingress authentication
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct AccessClass {
-    /// Display name for UI (e.g., "Public")
-    pub display_name: String,
-
-    /// Description for UI
-    pub description: String,
-
-    /// Ingress class to use
-    pub ingress_class: String,
-
-    /// Access requirement level
-    pub access_requirement: AccessRequirement,
-
-    /// Optional custom nginx annotations
-    #[serde(default)]
-    pub custom_annotations: std::collections::HashMap<String, String>,
-}
+pub use rise_backend_core::AccessClass;
+// The Kubernetes-only controller config types live with the backend that
+// reads them; re-exported so `settings::*` paths stay unchanged.
+pub use rise_backend_kubernetes::config::{
+    BackendAddress, CustomDomainTlsMode, HealthProbeConfig, KubernetesLogBackendSettings,
+    NetworkPolicyConfig,
+};
 
 /// Validate that a Traefik-fronted deployment controller (Docker or ECS) can
 /// actually enforce the authentication required by its configured access classes.
@@ -1130,52 +1045,6 @@ impl Default for DeploymentConstraints {
     }
 }
 
-/// Health probe configuration
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct HealthProbeConfig {
-    /// Enable liveness probes (default: true)
-    #[serde(default = "default_true")]
-    pub liveness_enabled: bool,
-
-    /// Enable readiness probes (default: true)
-    #[serde(default = "default_true")]
-    pub readiness_enabled: bool,
-
-    /// Path for HTTP probes (default: "/")
-    #[serde(default = "default_probe_path")]
-    pub path: String,
-
-    /// Initial delay in seconds (default: 10)
-    #[serde(default = "default_initial_delay")]
-    pub initial_delay_seconds: i32,
-
-    /// Period in seconds (default: 10)
-    #[serde(default = "default_period_seconds")]
-    pub period_seconds: i32,
-
-    /// Timeout in seconds (default: 5)
-    #[serde(default = "default_timeout_seconds")]
-    pub timeout_seconds: i32,
-
-    /// Failure threshold (default: 3)
-    #[serde(default = "default_failure_threshold")]
-    pub failure_threshold: i32,
-}
-
-/// NetworkPolicy configuration for deployed apps
-///
-/// Uses Kubernetes NetworkPolicy types directly. Egress semantics:
-/// - null: policyTypes is ["Ingress"] only, Kubernetes does not restrict egress
-/// - Empty list: policyTypes includes "Egress" with no rules = deny all egress
-/// - Non-empty list: explicit egress rules enforced
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct NetworkPolicyConfig {
-    /// Ingress rules
-    pub ingress: Vec<k8s_openapi::api::networking::v1::NetworkPolicyIngressRule>,
-    /// Egress rules (null = unrestricted egress)
-    pub egress: Option<Vec<k8s_openapi::api::networking::v1::NetworkPolicyEgressRule>>,
-}
-
 // Default functions for pod security settings
 fn default_use_default_service_account_for_production() -> bool {
     true
@@ -1223,26 +1092,6 @@ fn default_min_memory() -> String {
 
 fn default_max_memory() -> String {
     "2Gi".to_string()
-}
-
-fn default_probe_path() -> String {
-    "/".to_string()
-}
-
-fn default_initial_delay() -> i32 {
-    10
-}
-
-fn default_period_seconds() -> i32 {
-    10
-}
-
-fn default_timeout_seconds() -> i32 {
-    5
-}
-
-fn default_failure_threshold() -> i32 {
-    3
 }
 
 /// Deployment controller configuration

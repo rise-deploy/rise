@@ -1,16 +1,22 @@
 [package]
 name = "rise-backend-ecs"
 version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/rise-deploy/rise"
+edition.workspace = true
+# Business Source License 1.1, not the workspace default. See ../../LICENSING.md.
+license = "BUSL-1.1"
+repository.workspace = true
 description = "Amazon ECS deployment backend for Rise (in-process reconcile loop over the ECS API)"
 publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+async-stream = "0.3"
 async-trait = { workspace = true }
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
+aws-sdk-cloudwatchlogs = { version = "1.80", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
 aws-sdk-ecs = { version = "1.80", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
@@ -25,6 +31,7 @@ aws-sdk-sts = { version = "1.80", default-features = false, features = [
     "sigv4a",
 ] }
 chrono = { workspace = true }
+futures = "0.3"
 rise-backend-core = { path = "../rise-backend-core" }
 rise-backend-traefik = { path = "../rise-backend-traefik" }
 rise-deployment-spec = { path = "../rise-deployment-spec" }

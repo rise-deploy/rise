@@ -28,9 +28,11 @@ pub mod health_path;
 pub mod identity;
 pub mod labels;
 pub mod lifecycle;
+pub mod logs;
 pub mod models;
 pub mod naming;
 pub mod observation;
+pub mod organization;
 pub mod providers;
 pub mod quantity;
 pub mod rolling;
@@ -43,7 +45,9 @@ pub mod url_builder;
 
 pub mod test_helpers;
 
-pub use backend::{DeploymentBackend, DeploymentUrls};
+pub use backend::{
+    normalize_runtime_arch, AccessClass, BackendCapabilities, DeploymentBackend, DeploymentUrls,
+};
 pub use custom_domain::validate_custom_domain;
 pub use desired::{DesiredContainer, DesiredRoute};
 pub use diff::{
@@ -59,6 +63,10 @@ pub use lifecycle::{
 };
 pub use naming::{container_name, group_app_name, sanitize_ecs_name, stable_identity_name};
 pub use observation::{derive_events, ContainerObservation, DerivedEvent, ObservedState};
+pub use organization::{
+    controller_class_matches, resolve_namespace_prefix, resolve_namespace_prefix_fallback,
+    OrganizationView, NAMESPACE_PREFIX_ANNOTATION,
+};
 pub use providers::{
     EncryptionProvider, ImageTagType, RegistryAuthMethod, RegistryCredentials, RegistryProvider,
 };
