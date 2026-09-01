@@ -45,9 +45,8 @@ allow = [
     "Zlib",
 ]
 
-# Our own crates are `publish = false`, and two of them are BUSL-1.1. Without
-# this they would be checked against the allow list above and rejected — a
-# third-party license policy has nothing to say about first-party code.
+# Our own crates are `publish = false`. A third-party license policy has nothing
+# to say about first-party code, so private packages stay outside this gate.
 private = { ignore = true }
 
 confidence-threshold = 0.9
