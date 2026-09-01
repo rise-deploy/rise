@@ -139,9 +139,6 @@ pub struct AppState {
     pub ingress_schema: String,
     /// Optional ingress port (for development environments)
     pub ingress_port: Option<u16>,
-    /// ResourceBuilder for Metacontroller webhook (builds K8s resource specs)
-    #[cfg(feature = "backend")]
-    pub resource_builder: Option<Arc<crate::server::deployment::resource_builder::ResourceBuilder>>,
     /// Native architecture accepted by the configured deployment runtime.
     ///
     /// Kubernetes derives this from its architecture node selector. Docker
@@ -152,13 +149,13 @@ pub struct AppState {
     /// Kubernetes client for direct API calls (pod health checks, log streaming)
     #[cfg(feature = "backend")]
     pub kube_client: Option<kube::Client>,
-    /// IP validator for Metacontroller webhook requests (None in dev mode)
-    #[cfg(feature = "backend")]
-    pub metacontroller_ip_validator:
-        Option<Arc<crate::server::deployment::ip_validator::MetacontrollerIpValidator>>,
     /// Port for the internal metacontroller webhook listener
     #[cfg(feature = "backend")]
     pub metacontroller_webhook_port: Option<u16>,
+    /// Everything the Metacontroller webhook handlers need, or `None` when the
+    /// Kubernetes controller is not configured.
+    #[cfg(feature = "backend")]
+    pub webhook_ctx: Option<Arc<crate::server::deployment::webhook::WebhookContext>>,
     /// Default resource values for new deployments
     #[cfg(feature = "backend")]
     pub deployment_defaults: Option<crate::server::settings::DeploymentDefaults>,
@@ -1830,6 +1827,27 @@ impl AppState {
                 deployment_store.clone(),
             ));
 
+        // The Metacontroller webhook's own dependency bundle. `None` unless the
+        // Kubernetes controller is configured, which is also what gates the
+        // webhook listener in `server::run`.
+        #[cfg(feature = "backend")]
+        let webhook_ctx = match (resource_builder.as_ref(), webhook_kube_client.as_ref()) {
+            (Some(rb), Some(kc)) => Some(Arc::new(
+                crate::server::deployment::webhook::WebhookContext {
+                    kube_client: kc.clone(),
+                    resource_builder: rb.clone(),
+                    ip_validator: ip_validator.clone(),
+                    deployment_store: deployment_store.clone(),
+                    org_view: org_view.clone(),
+                    jwt_signer: jwt_signer.clone(),
+                    encryption_provider: encryption_provider.clone(),
+                    controller_class_name: deployment_controller_class_name.clone(),
+                    identity_token_ttl_seconds,
+                },
+            )),
+            _ => None,
+        };
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -2001,15 +2019,13 @@ impl AppState {
             ingress_schema,
             ingress_port,
             #[cfg(feature = "backend")]
-            resource_builder,
-            #[cfg(feature = "backend")]
             runtime_arch,
             #[cfg(feature = "backend")]
             kube_client: webhook_kube_client,
             #[cfg(feature = "backend")]
-            metacontroller_ip_validator: ip_validator,
-            #[cfg(feature = "backend")]
             metacontroller_webhook_port: webhook_port,
+            #[cfg(feature = "backend")]
+            webhook_ctx,
             #[cfg(feature = "backend")]
             deployment_defaults: deployment_defaults_opt,
             #[cfg(feature = "backend")]

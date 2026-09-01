@@ -57,7 +57,7 @@ pub fn deployment_routes() -> Router<AppState> {
 /// These are called by Metacontroller within the cluster and require a shared-secret
 /// token passed as a `?token=` query parameter.
 #[cfg(feature = "backend")]
-pub fn metacontroller_routes() -> Router<AppState> {
+pub fn metacontroller_routes() -> Router<std::sync::Arc<super::webhook::WebhookContext>> {
     Router::new()
         .route("/metacontroller/sync", post(super::webhook::handle_sync))
         .route(
