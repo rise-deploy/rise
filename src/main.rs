@@ -862,7 +862,7 @@ enum EnvCommands {
         #[arg(long, short = 'E')]
         environment: Option<String>,
     },
-    /// Export resolved environment variables in dotfile format (KEY=value)
+    /// Export resolved environment variables as shell export commands
     #[command(visible_alias = "x")]
     Export {
         /// Project name (optional if rise.toml contains [project] section)

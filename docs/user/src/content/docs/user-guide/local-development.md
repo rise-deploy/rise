@@ -177,13 +177,14 @@ rise build myapp:latest --push
 If your workflow runs the app directly (e.g. `cargo run`, `npm run dev`) rather than in a container, use `rise env export` to inject Rise's environment variables into your shell:
 
 ```bash
+eval "$(rise env export -p my-app)"
+npm run dev
+# Or save the commands and source them later:
 rise env export -p my-app > .env.rise
-# Load with your preferred tool:
-export $(cat .env.rise | xargs)
-# or: source .env.rise, direnv, dotenv, etc.
+source .env.rise
 ```
 
-`rise env export` outputs the resolved set of non-secret environment variables — `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URLS`, and any user-set project variables. No image build is required.
+`rise env export` outputs shell-safe `export` commands for the resolved set of loadable environment variables — `PORT`, `RISE_ISSUER`, `RISE_APP_URL`, `RISE_APP_URLS`, and any user-set project variables. Protected secrets are omitted. No image build is required.
 
 :::note
 Variables from extensions (e.g., RDS database credentials) are protected secrets and are not included. Use a local database instead and override `DATABASE_URL` in your shell.
