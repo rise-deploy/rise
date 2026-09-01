@@ -101,17 +101,20 @@ fn network_exists(container_cli: &str, network_name: &str) -> bool {
 }
 
 /// Create a Docker network if it doesn't exist
-fn create_network(container_cli: &str, network_name: &str) -> Result<()> {
+fn create_network(
+    container_cli: &str,
+    network_name: &str,
+    output: super::CommandOutput,
+) -> Result<()> {
     if network_exists(container_cli, network_name) {
         debug!("Network '{}' already exists", network_name);
         return Ok(());
     }
 
     info!("Creating Docker network '{}'", network_name);
-    let status = Command::new(container_cli)
-        .args(["network", "create", network_name])
-        .status()
-        .context("Failed to create network")?;
+    let mut command = Command::new(container_cli);
+    command.args(["network", "create", network_name]);
+    let status = super::run_command(command, "Failed to create network", output)?;
 
     if !status.success() {
         bail!("Failed to create network '{}'", network_name);
@@ -122,16 +125,20 @@ fn create_network(container_cli: &str, network_name: &str) -> Result<()> {
 }
 
 /// Connect a container to a Docker network
-fn connect_to_network(container_cli: &str, network_name: &str, container_name: &str) -> Result<()> {
+fn connect_to_network(
+    container_cli: &str,
+    network_name: &str,
+    container_name: &str,
+    output: super::CommandOutput,
+) -> Result<()> {
     info!(
         "Connecting container '{}' to network '{}'",
         container_name, network_name
     );
 
-    let status = Command::new(container_cli)
-        .args(["network", "connect", network_name, container_name])
-        .status()
-        .context("Failed to connect to network")?;
+    let mut command = Command::new(container_cli);
+    command.args(["network", "connect", network_name, container_name]);
+    let status = super::run_command(command, "Failed to connect to network", output)?;
 
     if !status.success() {
         bail!(
@@ -358,13 +365,16 @@ fn get_daemon_state(container_cli: &str, daemon_name: &str) -> DaemonState {
 /// Uses `rm -f` instead of `stop` because Podman does not always clean up
 /// `--rm` containers reliably on `stop`, leaving the container name in use.
 /// `rm -f` works correctly on both Docker and Podman.
-fn stop_buildkit_daemon(container_cli: &ContainerCli, daemon_name: &str) -> Result<()> {
+fn stop_buildkit_daemon(
+    container_cli: &ContainerCli,
+    daemon_name: &str,
+    output: super::CommandOutput,
+) -> Result<()> {
     info!("Stopping existing BuildKit daemon '{}'", daemon_name);
 
-    let status = Command::new(container_cli.command())
-        .args(["rm", "-f", daemon_name])
-        .status()
-        .context("Failed to remove BuildKit daemon")?;
+    let mut command = Command::new(container_cli.command());
+    command.args(["rm", "-f", daemon_name]);
+    let status = super::run_command(command, "Failed to remove BuildKit daemon", output)?;
 
     if !status.success() {
         bail!("Failed to remove BuildKit daemon");
@@ -381,6 +391,7 @@ fn create_buildkit_daemon(
     ssl_cert_file: Option<&Path>,
     network_name: Option<&str>,
     proxy_vars: &std::collections::HashMap<String, String>,
+    output: super::CommandOutput,
 ) -> Result<String> {
     if let Some(cert_path) = ssl_cert_file {
         info!(
@@ -522,7 +533,7 @@ fn create_buildkit_daemon(
 
     cmd.arg("moby/buildkit");
 
-    let status = cmd.status().context("Failed to start BuildKit daemon")?;
+    let status = super::run_command(cmd, "Failed to start BuildKit daemon", output)?;
 
     if !status.success() {
         bail!("Failed to create BuildKit daemon");
@@ -533,8 +544,8 @@ fn create_buildkit_daemon(
     // Connect to network if specified (skip when using host networking)
     if !use_host_network {
         if let Some(network) = network_name {
-            create_network(container_cli.command(), network)?;
-            connect_to_network(container_cli.command(), network, daemon_name)?;
+            create_network(container_cli.command(), network, output)?;
+            connect_to_network(container_cli.command(), network, daemon_name, output)?;
         }
     }
 
@@ -547,6 +558,7 @@ fn create_buildkit_daemon(
 pub(crate) fn ensure_managed_buildkit_daemon(
     ssl_cert_file: Option<&Path>,
     container_cli: &ContainerCli,
+    output: super::CommandOutput,
 ) -> Result<String> {
     let daemon_name = "rise-buildkit";
 
@@ -573,13 +585,14 @@ pub(crate) fn ensure_managed_buildkit_daemon(
                 "BuildKit daemon version changed ({:?} -> {}), recreating",
                 current_version, DAEMON_VERSION
             );
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
             return create_buildkit_daemon(
                 container_cli,
                 daemon_name,
                 ssl_cert_file,
                 network_name.as_deref(),
                 &proxy_vars,
+                output,
             );
         }
 
@@ -587,13 +600,14 @@ pub(crate) fn ensure_managed_buildkit_daemon(
         let current_proxy_hash = get_proxy_hash_label(container_cli.command(), daemon_name);
         if current_proxy_hash != expected_proxy_hash {
             info!("Proxy configuration has changed, recreating daemon");
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
             return create_buildkit_daemon(
                 container_cli,
                 daemon_name,
                 ssl_cert_file,
                 network_name.as_deref(),
                 &proxy_vars,
+                output,
             );
         }
 
@@ -606,13 +620,14 @@ pub(crate) fn ensure_managed_buildkit_daemon(
                 "Host networking changed (was={}, want={}), recreating daemon",
                 has_host_network, want_host_network
             );
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
             return create_buildkit_daemon(
                 container_cli,
                 daemon_name,
                 ssl_cert_file,
                 network_name.as_deref(),
                 &proxy_vars,
+                output,
             );
         }
     }
@@ -646,7 +661,7 @@ pub(crate) fn ensure_managed_buildkit_daemon(
             } else if config_changed {
                 info!("BuildKit config has changed (insecure registries), recreating daemon");
             }
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
         }
 
         // Certificate provided, but daemon has no cert label
@@ -664,7 +679,7 @@ pub(crate) fn ensure_managed_buildkit_daemon(
             } else {
                 info!("SSL certificate now available, recreating daemon with certificate");
             }
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
         }
 
         // No certificate, daemon has no cert label (matches)
@@ -685,7 +700,7 @@ pub(crate) fn ensure_managed_buildkit_daemon(
             } else if config_changed {
                 info!("BuildKit config has changed (insecure registries), recreating daemon");
             }
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
         }
 
         // No certificate, but daemon has cert (mismatch)
@@ -705,7 +720,7 @@ pub(crate) fn ensure_managed_buildkit_daemon(
             } else {
                 info!("SSL certificate removed, recreating daemon without certificate");
             }
-            stop_buildkit_daemon(container_cli, daemon_name)?;
+            stop_buildkit_daemon(container_cli, daemon_name, output)?;
         }
 
         // Daemon doesn't exist
@@ -721,12 +736,17 @@ pub(crate) fn ensure_managed_buildkit_daemon(
         ssl_cert_file,
         network_name.as_deref(),
         &proxy_vars,
+        output,
     )
 }
 
 /// Ensure buildx builder exists for the given BuildKit daemon
 /// Returns the builder name to use
-pub(crate) fn ensure_buildx_builder(container_cli: &str, buildkit_host: &str) -> Result<String> {
+pub(crate) fn ensure_buildx_builder(
+    container_cli: &str,
+    buildkit_host: &str,
+    output: super::CommandOutput,
+) -> Result<String> {
     let builder_name = "rise-buildkit";
 
     // Check if builder already exists
@@ -735,9 +755,9 @@ pub(crate) fn ensure_buildx_builder(container_cli: &str, buildkit_host: &str) ->
         .output();
 
     match inspect_status {
-        Ok(output) if output.status.success() => {
+        Ok(builder_inspect) if builder_inspect.status.success() => {
             // Builder exists, check if it's pointing to the correct endpoint
-            let inspect_output = String::from_utf8_lossy(&output.stdout);
+            let inspect_output = String::from_utf8_lossy(&builder_inspect.stdout);
 
             // Check if the buildkit_host appears in the inspect output
             // The output contains lines like "Endpoint: docker-container://rise-buildkit"
@@ -754,9 +774,9 @@ pub(crate) fn ensure_buildx_builder(container_cli: &str, buildkit_host: &str) ->
                 "Buildx builder '{}' exists but points to different endpoint, recreating",
                 builder_name
             );
-            let _ = Command::new(container_cli)
-                .args(["buildx", "rm", builder_name])
-                .status();
+            let mut command = Command::new(container_cli);
+            command.args(["buildx", "rm", builder_name]);
+            let _ = super::run_command(command, "Failed to remove buildx builder", output);
         }
         _ => {
             info!(
@@ -767,10 +787,9 @@ pub(crate) fn ensure_buildx_builder(container_cli: &str, buildkit_host: &str) ->
     }
 
     // Create new builder pointing to the BuildKit daemon
-    let status = Command::new(container_cli)
-        .args(["buildx", "create", "--name", builder_name, buildkit_host])
-        .status()
-        .context("Failed to create buildx builder")?;
+    let mut command = Command::new(container_cli);
+    command.args(["buildx", "create", "--name", builder_name, buildkit_host]);
+    let status = super::run_command(command, "Failed to create buildx builder", output)?;
 
     if !status.success() {
         bail!("Failed to create buildx builder '{}'", builder_name);

@@ -16,6 +16,7 @@ pub(crate) fn build_image_with_buildpacks(
     env: &[String],
     no_cache: bool,
     platform: &str,
+    output: super::CommandOutput,
 ) -> Result<()> {
     // Check if pack CLI is available
     let pack_check = Command::new("pack").arg("version").output();
@@ -130,7 +131,7 @@ pub(crate) fn build_image_with_buildpacks(
 
     debug!("Executing command: {:?}", cmd);
 
-    let status = cmd.status().context("Failed to execute pack build")?;
+    let status = super::run_command(cmd, "Failed to execute pack build", output)?;
 
     if !status.success() {
         bail!("pack build failed with status: {}", status);

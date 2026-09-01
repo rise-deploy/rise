@@ -4,6 +4,7 @@ use comfy_table::{
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -296,6 +297,8 @@ pub async fn list_deployments(
     project: &str,
     group: Option<&str>,
     limit: usize,
+    json_output: bool,
+    status_file: Option<&str>,
 ) -> Result<()> {
     let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
@@ -338,6 +341,24 @@ pub async fn list_deployments(
 
     // Limit results
     deployments.truncate(limit);
+
+    let deployments_json = if json_output || status_file.is_some() {
+        Some(
+            serde_json::to_string_pretty(&deployments)
+                .context("Failed to serialize deployments as JSON")?,
+        )
+    } else {
+        None
+    };
+
+    if let (Some(path), Some(json)) = (status_file, deployments_json.as_deref()) {
+        write_json_status_file(path, json)?;
+    }
+
+    if json_output {
+        println!("{}", deployments_json.expect("JSON was serialized above"));
+        return Ok(());
+    }
 
     if deployments.is_empty() {
         println!("No deployments found for project '{}'", project);
@@ -491,6 +512,7 @@ pub async fn show_deployment(
             project,
             deployment_id,
             timeout_str,
+            false,
         )
         .await?;
 
@@ -805,6 +827,7 @@ async fn push_with_fresh_registry_credentials(
     project_name: &str,
     deployment_id: &str,
     image_tag: &str,
+    output: build::CommandOutput,
 ) -> Result<()> {
     let registry_credentials = fetch_deployment_registry_credentials(
         http_client,
@@ -823,9 +846,10 @@ async fn push_with_fresh_registry_credentials(
         &registry_credentials,
         project_name,
         deployment_id,
+        output,
     )
     .await?;
-    build::docker_push(container_cli, image_tag)
+    build::docker_push_with_output(container_cli, image_tag, output)
 }
 
 /// Fetch registry push credentials scoped to a specific deployment.
@@ -973,6 +997,10 @@ pub struct DeploymentOptions<'a> {
     pub cpu: Option<String>,
     /// Memory allocation (resolved from CLI flag > rise.toml > server default)
     pub memory: Option<String>,
+    /// Emit the completed deployment as JSON on stdout.
+    pub json_output: bool,
+    /// Write the completed deployment JSON to this file.
+    pub status_file: Option<String>,
 }
 
 pub async fn create_deployment(
@@ -1010,6 +1038,11 @@ pub async fn create_deployment(
     // exchanged for that service account's short-lived Rise access token;
     // otherwise it is used as-is.
     let provider = crate::token_source::resolve_token_provider(http_client, config)?;
+    let command_output = if deploy_opts.json_output {
+        build::CommandOutput::Stderr
+    } else {
+        build::CommandOutput::Inherit
+    };
     debug!("Authenticating to backend using {}", provider.describe());
     let token = token_with_retry(&provider).await?;
 
@@ -1157,7 +1190,12 @@ pub async fn create_deployment(
                 backend_platform,
             );
             log_platform_choice(&platform, source, "Pulling");
-            if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
+            if let Err(e) = build::docker_pull_with_output(
+                &container_cli,
+                source_image,
+                &platform,
+                command_output,
+            ) {
                 report_failed_status(
                     http_client,
                     backend_url,
@@ -1171,9 +1209,12 @@ pub async fn create_deployment(
             }
 
             // Tag it with the Rise registry image tag
-            if let Err(e) =
-                build::docker_tag(&container_cli, source_image, &deployment_info.image_tag)
-            {
+            if let Err(e) = build::docker_tag_with_output(
+                &container_cli,
+                source_image,
+                &deployment_info.image_tag,
+                command_output,
+            ) {
                 report_failed_status(
                     http_client,
                     backend_url,
@@ -1209,6 +1250,7 @@ pub async fn create_deployment(
                     deploy_opts.project_name,
                     &deployment_info.deployment_id,
                     &deployment_info.image_tag,
+                    command_output,
                 )
                 .await
             } else {
@@ -1228,9 +1270,14 @@ pub async fn create_deployment(
                     &registry_credentials,
                     deploy_opts.project_name,
                     &deployment_info.deployment_id,
+                    command_output,
                 )
                 .await?;
-                build::docker_push(&container_cli, &deployment_info.image_tag)
+                build::docker_push_with_output(
+                    &container_cli,
+                    &deployment_info.image_tag,
+                    command_output,
+                )
             };
             if let Err(e) = push_result {
                 report_failed_status(
@@ -1305,7 +1352,8 @@ pub async fn create_deployment(
             deploy_opts.build_args,
             deploy_opts.toml_config,
             backend_platform,
-        );
+        )
+        .with_output(command_output);
         log_platform_choice(&options.platform, options.platform_source, "Building");
 
         if !deploy_opts.build_args.separate_push {
@@ -1326,6 +1374,7 @@ pub async fn create_deployment(
                 &registry_credentials,
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
+                command_output,
             )
             .await?;
         }
@@ -1374,6 +1423,7 @@ pub async fn create_deployment(
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
                 &deployment_info.image_tag,
+                command_output,
             )
             .await
             {
@@ -1409,20 +1459,79 @@ pub async fn create_deployment(
         );
     }
     info!("  Deployment ID: {}", deployment_info.deployment_id);
-    println!();
+
+    if !deploy_opts.json_output {
+        println!();
+    }
 
     // Step 7: Follow deployment until completion
-    show_deployment(
+    let final_deployment = super::follow_ui::follow_deployment_with_ui(
         http_client,
         backend_url,
         config,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
-        true,  // follow
-        "10m", // timeout
+        "10m",
+        deploy_opts.json_output,
     )
     .await?;
 
+    let deployment_json = if deploy_opts.json_output || deploy_opts.status_file.is_some() {
+        Some(
+            serde_json::to_string_pretty(&final_deployment)
+                .context("Failed to serialize deployment as JSON")?,
+        )
+    } else {
+        None
+    };
+
+    if let (Some(path), Some(json)) = (
+        deploy_opts.status_file.as_deref(),
+        deployment_json.as_deref(),
+    ) {
+        write_json_status_file(path, json)?;
+    }
+
+    if deploy_opts.json_output {
+        println!("{}", deployment_json.expect("JSON was serialized above"));
+    }
+
+    if final_deployment.status == DeploymentStatus::Failed {
+        if let Some(error) = final_deployment.error_message {
+            bail!("Deployment failed: {error}");
+        } else {
+            bail!("Deployment failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Write a complete JSON document without exposing a partially written file to
+/// readers such as CI jobs.
+pub(crate) fn write_json_status_file(path: &str, json: &str) -> Result<()> {
+    let path = Path::new(path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Status file path must name a valid UTF-8 file")?;
+    let temporary_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    std::fs::write(&temporary_path, json)
+        .with_context(|| format!("Failed to write status file {}", path.display()))?;
+    if let Err(error) = std::fs::rename(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error)
+            .with_context(|| format!("Failed to replace status file {}", path.display()));
+    }
     Ok(())
 }
 /// Multi-container build path: builds every container with `[build]` set
@@ -1466,6 +1575,11 @@ async fn build_and_push_multi_container(
     // can't outlast a short-lived CI token. See #352.
     let token = token_with_retry(provider).await?;
     let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
+    let command_output = if deploy_opts.json_output {
+        build::CommandOutput::Stderr
+    } else {
+        build::CommandOutput::Inherit
+    };
 
     update_deployment_status_with(
         http_client,
@@ -1527,7 +1641,8 @@ async fn build_and_push_multi_container(
             BuildPushMode::Deferred
         } else {
             BuildPushMode::Inline
-        });
+        })
+        .with_output(command_output);
         let container_cli = options.container_cli.command().to_string();
         // What the project asked for. `None` means the method was auto-detected
         // from the build context, and the detected value is resolved inside
@@ -1566,6 +1681,7 @@ async fn build_and_push_multi_container(
                     &fresh_creds,
                     deploy_opts.project_name,
                     &deployment_info.deployment_id,
+                    command_output,
                 )
                 .await?;
                 cached_creds = Some(TimedRegistryCredentials::new(fresh_creds, &container_cli));
@@ -1602,6 +1718,7 @@ async fn build_and_push_multi_container(
                 deploy_opts.project_name,
                 &deployment_info.deployment_id,
                 image_tag,
+                command_output,
             )
             .await
             {
@@ -1672,6 +1789,7 @@ async fn login_to_registry(
     credentials: &RegistryCredentials,
     project_name: &str,
     deployment_id: &str,
+    output: build::CommandOutput,
 ) -> Result<()> {
     let result = match credentials.auth_method {
         RegistryAuthMethod::LoginCredentials => {
@@ -1679,11 +1797,12 @@ async fn login_to_registry(
                 return Ok(()); // OCI client-auth: credentials managed by docker login
             }
             info!("Logging into registry");
-            build::docker_login(
+            build::docker_login_with_output(
                 container_cli,
                 &credentials.registry_url,
                 &credentials.username,
                 &credentials.password,
+                output,
             )
         }
         RegistryAuthMethod::RegistryToken => {
@@ -2782,7 +2901,7 @@ pub(super) async fn open_log_stream(
 mod tests {
     use super::{
         build_multi_container_payload, extract_log_event, normalize_git_url, token_with_retry,
-        ByteLineBuffer,
+        write_json_status_file, ByteLineBuffer,
     };
     use crate::token_source::{TokenProvider, TokenSource, TokenSourceError};
     use std::sync::{
@@ -3107,6 +3226,26 @@ mod tests {
         let (containers, routes) = build_multi_container_payload(Some(&config)).unwrap();
         assert!(containers.is_none());
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn status_file_replacement_keeps_the_document_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deployment.json");
+        let path = path.to_str().unwrap();
+
+        write_json_status_file(path, r#"{"status":"Healthy"}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            r#"{"status":"Healthy"}"#
+        );
+
+        write_json_status_file(path, r#"{"status":"Failed"}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            r#"{"status":"Failed"}"#
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     mod registry_credential_reuse {
