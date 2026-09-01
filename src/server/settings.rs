@@ -1004,25 +1004,7 @@ fn default_custom_domain_tls_mode() -> CustomDomainTlsMode {
 
 pub use rise_backend_core::AccessRequirement;
 
-/// Access class configuration for ingress authentication
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct AccessClass {
-    /// Display name for UI (e.g., "Public")
-    pub display_name: String,
-
-    /// Description for UI
-    pub description: String,
-
-    /// Ingress class to use
-    pub ingress_class: String,
-
-    /// Access requirement level
-    pub access_requirement: AccessRequirement,
-
-    /// Optional custom nginx annotations
-    #[serde(default)]
-    pub custom_annotations: std::collections::HashMap<String, String>,
-}
+pub use rise_backend_core::AccessClass;
 
 /// Validate that a Traefik-fronted deployment controller (Docker or ECS) can
 /// actually enforce the authentication required by its configured access classes.

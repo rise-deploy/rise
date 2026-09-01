@@ -134,3 +134,61 @@ pub struct BackendCapabilities {
     /// the concept does not apply to this runtime.
     pub pod_security_enabled: Option<bool>,
 }
+
+/// Normalize architecture names from runtime APIs to OCI platform names.
+///
+/// Docker normally reports Go's `GOARCH` values (already `amd64`, `arm64`,
+/// etc.), but compatible/remote daemons may expose kernel-style aliases.  Keep
+/// the capability stable so the CLI can safely prepend `linux/`.
+pub fn normalize_runtime_arch(raw: &str) -> Option<String> {
+    let arch = raw.trim().to_ascii_lowercase();
+    let normalized = match arch.as_str() {
+        "" => return None,
+        "x86_64" | "x86-64" => "amd64",
+        "aarch64" => "arm64",
+        "i386" | "i486" | "i586" | "i686" | "x86" => "386",
+        "armv7" | "armv7l" => "arm/v7",
+        "armv6" | "armv6l" => "arm/v6",
+        other => other,
+    };
+    Some(normalized.to_string())
+}
+
+/// Named ingress access configuration, referenced by projects through their
+/// access class. Shared by every backend: each maps `access_requirement` onto
+/// its own ingress mechanism (nginx annotations, Traefik forwardAuth).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct AccessClass {
+    /// Display name for UI (e.g., "Public")
+    pub display_name: String,
+
+    /// Description for UI
+    pub description: String,
+
+    /// Ingress class to use
+    pub ingress_class: String,
+
+    /// Access requirement level
+    pub access_requirement: crate::AccessRequirement,
+
+    /// Optional custom annotations
+    #[serde(default)]
+    pub custom_annotations: std::collections::HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_runtime_architectures_to_oci_names() {
+        assert_eq!(normalize_runtime_arch("amd64").as_deref(), Some("amd64"));
+        assert_eq!(normalize_runtime_arch("x86_64").as_deref(), Some("amd64"));
+        assert_eq!(normalize_runtime_arch("aarch64").as_deref(), Some("arm64"));
+        assert_eq!(normalize_runtime_arch("ARM64").as_deref(), Some("arm64"));
+        assert_eq!(normalize_runtime_arch("armv7l").as_deref(), Some("arm/v7"));
+        assert_eq!(normalize_runtime_arch("s390x").as_deref(), Some("s390x"));
+        assert_eq!(normalize_runtime_arch("  "), None);
+    }
+}

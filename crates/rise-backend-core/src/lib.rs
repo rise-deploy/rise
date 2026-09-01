@@ -45,7 +45,9 @@ pub mod url_builder;
 
 pub mod test_helpers;
 
-pub use backend::{BackendCapabilities, DeploymentBackend, DeploymentUrls};
+pub use backend::{
+    normalize_runtime_arch, AccessClass, BackendCapabilities, DeploymentBackend, DeploymentUrls,
+};
 pub use custom_domain::validate_custom_domain;
 pub use desired::{DesiredContainer, DesiredRoute};
 pub use diff::{
