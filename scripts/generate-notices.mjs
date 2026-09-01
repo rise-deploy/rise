@@ -22,7 +22,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -151,6 +151,71 @@ function readManifest(name) {
  * entries are deduplicated on name@version, preferring whichever copy actually
  * carries a license text.
  */
+/**
+ * Read whatever license text a package ships.
+ *
+ * Most ship a `LICENSE` file. Some ship a `LICENSE` *directory* holding several
+ * — pagefind does, carrying its own plus one for a vendored component — and
+ * both have to be reproduced, so a directory is concatenated rather than
+ * skipped. A naive readFileSync on that path throws EISDIR.
+ */
+function readLicenseText(dir) {
+  const candidates = ['LICENSE', 'LICENSE.md', 'LICENSE.txt', 'LICENCE', 'LICENCE.md', 'COPYING'];
+  for (const name of candidates) {
+    const path = join(dir, name);
+    if (!existsSync(path)) continue;
+    const stat = statSync(path);
+    if (stat.isFile()) {
+      return readFileSync(path, 'utf8').replace(/\r\n/g, '\n').trimEnd();
+    }
+    if (stat.isDirectory()) {
+      const parts = readdirSync(path)
+        .sort()
+        .map((f) => join(path, f))
+        .filter((f) => statSync(f).isFile())
+        .map((f) => readFileSync(f, 'utf8').replace(/\r\n/g, '\n').trimEnd());
+      if (parts.length > 0) return parts.join('\n\n----\n\n');
+    }
+  }
+  return null;
+}
+
+/**
+ * Packages that ship but that no bundler reports, because their output is
+ * produced outside the module graph. License text is read from the installed
+ * package at generation time rather than copied into the supplemental file, so
+ * it cannot drift from what is actually installed.
+ */
+function supplementalPackages(section) {
+  const spec = JSON.parse(
+    readFileSync(join(ROOT, 'scripts', 'notices', 'npm-supplemental.json'), 'utf8'),
+  );
+  return spec.packages
+    .filter((entry) => entry.section === section)
+    .map((entry) => {
+      const dir = join(ROOT, entry.dir);
+      if (!existsSync(dir)) {
+        throw new Error(
+          `supplemental package ${entry.name} not installed at ${entry.dir}. ` +
+            'Run the npm install step first, or drop the entry if the dependency is gone.',
+        );
+      }
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
+      return {
+        name: manifest.name,
+        version: manifest.version,
+        license:
+          typeof manifest.license === 'string' ? manifest.license : (manifest.license?.type ?? null),
+        repository:
+          typeof manifest.repository === 'string'
+            ? manifest.repository
+            : (manifest.repository?.url ?? null),
+        licenseText: readLicenseText(dir),
+        via: 'supplemental',
+      };
+    });
+}
+
 function mergePackages(manifests) {
   const merged = new Map();
   for (const entry of manifests.flat()) {
@@ -268,9 +333,18 @@ function main() {
   );
   sections.push(renderPackages(web));
 
+  const docs = mergePackages([readManifest('docs-js.json'), supplementalPackages('docs')]);
+  enforceAllowList(docs, allowed);
+  sections.push('## Bundled documentation site\n');
+  sections.push(
+    'The user documentation served by the `rise` server image at `/docs` is a\n' +
+      'static Astro site, and these are the npm packages whose code it ships.\n',
+  );
+  sections.push(renderPackages(docs));
+
   writeFileSync(OUT, `${HEADER}\n${sections.join('\n')}`);
   process.stderr.write(
-    `wrote ${OUT}: ${web.length} npm packages, ` +
+    `wrote ${OUT}: ${web.length} web-UI packages, ${docs.length} docs packages, ` +
       `${allowed.size} licenses allowed by deny.toml\n`,
   );
 }

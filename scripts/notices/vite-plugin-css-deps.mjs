@@ -16,7 +16,7 @@
  * during the build" and "reaches a user" are the same set.
  */
 
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
 
 /** Strip Vite's query suffixes (`?used`, `?direct`, `?inline`, `?raw`). */
@@ -47,12 +47,27 @@ function owningPackage(file) {
   return null;
 }
 
-/** Find the license text a package ships, if it ships one. */
+/**
+ * Find the license text a package ships, if it ships one.
+ *
+ * A few packages ship `LICENSE` as a *directory* of several files rather than
+ * one file; concatenate those, and never readFileSync a directory.
+ */
 function licenseText(dir) {
   for (const name of ['LICENSE', 'LICENSE.md', 'LICENSE.txt', 'LICENCE', 'LICENCE.md', 'COPYING']) {
     const p = join(dir, name);
-    if (existsSync(p)) {
+    if (!existsSync(p)) continue;
+    const stat = statSync(p);
+    if (stat.isFile()) {
       return readFileSync(p, 'utf8').replace(/\r\n/g, '\n').trimEnd();
+    }
+    if (stat.isDirectory()) {
+      const parts = readdirSync(p)
+        .sort()
+        .map((f) => join(p, f))
+        .filter((f) => statSync(f).isFile())
+        .map((f) => readFileSync(f, 'utf8').replace(/\r\n/g, '\n').trimEnd());
+      if (parts.length > 0) return parts.join('\n\n----\n\n');
     }
   }
   return null;

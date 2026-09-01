@@ -1,0 +1,11 @@
+{
+  "_comment": "Packages that ship in an artifact but that no bundler reports, because their output is produced outside the Vite/Rollup graph. Each entry states why it is here, so a future reader can tell whether it is still needed rather than deleting it on suspicion. `dir` is resolved relative to the repo root and its LICENSE file is read at generation time -- the text is never copied into this file, so it cannot go stale.",
+  "packages": [
+    {
+      "name": "pagefind",
+      "dir": "docs/node_modules/pagefind",
+      "section": "docs",
+      "reason": "Starlight's search. The Rust `pagefind` binary writes ~50 JS and WASM runtime files into docs/user/dist/pagefind/ after Astro finishes, so they never enter the Vite module graph. The bundler only sees @pagefind/default-ui, the UI wrapper."
+    }
+  ]
+}

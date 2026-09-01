@@ -186,7 +186,13 @@ description = "Regenerate THIRD-PARTY-NOTICES.md from the shipped dependencies."
 # `npm ci`, not `npm install`, so the lockfile cannot move underneath it.
 run = """
 mkdir -p target/notices
-(cd frontend && npm ci --silent && RISE_NOTICES_OUT="$PWD/../target/notices" npx vite build)
+NOTICES_OUT="$PWD/target/notices"
+(cd frontend && npm ci --silent && RISE_NOTICES_OUT="$NOTICES_OUT" npx vite build)
+# `npx astro build`, not `npm run build`: the package script runs `astro check`
+# in front, a full tsc pass this has no reason to pay for.
+(cd docs && npm ci --silent)
+node docs/scripts/generate-llms.mjs
+(cd docs/user && RISE_NOTICES_OUT="$NOTICES_OUT" npx astro build)
 node scripts/generate-notices.mjs
 """
 

@@ -1,10 +1,61 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import license from 'rollup-plugin-license';
 
 const base = process.env.ASTRO_BASE ?? '/docs';
 
+// Third-party attribution for the JavaScript this site ships. Inert unless
+// RISE_NOTICES_OUT is set, so `npm run build`, `mise docs:build` and the Docker
+// image build are unaffected -- only `mise notices:generate` turns it on.
+//
+// Note this reports only what Vite bundles. Pagefind's search runtime is
+// written into dist/ by a separate binary after the build and is attributed
+// through scripts/notices/npm-supplemental.json instead.
+const noticesOut = process.env.RISE_NOTICES_OUT;
+
 export default defineConfig({
   base,
+  vite: noticesOut
+    ? {
+        plugins: [
+          {
+            ...license({
+              thirdParty: {
+                includePrivate: false,
+                output: {
+                  file: `${noticesOut}/docs-js.json`,
+                  template: (deps) =>
+                    JSON.stringify(
+                      deps
+                        .map((d) => ({
+                          name: d.name,
+                          version: d.version,
+                          license: d.license ?? null,
+                          repository:
+                            typeof d.repository === 'string'
+                              ? d.repository
+                              : (d.repository?.url ?? null),
+                          licenseText: d.licenseText ?? null,
+                          via: 'js',
+                        }))
+                        // Producer order follows module traversal and is not
+                        // guaranteed stable; the notices file is committed.
+                        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+                      null,
+                      2,
+                    ),
+                },
+              },
+            }),
+            // Astro runs two Vite builds against the same plugin instance.
+            // `apply: 'build'` keeps it out of dev; `enforce: 'post'` runs it
+            // after Astro's own transforms so the module graph is final.
+            apply: 'build',
+            enforce: 'post',
+          },
+        ],
+      }
+    : {},
   integrations: [
     starlight({
       title: 'Rise User Docs',
