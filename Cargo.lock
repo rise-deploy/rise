@@ -4343,8 +4343,11 @@ name = "rise-backend-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
+ "futures",
  "regex",
  "reqwest 0.13.4",
  "rise-deployment-spec",

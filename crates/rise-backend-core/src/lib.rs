@@ -28,6 +28,7 @@ pub mod health_path;
 pub mod identity;
 pub mod labels;
 pub mod lifecycle;
+pub mod logs;
 pub mod models;
 pub mod naming;
 pub mod observation;

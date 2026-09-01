@@ -1,45 +1,28 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use futures::{Stream, StreamExt};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::db::models::{Deployment, DeploymentStatus, Project};
 use crate::server::deployment::resource_builder::{ResourceBuilder, LABEL_CONTAINER};
 use crate::server::settings::{DeploymentLogsSettings, KubernetesLogBackendSettings, LokiLabels};
+pub use rise_backend_core::logs::{
+    classify_log_line, decode_log_cursor, distinct_log_ids_from_newest, encode_log_cursor,
+    is_followable_status, line_matches_search, log_cursor_signature, merge_container_streams,
+    normalize_search, parse_duration_hint, select_recent_page, split_timestamped_log_line,
+    stable_log_id, status_stream, truncate_for_error, LogEvent, LogEventStream, LogQuery,
+    LogStatus, LogStatusReason, LogVolumeBucket, LogVolumeQuery, LogVolumeResponse,
+    LogsCapabilities, RuntimeLogBackend, TimestampedLineStream, DOCKER_MAX_TAIL, HEURISTIC_LEVELS,
+    LOKI_LEVELS, LOKI_MAX_TAIL,
+};
+use rise_backend_core::logs::{distinct_log_id, BoundedNewest, MergeKey};
 
 mod cloudwatch;
 use cloudwatch::CloudWatchLogBackend;
-
-/// Loki 3.x's documented `detected_level` value set. Passed through verbatim
-/// to clients; the frontend renders each via its own palette entry.
-pub const LOKI_LEVELS: &[&str] = &[
-    "unknown", "trace", "debug", "info", "warn", "error", "critical", "fatal",
-];
-
-/// The three levels the Kubernetes backend's internal regex classifier can
-/// emit. Each line lands in exactly one of these.
-pub const KUBERNETES_LEVELS: &[&str] = &["info", "warn", "error"];
-
-/// Server-side cap on `?tail=` passed to Loki's `query_range`. Advertised via
-/// `LogsCapabilities::max_tail` so the frontend can mirror the limit.
-pub const LOKI_MAX_TAIL: i64 = 5000;
-
-/// Ceiling on `?tail=` for the Docker backend, and on any merge buffer built
-/// without one.
-///
-/// The runtime backends fan out over a deployment's containers and merge the
-/// results here, in this process, so the buffer is the server's memory and the
-/// request that sizes it is a tenant's. Without a ceiling one request can name
-/// a tail large enough that the daemon returns whole retained logs for every
-/// container at once.
-pub const DOCKER_MAX_TAIL: i64 = 100_000;
 
 /// How many of a deployment's Pods the Kubernetes backend reads at once.
 ///
@@ -57,403 +40,6 @@ pub struct EcsCloudWatchContext {
     pub region: String,
     pub log_group: Option<String>,
     pub resource_prefix: String,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LogQuery {
-    pub follow: bool,
-    pub tail_lines: Option<i64>,
-    pub timestamps: bool,
-    pub since_seconds: Option<i64>,
-    pub start_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
-    /// Levels the caller wants to see. Empty means "all" (no filter).
-    /// Loki passes these straight into a `| detected_level=~"a|b|..."` clause;
-    /// the K8s backend filters post-classification.
-    pub levels: Vec<String>,
-    /// Optional case-insensitive substring users can type into the runtime
-    /// logs search box. Empty/whitespace means "no filter".
-    pub search: Option<String>,
-    /// Containers of the deployment the caller wants to see. Empty means
-    /// "all". Names are the deployment's own container names (the implicit
-    /// `app` for a single-container deployment); each backend maps them onto
-    /// whatever carries the attribution in its own store.
-    pub containers: Vec<String>,
-    /// Opaque continuation returned by the configured backend. Its contents
-    /// are private to that backend and bound to the deployment and filters.
-    pub cursor: Option<String>,
-    /// Per-Organization namespace prefix resolved by the caller (see
-    /// `resolve_project_namespace_prefix`). Used by the Kubernetes backend
-    /// to compute the Pod namespace; the Loki backend ignores this and
-    /// scopes its query by stream labels instead.
-    pub namespace_prefix: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LogVolumeQuery {
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub step_seconds: i64,
-    /// Levels the caller wants counted. Empty means "all" (no filter).
-    pub levels: Vec<String>,
-    /// Containers the caller wants counted. Empty means "all".
-    pub containers: Vec<String>,
-    pub search: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LogStatusReason {
-    NoLogsFound,
-    RetentionExpiredPossible,
-    HistoricalBackendNotConfigured,
-    #[allow(dead_code)]
-    BackendUnavailable,
-    DeploymentNotReady,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LogStatus {
-    pub reason: LogStatusReason,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retention_hint: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LogVolumeResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<LogStatus>,
-    pub start_time: String,
-    pub end_time: String,
-    pub step_seconds: i64,
-    pub buckets: Vec<LogVolumeBucket>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LogVolumeBucket {
-    pub timestamp: String,
-    pub total: u64,
-    /// Sparse per-level counts. Keys are level strings emitted by the
-    /// backend; zero counts are omitted. The sum across entries equals
-    /// `total`.
-    pub by_level: HashMap<String, u64>,
-}
-
-#[derive(Debug, Clone)]
-pub enum LogEvent {
-    /// A single log line plus the backend's classification of its level.
-    ///
-    /// `text` is the raw log line content (with an optional RFC3339 prefix
-    /// when `timestamps=true`). `level` is the level string the configured
-    /// backend emits — either Loki's `detected_level` (one of `LOKI_LEVELS`,
-    /// defaulting to `"unknown"`) or the K8s regex classifier's output (one
-    /// of `KUBERNETES_LEVELS`). `id` remains stable when the same stored event
-    /// appears in a retried or adjacent request. `container` names the
-    /// deployment container the line came from, when the backend can
-    /// attribute it.
-    Line {
-        id: String,
-        text: String,
-        level: String,
-        container: Option<String>,
-    },
-    Status(LogStatus),
-    /// Sent once the initial backlog phase of a streaming request has been
-    /// fully emitted, before the live-tail loop begins. `count` reports the
-    /// emitted backlog size and `next_cursor` continues toward older entries.
-    BacklogLoaded {
-        count: usize,
-        next_cursor: Option<String>,
-    },
-    /// Completes a finite historical page. A cursor is present exactly when
-    /// the backend can continue paging toward older entries.
-    PageLoaded {
-        next_cursor: Option<String>,
-    },
-    /// Makes a continuation available before a combined backlog/follow source
-    /// reaches an explicit backlog boundary.
-    CursorUpdated {
-        next_cursor: String,
-    },
-}
-
-pub type LogEventStream = futures::stream::BoxStream<'static, Result<LogEvent>>;
-
-/// One container's lines, each carrying the timestamp the merge orders on.
-type TimestampedLineStream = futures::stream::BoxStream<'static, Result<(DateTime<Utc>, LogEvent)>>;
-
-/// Merge per-container line streams into the one stream the API returns.
-///
-/// The two modes differ because the guarantees available differ, not for
-/// convenience:
-///
-/// - **Following**, lines are emitted as they arrive. A live merge cannot be
-///   globally ordered without buffering, and buffering a follow holds back the
-///   output that is the point of following. `docker compose logs -f` and
-///   `kubectl logs -f --all-containers` make the same trade; the container named
-///   on each line is what lets a reader put them back together.
-/// - **Not following**, the whole range is in hand, so it is sorted by
-///   timestamp before anything is emitted.
-///
-/// `tail_limit` is applied *after* the merge. It asks for N lines from the
-/// deployment, but each container's stream was asked for N of its own, so
-/// without this a four-container deployment returns four times what was asked.
-fn merge_container_streams(
-    streams: Vec<TimestampedLineStream>,
-    follow: bool,
-    tail_limit: Option<usize>,
-) -> LogEventStream {
-    if follow {
-        return futures::stream::select_all(streams)
-            .map(|item| item.map(|(_, event)| event))
-            .boxed();
-    }
-
-    // Only the newest `buffer_cap` lines can survive the trim below, so the
-    // buffer holds that many and no more. Collecting first and trimming after
-    // would size the server's memory from the request: N containers each
-    // answering a large `tail` at once.
-    let buffer_cap = tail_limit
-        .unwrap_or(DOCKER_MAX_TAIL as usize)
-        .clamp(1, DOCKER_MAX_TAIL as usize);
-
-    async_stream::stream! {
-        let mut newest = BoundedNewest::new(buffer_cap);
-        let mut arrivals = 0usize;
-        let mut merged = futures::stream::select_all(streams);
-        while let Some(item) = merged.next().await {
-            match item {
-                Ok((timestamp, event)) => {
-                    // This page is not paginated (`next_cursor` is always
-                    // `None` below), so arrival order is a sufficient tiebreak
-                    // here — no later request has to agree with it.
-                    let key = MergeKey { timestamp, source: 0, sequence: arrivals };
-                    arrivals = arrivals.saturating_add(1);
-                    newest.push(key, event);
-                }
-                // A container that failed has said so; the lines the others
-                // produced are still worth returning.
-                Err(e) => yield Err(e),
-            }
-        }
-
-        for event in newest.into_chronological() {
-            yield Ok(event);
-        }
-        yield Ok(LogEvent::PageLoaded { next_cursor: None });
-    }
-    .boxed()
-}
-
-/// Total order for merged lines: time first, then a tiebreak that does not
-/// depend on which source happened to answer first.
-///
-/// The tiebreak carries pagination correctness. Two pages are two requests, and
-/// if lines sharing a timestamp sorted differently between them, one would be
-/// served twice and another skipped — so `source`/`sequence` identify the
-/// stream and the line's place within it, never its arrival.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct MergeKey {
-    timestamp: DateTime<Utc>,
-    source: usize,
-    sequence: usize,
-}
-
-/// The newest `capacity` lines seen across every source, in bounded memory.
-///
-/// A merge cannot know which lines are the newest until every source has been
-/// read, but it does know that anything older than the `capacity` newest so far
-/// can never become one. Dropping those as they arrive keeps the buffer the
-/// size of the answer rather than the size of the input — so it does not grow
-/// with the number of containers or Pods, and a deployment with fifty costs
-/// what one with two costs.
-struct BoundedNewest<T> {
-    capacity: usize,
-    heap: BinaryHeap<Reverse<Keyed<T>>>,
-}
-
-struct Keyed<T> {
-    key: MergeKey,
-    value: T,
-}
-
-impl<T> PartialEq for Keyed<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-impl<T> Eq for Keyed<T> {}
-impl<T> PartialOrd for Keyed<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl<T> Ord for Keyed<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-impl<T> BoundedNewest<T> {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity: capacity.max(1),
-            heap: BinaryHeap::new(),
-        }
-    }
-
-    fn push(&mut self, key: MergeKey, value: T) {
-        self.heap.push(Reverse(Keyed { key, value }));
-        if self.heap.len() > self.capacity {
-            // `Reverse` puts the oldest line at the heap's root, which is
-            // exactly the one that just stopped being a candidate.
-            self.heap.pop();
-        }
-    }
-
-    fn into_chronological(self) -> Vec<T> {
-        let mut kept = self.heap.into_vec();
-        kept.sort_by(|Reverse(left), Reverse(right)| left.key.cmp(&right.key));
-        kept.into_iter().map(|Reverse(keyed)| keyed.value).collect()
-    }
-}
-
-pub(super) fn encode_log_cursor<T: Serialize>(cursor: &T) -> Result<String> {
-    let bytes = serde_json::to_vec(cursor).context("Failed to encode log cursor")?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-pub(super) fn decode_log_cursor<T: DeserializeOwned>(cursor: &str) -> Result<T> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
-        .context("invalid log cursor encoding")?;
-    serde_json::from_slice(&bytes).context("invalid log cursor payload")
-}
-
-pub(super) fn log_cursor_signature(
-    backend: &str,
-    deployment: &Deployment,
-    project: &Project,
-    query: &LogQuery,
-) -> String {
-    let mut levels = query.levels.clone();
-    levels.sort();
-    levels.dedup();
-    let mut containers = query.containers.clone();
-    containers.sort();
-    containers.dedup();
-    let deployment_id = deployment.id.to_string();
-    let project_id = project.id.to_string();
-    let levels = levels.join("\0");
-    let containers = containers.join("\0");
-
-    let mut digest = Sha256::new();
-    for part in [
-        backend.as_bytes(),
-        deployment_id.as_bytes(),
-        project_id.as_bytes(),
-        levels.as_bytes(),
-        query.search.as_deref().unwrap_or_default().as_bytes(),
-        containers.as_bytes(),
-    ] {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part);
-    }
-    URL_SAFE_NO_PAD.encode(digest.finalize())
-}
-
-pub(super) fn stable_log_id<'a>(
-    backend: &str,
-    parts: impl IntoIterator<Item = &'a [u8]>,
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(backend.as_bytes());
-    for part in parts {
-        digest.update((part.len() as u64).to_be_bytes());
-        digest.update(part);
-    }
-    URL_SAFE_NO_PAD.encode(digest.finalize())
-}
-
-fn distinct_log_id(seen: &mut HashMap<String, u64>, base_id: String) -> String {
-    let occurrence = seen.entry(base_id.clone()).or_default();
-    let id = if *occurrence == 0 {
-        base_id.clone()
-    } else {
-        let occurrence_bytes = occurrence.to_be_bytes();
-        stable_log_id(
-            "occurrence",
-            [base_id.as_bytes(), occurrence_bytes.as_slice()],
-        )
-    };
-    *occurrence = occurrence.saturating_add(1);
-    id
-}
-
-fn split_timestamped_log_line(line: &str) -> Option<(DateTime<Utc>, &str, &str)> {
-    let (timestamp_text, content) = line.split_once(' ')?;
-    let timestamp = DateTime::parse_from_rfc3339(timestamp_text)
-        .ok()?
-        .with_timezone(&Utc);
-    Some((timestamp, content, timestamp_text))
-}
-
-/// Server-scoped capabilities of the configured log backend. Surfaced to the
-/// frontend (and any other client) via `GET /api/v1/logs/capabilities` so the
-/// filter UI and chart can be driven dynamically rather than hardcoded to
-/// info/warn/error.
-#[derive(Debug, Clone, Serialize)]
-pub struct LogsCapabilities {
-    pub backend: &'static str,
-    pub levels: &'static [&'static str],
-    pub supports_volume: bool,
-    /// Server-side cap on `?tail=` for this backend, if any. Lets the frontend
-    /// surface the ceiling instead of silently truncating the requested count.
-    /// `None` means "no explicit advertised cap" (Kubernetes derives its cap
-    /// from per-backend config rather than a global constant).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tail: Option<i64>,
-}
-
-#[async_trait]
-pub trait RuntimeLogBackend: Send + Sync {
-    /// Identifier surfaced for diagnostics in the capabilities response.
-    /// Query and pagination behavior remains behind the trait.
-    fn backend_kind(&self) -> &'static str;
-
-    /// Full list of level strings the backend can emit. Drives both the
-    /// `level` filter dropdown options and the chart's color palette on the
-    /// frontend.
-    fn levels(&self) -> &'static [&'static str];
-
-    /// Whether the backend can return per-level volume buckets. The
-    /// Kubernetes backend has no historical store, so this is `false` and
-    /// the chart panel is hidden.
-    fn supports_volume(&self) -> bool;
-
-    /// Optional advertised cap on `tail` (lines) accepted by this backend.
-    /// Returned via `/api/v1/logs/capabilities` so the frontend can constrain
-    /// its UI rather than letting the server silently clamp the request.
-    /// Default `None` = no advertised cap.
-    fn max_tail(&self) -> Option<i64> {
-        None
-    }
-
-    async fn stream_logs(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-        query: LogQuery,
-    ) -> Result<LogEventStream>;
-
-    async fn query_volume(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-        query: LogVolumeQuery,
-    ) -> Result<LogVolumeResponse>;
 }
 
 pub async fn init_runtime_log_backend(
@@ -605,7 +191,7 @@ impl KubernetesLineFilter {
         if self.start_time.is_some_and(|start| timestamp < start) {
             return KubernetesLineOutcome::Skip;
         }
-        let level = classify_k8s_line(content);
+        let level = classify_log_line(content);
         if !self.levels.is_empty() && !self.levels.iter().any(|wanted| wanted == level) {
             return KubernetesLineOutcome::Skip;
         }
@@ -889,18 +475,6 @@ async fn read_kubernetes_pods(
     )
 }
 
-fn select_recent_page<T>(items: Vec<T>, page_size: usize, skip_recent: usize) -> (Vec<T>, bool) {
-    let end = items.len().saturating_sub(skip_recent);
-    let start = end.saturating_sub(page_size);
-    let has_older = start > 0;
-    let page = items
-        .into_iter()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect();
-    (page, has_older)
-}
-
 fn kubernetes_tail_lines(has_end_time: bool, follow: bool, effective_tail: usize) -> Option<i64> {
     (!has_end_time || follow).then_some(effective_tail as i64)
 }
@@ -939,26 +513,6 @@ fn kubernetes_since_seconds(now: DateTime<Utc>, start: DateTime<Utc>) -> Option<
     Some(whole_seconds.saturating_add(i64::from(delta > Duration::seconds(whole_seconds))))
 }
 
-fn distinct_log_ids_from_newest(base_ids: &[String]) -> Vec<String> {
-    let mut ids = vec![String::new(); base_ids.len()];
-    let mut seen = HashMap::new();
-    for (index, base_id) in base_ids.iter().enumerate().rev() {
-        ids[index] = distinct_log_id(&mut seen, base_id.clone());
-    }
-    ids
-}
-
-pub(crate) fn is_followable_status(status: &DeploymentStatus) -> bool {
-    matches!(
-        status,
-        DeploymentStatus::Deploying
-            | DeploymentStatus::Healthy
-            | DeploymentStatus::Unhealthy
-            | DeploymentStatus::Cancelling
-            | DeploymentStatus::Terminating
-    )
-}
-
 #[async_trait]
 impl RuntimeLogBackend for KubernetesLogBackend {
     fn backend_kind(&self) -> &'static str {
@@ -966,7 +520,7 @@ impl RuntimeLogBackend for KubernetesLogBackend {
     }
 
     fn levels(&self) -> &'static [&'static str] {
-        KUBERNETES_LEVELS
+        HEURISTIC_LEVELS
     }
 
     fn supports_volume(&self) -> bool {
@@ -1308,10 +862,6 @@ impl RuntimeLogBackend for NoneLogBackend {
     }
 }
 
-pub(super) fn status_stream(status: LogStatus) -> LogEventStream {
-    futures::stream::once(async move { Ok(LogEvent::Status(status)) }).boxed()
-}
-
 /// Runtime log backend that streams directly from the Docker daemon.
 ///
 /// Resolves the deployment's container(s) by the namespaced `deployment-id`
@@ -1416,7 +966,7 @@ impl RuntimeLogBackend for DockerLogBackend {
     }
 
     fn levels(&self) -> &'static [&'static str] {
-        KUBERNETES_LEVELS
+        HEURISTIC_LEVELS
     }
 
     fn supports_volume(&self) -> bool {
@@ -1552,7 +1102,7 @@ impl RuntimeLogBackend for DockerLogBackend {
                             {
                                 continue;
                             }
-                            let level = classify_k8s_line(content);
+                            let level = classify_log_line(content);
                             if !levels.is_empty() && !levels.iter().any(|l| l == level) {
                                 continue;
                             }
@@ -2460,11 +2010,11 @@ impl LogLine {
         //     ingester's in-memory write buffer. Fall back to the same
         //     regex the Kubernetes backend uses so the live tail is
         //     never un-classified for the user. Returns one of
-        //     `KUBERNETES_LEVELS` — a subset of Loki's vocabulary, safe
+        //     `HEURISTIC_LEVELS` — a subset of Loki's vocabulary, safe
         //     to render with the same palette.
         match self.detected_level.as_deref().map(str::trim) {
             Some(raw) if !raw.is_empty() => raw.to_string(),
-            _ => classify_k8s_line(&self.line).to_string(),
+            _ => classify_log_line(&self.line).to_string(),
         }
     }
 
@@ -2722,26 +2272,6 @@ fn escape_logql_label_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Cap an upstream response body before including it in an error message. Loki
-/// can return very large HTML/JSON error pages and we don't want those flooding
-/// the structured log line that surfaces the failure.
-fn truncate_for_error(s: String) -> String {
-    const MAX: usize = 1024;
-    if s.len() <= MAX {
-        return s;
-    }
-    // Truncate at a UTF-8 boundary at or before MAX so the resulting String is
-    // still valid. `floor_char_boundary` is unstable, so do it by hand.
-    let mut end = MAX;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut t = s;
-    t.truncate(end);
-    t.push_str("... (truncated)");
-    t
-}
-
 /// Reject Loki/Prometheus label names that wouldn't be valid identifiers.
 /// Prevents an operator-supplied override from producing malformed LogQL.
 /// Validate a value that will be emitted as a (case-insensitive) HTTP header.
@@ -2778,30 +2308,6 @@ fn validate_loki_label_name(role: &str, name: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-// LogQL regex patterns the Kubernetes backend uses for per-line
-// classification. Loki classifies via its built-in `detected_level` metadata
-// (passed through verbatim), so these are now K8s-only.
-const LEVEL_REGEX_ERROR: &str = r"(?i)\b(error|err|fatal|panic|exception|failed)\b";
-const LEVEL_REGEX_WARN: &str = r"(?i)\b(warn|warning)\b";
-
-/// Classify a raw log line into one of the three `KUBERNETES_LEVELS`. The
-/// Kubernetes backend has no upstream classifier (kubelet returns raw bytes),
-/// so each line is scanned for error/warn keywords with an info catch-all.
-pub(super) fn classify_k8s_line(line: &str) -> &'static str {
-    use std::sync::OnceLock;
-    static ERROR_RE: OnceLock<regex::Regex> = OnceLock::new();
-    static WARN_RE: OnceLock<regex::Regex> = OnceLock::new();
-    let err = ERROR_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_ERROR).unwrap());
-    let warn = WARN_RE.get_or_init(|| regex::Regex::new(LEVEL_REGEX_WARN).unwrap());
-    if err.is_match(line) {
-        "error"
-    } else if warn.is_match(line) {
-        "warn"
-    } else {
-        "info"
-    }
 }
 
 /// Append a `| detected_level=~"a|b|..."` clause to a Loki selector when the
@@ -2863,13 +2369,6 @@ fn container_label_pattern(containers: &[String]) -> Option<String> {
     (!cleaned.is_empty()).then(|| cleaned.join("|"))
 }
 
-fn normalize_search(value: Option<&str>) -> Option<String> {
-    value
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
 fn append_search_filter(selector: &str, search: Option<&str>) -> String {
     let Some(text) = normalize_search(search) else {
         return selector.to_string();
@@ -2886,15 +2385,6 @@ fn append_search_filter(selector: &str, search: Option<&str>) -> String {
     format!("{selector} |~ `(?i){escaped}`")
 }
 
-pub(crate) fn line_matches_search(line: &str, search: Option<&str>) -> bool {
-    let Some(text) = normalize_search(search) else {
-        return true;
-    };
-    let lower_line = line.to_lowercase();
-    let lower_text = text.to_lowercase();
-    lower_line.contains(&lower_text)
-}
-
 fn to_loki_nanos(ts: DateTime<Utc>) -> String {
     ts.timestamp_nanos_opt().unwrap_or_default().to_string()
 }
@@ -2907,25 +2397,6 @@ fn websocket_url(http_url: &str, selector: &str) -> String {
         url = format!("ws://{}", rest);
     }
     format!("{}?query={}", url, urlencoding::encode(selector))
-}
-
-/// Parse a short retention hint like `"7d"` or `"2w"`. Supported units:
-/// `s` (seconds), `m` (minutes), `h` (hours), `d` (days), `w` (weeks; 7 days).
-pub(super) fn parse_duration_hint(value: &str) -> Option<Duration> {
-    let trimmed = value.trim();
-    if trimmed.len() < 2 {
-        return None;
-    }
-    let (number, unit) = trimmed.split_at(trimmed.len() - 1);
-    let number: i64 = number.parse().ok()?;
-    match unit {
-        "s" => Some(Duration::seconds(number)),
-        "m" => Some(Duration::minutes(number)),
-        "h" => Some(Duration::hours(number)),
-        "d" => Some(Duration::days(number)),
-        "w" => Some(Duration::weeks(number)),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -3222,30 +2693,6 @@ mod tests {
 
         assert_eq!(follow_ids, finite_ids);
         assert_eq!(follow_ids.len(), base_ids.len());
-    }
-
-    #[test]
-    fn timestamped_line_identity_is_distinct_per_occurrence() {
-        let line = "2026-08-29T12:34:56.123456789Z repeated";
-        let (timestamp, content, timestamp_text) = split_timestamped_log_line(line).unwrap();
-        assert_eq!(
-            timestamp.timestamp_nanos_opt(),
-            Some(1_788_006_896_123_456_789)
-        );
-        assert_eq!(content, "repeated");
-
-        let base_id = stable_log_id(
-            "kubernetes",
-            [timestamp_text.as_bytes(), content.as_bytes()],
-        );
-        let mut seen = HashMap::new();
-        let first = distinct_log_id(&mut seen, base_id.clone());
-        let second = distinct_log_id(&mut seen, base_id.clone());
-        assert_ne!(first, second);
-
-        let mut retry = HashMap::new();
-        assert_eq!(first, distinct_log_id(&mut retry, base_id.clone()));
-        assert_eq!(second, distinct_log_id(&mut retry, base_id));
     }
 
     #[test]
@@ -3659,21 +3106,6 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_error_keeps_short_strings_intact() {
-        let short = "boom".to_string();
-        assert_eq!(truncate_for_error(short.clone()), short);
-    }
-
-    #[test]
-    fn truncate_for_error_truncates_long_strings_at_utf8_boundary() {
-        let long: String = "a".repeat(2048);
-        let out = truncate_for_error(long);
-        assert!(out.ends_with("... (truncated)"));
-        // Total length: 1024 + len("... (truncated)").
-        assert_eq!(out.len(), 1024 + "... (truncated)".len());
-    }
-
-    #[test]
     fn append_search_filter_strips_backticks() {
         // Backticks would close the LogQL raw-string literal mid-filter and
         // produce a syntactically invalid query — must be stripped, not
@@ -3776,81 +3208,6 @@ mod tests {
 
     fn rendered(page: &[KubernetesLine]) -> Vec<String> {
         page.iter().map(|line| line.rendered.clone()).collect()
-    }
-
-    fn at(second: u32) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(&format!("2026-08-31T12:00:{second:02}Z"))
-            .expect("valid timestamp")
-            .with_timezone(&Utc)
-    }
-
-    #[test]
-    fn bounded_merge_keeps_the_newest_and_not_the_first_seen() {
-        // Sources are read concurrently, so the oldest line can arrive last.
-        // Keeping the first `capacity` would return whatever raced in first.
-        let mut newest = BoundedNewest::new(3);
-        for (source, second) in [(1, 9), (0, 1), (1, 7), (0, 3), (1, 5)] {
-            newest.push(
-                MergeKey {
-                    timestamp: at(second),
-                    source,
-                    sequence: 0,
-                },
-                format!("line-{second}"),
-            );
-        }
-
-        assert_eq!(
-            newest.into_chronological(),
-            vec!["line-5", "line-7", "line-9"]
-        );
-    }
-
-    #[test]
-    fn bounded_merge_does_not_grow_with_the_number_of_sources() {
-        // The property that keeps one request's memory off the replica count:
-        // twenty Pods of a hundred lines each still cost one page, not twenty.
-        let mut newest = BoundedNewest::new(10);
-        for source in 0..20 {
-            for sequence in 0..100 {
-                newest.push(
-                    MergeKey {
-                        timestamp: at((sequence % 60) as u32),
-                        source,
-                        sequence,
-                    },
-                    format!("{source}:{sequence}"),
-                );
-            }
-        }
-
-        assert_eq!(newest.into_chronological().len(), 10);
-    }
-
-    #[test]
-    fn bounded_merge_result_does_not_depend_on_arrival_order() {
-        // Two pages are two requests, and they must agree on how lines sharing
-        // a timestamp are ordered. If they disagreed, the page boundary would
-        // serve one line twice and step over another.
-        let lines = [(0, 0, 5), (1, 0, 5), (0, 1, 5), (1, 1, 5)];
-        let collect = |order: &[usize]| {
-            let mut newest = BoundedNewest::new(10);
-            for &index in order {
-                let (source, sequence, second) = lines[index];
-                newest.push(
-                    MergeKey {
-                        timestamp: at(second),
-                        source,
-                        sequence,
-                    },
-                    format!("{source}:{sequence}"),
-                );
-            }
-            newest.into_chronological()
-        };
-
-        assert_eq!(collect(&[0, 1, 2, 3]), collect(&[3, 1, 0, 2]));
-        assert_eq!(collect(&[0, 1, 2, 3]), vec!["0:0", "0:1", "1:0", "1:1"]);
     }
 
     #[test]
@@ -4103,27 +3460,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_duration_hint_supports_all_units_including_weeks() {
-        // Cover every supported unit; `w` is the new one and must equal 7d.
-        assert_eq!(parse_duration_hint("30s"), Some(Duration::seconds(30)));
-        assert_eq!(parse_duration_hint("5m"), Some(Duration::minutes(5)));
-        assert_eq!(parse_duration_hint("2h"), Some(Duration::hours(2)));
-        assert_eq!(parse_duration_hint("7d"), Some(Duration::days(7)));
-        assert_eq!(parse_duration_hint("2w"), Some(Duration::weeks(2)));
-        assert_eq!(parse_duration_hint("2w"), Some(Duration::days(14)));
-        // Negative weeks pass through (chrono::Duration accepts negatives) — a
-        // retention hint of "-1w" is nonsensical but the parser shouldn't
-        // crash on it. We only assert the unit math here.
-        assert_eq!(parse_duration_hint("0w"), Some(Duration::zero()));
-
-        // Unsupported unit / malformed input.
-        assert_eq!(parse_duration_hint("5y"), None);
-        assert_eq!(parse_duration_hint("xw"), None);
-        // Whitespace is trimmed.
-        assert_eq!(parse_duration_hint("  3w  "), Some(Duration::weeks(3)));
-    }
-
-    #[test]
     fn loki_value_deserialize_accepts_two_and_three_tuples() {
         // Legacy 2-tuple: no structured metadata → detected_level is None.
         let v2: LokiValue =
@@ -4213,17 +3549,6 @@ mod tests {
                 assert_eq!(l.classified_level(), expected, "input {line:?}");
             }
         }
-    }
-
-    #[test]
-    fn classify_k8s_line_returns_one_of_three_levels() {
-        // The K8s backend has no upstream classifier; its regex catch-all
-        // promises every line lands in exactly one of `KUBERNETES_LEVELS`.
-        assert_eq!(classify_k8s_line("plain hello world"), "info");
-        assert_eq!(classify_k8s_line("WARN connection retry"), "warn");
-        assert_eq!(classify_k8s_line("ERROR: failed to connect"), "error");
-        // Error wins over warn when both match.
-        assert_eq!(classify_k8s_line("WARN: fatal error in handler"), "error");
     }
 
     #[test]

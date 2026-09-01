@@ -10,10 +10,10 @@ use tracing::warn;
 use crate::db::models::{Deployment, DeploymentStatus, Project};
 
 use super::{
-    classify_k8s_line, decode_log_cursor, encode_log_cursor, is_followable_status,
+    classify_log_line, decode_log_cursor, encode_log_cursor, is_followable_status,
     line_matches_search, log_cursor_signature, parse_duration_hint, stable_log_id, status_stream,
     LogEvent, LogEventStream, LogQuery, LogStatus, LogStatusReason, LogVolumeBucket,
-    LogVolumeQuery, LogVolumeResponse, RuntimeLogBackend, KUBERNETES_LEVELS,
+    LogVolumeQuery, LogVolumeResponse, RuntimeLogBackend, HEURISTIC_LEVELS,
 };
 
 const MAX_TAIL: i64 = 5_000;
@@ -136,7 +136,7 @@ impl CloudWatchLine {
     }
 
     fn level(&self) -> &'static str {
-        classify_k8s_line(&self.message)
+        classify_log_line(&self.message)
     }
 
     fn matches(&self, levels: &[String], search: Option<&str>, containers: &[String]) -> bool {
@@ -735,7 +735,7 @@ impl RuntimeLogBackend for CloudWatchLogBackend {
     }
 
     fn levels(&self) -> &'static [&'static str] {
-        KUBERNETES_LEVELS
+        HEURISTIC_LEVELS
     }
 
     fn supports_volume(&self) -> bool {
