@@ -5,15 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "schema")]
 use schemars::JsonSchema;
 
 fn default_kubernetes_max_tail_lines() -> i64 {
     100_000
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct KubernetesLogBackendSettings {
     /// Upper bound on the number of lines the backend will ever request from
     /// the kubelet in a single call. The frontend pages backward by widening
@@ -73,8 +71,7 @@ impl BackendAddress {
 }
 
 /// TLS mode for custom domains
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum CustomDomainTlsMode {
     /// All hosts (primary + custom domains) share the same TLS secret
@@ -84,8 +81,7 @@ pub enum CustomDomainTlsMode {
 }
 
 /// Health probe configuration
-#[derive(Debug, Clone, Deserialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct HealthProbeConfig {
     /// Enable liveness probes (default: true)
     #[serde(default = "default_true")]
@@ -122,8 +118,7 @@ pub struct HealthProbeConfig {
 /// - null: policyTypes is ["Ingress"] only, Kubernetes does not restrict egress
 /// - Empty list: policyTypes includes "Egress" with no rules = deny all egress
 /// - Non-empty list: explicit egress rules enforced
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct NetworkPolicyConfig {
     /// Ingress rules
     pub ingress: Vec<k8s_openapi::api::networking::v1::NetworkPolicyIngressRule>,
