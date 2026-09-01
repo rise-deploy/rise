@@ -50,20 +50,14 @@ async fn environment_name_for(pool: &PgPool, env_id: Uuid) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// Force Metacontroller to re-run the sync webhook for `project_name` so the
-/// updated set of custom domains is reflected in the K8s ingresses. Best-effort:
-/// errors are logged but not propagated, mirroring the pattern in
-/// `project/handlers.rs` and `deployment/handlers.rs`. No-op when the server is
-/// running without a Kubernetes client configured (local dev / tests).
-async fn trigger_project_resync(state: &AppState, project_name: &str) {
-    let Some(kube_client) = state.kube_client.as_ref() else {
-        return;
-    };
-    if let Err(e) = crate::server::deployment::crd::trigger_resync(kube_client, project_name).await
-    {
+/// Ask the deployment backend to converge on the project's updated set of
+/// custom domains. Best-effort: errors are logged but not propagated, since the
+/// change is already durable and the backend converges on it regardless.
+async fn trigger_project_resync(state: &AppState, project: &crate::db::models::Project) {
+    if let Err(e) = state.deployment_backend.project_changed(project).await {
         warn!(
-            project = %project_name,
-            "Failed to trigger CRD resync after custom-domain change: {:?}", e
+            project = %project.name,
+            "Failed to notify deployment backend after custom-domain change: {:?}", e
         );
     }
 }
@@ -124,7 +118,7 @@ pub async fn add_custom_domain(
         }
     })?;
 
-    trigger_project_resync(&state, &project.name).await;
+    trigger_project_resync(&state, &project).await;
 
     Ok((
         StatusCode::CREATED,
@@ -261,7 +255,7 @@ pub async fn delete_custom_domain(
         return Err(ServerError::not_found("Custom domain not found"));
     }
 
-    trigger_project_resync(&state, &project.name).await;
+    trigger_project_resync(&state, &project).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -318,7 +312,7 @@ pub async fn update_custom_domain(
 
     // A single project-wide resync regenerates ingresses for both the old and
     // the new primary deployment group in one pass.
-    trigger_project_resync(&state, &project.name).await;
+    trigger_project_resync(&state, &project).await;
 
     Ok(Json(CustomDomainResponse::from_db_model(
         &updated,
@@ -359,7 +353,7 @@ pub async fn set_primary_domain(
             }
         })?;
 
-    trigger_project_resync(&state, &project.name).await;
+    trigger_project_resync(&state, &project).await;
 
     let env_name = environment_name_for(&state.db_pool, updated_domain.environment_id).await;
 
@@ -400,7 +394,7 @@ pub async fn unset_primary_domain(
         ));
     }
 
-    trigger_project_resync(&state, &project.name).await;
+    trigger_project_resync(&state, &project).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

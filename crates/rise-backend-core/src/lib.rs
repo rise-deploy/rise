@@ -44,7 +44,7 @@ pub mod url_builder;
 
 pub mod test_helpers;
 
-pub use backend::{DeploymentBackend, DeploymentUrls};
+pub use backend::{BackendCapabilities, DeploymentBackend, DeploymentUrls};
 pub use custom_domain::validate_custom_domain;
 pub use desired::{DesiredContainer, DesiredRoute};
 pub use diff::{

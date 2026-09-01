@@ -61,4 +61,76 @@ pub trait DeploymentBackend: Send + Sync {
         let _ = (project, environment_name);
         Ok(())
     }
+
+    /// A project's desired state changed — a new deployment, a status change, a
+    /// stop, an access-class or custom-domain edit.
+    ///
+    /// Best-effort: callers log a failure and carry on, because the change is
+    /// already durable in the database and the backend will converge on it
+    /// regardless. This only asks the backend to converge *sooner*.
+    ///
+    /// Backends that run their own polling reconcile loop pick the change up on
+    /// the next tick, so the default no-op is correct for them.
+    async fn project_changed(&self, project: &Project) -> anyhow::Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// A project was created.
+    ///
+    /// Backends with a per-project runtime object create it here. Backends that
+    /// discover projects from the database need nothing.
+    async fn project_created(&self, project: &Project) -> anyhow::Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// A project was marked deleting.
+    ///
+    /// Backends with a per-project runtime object delete it here, which is what
+    /// starts their finalization. Backends that garbage-collect from the
+    /// database on their next reconcile need nothing.
+    async fn project_deleting(&self, project: &Project) -> anyhow::Result<()> {
+        let _ = project;
+        Ok(())
+    }
+
+    /// Reject, at request time, container names that would produce runtime
+    /// resource names this backend cannot represent.
+    ///
+    /// `Err` carries a user-facing message and is surfaced as a 400. The limits
+    /// are per-backend — a name that is fine on one runtime may be too long on
+    /// another — so the default accepts everything and each backend narrows it.
+    fn validate_container_names(
+        &self,
+        project_name: &str,
+        deployment_group: &str,
+        deployment_id: &str,
+        container_names: &[&str],
+    ) -> Result<(), String> {
+        let _ = (
+            project_name,
+            deployment_group,
+            deployment_id,
+            container_names,
+        );
+        Ok(())
+    }
+
+    /// Static facts about the runtime, surfaced by the platform capabilities
+    /// endpoint so clients can adapt (e.g. build for the right architecture).
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+}
+
+/// What a deployment backend's runtime can tell clients about itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendCapabilities {
+    /// CPU architecture the runtime schedules onto (`amd64`, `arm64`), when the
+    /// backend pins one. `None` means it does not constrain the choice.
+    pub runtime_arch: Option<String>,
+    /// Whether the runtime enforces a non-root security context. `None` when
+    /// the concept does not apply to this runtime.
+    pub pod_security_enabled: Option<bool>,
 }
