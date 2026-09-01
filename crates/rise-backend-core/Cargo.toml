@@ -15,8 +15,11 @@ schema = ["dep:schemars", "rise-deployment-spec/schema"]
 
 [dependencies]
 anyhow = { workspace = true }
+async-stream = "0.3"
 async-trait = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
+futures = "0.3"
 regex = "1.11"
 # Traefik API client for the shared readiness signal (`serverStatus`). HTTP only —
 # this crate still never touches a database.
