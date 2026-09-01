@@ -354,10 +354,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Spawn internal webhook listener for Metacontroller (separate port, IP-validated)
     #[cfg(feature = "backend")]
-    let webhook_handle = if let Some(port) = state.metacontroller_webhook_port {
+    let webhook_handle = if let (Some(port), Some(webhook_ctx)) =
+        (state.metacontroller_webhook_port, state.webhook_ctx.clone())
+    {
         let webhook_app = Router::new()
             .nest("/api/v1", deployment::routes::metacontroller_routes())
-            .with_state(state.clone())
+            .with_state(webhook_ctx)
             .layer(trace_layer!())
             .layer(axum_middleware::from_fn(
                 self::middleware::request_id_middleware,
