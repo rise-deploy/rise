@@ -1,10 +1,10 @@
-//! Runtime-native events, forwarded from a backend into the deployment log.
+//! Backend-originated events, forwarded into the deployment log.
 //!
-//! These are the runtime's own words about a deployment — an ECS service saying
-//! it cannot place a task, Kubernetes saying a pod will not schedule. They
-//! explain things the periodic observation cannot: a replica stuck `pending`
-//! looks identical whether the image is missing or the cluster is full, and only
-//! the runtime knows which.
+//! These are backend-owned details about a deployment — an ECS service saying it
+//! cannot place a task, Kubernetes saying a pod will not schedule, or a
+//! controller explaining that it represented a requested resource with a
+//! different effective value. They explain things the periodic observation
+//! cannot.
 //!
 //! Forwarded rather than trusted as the source of truth. A stream can drop and a
 //! poll can overlap, so these enrich the level-triggered observations rather

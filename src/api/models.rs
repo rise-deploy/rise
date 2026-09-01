@@ -11,6 +11,25 @@ pub use crate::server::deployment::models::*;
 #[cfg(not(feature = "backend"))]
 pub use self::client_models::*;
 
+/// One event recorded in a deployment's append-only history.
+#[derive(Debug, serde::Deserialize, Clone)]
+pub struct DeploymentEvent {
+    pub id: i64,
+    pub occurred_at: String,
+    pub kind: String,
+    pub severity: String,
+    pub source: String,
+    pub subject: Option<String>,
+    pub message: Option<String>,
+    pub attributes: serde_json::Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DeploymentEventPage {
+    pub events: Vec<DeploymentEvent>,
+    pub next_cursor: Option<String>,
+}
+
 #[cfg(not(feature = "backend"))]
 mod client_models {
     use serde::{Deserialize, Serialize};

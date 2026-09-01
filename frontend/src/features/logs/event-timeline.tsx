@@ -139,6 +139,7 @@ const RESERVED_KEYS = new Set(['from', 'to', 'reason']);
  * single place that decides what an attribute *means*.
  */
 const LABELS: Record<string, string> = {
+    type: 'type',
     created_by: 'by',
     build_method: 'build',
     image_size_bytes: 'size',
@@ -149,6 +150,10 @@ const LABELS: Record<string, string> = {
     git_revision: 'revision',
     git_branch: 'branch',
     git_dirty: 'uncommitted changes',
+    requested_cpu: 'requested CPU',
+    requested_memory: 'requested memory',
+    resolved_cpu_units: 'effective CPU units',
+    resolved_memory_mib: 'effective memory (MiB)',
 };
 
 /**
@@ -161,6 +166,7 @@ const ORDER = [
     // Who and what, before how much.
     'created_by', 'superseded_by', 'rolled_back_from', 'stopped_by',
     'container', 'containers', 'replicas', 'cpu', 'memory',
+    'requested_cpu', 'requested_memory', 'resolved_cpu_units', 'resolved_memory_mib',
     // Then what was built, and from what.
     'git_branch', 'git_revision', 'git_dirty',
     'build_method', 'build_ms', 'push_ms', 'registry',

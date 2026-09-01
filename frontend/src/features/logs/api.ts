@@ -190,7 +190,7 @@ export async function fetchLogVolume(request: LogVolumeRequest): Promise<LogVolu
 export interface DeploymentEvent {
     id: number;
     deployment_id: string;
-    /** When it happened, per the runtime's clock. What the rail plots. */
+    /** When it happened, according to the event source. What the rail plots. */
     occurred_at: string;
     /** When Rise recorded it. What pages are cut on. */
     recorded_at: string;

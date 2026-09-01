@@ -236,6 +236,39 @@ fn forwarded_from_ecs(n: &crate::service::ServiceNarrative) -> Option<ForwardedE
     })
 }
 
+/// Describe a resource representation that differs from the user's request.
+///
+/// The event is emitted from desired-state computation, after the task
+/// definition has a valid Fargate size. Its key includes both sides of the
+/// representation so a later, different resolution remains visible while
+/// repeated reconcile ticks remain idempotent.
+fn resource_adjustment_event(
+    container: &str,
+    requested_cpu: &str,
+    requested_memory: &str,
+    size: crate::sizing::FargateSize,
+) -> ForwardedEvent {
+    ForwardedEvent {
+        dedupe_key: format!(
+            "resource-adjusted:{container}:{requested_cpu}:{requested_memory}:{}:{}",
+            size.cpu_units, size.memory_mib
+        ),
+        occurred_at: chrono::Utc::now(),
+        severity: EventSeverity::Warning,
+        message: "Resources were rounded up to satisfy Fargate task-size limits".to_string(),
+        subject: Some(container.to_string()),
+        attributes: serde_json::json!({
+            rise_backend_core::events::attributes::EVENT_TYPE:
+                rise_backend_core::events::attributes::RESOURCE_ADJUSTED,
+            rise_backend_core::events::attributes::CONTAINER: container,
+            rise_backend_core::events::attributes::REQUESTED_CPU: requested_cpu,
+            rise_backend_core::events::attributes::REQUESTED_MEMORY: requested_memory,
+            rise_backend_core::events::attributes::RESOLVED_CPU_UNITS: size.cpu_units,
+            rise_backend_core::events::attributes::RESOLVED_MEMORY_MIB: size.memory_mib,
+        }),
+    }
+}
+
 /// Project an ECS service's event list onto the shape the reconciler keeps.
 ///
 /// ECS returns roughly the last hour, newest first, and caps the list — so this
@@ -826,7 +859,29 @@ impl EcsReconciler {
                 .compute_desired_for_deployment(project, deployment)
                 .await
             {
-                Ok(mut entries) => desired.append(&mut entries),
+                Ok((mut entries, events)) => {
+                    desired.append(&mut entries);
+                    if !events.is_empty() {
+                        match self
+                            .store
+                            .forward_backend_events(deployment.id, EventSource::Ecs, &events)
+                            .await
+                        {
+                            Ok(n) if n > 0 => {
+                                debug!(
+                                    deployment = %deployment.deployment_id,
+                                    "Forwarded {n} new ECS deployment event(s)"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                deployment = %deployment.deployment_id,
+                                "Failed to forward ECS deployment events: {:?}",
+                                e
+                            ),
+                        }
+                    }
+                }
                 Err(e) if e.downcast_ref::<PermanentDeployError>().is_some() => {
                     let message = rejection_message(&e);
                     if rejection_fails_deployment(&deployment.status) {
@@ -975,7 +1030,10 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
-    ) -> Result<Vec<(DesiredService, TaskDefinitionSpec, DesiredContainer)>> {
+    ) -> Result<(
+        Vec<(DesiredService, TaskDefinitionSpec, DesiredContainer)>,
+        Vec<ForwardedEvent>,
+    )> {
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Fail closed on the features v1 does not implement, rather than
@@ -1042,6 +1100,7 @@ impl EcsReconciler {
                 .resolve_image(project, deployment, source_deployment_id.as_deref());
 
         let mut out = Vec::new();
+        let mut events = Vec::new();
         for spec in &container_specs {
             let entry = self
                 .desired_for_spec(
@@ -1057,9 +1116,13 @@ impl EcsReconciler {
                     &base_image,
                 )
                 .await?;
-            out.push(entry);
+            let (service, task_definition, desired_container, event) = entry;
+            out.push((service, task_definition, desired_container));
+            if let Some(event) = event {
+                events.push(event);
+            }
         }
-        Ok(out)
+        Ok((out, events))
     }
 
     /// Reject deployments that request a capability this backend does not yet
@@ -1114,7 +1177,12 @@ impl EcsReconciler {
         secret_env: &ResolvedDeploymentEnvVars,
         env_name: Option<&str>,
         base_image: &str,
-    ) -> Result<(DesiredService, TaskDefinitionSpec, DesiredContainer)> {
+    ) -> Result<(
+        DesiredService,
+        TaskDefinitionSpec,
+        DesiredContainer,
+        Option<ForwardedEvent>,
+    )> {
         let replica_count = clamp_replicas(spec.replicas);
         if let Some(requested) = spec.replicas {
             if requested > MAX_REPLICAS {
@@ -1243,7 +1311,7 @@ impl EcsReconciler {
             },
         ))?;
 
-        if task_def.size.rounded_up {
+        let resource_adjustment = if task_def.size.rounded_up {
             info!(
                 project = %project.name,
                 container = %spec.name,
@@ -1253,7 +1321,15 @@ impl EcsReconciler {
                 resolved_memory_mib = %task_def.memory,
                 "Rounded the requested resources up to the nearest valid Fargate task size"
             );
-        }
+            Some(resource_adjustment_event(
+                &spec.name,
+                &desired_container.cpu,
+                &desired_container.memory,
+                task_def.size,
+            ))
+        } else {
+            None
+        };
 
         let desired_service = DesiredService {
             name: service::service_name(
@@ -1285,7 +1361,12 @@ impl EcsReconciler {
                 route_hash: desired_container.route_hash.clone(),
             },
         };
-        Ok((desired_service, task_def, desired_container))
+        Ok((
+            desired_service,
+            task_def,
+            desired_container,
+            resource_adjustment,
+        ))
     }
 
     // ── observing the cluster ─────────────────────────────────────────────
@@ -2566,7 +2647,35 @@ pub(crate) fn clamp_replicas(requested: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{persisted_td_hash, tasks_or_indeterminate, with_persisted_td_hash, TaskView};
+    use super::{
+        persisted_td_hash, resource_adjustment_event, tasks_or_indeterminate,
+        with_persisted_td_hash, TaskView,
+    };
+
+    #[test]
+    fn resource_adjustment_event_preserves_request_and_effective_size() {
+        let event = resource_adjustment_event(
+            "app",
+            "128m-500m",
+            "192Mi-512Mi",
+            crate::sizing::FargateSize {
+                cpu_units: 512,
+                memory_mib: 1024,
+                rounded_up: true,
+            },
+        );
+
+        assert_eq!(
+            event.severity,
+            rise_backend_core::events::EventSeverity::Warning
+        );
+        assert_eq!(event.subject.as_deref(), Some("app"));
+        assert_eq!(event.attributes["type"], "resource_adjusted");
+        assert_eq!(event.attributes["requested_cpu"], "128m-500m");
+        assert_eq!(event.attributes["requested_memory"], "192Mi-512Mi");
+        assert_eq!(event.attributes["resolved_cpu_units"], 512);
+        assert_eq!(event.attributes["resolved_memory_mib"], 1024);
+    }
 
     fn task_view(name: &str) -> TaskView {
         TaskView {

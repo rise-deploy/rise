@@ -179,7 +179,7 @@ pub trait DeploymentStore: Send + Sync {
         events: &[crate::observation::DerivedEvent],
     ) -> Result<()>;
 
-    /// Forward runtime-native events into the deployment's log, skipping any
+    /// Forward backend-originated events into the deployment's log, skipping any
     /// already recorded.
     ///
     /// Deduplicated on `dedupe_key`, because a backend re-reads the same window

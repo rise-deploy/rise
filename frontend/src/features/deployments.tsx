@@ -13,6 +13,7 @@ import { EmptyState, ErrorState, LoadingState } from '../components/states';
 import { LogConsole } from './logs/log-console';
 import { ContainerStatusPanel } from './logs/container-status';
 import { EventTimeline } from './logs/event-timeline';
+import { fetchDeploymentEvents, type DeploymentEvent } from './logs/api';
 
 const STATUS_TONES = {
     Healthy: 'ok',
@@ -794,6 +795,81 @@ export function DeploymentsList({ projectName }) {
 }
 
 
+/**
+ * Shows the latest backend resource representation for each container.
+ *
+ * This is keyed by the event contract rather than a backend name: any backend
+ * that reports `type: resource_adjusted` gets the same notice. The event log is
+ * the source of this fact because the deployment row retains the requested
+ * resources and controller metadata is private bookkeeping.
+ */
+function ResourceAdjustmentNotice({
+    projectName,
+    deploymentId,
+    deploymentStatus,
+}: {
+    projectName: string;
+    deploymentId: string;
+    deploymentStatus: string;
+}) {
+    const [events, setEvents] = useState<DeploymentEvent[]>([]);
+
+    useEffect(() => {
+        const controller = new AbortController();
+        void fetchDeploymentEvents({
+            projectName,
+            deploymentId,
+            kinds: ['backend_event'],
+            minSeverity: 'all',
+            limit: 500,
+            signal: controller.signal,
+        })
+            .then((page) => setEvents(page.events))
+            .catch((error) => {
+                if (error instanceof Error && error.name === 'AbortError') return;
+                setEvents([]);
+            });
+        return () => controller.abort();
+    }, [projectName, deploymentId, deploymentStatus]);
+
+    const latestByContainer = new Map<string, DeploymentEvent>();
+    for (const event of events) {
+        if (event.attributes?.type !== 'resource_adjusted') continue;
+        const container = typeof event.attributes.container === 'string'
+            ? event.attributes.container
+            : event.subject || 'deployment';
+        if (!latestByContainer.has(container)) latestByContainer.set(container, event);
+    }
+
+    if (latestByContainer.size === 0) return null;
+
+    return (
+        <div className="r-alert warn" style={{ marginBottom: 16, fontSize: 12.5 }}>
+            <Icon name="info" size={14} />
+            <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>Resources adjusted by the backend</div>
+                {[...latestByContainer.entries()].map(([container, event]) => (
+                    <div key={`${container}-${event.id}`}>
+                        <span className="mono">{container}</span>{': '}
+                        CPU <span className="mono">{attributeText(event, 'requested_cpu')}</span>
+                        {' → '}
+                        <span className="mono">{attributeText(event, 'resolved_cpu_units')} units</span>
+                        {', memory '}
+                        <span className="mono">{attributeText(event, 'requested_memory')}</span>
+                        {' → '}
+                        <span className="mono">{attributeText(event, 'resolved_memory_mib')} MiB</span>
+                    </div>
+                ))}
+            </div>
+        </div>
+    );
+}
+
+function attributeText(event: DeploymentEvent, key: string): string {
+    const value = event.attributes?.[key];
+    return value === undefined || value === null ? '-' : String(value);
+}
+
 function formatDurationDelta(fromTs?: string | null, toTs?: string | null) {
     if (!fromTs || !toTs) return '--';
     const from = new Date(fromTs).getTime();
@@ -1108,6 +1184,11 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 }
             />
             <PanelBody>
+                <ResourceAdjustmentNotice
+                    projectName={projectName}
+                    deploymentId={deploymentId}
+                    deploymentStatus={deployment.status}
+                />
                 <KV>
                     <KVRow k="Replicas">
                         {totals.replicas}

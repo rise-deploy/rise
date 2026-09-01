@@ -1,14 +1,19 @@
 use anyhow::{bail, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write as _};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::debug;
 
-use crate::api::models::{Deployment, DeploymentStatus};
+use crate::api::models::{Deployment, DeploymentEvent, DeploymentStatus};
 use crate::config::Config;
 
-use super::core::{fetch_deployment, open_log_stream, parse_duration, LogStreamError};
+use super::core::{
+    fetch_deployment, fetch_deployment_events, fetch_latest_deployment_events, open_log_stream,
+    parse_duration, LogStreamError,
+};
 use crate::token_source::token_with_retry;
 
 // Project info for fetching project URL
@@ -39,33 +44,139 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 /// State tracking between polls
 struct FollowState {
-    last_status: DeploymentStatus,
-    last_error: Option<String>,
-    last_url: Option<String>,
     spinner_frame: usize,
-    is_first_poll: bool,
 }
 
 impl FollowState {
     fn new() -> Self {
+        Self { spinner_frame: 0 }
+    }
+}
+
+/// Keeps the deployment event log visible while the deploy command follows a
+/// deployment. The initial read includes the complete history; later reads use
+/// only the newest page and the event id set makes the output idempotent.
+struct EventReporter {
+    seen: HashSet<i64>,
+    initialized: bool,
+}
+
+impl EventReporter {
+    fn new() -> Self {
         Self {
-            last_status: DeploymentStatus::Pending,
-            last_error: None,
-            last_url: None,
-            spinner_frame: 0,
-            is_first_poll: true,
+            seen: HashSet::new(),
+            initialized: false,
         }
     }
 
-    fn should_log_state_change(&self, deployment: &Deployment) -> bool {
-        self.is_first_poll || self.last_status != deployment.status
+    async fn poll(
+        &mut self,
+        http_client: &Client,
+        backend_url: &str,
+        provider: &crate::token_source::TokenProvider,
+        project: &str,
+        deployment_id: &str,
+    ) -> Vec<DeploymentEvent> {
+        let token = match token_with_retry(provider).await {
+            Ok(token) => token,
+            Err(error) => {
+                debug!(
+                    "Could not resolve a token for deployment events: {:?}",
+                    error
+                );
+                return Vec::new();
+            }
+        };
+
+        let result = if self.initialized {
+            fetch_latest_deployment_events(http_client, backend_url, &token, project, deployment_id)
+                .await
+        } else {
+            fetch_deployment_events(http_client, backend_url, &token, project, deployment_id).await
+        };
+
+        let events = match result {
+            Ok(events) => events,
+            Err(error) => {
+                debug!("Could not read deployment events: {:?}", error);
+                return Vec::new();
+            }
+        };
+        self.initialized = true;
+
+        unseen_events(&mut self.seen, events)
+    }
+}
+
+fn unseen_events(seen: &mut HashSet<i64>, events: Vec<DeploymentEvent>) -> Vec<DeploymentEvent> {
+    let mut new_events: Vec<_> = events
+        .into_iter()
+        .filter(|event| seen.insert(event.id))
+        .collect();
+    // The API returns newest-first; command output follows the order in which
+    // the server recorded events.
+    new_events.reverse();
+    new_events
+}
+
+fn print_deployment_events(events: &[DeploymentEvent]) {
+    for event in events {
+        let subject = event
+            .subject
+            .as_deref()
+            .map(|value| format!(" {value}:"))
+            .unwrap_or_default();
+        let description = event_description(event);
+        let attributes = if event.attributes.is_object()
+            && event
+                .attributes
+                .as_object()
+                .is_some_and(|attrs| !attrs.is_empty())
+        {
+            format!(
+                " {}",
+                serde_json::to_string(&event.attributes).unwrap_or_else(|_| "{}".to_string())
+            )
+        } else {
+            String::new()
+        };
+
+        println!(
+            "{} [{}] {}{} {}{}",
+            event.occurred_at,
+            event.severity.to_uppercase(),
+            event.source,
+            subject,
+            description,
+            attributes
+        );
+    }
+}
+
+fn event_description(event: &DeploymentEvent) -> String {
+    if event.kind == "status_changed" {
+        let from = event.attributes.get("from").and_then(event_scalar);
+        let to = event.attributes.get("to").and_then(event_scalar);
+        if let Some(to) = to {
+            return match from {
+                Some(from) => format!("status changed: {from} → {to}"),
+                None => format!("status: {to}"),
+            };
+        }
     }
 
-    fn update(&mut self, deployment: &Deployment) {
-        self.last_status = deployment.status.clone();
-        self.last_error = deployment.error_message.clone();
-        self.last_url = deployment.primary_url.clone();
-        self.is_first_poll = false;
+    event
+        .message
+        .clone()
+        .unwrap_or_else(|| event.kind.replace('_', " "))
+}
+
+fn event_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -212,13 +323,6 @@ fn is_terminal_state(status: &DeploymentStatus) -> bool {
     )
 }
 
-/// Log state change to tracing (appears in history)
-fn log_state_change(project: &str, deployment_id: &str, status: &DeploymentStatus) {
-    let status_text = format!("{}", status);
-
-    info!("Deployment {}:{} → {}", project, deployment_id, status_text);
-}
-
 /// Check if stdout is a TTY
 fn is_tty() -> bool {
     io::stdout().is_terminal()
@@ -318,6 +422,7 @@ fn should_stream_logs(status: &DeploymentStatus) -> bool {
 ///
 /// Opens an SSE log stream and polls deployment status every 3 seconds.
 /// Returns the final deployment when a terminal state is reached.
+#[allow(clippy::too_many_arguments)]
 async fn stream_logs_with_status_polling(
     http_client: &Client,
     backend_url: &str,
@@ -326,6 +431,7 @@ async fn stream_logs_with_status_polling(
     deployment_id: &str,
     timeout: Duration,
     start_time: Instant,
+    event_reporter: &mut EventReporter,
 ) -> Result<Deployment> {
     let mut log_stream = None;
     let mut retry_count: usize = 0;
@@ -391,6 +497,16 @@ async fn stream_logs_with_status_polling(
                     let deployment = fetch_deployment(
                         http_client, backend_url, &token, project, deployment_id,
                     ).await?;
+                    let events = event_reporter
+                        .poll(
+                            http_client,
+                            backend_url,
+                            provider,
+                            project,
+                            deployment_id,
+                        )
+                        .await;
+                    print_deployment_events(&events);
                     if is_terminal_state(&deployment.status) {
                         drain_log_stream(stream).await;
                         return Ok(deployment);
@@ -409,6 +525,7 @@ async fn stream_logs_with_status_polling(
                     deployment_id,
                     timeout,
                     start_time,
+                    event_reporter,
                 )
                 .await;
             }
@@ -443,6 +560,16 @@ async fn stream_logs_with_status_polling(
                     let deployment = fetch_deployment(
                         http_client, backend_url, &token, project, deployment_id,
                     ).await?;
+                    let events = event_reporter
+                        .poll(
+                            http_client,
+                            backend_url,
+                            provider,
+                            project,
+                            deployment_id,
+                        )
+                        .await;
+                    print_deployment_events(&events);
                     if is_terminal_state(&deployment.status) {
                         return Ok(deployment);
                     }
@@ -469,6 +596,7 @@ async fn drain_log_stream(stream: &mut super::core::LogStream) {
 }
 
 /// Fall back to status-only polling when log streaming is unavailable.
+#[allow(clippy::too_many_arguments)]
 async fn status_only_polling(
     http_client: &Client,
     backend_url: &str,
@@ -477,6 +605,7 @@ async fn status_only_polling(
     deployment_id: &str,
     timeout: Duration,
     start_time: Instant,
+    event_reporter: &mut EventReporter,
 ) -> Result<Deployment> {
     loop {
         // Resolve a fresh token per poll so a long wait doesn't outlast a
@@ -484,6 +613,10 @@ async fn status_only_polling(
         let token = token_with_retry(provider).await?;
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
+        let events = event_reporter
+            .poll(http_client, backend_url, provider, project, deployment_id)
+            .await;
+        print_deployment_events(&events);
         if is_terminal_state(&deployment.status) {
             return Ok(deployment);
         }
@@ -530,6 +663,7 @@ pub async fn follow_deployment_with_ui(
 
     let mut state = FollowState::new();
     let mut live_section = LiveStatusSection::new();
+    let mut event_reporter = EventReporter::new();
 
     // Hide cursor for cleaner output
     print!("{}", ansi::HIDE_CURSOR);
@@ -543,17 +677,19 @@ pub async fn follow_deployment_with_ui(
             let deployment =
                 fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
-            if state.should_log_state_change(&deployment) {
+            let events = event_reporter
+                .poll(http_client, backend_url, &provider, project, deployment_id)
+                .await;
+            if !events.is_empty() {
                 live_section.clear_previous();
-                log_state_change(project, deployment_id, &deployment.status);
                 live_section.last_line_count = 0;
-            } else {
-                let output = live_section.render(&deployment, &state);
-                print!("{}", output);
-                io::stdout().flush().unwrap();
+                print_deployment_events(&events);
             }
 
-            state.update(&deployment);
+            let output = live_section.render(&deployment, &state);
+            print!("{}", output);
+            io::stdout().flush().unwrap();
+
             state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
 
             // Terminal state reached before Deploying - skip to Phase 3
@@ -604,6 +740,7 @@ pub async fn follow_deployment_with_ui(
             deployment_id,
             timeout,
             start_time,
+            &mut event_reporter,
         )
         .await?
     } else {
@@ -640,19 +777,18 @@ async fn follow_deployment_simple(
     timeout: Duration,
 ) -> Result<Deployment> {
     let start_time = Instant::now();
-    let mut state = FollowState::new();
+    let mut event_reporter = EventReporter::new();
 
-    // Phase 1: Status polling (print state changes as text lines)
+    // Phase 1: Status polling with the event log as the permanent output.
     let deployment = loop {
         let token = token_with_retry(provider).await?;
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
-        if state.should_log_state_change(&deployment) {
-            log_state_change(project, deployment_id, &deployment.status);
-        }
-
-        state.update(&deployment);
+        let events = event_reporter
+            .poll(http_client, backend_url, provider, project, deployment_id)
+            .await;
+        print_deployment_events(&events);
 
         if is_terminal_state(&deployment.status) {
             break deployment;
@@ -681,6 +817,7 @@ async fn follow_deployment_simple(
             deployment_id,
             timeout,
             start_time,
+            &mut event_reporter,
         )
         .await?
     } else {
@@ -703,4 +840,64 @@ async fn follow_deployment_simple(
     }
 
     Ok(final_deployment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(id: i64, kind: &str, message: Option<&str>, attributes: Value) -> DeploymentEvent {
+        DeploymentEvent {
+            id,
+            occurred_at: "2026-09-01T09:11:03.969119Z".to_string(),
+            kind: kind.to_string(),
+            severity: "info".to_string(),
+            source: "control-plane".to_string(),
+            subject: None,
+            message: message.map(str::to_string),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn unseen_events_are_returned_in_recorded_order_once() {
+        let mut seen = HashSet::from([2]);
+        let events = vec![
+            event(3, "backend_event", Some("third"), Value::Null),
+            event(2, "backend_event", Some("second"), Value::Null),
+            event(1, "backend_event", Some("first"), Value::Null),
+        ];
+
+        let fresh = unseen_events(&mut seen, events);
+        assert_eq!(
+            fresh.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(unseen_events(&mut seen, fresh).is_empty());
+    }
+
+    #[test]
+    fn status_events_get_a_readable_transition_description() {
+        let status = event(
+            1,
+            "status_changed",
+            None,
+            serde_json::json!({ "from": "Pending", "to": "Building" }),
+        );
+        assert_eq!(
+            event_description(&status),
+            "status changed: Pending → Building"
+        );
+    }
+
+    #[test]
+    fn backend_events_keep_their_message_as_the_description() {
+        let backend = event(
+            1,
+            "backend_event",
+            Some("Resources were rounded up"),
+            serde_json::json!({ "type": "resource_adjusted" }),
+        );
+        assert_eq!(event_description(&backend), "Resources were rounded up");
+    }
 }

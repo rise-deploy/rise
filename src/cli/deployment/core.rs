@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::token_source::token_with_retry;
 
 // Re-export models from API module (always available)
-pub use crate::api::models::{Deployment, DeploymentStatus};
+pub use crate::api::models::{Deployment, DeploymentEvent, DeploymentStatus};
 // Multi-container request wire types (serialized into the create-deployment body).
 use crate::api::models::{ContainerSpec, RouteSpec};
 
@@ -182,6 +182,110 @@ pub async fn fetch_deployment(
         .context("Failed to parse deployment response")?;
 
     Ok(deployment)
+}
+
+/// Fetch the complete recorded event history for a deployment.
+///
+/// Events are read newest-first by the API and paged on the server's write
+/// order. The caller decides how to display them, so this helper preserves the
+/// API order and follows every page.
+pub async fn fetch_deployment_events(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project: &str,
+    deployment_id: &str,
+) -> Result<Vec<DeploymentEvent>> {
+    let base = format!(
+        "{}/api/v1/projects/{}/deployments/{}/events",
+        backend_url, project, deployment_id
+    );
+    let mut events = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        let mut url = format!("{}?limit=500&min_severity=all", base);
+        if let Some(cursor) = cursor.as_deref() {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding::encode(cursor));
+        }
+
+        let response = http_client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("Failed to fetch deployment events")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            bail!(
+                "Failed to fetch deployment events ({}): {}",
+                status,
+                error_text
+            );
+        }
+
+        let page: crate::api::models::DeploymentEventPage = response
+            .json()
+            .await
+            .context("Failed to parse deployment events response")?;
+        events.extend(page.events);
+
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+
+    Ok(events)
+}
+
+/// Fetch the newest page of a deployment's event history.
+///
+/// Follow mode uses this after its initial complete read. Re-reading one page
+/// keeps the polling path bounded while the reporter's event-id set prevents
+/// already printed events from appearing again.
+pub async fn fetch_latest_deployment_events(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project: &str,
+    deployment_id: &str,
+) -> Result<Vec<DeploymentEvent>> {
+    let url = format!(
+        "{}/api/v1/projects/{}/deployments/{}/events?limit=500&min_severity=all",
+        backend_url, project, deployment_id
+    );
+    let response = http_client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("Failed to fetch deployment events")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        bail!(
+            "Failed to fetch deployment events ({}): {}",
+            status,
+            error_text
+        );
+    }
+
+    let page: crate::api::models::DeploymentEventPage = response
+        .json()
+        .await
+        .context("Failed to parse deployment events response")?;
+    Ok(page.events)
 }
 
 /// List deployments for a project
