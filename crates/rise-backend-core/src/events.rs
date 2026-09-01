@@ -43,9 +43,9 @@ pub enum EventKind {
     ReplicaRestarted,
     /// The desired replica count changed.
     Scaled,
-    /// A runtime-native event passed through. `attributes` carries whatever the
-    /// backend supplied, including an upstream `count` where the source already
-    /// aggregated repeats (Kubernetes `Event` does).
+    /// A backend-originated event passed through. `attributes` carries whatever
+    /// the backend supplied, including an upstream `count` where the source
+    /// already aggregated repeats (Kubernetes `Event` does).
     BackendEvent,
 }
 
@@ -92,8 +92,8 @@ impl fmt::Display for EventKind {
     }
 }
 
-/// The attribute vocabulary: what a `status_changed` event may carry, and what
-/// each key means.
+/// The attribute vocabulary: what a deployment event may carry, and what each
+/// key means.
 ///
 /// This module is the single place that decides an attribute's *meaning*. It is
 /// deliberately not an allowlist — readers render whatever an event carries, so
@@ -126,6 +126,16 @@ pub mod attributes {
     pub const REPLICAS: &str = "replicas";
     pub const CPU: &str = "cpu";
     pub const MEMORY: &str = "memory";
+    /// A backend-originated event subtype. `resource_adjusted` identifies a
+    /// requested resource shape that the backend represented with different
+    /// effective values.
+    pub const EVENT_TYPE: &str = "type";
+    pub const RESOURCE_ADJUSTED: &str = "resource_adjusted";
+    pub const REQUESTED_CPU: &str = "requested_cpu";
+    pub const REQUESTED_MEMORY: &str = "requested_memory";
+    pub const RESOLVED_CPU_UNITS: &str = "resolved_cpu_units";
+    pub const RESOLVED_MEMORY_MIB: &str = "resolved_memory_mib";
+    pub const CONTAINER: &str = "container";
     /// Declared container names, and the image the deployment was created with.
     pub const CONTAINERS: &str = "containers";
     pub const IMAGE: &str = "image";
@@ -164,17 +174,16 @@ pub mod attributes {
     pub const IMAGES: &str = "images";
 }
 
-/// A runtime-native event a backend wants forwarded into the log.
+/// A backend-originated event a backend wants forwarded into the log.
 ///
-/// The runtime's own words, carried through rather than translated: what
-/// Kubernetes calls `FailedScheduling` and what ECS phrases as prose both say
-/// something no periodic observation can, and paraphrasing them would lose the
-/// detail that makes them worth having.
+/// The backend's own words, carried through rather than translated: what
+/// Kubernetes calls `FailedScheduling`, what ECS phrases as prose, and what a
+/// controller resolves before applying all say something no periodic
+/// observation can, and paraphrasing them would lose useful detail.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForwardedEvent {
-    /// The runtime's identifier for this occurrence. Stable for the same event
-    /// and distinct across events, so re-reading the same window cannot record
-    /// it twice.
+    /// A stable identifier for this occurrence, distinct across occurrences, so
+    /// re-reading the same backend window cannot record it twice.
     pub dedupe_key: String,
     pub occurred_at: chrono::DateTime<chrono::Utc>,
     pub severity: EventSeverity,

@@ -125,6 +125,25 @@ mod client_models {
         pub updated: String,
     }
 
+    /// One event recorded in a deployment's append-only history.
+    #[derive(Debug, Deserialize, Clone)]
+    pub struct DeploymentEvent {
+        pub id: i64,
+        pub occurred_at: String,
+        pub kind: String,
+        pub severity: String,
+        pub source: String,
+        pub subject: Option<String>,
+        pub message: Option<String>,
+        pub attributes: serde_json::Value,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct DeploymentEventPage {
+        pub events: Vec<DeploymentEvent>,
+        pub next_cursor: Option<String>,
+    }
+
     fn default_group() -> String {
         DEFAULT_DEPLOYMENT_GROUP.to_string()
     }
