@@ -167,6 +167,25 @@ rise deployment list -p my-app
 rise d ls -p my-app --group staging
 ```
 
+For CI and other scripts, `--json` writes a deliberately minimal JSON payload. Each
+deployment contains `deployment_id` and `status`, plus `primary_url` when available and
+`error_message` when present. `rise deploy` waits for the deployment to reach its
+terminal state and writes one object; `rise deployment list` writes an array. Build and
+push failures also produce a failed payload after the deployment record is created.
+`--status-file <path>` writes the same JSON to a file, while preserving human-readable
+output unless `--json` is also supplied.
+
+```bash
+# Retrieve the URL of the deployment that just completed
+rise deploy -p my-app --status-file deployment.json
+jq -r '.primary_url // empty' deployment.json
+
+# Write JSON directly to stdout
+rise deployment list -p my-app --json | jq '.[].primary_url'
+```
+
+Status files are replaced atomically after a complete JSON document is available.
+
 ### Viewing Deployment Details
 
 ```bash

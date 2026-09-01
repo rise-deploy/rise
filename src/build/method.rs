@@ -125,6 +125,8 @@ pub(crate) struct BuildOptions {
     /// Where `platform` was sourced from (CLI / env / rise.toml / backend / host).
     /// Lets callers report or react to the precedence level that won.
     pub platform_source: crate::build::PlatformSource,
+    /// Where build command stdout is written.
+    pub output: crate::build::CommandOutput,
 }
 
 /// How the build backend should handle image push output.
@@ -293,6 +295,7 @@ impl BuildOptions {
             platform,
             platform_source,
             push_mode: BuildPushMode::Disabled,
+            output: crate::build::CommandOutput::Inherit,
         }
     }
 
@@ -309,6 +312,11 @@ impl BuildOptions {
     /// Builder method to set explicit push mode.
     pub(crate) fn with_push_mode(mut self, push_mode: BuildPushMode) -> Self {
         self.push_mode = push_mode;
+        self
+    }
+
+    pub(crate) fn with_output(mut self, output: crate::build::CommandOutput) -> Self {
+        self.output = output;
         self
     }
 }

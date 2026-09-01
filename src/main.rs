@@ -164,6 +164,12 @@ struct DeployArgs {
     /// Memory allocation (e.g., "256Mi", "1Gi") — sets both K8s request and limit (overrides rise.toml)
     #[arg(long)]
     memory: Option<String>,
+    /// Emit the completed deployment as JSON on stdout.
+    #[arg(long)]
+    json: bool,
+    /// Write the completed deployment JSON to this file.
+    #[arg(long, value_name = "PATH")]
+    status_file: Option<String>,
     #[command(flatten)]
     build_args: build::BuildArgs,
 }
@@ -635,6 +641,12 @@ enum DeploymentCommands {
         /// Limit number of deployments to show
         #[arg(long, short, default_value = "10")]
         limit: usize,
+        /// Emit deployments as a JSON array on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Write the deployments JSON array to this file.
+        #[arg(long, value_name = "PATH")]
+        status_file: Option<String>,
     },
     /// Show deployment details
     #[command(visible_alias = "s")]
@@ -1637,6 +1649,8 @@ async fn main() -> Result<()> {
                         replicas,
                         cpu,
                         memory,
+                        json_output: args.json,
+                        status_file: args.status_file.clone(),
                     },
                 )
                 .await?;
@@ -1646,6 +1660,8 @@ async fn main() -> Result<()> {
                 path,
                 group,
                 limit,
+                json,
+                status_file,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
                 deployment::list_deployments(
@@ -1655,6 +1671,10 @@ async fn main() -> Result<()> {
                     &project_name,
                     group.as_deref(),
                     *limit,
+                    deployment::DeploymentOutputOptions {
+                        json: *json,
+                        status_file: status_file.as_deref(),
+                    },
                 )
                 .await?;
             }
@@ -2260,5 +2280,54 @@ mod log_color_tests {
     fn an_unrecognised_override_defers_rather_than_forcing() {
         assert!(!ansi_enabled(Some("banana"), Some("1"), true));
         assert!(ansi_enabled(Some("banana"), None, false));
+    }
+}
+
+#[cfg(all(test, feature = "cli"))]
+mod deployment_output_cli_tests {
+    use super::{Cli, Commands, DeploymentCommands};
+    use clap::Parser;
+
+    #[test]
+    fn deploy_accepts_json_and_status_file_flags() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "deploy",
+            "--json",
+            "--status-file",
+            "deployment.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Deploy { args } => {
+                assert!(args.json);
+                assert_eq!(args.status_file.as_deref(), Some("deployment.json"));
+            }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn deployment_list_accepts_json_and_status_file_flags() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "deployment",
+            "list",
+            "--json",
+            "--status-file",
+            "deployments.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Deployment(DeploymentCommands::List {
+                json, status_file, ..
+            }) => {
+                assert!(json);
+                assert_eq!(status_file.as_deref(), Some("deployments.json"));
+            }
+            _ => panic!("expected deployment list command"),
+        }
     }
 }

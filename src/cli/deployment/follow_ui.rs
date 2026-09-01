@@ -638,6 +638,7 @@ pub async fn follow_deployment_with_ui(
     project: &str,
     deployment_id: &str,
     timeout_str: &str,
+    quiet: bool,
 ) -> Result<Deployment> {
     // The follow/poll loop can run for up to ~10 minutes, so resolve a fresh
     // token before each request rather than capturing one up front: in CI the
@@ -647,6 +648,19 @@ pub async fn follow_deployment_with_ui(
 
     let timeout = parse_duration(timeout_str)?;
     let start_time = Instant::now();
+
+    if quiet {
+        return follow_deployment_quiet(
+            http_client,
+            backend_url,
+            &provider,
+            project,
+            deployment_id,
+            timeout,
+            start_time,
+        )
+        .await;
+    }
 
     // Check if we're in a TTY - if not, fall back to simple mode
     if !is_tty() {
@@ -765,6 +779,36 @@ pub async fn follow_deployment_with_ui(
     }
 
     Ok(final_deployment)
+}
+
+/// Follow a deployment without writing progress to stdout.
+async fn follow_deployment_quiet(
+    http_client: &Client,
+    backend_url: &str,
+    provider: &crate::token_source::TokenProvider,
+    project: &str,
+    deployment_id: &str,
+    timeout: Duration,
+    start_time: Instant,
+) -> Result<Deployment> {
+    loop {
+        let token = token_with_retry(provider).await?;
+        let deployment =
+            fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
+
+        if is_terminal_state(&deployment.status) {
+            return Ok(deployment);
+        }
+
+        if start_time.elapsed() >= timeout {
+            bail!(
+                "Timeout waiting for deployment to complete after {:?}",
+                timeout
+            );
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Simple fallback for non-TTY environments (pipes, redirects)

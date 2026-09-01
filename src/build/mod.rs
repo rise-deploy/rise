@@ -15,6 +15,76 @@ mod railpack;
 mod registry;
 mod ssl;
 
+use anyhow::{bail, Context, Result};
+use std::io::{self, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
+
+/// Where a child command should write its stdout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandOutput {
+    Inherit,
+    Stderr,
+}
+
+/// Run a child command while keeping its stdout out of a machine-readable
+/// command's stdout.
+pub(crate) fn run_command(
+    mut command: Command,
+    context: &str,
+    output: CommandOutput,
+) -> Result<ExitStatus> {
+    if output == CommandOutput::Inherit {
+        return command.status().with_context(|| context.to_string());
+    }
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| context.to_string())?;
+    forward_child_stdout(&mut child, context)?;
+    child.wait().with_context(|| context.to_string())
+}
+
+/// Run a child command with stdin while forwarding its stdout to stderr when
+/// machine-readable output is selected.
+pub(crate) fn run_command_with_stdin(
+    mut command: Command,
+    stdin: &[u8],
+    context: &str,
+    output: CommandOutput,
+) -> Result<ExitStatus> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(if output == CommandOutput::Stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .spawn()
+        .with_context(|| context.to_string())?;
+
+    if let Some(mut child_stdin) = child.stdin.take() {
+        child_stdin
+            .write_all(stdin)
+            .with_context(|| context.to_string())?;
+    }
+    if output == CommandOutput::Stderr {
+        forward_child_stdout(&mut child, context)?;
+    }
+    child.wait().with_context(|| context.to_string())
+}
+
+fn forward_child_stdout(child: &mut Child, context: &str) -> Result<()> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
+    let mut stderr = io::stderr();
+    io::copy(&mut stdout, &mut stderr)
+        .map(|_| ())
+        .with_context(|| context.to_string())
+}
+
 /// Fallback target platform when nothing more specific (CLI flag, env var,
 /// rise.toml, backend hint) is provided. We default to the host architecture
 /// so local dev (e.g. ARM Mac + ARM minikube) just works; production deploys
@@ -112,10 +182,10 @@ pub use method::BuildArgs;
 pub(crate) use method::{BuildMethod, BuildOptions, BuildPushMode};
 pub(crate) use railpack::{build_with_buildctl, BuildctlFrontend, RailpackBuildOptions};
 pub(crate) use registry::{
-    docker_login, docker_pull, docker_push, docker_tag, inject_registry_auth,
+    docker_login_with_output, docker_pull_with_output, docker_push, docker_push_with_output,
+    docker_tag_with_output, inject_registry_auth,
 };
 
-use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -123,7 +193,7 @@ use tracing::{debug, info, warn};
 use buildkit::{check_ssl_cert_and_warn, ensure_managed_buildkit_daemon};
 use docker::{build_image_with_dockerfile, DockerBuildOptions};
 use method::{requires_buildkit, select_build_method};
-use pack::build_image_with_buildpacks;
+use pack::{build_image_with_buildpacks, BuildpackBuildOptions};
 use railpack::build_image_with_railpacks;
 
 /// Read an environment variable, treating empty strings as if the variable is not set.
@@ -234,6 +304,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
             Some(ensure_managed_buildkit_daemon(
                 ssl_cert_path.as_deref(),
                 container_cli,
+                options.output,
             )?)
         }
     } else {
@@ -281,6 +352,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 build_contexts: &resolved_build_contexts,
                 no_cache: options.no_cache,
                 platform: &options.platform,
+                output: options.output,
             })?;
         }
         BuildMethod::Pack => {
@@ -290,20 +362,25 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
             if options.managed_buildkit.is_some() {
                 warn!("--managed-buildkit flag is ignored when using pack build method");
             }
-            build_image_with_buildpacks(
-                &options.app_path,
-                &options.image_tag,
-                options.builder.as_deref(),
-                &options.buildpacks,
-                &options.env,
-                options.no_cache,
-                &options.platform,
-            )?;
+            build_image_with_buildpacks(BuildpackBuildOptions {
+                app_path: &options.app_path,
+                image_tag: &options.image_tag,
+                builder: options.builder.as_deref(),
+                buildpacks: &options.buildpacks,
+                env: &options.env,
+                no_cache: options.no_cache,
+                platform: &options.platform,
+                output: options.output,
+            })?;
 
             // Pack doesn't support push during build, so inline push falls back
             // to a separate push owned by the build module.
             if options.push_mode == BuildPushMode::Inline {
-                registry::docker_push(container_cli.command(), &options.image_tag)?;
+                registry::docker_push_with_output(
+                    container_cli.command(),
+                    &options.image_tag,
+                    options.output,
+                )?;
             }
         }
         BuildMethod::Railpack { use_buildctl } => {
@@ -328,6 +405,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 env: &options.env,
                 no_cache: options.no_cache,
                 platform: &options.platform,
+                output: options.output,
             })?;
         }
         BuildMethod::Buildctl => {
@@ -400,6 +478,7 @@ pub(crate) fn build_image(options: BuildOptions) -> Result<()> {
                 options.no_cache,
                 container_cli.command(),
                 &options.platform,
+                options.output,
             )?;
 
             // Note: SslCertContext cleanup is automatic via RAII when it goes out of scope
