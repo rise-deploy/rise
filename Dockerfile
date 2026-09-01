@@ -113,6 +113,13 @@ COPY --from=builder /usr/src/static /var/lib/rise/static
 # Copy built user documentation for serving via docs_dir
 COPY --from=user-docs-builder /usr/src/docs/user/dist /var/rise/docs
 
+# Third-party attribution for everything in this image: the binary's crates
+# plus the JavaScript bundled into the web UI and the docs site. Copied from
+# the build context into the final stage rather than into the builder's static/
+# dir, so a dependency bump does not invalidate the expensive Rust layer. Lands
+# under static_dir, where the existing fallback handler already serves it.
+COPY THIRD-PARTY-NOTICES.md /var/lib/rise/static/THIRD-PARTY-NOTICES.md
+
 # Default config location/run mode for containerized execution
 ENV RISE_CONFIG_DIR=/etc/rise
 ENV RISE_CONFIG_RUN_MODE=production

@@ -19,6 +19,32 @@ pub fn frontend_routes() -> Router<AppState> {
         .fallback(fallback_handler)
 }
 
+/// Third-party attribution for everything this server ships.
+///
+/// The file is also reachable through the static fallback, but `mime_guess`
+/// types `.md` as `text/markdown`, which browsers download rather than render.
+/// This route exists so the URL can be handed to someone and simply open. It
+/// sits in the reserved `/.rise/` namespace so no future frontend route can
+/// collide with it.
+pub fn notices_routes() -> Router<AppState> {
+    Router::new().route("/.rise/third-party-notices", get(serve_notices))
+}
+
+async fn serve_notices(State(state): State<AppState>) -> Response {
+    let Some(static_dir) = state.server_settings.static_dir.as_deref() else {
+        return (StatusCode::NOT_FOUND, "Third-party notices not available").into_response();
+    };
+    match load_static_file(static_dir, "THIRD-PARTY-NOTICES.md").await {
+        Some(bytes) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(Body::from(bytes))
+            .unwrap(),
+        None => (StatusCode::NOT_FOUND, "Third-party notices not available").into_response(),
+    }
+}
+
 pub fn docs_routes() -> Router<AppState> {
     Router::new()
         .route("/docs", get(|| async { Redirect::permanent("/docs/") }))

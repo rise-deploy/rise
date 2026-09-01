@@ -10,5 +10,9 @@ cargo-dist-version = "0.30.3"
 ci = "github"
 # The installers to generate for each app
 installers = []
+# Ship the third-party notices alongside the binary. dist auto-includes
+# LICENSE* and README* but not this, and MIT/Apache-2.0 require the notices to
+# accompany the distribution. Workspace [dist] is what release.yml honours.
+include = ["THIRD-PARTY-NOTICES.md"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]

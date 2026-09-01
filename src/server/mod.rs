@@ -334,6 +334,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         // OAuth/OIDC routes at root level (before frontend fallback)
         .merge(extensions::providers::oauth::routes::oauth_routes())
         .merge(frontend::routes::docs_routes())
+        .merge(frontend::routes::notices_routes())
         .merge(frontend::routes::frontend_routes())
         .with_state(state.clone())
         .layer(

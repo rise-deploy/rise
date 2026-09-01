@@ -376,7 +376,7 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (us
 | Resource API types (`crates/rise-resource-api/`) | `mise run resource:schema:generate` | Regenerate the resource/organization/controller-status schemas under `docs/engineering/public/schemas/` (commit the result) |
 | CRD structs (`src/server/deployment/crd.rs`) | `mise run crd:generate` | Regenerate `helm/rise/crds/riseproject-crd.yaml` (commit the result) |
 | Helm chart (`helm/rise/`) | `helm lint helm/rise` | Validate chart templates |
-| `Cargo.lock` (or any dependency change) | `mise run notices:generate` | Regenerate `THIRD-PARTY-NOTICES.md` (commit the result); CI fails on drift |
+| `Cargo.lock`, `frontend/package-lock.json`, `docs/package-lock.json` | `mise run notices:generate` | Regenerate `THIRD-PARTY-NOTICES.md` (commit the result); CI fails on drift. The JS half comes from real Vite/Astro builds, so the task runs them |
 
 **Full CI-equivalent check** (slower, runs everything):
 
