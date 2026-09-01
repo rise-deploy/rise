@@ -4,16 +4,16 @@ title: "ADR-0006: Source-Available Backend Licensing"
 
 ## Status
 
-**In Progress** — Date: 2026-09-01.
+**Implemented** — Date: 2026-09-01.
 
-Shipped: the licensing split itself (D1–D5), the ECS backend relicensed, the
-per-crate license metadata, `LICENSING.md`, the DCO requirement.
+Shipped: the licensing split (D1–D5), both backends relicensed, the per-crate
+license metadata, `LICENSING.md`, the DCO requirement, and the D3 extraction —
+`crates/rise-backend-kubernetes/` now carries its own license, reached only
+through `DeploymentBackend`, `OrganizationView` and its own `WebhookContext`.
 
-Outstanding: the Kubernetes backend still lives in `src/server/deployment/` and
-cannot carry its own license until it is extracted into
-`crates/rise-backend-kubernetes/` (D3). Until that lands, the Kubernetes code is
-still under MIT OR Apache-2.0 in fact, whatever `LICENSING.md` says about the
-intended end state.
+Follow-ups, neither of which changes the licensing position: `logs/cloudwatch.rs`
+is the ECS log backend and still sits in the root crate, and the `backend` cargo
+feature is not split per backend (see the D4 consequences).
 
 ## Context
 
