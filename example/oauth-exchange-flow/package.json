@@ -9,7 +9,7 @@
   },
   "keywords": ["oauth", "rise", "exchange-flow"],
   "author": "",
-  "license": "MIT",
+  "license": "MIT OR Apache-2.0",
   "engines": {
     "node": ">=18"
   },

@@ -188,13 +188,21 @@ The script validates prerequisites, generates release notes, shows a plan, and a
 
 ## License
 
-Licensed under either of
+Rise is split across two licenses:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- The core platform, the `rise` CLI and the single-node **Docker backend** are
+  licensed under **MIT OR Apache-2.0** ([LICENSE-MIT](LICENSE-MIT),
+  [LICENSE-APACHE](LICENSE-APACHE)), at your option.
+- The **Kubernetes** and **Amazon ECS** backends, the Helm chart and the ECS
+  Terraform module are licensed under the **Business Source License 1.1**
+  ([LICENSE-BSL](LICENSE-BSL)) and convert to MIT OR Apache-2.0 four years
+  after each release. Production use is permitted unless you offer Rise as a
+  hosted or managed service to third parties; non-profits are exempt.
 
-at your option.
+Released `rise` CLI binaries link no BSL code. See [LICENSING.md](LICENSING.md)
+for the full path-by-path map and what it means in practice.
 
 ### Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Contributions are accepted under the license of the path they touch. A
+`Signed-off-by` line (DCO) is required — see [CONTRIBUTING.md](CONTRIBUTING.md).

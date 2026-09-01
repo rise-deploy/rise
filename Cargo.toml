@@ -18,6 +18,14 @@ members = [
 exclude = ["tests/e2e"]
 resolver = "2"
 
+# Shared package metadata. Crates that are part of the permissively-licensed
+# core inherit `license` from here; the BSL-licensed backend crates state their
+# own. See LICENSING.md.
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
+
 [workspace.dependencies]
 anyhow = "1.0.100"
 async-trait = "0.1"
@@ -43,9 +51,9 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 name = "rise-deploy"
 version = "0.23.0-rc15"
 publish = false
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/rise-deploy/rise"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "A simple and powerful CLI for deploying containerized applications"
 
 [package.metadata.cargo-all-features]

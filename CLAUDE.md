@@ -76,7 +76,7 @@ Focused support crates live under `crates/`:
 | `rise-backend-auth` | Pure-core token signing, verification, and claim matching — the single home for auth-token logic (see `ROADMAP.md` § 2, "Rise-issued authentication and token issuance") | `backend` |
 | `rise-backend-core` | The deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine`/`runtime`/`url_builder`/`token_ttl`/`custom_domain` helpers, the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore` — and the runtime-agnostic reconcile machinery every backend shares (`desired`/`env`/`naming`/`labels`/`diff`/`rolling`). Deliberately free of any one proxy's machinery: routing lives in `rise-backend-traefik` | `backend` |
 | `rise-backend-docker` | The Docker deployment backend: `DockerBackend` + the in-process `DockerReconciler`, the first controller extracted onto the `rise-backend-core` seam. Re-exported under `crate::server::deployment::controller::docker`, so existing module paths keep resolving | `backend` |
-| `rise-backend-ecs` | The Amazon ECS deployment backend (Fargate): `EcsBackend` + the in-process `EcsReconciler`, plus the pure Fargate-sizing, tag, task-definition and service-diff modules | `backend` |
+| `rise-backend-ecs` | **BUSL-1.1** (see `LICENSING.md`). The Amazon ECS deployment backend (Fargate): `EcsBackend` + the in-process `EcsReconciler`, plus the pure Fargate-sizing, tag, task-definition and service-diff modules | `backend` |
 | `rise-backend-traefik` | Traefik routing machinery — the dynamic-config label vocabulary, the `DesiredContainer` → labels renderer with its fail-closed `routes_withheld` predicate, router/service naming, the `serverStatus` API client, and the readiness verdicts built on it. Owned by the Traefik-fronted backends (Docker, ECS) rather than by `rise-backend-core`: Kubernetes routes with nginx annotations and depends on none of it | `backend` |
 | `rise-authz` | Authorization policy evaluation, in two tiers. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies. `engine` is Tier 1: the live ADR-0001 §4 algorithm over `ResourceStore` reads and one `MembershipResolver` seam — still free of HTTP, SQL, and product kinds | `backend` |
 | `rise-resource-api` | Generic resource API contract (resource kinds, scopes, owner references, identity, policy types) | `backend` |
@@ -235,6 +235,31 @@ Documentation lives in two Astro Starlight sites under [`/docs`](./docs):
   - Architecture decision records: [adr/](docs/engineering/src/content/docs/adr/)
 
 Serve them locally with `mise run docs:serve` / `mise run docs:engineering:serve`.
+
+## Licensing
+
+The repository is split across two licenses; `LICENSING.md` is the authoritative
+map and ADR-0006 records the reasoning.
+
+- **BUSL-1.1**: `crates/rise-backend-ecs/`, `helm/rise/`, `modules/rise-ecs/`,
+  and — once extracted from `src/server/deployment/` — the Kubernetes backend.
+- **MIT OR Apache-2.0**: everything else, including the CLI, the server core,
+  `rise-backend-core`, `rise-backend-traefik` and `rise-backend-docker`.
+
+Two rules follow from this and are easy to violate by accident:
+
+- **Nothing permissive may depend on a BSL crate.** `rise-backend-traefik` is
+  shared with Docker, so ECS-aware code in it (the `@ecs` provider name) stays
+  permissive; likewise `sanitize_ecs_name` and `EventSource::Ecs` in
+  `rise-backend-core`, and `AccessClass` in `src/server/settings.rs`. When a
+  shared type starts to look backend-specific, keep it shared and narrow the
+  seam instead of moving it.
+- **New crates inherit the permissive license** via `license.workspace = true`.
+  A BSL crate states `license = "BUSL-1.1"` literally and carries a `LICENSE`
+  copy. `tests/e2e` is a separate workspace and inherits nothing.
+
+Contributions require a DCO `Signed-off-by` line (`git commit -s`); CI enforces
+it. See `CONTRIBUTING.md`.
 
 ## Git Branching
 

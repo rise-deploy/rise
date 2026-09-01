@@ -3,6 +3,8 @@ name = "rise-e2e"
 version = "0.0.0"
 edition = "2021"
 publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rise-deploy/rise"
 description = "Cross-backend end-to-end test harness for Rise (Docker / Kubernetes)."
 
 # Standalone workspace: deliberately excluded from the root workspace so the
