@@ -4546,12 +4546,15 @@ name = "rise-backend-ecs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "aws-config",
+ "aws-sdk-cloudwatchlogs",
  "aws-sdk-ecs",
  "aws-sdk-ssm",
  "aws-sdk-sts",
  "chrono",
+ "futures",
  "rise-backend-core",
  "rise-backend-traefik",
  "rise-deployment-spec",
@@ -4625,7 +4628,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
- "aws-sdk-cloudwatchlogs",
  "aws-sdk-ecr",
  "aws-sdk-ecs",
  "aws-sdk-iam",
