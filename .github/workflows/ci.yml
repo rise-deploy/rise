@@ -204,6 +204,16 @@ jobs:
           # notices file, so it must be a deliberate change, not a CI surprise.
           tool: cargo-about@0.9.2
 
+      # The JS half of the notices comes from a real Vite build, so this job
+      # needs Node. It is also the only place the frontend is built outside the
+      # Docker image, which surfaces a broken build earlier than it would be.
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       # `cargo about --offline` needs a populated registry cache.
       - name: Fetch dependencies
         run: cargo fetch --locked

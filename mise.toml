@@ -181,7 +181,14 @@ helm dependency build helm/rise \
 
 [tasks."notices:generate"]
 description = "Regenerate THIRD-PARTY-NOTICES.md from the shipped dependencies."
-run = "node scripts/generate-notices.mjs"
+# The JS half is bundle-accurate on purpose: it reports what the build actually
+# emitted, not what the lockfile resolves. That means the build has to run.
+# `npm ci`, not `npm install`, so the lockfile cannot move underneath it.
+run = """
+mkdir -p target/notices
+(cd frontend && npm ci --silent && RISE_NOTICES_OUT="$PWD/../target/notices" npx vite build)
+node scripts/generate-notices.mjs
+"""
 
 [tasks."notices:check"]
 description = "Verify THIRD-PARTY-NOTICES.md is up to date."
