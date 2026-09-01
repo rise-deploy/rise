@@ -422,6 +422,7 @@ fn should_stream_logs(status: &DeploymentStatus) -> bool {
 ///
 /// Opens an SSE log stream and polls deployment status every 3 seconds.
 /// Returns the final deployment when a terminal state is reached.
+#[allow(clippy::too_many_arguments)]
 async fn stream_logs_with_status_polling(
     http_client: &Client,
     backend_url: &str,
@@ -595,6 +596,7 @@ async fn drain_log_stream(stream: &mut super::core::LogStream) {
 }
 
 /// Fall back to status-only polling when log streaming is unavailable.
+#[allow(clippy::too_many_arguments)]
 async fn status_only_polling(
     http_client: &Client,
     backend_url: &str,
