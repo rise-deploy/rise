@@ -26,7 +26,8 @@ use rise_backend_core::labels::{ns_key, SUFFIX_CONTROLLER_CLASS};
 use rise_backend_core::naming::sanitize_ecs_name;
 use rise_backend_traefik::render::{render_traefik_labels_for, TraefikRenderConfig};
 
-use crate::sizing::{self, FargateSize};
+use crate::capacity::Compatibility;
+use crate::sizing::{self, TaskSize};
 
 /// ECS caps a task definition at 64 KiB. Plain env values and one ~120-character
 /// SSM ARN per secret both count toward it. We check before registering so an
@@ -78,7 +79,7 @@ pub struct ContainerDefinitionSpec {
     pub repository_credentials_secret_arn: Option<String>,
 }
 
-/// A complete Fargate task definition, ready to convert to SDK input.
+/// A complete ECS task definition, ready to convert to SDK input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskDefinitionSpec {
     pub family: String,
@@ -89,7 +90,7 @@ pub struct TaskDefinitionSpec {
     pub task_role_arn: Option<String>,
     pub containers: Vec<ContainerDefinitionSpec>,
     /// Resolved size, retained so the reconciler can log a round-up.
-    pub size: FargateSize,
+    pub size: TaskSize,
 }
 
 impl TaskDefinitionSpec {
@@ -183,6 +184,9 @@ impl TaskDefinitionSpec {
 pub struct TaskDefinitionConfig<'a> {
     pub resource_prefix: &'a str,
     pub cpu_architecture: &'a str,
+    /// What the task definition must declare in `requiresCompatibilities`, and
+    /// therefore whether `cpu`/`memory` are restricted to Fargate's size table.
+    pub compatibility: Compatibility,
     pub execution_role_arn: Option<&'a str>,
     pub task_role_arn: Option<&'a str>,
     /// Secrets Manager secret ARN for a private non-ECR registry; see
@@ -250,7 +254,7 @@ pub fn build(
     secrets: &[SecretRef],
     cfg: &TaskDefinitionConfig<'_>,
 ) -> Result<TaskDefinitionSpec> {
-    let size = sizing::resolve(&desired.cpu, &desired.memory)?;
+    let size = sizing::resolve(&desired.cpu, &desired.memory, cfg.compatibility)?;
 
     // Secrets are injected by ECS; their names must not also appear as plain
     // environment or the plaintext would be back in the task definition.
@@ -352,6 +356,7 @@ mod tests {
         TaskDefinitionConfig {
             resource_prefix: "rise",
             cpu_architecture: "X86_64",
+            compatibility: Compatibility::Fargate,
             execution_role_arn: Some("arn:aws:iam::1:role/exec"),
             task_role_arn: None,
             repository_credentials_secret_arn: None,

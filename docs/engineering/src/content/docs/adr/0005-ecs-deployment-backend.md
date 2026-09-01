@@ -41,6 +41,27 @@ execution role, and Cloud Map registration is part of the unimplemented D10 — 
 those grants are omitted rather than reserved, with tests asserting they stay
 out.
 
+D2 has since been widened. Workloads run on **either Fargate or EC2 container
+instances**, chosen by a `capacity` setting; `awsvpc` remains fixed, and the
+readiness path that depends on it is unchanged. EC2 capacity is bring-your-own —
+`modules/rise-ecs` provisions no Auto Scaling group or capacity provider, and the
+control plane itself still runs on Fargate. The same change closed a gap the
+service diff had from the start: it compared only the task-definition hash and
+the desired count, so a change to `subnets`, `security_groups` or
+`assign_public_ip` was never detected on a running service. Those are now
+compared against what `DescribeServices` reports — read from the API rather than
+from a Rise tag, because a tag would be absent on every existing service and make
+the whole fleet look drifted on the first tick after an upgrade. Capacity itself
+is reported but never applied in place: ECS restricts which transitions
+`UpdateService` performs, and the next deployment carries the change for free.
+
+Interruptible capacity is **not** shipped. The placement code is already
+capacity-provider-shaped (a `Capacity::Provider` variant renders a
+`capacityProviderStrategy`), but nothing selects one; see D2 for the two
+decisions recorded ahead of that work. Real EC2 verification is manual — the e2e
+harness provisions Fargate only, so what it asserts about this change is that the
+default path is byte-for-byte unchanged.
+
 Deliberately deferred, each **failing closed**: the deployment is marked Failed
 on its first reconcile, carrying the reason as its failure message rather than
 running half-working or timing out with a generic one. The features: workload identity (D8), Cloud Map
@@ -116,16 +137,43 @@ client exists.
 **Not decided here:** whether ECS reconciliation eventually moves out of process.
 It follows whatever the external-controller work decides for Docker.
 
-### D2. Fargate first; `awsvpc` networking
+### D2. Configurable capacity; `awsvpc` networking always
 
-The backend targets **Fargate** launch type on `awsvpc` networking. EC2 capacity
-providers are a later, additive option (a `capacity_provider` setting), not a
-day-one variant.
+The backend runs workloads on either **Fargate** (the default) or the cluster's
+own **EC2 container instances**, selected by a `capacity` setting. Both run on
+**`awsvpc` networking**, which is not configurable.
 
-Consequences accepted: per-task ENIs (subnet IP consumption scales with replica
-count), task start latency measured in tens of seconds rather than the Docker
-backend's seconds, no privileged containers, no host bind mounts, and CPU/memory
-restricted to Fargate's discrete size table (see D9).
+`awsvpc` is the load-bearing half of this decision. Readiness is a lookup of
+`http://{task-ip}:{port}` in Traefik's `serverStatus`, and that IP is the task's
+own ENI address from `DescribeTasks` attachment details. A `bridge`-networked
+cluster would register the container instance's address and a dynamic host port
+instead, which the controller cannot construct without `ec2:DescribeInstances` —
+a grant this ADR's own permission narrowing removed, with a Terraform test
+asserting it stays out. So capacity is a knob and networking is not.
+
+Interruptible capacity (`FARGATE_SPOT`, or a Spot-backed Auto Scaling group
+capacity provider) is the next step and is why capacity is modelled as an enum
+that renders to *either* a `launchType` *or* a `capacityProviderStrategy` —
+ECS rejects a `CreateService` carrying both. Two decisions are recorded ahead of
+that work:
+
+- It will be a **per-container `rise.toml` knob**, not a mutable project
+  setting. `rise.toml` is deployment-scoped, so a change is fixed at deploy time
+  and arrives as a new service rather than as drift on a running one — which
+  matters because ECS restricts the capacity transitions `UpdateService` will
+  perform in place.
+- It will be named **generically** (interruptible/preemptible), not "spot".
+  Kubernetes can express the same intent with a spot node pool via nodeSelector
+  and tolerations; Docker cannot, and documents it as a limitation. Keeping an
+  AWS term out of the cross-backend `rise.toml` schema is cheaper to decide now
+  than to rename later.
+
+Consequences accepted: per-task ENIs on both capacities (subnet IP consumption
+scales with replica count, and on EC2 the per-instance ENI attachment limit caps
+tasks per host unless trunking is enabled), task start latency measured in tens
+of seconds rather than the Docker backend's seconds, no privileged containers,
+and no host bind mounts. CPU/memory is restricted to Fargate's discrete size
+table on Fargate capacity only (see D9).
 
 ### D3. Object mapping
 
@@ -445,6 +493,14 @@ an error naming the nearest valid size — not silently clamped.
 
 Rounding up is billing-visible, so the resolved size is surfaced on the
 deployment (and in the CLI's deploy output) rather than hidden.
+
+**This applies to Fargate capacity only.** EC2 capacity (D2) declares arbitrary
+task-level CPU and memory, bounded by what a container instance has rather than
+by a table, so the request is carried through exactly as written and nothing is
+flagged as rounded. Rounding there would be actively wrong: it would inflate the
+task against real instance capacity and fail placement for a request that would
+have fitted. The `deployment_constraints` check is unchanged — it runs in the
+API handler, before any capacity is consulted.
 
 ### D10. Cross-container discovery via Cloud Map
 

@@ -466,7 +466,7 @@ variable "rise_desired_count" {
 }
 
 variable "cpu_architecture" {
-  description = "Fargate CPU architecture for the control plane and for deployed workloads."
+  description = "CPU architecture for the control plane and for deployed workloads."
   type        = string
   default     = "X86_64"
 

@@ -110,6 +110,13 @@ deployment_controller:
   # since a wrong guess builds images the tasks cannot execute.
   cpu_architecture: "${RISE_ECS_CPU_ARCHITECTURE:-X86_64}"
 
+  # Where the workload tasks run: "fargate" (AWS schedules them) or "ec2" (they
+  # are placed on the cluster's own container instances). Networking is awsvpc
+  # either way, which is why `subnets` above is required for both. On ec2,
+  # enable ENI trunking on the container instances — without it, the per-instance
+  # ENI limit, not CPU or memory, is what caps tasks per host.
+  capacity: "${RISE_ECS_CAPACITY:-fargate}"
+
   production_ingress_url_template: "{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
   staging_ingress_url_template: "{deployment_group}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
   environment_ingress_url_template: "{environment}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"

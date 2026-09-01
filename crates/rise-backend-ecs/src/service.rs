@@ -12,12 +12,62 @@
 //! window that would otherwise be far worse on ECS, where a task takes tens of
 //! seconds to start rather than one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rise_backend_core::naming::sanitize_ecs_name;
 use rise_backend_core::spec_key;
 
+use crate::capacity::Capacity;
 use crate::tags::ServiceTags;
+
+/// The service-level shape Rise controls: where the tasks' ENIs live, and what
+/// capacity places them.
+///
+/// Separate from the task definition on purpose. These are properties of the
+/// *service*, so folding them into `TaskDefinitionSpec::content_hash` would
+/// register a new revision for a change that needs none — and
+/// `RegisterTaskDefinition` sustains only 1 request/second.
+///
+/// Subnets and security groups are sets, not lists: ECS does not preserve the
+/// order they were sent in, so comparing sequences would report drift on every
+/// tick and re-roll the fleet forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredShape {
+    pub subnets: BTreeSet<String>,
+    pub security_groups: BTreeSet<String>,
+    pub assign_public_ip: bool,
+    pub capacity: Capacity,
+}
+
+/// The same shape as ECS reports it for a running service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedShape {
+    pub subnets: BTreeSet<String>,
+    pub security_groups: BTreeSet<String>,
+    pub assign_public_ip: bool,
+    /// `launchType`, when the service was created with one.
+    pub launch_type: Option<String>,
+    /// Provider names from `capacityProviderStrategy`. ECS reports this **or**
+    /// `launch_type`, never both.
+    pub capacity_providers: Vec<String>,
+}
+
+impl DesiredShape {
+    /// Whether the observed network configuration already matches.
+    pub fn network_matches(&self, observed: &ObservedShape) -> bool {
+        self.subnets == observed.subnets
+            && self.security_groups == observed.security_groups
+            && self.assign_public_ip == observed.assign_public_ip
+    }
+
+    /// Whether the observed capacity already matches.
+    pub fn capacity_matches(&self, observed: &ObservedShape) -> bool {
+        self.capacity.matches_observed(
+            observed.launch_type.as_deref(),
+            &observed.capacity_providers,
+        )
+    }
+}
 
 /// A service Rise wants to exist.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +83,8 @@ pub struct DesiredService {
     pub task_definition_hash: String,
     pub desired_count: i32,
     pub tags: ServiceTags,
+    /// Service-level configuration: network placement and capacity.
+    pub shape: DesiredShape,
 }
 
 /// One line of an ECS service's event narrative.
@@ -84,6 +136,18 @@ pub struct ActualService {
     /// read budget.
     pub events: Vec<ServiceNarrative>,
     pub rollout_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Network placement and capacity, read straight from `DescribeServices`.
+    ///
+    /// Read from the API rather than recovered from a Rise tag deliberately. A
+    /// tag would be absent on every service that predates it, making the whole
+    /// fleet look drifted on the first tick after an upgrade — and since
+    /// `networkConfiguration` is one of the parameters that makes ECS start new
+    /// tasks, that is a fleet-wide rolling restart. The API cannot go stale the
+    /// way a cached tag can.
+    ///
+    /// `None` when ECS reported no network configuration at all. Unknown is not
+    /// drift: an absent shape is left alone rather than "corrected".
+    pub shape: Option<ObservedShape>,
 }
 
 /// Whether a `Healthy` deployment should keep that status while ECS replaces
@@ -130,6 +194,15 @@ pub enum ServiceAction {
     /// Register a new task-definition revision and point the service at it.
     /// ECS performs the rolling replacement.
     UpdateTaskDefinition { key: String, name: String },
+    /// Apply service-level configuration — network placement — to a service
+    /// whose task definition is already current. No new revision is registered:
+    /// nothing about the task changed, and `RegisterTaskDefinition` sustains
+    /// only 1 request/second.
+    UpdateServiceShape {
+        key: String,
+        name: String,
+        desired_count: i32,
+    },
     /// Scale only — no new revision needed.
     UpdateDesiredCount {
         key: String,
@@ -147,8 +220,9 @@ fn action_key(a: &ServiceAction) -> (u8, String) {
     match a {
         ServiceAction::Create { name, .. } => (0, name.clone()),
         ServiceAction::UpdateTaskDefinition { name, .. } => (1, name.clone()),
-        ServiceAction::UpdateDesiredCount { name, .. } => (2, name.clone()),
-        ServiceAction::Delete { name } => (3, name.clone()),
+        ServiceAction::UpdateServiceShape { name, .. } => (2, name.clone()),
+        ServiceAction::UpdateDesiredCount { name, .. } => (3, name.clone()),
+        ServiceAction::Delete { name } => (4, name.clone()),
     }
 }
 
@@ -172,6 +246,65 @@ pub fn service_name(
 /// Identity key for a desired/actual service — the core `spec_key` tuple.
 pub fn service_key(project: &str, group: &str, deployment_id: &str, container: &str) -> String {
     spec_key(project, group, deployment_id, container)
+}
+
+/// One service running on a capacity other than the one now configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityDrift {
+    pub name: String,
+    pub desired: String,
+    pub observed: String,
+}
+
+/// Services whose capacity no longer matches what is configured.
+///
+/// Deliberately **not** a [`ServiceAction`]. Moving a live service between a
+/// launch type and a capacity provider is a retopology, not a routine
+/// reconcile: AWS's own two references disagree about which of those
+/// transitions `UpdateService` performs, and the ones that are allowed need a
+/// forced new deployment. Attempting it on every tick would either roll the
+/// fleet or fail the same call forever.
+///
+/// Rise creates one service per (deployment, container spec), so the next
+/// deploy creates fresh services on the new capacity with no special handling.
+/// Until then the mismatch is reported, never silently tolerated -- the same
+/// posture as `reject_unsupported`.
+pub fn capacity_drift(desired: &[DesiredService], actual: &[ActualService]) -> Vec<CapacityDrift> {
+    let actual_by_key: HashMap<&str, &ActualService> = actual
+        .iter()
+        .filter_map(|a| a.key.as_deref().map(|k| (k, a)))
+        .collect();
+
+    let mut drift: Vec<CapacityDrift> = desired
+        .iter()
+        .filter_map(|d| {
+            let a = actual_by_key.get(d.key.as_str())?;
+            let observed = a.shape.as_ref()?;
+            if d.shape.capacity_matches(observed) {
+                return None;
+            }
+            Some(CapacityDrift {
+                name: a.name.clone(),
+                desired: d.shape.capacity.describe(),
+                observed: describe_observed_capacity(observed),
+            })
+        })
+        .collect();
+    drift.sort_by(|a, b| a.name.cmp(&b.name));
+    drift
+}
+
+fn describe_observed_capacity(observed: &ObservedShape) -> String {
+    if !observed.capacity_providers.is_empty() {
+        return format!(
+            "capacity provider {}",
+            observed.capacity_providers.join(", ")
+        );
+    }
+    match &observed.launch_type {
+        Some(lt) => format!("launch type {lt}"),
+        None => "an unreported capacity".to_string(),
+    }
 }
 
 /// Diff desired services against what the cluster actually runs.
@@ -206,6 +339,21 @@ pub fn diff_services(
                     actions.push(ServiceAction::UpdateTaskDefinition {
                         key: d.key.clone(),
                         name: a.name.clone(),
+                    });
+                } else if a
+                    .shape
+                    .as_ref()
+                    .is_some_and(|observed| !d.shape.network_matches(observed))
+                {
+                    // The operator moved the workload's subnets, security groups
+                    // or public-IP assignment. Nothing about the task changed,
+                    // so this needs no revision -- but it does need applying,
+                    // which is why it outranks a scale change: the scale-only
+                    // call omits the network configuration entirely.
+                    actions.push(ServiceAction::UpdateServiceShape {
+                        key: d.key.clone(),
+                        name: a.name.clone(),
+                        desired_count: d.desired_count,
                     });
                 } else if a.desired_count != d.desired_count {
                     // Scale-only: no revision churn, and RegisterTaskDefinition
@@ -302,6 +450,26 @@ mod tests {
         }
     }
 
+    fn shape() -> DesiredShape {
+        DesiredShape {
+            subnets: ["subnet-a".to_string(), "subnet-b".to_string()].into(),
+            security_groups: ["sg-1".to_string()].into(),
+            assign_public_ip: false,
+            capacity: Capacity::Fargate,
+        }
+    }
+
+    /// The observed shape of a service that already matches [`shape`].
+    fn converged_shape() -> ObservedShape {
+        ObservedShape {
+            subnets: ["subnet-a".to_string(), "subnet-b".to_string()].into(),
+            security_groups: ["sg-1".to_string()].into(),
+            assign_public_ip: false,
+            launch_type: Some("FARGATE".to_string()),
+            capacity_providers: Vec::new(),
+        }
+    }
+
     fn desired(deployment_id: &str, hash: &str, count: i32) -> DesiredService {
         DesiredService {
             name: service_name("rise", "myapp", "default", deployment_id, "app"),
@@ -310,11 +478,13 @@ mod tests {
             task_definition_hash: hash.to_string(),
             desired_count: count,
             tags: tags(deployment_id),
+            shape: shape(),
         }
     }
 
     fn actual_for(d: &DesiredService, hash: &str, count: i32) -> ActualService {
         ActualService {
+            shape: Some(converged_shape()),
             events: Vec::new(),
             name: d.name.clone(),
             arn: format!(
@@ -467,6 +637,156 @@ mod tests {
             actions[0],
             ServiceAction::UpdateTaskDefinition { .. }
         ));
+    }
+
+    #[test]
+    fn a_changed_subnet_set_produces_a_shape_update() {
+        // The operator moved the workload subnets. Nothing about the task
+        // changed, so this must not register a revision -- but it must be
+        // applied, which before this existed it never was.
+        let mut d = desired("dep-a", "h1", 1);
+        let a = actual_for(&d, "h1", 1);
+        d.shape.subnets = ["subnet-c".to_string()].into();
+
+        let actions = diff_services(&[d], &[a], &HashSet::new());
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(actions[0], ServiceAction::UpdateServiceShape { .. }),
+            "{:?}",
+            actions[0]
+        );
+    }
+
+    #[test]
+    fn subnets_in_a_different_order_are_not_drift() {
+        // ECS does not preserve the order subnets were sent in. Comparing them
+        // as sequences would report drift on every tick and roll the fleet
+        // forever, so the comparison is set-based.
+        let d = desired("dep-a", "h1", 1);
+        let mut a = actual_for(&d, "h1", 1);
+        let observed = a.shape.as_mut().expect("test fixture has a shape");
+        assert_eq!(
+            observed.subnets, d.shape.subnets,
+            "fixture must start converged"
+        );
+        // A BTreeSet already normalises order; assert the desired-vs-observed
+        // comparison itself is order-free rather than the container type.
+        observed.subnets = ["subnet-b".to_string(), "subnet-a".to_string()].into();
+
+        assert!(d.shape.network_matches(observed));
+        assert!(diff_services(&[d], &[a], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_changed_security_group_or_public_ip_is_also_shape_drift() {
+        for mutate in [
+            (|d: &mut DesiredService| d.shape.security_groups = ["sg-2".to_string()].into())
+                as fn(&mut DesiredService),
+            |d: &mut DesiredService| d.shape.assign_public_ip = true,
+        ] {
+            let mut d = desired("dep-a", "h1", 1);
+            let a = actual_for(&d, "h1", 1);
+            mutate(&mut d);
+            let actions = diff_services(&[d], &[a], &HashSet::new());
+            assert_eq!(actions.len(), 1);
+            assert!(matches!(
+                actions[0],
+                ServiceAction::UpdateServiceShape { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn content_drift_still_outranks_shape_drift() {
+        // The task-definition update carries the network configuration anyway,
+        // so doing both would be two calls for one convergence.
+        let mut d = desired("dep-a", "h2", 1);
+        let a = actual_for(&d, "h1", 1);
+        d.shape.subnets = ["subnet-c".to_string()].into();
+
+        let actions = diff_services(&[d], &[a], &HashSet::new());
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            ServiceAction::UpdateTaskDefinition { .. }
+        ));
+    }
+
+    #[test]
+    fn shape_drift_outranks_scale_drift_and_carries_the_count() {
+        // The scale-only call omits the network configuration entirely, so
+        // taking that branch would leave the subnets stale until something else
+        // happened to touch the service.
+        let mut d = desired("dep-a", "h1", 4);
+        let a = actual_for(&d, "h1", 1);
+        d.shape.subnets = ["subnet-c".to_string()].into();
+
+        let actions = diff_services(&[d], &[a], &HashSet::new());
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            ServiceAction::UpdateServiceShape { desired_count, .. } => {
+                assert_eq!(*desired_count, 4, "the count must ride along");
+            }
+            other => panic!("expected a shape update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_shape_is_never_treated_as_drift() {
+        // A service ECS reports without a network configuration must be left
+        // alone. "Unknown" is not "wrong", and correcting it on the strength of
+        // a missing field would roll the service for nothing.
+        let mut d = desired("dep-a", "h1", 1);
+        let mut a = actual_for(&d, "h1", 1);
+        a.shape = None;
+        d.shape.subnets = ["subnet-c".to_string()].into();
+
+        assert!(diff_services(&[d], &[a], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_converged_service_is_still_silent() {
+        // The steady state must stay a no-op now that there is a third thing to
+        // compare -- otherwise every install rolls every service every tick.
+        let d = desired("dep-a", "h1", 1);
+        let a = actual_for(&d, "h1", 1);
+        assert!(diff_services(&[d], &[a], &HashSet::new()).is_empty());
+    }
+
+    #[test]
+    fn a_capacity_change_is_reported_but_produces_no_action() {
+        // ECS restricts which capacity transitions UpdateService performs, and
+        // the permitted ones need a forced new deployment. Attempting it every
+        // tick would either roll the fleet or fail the same call forever; the
+        // next deploy creates fresh services on the new capacity.
+        let mut d = desired("dep-a", "h1", 1);
+        let a = actual_for(&d, "h1", 1);
+        d.shape.capacity = Capacity::Ec2;
+
+        assert!(
+            diff_services(&[d.clone()], std::slice::from_ref(&a), &HashSet::new()).is_empty(),
+            "capacity must not become an in-place action"
+        );
+
+        let drift = capacity_drift(&[d], &[a]);
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].desired, "launch type EC2");
+        assert_eq!(drift[0].observed, "launch type FARGATE");
+    }
+
+    #[test]
+    fn a_converged_capacity_reports_no_drift() {
+        let d = desired("dep-a", "h1", 1);
+        let a = actual_for(&d, "h1", 1);
+        assert!(capacity_drift(&[d], &[a]).is_empty());
+    }
+
+    #[test]
+    fn capacity_drift_ignores_a_service_with_no_readable_shape() {
+        let d = desired("dep-a", "h1", 1);
+        let mut a = actual_for(&d, "h1", 1);
+        a.shape = None;
+        assert!(capacity_drift(&[d], &[a]).is_empty());
     }
 
     #[test]
