@@ -370,7 +370,7 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (us
 | SQLX queries in `rise-deploy` | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
 | SQLX queries in `rise-resource-store-postgres` | `mise run resource-store-postgres:sqlx:prepare` | Crate-local offline cache (commit the result) |
 | SQLX queries in `rise-runtime-sync` | `mise run runtime-sync:db:migrate` once, then `mise run runtime-sync:sqlx:prepare` | Crate-local offline cache; needs the `runtime_sync` schema applied |
-| Dependencies (`Cargo.toml`/`Cargo.lock`) | `cargo audit` | CI fails on advisories |
+| Dependencies (`Cargo.toml`/`Cargo.lock`) | `cargo audit`, then `mise run deny` | CI fails on advisories, and on a dependency whose license is not in `deny.toml` |
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `rise.toml` structs (`crates/rise-deployment-spec/src/project_config.rs`) | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
 | Resource API types (`crates/rise-resource-api/`) | `mise run resource:schema:generate` | Regenerate the resource/organization/controller-status schemas under `docs/engineering/public/schemas/` (commit the result) |
@@ -393,7 +393,7 @@ cargo test --workspace --all-features  # Unit tests (all workspace crates)
 combinations — `cli` and `cli,backend`, since `always_include_features` pins
 `cli` on; the same two workspace-wide
 (`--workspace --all-features --all-targets`), which cover every support crate
-and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`;
+and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`; `mise deny`;
 `mise resource:schema:check`; `helm lint helm/rise`; and a workspace `cargo
 test` excluding the three crates that need Postgres (`rise-deploy`,
 `rise-resource-store-postgres`, `rise-runtime-sync`) — so every other crate's

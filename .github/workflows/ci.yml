@@ -134,10 +134,10 @@ jobs:
           setup-mise: "true"
           mise-tools: "cargo:sqlx-cli cargo:cargo-all-features"
 
-      - name: Install cargo-audit
+      - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
+          tool: cargo-audit,cargo-deny
 
       - name: Verify backend config schema is up to date
         run: mise config:schema:check
@@ -168,6 +168,10 @@ jobs:
 
       - name: Run cargo audit
         run: cargo audit
+
+      # Licenses and sources only -- cargo-audit above owns advisories.
+      - name: Check dependency licenses
+        run: cargo deny check licenses sources
 
   rise-e2e-quality:
     name: Quality / rise-e2e harness
