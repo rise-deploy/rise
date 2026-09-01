@@ -11,9 +11,8 @@ license metadata, `LICENSING.md`, the DCO requirement, and the D3 extraction —
 `crates/rise-backend-kubernetes/` now carries its own license, reached only
 through `DeploymentBackend`, `OrganizationView` and its own `WebhookContext`.
 
-Follow-ups, neither of which changes the licensing position: `logs/cloudwatch.rs`
-is the ECS log backend and still sits in the root crate, and the `backend` cargo
-feature is not split per backend (see the D4 consequences).
+One follow-up remains, and it does not change the licensing position: the
+`backend` cargo feature is not split per backend (see the D4 consequences).
 
 ## Context
 
