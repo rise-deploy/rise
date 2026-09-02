@@ -149,6 +149,8 @@ rise deploy --group temp --expire 7d      # Days (max unit; no weeks shorthand)
 
 Expired deployments are automatically cleaned up.
 
+When the target environment sets a `--max-expiration` (see [Environments](../environments#maximum-expiration-for-non-primary-groups)), a deployment landing in a non-primary group is capped at that value: a missing `--expire` gets the max, and a longer one is clamped down to it.
+
 ## Monitoring Deployments
 
 ### Following a Deployment

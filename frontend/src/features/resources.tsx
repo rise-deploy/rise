@@ -260,6 +260,14 @@ function EnvironmentCard({ env, projectName, deployments, onEdit, onDelete }) {
                 <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
                     · {activeDeployments.length} active deployment{activeDeployments.length === 1 ? '' : 's'}
                 </span>
+                {env.max_deployment_expiration && (
+                    <span
+                        style={{ fontSize: 11.5, color: 'var(--text-soft)' }}
+                        title="Deployments into any group other than the primary group expire after at most this long"
+                    >
+                        · non-primary max {env.max_deployment_expiration}
+                    </span>
+                )}
             </RGroupBar>
             {open && (
                 activeDeployments.length === 0 ? (
@@ -332,6 +340,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
     const [editingEnv, setEditingEnv] = useState(null);
     const [formData, setFormData] = useState({
         name: '', primary_deployment_group: '', is_production: false, color: 'green',
+        max_deployment_expiration: '',
         min_replicas: '', max_replicas: '', min_cpu: '', max_cpu: '', min_memory: '', max_memory: '',
     });
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
@@ -371,6 +380,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
         setEditingEnv(null);
         setFormData({
             name: '', primary_deployment_group: '', is_production: false, color: 'green',
+            max_deployment_expiration: '',
             min_replicas: '', max_replicas: '', min_cpu: '', max_cpu: '', min_memory: '', max_memory: '',
         });
         setIsModalOpen(true);
@@ -384,6 +394,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
             primary_deployment_group: env.primary_deployment_group || '',
             is_production: env.is_production,
             color: env.color || 'green',
+            max_deployment_expiration: env.max_deployment_expiration ?? '',
             min_replicas: c?.min_replicas?.toString() ?? '',
             max_replicas: c?.max_replicas?.toString() ?? '',
             min_cpu: c?.min_cpu ?? '',
@@ -412,6 +423,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                     primary_deployment_group: formData.primary_deployment_group || null,
                     is_production: formData.is_production,
                     color: formData.color,
+                    max_deployment_expiration: formData.max_deployment_expiration || null,
                 };
                 // Include deployment constraints if admin
                 if (isAdmin) {
@@ -437,6 +449,7 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                     primary_deployment_group: formData.primary_deployment_group || null,
                     is_production: formData.is_production,
                     color: formData.color,
+                    max_deployment_expiration: formData.max_deployment_expiration || null,
                 });
                 showToast(`Environment ${formData.name} created`, 'success');
             }
@@ -535,6 +548,16 @@ export function EnvironmentsList({ projectName, platformConstraints = null }) {
                         value={formData.primary_deployment_group}
                         onChange={(e) => setFormData({ ...formData, primary_deployment_group: e.target.value })}
                         placeholder="default"
+                    />
+                </RField>
+                <RField
+                    label="Max expiration for non-primary groups"
+                    hint="Deployments into any group other than the primary group expire after at most this long. A missing --expire gets this value; a longer one is clamped. Leave empty for no cap."
+                >
+                    <RInput
+                        value={formData.max_deployment_expiration}
+                        onChange={(e) => setFormData({ ...formData, max_deployment_expiration: e.target.value })}
+                        placeholder="7d"
                     />
                 </RField>
                 <div className="flex gap-6">

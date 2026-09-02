@@ -53,7 +53,7 @@ User intent
 │  → Docs: https://rise-deploy.github.io/rise/user/user-guide/environments.md
 │
 ├─ "staging / preview env", "environments"
-│  → rise environment create <name> --group <group> [--production] [--color <c>]
+│  → rise environment create <name> --group <group> [--production] [--color <c>] [--max-expiration <duration>]
 │  → Docs: https://rise-deploy.github.io/rise/user/user-guide/environments.md
 │
 ├─ "workload identity", "AWS role for my app"

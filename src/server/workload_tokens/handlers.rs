@@ -224,6 +224,7 @@ mod tests {
                             identity_audiences: serde_json::json!({}),
                             containers: None,
                             routes: None,
+                            expiration_cap: None,
                         },
                     )
                     .await

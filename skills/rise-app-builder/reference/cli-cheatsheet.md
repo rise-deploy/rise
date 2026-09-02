@@ -127,10 +127,10 @@ Build and run a container locally for development.
 
 | Command | Aliases | Key Flags |
 |---------|---------|-----------|
-| `rise environment create <name>` | `c`, `new` | `-p`, `--path`, `-g/--group`, `--production`, `--color` (default: green) |
+| `rise environment create <name>` | `c`, `new` | `-p`, `--path`, `-g/--group`, `--production`, `--color` (default: green), `--max-expiration <duration>` |
 | `rise environment list` | `ls`, `l` | `-p`, `--path` |
 | `rise environment show <name>` | `s` | `-p`, `--path` |
-| `rise environment update <name>` | `u`, `edit` | `-p`, `--path`, `--rename <new>`, `-g/--group`, `--production [bool]`, `--color` |
+| `rise environment update <name>` | `u`, `edit` | `-p`, `--path`, `--rename <new>`, `-g/--group`, `--production [bool]`, `--color`, `--max-expiration <duration>` (empty string clears) |
 | `rise environment delete <name>` | `del`, `rm` | `-p`, `--path` |
 
 Valid colors: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray`.

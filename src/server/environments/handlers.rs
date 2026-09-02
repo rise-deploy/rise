@@ -31,6 +31,20 @@ pub async fn create_environment(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
+    let max_deployment_expiration = match payload.max_deployment_expiration.as_deref() {
+        Some(raw) => Some(
+            rise_backend_core::expiration::ExpirationDuration::parse(raw)
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Invalid max_deployment_expiration '{}': {}",
+                        raw, e
+                    ))
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
+
     let env = db_environments::create_with_flag_swap(
         &state.db_pool,
         project.id,
@@ -38,6 +52,7 @@ pub async fn create_environment(
         payload.primary_deployment_group.as_deref(),
         payload.is_production,
         &payload.color,
+        max_deployment_expiration.as_deref(),
     )
     .await
     .map_err(|e| {
@@ -77,6 +92,11 @@ pub async fn create_environment(
             ServerError::bad_request(format!(
                 "Invalid environment color '{}'. Allowed colors: green, blue, yellow, red, purple, orange, gray.",
                 payload.color
+            ))
+        } else if msg.contains("valid_max_deployment_expiration") {
+            ServerError::bad_request(format!(
+                "Invalid max_deployment_expiration '{}'. Must be a duration like '7d', '12h' or '30m'.",
+                payload.max_deployment_expiration.as_deref().unwrap_or("")
             ))
         } else {
             ServerError::internal_anyhow(e, "Failed to create environment")
@@ -180,6 +200,23 @@ pub async fn update_environment(
         ));
     }
 
+    // Canonicalize before storing, same as on create, so the CHECK constraint
+    // can never reject what this parser accepted.
+    let max_deployment_expiration = match &payload.max_deployment_expiration {
+        Some(Some(raw)) => Some(Some(
+            rise_backend_core::expiration::ExpirationDuration::parse(raw)
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Invalid max_deployment_expiration '{}': {}",
+                        raw, e
+                    ))
+                })?
+                .to_string(),
+        )),
+        Some(None) => Some(None),
+        None => None,
+    };
+
     let mut updated = db_environments::update(
         &state.db_pool,
         env.id,
@@ -191,6 +228,9 @@ pub async fn update_environment(
             .map(|o| o.as_deref()),
         payload.is_production,
         payload.color.as_deref(),
+        max_deployment_expiration
+            .as_ref()
+            .map(|o| o.as_deref()),
     )
     .await
     .map_err(|e| {
@@ -216,6 +256,8 @@ pub async fn update_environment(
             ServerError::bad_request("Invalid environment name. Must be lowercase alphanumeric with hyphens, no '--'.")
         } else if msg.contains("valid_environment_color") {
             ServerError::bad_request("Invalid environment color. Allowed colors: green, blue, yellow, red, purple, orange, gray.")
+        } else if msg.contains("valid_max_deployment_expiration") {
+            ServerError::bad_request("Invalid max_deployment_expiration. Must be a duration like '7d', '12h' or '30m'.")
         } else {
             ServerError::internal_anyhow(e, "Failed to update environment")
         }
