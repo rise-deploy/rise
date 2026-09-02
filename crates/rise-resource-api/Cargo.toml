@@ -19,5 +19,5 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-jsonschema = "0.29"
+jsonschema = "0.52"
 tokio = { workspace = true }
