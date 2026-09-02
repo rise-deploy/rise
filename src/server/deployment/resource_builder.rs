@@ -2493,6 +2493,7 @@ mod tests {
             max_cpu: None,
             min_memory: None,
             max_memory: None,
+            max_deployment_expiration: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

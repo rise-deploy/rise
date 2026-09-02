@@ -172,6 +172,21 @@ pub mod attributes {
     /// Reported by the CLI, which is the only thing that observes the build.
     pub const REGISTRY: &str = "registry";
     pub const IMAGES: &str = "images";
+
+    /// The deployment's expiration deadline, as set at creation. Present
+    /// whenever the deployment was created with one, whether requested by the
+    /// caller or imposed by [`MAX_DEPLOYMENT_EXPIRATION`].
+    pub const EXPIRES_AT: &str = "expires_at";
+    /// What the caller asked for (a parsed `--expire`), when the environment's
+    /// cap moved the deadline earlier than that. Absent when `expires_at` was
+    /// not capped, and when there was no request to begin with.
+    pub const REQUESTED_EXPIRES_AT: &str = "requested_expires_at";
+    /// The environment's `max_deployment_expiration` that capped `expires_at`,
+    /// in canonical form. Present only when a cap was applied.
+    pub const MAX_DEPLOYMENT_EXPIRATION: &str = "max_deployment_expiration";
+    /// Name of the environment whose `max_deployment_expiration` capped
+    /// `expires_at`. Present only when a cap was applied.
+    pub const EXPIRATION_LIMITED_BY: &str = "expiration_limited_by";
 }
 
 /// A backend-originated event a backend wants forwarded into the log.

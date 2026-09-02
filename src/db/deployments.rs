@@ -53,6 +53,10 @@ pub struct CreateDeploymentParams<'a> {
     /// Ingress route map (`Vec<RouteSpec>` as JSONB) or `None`. Always `None`
     /// when `containers` is `None`.
     pub routes: Option<&'a serde_json::Value>,
+    /// Present when the environment's `max_deployment_expiration` capped
+    /// `expires_at`. Recorded on the creation event so the timeline shows the
+    /// cap alongside what was actually asked for.
+    pub expiration_cap: Option<&'a rise_backend_core::expiration::ExpirationCap>,
 }
 
 /// List deployments for a project
@@ -387,7 +391,14 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
                     END,
                     'rolled_back_from', ins.rolled_back_from_deployment_id,
                     'job_url', ins.job_url,
-                    'pull_request_url', ins.pull_request_url
+                    'pull_request_url', ins.pull_request_url,
+                    -- The deployment's expiration, and — only when the
+                    -- environment's max_deployment_expiration capped it —
+                    -- what was actually requested and what capped it.
+                    'expires_at', ins.expires_at,
+                    'requested_expires_at', $23::timestamptz,
+                    'max_deployment_expiration', $24::text,
+                    'expiration_limited_by', $25::text
             )) AS attrs) detail
         )
         SELECT
@@ -435,6 +446,11 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             .containers
             .and_then(|c| c.get("items"))
             .is_some_and(serde_json::Value::is_array),
+        params.expiration_cap.and_then(|c| c.requested_expires_at),
+        params
+            .expiration_cap
+            .map(|c| c.max_deployment_expiration.as_str()),
+        params.expiration_cap.map(|c| c.environment.as_str()),
     )
     .fetch_one(pool)
     .await
@@ -1952,6 +1968,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: Some(&containers),
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2015,6 +2032,108 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn creation_event_records_expiration_cap_only_when_applied(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let requested_expires_at = chrono::Utc::now() + chrono::Duration::days(30);
+        let capped_expires_at = chrono::Utc::now() + chrono::Duration::days(7);
+        let cap = rise_backend_core::expiration::ExpirationCap {
+            requested_expires_at: Some(requested_expires_at),
+            max_deployment_expiration: "7d".to_string(),
+            environment: "staging".to_string(),
+        };
+
+        let capped = create(
+            &pool,
+            CreateDeploymentParams {
+                deployment_id: "20260830-000010",
+                project_id,
+                created_by_id: user_id,
+                status: DeploymentStatus::Pending,
+                image: Some("registry.test/app:v1"),
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: "mr/123",
+                environment_id: None,
+                expires_at: Some(capped_expires_at),
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 1,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
+                expiration_cap: Some(&cap),
+            },
+        )
+        .await
+        .unwrap();
+
+        let capped_attrs: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(capped.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_close(&capped_attrs["expires_at"], capped_expires_at);
+        assert_close(&capped_attrs["requested_expires_at"], requested_expires_at);
+        assert_eq!(capped_attrs["max_deployment_expiration"], "7d");
+        assert_eq!(capped_attrs["expiration_limited_by"], "staging");
+
+        let uncapped = create(
+            &pool,
+            CreateDeploymentParams {
+                deployment_id: "20260830-000011",
+                project_id,
+                created_by_id: user_id,
+                status: DeploymentStatus::Pending,
+                image: Some("registry.test/app:v1"),
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: "default",
+                environment_id: None,
+                expires_at: Some(requested_expires_at),
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 1,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
+                expiration_cap: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let uncapped_attrs: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(uncapped.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_close(&uncapped_attrs["expires_at"], requested_expires_at);
+        for absent in [
+            "requested_expires_at",
+            "max_deployment_expiration",
+            "expiration_limited_by",
+        ] {
+            assert!(
+                uncapped_attrs.get(absent).is_none(),
+                "{absent} is only recorded when the environment's max_deployment_expiration \
+                 actually capped expires_at",
+            );
+        }
+    }
+
     /// The creation event describes the write it rides along with, so nothing
     /// about assembling it may be able to fail that write. A `containers` value
     /// this does not recognise costs the event one attribute, not the
@@ -2056,6 +2175,7 @@ mod tests {
                     identity_audiences: serde_json::json!({}),
                     containers: Some(&containers),
                     routes: None,
+                    expiration_cap: None,
                 },
             )
             .await
@@ -2616,6 +2736,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2706,6 +2827,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2782,6 +2904,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2808,6 +2931,26 @@ mod tests {
         assert!(result.is_none());
         let current = find_by_id(&pool, deployment.id).await.unwrap().unwrap();
         assert_eq!(current.status, DeploymentStatus::Terminating);
+    }
+
+    /// Compare a jsonb-stored timestamp against the `DateTime<Utc>` it was
+    /// written from. Postgres truncates `timestamptz` to microsecond
+    /// precision, so an exact string match against chrono's (sub-microsecond)
+    /// `to_rfc3339()` would be brittle; a sub-millisecond tolerance is not.
+    fn assert_close(actual: &serde_json::Value, expected: chrono::DateTime<chrono::Utc>) {
+        let actual = actual
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .unwrap_or_else(|| panic!("expected an RFC3339 timestamp, got {actual:?}"))
+            .with_timezone(&chrono::Utc);
+        let diff = (actual - expected)
+            .num_microseconds()
+            .unwrap_or(i64::MAX)
+            .abs();
+        assert!(
+            diff < 1000,
+            "expected {expected} and stored {actual} to be within 1ms, differed by {diff}us",
+        );
     }
 
     async fn seed_project_and_user(pool: &PgPool) -> (Uuid, Uuid) {
@@ -2867,6 +3010,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await

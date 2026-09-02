@@ -5,7 +5,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures::StreamExt;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -56,37 +56,6 @@ fn is_valid_group_name(name: &str) -> bool {
     }
 
     true
-}
-
-/// Parse expiration duration string (e.g., "7d", "2h", "30m") to DateTime
-fn parse_expiration(expires_in: &str) -> Result<DateTime<Utc>, String> {
-    let s = expires_in.trim();
-    let (num_str, unit) = if let Some(num_str) = s.strip_suffix('d') {
-        (num_str, "d")
-    } else if let Some(num_str) = s.strip_suffix('h') {
-        (num_str, "h")
-    } else if let Some(num_str) = s.strip_suffix('m') {
-        (num_str, "m")
-    } else {
-        return Err("Duration must end with d, h, or m".to_string());
-    };
-
-    let num: i64 = num_str
-        .parse()
-        .map_err(|_| "Invalid number in duration".to_string())?;
-
-    if num <= 0 {
-        return Err("Duration must be positive".to_string());
-    }
-
-    let duration = match unit {
-        "d" => chrono::Duration::days(num),
-        "h" => chrono::Duration::hours(num),
-        "m" => chrono::Duration::minutes(num),
-        _ => return Err("Invalid duration unit".to_string()),
-    };
-
-    Ok(Utc::now() + duration)
 }
 
 /// Resolve image tag to digest by contacting OCI registry directly
@@ -1180,14 +1149,25 @@ pub async fn create_deployment(
         }
     }
 
-    // Parse expiration duration if provided
-    let expires_at = if let Some(ref expires_in) = payload.expires_in {
-        Some(parse_expiration(expires_in).map_err(|e| {
-            ServerError::bad_request(format!(
-                "Invalid expiration duration '{}': {}",
-                expires_in, e
-            ))
-        })?)
+    // Parse expiration duration if provided. This is the caller's ask; whether
+    // it survives unmodified or gets capped by the target environment's
+    // `max_deployment_expiration` is decided once the target is resolved below.
+    let requested_expires_at = if let Some(ref expires_in) = payload.expires_in {
+        Some(
+            rise_backend_core::expiration::ExpirationDuration::parse(expires_in)
+                .and_then(|d| d.to_duration())
+                .and_then(|dur| {
+                    Utc::now()
+                        .checked_add_signed(dur)
+                        .ok_or_else(|| "Duration is too large".to_string())
+                })
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Invalid expiration duration '{}': {}",
+                        expires_in, e
+                    ))
+                })?,
+        )
     } else {
         None
     };
@@ -1220,6 +1200,29 @@ pub async fn create_deployment(
         payload.group.as_deref(),
     )
     .await?;
+
+    // Apply the target environment's max_deployment_expiration, if any. Errs
+    // only when the stored cap fails to parse — the CHECK constraint on
+    // `environments.max_deployment_expiration` should make that impossible.
+    let (expires_at, expiration_cap) = rise_backend_core::expiration::effective_expiration(
+        requested_expires_at,
+        Utc::now(),
+        resolved_environment.as_ref(),
+        &resolved_group,
+    )
+    .map_err(|e| {
+        ServerError::internal_anyhow(
+            anyhow::anyhow!("{e}"),
+            "Failed to resolve deployment expiration",
+        )
+    })?;
+    if let Some(ref cap) = expiration_cap {
+        info!(
+            "Capped expires_at for deployment into group '{}': environment '{}' \
+             caps max_deployment_expiration at {}",
+            resolved_group, cap.environment, cap.max_deployment_expiration
+        );
+    }
 
     // Resolve auth for project scope (validates SA claims if external token)
     // Only mask auth failures (401/403) as 404 to prevent project existence leakage;
@@ -1542,6 +1545,7 @@ pub async fn create_deployment(
                 identity_audiences: effective_identity_audiences.clone(),
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
+                expiration_cap: expiration_cap.as_ref(),
             },
             &project,
         )
@@ -1730,6 +1734,7 @@ pub async fn create_deployment(
                     identity_audiences: effective_identity_audiences.clone(),
                     containers: containers_json.as_ref(),
                     routes: routes_json.as_ref(),
+                    expiration_cap: expiration_cap.as_ref(),
                 },
                 &project,
             )
@@ -1828,6 +1833,7 @@ pub async fn create_deployment(
                 identity_audiences: effective_identity_audiences.clone(),
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
+                expiration_cap: expiration_cap.as_ref(),
             },
             &project,
         )
@@ -1958,6 +1964,7 @@ pub async fn create_deployment(
                 identity_audiences: effective_identity_audiences.clone(),
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
+                expiration_cap: expiration_cap.as_ref(),
             },
             &project,
         )
@@ -3997,9 +4004,17 @@ mod tests {
         .unwrap();
 
         // Create a single environment
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Neither environment nor group specified → should auto-select the single env
         let (group, env) = super::resolve_deployment_target(&pool, project.id, None, None)
@@ -4029,9 +4044,17 @@ mod tests {
         .unwrap();
 
         // Create two environments
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
         environments::create(
             &pool,
             project.id,
@@ -4039,6 +4062,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -4075,9 +4099,17 @@ mod tests {
         .unwrap();
 
         // Create two environments
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
         environments::create(
             &pool,
             project.id,
@@ -4085,6 +4117,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -4127,12 +4160,21 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
 
         // "default" is primary of "production", but env is "staging" → should reject
         let err =
@@ -4167,9 +4209,17 @@ mod tests {
         .unwrap();
 
         // Create two environments
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
         environments::create(
             &pool,
             project.id,
@@ -4177,6 +4227,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -4219,6 +4270,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -4255,9 +4307,17 @@ mod tests {
         .await
         .unwrap();
 
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Non-primary group with single env → auto-resolve to that env
         let (group, env) =

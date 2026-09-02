@@ -23,6 +23,7 @@ pub mod desired;
 pub mod diff;
 pub mod env;
 pub mod events;
+pub mod expiration;
 pub mod group;
 pub mod health_path;
 pub mod identity;

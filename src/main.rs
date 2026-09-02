@@ -911,6 +911,9 @@ enum EnvironmentCommands {
         /// Badge color (green, blue, yellow, red, purple, orange, gray)
         #[arg(long, default_value = "green")]
         color: String,
+        /// Maximum lifetime for deployments into non-primary groups, e.g. '7d', '12h'.
+        #[arg(long, value_name = "DURATION")]
+        max_expiration: Option<String>,
     },
     /// List all environments for a project
     #[command(visible_alias = "ls")]
@@ -959,6 +962,10 @@ enum EnvironmentCommands {
         /// Badge color (green, blue, yellow, red, purple, orange, gray)
         #[arg(long)]
         color: Option<String>,
+        /// Maximum lifetime for deployments into non-primary groups, e.g. '7d', '12h'
+        /// (empty string clears)
+        #[arg(long, value_name = "DURATION")]
+        max_expiration: Option<String>,
     },
     /// Delete an environment
     #[command(visible_alias = "del")]

@@ -435,6 +435,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -488,6 +489,7 @@ mod tests {
             Some("staging"),
             false,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -541,6 +543,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await

@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE environments\n        SET\n            name = COALESCE($2, name),\n            primary_deployment_group = CASE WHEN $3 THEN $4 ELSE primary_deployment_group END,\n            is_production = COALESCE($5, is_production),\n            color = COALESCE($6, color),\n            max_deployment_expiration = CASE WHEN $7 THEN $8 ELSE max_deployment_expiration END,\n            updated_at = NOW()\n        WHERE id = $1\n        RETURNING id, project_id, name, primary_deployment_group, is_production, color,\n                 min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,\n                 max_deployment_expiration,\n                 created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "primary_deployment_group",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "is_production",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "color",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "min_replicas",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "max_replicas",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "min_cpu",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "max_cpu",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "min_memory",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "max_memory",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "max_deployment_expiration",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "Text",
+        "Bool",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "0c9bdf5f869e8b52b45374ccdf913c13152e83b0945eeb4b2aa923a481cb2f51"
+}

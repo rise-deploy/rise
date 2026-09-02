@@ -154,6 +154,10 @@ const LABELS: Record<string, string> = {
     requested_memory: 'requested memory',
     resolved_cpu_units: 'effective CPU units',
     resolved_memory_mib: 'effective memory (MiB)',
+    expires_at: 'expires',
+    requested_expires_at: 'requested expiry',
+    max_deployment_expiration: 'max expiration',
+    expiration_limited_by: 'capped by environment',
 };
 
 /**
@@ -171,6 +175,7 @@ const ORDER = [
     'git_branch', 'git_revision', 'git_dirty',
     'build_method', 'build_ms', 'push_ms', 'registry',
     'image', 'image_digest', 'image_size_bytes', 'group',
+    'expires_at', 'requested_expires_at', 'max_deployment_expiration', 'expiration_limited_by',
 ];
 
 /** Keys that name the subject of a breakdown row, so it can lead. */

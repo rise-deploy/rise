@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::db::models::Environment;
 
 /// Create a new environment for a project
+#[allow(clippy::too_many_arguments)]
 pub async fn create<'a, E>(
     executor: E,
     project_id: Uuid,
@@ -12,6 +13,7 @@ pub async fn create<'a, E>(
     primary_deployment_group: Option<&str>,
     is_production: bool,
     color: &str,
+    max_deployment_expiration: Option<&str>,
 ) -> Result<Environment>
 where
     E: sqlx::Executor<'a, Database = sqlx::Postgres>,
@@ -19,17 +21,19 @@ where
     let env = sqlx::query_as!(
         Environment,
         r#"
-        INSERT INTO environments (project_id, name, primary_deployment_group, is_production, color)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO environments (project_id, name, primary_deployment_group, is_production, color, max_deployment_expiration)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id, project_id, name, primary_deployment_group, is_production, color,
                  min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+                 max_deployment_expiration,
                  created_at, updated_at
         "#,
         project_id,
         name,
         primary_deployment_group,
         is_production,
-        color
+        color,
+        max_deployment_expiration
     )
     .fetch_one(executor)
     .await
@@ -45,6 +49,7 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Env
         r#"
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1
@@ -72,6 +77,7 @@ pub async fn find_by_name(
         r#"
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1 AND name = $2
@@ -97,6 +103,7 @@ pub async fn find_by_primary_group(
         r#"
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1 AND primary_deployment_group = $2
@@ -119,6 +126,7 @@ pub async fn find_production(pool: &PgPool, project_id: Uuid) -> Result<Option<E
         r#"
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1 AND is_production = true
@@ -139,6 +147,7 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Environment>> 
         r#"
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
                created_at, updated_at
         FROM environments
         WHERE id = $1
@@ -190,6 +199,7 @@ pub async fn update(
     primary_deployment_group: Option<Option<&str>>,
     is_production: Option<bool>,
     color: Option<&str>,
+    max_deployment_expiration: Option<Option<&str>>,
 ) -> Result<Environment> {
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
@@ -204,10 +214,12 @@ pub async fn update(
             primary_deployment_group = CASE WHEN $3 THEN $4 ELSE primary_deployment_group END,
             is_production = COALESCE($5, is_production),
             color = COALESCE($6, color),
+            max_deployment_expiration = CASE WHEN $7 THEN $8 ELSE max_deployment_expiration END,
             updated_at = NOW()
         WHERE id = $1
         RETURNING id, project_id, name, primary_deployment_group, is_production, color,
                  min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+                 max_deployment_expiration,
                  created_at, updated_at
         "#,
         id,
@@ -215,7 +227,9 @@ pub async fn update(
         primary_deployment_group.is_some(), // $3: whether to update primary_deployment_group
         primary_deployment_group.flatten(), // $4: the new value (can be NULL)
         is_production,
-        color
+        color,
+        max_deployment_expiration.is_some(), // $7: whether to update max_deployment_expiration
+        max_deployment_expiration.flatten(), // $8: the new value (can be NULL)
     )
     .fetch_one(&mut *tx)
     .await
@@ -228,6 +242,7 @@ pub async fn update(
 
 /// Create a new environment, atomically swapping `is_production` flag
 /// from other environments in the same project when the flag is set.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_with_flag_swap(
     pool: &PgPool,
     project_id: Uuid,
@@ -235,6 +250,7 @@ pub async fn create_with_flag_swap(
     primary_deployment_group: Option<&str>,
     is_production: bool,
     color: &str,
+    max_deployment_expiration: Option<&str>,
 ) -> Result<Environment> {
     let mut tx = pool.begin().await.context("Failed to begin transaction")?;
 
@@ -247,6 +263,7 @@ pub async fn create_with_flag_swap(
         primary_deployment_group,
         is_production,
         color,
+        max_deployment_expiration,
     )
     .await?;
 
@@ -276,6 +293,7 @@ pub async fn update_deployment_constraints(
         WHERE id = $1
         RETURNING id, project_id, name, primary_deployment_group, is_production, color,
                  min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+                 max_deployment_expiration,
                  created_at, updated_at
         "#,
         id,
@@ -329,6 +347,7 @@ where
         Some("default"),
         true,
         "green",
+        None,
     )
     .await
 }
@@ -359,6 +378,7 @@ mod tests {
             Some("staging"),
             false,
             "green",
+            None,
         )
         .await?;
         assert_eq!(env.name, "staging");
@@ -368,6 +388,134 @@ mod tests {
         let found = find_by_name(&pool, project.id, "staging").await?;
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, env.id);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_create_round_trips_max_deployment_expiration(pool: PgPool) -> Result<()> {
+        let user = users::create(&pool, "env-test@example.com").await?;
+        let project = projects::create(
+            &pool,
+            "env-test-project",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await?;
+
+        let env = create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "green",
+            Some("7d"),
+        )
+        .await?;
+        assert_eq!(env.max_deployment_expiration.as_deref(), Some("7d"));
+
+        let found = find_by_name(&pool, project.id, "staging").await?.unwrap();
+        assert_eq!(found.max_deployment_expiration.as_deref(), Some("7d"));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_update_max_deployment_expiration_set_leave_and_clear(pool: PgPool) -> Result<()> {
+        let user = users::create(&pool, "env-test@example.com").await?;
+        let project = projects::create(
+            &pool,
+            "env-test-project",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await?;
+
+        let env = create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "green",
+            None,
+        )
+        .await?;
+        assert_eq!(env.max_deployment_expiration, None);
+
+        // `Some(Some(_))` sets it.
+        let env = update(
+            &pool,
+            env.id,
+            project.id,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("7d")),
+        )
+        .await?;
+        assert_eq!(env.max_deployment_expiration.as_deref(), Some("7d"));
+
+        // `None` leaves it unchanged.
+        let env = update(&pool, env.id, project.id, None, None, None, None, None).await?;
+        assert_eq!(env.max_deployment_expiration.as_deref(), Some("7d"));
+
+        // `Some(None)` clears it.
+        let env = update(
+            &pool,
+            env.id,
+            project.id,
+            None,
+            None,
+            None,
+            None,
+            Some(None),
+        )
+        .await?;
+        assert_eq!(env.max_deployment_expiration, None);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_invalid_max_deployment_expiration_violates_check_constraint(
+        pool: PgPool,
+    ) -> Result<()> {
+        let user = users::create(&pool, "env-test@example.com").await?;
+        let project = projects::create(
+            &pool,
+            "env-test-project",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await?;
+
+        let result = create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "green",
+            Some("7w"),
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("valid_max_deployment_expiration"),
+            "expected the CHECK constraint violation, got: {err:#}",
+        );
 
         Ok(())
     }
@@ -416,6 +564,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await?;
 
@@ -427,13 +576,21 @@ mod tests {
             Some("staging"),
             false,
             "green",
+            None,
         )
         .await?;
 
         // Create a new env with is_production=true — should swap from prod
-        let canary =
-            create_with_flag_swap(&pool, project.id, "canary", Some("canary"), true, "yellow")
-                .await?;
+        let canary = create_with_flag_swap(
+            &pool,
+            project.id,
+            "canary",
+            Some("canary"),
+            true,
+            "yellow",
+            None,
+        )
+        .await?;
         assert!(canary.is_production);
 
         // Verify prod lost production flag
@@ -462,9 +619,16 @@ mod tests {
         assert!(prod.is_production);
 
         // Create a new env with is_production=false
-        let staging =
-            create_with_flag_swap(&pool, project.id, "staging", Some("staging"), false, "blue")
-                .await?;
+        let staging = create_with_flag_swap(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await?;
         assert!(!staging.is_production);
 
         // Verify prod still has production flag
@@ -472,9 +636,16 @@ mod tests {
         assert!(prod.is_production);
 
         // Create another env with is_production=true — should swap from prod
-        let canary =
-            create_with_flag_swap(&pool, project.id, "canary", Some("canary"), true, "yellow")
-                .await?;
+        let canary = create_with_flag_swap(
+            &pool,
+            project.id,
+            "canary",
+            Some("canary"),
+            true,
+            "yellow",
+            None,
+        )
+        .await?;
         assert!(canary.is_production);
 
         // Verify prod lost production flag
@@ -527,6 +698,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await?;
         create(
@@ -536,6 +708,7 @@ mod tests {
             Some("staging"),
             false,
             "green",
+            None,
         )
         .await?;
 
@@ -567,7 +740,7 @@ mod tests {
         )
         .await?;
 
-        create(&pool, project.id, "dev", None, false, "green").await?;
+        create(&pool, project.id, "dev", None, false, "green", None).await?;
         create(
             &pool,
             project.id,
@@ -575,6 +748,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await?;
         create(
@@ -584,6 +758,7 @@ mod tests {
             Some("staging"),
             false,
             "green",
+            None,
         )
         .await?;
 

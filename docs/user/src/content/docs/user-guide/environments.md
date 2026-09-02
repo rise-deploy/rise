@@ -15,11 +15,11 @@ rise environment list
 ```
 
 ```
-╭────────────┬───────────────┬────────────┬───────╮
-│ NAME       │ PRIMARY GROUP │ PRODUCTION │ COLOR │
-├────────────┼───────────────┼────────────┼───────┤
-│ production │ default       │ yes        │ green │
-╰────────────┴───────────────┴────────────┴───────╯
+╭────────────┬───────────────┬────────────┬───────┬────────────────╮
+│ NAME       │ PRIMARY GROUP │ PRODUCTION │ COLOR │ MAX EXPIRATION │
+├────────────┼───────────────┼────────────┼───────┼────────────────┤
+│ production │ default       │ yes        │ green │ -              │
+╰────────────┴───────────────┴────────────┴───────┴────────────────╯
 ```
 
 ## Creating Environments
@@ -34,6 +34,7 @@ rise environment create dev -p my-app --group dev --color yellow
 | `--group`, `-g` | Primary deployment group for this environment |
 | `--production` | Set as the production environment (one per project) |
 | `--color` | Badge color: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray` (default: `green`) |
+| `--max-expiration` | Caps the lifetime of deployments into any non-primary group, e.g. `7d`, `12h`, `30m` (default: no cap) |
 
 Names must be lowercase alphanumeric with hyphens, no consecutive `--` (same rules as deployment groups).
 
@@ -67,6 +68,12 @@ rise environment update staging --production true
 
 # Change color
 rise environment update staging --color purple
+
+# Set (or change) the max expiration for non-primary groups
+rise environment update staging --max-expiration 7d
+
+# Clear the max expiration
+rise environment update staging --max-expiration ""
 ```
 
 Setting `--production true` automatically transfers the flag from the environment that previously held it.
@@ -121,6 +128,14 @@ The environment and deployment group are resolved together:
 | omitted | omitted | Auto-resolves from `rise.toml` default or server-side (see above) |
 
 If an environment is specified but has no primary deployment group, you must also pass `--group`.
+
+### Maximum Expiration for Non-Primary Groups
+
+An environment's `--max-expiration` caps how long a deployment can live once it lands in a group other than that environment's primary deployment group — the preview deployments created by `--group mr/123`, for example. An environment with no primary group has no group exempt from the cap, so it applies to every deployment created into it.
+
+A deployment created without `--expire` gets the max as its expiration. One created with a longer `--expire` is clamped down to the max; a shorter one is left as requested. Either way, when the cap changes what a deployment's `expires_at` would otherwise have been, that is recorded on the deployment's creation event alongside what was actually requested.
+
+Changing `--max-expiration` only affects deployments created afterward — it does not reach back and change `expires_at` on deployments that already exist.
 
 See [Deployments](../deployments) for the full deployment lifecycle.
 
