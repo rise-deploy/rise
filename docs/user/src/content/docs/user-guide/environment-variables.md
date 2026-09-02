@@ -13,20 +13,21 @@ Rise manages environment variables at the project level. Variables are injected 
 rise env set -p my-app LOG_LEVEL info --plain
 
 # Retrievable secret (encrypted at rest, masked in listings)
-rise env set -p my-app DATABASE_URL postgres://user:pass@db/mydb --secret --protected=false
+rise env set -p my-app DATABASE_URL postgres://user:pass@db/mydb --secret
 
 # Protected secret (encrypted, cannot be retrieved via API)
-rise env set -p my-app JWT_SECRET supersecret --secret
+rise env set -p my-app JWT_SECRET supersecret --protected
 ```
 
-Every value requires an explicit `--plain` or `--secret` type. Secrets are
-protected by default; pass `--protected=false` when the value must be
-retrievable through the API. Omit the value to enter it interactively; input
-for both secret forms is hidden:
+Every value requires exactly one type: `--plain`, `--secret`, or `--protected`.
+Secret values are encrypted at rest; protected secrets cannot be retrieved
+through the API. Omit the value to enter it interactively; input for both
+secret forms is hidden:
 
 ```bash
 rise env set -p my-app LOG_LEVEL --plain
 rise env set -p my-app DATABASE_URL --secret
+rise env set -p my-app JWT_SECRET --protected
 ```
 
 With a `rise.toml` in your directory, you can omit `-p`:
@@ -209,4 +210,4 @@ When deploying, variables are merged in this order (later overrides earlier):
 2. `[environments.<target>.env]` variables for the target environment (source: `toml`)
 3. CLI deploy-time overrides (`-e`, `--secret-env`, `--protected-env`, `--env-file`) (source: `cli`)
 
-Only plain-text variables can be managed in `rise.toml`. Secrets must be set via the CLI (`rise env set --secret`) or passed at deploy time (`--secret-env`, `--protected-env`).
+Only plain-text variables can be managed in `rise.toml`. Secrets must be set via the CLI (`rise env set --secret` or `rise env set --protected`) or passed at deploy time (`--secret-env`, `--protected-env`).

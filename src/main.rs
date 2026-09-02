@@ -787,7 +787,7 @@ enum EnvCommands {
         clap::ArgGroup::new("env_type")
             .required(true)
             .multiple(false)
-            .args(["plain", "secret"])
+            .args(["plain", "secret", "protected"])
     ))]
     Set {
         /// Project name (optional if rise.toml contains [project] section)
@@ -803,12 +803,12 @@ enum EnvCommands {
         /// Store the value as plain text
         #[arg(long)]
         plain: bool,
-        /// Store the value as an encrypted, protected secret
+        /// Store the value as an encrypted secret retrievable through the API
         #[arg(long)]
         secret: bool,
-        /// Whether the secret is protected from API retrieval (defaults to true)
-        #[arg(long, requires = "secret", conflicts_with = "plain")]
-        protected: Option<bool>,
+        /// Store the value as an encrypted secret that cannot be retrieved
+        #[arg(long)]
+        protected: bool,
         /// Scope variable to a specific environment (e.g., 'staging'). Without this, the variable is global.
         #[arg(long, short = 'E')]
         environment: Option<String>,
@@ -1889,9 +1889,15 @@ async fn main() -> Result<()> {
             };
             let project_name = resolve_project_name(project.clone(), path)?;
             let prompted_value = match env_cmd {
-                EnvCommands::Set { value, secret, .. } => {
-                    Some(env::resolve_env_value(value.as_deref(), *secret)?)
-                }
+                EnvCommands::Set {
+                    value,
+                    secret,
+                    protected,
+                    ..
+                } => Some(env::resolve_env_value(
+                    value.as_deref(),
+                    *secret || *protected,
+                )?),
                 _ => None,
             };
             let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
@@ -1903,9 +1909,7 @@ async fn main() -> Result<()> {
                     environment,
                     ..
                 } => {
-                    // Protected defaults to true for secrets, false for non-secrets
-                    // Can be explicitly overridden with --protected flag
-                    let is_protected = protected.unwrap_or(*secret);
+                    let is_secret = *secret || *protected;
                     env::set_env(
                         &http_client,
                         &backend_url,
@@ -1915,8 +1919,8 @@ async fn main() -> Result<()> {
                         prompted_value
                             .as_deref()
                             .expect("set commands resolve an environment variable value"),
-                        *secret,
-                        is_protected,
+                        is_secret,
+                        *protected,
                         environment.as_deref(),
                     )
                     .await?;
@@ -2364,6 +2368,7 @@ mod deployment_output_cli_tests {
 
         assert!(message.contains("--plain"));
         assert!(message.contains("--secret"));
+        assert!(message.contains("--protected"));
     }
 
     #[test]
@@ -2388,14 +2393,6 @@ mod deployment_output_cli_tests {
     }
 
     #[test]
-    fn env_set_rejects_plain_and_secret_together() {
-        assert!(
-            Cli::try_parse_from(["rise", "env", "set", "KEY", "value", "--plain", "--secret"])
-                .is_err()
-        );
-    }
-
-    #[test]
     fn env_set_accepts_an_omitted_secret_value() {
         let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--secret"]).unwrap();
 
@@ -2408,40 +2405,42 @@ mod deployment_output_cli_tests {
             }) => {
                 assert_eq!(value, None);
                 assert!(secret);
-                assert_eq!(protected, None);
+                assert!(!protected);
             }
             _ => panic!("expected env set command"),
         }
     }
 
     #[test]
-    fn env_set_requires_secret_when_setting_protection() {
-        assert!(Cli::try_parse_from([
-            "rise",
-            "env",
-            "set",
-            "KEY",
-            "value",
-            "--plain",
-            "--protected=false"
-        ])
-        .is_err());
+    fn env_set_accepts_an_omitted_protected_value() {
+        let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--protected"]).unwrap();
 
-        let cli = Cli::try_parse_from([
-            "rise",
-            "env",
-            "set",
-            "KEY",
-            "value",
-            "--secret",
-            "--protected=false",
-        ])
-        .unwrap();
         match cli.command {
-            Commands::Env(EnvCommands::Set { protected, .. }) => {
-                assert_eq!(protected, Some(false));
+            Commands::Env(EnvCommands::Set {
+                value,
+                secret,
+                protected,
+                ..
+            }) => {
+                assert_eq!(value, None);
+                assert!(!secret);
+                assert!(protected);
             }
             _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn env_set_rejects_multiple_types() {
+        for types in [
+            ["--plain", "--secret"],
+            ["--plain", "--protected"],
+            ["--secret", "--protected"],
+        ] {
+            assert!(Cli::try_parse_from([
+                "rise", "env", "set", "KEY", "value", types[0], types[1],
+            ])
+            .is_err());
         }
     }
 

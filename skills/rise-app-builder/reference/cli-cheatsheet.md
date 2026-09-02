@@ -139,7 +139,7 @@ Valid colors: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray`.
 
 | Command | Aliases | Key Flags |
 |---------|---------|-----------|
-| `rise env set <key> [value]` | `s` | `--plain` or `--secret` (required), `-p`, `--path`, `--protected <bool>`, `-E/--environment` |
+| `rise env set <key> [value]` | `s` | `--plain`, `--secret`, or `--protected` (exactly one required), `-p`, `--path`, `-E/--environment` |
 | `rise env list` | `ls`, `l` | `-p`, `--path`, `-E/--environment` |
 | `rise env get <key>` | `g` | `-p`, `--path`, `-E/--environment` |
 | `rise env delete <key>` | `unset`, `rm`, `del` | `-p`, `--path`, `-E/--environment` |

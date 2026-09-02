@@ -333,8 +333,9 @@ pub async fn get_env(
     if env_var.is_secret && env_var.is_protected {
         anyhow::bail!(
             "Cannot retrieve value: '{}' is a protected secret.\n\
-             To make it unprotected, update it with: rise env set {} <value> --secret --protected=false",
-            key, key
+             To make it retrievable, update it with: rise env set {} <value> --secret",
+            key,
+            key
         );
     }
 
