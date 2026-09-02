@@ -162,6 +162,9 @@ rise project list --profile work
 export RISE_PROFILE=work
 rise project list
 
+# Make it the default for future commands
+rise profile use work
+
 # See every registered profile and which one is active
 rise profile list
 
@@ -169,10 +172,11 @@ rise profile list
 rise profile remove work
 ```
 
-`--profile` takes precedence over the `RISE_PROFILE` environment variable;
-passing `--profile default` (or unsetting `RISE_PROFILE`) switches back to the
-default profile. A named profile's config is stored separately, at
-`~/.config/rise/profiles/<name>.json`.
+Profile selection follows `--profile`, then `RISE_PROFILE`, then the profile
+selected by `rise profile use`. `rise profile use default` selects the default
+profile for future commands. A named profile's config is stored separately at
+`~/.config/rise/profiles/<name>.json`; the default selection is stored at
+`~/.config/rise/default-profile`.
 
 ## Backend Configuration Schema
 

@@ -74,6 +74,7 @@ cli = [
     "dep:clap",
     "dep:comfy-table",
     "dep:dirs",
+    "dep:rpassword",
     "dep:tempfile",
     "dep:toml",
     "dep:url",
@@ -178,6 +179,7 @@ urlencoding = "2.1"
 clap = { version = "4.5.53", features = ["derive"], optional = true }
 comfy-table = { version = "7.1", optional = true }
 dirs = { version = "6.0", optional = true }
+rpassword = { version = "7.4", optional = true }
 tempfile = { version = "3.0", optional = true }
 toml = { version = "1", optional = true }
 url = { workspace = true, optional = true }

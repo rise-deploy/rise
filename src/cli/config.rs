@@ -193,6 +193,8 @@ pub struct Config {
 /// is unsound if anything else reads the environment concurrently.
 static PROFILE_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 
+const DEFAULT_PROFILE_FILE: &str = "default-profile";
+
 /// Set the process-wide profile override. Must be called at most once, before
 /// any other profile resolution — `main()` does this immediately after
 /// parsing CLI args, when `--profile` was passed.
@@ -202,13 +204,13 @@ pub fn set_profile_override(profile: Option<String>) {
 
 impl Config {
     /// The active login profile, i.e. the one selected via `--profile` /
-    /// `RISE_PROFILE` for the lifetime of this process, or `None` for the
+    /// `RISE_PROFILE` for the lifetime of this process, or the configured
     /// default profile.
     ///
     /// `--profile` is resolved once in `main()` into [`set_profile_override`],
     /// so every independent config load in the process — not just the one in
     /// `main()` — agrees on the same active profile. Absent that override,
-    /// falls back to the `RISE_PROFILE` environment variable.
+    /// falls back to `RISE_PROFILE`, then the persisted default selection.
     pub fn active_profile() -> Result<Option<String>> {
         if let Some(overridden) = PROFILE_OVERRIDE.get() {
             return Ok(overridden.clone());
@@ -222,12 +224,59 @@ impl Config {
             validate_profile_name(trimmed)?;
             return Ok(Some(trimmed.to_string()));
         }
+        #[cfg(not(test))]
+        return Self::default_profile();
+
+        #[cfg(test)]
         Ok(None)
     }
 
     /// The active profile's name for display purposes (`"default"` when unset).
     pub fn active_profile_label() -> Result<String> {
         Ok(Self::active_profile()?.unwrap_or_else(|| "default".to_string()))
+    }
+
+    /// The profile selected by `rise profile use`, independent of overrides.
+    pub fn default_profile() -> Result<Option<String>> {
+        let path = Self::config_dir()?.join(DEFAULT_PROFILE_FILE);
+        Self::read_default_profile_file(&path)
+    }
+
+    /// Select the profile used when neither `--profile` nor `RISE_PROFILE` is set.
+    pub fn set_default_profile(name: &str) -> Result<()> {
+        validate_profile_name(name)?;
+
+        if name != "default" && !Self::path_for(Some(name))?.exists() {
+            anyhow::bail!(
+                "Profile '{}' does not exist; register it with 'rise login --profile {}' first",
+                name,
+                name
+            );
+        }
+
+        let path = Self::config_dir()?.join(DEFAULT_PROFILE_FILE);
+        Self::write_private_file(&path, format!("{name}\n").as_bytes())
+    }
+
+    fn read_default_profile_file(path: &std::path::Path) -> Result<Option<String>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let contents = fs::read_to_string(path).context("Failed to read default profile")?;
+        let name = contents.trim();
+        if name.is_empty() || name == "default" {
+            return Ok(None);
+        }
+        validate_profile_name(name).context("Invalid default profile")?;
+        Ok(Some(name.to_string()))
+    }
+
+    fn config_dir() -> Result<PathBuf> {
+        let home = dirs::home_dir().context("Failed to get home directory")?;
+        let config_dir = home.join(".config").join("rise");
+        ensure_config_dir(&config_dir)?;
+        Ok(config_dir)
     }
 
     /// List the names of all registered non-default profiles, i.e. every
@@ -266,14 +315,15 @@ impl Config {
         }
 
         fs::remove_file(&path).context("Failed to remove profile config file")?;
+        if Self::default_profile()?.as_deref() == Some(name) {
+            Self::set_default_profile("default")?;
+        }
         Ok(())
     }
 
     /// The config file path for a given profile (`None` = default profile).
     pub fn path_for(profile: Option<&str>) -> Result<PathBuf> {
-        let home = dirs::home_dir().context("Failed to get home directory")?;
-        let config_dir = home.join(".config").join("rise");
-        ensure_config_dir(&config_dir)?;
+        let config_dir = Self::config_dir()?;
 
         match profile {
             None => Ok(config_dir.join("config.json")),
@@ -323,8 +373,11 @@ impl Config {
     /// Write configuration to a specific path with restrictive permissions on Unix
     fn write_config_file(config_path: &std::path::Path, config: &Config) -> Result<()> {
         let json = serde_json::to_string_pretty(config).context("Failed to serialize config")?;
+        Self::write_private_file(config_path, json.as_bytes())
+    }
 
-        // On Unix, create/write the file with 0600 permissions atomically
+    fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+        // On Unix, create/write the file with 0600 permissions
         #[cfg(unix)]
         {
             use std::io::Write;
@@ -334,15 +387,15 @@ impl Config {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(config_path)
+                .open(path)
                 .context("Failed to create config file")?;
-            file.write_all(json.as_bytes())
+            file.write_all(contents)
                 .context("Failed to write config file")?;
         }
 
         #[cfg(not(unix))]
         {
-            fs::write(config_path, json).context("Failed to write config file")?;
+            fs::write(path, contents).context("Failed to write config file")?;
         }
 
         Ok(())
@@ -502,10 +555,32 @@ mod tests {
 
     #[test]
     fn test_active_profile_is_default_in_tests() {
-        // RISE_PROFILE reads are disabled under #[cfg(test)] (like the other
-        // env-checking getters), so this only exercises the "unset" path.
         assert_eq!(Config::active_profile().unwrap(), None);
         assert_eq!(Config::active_profile_label().unwrap(), "default");
+    }
+
+    #[test]
+    fn test_read_default_profile_file() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join(DEFAULT_PROFILE_FILE);
+
+        assert_eq!(Config::read_default_profile_file(&path).unwrap(), None);
+        fs::write(&path, "default\n").unwrap();
+        assert_eq!(Config::read_default_profile_file(&path).unwrap(), None);
+        fs::write(&path, "work\n").unwrap();
+        assert_eq!(
+            Config::read_default_profile_file(&path).unwrap(),
+            Some("work".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_default_profile_file_rejects_invalid_name() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join(DEFAULT_PROFILE_FILE);
+        fs::write(&path, "../work\n").unwrap();
+
+        assert!(Config::read_default_profile_file(&path).is_err());
     }
 
     #[test]

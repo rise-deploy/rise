@@ -142,7 +142,7 @@ Scope environment variables to a specific environment with the `-E` flag:
 
 ```bash
 # Set a variable only for staging
-rise env set DATABASE_URL postgres://staging-db/mydb -E staging
+rise env set DATABASE_URL postgres://staging-db/mydb --plain -E staging
 
 # List variables for staging (shows merged global + scoped)
 rise env list -p my-app -E staging

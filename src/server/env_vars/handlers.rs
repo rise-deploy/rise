@@ -535,7 +535,7 @@ pub async fn get_project_env_var_value(
     if !env_var.is_secret || env_var.is_protected {
         return Err(ServerError::bad_request(format!(
             "Environment variable '{}' is a protected secret and cannot be retrieved. \
-             Update it with --protected=false to allow retrieval.",
+             Update it with --secret to allow retrieval.",
             key
         )));
     }
@@ -605,7 +605,7 @@ pub async fn get_deployment_env_var_value(
     if !env_var.is_secret || env_var.is_protected {
         return Err(ServerError::bad_request(format!(
             "Environment variable '{}' is a protected secret and cannot be retrieved. \
-             Update it with --protected=false to allow retrieval.",
+             Update it with --secret to allow retrieval.",
             key
         )));
     }

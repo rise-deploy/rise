@@ -9,7 +9,7 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 | Command | Alias | Subcommands | Details |
 |---------|-------|-------------|---------|
 | `rise login` | | | [Authentication](../authentication) |
-| `rise profile` | | `list` (`ls`), `remove` (`rm`) | [Login Profiles](../configuration#login-profiles) |
+| `rise profile` | | `list` (`ls`), `use`, `remove` (`rm`) | [Login Profiles](../configuration#login-profiles) |
 | `rise deploy` | | | [Deployments](../deployments) |
 | `rise build` | | | [Building Images](../builds) |
 | `rise run` | | | [Local Development](../local-development) |
@@ -86,4 +86,4 @@ For token sources that can mint new tokens, the CLI refreshes proactively so lon
 
 CLI settings are stored in `~/.config/rise/config.json`, created on first `rise login`. See [Project Configuration](../configuration#global-cli-config) for details.
 
-Multiple accounts/backends can be managed side by side with named login profiles (`--profile` / `RISE_PROFILE`, `rise profile list`/`remove`). See [Login Profiles](../configuration#login-profiles).
+Multiple accounts/backends can be managed side by side with named login profiles (`--profile` / `RISE_PROFILE`, `rise profile list`/`use`/`remove`). See [Login Profiles](../configuration#login-profiles).

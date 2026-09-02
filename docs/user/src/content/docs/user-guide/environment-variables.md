@@ -10,19 +10,30 @@ Rise manages environment variables at the project level. Variables are injected 
 
 ```bash
 # Plain text variable
-rise env set -p my-app LOG_LEVEL info
+rise env set -p my-app LOG_LEVEL info --plain
 
-# Secret variable (encrypted at rest, masked in listings)
+# Retrievable secret (encrypted at rest, masked in listings)
 rise env set -p my-app DATABASE_URL postgres://user:pass@db/mydb --secret
 
 # Protected secret (encrypted, cannot be retrieved via API)
-rise env set -p my-app JWT_SECRET supersecret --secret --protected
+rise env set -p my-app JWT_SECRET supersecret --protected
+```
+
+Every value requires exactly one type: `--plain`, `--secret`, or `--protected`.
+Secret values are encrypted at rest; protected secrets cannot be retrieved
+through the API. Omit the value to enter it interactively; input for both
+secret forms is hidden:
+
+```bash
+rise env set -p my-app LOG_LEVEL --plain
+rise env set -p my-app DATABASE_URL --secret
+rise env set -p my-app JWT_SECRET --protected
 ```
 
 With a `rise.toml` in your directory, you can omit `-p`:
 
 ```bash
-rise env set LOG_LEVEL info
+rise env set LOG_LEVEL info --plain
 ```
 
 ### Listing Variables
@@ -75,7 +86,7 @@ Variables can be scoped to a specific [environment](../environments) using the `
 
 ```bash
 # Set a variable only for staging
-rise env set DATABASE_URL postgres://staging-db/mydb -E staging
+rise env set DATABASE_URL postgres://staging-db/mydb --plain -E staging
 
 # Get a scoped variable
 rise env get -p my-app DATABASE_URL -E staging
@@ -114,7 +125,7 @@ Rise automatically injects these variables into every deployment:
 | `RISE_ENVIRONMENT` | Environment name (if the deployment has an associated environment) | `staging` |
 | `RISE_CONTAINER_HOST__<NAME>` | Resolvable address (`<host>:<port>`) of each sibling container in a [multi-container deployment](../deployments#multi-container-deployments) that exposes a `port` — one entry per such container, whether or not it is routed (a port-having database like Redis is included). `<NAME>` is the uppercase container name (dashes mapped to underscores). Workers (containers without a `port`) are excluded. Injected only when the deployment has two or more containers. Each container also sees its own entry. | `default-api:8080` |
 
-`PORT` defaults to 8080. Override it per-deployment with `--http-port` on `rise deploy`, or set it permanently with `rise env set -p my-app PORT 3000`.
+`PORT` defaults to 8080. Override it per-deployment with `--http-port` on `rise deploy`, or set it permanently with `rise env set -p my-app PORT 3000 --plain`.
 
 `RISE_CONTAINER_HOST__<NAME>` values are `<host>:<port>` (no scheme). Always address siblings through this variable rather than hardcoding a hostname — the exact host string depends on the deployment backend, but the variable resolves correctly on both:
 
@@ -199,4 +210,4 @@ When deploying, variables are merged in this order (later overrides earlier):
 2. `[environments.<target>.env]` variables for the target environment (source: `toml`)
 3. CLI deploy-time overrides (`-e`, `--secret-env`, `--protected-env`, `--env-file`) (source: `cli`)
 
-Only plain-text variables can be managed in `rise.toml`. Secrets must be set via the CLI (`rise env set --secret`) or passed at deploy time (`--secret-env`, `--protected-env`).
+Only plain-text variables can be managed in `rise.toml`. Secrets must be set via the CLI (`rise env set --secret` or `rise env set --protected`) or passed at deploy time (`--secret-env`, `--protected-env`).
