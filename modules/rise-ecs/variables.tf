@@ -459,6 +459,43 @@ variable "control_plane_local_config_secret_arn" {
   default     = null
 }
 
+variable "control_plane_secret_environment" {
+  description = <<-EOT
+    Additional Secrets Manager values to inject into the Rise control-plane
+    container, keyed by environment-variable name. Each value must be a full
+    Secrets Manager secret ARN, optionally followed by the three ECS selector
+    segments for JSON key, version stage and version id.
+
+    The module exposes each base secret ARN through
+    secret_arns_for_execution_role. Names reserved for the module's built-in
+    secrets cannot be overridden.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = length(setintersection(
+      toset(keys(var.control_plane_secret_environment)),
+      toset([
+        "DATABASE_URL",
+        "RISE_JWT_SIGNING_SECRET",
+        "RISE_ENCRYPTION_KEY",
+        "OIDC_CLIENT_SECRET",
+        "RISE_LOCAL_CONFIG_YAML",
+      ]),
+    )) == 0
+    error_message = "control_plane_secret_environment cannot override DATABASE_URL, RISE_JWT_SIGNING_SECRET, RISE_ENCRYPTION_KEY, OIDC_CLIENT_SECRET or RISE_LOCAL_CONFIG_YAML."
+  }
+
+  validation {
+    condition = alltrue([
+      for value_from in values(var.control_plane_secret_environment) :
+      can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:[^:]+(?::[^:]*:[^:]*:[^:]*)?$", value_from))
+    ])
+    error_message = "control_plane_secret_environment values must be full Secrets Manager secret ARNs, optionally followed by ECS JSON-key, version-stage and version-id selectors."
+  }
+}
+
 variable "rise_desired_count" {
   description = "Control-plane replicas. Safe above 1: the reconcile loop is leader-elected through rise-runtime-sync."
   type        = number

@@ -97,13 +97,27 @@ locals {
   # plane's environment and Traefik labels look like on ECS.
   rise_environment = module.control_plane_env.environment
 
-  control_plane_secrets = concat([
-    { name = "DATABASE_URL", valueFrom = local.database_url_secret_arn },
-    { name = "RISE_JWT_SIGNING_SECRET", valueFrom = aws_secretsmanager_secret.jwt_signing_secret.arn },
-    { name = "RISE_ENCRYPTION_KEY", valueFrom = aws_secretsmanager_secret.encryption_key.arn },
-    { name = "OIDC_CLIENT_SECRET", valueFrom = aws_secretsmanager_secret.oidc_client_secret.arn },
-    ], var.control_plane_local_config_secret_arn == null ? [] : [
-    { name = "RISE_LOCAL_CONFIG_YAML", valueFrom = var.control_plane_local_config_secret_arn },
+  control_plane_builtin_secret_environment = merge({
+    DATABASE_URL            = local.database_url_secret_arn
+    RISE_JWT_SIGNING_SECRET = aws_secretsmanager_secret.jwt_signing_secret.arn
+    RISE_ENCRYPTION_KEY     = aws_secretsmanager_secret.encryption_key.arn
+    OIDC_CLIENT_SECRET      = aws_secretsmanager_secret.oidc_client_secret.arn
+    }, var.control_plane_local_config_secret_arn == null ? {} : {
+    RISE_LOCAL_CONFIG_YAML = var.control_plane_local_config_secret_arn
+  })
+  control_plane_secret_environment = merge(
+    local.control_plane_builtin_secret_environment,
+    var.control_plane_secret_environment,
+  )
+  control_plane_secrets = [
+    for name, value_from in local.control_plane_secret_environment : {
+      name      = name
+      valueFrom = value_from
+    }
+  ]
+  control_plane_additional_secret_arns = distinct([
+    for value_from in values(var.control_plane_secret_environment) :
+    join(":", slice(split(":", value_from), 0, 7))
   ])
 }
 

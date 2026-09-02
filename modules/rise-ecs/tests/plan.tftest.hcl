@@ -145,6 +145,39 @@ run "loads_a_secret_local_config_overlay" {
   }
 }
 
+run "injects_additional_control_plane_secrets" {
+  command = plan
+
+  variables {
+    control_plane_secret_environment = {
+      SNOWFLAKE_OAUTH_PRIVATE_KEY = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123:private_key:AWSCURRENT:"
+      SHARED_SECRET_COPY          = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123"
+    }
+  }
+
+  assert {
+    condition = one([
+      for secret in local.control_plane_secrets :
+      secret.valueFrom
+      if secret.name == "SNOWFLAKE_OAUTH_PRIVATE_KEY"
+    ]) == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123:private_key:AWSCURRENT:"
+    error_message = "additional secrets must reach the task with ECS selectors intact"
+  }
+
+  assert {
+    condition     = output.rise_task_secrets["SNOWFLAKE_OAUTH_PRIVATE_KEY"] == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123:private_key:AWSCURRENT:"
+    error_message = "module outputs must expose additional task secret references"
+  }
+
+  assert {
+    condition = (
+      length(output.secret_arns_for_execution_role) == 5
+      && output.secret_arns_for_execution_role[4] == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123"
+    )
+    error_message = "execution-role output must contain each base secret ARN once"
+  }
+}
+
 run "uses_an_external_traefik_role_without_creating_iam" {
   command = plan
 
