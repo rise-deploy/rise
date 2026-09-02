@@ -87,12 +87,15 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
+      - "--providers.http.endpoint=http://host.docker.internal:3001/internal/traefik/config"
+      - "--providers.http.pollInterval=5s"
       # File provider: routes /.rise/* on app hosts to the host-run Rise backend
       # (see dev/traefik/dynamic/rise-dotrise.yml). The backend isn't a container
       # here, so a Docker-provider label can't target it.
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.rise-catalog.address=127.0.0.1:8083"
       - "--api.dashboard=true"
       - "--api.insecure=true"
     ports:

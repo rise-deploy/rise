@@ -628,7 +628,7 @@ export function DeploymentsList({ projectName }) {
                                 <th>Image</th>
                                 <th>Created by</th>
                                 <th>Duration</th>
-                                <th>Age</th>
+                                <th>Expires in</th>
                                 <th style={{ textAlign: 'right' }}>Actions</th>
                             </tr>
                         </thead>
@@ -655,10 +655,10 @@ export function DeploymentsList({ projectName }) {
                                     </td>
                                     <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
                                     <td className="mono" style={{ fontSize: 12.25, color: 'var(--text-muted)' }}>
-                                        {d.completed_at ? formatDurationDelta(d.created, d.completed_at) : '—'}
+                                        {formatDurationDelta(d.created, d.completed_at || new Date().toISOString())}
                                     </td>
-                                    <td style={{ color: 'var(--text-muted)' }} title={formatISO8601(d.created)}>
-                                        {formatRelativeTimeRounded(d.created)}
+                                    <td style={{ color: 'var(--text-muted)' }} title={d.expires_at ? formatISO8601(d.expires_at) : undefined}>
+                                        {d.expires_at ? formatTimeRemaining(d.expires_at) : '—'}
                                     </td>
                                     <td style={{ textAlign: 'right' }}>
                                         <div className="row-actions" style={{ display: 'inline-flex', gap: 6, justifyContent: 'flex-end' }}>

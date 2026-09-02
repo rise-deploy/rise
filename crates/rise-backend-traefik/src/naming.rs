@@ -18,13 +18,9 @@ use crate::labels;
 /// [`render_traefik_labels_for`] add on top.
 pub const MAX_SERVICE_BASE_LEN: usize = 48;
 
-/// Group-scoped Traefik router/service BASE name for a (project, group,
-/// container), deployment-id-FREE so ALL routers/services/middlewares of a
-/// (project, group, container) are named IDENTICALLY across every deployment of
-/// the group. This lets an old and a new deployment share one Traefik service
-/// (their replica containers register as servers of the same load balancer),
-/// setting up health-driven rolling overlap. Mirrors the K8s group
-/// Service/Ingress naming, which is likewise deployment-id-free.
+/// Group-scoped Traefik router base name for a (project, group, container).
+/// Public HTTP-provider routers keep this stable while their service reference
+/// moves between deployment-scoped native-provider pools.
 ///
 /// **Injective.** [`sanitize_router_name`] is lossy — it lowercases and
 /// collapses every run of non-`[a-z0-9]` to a single `-`, so distinct tuples
@@ -38,9 +34,8 @@ pub const MAX_SERVICE_BASE_LEN: usize = 48;
 /// appear in any field) encoding of the three fields. The human-readable base
 /// is length-capped first so the total stays well within name limits.
 ///
-/// Shared by [`render_traefik_labels_for`] (which stamps the labels) and the
-/// reconciler's `serverStatus` lookup (which queries `{service}@docker`) so the
-/// two can't drift on how the service is named.
+/// Deployment service names extend this base, keeping the router and service
+/// collision boundaries identical.
 pub fn group_service_base(project: &str, deployment_group: &str, container: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut sanitized =
@@ -72,6 +67,27 @@ pub fn group_service_base(project: &str, deployment_group: &str, container: &str
     }
 }
 
+/// Deployment-scoped native-provider service name.
+///
+/// HTTP-provider routers remain group-scoped, while Docker/ECS provider
+/// services carry the deployment id so a cutover can point at exactly one
+/// deployment without taking server membership away from the native provider.
+pub fn deployment_service_base(
+    project: &str,
+    deployment_group: &str,
+    deployment_id: &str,
+    container: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let group = group_service_base(project, deployment_group, container);
+    let mut hasher = Sha256::new();
+    hasher.update(deployment_id.as_bytes());
+    let digest = hasher.finalize();
+    let suffix: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{group}-{suffix}")
+}
+
 /// Per-route Traefik service/router name for route `route_idx` of a container
 /// that emits `route_count` routes. A single-route container uses the bare
 /// [`group_service_base`]; a multi-route container gets per-route services
@@ -96,13 +112,14 @@ pub fn group_service_name(base: &str, route_idx: usize, route_count: usize) -> S
 /// [`DesiredContainer`]-free path
 /// ([`super::reconciler::service_names_for_spec`]); this `DesiredContainer`-based
 /// form is the reference used to assert the two derivations agree.
-pub fn group_service_names(desired: &DesiredContainer) -> Vec<String> {
+pub fn deployment_service_names(desired: &DesiredContainer) -> Vec<String> {
     if desired.port.filter(|_| desired.routable).is_none() {
         return Vec::new();
     }
-    let base = group_service_base(
+    let base = deployment_service_base(
         &desired.project,
         &desired.deployment_group,
+        &desired.deployment_id,
         &desired.container,
     );
     let mut routes = desired.routes.clone();

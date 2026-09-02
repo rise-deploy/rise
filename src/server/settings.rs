@@ -1492,9 +1492,10 @@ pub enum DeploymentControllerSettings {
 
     /// Docker deployment controller.
     ///
-    /// Deploys app containers to a single Docker host and lets Traefik's Docker
-    /// provider route to them via container labels Rise stamps. No Kubernetes,
-    /// no Metacontroller — reconciliation runs in-process (see
+    /// Deploys app containers to a single Docker host. Traefik's Docker provider
+    /// discovers deployment services from labels, while its HTTP provider reads
+    /// the active public routes from Rise. No Kubernetes, no Metacontroller —
+    /// reconciliation runs in-process (see
     /// `controller::docker::DockerReconciler`).
     #[cfg(feature = "backend")]
     Docker {
@@ -1524,7 +1525,7 @@ pub enum DeploymentControllerSettings {
         /// identifier (e.g. "public", "private"). Mirrors the Kubernetes variant
         /// so the typed project API can validate a project's access class. For
         /// access classes whose `access_requirement` is `Authenticated`/`Member`,
-        /// the Docker controller stamps Traefik forwardAuth middleware labels
+        /// the HTTP-provider configuration includes a Traefik forwardAuth middleware
         /// (requires `auth_backend_url` to be set). A permissive "public" class
         /// is provided by default; operators may override.
         /// Use `null` in YAML to remove an inherited access class.
@@ -1673,8 +1674,8 @@ pub enum DeploymentControllerSettings {
         /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
         /// or `http://localhost:8090` for a host-run dev backend). Read to learn
         /// per-server health status (the top-level `serverStatus` map) from
-        /// Traefik so the old deployment is retired only once the new servers are
-        /// actually in Traefik's rotation. Optional basic-auth may be embedded in
+        /// Traefik so a deployment is finalized only once its native service is
+        /// ready and the HTTP-provider routers select it. Optional basic-auth may be embedded in
         /// the URL (userinfo). **Required for projects that set a `health_check`**:
         /// Traefik's `serverStatus` is the authoritative readiness signal (no
         /// fallback), so without a reachable API a health-checked deployment never
@@ -1686,9 +1687,10 @@ pub enum DeploymentControllerSettings {
 
     /// Amazon ECS deployment controller (Fargate launch type).
     ///
-    /// Deploys each container spec as its own ECS service and lets Traefik's ECS
-    /// provider route to the tasks via labels Rise stamps on the container
-    /// definition. No Kubernetes, no Metacontroller — reconciliation runs
+    /// Deploys each container spec as its own ECS service. Traefik's ECS provider
+    /// discovers deployment services from container-definition labels, while its
+    /// HTTP provider reads active public routes from Rise. No Kubernetes, no
+    /// Metacontroller — reconciliation runs
     /// in-process (see `rise_backend_ecs::reconciler::EcsReconciler`).
     ///
     /// See ADR-0005 for the design and its deliberate v1 limitations.
@@ -1824,8 +1826,8 @@ pub enum DeploymentControllerSettings {
         ingress_schema: String,
 
         /// Access classes defining ingress authentication levels. For classes
-        /// whose `access_requirement` is `Authenticated`/`Member` the controller
-        /// stamps Traefik forwardAuth labels, which requires `auth_backend_url`;
+        /// whose `access_requirement` is `Authenticated`/`Member` the HTTP-provider
+        /// configuration includes Traefik forwardAuth, which requires `auth_backend_url`;
         /// the backend refuses to start otherwise rather than serve those
         /// projects publicly with no auth enforced.
         #[serde(default = "default_ecs_access_classes")]

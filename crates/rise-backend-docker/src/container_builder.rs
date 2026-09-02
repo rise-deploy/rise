@@ -24,8 +24,10 @@ use rise_backend_traefik::render::TraefikRenderConfig;
 pub use rise_backend_core::desired::{DesiredContainer, DesiredRoute};
 pub use rise_backend_core::naming::MAX_NAME_LEN;
 pub use rise_backend_core::naming::{container_name, group_app_name, stable_identity_name};
-pub use rise_backend_traefik::naming::{group_service_base, group_service_name};
-pub use rise_backend_traefik::naming::{group_service_names, MAX_SERVICE_BASE_LEN};
+pub use rise_backend_traefik::naming::{
+    deployment_service_base, group_service_base, group_service_name,
+};
+pub use rise_backend_traefik::naming::{deployment_service_names, MAX_SERVICE_BASE_LEN};
 pub use rise_backend_traefik::render::{
     render_traefik_labels_for, routes_withheld, TraefikRenderConfig as _TraefikRenderConfig,
 };
@@ -72,6 +74,7 @@ impl<'a> BuilderConfig<'a> {
             label_namespace: self.label_namespace,
             controller_class: self.controller_class,
             traefik_entrypoint: self.traefik_entrypoint,
+            catalog_entrypoint: "rise-catalog",
             traefik_certresolver: self.traefik_certresolver,
             network: Some(self.traefik_network),
             auth_backend_url: self.auth_backend_url,
@@ -648,13 +651,12 @@ mod tests {
             t0, t1,
             "replicas must render identical Traefik labels (shared router+service)"
         );
-        // Spot-check the shared service/router name is group-scoped (replica- and
-        // deployment-id-free). The base carries the injective `-{hex16}` suffix.
-        let base = group_service_base("myapp", "default", "app");
+        // Replicas share the deployment-scoped service name.
+        let base = deployment_service_base("myapp", "default", &r0.deployment_id, "app");
         assert!(t0.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
-        assert!(t0.contains_key(&format!("traefik.http.routers.{base}.rule")));
+        assert!(t0.contains_key(&format!("traefik.http.routers.{base}-catalog.rule")));
         assert!(
             !t0.keys().any(|k| k.contains("-r0") || k.contains("-r1")),
             "Traefik router/service names must not include a replica index"
@@ -666,10 +668,7 @@ mod tests {
     }
 
     #[test]
-    fn traefik_names_stable_across_different_deployment_ids() {
-        // Two DIFFERENT deployment_ids of the same (project, group, container)
-        // must render the SAME Traefik service/router names, so an old and a new
-        // deployment register as servers of ONE Traefik service (rolling overlap).
+    fn traefik_names_isolate_different_deployment_ids() {
         let cfg = test_cfg();
         let mut d1 = single_container();
         d1.deployment_id = "20260101-120000".to_string();
@@ -685,14 +684,14 @@ mod tests {
                 .filter(|(k, _)| k.starts_with("traefik."))
                 .collect()
         };
-        assert_eq!(
+        assert_ne!(
             traefik_of(&d1),
             traefik_of(&d2),
-            "different deployments of a group must share one Traefik router+service"
+            "different deployments must publish distinct native-provider services"
         );
         let t = traefik_of(&d1);
-        let base = group_service_base("myapp", "default", "app");
-        assert!(t.contains_key(&format!("traefik.http.routers.{base}.rule")));
+        let base = deployment_service_base("myapp", "default", &d1.deployment_id, "app");
+        assert!(t.contains_key(&format!("traefik.http.routers.{base}-catalog.rule")));
         assert!(t.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
@@ -722,17 +721,18 @@ mod tests {
             labels.get("rise.dev/image").map(String::as_str),
             Some("registry.example.test/rise/myapp:20260101-120000")
         );
-        // Traefik router present for the single `/` route.
+        // The native provider publishes the deployment service through an
+        // internal catalog router; public routing comes from the HTTP provider.
         assert_eq!(
             labels.get("traefik.enable").map(String::as_str),
             Some("true")
         );
-        let base = group_service_base("myapp", "default", "app");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{base}.rule"))
+                .get(&format!("traefik.http.routers.{base}-catalog.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`)")
+            Some("PathPrefix(`/`)")
         );
         assert_eq!(
             labels
@@ -1115,21 +1115,20 @@ mod tests {
         ];
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
-        // Two routers, index suffixed. Longest prefix (/api/v1) sorts first → -0.
-        let base = group_service_base("myapp", "default", "api");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "api");
         let r0 = group_service_name(&base, 0, 2);
         let r1 = group_service_name(&base, 1, 2);
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{r0}.rule"))
+                .get(&format!("traefik.http.routers.{r0}-catalog.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`) && (Path(`/api/v1`) || PathPrefix(`/api/v1/`))")
+            Some("PathPrefix(`/`)")
         );
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{r1}.rule"))
+                .get(&format!("traefik.http.routers.{r1}-catalog.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`)")
+            Some("PathPrefix(`/`)")
         );
     }
 
@@ -1155,26 +1154,12 @@ mod tests {
         ];
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
-        let base = group_service_base("myapp", "default", "api");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "api");
         // r0 = longest prefix (/api/v1, sorts first); r1 = host-only (/).
         let r0 = group_service_name(&base, 0, 2);
         let r1 = group_service_name(&base, 1, 2);
-        let p0: usize = labels
-            .get(&format!("traefik.http.routers.{r0}.priority"))
-            .expect("longer-prefix route must carry a priority label")
-            .parse()
-            .unwrap();
-        let p1: usize = labels
-            .get(&format!("traefik.http.routers.{r1}.priority"))
-            .expect("host-only route must carry a priority label")
-            .parse()
-            .unwrap();
-        assert!(
-            p0 > p1,
-            "longer prefix /api/v1 (priority {p0}) must outrank host-only / (priority {p1})"
-        );
-        // Host-only route still has a positive, non-zero priority.
-        assert!(p1 >= 1, "host-only route priority must be positive");
+        assert!(!labels.contains_key(&format!("traefik.http.routers.{r0}.priority")));
+        assert!(!labels.contains_key(&format!("traefik.http.routers.{r1}.priority")));
     }
 
     #[test]
@@ -1184,30 +1169,24 @@ mod tests {
         // heuristic.
         let built = build_container(&single_container(), &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
-        let base = group_service_base("myapp", "default", "app");
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{base}.priority"))
-                .map(String::as_str),
-            Some("1"),
-            "host-only single route gets priority 1 (path_len 0 + 1)"
-        );
+        let base = deployment_service_base("myapp", "default", "20260101-120000", "app");
+        assert!(!labels.contains_key(&format!("traefik.http.routers.{base}.priority")));
     }
 
     #[test]
-    fn group_service_names_single_route_matches_emitted_service_label() {
+    fn deployment_service_names_single_route_matches_emitted_service_label() {
         // A single-route container's `serverStatus` lookup name must equal the
         // bare base service the labels stamp (`{project}-{group}-{container}`).
         let desired = single_container();
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.unwrap();
-        let base = group_service_base("myapp", "default", "app");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         // The label set carries exactly one loadbalancer service for the base.
         assert!(labels.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
 
-        let names = group_service_names(&desired);
+        let names = deployment_service_names(&desired);
         assert_eq!(names, vec![base.clone()]);
         // Every derived name corresponds to a service the labels actually emit.
         for name in &names {
@@ -1221,7 +1200,7 @@ mod tests {
     }
 
     #[test]
-    fn group_service_names_multi_route_matches_per_route_service_labels() {
+    fn deployment_service_names_multi_route_matches_per_route_service_labels() {
         // A multi-route container emits per-route services `{base}-{idx}`; the
         // reconciler's lookup names must match those EXACTLY (the bug behind the
         // 404 → serverStatus None fallback for multi-route containers).
@@ -1243,7 +1222,7 @@ mod tests {
         let labels = built.config.labels.unwrap();
 
         // Labels emit per-route services -0 (longest prefix /api/v1) and -1 (/).
-        let base = group_service_base("myapp", "default", "api");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "api");
         let svc0 = group_service_name(&base, 0, 2);
         let svc1 = group_service_name(&base, 1, 2);
         assert!(labels.contains_key(&format!(
@@ -1257,7 +1236,7 @@ mod tests {
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
 
-        let names = group_service_names(&desired);
+        let names = deployment_service_names(&desired);
         assert_eq!(
             names,
             vec![svc0.clone(), svc1.clone()],
@@ -1274,16 +1253,16 @@ mod tests {
     }
 
     #[test]
-    fn group_service_names_empty_for_non_routable_or_worker() {
+    fn deployment_service_names_empty_for_non_routable_or_worker() {
         // Non-routable (router-withheld) container: no Traefik service, so no lookup.
         let mut non_routable = single_container();
         non_routable.routable = false;
-        assert!(group_service_names(&non_routable).is_empty());
+        assert!(deployment_service_names(&non_routable).is_empty());
         // Worker (no port): never routed.
         let mut worker = single_container();
         worker.port = None;
         worker.routes = vec![];
-        assert!(group_service_names(&worker).is_empty());
+        assert!(deployment_service_names(&worker).is_empty());
     }
 
     #[test]
@@ -1295,19 +1274,8 @@ mod tests {
         let desired = single_container();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let base = group_service_base("myapp", "default", "app");
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{base}.tls"))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{base}.tls.certresolver"))
-                .map(String::as_str),
-            Some("le")
-        );
+        assert!(!labels.keys().any(|key| key.ends_with(".tls")));
+        assert!(!labels.keys().any(|key| key.ends_with(".tls.certresolver")));
     }
 
     /// An access-class map where `public` is `None` and `private` is `Member`.
@@ -1319,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn private_access_class_stamps_forward_auth_labels() {
+    fn private_access_class_keeps_forward_auth_out_of_native_labels() {
         let map = public_private_map();
         let cfg = BuilderConfig {
             // Config values are trimmed before constructing the middleware URL.
@@ -1331,33 +1299,11 @@ mod tests {
         desired.access_class = "private".to_string();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = group_service_base("myapp", "default", "app");
-        assert_eq!(
-            labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
-                ))
-                .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
-        );
-        assert_eq!(
-            labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.authResponseHeaders"
-                ))
-                .map(String::as_str),
-            Some("X-Auth-Request-Email,X-Auth-Request-User")
-        );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{r}.middlewares"))
-                .map(String::as_str),
-            Some(format!("{r}-auth").as_str())
-        );
+        assert!(labels.keys().all(|key| !key.contains("forwardauth")));
     }
 
     #[test]
-    fn per_route_access_overrides_forward_auth_independently() {
+    fn per_route_access_stays_out_of_native_provider_labels() {
         // A public project (access_class None) with two routes: `/` inherits
         // public, `/admin` is tightened to Member. Only the `/admin` router gets
         // forwardAuth, and its address stamps `&access=Member`.
@@ -1384,44 +1330,22 @@ mod tests {
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
 
-        // Routers are indexed longest-path-prefix first, so `/admin` (idx 0)
-        // precedes `/` (idx 1).
-        let base = group_service_base("myapp", "default", "app");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         let member_router = group_service_name(&base, 0, 2);
         let public_router = group_service_name(&base, 1, 2);
 
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{member_router}.rule"))
-                .map(String::as_str),
-            Some("Host(`myapp.rise.dev`) && (Path(`/admin`) || PathPrefix(`/admin/`))"),
-            "the gated route must not capture a neighboring path such as /administrator"
-        );
-
-        // `/` router: no forwardAuth middleware.
-        assert!(
-            labels
-                .get(&format!("traefik.http.routers.{public_router}.middlewares"))
-                .is_none(),
-            "public route must not be gated"
-        );
-        // `/admin` router: forwardAuth wired with `&access=Member`.
-        assert_eq!(
-            labels
                 .get(&format!(
-                    "traefik.http.middlewares.{member_router}-auth.forwardauth.address"
+                    "traefik.http.routers.{member_router}-catalog.rule"
                 ))
                 .map(String::as_str),
-            Some(
-                "http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1"
-            )
+            Some("PathPrefix(`/`)")
         );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{member_router}.middlewares"))
-                .map(String::as_str),
-            Some(format!("{member_router}-auth").as_str())
-        );
+        assert!(labels.contains_key(&format!(
+            "traefik.http.routers.{public_router}-catalog.rule"
+        )));
+        assert!(labels.keys().all(|key| !key.contains("forwardauth")));
     }
 
     #[test]
@@ -1620,20 +1544,12 @@ mod tests {
         member_c.access_class = "private".to_string();
         let member_built = build_container(&member_c, &set_cfg);
         let member_labels = member_built.config.labels.as_ref().unwrap();
-        let r = group_service_base("myapp", "default", "app");
         assert_eq!(
             member_labels.get("traefik.enable").map(String::as_str),
             Some("true"),
             "Member route IS routed when forwardAuth can be wired"
         );
-        assert_eq!(
-            member_labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
-                ))
-                .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
-        );
+        assert!(member_labels.keys().all(|key| !key.contains("forwardauth")));
     }
 
     #[test]
@@ -1658,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_auth_changes_route_hash() {
+    fn forward_auth_does_not_change_native_service_hash() {
         let map = public_private_map();
         let cfg = BuilderConfig {
             auth_backend_url: "http://rise:3000",
@@ -1669,10 +1585,10 @@ mod tests {
         public_c.access_class = "public".to_string();
         let mut private_c = single_container();
         private_c.access_class = "private".to_string();
-        assert_ne!(
+        assert_eq!(
             route_hash_for(&public_c, &cfg),
             route_hash_for(&private_c, &cfg),
-            "access-class change must change the route hash to trigger recreate"
+            "public auth policy belongs to the HTTP provider, not native service labels"
         );
     }
 
@@ -1687,7 +1603,7 @@ mod tests {
         desired.health_check_timeout_secs = None;
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let svc = group_service_base("myapp", "default", "app");
+        let svc = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         assert_eq!(
             labels
                 .get(&format!(

@@ -56,11 +56,9 @@ pub struct DesiredContainer {
     pub env_hash: String,
     /// Routes for this container (empty for workers / unrouted containers).
     pub routes: Vec<DesiredRoute>,
-    /// Whether this container should be routable (emit Traefik router/service
-    /// labels). `true` for every infra-bearing deployment of a group — the old
-    /// active and the new Deploying deployment both join the one group-scoped
-    /// Traefik service, and Traefik's per-server health check drains the old
-    /// servers as the new ones come up. `false` only when the router would be
+    /// Whether this container should be routable (emit its deployment-scoped
+    /// native-provider Traefik service). `true` for every infra-bearing
+    /// deployment whose route can be exposed safely. `false` when the router would be
     /// withheld (unknown access class, or auth required without an
     /// `auth_backend_url`), so the readiness path doesn't report a never-routed
     /// container as Healthy.

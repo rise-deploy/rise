@@ -15,7 +15,7 @@ use crate::naming;
 
 /// Group-scoped Traefik service name(s) a container spec's routes emit, used by
 /// the reconciler's `serverStatus` lookup so it queries the SAME service(s) the
-/// labels stamp. Mirrors [`naming::group_service_names`] but derives
+/// labels stamp. Mirrors [`naming::deployment_service_names`] but derives
 /// from the runtime [`rise_deployment_spec::request_spec::ContainerSpec`] +
 /// [`rise_deployment_spec::request_spec::RouteSpec`] set (what `reconcile_health`
 /// has on hand): a single-route container yields the bare base
@@ -35,6 +35,7 @@ use crate::naming;
 pub fn service_names_for_spec(
     project: &str,
     deployment_group: &str,
+    deployment_id: &str,
     spec: &rise_deployment_spec::request_spec::ContainerSpec,
     route_specs: &[rise_deployment_spec::request_spec::RouteSpec],
     primary_hosts: &[String],
@@ -45,7 +46,8 @@ pub fn service_names_for_spec(
     if spec.port.is_none() || primary_hosts.is_empty() {
         return Vec::new();
     }
-    let base = naming::group_service_base(project, deployment_group, &spec.name);
+    let base =
+        naming::deployment_service_base(project, deployment_group, deployment_id, &spec.name);
     // Routes for this container, sorted longest-path-prefix-first — the SAME
     // ordering `render_traefik_labels_for` uses to index per-route services.
     let mut routes: Vec<&rise_deployment_spec::request_spec::RouteSpec> = route_specs
@@ -261,13 +263,14 @@ mod tests {
             access: None,
         }];
         // A single-route container uses the bare base name — exactly what the
-        // labels stamp (`group_service_names` over the matching DesiredContainer).
-        // The base carries the injective hash suffix `group_service_base`
+        // labels stamp (`deployment_service_names` over the matching DesiredContainer).
+        // The base carries the injective deployment hash suffix
         // appends, so derive it the same way rather than hardcoding the hash.
-        let base = naming::group_service_base("myapp", "default", "app");
+        let deployment_id = "20260902-120000";
+        let base = naming::deployment_service_base("myapp", "default", deployment_id, "app");
         let hosts = ["myapp.rise.dev".to_string()];
         assert_eq!(
-            service_names_for_spec("myapp", "default", &spec, &routes, &hosts),
+            service_names_for_spec("myapp", "default", deployment_id, &spec, &routes, &hosts),
             vec![base]
         );
     }
@@ -308,10 +311,11 @@ mod tests {
         // container. The bare base is NOT queried (it 404s in the Traefik API).
         // The base carries the injective hash suffix, so derive the per-route
         // names via `group_service_name` rather than hardcoding the hash.
-        let base = naming::group_service_base("myapp", "default", "api");
+        let deployment_id = "20260902-120000";
+        let base = naming::deployment_service_base("myapp", "default", deployment_id, "api");
         let hosts = ["myapp.rise.dev".to_string()];
         assert_eq!(
-            service_names_for_spec("myapp", "default", &spec, &routes, &hosts),
+            service_names_for_spec("myapp", "default", deployment_id, &spec, &routes, &hosts),
             vec![
                 naming::group_service_name(&base, 0, 2),
                 naming::group_service_name(&base, 1, 2),
@@ -322,9 +326,9 @@ mod tests {
     #[test]
     fn service_names_for_spec_derivation_matches_container_builder() {
         // The reconciler-side derivation must agree with the builder-side
-        // `group_service_names` (the labels) for the same routes — single AND
+        // `deployment_service_names` (the labels) for the same routes — single AND
         // multi-route — so the lookup never drifts from what's stamped.
-        use crate::naming::group_service_names;
+        use crate::naming::deployment_service_names;
         use rise_deployment_spec::request_spec::{ContainerSpec, RouteSpec};
 
         let mk_desired = |container: &str, paths: &[&str]| {
@@ -366,8 +370,16 @@ mod tests {
         let hosts = ["myapp.rise.dev".to_string()];
         for paths in [&["/"][..], &["/", "/api/v1"][..], &["/", "/a", "/bb"][..]] {
             let (spec, routes) = mk_spec_routes("app", paths);
-            let from_spec = service_names_for_spec("myapp", "default", &spec, &routes, &hosts);
-            let from_labels = group_service_names(&mk_desired("app", paths));
+            let desired = mk_desired("app", paths);
+            let from_spec = service_names_for_spec(
+                "myapp",
+                "default",
+                &desired.deployment_id,
+                &spec,
+                &routes,
+                &hosts,
+            );
+            let from_labels = deployment_service_names(&desired);
             assert_eq!(
                 from_spec, from_labels,
                 "service-name derivation must match the labels for paths {paths:?}"
@@ -389,7 +401,15 @@ mod tests {
             health_check: None,
         };
         let hosts = ["myapp.rise.dev".to_string()];
-        assert!(service_names_for_spec("myapp", "default", &worker, &[], &hosts).is_empty());
+        assert!(service_names_for_spec(
+            "myapp",
+            "default",
+            "20260902-120000",
+            &worker,
+            &[],
+            &hosts
+        )
+        .is_empty());
     }
 
     #[test]
@@ -418,7 +438,8 @@ mod tests {
         // Same spec/routes that yield a service WITH a host — but with no host the
         // result is empty.
         assert!(
-            service_names_for_spec("myapp", "default", &spec, &routes, &[]).is_empty(),
+            service_names_for_spec("myapp", "default", "20260902-120000", &spec, &routes, &[])
+                .is_empty(),
             "no routable host → no service names"
         );
     }

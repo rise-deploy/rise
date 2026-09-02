@@ -102,6 +102,8 @@ locals {
       # be routed. Docker's provider has no equivalent gate, so this also keeps
       # the two Traefik-fronted backends on the same readiness semantics.
       "--providers.ecs.healthyTasksOnly=false",
+      "--providers.http.endpoint=http://${local.control_plane_discovery_name}.${local.namespace_name}:3001/internal/traefik/config",
+      "--providers.http.pollInterval=5s",
     ],
     # Confine discovery to one Rise install. Without it a cluster shared by two
     # installs gives each Traefik the other's containers -- both would answer for
@@ -114,6 +116,7 @@ locals {
     [
       "--entrypoints.web.address=:80",
       "--entrypoints.websecure.address=:443",
+      "--entrypoints.rise-catalog.address=127.0.0.1:8083",
       # A dedicated entrypoint for the load balancer's health check, so it does
       # not depend on a router existing.
       "--entrypoints.ping.address=:8082",

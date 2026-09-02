@@ -368,6 +368,7 @@ mod tests {
                 label_namespace: "rise.dev",
                 controller_class: "default",
                 traefik_entrypoint: "web",
+                catalog_entrypoint: "rise-catalog",
                 traefik_certresolver: None,
                 // ECS must never receive traefik.docker.network.
                 network: None,

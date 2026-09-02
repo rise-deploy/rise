@@ -87,14 +87,15 @@ resource "aws_security_group" "control_plane" {
   tags        = merge(local.tags, { Name = "${local.name}-control-plane" })
 }
 
-# Both the routed traffic and the forwardAuth subrequest arrive this way.
+# Public control-plane traffic and forwardAuth use 3000. Traefik pulls the
+# deployment routing snapshot from the internal listener on 3001.
 resource "aws_vpc_security_group_ingress_rule" "control_plane_from_traefik" {
   security_group_id            = aws_security_group.control_plane.id
   referenced_security_group_id = aws_security_group.traefik.id
   from_port                    = 3000
-  to_port                      = 3000
+  to_port                      = 3001
   ip_protocol                  = "tcp"
-  description                  = "Routed traffic and forwardAuth subrequests"
+  description                  = "Routed traffic, forwardAuth, and dynamic routing configuration"
 }
 
 resource "aws_vpc_security_group_egress_rule" "control_plane_all" {
