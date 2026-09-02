@@ -91,6 +91,30 @@ run "rejects_noncanonical_idp_group_sync_prefixes" {
   expect_failures = [var.idp_group_sync_prefixes]
 }
 
+run "rejects_an_additional_secret_that_overrides_a_builtin" {
+  command = plan
+
+  variables {
+    control_plane_secret_environment = {
+      DATABASE_URL = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/database-url-abc123"
+    }
+  }
+
+  expect_failures = [var.control_plane_secret_environment]
+}
+
+run "rejects_an_additional_secret_without_a_full_arn" {
+  command = plan
+
+  variables {
+    control_plane_secret_environment = {
+      SNOWFLAKE_OAUTH_PRIVATE_KEY = "rise/snowflake-oauth"
+    }
+  }
+
+  expect_failures = [var.control_plane_secret_environment]
+}
+
 # VPC endpoints reach AWS services only. Traefik's HTTP-01 challenge needs
 # Let's Encrypt, so the certificate would silently never arrive.
 run "rejects_acme_without_internet_egress" {

@@ -177,6 +177,28 @@ module "rise_ecs" {
 }
 ```
 
+Use `control_plane_secret_environment` for credentials referenced through Rise
+configuration expansion. Keys are control-plane environment-variable names;
+values are full Secrets Manager ARNs in the format ECS accepts, including the
+optional JSON-key, version-stage and version-id selectors. The five built-in
+names—those four plus `RISE_LOCAL_CONFIG_YAML`—are reserved.
+
+```hcl
+module "rise_ecs" {
+  # ...
+  control_plane_secret_environment = {
+    SNOWFLAKE_OAUTH_PRIVATE_KEY = "${aws_secretsmanager_secret.snowflake_oauth.arn}:private_key::"
+  }
+}
+```
+
+The corresponding YAML can use `${SNOWFLAKE_OAUTH_PRIVATE_KEY}`. ECS resolves
+the selected secret value before Rise starts, and Rise expands the environment
+reference while loading its configuration. `rise_task_secrets` retains the
+complete `valueFrom` reference. `secret_arns_for_execution_role` strips any ECS
+selectors to the base secret ARN and deduplicates additional references to the
+same secret for IAM.
+
 **Generated source values remain in Terraform state.** The database password,
 JWT signing key and encryption key are outputs of persistent `random` resources;
 an OIDC client secret supplied as an ordinary Terraform input can also reach the
