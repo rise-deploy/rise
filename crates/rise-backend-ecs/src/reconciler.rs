@@ -158,6 +158,15 @@ const TASK_DEFINITION_HASH_SUFFIX: &str = "task-definition-hash";
 const ECS_META_KEY: &str = "ecs";
 const TD_HASH_META_KEY: &str = "task_definition_hash";
 
+/// Project-scoped state shared by every deployment health pass in one tick.
+struct HealthReconcileInput<'a> {
+    desired: &'a [DesiredContainer],
+    services: &'a [ActualService],
+    registered: &'a HashMap<String, String>,
+    desired_td_hash: Option<&'a str>,
+    server_status_cache: &'a mut HashMap<String, Option<HashMap<String, bool>>>,
+}
+
 impl EcsReconciler {
     /// Load the previous observations, derive what changed, and store both.
     async fn record_observations(
@@ -1092,13 +1101,15 @@ impl EcsReconciler {
                 .reconcile_health(
                     project,
                     deployment,
-                    &selected,
-                    &actual,
-                    &registered,
-                    desired_hash_by_deployment
-                        .get(&deployment.deployment_id)
-                        .map(String::as_str),
-                    &mut server_status_cache,
+                    HealthReconcileInput {
+                        desired: &selected,
+                        services: &actual,
+                        registered: &registered,
+                        desired_td_hash: desired_hash_by_deployment
+                            .get(&deployment.deployment_id)
+                            .map(String::as_str),
+                        server_status_cache: &mut server_status_cache,
+                    },
                 )
                 .await
             {
@@ -2221,11 +2232,7 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
-        desired: &[DesiredContainer],
-        services: &[ActualService],
-        registered: &HashMap<String, String>,
-        desired_td_hash: Option<&str>,
-        server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
+        input: HealthReconcileInput<'_>,
     ) -> Result<()> {
         if !matches!(
             deployment.status,
@@ -2233,6 +2240,14 @@ impl EcsReconciler {
         ) {
             return Ok(());
         }
+
+        let HealthReconcileInput {
+            desired,
+            services,
+            registered,
+            desired_td_hash,
+            server_status_cache,
+        } = input;
 
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
         let by_key: HashMap<&str, &ActualService> = services
