@@ -570,7 +570,7 @@
           "type": "object"
         },
         {
-          "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host and lets Traefik's Docker\nprovider route to them via container labels Rise stamps. No Kubernetes,\nno Metacontroller — reconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
+          "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host. Traefik's Docker provider\ndiscovers deployment services from labels, while its HTTP provider reads\nthe active public routes from Rise. No Kubernetes, no Metacontroller —\nreconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
           "properties": {
             "access_classes": {
               "additionalProperties": {
@@ -592,7 +592,7 @@
                   "ingress_class": "traefik"
                 }
               },
-              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe Docker controller stamps Traefik forwardAuth middleware labels\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
+              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe HTTP-provider configuration includes a Traefik forwardAuth middleware\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
               "type": "object"
             },
             "app_backend_host_aliases": {
@@ -720,7 +720,7 @@
             },
             "traefik_api_url": {
               "default": null,
-              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so the old deployment is retired only once the new servers are\nactually in Traefik's rotation. Optional basic-auth may be embedded in\nthe URL (userinfo). **Required for projects that set a `health_check`**:\nTraefik's `serverStatus` is the authoritative readiness signal (no\nfallback), so without a reachable API a health-checked deployment never\nbecomes Healthy. May be left empty only when no project uses health\nchecks (ready-when-running gates on run-state alone).",
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so a deployment is finalized only once its native service is\nready and the HTTP-provider routers select it. Optional basic-auth may be embedded in\nthe URL (userinfo). **Required for projects that set a `health_check`**:\nTraefik's `serverStatus` is the authoritative readiness signal (no\nfallback), so without a reachable API a health-checked deployment never\nbecomes Healthy. May be left empty only when no project uses health\nchecks (ready-when-running gates on run-state alone).",
               "type": [
                 "string",
                 "null"
@@ -756,7 +756,7 @@
           "type": "object"
         },
         {
-          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service and lets Traefik's ECS\nprovider route to the tasks via labels Rise stamps on the container\ndefinition. No Kubernetes, no Metacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0005 for the design and its deliberate v1 limitations.",
+          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service. Traefik's ECS provider\ndiscovers deployment services from container-definition labels, while its\nHTTP provider reads active public routes from Rise. No Kubernetes, no\nMetacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0005 for the design and its deliberate v1 limitations.",
           "properties": {
             "access_classes": {
               "additionalProperties": {
@@ -778,7 +778,7 @@
                   "ingress_class": "traefik"
                 }
               },
-              "description": "Access classes defining ingress authentication levels. For classes\nwhose `access_requirement` is `Authenticated`/`Member` the controller\nstamps Traefik forwardAuth labels, which requires `auth_backend_url`;\nthe backend refuses to start otherwise rather than serve those\nprojects publicly with no auth enforced.",
+              "description": "Access classes defining ingress authentication levels. For classes\nwhose `access_requirement` is `Authenticated`/`Member` the HTTP-provider\nconfiguration includes Traefik forwardAuth, which requires `auth_backend_url`;\nthe backend refuses to start otherwise rather than serve those\nprojects publicly with no auth enforced.",
               "type": "object"
             },
             "access_key_id": {
