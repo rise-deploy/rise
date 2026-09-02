@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,34 @@ struct SetEnvVarRequest {
     is_secret: bool,
     #[serde(default)]
     is_protected: bool,
+}
+
+/// Return a supplied value or prompt for one when it is omitted.
+pub fn resolve_env_value(value: Option<&str>, is_secret: bool) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value.to_string());
+    }
+
+    if is_secret {
+        return rpassword::prompt_password("Value: ")
+            .context("Failed to read environment variable value");
+    }
+
+    read_plain_env_value(&mut std::io::stdin().lock(), &mut std::io::stderr())
+}
+
+fn read_plain_env_value(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<String> {
+    write!(writer, "Value: ").context("Failed to write environment variable prompt")?;
+    writer
+        .flush()
+        .context("Failed to write environment variable prompt")?;
+
+    let mut value = String::new();
+    reader
+        .read_line(&mut value)
+        .context("Failed to read environment variable value")?;
+    value.truncate(value.trim_end_matches(['\r', '\n']).len());
+    Ok(value)
 }
 
 /// Build a URL with an optional `?environment=` query parameter
@@ -687,7 +716,30 @@ pub async fn export_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_shell_identifier, parse_env_file, parse_env_string, shell_quote};
+    use super::{
+        is_shell_identifier, parse_env_file, parse_env_string, read_plain_env_value,
+        resolve_env_value, shell_quote,
+    };
+
+    #[test]
+    fn supplied_env_value_does_not_prompt() {
+        assert_eq!(
+            resolve_env_value(Some("  value  "), false).unwrap(),
+            "  value  "
+        );
+    }
+
+    #[test]
+    fn plain_env_prompt_removes_only_the_line_ending() {
+        let mut input = &b"  value  \r\n"[..];
+        let mut output = Vec::new();
+
+        assert_eq!(
+            read_plain_env_value(&mut input, &mut output).unwrap(),
+            "  value  "
+        );
+        assert_eq!(output, b"Value: ");
+    }
 
     #[test]
     fn shell_quote_preserves_shell_significant_values() {

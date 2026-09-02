@@ -1,5 +1,6 @@
 //! `rise profile` — inspect and manage the login profiles selected via the
-//! global `--profile` flag / `RISE_PROFILE` environment variable.
+//! global `--profile` flag, `RISE_PROFILE` environment variable, or persisted
+//! default selection.
 //!
 //! A profile is "registered" simply by having a saved config file: `rise
 //! login --profile <name>` creates one on first use, so there is nothing to
@@ -51,11 +52,15 @@ pub fn list_profiles() -> Result<()> {
     }
 
     println!("{}", table);
-    println!(
-        "\nActive profile: {} (RISE_PROFILE env var / --profile flag; \"default\" if unset)",
-        active
-    );
+    println!("\nActive profile: {}", active);
 
+    Ok(())
+}
+
+/// Select the profile used when no per-command or environment override exists.
+pub fn use_profile(name: &str) -> Result<()> {
+    Config::set_default_profile(name)?;
+    println!("✓ Default profile set to '{}'", name);
     Ok(())
 }
 

@@ -83,8 +83,8 @@ fn resolve_project_name_with_config(
 pub struct Cli {
     /// Login profile to use, letting you manage multiple Rise accounts or
     /// backends side by side. Falls back to the RISE_PROFILE environment
-    /// variable, then the default profile. `rise login --profile <name>`
-    /// registers a new profile if it doesn't already exist.
+    /// variable, then the profile selected by `rise profile use`.
+    /// `rise login --profile <name>` registers a new profile if needed.
     #[arg(long, global = true)]
     profile: Option<String>,
     #[command(subcommand)]
@@ -440,6 +440,11 @@ enum ProfileCommands {
     /// List registered login profiles
     #[command(visible_alias = "ls")]
     List,
+    /// Select the profile used when --profile and RISE_PROFILE are unset
+    Use {
+        /// Registered profile name (or "default")
+        name: String,
+    },
     /// Remove a profile's saved login/config
     #[command(visible_alias = "rm")]
     Remove {
@@ -778,6 +783,12 @@ enum ServiceAccountCommands {
 enum EnvCommands {
     /// Set an environment variable for a project
     #[command(visible_alias = "s")]
+    #[command(group(
+        clap::ArgGroup::new("env_type")
+            .required(true)
+            .multiple(false)
+            .args(["plain", "secret"])
+    ))]
     Set {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
@@ -787,13 +798,16 @@ enum EnvCommands {
         path: String,
         /// Variable name (e.g., DATABASE_URL)
         key: String,
-        /// Variable value
-        value: String,
-        /// Mark as secret (encrypted at rest)
+        /// Variable value (prompted for when omitted)
+        value: Option<String>,
+        /// Store the value as plain text
+        #[arg(long)]
+        plain: bool,
+        /// Store the value as an encrypted, protected secret
         #[arg(long)]
         secret: bool,
-        /// Mark secret as protected (cannot be decrypted via API). Only applies to secrets. Defaults to true for secrets, must be false for non-secrets.
-        #[arg(long)]
+        /// Whether the secret is protected from API retrieval (defaults to true)
+        #[arg(long, requires = "secret", conflicts_with = "plain")]
         protected: Option<bool>,
         /// Scope variable to a specific environment (e.g., 'staging'). Without this, the variable is global.
         #[arg(long, short = 'E')]
@@ -1192,11 +1206,20 @@ async fn main() -> Result<()> {
         other => other,
     };
 
-    // Backend commands don't need CLI config (they use Settings from TOML/env vars)
-    // Only client commands (login, project, team, deployment, service-account) need it
+    // Backend commands use Settings from TOML/environment variables.
     #[cfg(feature = "backend")]
     if let Commands::Backend(backend_cmd) = &cli_command {
         return backend::handle_backend_command(backend_cmd.clone()).await;
+    }
+
+    // Profile management only reads and writes local profile files.
+    if let Commands::Profile(profile_cmd) = &cli_command {
+        match profile_cmd {
+            ProfileCommands::List => profile::list_profiles()?,
+            ProfileCommands::Use { name } => profile::use_profile(name)?,
+            ProfileCommands::Remove { name } => profile::remove_profile(name)?,
+        }
+        return Ok(());
     }
 
     // Load CLI config for client commands
@@ -1204,8 +1227,7 @@ async fn main() -> Result<()> {
     let mut config = config::Config::load()?;
     let backend_url = config.get_backend_url();
 
-    // Check version compatibility for all commands except Login
-    // (Backend commands are handled above and don't use the HTTP API; Login might use a custom URL)
+    // Commands that call the backend warn when the CLI and server versions differ.
     if !matches!(&cli_command, Commands::Login { .. }) {
         // Non-fatal version check - just warns user
         let _ = version::check_version_compatibility(&http_client, &backend_url).await;
@@ -1246,10 +1268,7 @@ async fn main() -> Result<()> {
         Commands::Encrypt { plaintext } => {
             cli::encrypt::encrypt_command(&config, plaintext.clone()).await?;
         }
-        Commands::Profile(profile_cmd) => match profile_cmd {
-            ProfileCommands::List => profile::list_profiles()?,
-            ProfileCommands::Remove { name } => profile::remove_profile(name)?,
-        },
+        Commands::Profile(_) => unreachable!("Profile commands are handled before config loading"),
         Commands::Project(project_cmd) => match project_cmd {
             ProjectCommands::Create {
                 name,
@@ -1869,11 +1888,16 @@ async fn main() -> Result<()> {
                 | EnvCommands::ShowDeployment { project, path, .. } => (project, path),
             };
             let project_name = resolve_project_name(project.clone(), path)?;
+            let prompted_value = match env_cmd {
+                EnvCommands::Set { value, secret, .. } => {
+                    Some(env::resolve_env_value(value.as_deref(), *secret)?)
+                }
+                _ => None,
+            };
             let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match env_cmd {
                 EnvCommands::Set {
                     key,
-                    value,
                     secret,
                     protected,
                     environment,
@@ -1888,7 +1912,9 @@ async fn main() -> Result<()> {
                         &token,
                         &project_name,
                         key,
-                        value,
+                        prompted_value
+                            .as_deref()
+                            .expect("set commands resolve an environment variable value"),
                         *secret,
                         is_protected,
                         environment.as_deref(),
@@ -2285,7 +2311,7 @@ mod log_color_tests {
 
 #[cfg(all(test, feature = "cli"))]
 mod deployment_output_cli_tests {
-    use super::{Cli, Commands, DeploymentCommands};
+    use super::{Cli, Commands, DeploymentCommands, EnvCommands, ProfileCommands};
     use clap::Parser;
 
     #[test]
@@ -2328,6 +2354,104 @@ mod deployment_output_cli_tests {
                 assert_eq!(status_file.as_deref(), Some("deployments.json"));
             }
             _ => panic!("expected deployment list command"),
+        }
+    }
+
+    #[test]
+    fn env_set_requires_an_explicit_type() {
+        let error = Cli::try_parse_from(["rise", "env", "set", "KEY", "value"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("--plain"));
+        assert!(message.contains("--secret"));
+    }
+
+    #[test]
+    fn env_set_accepts_an_omitted_plain_value() {
+        let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--plain"]).unwrap();
+
+        match cli.command {
+            Commands::Env(EnvCommands::Set {
+                key,
+                value,
+                plain,
+                secret,
+                ..
+            }) => {
+                assert_eq!(key, "KEY");
+                assert_eq!(value, None);
+                assert!(plain);
+                assert!(!secret);
+            }
+            _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn env_set_rejects_plain_and_secret_together() {
+        assert!(
+            Cli::try_parse_from(["rise", "env", "set", "KEY", "value", "--plain", "--secret"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn env_set_accepts_an_omitted_secret_value() {
+        let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--secret"]).unwrap();
+
+        match cli.command {
+            Commands::Env(EnvCommands::Set {
+                value,
+                secret,
+                protected,
+                ..
+            }) => {
+                assert_eq!(value, None);
+                assert!(secret);
+                assert_eq!(protected, None);
+            }
+            _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn env_set_requires_secret_when_setting_protection() {
+        assert!(Cli::try_parse_from([
+            "rise",
+            "env",
+            "set",
+            "KEY",
+            "value",
+            "--plain",
+            "--protected=false"
+        ])
+        .is_err());
+
+        let cli = Cli::try_parse_from([
+            "rise",
+            "env",
+            "set",
+            "KEY",
+            "value",
+            "--secret",
+            "--protected=false",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Env(EnvCommands::Set { protected, .. }) => {
+                assert_eq!(protected, Some(false));
+            }
+            _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn profile_use_accepts_a_profile_name() {
+        let cli = Cli::try_parse_from(["rise", "profile", "use", "work"]).unwrap();
+
+        match cli.command {
+            Commands::Profile(ProfileCommands::Use { name }) => assert_eq!(name, "work"),
+            _ => panic!("expected profile use command"),
         }
     }
 }

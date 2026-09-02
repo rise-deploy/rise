@@ -110,7 +110,7 @@ See [Deployments](../deployments) for the full lifecycle and [Environments](../e
 Set runtime environment variables for your project:
 
 ```bash
-rise env set -p my-app DATABASE_URL postgres://db.example.com/mydb
+rise env set -p my-app DATABASE_URL postgres://db.example.com/mydb --plain
 rise env set -p my-app API_KEY s3cret --secret
 ```
 
