@@ -15,7 +15,7 @@ helm = "latest"
 # Pinned, not "latest": the modules' `terraform test` files use override_data and
 # check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
 # `mise run terraform:check` in the same change.
-terraform = "1.16.0"
+terraform = "1.16.1"
 rust = { version = "1.95.0", profile = "default" }
 kubectl = "latest"
 k9s = "latest"
