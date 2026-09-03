@@ -429,21 +429,7 @@ impl Backend for DockerBackend {
     }
 
     fn assert_ingress_auth_configured(&self, project: &str) -> Result<()> {
-        // Traefik forwardAuth: the controller stamps forwardauth + router-middleware
-        // labels on the app container (it can lag the Healthy mark, so poll).
-        let mut labels = String::new();
-        http::poll(
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-            &format!("forwardAuth labels on {project}"),
-            || {
-                labels = self.app_container_labels(project)?;
-                Ok(labels.contains("forwardauth.address")
-                    && labels.contains(".routers.")
-                    && labels.contains(".middlewares"))
-            },
-        )
-        .with_context(|| format!("private app container missing forwardAuth labels:\n{labels}"))
+        super::assert_traefik_ingress_auth_configured(self, project)
     }
 
     fn app_container_envs(&self, project: &str) -> Result<Vec<String>> {

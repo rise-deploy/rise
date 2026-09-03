@@ -33,9 +33,9 @@ pub struct DynamicConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DynamicHttp {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routers: BTreeMap<String, DynamicRouter>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub middlewares: BTreeMap<String, DynamicMiddleware>,
 }
 
@@ -239,6 +239,9 @@ mod tests {
             first_config.http.routers.values().next().unwrap().service,
             second_config.http.routers.values().next().unwrap().service
         );
+        assert!(serde_json::to_value(first_config).unwrap()["http"]
+            .get("middlewares")
+            .is_none());
     }
 
     #[test]

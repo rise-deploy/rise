@@ -769,10 +769,9 @@ impl Scenario for PrivateIngressAuth {
 
     fn applies_to(&self, _b: &dyn Backend) -> Applicability {
         // The ingress-auth contract — block unauthenticated, allow authenticated —
-        // holds on every backend; only the wiring + reach differ, behind the trait
-        // (Traefik forwardAuth labels on docker and ECS; nginx auth annotations on
-        // K8s). Runs on ECS because the e2e stack puts the Rise control plane in
-        // the cluster, so Traefik can actually reach it for the subrequest.
+        // holds on every backend; only the wiring + reach differ behind the trait.
+        // The ECS e2e stack puts the Rise control plane in the cluster, so Traefik
+        // can reach it for the forwardAuth subrequest.
         Applicability::Run
     }
 
@@ -796,7 +795,7 @@ impl Scenario for PrivateIngressAuth {
         deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
 
-        // Per-backend wiring check (Traefik forwardAuth labels / nginx annotations).
+        // Per-backend wiring check (Traefik HTTP-provider router / nginx annotations).
         b.assert_ingress_auth_configured(&project)?;
 
         // Unauthenticated → 302 to the project's signin page. Poll the ingress until
@@ -1055,17 +1054,23 @@ impl Scenario for HealthRollingCutover {
             })
             .context("no traefik service label on the app container")?
             .to_string();
-        // Drift guard: readable base + an injective 16-hex suffix.
+        // Drift guard: a readable base, an injective group hash, and a
+        // deployment hash that keeps the incoming and outgoing pools distinct.
         let base = sanitize_router_name(&format!("{project}-default-app"));
         let suffix = svc
             .strip_prefix(&format!("{base}-"))
             .with_context(|| format!("service '{svc}' does not start with '{base}-'"))?;
+        let (group_hash, deployment_hash) = suffix
+            .split_once('-')
+            .with_context(|| format!("service '{svc}' has no deployment hash"))?;
         anyhow::ensure!(
-            suffix.len() == 16
-                && suffix
+            group_hash.len() == 16
+                && deployment_hash.len() == 12
+                && group_hash
                     .chars()
+                    .chain(deployment_hash.chars())
                     .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-            "service '{svc}' suffix is not 16 lowercase hex chars"
+            "service '{svc}' does not have 16-hex group and 12-hex deployment hashes"
         );
 
         // The serverStatus gate signal must exist and be correctly shaped (Traefik

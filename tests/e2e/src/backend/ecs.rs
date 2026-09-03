@@ -1706,56 +1706,8 @@ impl Backend for EcsBackend {
         Ok(false)
     }
 
-    /// Assert the ECS task definition carries the Traefik forwardAuth labels.
-    ///
-    /// The ECS analogue of inspecting container labels on Docker: the provider
-    /// reads routing configuration from `dockerLabels` on the container
-    /// definition, so that is where the evidence lives.
     fn assert_ingress_auth_configured(&self, project: &str) -> Result<()> {
-        let mut last = String::new();
-        for _ in 0..30 {
-            if let Ok(services) = self.project_services(project) {
-                for svc in &services {
-                    let raw = self.aws(&[
-                        "ecs",
-                        "describe-services",
-                        "--cluster",
-                        &self.env().cluster_name,
-                        "--services",
-                        svc,
-                        "--query",
-                        "services[0].taskDefinition",
-                        "--output",
-                        "text",
-                    ])?;
-                    let td = raw.trim();
-                    if td.is_empty() {
-                        continue;
-                    }
-                    let labels = self.aws(&[
-                        "ecs",
-                        "describe-task-definition",
-                        "--task-definition",
-                        td,
-                        "--query",
-                        "taskDefinition.containerDefinitions[0].dockerLabels",
-                        "--output",
-                        "json",
-                    ])?;
-                    last = labels.clone();
-                    if labels.contains("forwardauth.address")
-                        && labels.contains(".routers.")
-                        && labels.contains(".middlewares")
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_secs(3));
-        }
-        anyhow::bail!(
-            "no forwardAuth middleware labels found on {project}'s task definition; last saw: {last}"
-        )
+        super::assert_traefik_ingress_auth_configured(self, project)
     }
 
     fn wait_workload_removed(&self, project: &str) -> Result<()> {

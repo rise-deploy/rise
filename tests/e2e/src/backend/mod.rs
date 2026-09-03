@@ -3,7 +3,7 @@
 //! invocation, app reach, teardown). Shared behaviour (e.g. wait-for-healthy)
 //! lives as default methods.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::cli::CliOutput;
@@ -185,8 +185,7 @@ pub trait Backend {
         cookie: Option<&str>,
     ) -> Result<crate::http::Resp>;
 
-    /// Assert the backend wired ingress-level auth for a private (Member) project:
-    /// Traefik forwardAuth labels on docker, nginx auth annotations on minikube.
+    /// Assert the backend wired ingress-level auth for a private (Member) project.
     fn assert_ingress_auth_configured(&self, project: &str) -> Result<()>;
 
     /// Each running app container's `Config.Env` as a JSON-array string — to
@@ -252,6 +251,57 @@ pub trait Backend {
     /// (the failing command's own output rarely explains, e.g., why a pod won't
     /// start). Best-effort and silent on success; no-op by default.
     fn dump_diagnostics(&self) {}
+}
+
+/// Assert that Traefik's active HTTP-provider router applies forwardAuth and
+/// selects a service owned by the backend's native discovery provider.
+fn assert_traefik_ingress_auth_configured(
+    backend: &dyn Backend,
+    project: &str,
+) -> Result<()> {
+    let mut last = String::new();
+    let expected_service_suffix = format!("@{}", backend.traefik_provider());
+    let expected_host = backend.app_host(project);
+    crate::http::poll(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        &format!("Traefik HTTP-provider forwardAuth router on {project}"),
+        || {
+            let response = backend.traefik_api("/api/http/routers")?;
+            last = response.body.clone();
+            if response.status != 200 {
+                return Ok(false);
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(&response.body).unwrap_or(serde_json::Value::Null);
+            Ok(value.as_array().is_some_and(|routers| {
+                routers.iter().any(|router| {
+                    router["provider"].as_str() == Some("http")
+                        && router["name"].as_str().is_some_and(|name| {
+                            name.starts_with(&format!("{project}-")) && name.ends_with("@http")
+                        })
+                        && router["rule"]
+                            .as_str()
+                            .is_some_and(|rule| rule.contains(&expected_host))
+                        && router["service"]
+                            .as_str()
+                            .is_some_and(|service| service.ends_with(&expected_service_suffix))
+                        && router["middlewares"].as_array().is_some_and(|middlewares| {
+                            middlewares.iter().any(|middleware| {
+                                middleware
+                                    .as_str()
+                                    .is_some_and(|name| name.ends_with("-auth@http"))
+                            })
+                        })
+                })
+            }))
+        },
+    )
+    .with_context(|| {
+        format!(
+            "Traefik has no active HTTP-provider forwardAuth router for {project}; last saw:\n{last}"
+        )
+    })
 }
 
 /// The latest deployment's `status` string for a project, via the deployments API.
