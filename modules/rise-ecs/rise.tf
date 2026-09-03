@@ -25,7 +25,10 @@ resource "aws_ecs_task_definition" "rise" {
       essential = true
       command   = ["backend", "server"]
 
-      portMappings = [{ containerPort = 3000 }]
+      portMappings = [
+        { containerPort = 3000 },
+        { containerPort = 3001 },
+      ]
 
       environment = [
         for k, v in local.rise_environment : { name = k, value = tostring(v) }

@@ -159,8 +159,8 @@ pub struct ReconcilerConfig {
     /// with embedded basic-auth userinfo. The reconciler reads the top-level
     /// `serverStatus` map from Traefik (falling back to a
     /// `loadBalancer.serverStatus` nesting for version tolerance) to learn
-    /// whether a container's server is actually in Traefik's rotation (UP) before
-    /// retiring the prior active deployment. Required for health-checked
+    /// whether a container's server is actually in Traefik's rotation (UP), and
+    /// whether HTTP-provider routers select the deployment service. Required for routed
     /// containers — `serverStatus` is the authoritative readiness signal with no
     /// fallback, so when this is `None` (unset) a health-checked deployment never
     /// becomes Healthy. See the `Docker` settings variant's `traefik_api_url`.
@@ -638,9 +638,8 @@ impl DockerReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         // Memoize Traefik `serverStatus` per service for THIS reconcile pass:
-        // during a rollout a group has 2+ non-terminal deployments sharing one
-        // group-scoped service, so without this each `reconcile_health` would
-        // re-fetch the SAME serverStatus (up to 3s each). Populated once per
+        // Replicas and repeated checks can query the same deployment-scoped
+        // service, so cache each serverStatus response for this pass. Populated once per
         // service and reused across the group's deployments this tick.
         let mut server_status_cache: HashMap<String, Option<HashMap<String, bool>>> =
             HashMap::new();
@@ -649,7 +648,7 @@ impl DockerReconciler {
                 continue;
             }
             if let Err(e) = self
-                .reconcile_health(project, deployment, &mut server_status_cache)
+                .reconcile_health(project, deployment, &desired, &mut server_status_cache)
                 .await
             {
                 warn!(
@@ -858,7 +857,7 @@ impl DockerReconciler {
                     access: r.access.clone(),
                 })
                 .collect();
-            // Every infra-bearing deployment normally joins the group-scoped
+            // Every infra-bearing deployment normally publishes its native-provider
             // Traefik service immediately. The exception is a container with an
             // unknown access class, or an auth-required effective route without
             // a forwardAuth backend: its routers fail closed, so desired
@@ -876,7 +875,7 @@ impl DockerReconciler {
 
             // Base container (replica 0). All replicas are clones of this with
             // only their `replica` index differing — same image/env/routes, so
-            // they share one Traefik service and one DNS alias, and the route-hash
+            // they share one deployment service and one DNS alias, and the route-hash
             // (which never depends on the replica) is computed once below.
             let mut base = DesiredContainer {
                 project: project.name.clone(),
@@ -1163,6 +1162,11 @@ impl DockerReconciler {
                                         .update_project_calculated_status(project.id)
                                         .await
                                         .context("Failed to update project status after container creation failure")?;
+                                    rise_backend_core::lifecycle::restore_traefik_predecessor_if_interrupted(
+                                        self.store.as_ref(),
+                                        deployment_uuid,
+                                    )
+                                    .await?;
                                     failed_deployment_uuids.insert(d.deployment_uuid.clone());
                                 }
                             } else {
@@ -1828,6 +1832,7 @@ impl DockerReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
+        desired: &[DesiredContainer],
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
     ) -> Result<()> {
         // Only probe states where health is meaningful.
@@ -1900,6 +1905,7 @@ impl DockerReconciler {
             let service_names = service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
+                &deployment.deployment_id,
                 spec,
                 &route_specs,
                 &primary_hosts,
@@ -2085,10 +2091,45 @@ impl DockerReconciler {
 
         match deployment.status {
             DeploymentStatus::Deploying if is_ready => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment is ready, marking as Healthy"
+                if !rise_backend_core::lifecycle::prepare_traefik_cutover(
+                    self.store.as_ref(),
+                    project,
+                    deployment,
+                )
+                .await?
+                {
+                    info!(deployment_id = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
+                    return Ok(());
+                }
+                let selected: Vec<DesiredContainer> = desired
+                    .iter()
+                    .filter(|container| container.deployment_uuid == deployment.id.to_string())
+                    .cloned()
+                    .collect();
+                let expected = rise_backend_traefik::dynamic::render_dynamic_config(
+                    &selected,
+                    &rise_backend_traefik::TraefikRenderConfig {
+                        label_namespace: &self.config.label_namespace,
+                        controller_class: &self.config.controller_class,
+                        traefik_entrypoint: &self.config.traefik_entrypoint,
+                        catalog_entrypoint: "rise-catalog",
+                        traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+                        network: Some(&self.config.traefik_network),
+                        auth_backend_url: &self.config.auth_backend_url,
+                        access_classes: &self.config.access_classes,
+                    },
+                    "docker",
                 );
+                if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
+                    warn!(deployment_id = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
+                    return Ok(());
+                }
+                if let Some(api) = self.traefik_api.as_ref() {
+                    if !api.dynamic_config_applied(&expected).await {
+                        debug!(deployment_id = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
+                        return Ok(());
+                    }
+                }
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
                     self.store.as_ref(),
                     None,

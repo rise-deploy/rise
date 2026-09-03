@@ -190,15 +190,18 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
+      - "--providers.http.endpoint=http://rise:3001/internal/traefik/config"
+      - "--providers.http.pollInterval=5s"
       # Enable Traefik's API/dashboard on :8080 for INTERNAL use only: the Rise
-      # backend reads per-server health (loadBalancer.serverStatus) here to gate
-      # the rolling cutover (traefik_api_url=http://rise-traefik:8080 in
+      # backend reads per-server health and HTTP-router targets here to gate
+      # deployment cutover (traefik_api_url=http://rise-traefik:8080 in
       # config/docker.yaml). The :8080 port is deliberately NOT published below,
       # so the API is reachable only over the rise_default network (no credential,
       # never publicly exposed).
       - "--api.insecure=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.rise-catalog.address=127.0.0.1:8083"
       # Global HTTP -> HTTPS redirect.
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"

@@ -42,6 +42,17 @@ pub struct ControllerState {
     pub deployment_retention: crate::server::settings::DeploymentRetentionSettings,
 }
 
+#[cfg(feature = "backend")]
+#[derive(Clone)]
+pub struct TraefikHttpProviderConfig {
+    pub native_provider: &'static str,
+    pub label_namespace: String,
+    pub controller_class: String,
+    pub entrypoint: String,
+    pub certresolver: Option<String>,
+    pub auth_backend_url: String,
+}
+
 /// Full state for HTTP server
 #[derive(Clone)]
 pub struct AppState {
@@ -94,6 +105,11 @@ pub struct AppState {
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
+    /// Dynamic public-routing configuration for Traefik-fronted runtimes.
+    /// The HTTP endpoint combines this static runtime configuration with the
+    /// active deployment and current project/domain rows on every request.
+    #[cfg(feature = "backend")]
+    pub traefik_http_provider: Option<TraefikHttpProviderConfig>,
     /// Short-TTL cache of the per-Org fields the webhook reads on every
     /// sync (`spec.deploymentControllerClass`, resolved namespace prefix).
     /// 30s TTL means a change to either propagates within roughly one
@@ -1413,6 +1429,45 @@ impl AppState {
             }
         };
 
+        #[cfg(feature = "backend")]
+        let traefik_http_provider = match &settings.deployment_controller {
+            Some(crate::server::settings::DeploymentControllerSettings::Docker {
+                label_namespace,
+                controller_class_name,
+                traefik_entrypoint,
+                traefik_certresolver,
+                auth_backend_url,
+                ..
+            }) => Some(TraefikHttpProviderConfig {
+                native_provider: "docker",
+                label_namespace: label_namespace.clone(),
+                controller_class: controller_class_name.clone(),
+                entrypoint: traefik_entrypoint.clone(),
+                certresolver: rise_backend_traefik::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+                auth_backend_url: auth_backend_url.clone(),
+            }),
+            Some(crate::server::settings::DeploymentControllerSettings::Ecs {
+                label_namespace,
+                controller_class_name,
+                traefik_entrypoint,
+                traefik_certresolver,
+                auth_backend_url,
+                ..
+            }) => Some(TraefikHttpProviderConfig {
+                native_provider: "ecs",
+                label_namespace: label_namespace.clone(),
+                controller_class: controller_class_name.clone(),
+                entrypoint: traefik_entrypoint.clone(),
+                certresolver: rise_backend_traefik::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+                auth_backend_url: auth_backend_url.clone(),
+            }),
+            _ => None,
+        };
+
         // Cooperative shutdown signal shared by extension reconciliation loops
         // and the background controllers (see `run_server`). Cancelling it stops
         // every leader-elected loop and releases its lease. Created here (before
@@ -1984,6 +2039,8 @@ impl AppState {
             default_organization_uid,
             #[cfg(feature = "backend")]
             deployment_controller_class_name,
+            #[cfg(feature = "backend")]
+            traefik_http_provider,
             #[cfg(feature = "backend")]
             org_view_cache,
             auth_settings,

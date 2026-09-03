@@ -1660,14 +1660,25 @@ pub async fn mark_as_active(
     .await?;
 
     // Then mark the target deployment as active
-    sqlx::query!(
+    let updated = sqlx::query!(
         "UPDATE deployments
          SET is_active = TRUE, updated_at = NOW()
-         WHERE id = $1",
-        deployment_id
+         WHERE id = $1
+           AND project_id = $2
+           AND deployment_group = $3
+           AND NOT is_terminal(status)",
+        deployment_id,
+        project_id,
+        deployment_group,
     )
     .execute(&mut *tx)
     .await?;
+
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "deployment {deployment_id} is not a non-terminal member of project {project_id} group '{deployment_group}'"
+        );
+    }
 
     tx.commit().await?;
 

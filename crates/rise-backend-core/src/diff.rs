@@ -48,8 +48,8 @@ pub struct ActualContainer {
     /// The `route-hash` recreate-signature label stamped on the live container
     /// (sha256 of its rendered Traefik label set plus its published-port intent).
     /// `None` for legacy containers created before this label existed. Compared
-    /// against the desired container's `route_hash` so a routing transition (a
-    /// deployment becoming or ceasing to be active) OR a published-port change
+    /// against the desired container's `route_hash` so a native routing-label
+    /// change or a published-port change
     /// forces a recreate — Docker can't mutate a running container's labels or
     /// port bindings in place.
     pub route_hash_label: Option<String>,
@@ -597,15 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn diff_recreates_on_route_hash_drift_active_gains_labels() {
-        // A deployment that just became active: desired now carries the active
-        // route-hash, but the live container was created while non-routable and
-        // still bears the empty/non-routable hash. Image + env match, but the
-        // routing changed — Docker can't edit labels in place, so the container
-        // must be recreated WITH the Traefik labels.
+    fn diff_recreates_when_native_routing_labels_are_added() {
+        // Desired routing labels differ from the live container's empty route
+        // hash. Docker cannot edit labels in place, so it recreates the container.
         let d = desired("app", "img:1", "h1"); // route_hash = "rh-active"
         let actual = vec![ActualContainer {
-            // Was created non-routable (empty route-hash).
             route_hash_label: Some(String::new()),
             ..actual_for(&d, "img:1", "h1")
         }];
@@ -623,11 +619,9 @@ mod tests {
     }
 
     #[test]
-    fn diff_recreates_on_route_hash_drift_deactivated_loses_labels() {
-        // A deployment that stopped being active: desired is now non-routable
-        // (empty route-hash) while the live container still carries the active
-        // routing hash. Image + env match, but its Traefik labels must be
-        // removed — force a recreate.
+    fn diff_recreates_when_native_routing_labels_are_removed() {
+        // A non-routable desired container has an empty hash while the live
+        // container carries routing labels. Recreate removes those labels.
         let mut d = desired("app", "img:1", "h1");
         d.routable = false;
         d.route_hash = String::new();

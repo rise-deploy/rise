@@ -158,6 +158,15 @@ const TASK_DEFINITION_HASH_SUFFIX: &str = "task-definition-hash";
 const ECS_META_KEY: &str = "ecs";
 const TD_HASH_META_KEY: &str = "task_definition_hash";
 
+/// Project-scoped state shared by every deployment health pass in one tick.
+struct HealthReconcileInput<'a> {
+    desired: &'a [DesiredContainer],
+    services: &'a [ActualService],
+    registered: &'a HashMap<String, String>,
+    desired_td_hash: Option<&'a str>,
+    server_status_cache: &'a mut HashMap<String, Option<HashMap<String, bool>>>,
+}
+
 impl EcsReconciler {
     /// Load the previous observations, derive what changed, and store both.
     async fn record_observations(
@@ -976,6 +985,11 @@ impl EcsReconciler {
                             self.store
                                 .update_project_calculated_status(project.id)
                                 .await?;
+                            rise_backend_core::lifecycle::restore_traefik_predecessor_if_interrupted(
+                                self.store.as_ref(),
+                                deployment.id,
+                            )
+                            .await?;
                         }
                     } else {
                         // Already serving, or on its way down. See
@@ -1078,16 +1092,24 @@ impl EcsReconciler {
             if !should_have_infrastructure(deployment) {
                 continue;
             }
+            let selected: Vec<DesiredContainer> = desired
+                .iter()
+                .filter(|(_, _, container)| container.deployment_uuid == deployment.id.to_string())
+                .map(|(_, _, container)| container.clone())
+                .collect();
             if let Err(e) = self
                 .reconcile_health(
                     project,
                     deployment,
-                    &actual,
-                    &registered,
-                    desired_hash_by_deployment
-                        .get(&deployment.deployment_id)
-                        .map(String::as_str),
-                    &mut server_status_cache,
+                    HealthReconcileInput {
+                        desired: &selected,
+                        services: &actual,
+                        registered: &registered,
+                        desired_td_hash: desired_hash_by_deployment
+                            .get(&deployment.deployment_id)
+                            .map(String::as_str),
+                        server_status_cache: &mut server_status_cache,
+                    },
                 )
                 .await
             {
@@ -2210,10 +2232,7 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
-        services: &[ActualService],
-        registered: &HashMap<String, String>,
-        desired_td_hash: Option<&str>,
-        server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
+        input: HealthReconcileInput<'_>,
     ) -> Result<()> {
         if !matches!(
             deployment.status,
@@ -2221,6 +2240,14 @@ impl EcsReconciler {
         ) {
             return Ok(());
         }
+
+        let HealthReconcileInput {
+            desired,
+            services,
+            registered,
+            desired_td_hash,
+            server_status_cache,
+        } = input;
 
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
         let by_key: HashMap<&str, &ActualService> = services
@@ -2296,6 +2323,7 @@ impl EcsReconciler {
             let service_names = rise_backend_traefik::service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
+                &deployment.deployment_id,
                 spec,
                 &route_specs,
                 &primary_hosts,
@@ -2506,10 +2534,12 @@ impl EcsReconciler {
             }
         }
 
-        // `controller_metadata` carries exactly one thing: the task-definition
-        // hash the service has converged to. It is the authoritative drift
-        // marker, so it is written even when there is nothing else to record.
-        let metadata = with_persisted_td_hash(serde_json::json!({}), converged_hash.as_deref());
+        // Preserve controller coordination fields while updating the
+        // authoritative task-definition drift marker.
+        let metadata = with_persisted_td_hash(
+            deployment.controller_metadata.clone(),
+            converged_hash.as_deref(),
+        );
         if let Err(e) = self
             .store
             .update_deployment_controller_metadata(deployment.id, &metadata)
@@ -2529,6 +2559,40 @@ impl EcsReconciler {
 
         match deployment.status {
             DeploymentStatus::Deploying if all_ready => {
+                if !rise_backend_core::lifecycle::prepare_traefik_cutover(
+                    self.store.as_ref(),
+                    project,
+                    deployment,
+                )
+                .await?
+                {
+                    info!(deployment = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
+                    return Ok(());
+                }
+                let expected = rise_backend_traefik::dynamic::render_dynamic_config(
+                    desired,
+                    &rise_backend_traefik::TraefikRenderConfig {
+                        label_namespace: &self.config.label_namespace,
+                        controller_class: &self.config.controller_class,
+                        traefik_entrypoint: &self.config.traefik_entrypoint,
+                        catalog_entrypoint: "rise-catalog",
+                        traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+                        network: None,
+                        auth_backend_url: &self.config.auth_backend_url,
+                        access_classes: &self.config.access_classes,
+                    },
+                    "ecs",
+                );
+                if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
+                    warn!(deployment = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
+                    return Ok(());
+                }
+                if let Some(api) = self.traefik_api.as_ref() {
+                    if !api.dynamic_config_applied(&expected).await {
+                        debug!(deployment = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
+                        return Ok(());
+                    }
+                }
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
                     self.store.as_ref(),
                     Some(self),
@@ -2683,6 +2747,7 @@ impl EcsReconciler {
             label_namespace: &self.config.label_namespace,
             controller_class: &self.config.controller_class,
             traefik_entrypoint: &self.config.traefik_entrypoint,
+            catalog_entrypoint: "rise-catalog",
             traefik_certresolver: self.config.traefik_certresolver.as_deref(),
             // ECS tasks are on awsvpc ENIs; the ECS provider resolves them itself
             // and would mis-resolve if handed a Docker network name.

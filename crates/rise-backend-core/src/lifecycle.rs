@@ -149,6 +149,10 @@ pub async fn perform_status_transition(
         }
     }
 
+    if deployment.is_active {
+        restore_traefik_predecessor_if_interrupted(store, deployment.id).await?;
+    }
+
     Ok(())
 }
 
@@ -277,9 +281,127 @@ pub async fn handle_deployment_became_healthy(
     store
         .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
         .await?;
+    if deployment
+        .controller_metadata
+        .get(TRAEFIK_PREDECESSOR_METADATA_KEY)
+        .is_some()
+    {
+        let mut metadata = deployment.controller_metadata.clone();
+        if let Some(object) = metadata.as_object_mut() {
+            object.remove(TRAEFIK_PREDECESSOR_METADATA_KEY);
+            store
+                .update_deployment_controller_metadata(deployment.id, &metadata)
+                .await?;
+        }
+    }
     store.update_project_calculated_status(project.id).await?;
 
     Ok(())
+}
+
+pub const TRAEFIK_PREDECESSOR_METADATA_KEY: &str = "traefik_predecessor_deployment_id";
+
+/// Restore the serving predecessor when an in-progress Traefik cutover reaches
+/// a terminal state before it is confirmed.
+pub async fn restore_traefik_predecessor_if_interrupted(
+    store: &dyn DeploymentStore,
+    deployment_id: uuid::Uuid,
+) -> Result<bool> {
+    let Some(deployment) = store.find_deployment(deployment_id).await? else {
+        return Ok(false);
+    };
+    if deployment.is_active && deployment.status == DeploymentStatus::Healthy {
+        let mut metadata = deployment.controller_metadata.clone();
+        if metadata
+            .as_object_mut()
+            .and_then(|object| object.remove(TRAEFIK_PREDECESSOR_METADATA_KEY))
+            .is_some()
+        {
+            store
+                .update_deployment_controller_metadata(deployment.id, &metadata)
+                .await?;
+        }
+        return Ok(false);
+    }
+    if !deployment.is_active
+        || matches!(
+            deployment.status,
+            DeploymentStatus::Deploying | DeploymentStatus::Healthy | DeploymentStatus::Unhealthy
+        )
+    {
+        return Ok(false);
+    }
+    let Some(predecessor_id) = deployment
+        .controller_metadata
+        .get(TRAEFIK_PREDECESSOR_METADATA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    else {
+        return Ok(false);
+    };
+    let Some(predecessor) = store.find_deployment(predecessor_id).await? else {
+        return Ok(false);
+    };
+    if state_machine::is_terminal(&predecessor.status) {
+        return Ok(false);
+    }
+    store
+        .mark_deployment_as_active(
+            predecessor.id,
+            predecessor.project_id,
+            &predecessor.deployment_group,
+        )
+        .await?;
+    info!(
+        deployment = %deployment.deployment_id,
+        predecessor = %predecessor.deployment_id,
+        "Restored Traefik routing target after an interrupted cutover"
+    );
+    Ok(true)
+}
+
+/// Select a ready deployment as the desired Traefik target while leaving its
+/// predecessor healthy and intact. Returns `true` when the deployment was
+/// already selected and the caller may verify Traefik's applied router state.
+pub async fn prepare_traefik_cutover(
+    store: &dyn DeploymentStore,
+    project: &Project,
+    deployment: &Deployment,
+) -> Result<bool> {
+    if deployment.is_active {
+        return Ok(true);
+    }
+
+    let predecessor = store
+        .find_non_terminal_deployments_for_project_and_group(
+            project.id,
+            &deployment.deployment_group,
+        )
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.is_active && candidate.id != deployment.id);
+
+    let mut metadata = deployment.controller_metadata.clone();
+    let object = metadata.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "deployment {} controller_metadata must be a JSON object",
+            deployment.deployment_id
+        )
+    })?;
+    if let Some(predecessor) = predecessor {
+        object.insert(
+            TRAEFIK_PREDECESSOR_METADATA_KEY.to_string(),
+            serde_json::Value::String(predecessor.id.to_string()),
+        );
+        store
+            .update_deployment_controller_metadata(deployment.id, &metadata)
+            .await?;
+    }
+
+    store
+        .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
+        .await?;
+    Ok(false)
 }
 
 #[cfg(test)]
