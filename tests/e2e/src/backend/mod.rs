@@ -255,10 +255,7 @@ pub trait Backend {
 
 /// Assert that Traefik's active HTTP-provider router applies forwardAuth and
 /// selects a service owned by the backend's native discovery provider.
-fn assert_traefik_ingress_auth_configured(
-    backend: &dyn Backend,
-    project: &str,
-) -> Result<()> {
+fn assert_traefik_ingress_auth_configured(backend: &dyn Backend, project: &str) -> Result<()> {
     let mut last = String::new();
     let expected_service_suffix = format!("@{}", backend.traefik_provider());
     let expected_host = backend.app_host(project);
