@@ -503,4 +503,136 @@ mod tests {
             assert!(is_invalid_grant(&err));
         }
     }
+
+    mod resolve_controller_tests {
+        use super::*;
+        use rise_resource_api::{
+            CreateResourceParams, ResourceApi, API_VERSION_V1ALPHA1, CONTROLLER_KIND,
+            CONTROLLER_TRUST_POLICY_KIND,
+        };
+        use rise_resource_store_postgres::PgResourceStore;
+
+        /// Create a live `Controller` and one `ControllerTrustPolicy` beneath
+        /// it, trusting `issuer` with `claims` (which must include `aud`).
+        /// Returns the Controller's `(name, uid)`.
+        async fn create_controller_trust_policy(
+            pool: &sqlx::PgPool,
+            controller_name: &str,
+            issuer: &str,
+            claims: serde_json::Value,
+        ) -> (String, uuid::Uuid) {
+            rise_resource_store_postgres::run_migrations(pool)
+                .await
+                .expect("resource store migrations");
+            let store = PgResourceStore::new(pool.clone());
+            let controller = store
+                .create(CreateResourceParams {
+                    api_version: API_VERSION_V1ALPHA1.to_string(),
+                    kind: CONTROLLER_KIND.to_string(),
+                    name: controller_name.to_string(),
+                    spec: serde_json::json!({}),
+                    ..Default::default()
+                })
+                .await
+                .expect("create Controller");
+            store
+                .create(CreateResourceParams {
+                    api_version: API_VERSION_V1ALPHA1.to_string(),
+                    kind: CONTROLLER_TRUST_POLICY_KIND.to_string(),
+                    name: "trust".to_string(),
+                    parent_uid: Some(controller.uid),
+                    spec: serde_json::json!({"issuer": issuer, "claims": claims}),
+                    ..Default::default()
+                })
+                .await
+                .expect("create ControllerTrustPolicy");
+            (controller_name.to_string(), controller.uid)
+        }
+
+        #[sqlx::test]
+        async fn single_match_mints_controller_principal(pool: sqlx::PgPool) {
+            let (name, uid) = create_controller_trust_policy(
+                &pool,
+                "reconciler",
+                "https://issuer.example.com",
+                serde_json::json!({"aud": "rise-controller"}),
+            )
+            .await;
+            let token_claims = serde_json::json!({
+                "iss": "https://issuer.example.com",
+                "aud": "rise-controller",
+            });
+
+            let (sub, principal, _audit) =
+                resolve_controller(&pool, "https://issuer.example.com", &token_claims)
+                    .await
+                    .expect("single controller match");
+            assert_eq!(sub, format!("controller:{name}"));
+            match principal {
+                PrincipalClaims::Controller { name: n, uid: u } => {
+                    assert_eq!(n, name);
+                    assert_eq!(u, uid);
+                }
+                _ => panic!("expected Controller principal"),
+            }
+        }
+
+        #[sqlx::test]
+        async fn ambiguous_match_is_rejected(pool: sqlx::PgPool) {
+            create_controller_trust_policy(
+                &pool,
+                "reconciler-a",
+                "https://issuer.example.com",
+                serde_json::json!({"aud": "rise-controller"}),
+            )
+            .await;
+            create_controller_trust_policy(
+                &pool,
+                "reconciler-b",
+                "https://issuer.example.com",
+                serde_json::json!({"aud": "rise-controller"}),
+            )
+            .await;
+            let token_claims = serde_json::json!({
+                "iss": "https://issuer.example.com",
+                "aud": "rise-controller",
+            });
+
+            let err = resolve_controller(&pool, "https://issuer.example.com", &token_claims)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ExchangeError::OAuth {
+                    error: "invalid_grant",
+                    ..
+                }
+            ));
+        }
+
+        #[sqlx::test]
+        async fn no_trust_policy_requires_an_identity(pool: sqlx::PgPool) {
+            rise_resource_store_postgres::run_migrations(&pool)
+                .await
+                .expect("resource store migrations");
+            let token_claims = serde_json::json!({
+                "iss": "https://issuer.example.com",
+                "aud": "rise-controller",
+            });
+
+            let err = resolve_controller(&pool, "https://issuer.example.com", &token_claims)
+                .await
+                .unwrap_err();
+            match err {
+                ExchangeError::OAuth {
+                    error: "invalid_grant",
+                    description,
+                    ..
+                } => assert!(description
+                    .unwrap_or_default()
+                    .contains("identity is required")),
+                other => panic!("expected invalid_grant, got {other:?}"),
+            }
+        }
+    }
 }

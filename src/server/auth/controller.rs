@@ -144,14 +144,15 @@ pub async fn controller_issuer_exists(pool: &PgPool, issuer: &str) -> Result<boo
         .await
 }
 
-/// Re-check liveness for an already-exchanged Rise access token carrying a
-/// controller principal.
+/// Re-check liveness for a controller principal already extracted from
+/// `AccessClaims` by the caller.
 ///
-/// Returns `Ok(None)` when `claims` does not carry a controller principal at
-/// all (so the caller can fall through to other principal kinds). A
-/// controller principal that no longer resolves to a live Controller of that
-/// name and uid is a hard failure — never a fall-through to user auth, since
-/// the token unambiguously claims to be a controller.
+/// The caller is responsible for recognizing a `PrincipalClaims::Controller`
+/// claim before calling in — this function always treats `name`/`uid` as a
+/// controller assertion. A controller principal that no longer resolves to a
+/// live Controller of that name and uid is a hard failure — never a
+/// fall-through to user auth, since the token unambiguously claims to be a
+/// controller.
 pub async fn resolve_access(
     store: &dyn ResourceApi,
     name: &str,
@@ -174,5 +175,202 @@ pub async fn resolve_access(
         Err(ServerError::unauthorized(
             "controller identity is no longer live",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rise_resource_api::{CreateResourceParams, ResourceApi, CONTROLLER_TRUST_POLICY_KIND};
+    use rise_resource_store_postgres::PgResourceStore;
+
+    /// Create a live `Controller` and one `ControllerTrustPolicy` beneath it,
+    /// trusting `issuer` with `claims` (which must include `aud`). Returns the
+    /// Controller's `(name, uid)`.
+    async fn create_controller_trust_policy(
+        store: &PgResourceStore,
+        controller_name: &str,
+        issuer: &str,
+        claims: serde_json::Value,
+    ) -> (String, Uuid) {
+        let controller = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: CONTROLLER_KIND.to_string(),
+                name: controller_name.to_string(),
+                spec: serde_json::json!({}),
+                ..Default::default()
+            })
+            .await
+            .expect("create Controller");
+        store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: CONTROLLER_TRUST_POLICY_KIND.to_string(),
+                name: "trust".to_string(),
+                parent_uid: Some(controller.uid),
+                spec: serde_json::json!({"issuer": issuer, "claims": claims}),
+                ..Default::default()
+            })
+            .await
+            .expect("create ControllerTrustPolicy");
+        (controller_name.to_string(), controller.uid)
+    }
+
+    #[sqlx::test]
+    async fn resolve_external_collapses_two_policies_on_one_controller(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store = PgResourceStore::new(pool.clone());
+        let (name, uid) = create_controller_trust_policy(
+            &store,
+            "reconciler",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "rise-controller", "sub": "deploy-bot"}),
+        )
+        .await;
+        // A second trust policy on the same Controller, same issuer, a
+        // different (also-matching) claim shape.
+        store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: CONTROLLER_TRUST_POLICY_KIND.to_string(),
+                name: "trust-2".to_string(),
+                parent_uid: Some(uid),
+                spec: serde_json::json!({
+                    "issuer": "https://issuer.example.com",
+                    "claims": {"aud": "rise-controller"},
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("create second ControllerTrustPolicy");
+
+        let token_claims = serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "aud": "rise-controller",
+            "sub": "deploy-bot",
+        });
+        match resolve_external(&pool, "https://issuer.example.com", &token_claims)
+            .await
+            .expect("resolve_external")
+        {
+            ControllerResolution::Controller(principal) => {
+                assert_eq!(principal.name, name);
+                assert_eq!(principal.uid, uid);
+            }
+            other => panic!("expected a single collapsed match, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn resolve_external_two_distinct_controllers_is_ambiguous(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store = PgResourceStore::new(pool.clone());
+        create_controller_trust_policy(
+            &store,
+            "reconciler-a",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "rise-controller"}),
+        )
+        .await;
+        create_controller_trust_policy(
+            &store,
+            "reconciler-b",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "rise-controller"}),
+        )
+        .await;
+
+        let token_claims = serde_json::json!({
+            "iss": "https://issuer.example.com",
+            "aud": "rise-controller",
+        });
+        match resolve_external(&pool, "https://issuer.example.com", &token_claims)
+            .await
+            .expect("resolve_external")
+        {
+            ControllerResolution::Ambiguous(mut names) => {
+                names.sort();
+                assert_eq!(
+                    names,
+                    vec!["reconciler-a".to_string(), "reconciler-b".to_string()]
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[sqlx::test]
+    async fn resolve_access_live_controller_succeeds(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store = PgResourceStore::new(pool.clone());
+        let (name, uid) = create_controller_trust_policy(
+            &store,
+            "reconciler",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "x"}),
+        )
+        .await;
+
+        let principal = resolve_access(&store, &name, uid)
+            .await
+            .expect("live controller resolves");
+        assert_eq!(principal.name, name);
+        assert_eq!(principal.uid, uid);
+    }
+
+    #[sqlx::test]
+    async fn resolve_access_deleted_controller_fails(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store = PgResourceStore::new(pool.clone());
+        let (name, uid) = create_controller_trust_policy(
+            &store,
+            "reconciler",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "x"}),
+        )
+        .await;
+        store.delete(uid).await.expect("delete Controller");
+
+        let err = resolve_access(&store, &name, uid)
+            .await
+            .expect_err("a deleted controller must not resolve");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test]
+    async fn resolve_access_name_mismatch_fails(pool: sqlx::PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
+        let store = PgResourceStore::new(pool.clone());
+        create_controller_trust_policy(
+            &store,
+            "reconciler-a",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "x"}),
+        )
+        .await;
+        let (_, uid_b) = create_controller_trust_policy(
+            &store,
+            "reconciler-b",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "x"}),
+        )
+        .await;
+
+        // `uid_b` resolves to a live Controller, but not one named `reconciler-a`.
+        let err = resolve_access(&store, "reconciler-a", uid_b)
+            .await
+            .expect_err("uid/name mismatch must not resolve");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
     }
 }
