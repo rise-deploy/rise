@@ -41,7 +41,10 @@ use super::models::{
 use super::path::{
     parse_resource_path, parse_uid_token, CollectionRef, RawResourcePath, Subresource, UID_PREFIX,
 };
-use crate::server::auth::context::{AnyAuth, AuthContext};
+use crate::server::auth::context::AnyAuth;
+#[cfg(test)]
+use crate::server::auth::context::AuthContext;
+#[cfg(test)]
 use crate::server::auth::controller::ControllerAuthContext;
 use crate::server::authz::{
     change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
@@ -257,34 +260,6 @@ async fn resolve_parent_chain(
     }
     chain.reverse();
     Ok(chain)
-}
-
-/// Authorize a controller token for status/finalizer writes against a
-/// collection. The collection's `allowed_status_controller_ids` is the gate;
-/// an empty list is default-deny. Built-in collections currently carry an
-/// empty list, so controllers cannot write their status until a future phase
-/// wires controller ownership for built-ins.
-fn enforce_controller_allowed(
-    info: &CollectionInfo,
-    collection: &str,
-    controller_id: &str,
-) -> Result<(), ServerError> {
-    if info
-        .allowed_status_controller_ids
-        .iter()
-        .any(|id| id == controller_id)
-    {
-        return Ok(());
-    }
-    tracing::warn!(
-        controller_id = %controller_id,
-        kind = %info.kind,
-        "Controller status/finalizer write denied — controller not in collection's allowed_status_controller_ids"
-    );
-    Err(ServerError::forbidden(format!(
-        "controller '{controller_id}' is not authorized to write status or finalizers \
-         for collection '{collection}'"
-    )))
 }
 
 fn assert_body_matches(
@@ -583,7 +558,7 @@ fn mask_not_found(error: ServerError) -> ServerError {
 pub async fn dispatch_get(
     State(state): State<AppState>,
     Path(raw): Path<String>,
-    auth: AuthContext,
+    auth: AnyAuth,
     Query(q): Query<PendingDeletionQuery>,
 ) -> Result<Response, ServerError> {
     dispatch_get_inner(&ResourceApiCtx::from_state(&state), raw, auth, q).await
@@ -592,7 +567,7 @@ pub async fn dispatch_get(
 async fn dispatch_get_inner(
     ctx: &ResourceApiCtx,
     raw: String,
-    auth: AuthContext,
+    auth: AnyAuth,
     q: PendingDeletionQuery,
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
@@ -850,7 +825,7 @@ async fn dispatch_get_inner(
 pub async fn dispatch_post(
     State(state): State<AppState>,
     Path(raw): Path<String>,
-    auth: AuthContext,
+    auth: AnyAuth,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ServerError> {
     dispatch_post_inner(&ResourceApiCtx::from_state(&state), raw, auth, body).await
@@ -859,7 +834,7 @@ pub async fn dispatch_post(
 async fn dispatch_post_inner(
     ctx: &ResourceApiCtx,
     raw: String,
-    auth: AuthContext,
+    auth: AnyAuth,
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
     // Parsed once up front: a malformed path is a 400 regardless of who is
@@ -927,18 +902,9 @@ async fn dispatch_put_inner(
     // before any authentication or store work, matching the other handlers.
     parse_resource_path(&raw)?;
 
-    // A controller token writes only through the status/finalizer subresources,
-    // authorized by the collection's controller allowlist rather than by RBAC: a
-    // Controller is not a principal until its identity resource exists, so there
-    // is nothing for the engine to evaluate.
-    let user_auth = match &auth {
-        AnyAuth::User(auth_ctx) => auth_ctx.clone(),
-        AnyAuth::Controller(_) => return dispatch_put_controller(ctx, raw, auth, body).await,
-    };
-
     let mut attempt = 1;
     loop {
-        let write = ctx.authz.begin_write(&user_auth, attempt).await?;
+        let write = ctx.authz.begin_write(&auth, attempt).await?;
         let outcome = match update_once(ctx, write.context(), &raw, body.clone()).await {
             Ok(response) => write.commit().await.map(|()| response),
             Err(error) => Err(error),
@@ -983,9 +949,8 @@ async fn update_once(
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
                         })?;
-                    let resp =
-                        apply_user_status(authz, &row, body, &resolved.info.api_version, &target)
-                            .await?;
+                    let resp = apply_status(authz, &row, body, &resolved.info.api_version, &target)
+                        .await?;
                     Ok(resp.into_response())
                 }
                 Subresource::Finalizers => {
@@ -996,90 +961,9 @@ async fn update_once(
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
                         })?;
-                    let resp = apply_user_finalizers(
-                        authz,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                        &target,
-                    )
-                    .await?;
-                    Ok(resp.into_response())
-                }
-                Subresource::DeletionBlockers => Err(ServerError::new(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "deletion-blockers is a read-only subresource",
-                )),
-            }
-        }
-        _ => Err(ServerError::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "PUT is only valid for item and subresource paths",
-        )),
-    }
-}
-
-/// The controller-token half of `PUT`: status and finalizer writes gated by the
-/// collection's `allowed_status_controller_ids`.
-async fn dispatch_put_controller(
-    ctx: &ResourceApiCtx,
-    raw: String,
-    auth: AnyAuth,
-    body: serde_json::Value,
-) -> Result<Response, ServerError> {
-    let AnyAuth::Controller(controller) = auth else {
-        return Err(ServerError::unauthorized("Not authenticated"));
-    };
-    let raw_path = parse_resource_path(&raw)?;
-    // `classify_path` performs store I/O (resolving the collection) before the
-    // controller token is rejected for item-level paths. This means a controller
-    // token can observe whether a collection (ResourceDefinition) exists. This
-    // is acceptable: controllers can already probe collection existence via GET
-    // requests to listing paths, so the information is not meaningfully secret.
-    match classify_path(&ctx.store, raw_path).await? {
-        ResolvedPath::Item { .. } => Err(ServerError::forbidden(
-            "controller tokens cannot update resource items",
-        )),
-        ResolvedPath::Subresource {
-            resolved,
-            leaf,
-            subresource,
-        } => {
-            // The allowlist decides before the row is resolved: a controller
-            // that is not on it must not learn whether the item it named
-            // exists. Collection existence it can already observe (see above),
-            // and that is the whole of what it learns here.
-            enforce_controller_allowed(&resolved.info, &resolved.collection, &controller.0.name)?;
-            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
-            match subresource {
-                Subresource::Status => {
-                    let body: ControllerStatusUpdate =
-                        serde_json::from_value(body).map_err(|e| {
-                            ServerError::bad_request(format!("invalid request body: {e}"))
-                        })?;
-                    let resp = apply_controller_status(
-                        ctx,
-                        &controller,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                    )
-                    .await?;
-                    Ok(resp.into_response())
-                }
-                Subresource::Finalizers => {
-                    let body: ControllerFinalizerUpdate =
-                        serde_json::from_value(body).map_err(|e| {
-                            ServerError::bad_request(format!("invalid request body: {e}"))
-                        })?;
-                    let resp = apply_controller_finalizers(
-                        ctx,
-                        &controller,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                    )
-                    .await?;
+                    let resp =
+                        apply_finalizers(authz, &row, body, &resolved.info.api_version, &target)
+                            .await?;
                     Ok(resp.into_response())
                 }
                 Subresource::DeletionBlockers => Err(ServerError::new(
@@ -1098,7 +982,7 @@ async fn dispatch_put_controller(
 pub async fn dispatch_delete(
     State(state): State<AppState>,
     Path(raw): Path<String>,
-    auth: AuthContext,
+    auth: AnyAuth,
 ) -> Result<Response, ServerError> {
     dispatch_delete_inner(&ResourceApiCtx::from_state(&state), raw, auth).await
 }
@@ -1106,7 +990,7 @@ pub async fn dispatch_delete(
 async fn dispatch_delete_inner(
     ctx: &ResourceApiCtx,
     raw: String,
-    auth: AuthContext,
+    auth: AnyAuth,
 ) -> Result<Response, ServerError> {
     parse_resource_path(&raw)?;
     let mut attempt = 1;
@@ -1807,101 +1691,77 @@ async fn delete_resource(
     }
 }
 
-async fn apply_controller_status(
-    ctx: &ResourceApiCtx,
-    controller: &ControllerAuthContext,
-    row: &ResourceRow,
-    body: ControllerStatusUpdate,
-    response_api_version: &str,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
-    let updated = ctx
-        .store
-        .update_controller_status(row.uid, &controller.0.name, body.status)
-        .await
-        .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %controller.0.name,
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.controller_status_updated"
-    );
-    Ok(Json(response_resource(&updated, response_api_version)?))
-}
-
-async fn apply_controller_finalizers(
-    ctx: &ResourceApiCtx,
-    controller: &ControllerAuthContext,
-    row: &ResourceRow,
-    body: ControllerFinalizerUpdate,
-    response_api_version: &str,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
-    let updated = ctx
-        .store
-        .update_controller_finalizers(row.uid, &controller.0.name, &body.add, &body.remove)
-        .await
-        .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %controller.0.name,
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.controller_finalizers_updated"
-    );
-    Ok(Json(response_resource(&updated, response_api_version)?))
-}
-
-/// A user's `status` write, authorized by `(update, Kind, status)`.
+/// A `status` write, authorized by `(update, Kind, status)`.
 ///
-/// The value lands in the writer-keyed slot the store reserves for non-
-/// controller writers, so a controller's own slot is never overwritten by a
-/// human edit. That slot is still named for the operator tier it was introduced
-/// for; ADR-0002's subresource execution model owns the field separation and is
+/// A Controller subject writes its own `status.controllers[<name>]` slot (the
+/// store enforces that a controller can only ever touch its own slot); every
+/// other subject writes the shared writer-keyed slot `operator_update_status`
+/// reserves, keyed on its own stable subject — never its email, since the slot
+/// is stored inside the resource document and served to every reader of it,
+/// which makes it product data rather than an audit record (ADR-0001 §1). That
+/// slot is still named for the operator tier it was introduced for;
+/// ADR-0002's subresource execution model owns the field separation and is
 /// where the naming is settled, not here.
-async fn apply_user_status(
+async fn apply_status(
     authz: &AuthorizationContext,
     row: &ResourceRow,
     body: ControllerStatusUpdate,
     response_api_version: &str,
     target: &ResourceTree,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    // Keyed on the caller's stable subject, never their email: the slot is
-    // stored inside the resource document and served to every reader of it,
-    // which makes it product data rather than an audit record (ADR-0001 §1 —
-    // user identity is not email).
-    let updated = authz
-        .store()
-        .operator_update_status(row.uid, authz.subject().as_ref(), body.status)
-        .await
-        .map_err(store_error_to_server_error)?;
-    audit_write(authz, row, "resource.user_status_updated", None);
+    let subject = authz.subject();
+    let (updated, event) = if subject.kind() == "controller" {
+        let updated = authz
+            .store()
+            .update_controller_status(row.uid, subject.name(), body.status)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.controller_status_updated")
+    } else {
+        let updated = authz
+            .store()
+            .operator_update_status(row.uid, subject.as_ref(), body.status)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.user_status_updated")
+    };
+    audit_write(authz, row, event, None);
     Ok(Json(
         write_response(authz, &updated, response_api_version, target).await?,
     ))
 }
 
-/// A user's `finalizers` write, authorized by `(update, Kind, finalizers)`.
+/// A `finalizers` write, authorized by `(update, Kind, finalizers)`.
 ///
-/// Finalizer keys in the reserved `system.rise.dev/*` namespace stay refused by
-/// the store: those are lifecycle bookkeeping the garbage collector owns, and no
-/// RBAC grant makes them writable.
-async fn apply_user_finalizers(
+/// A Controller subject may only add or remove finalizers it owns (the store
+/// enforces `<name>` or `<name>/<reason>`); finalizer keys in the reserved
+/// `system.rise.dev/*` namespace stay refused for every subject, since those
+/// are lifecycle bookkeeping the garbage collector owns and no RBAC grant
+/// makes them writable.
+async fn apply_finalizers(
     authz: &AuthorizationContext,
     row: &ResourceRow,
     body: ControllerFinalizerUpdate,
     response_api_version: &str,
     target: &ResourceTree,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let updated = authz
-        .store()
-        .operator_update_finalizers(row.uid, authz.subject().as_ref(), &body.add, &body.remove)
-        .await
-        .map_err(store_error_to_server_error)?;
-    audit_write(authz, row, "resource.user_finalizers_updated", None);
+    let subject = authz.subject();
+    let (updated, event) = if subject.kind() == "controller" {
+        let updated = authz
+            .store()
+            .update_controller_finalizers(row.uid, subject.name(), &body.add, &body.remove)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.controller_finalizers_updated")
+    } else {
+        let updated = authz
+            .store()
+            .operator_update_finalizers(row.uid, subject.as_ref(), &body.add, &body.remove)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.user_finalizers_updated")
+    };
+    audit_write(authz, row, event, None);
     Ok(Json(
         write_response(authz, &updated, response_api_version, target).await?,
     ))
@@ -1932,42 +1792,6 @@ mod tests {
 
         // Wrong kind.
         assert!(assert_body_matches(&info, "rise.dev/v1alpha1", "Widget",).is_err());
-    }
-
-    fn collection_info(allowed: Vec<String>) -> CollectionInfo {
-        CollectionInfo {
-            api_version: "example.dev/v1".into(),
-            storage_api_version: "example.dev/v1".into(),
-            served_api_versions: vec!["example.dev/v1".into()],
-            declared_api_versions: vec!["example.dev/v1".into()],
-            kind: "Widget".into(),
-            parent: None,
-            spec_validator: std::sync::Arc::new(NoOpValidator),
-            allowed_status_controller_ids: allowed,
-        }
-    }
-
-    #[test]
-    fn enforce_controller_allowed_permits_listed_controller() {
-        let info = collection_info(vec!["controller.example.com".into()]);
-        assert!(enforce_controller_allowed(&info, "widgets", "controller.example.com").is_ok());
-    }
-
-    #[test]
-    fn enforce_controller_allowed_rejects_unlisted_controller() {
-        let info = collection_info(vec!["controller.example.com".into()]);
-        let err = enforce_controller_allowed(&info, "widgets", "other.example.com").unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        assert!(err.message.contains("not authorized"));
-    }
-
-    #[test]
-    fn enforce_controller_allowed_default_denies_empty_allowlist() {
-        // Built-in collections carry an empty allowlist — default-deny.
-        let info = collection_info(vec![]);
-        let err =
-            enforce_controller_allowed(&info, "widgets", "controller.example.com").unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -2072,20 +1896,16 @@ mod dispatch_tests {
         }
     }
 
-    /// A `User`-backed `AuthContext`. `User` rows do not need to exist in the
-    /// DB — the resource API authorizes purely on the email allowlists.
-    fn auth(email: &str) -> AuthContext {
-        AuthContext::User(User {
+    /// An `AnyAuth` carrying a User-backed `AuthContext`. `User` rows do not
+    /// need to exist in the DB — the resource API authorizes purely on the
+    /// email allowlists.
+    fn auth(email: &str) -> AnyAuth {
+        AnyAuth::User(AuthContext::User(User {
             id: Uuid::new_v4(),
             email: email.to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-        })
-    }
-
-    /// An `AnyAuth` carrying a user token (operator).
-    fn any_user(email: &str) -> AnyAuth {
-        AnyAuth::User(auth(email))
+        }))
     }
 
     /// An `AnyAuth` carrying a controller token with the given controller id.
@@ -2096,6 +1916,58 @@ mod dispatch_tests {
                 uid: Uuid::new_v4(),
             },
         ))
+    }
+
+    /// Create a live `Controller` resource named `name`, as the operator.
+    async fn create_controller(ctx: &ResourceApiCtx, name: &str) -> Value {
+        create_at(
+            ctx,
+            "rise.dev/v1alpha1/controllers",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Controller",
+                "metadata": {"name": name},
+                "spec": {},
+            }),
+        )
+        .await
+    }
+
+    /// Create a live Controller named `name` and grant `controller:<name>` the
+    /// given statements via a seeded `PlatformRole` + `PlatformRoleBinding`,
+    /// mirroring `grant_authenticated` but naming the Controller subject
+    /// directly — a `PlatformRoleBinding`'s `controller:` subject must
+    /// identify a live Controller (admission-checked), and an org
+    /// `RoleBinding` never reaches a Controller anyway (ADR-0001 §3), so this
+    /// is always a platform grant.
+    async fn grant_controller(ctx: &ResourceApiCtx, name: &str, statements: Value) {
+        create_controller(ctx, name).await;
+        let role_name = format!("{name}-role");
+        create_at(
+            ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": role_name},
+                "spec": {"statements": statements},
+            }),
+        )
+        .await;
+        create_at(
+            ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": format!("{name}-binding")},
+                "spec": {
+                    "subject": format!("controller:{name}"),
+                    "roleRef": {"kind": "PlatformRole", "name": role_name},
+                },
+            }),
+        )
+        .await;
     }
 
     /// Read a `Response` into `(status, json_body)`.
@@ -2346,7 +2218,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/labeled".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2469,7 +2341,7 @@ mod dispatch_tests {
         let wrong_kind = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/one".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Bogus",
@@ -2522,7 +2394,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2625,7 +2497,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/one".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2845,7 +2717,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2867,7 +2739,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2936,7 +2808,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -2954,7 +2826,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -2996,7 +2868,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "ResourceDefinition",
@@ -3048,7 +2920,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/victim".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3185,7 +3057,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3208,7 +3080,7 @@ mod dispatch_tests {
         let missing = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3233,7 +3105,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3384,7 +3256,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3551,7 +3423,7 @@ mod dispatch_tests {
             let err = dispatch_put_inner(
                 &ctx,
                 "example.dev/v1/widgets/unowned".to_string(),
-                AnyAuth::User(caller.clone()),
+                caller.clone(),
                 json!({
                     "apiVersion": "example.dev/v1",
                     "kind": "Widget",
@@ -3628,7 +3500,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/mine".to_string(),
-            AnyAuth::User(caller),
+            caller,
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3773,7 +3645,7 @@ mod dispatch_tests {
         let scheduled = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/platformrolebindings/the-cap".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "PlatformRoleBinding",
@@ -4070,7 +3942,7 @@ mod dispatch_tests {
         let deactivated = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/users/ghost".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
@@ -4102,7 +3974,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/users/ghost".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
@@ -4121,7 +3993,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/users/ghost".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
@@ -4203,7 +4075,7 @@ mod dispatch_tests {
         let user = crate::db::users::create(&pool, "grouped@example.com")
             .await
             .unwrap();
-        let auth_ctx = AuthContext::User(user.clone());
+        let auth_ctx = AnyAuth::User(AuthContext::User(user.clone()));
 
         // Same-named team that the IdP did not create grants nothing.
         let self_made = crate::db::teams::create(&pool, "platform-operators")
@@ -4307,7 +4179,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -4318,7 +4190,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/finalizers".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"add": ["x/y"], "remove": []}),
         )
         .await
@@ -4340,7 +4212,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -4363,7 +4235,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -4373,7 +4245,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/finalizers".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({"add": ["some.controller/cleanup"], "remove": []}),
         )
         .await
@@ -4381,62 +4253,253 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A Controller granted `update` on the `status` and `finalizers`
+    /// subresources writes its own `status.controllers[<name>]` slot and its
+    /// own `<name>/<reason>`-prefixed finalizers — exactly the RBAC decision
+    /// an equivalent User grant would produce, with no allowlist involved.
     #[sqlx::test]
-    async fn status_subresource_allows_listed_controller(pool: sqlx::PgPool) {
+    async fn bound_controller_can_write_status_and_finalizers(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx, &[]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([
+                {"effect": "Allow", "kinds": ["example.dev/Widget"], "verbs": ["get"]},
+                {
+                    "effect": "Allow",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["update"],
+                    "subresources": ["status", "finalizers"],
+                },
+            ]),
+        )
+        .await;
 
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_controller("controller.example.com"),
+            any_controller("reconciler"),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
-        .expect("listed controller status write");
+        .expect("bound controller status write");
         assert_eq!(resp.status(), StatusCode::OK);
+        let (_, body) = read(resp).await;
+        assert_eq!(
+            body["status"]["controllers"]["reconciler"]["phase"],
+            "Ready"
+        );
+
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_controller("reconciler"),
+            json!({"add": ["reconciler/cleanup"], "remove": []}),
+        )
+        .await
+        .expect("bound controller finalizer write");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, body) = read(resp).await;
+        assert_eq!(
+            body["metadata"]["finalizers"],
+            json!(["reconciler/cleanup"])
+        );
+
+        // Finalizers naming another controller's ownership prefix are refused
+        // regardless of the RBAC grant — the store enforces the token itself.
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_controller("reconciler"),
+            json!({"add": ["someone-else/cleanup"], "remove": []}),
+        )
+        .await
+        .expect_err("a controller cannot claim another controller's finalizer prefix");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
+    /// A Controller with no binding at all is masked exactly like an
+    /// ungranted User: the same 404, for both a real and an imaginary item —
+    /// there is no allowlist-specific refusal any more.
     #[sqlx::test]
-    async fn status_subresource_rejects_unlisted_controller_with_403(pool: sqlx::PgPool) {
+    async fn unbound_controller_is_masked_like_any_other_ungranted_principal(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        // Allowlist contains a different controller id.
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx, &[]).await;
+        create_widget(&ctx, "example.dev/v1", "real").await;
+
+        let present = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/real/status".to_string(),
+            any_controller("watcher"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("an unbound controller is refused");
+        let absent = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/imaginary/status".to_string(),
+            any_controller("watcher"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("an unbound controller is refused");
+        assert_eq!(present.status, StatusCode::NOT_FOUND, "{}", present.message);
+        assert_eq!(present.status, absent.status);
+        assert_eq!(present.message, absent.message);
+    }
+
+    /// A Controller visible on the main resource (`get`) but not granted the
+    /// `finalizers` subresource gets the ordinary named refusal, not the mask:
+    /// it already knows the resource exists.
+    #[sqlx::test]
+    async fn controller_without_finalizer_grant_gets_named_403(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([
+                {"effect": "Allow", "kinds": ["example.dev/Widget"], "verbs": ["get"]},
+                {
+                    "effect": "Allow",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["update"],
+                    "subresources": ["status"],
+                },
+            ]),
+        )
+        .await;
 
         let err = dispatch_put_inner(
             &ctx,
-            "example.dev/v1/widgets/w1/status".to_string(),
-            any_controller("other.example.com"),
-            json!({"status": {"phase": "Ready"}}),
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_controller("reconciler"),
+            json!({"add": ["reconciler/cleanup"], "remove": []}),
         )
         .await
-        .expect_err("unlisted controller must be rejected");
+        .expect_err("status grant does not extend to finalizers");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
+    /// A Controller is an ordinary principal on every verb, not just
+    /// status/finalizers: granted create/get/list/update/delete, it can POST,
+    /// PUT a full item, and DELETE — none of that is hard-coded to 403 for a
+    /// controller token any more.
     #[sqlx::test]
-    async fn item_update_rejects_controller_token_with_403(pool: sqlx::PgPool) {
+    async fn controller_with_full_grant_can_create_update_delete_items(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx, &[]).await;
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["create", "get", "list", "update", "delete"],
+            }]),
+        )
+        .await;
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            any_controller("reconciler"),
+            widget_body("example.dev/v1", "w1"),
+        )
+        .await
+        .expect("controller with create grant can POST");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1".to_string(),
+            any_controller("reconciler"),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "w1", "revision": created["metadata"]["revision"]},
+                "spec": {"size": "large"},
+            }),
+        )
+        .await
+        .expect("controller with update grant can PUT an item");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = dispatch_delete_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1".to_string(),
+            any_controller("reconciler"),
+        )
+        .await
+        .expect("controller with delete grant can DELETE");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// GET and LIST evaluate a Controller through the same choke point as any
+    /// other principal: without a grant the item is masked and the collection
+    /// lists empty; with one, both succeed.
+    #[sqlx::test]
+    async fn controller_get_and_list_honor_rbac(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx, &[]).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
-        // A controller token must not be able to PUT a full item.
-        let err = dispatch_put_inner(
+        let err = dispatch_get_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
-            any_controller("controller.example.com"),
-            json!({
-                "apiVersion": "example.dev/v1",
-                "kind": "Widget",
-                "metadata": {"name": "w1", "revision": 1},
-                "spec": {"size": "small"},
-            }),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
         )
         .await
-        .expect_err("controller token must not update items");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        .expect_err("an ungranted controller cannot GET the item");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list is never refused outright");
+        let (_, body) = read(resp).await;
+        assert_eq!(body["items"].as_array().expect("items").len(), 0);
+
+        grant_controller(
+            &ctx,
+            "watcher",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list"],
+            }]),
+        )
+        .await;
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a granted controller can GET the item");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a granted controller can LIST");
+        let (_, body) = read(resp).await;
+        assert_eq!(body["items"].as_array().expect("items").len(), 1);
     }
 
     // -------------------------------------------------------------------------
@@ -4452,7 +4515,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({}),
         )
         .await
@@ -4659,7 +4722,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v2/widgets/w1".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v2",
                 "kind": "Widget",
@@ -4717,7 +4780,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             update(revision),
         )
         .await
@@ -4728,7 +4791,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             update(revision),
         )
         .await
@@ -4846,7 +4909,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/lifecycle".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -5384,7 +5447,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             write("held"),
         )
         .await
@@ -5416,7 +5479,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             write("held"),
         )
         .await
@@ -5454,36 +5517,6 @@ mod dispatch_tests {
         .expect_err("the subresource is its own grant");
         assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
         assert!(err.message.contains("deletion-blockers"), "{}", err.message);
-    }
-
-    /// A controller that is not on the collection's allowlist must not learn
-    /// whether the item it named exists. The allowlist decides before the row
-    /// is resolved.
-    #[sqlx::test]
-    async fn an_unlisted_controller_cannot_probe_item_existence(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
-        create_widget(&ctx, "example.dev/v1", "real").await;
-
-        let present = dispatch_put_inner(
-            &ctx,
-            "example.dev/v1/widgets/real/status".to_string(),
-            any_controller("other.example.com"),
-            json!({"status": {"phase": "Ready"}}),
-        )
-        .await
-        .expect_err("an unlisted controller is refused");
-        let absent = dispatch_put_inner(
-            &ctx,
-            "example.dev/v1/widgets/imaginary/status".to_string(),
-            any_controller("other.example.com"),
-            json!({"status": {"phase": "Ready"}}),
-        )
-        .await
-        .expect_err("an unlisted controller is refused");
-        assert_eq!(present.status, StatusCode::FORBIDDEN, "{}", present.message);
-        assert_eq!(present.status, absent.status);
-        assert_eq!(present.message, absent.message);
     }
 
     // -------------------------------------------------------------------------
@@ -5622,10 +5655,21 @@ mod dispatch_tests {
         assert_eq!(body["metadata"]["name"], "g1");
 
         // Subresource — D + 2 segments, controller-authenticated status write.
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Gadget"],
+                "verbs": ["update"],
+                "subresources": ["status"],
+            }]),
+        )
+        .await;
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/gadgets/acme/g1/status".to_string(),
-            any_controller("controller.example.com"),
+            any_controller("reconciler"),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -5804,7 +5848,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": RESOURCE_DEFINITION_KIND,

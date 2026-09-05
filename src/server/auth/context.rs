@@ -288,6 +288,20 @@ pub enum AnyAuth {
     Controller(ControllerAuthContext),
 }
 
+#[cfg(test)]
+impl AnyAuth {
+    /// Get the authenticated Rise user, for tests that need the underlying
+    /// `User` row after building an `AnyAuth` for a dispatch call.
+    pub fn user(&self) -> Result<&User, ServerError> {
+        match self {
+            AnyAuth::User(auth_ctx) => auth_ctx.user(),
+            AnyAuth::Controller(_) => Err(ServerError::unauthorized(
+                "This endpoint does not support controller authentication",
+            )),
+        }
+    }
+}
+
 impl FromRequestParts<AppState> for AnyAuth {
     type Rejection = ServerError;
 

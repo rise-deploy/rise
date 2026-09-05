@@ -42,7 +42,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::db::models::User;
-use crate::server::auth::context::AuthContext;
+use crate::server::auth::context::AnyAuth;
 use crate::server::error::ServerError;
 use crate::server::resources::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
 
@@ -83,45 +83,74 @@ impl ResourceAuthorizer {
 
     /// The principal behind a credential.
     ///
-    /// Only a Rise-authenticated User reaches the generic resource API today.
-    /// Workload principals authenticate through the exchange endpoint and are
-    /// bound to a Project, which is a typed concept the generic API does not
-    /// share; ADR-0001 §7's target-bound `/token` route is what makes them
-    /// principals here, and it is not built yet.
+    /// A Rise-authenticated User or a Controller reaches the generic resource
+    /// API; both are evaluated identically by the engine from here on. A
+    /// Controller carries no `User` row, so the second element is `None` for
+    /// it and the third is the actor string audit records use in its place.
     ///
-    /// The subject is the User's stable identity as this install expresses it:
+    /// A User's subject is its stable identity as this install expresses it:
     /// the typed `users` row's UID, which is also the credential's `rise_uid`.
     /// ADR-0001 §1's generated `User` resource name replaces it when identity
-    /// resources go live; both are opaque, immutable, and never the email.
-    fn principal(auth: &AuthContext) -> Result<(AuthenticatedPrincipal, User), ServerError> {
-        let user = auth.user()?.clone();
-        let subject: SubjectId = format!("user:{}", user.id).parse().map_err(|error| {
-            ServerError::internal(format!("principal is not a valid subject: {error}"))
-        })?;
-        let principal =
-            // Unrestricted: authorization details (§7) are not issued yet, so no
-            // credential carries a ceiling. When they are, the parsed cap
-            // arrives here and every decision below intersects with it, with no
-            // other change.
-            AuthenticatedPrincipal::new(subject, user.id, AuthorizationCap::Unrestricted)
+    /// resources go live; both are opaque, immutable, and never the email. A
+    /// Controller's subject and UID are already its resource's — that identity
+    /// is already live.
+    ///
+    /// Workload principals other than Controllers (project-scoped service
+    /// accounts) still authenticate through the exchange endpoint but do not
+    /// reach the generic resource API: they are bound to a Project, which is a
+    /// typed concept the generic API does not share, and ADR-0001 §7's
+    /// target-bound `/token` route (which would make them principals here) is
+    /// not built yet.
+    fn principal(
+        auth: &AnyAuth,
+    ) -> Result<(AuthenticatedPrincipal, Option<User>, String), ServerError> {
+        match auth {
+            AnyAuth::User(auth_ctx) => {
+                let user = auth_ctx.user()?.clone();
+                let subject: SubjectId = format!("user:{}", user.id).parse().map_err(|error| {
+                    ServerError::internal(format!("principal is not a valid subject: {error}"))
+                })?;
+                let principal =
+                    // Unrestricted: authorization details (§7) are not issued
+                    // yet, so no credential carries a ceiling. When they are,
+                    // the parsed cap arrives here and every decision below
+                    // intersects with it, with no other change.
+                    AuthenticatedPrincipal::new(subject, user.id, AuthorizationCap::Unrestricted)
+                        .map_err(authorization_error_to_server_error)?;
+                let actor = user.email.clone();
+                Ok((principal, Some(user), actor))
+            }
+            AnyAuth::Controller(controller) => {
+                let subject: SubjectId = format!("controller:{}", controller.0.name)
+                    .parse()
+                    .map_err(|error| {
+                        ServerError::internal(format!("principal is not a valid subject: {error}"))
+                    })?;
+                let actor = subject.to_string();
+                let principal = AuthenticatedPrincipal::new(
+                    subject,
+                    controller.0.uid,
+                    AuthorizationCap::Unrestricted,
+                )
                 .map_err(authorization_error_to_server_error)?;
-        Ok((principal, user))
+                Ok((principal, None, actor))
+            }
+        }
     }
 
     /// A read-path context. Facts are read through the pool at the default
     /// isolation: a read decides against current facts and commits nothing.
-    pub async fn read_context(
-        &self,
-        auth: &AuthContext,
-    ) -> Result<AuthorizationContext, ServerError> {
-        let (principal, user) = Self::principal(auth)?;
-        self.context(principal, user, self.store.session()).await
+    pub async fn read_context(&self, auth: &AnyAuth) -> Result<AuthorizationContext, ServerError> {
+        let (principal, user, actor) = Self::principal(auth)?;
+        self.context(principal, user, actor, self.store.session())
+            .await
     }
 
     async fn context(
         &self,
         principal: AuthenticatedPrincipal,
-        user: User,
+        user: Option<User>,
+        actor: String,
         session: PgSession,
     ) -> Result<AuthorizationContext, ServerError> {
         let store: Arc<dyn ResourceStore> = Arc::new(self.store.in_session(session.clone()));
@@ -131,7 +160,7 @@ impl ResourceAuthorizer {
                 session.clone(),
                 store.clone(),
                 self.operators.clone(),
-                user.clone(),
+                user,
             )),
         );
         let snapshot = engine
@@ -143,7 +172,7 @@ impl ResourceAuthorizer {
             snapshot,
             store,
             session,
-            actor: user.email,
+            actor,
             attempt: 1,
             deferred_audit: Mutex::new(Vec::new()),
         })
@@ -165,17 +194,19 @@ impl ResourceAuthorizer {
     /// duplicate would read as two separate attempts to delegate.
     pub async fn begin_write(
         &self,
-        auth: &AuthContext,
+        auth: &AnyAuth,
         attempt: u32,
     ) -> Result<WriteAttempt, ServerError> {
         // Resolved before the transaction opens: a credential this API does not
         // accept should not cost one, and on a retry loop it would cost one per
         // attempt.
-        let (principal, user) = Self::principal(auth)?;
+        let (principal, user, actor) = Self::principal(auth)?;
         let transaction = SerializableTransaction::begin(&self.pool)
             .await
             .map_err(store_error_to_server_error)?;
-        let mut context = self.context(principal, user, transaction.session()).await?;
+        let mut context = self
+            .context(principal, user, actor, transaction.session())
+            .await?;
         context.attempt = attempt;
         Ok(WriteAttempt {
             transaction,
@@ -273,8 +304,9 @@ impl AuthorizationContext {
         &self.session
     }
 
-    /// The caller's email, for audit records. Not an identity: policy never
-    /// matches on it (ADR-0001 §1).
+    /// The caller's email, or a Controller's `controller:<name>` subject, for
+    /// audit records. Not an identity: policy never matches on it
+    /// (ADR-0001 §1).
     pub fn actor(&self) -> &str {
         &self.actor
     }
