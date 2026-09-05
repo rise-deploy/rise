@@ -64,16 +64,15 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.
-- [~] Implement live membership expansion, per-item list filtering/projection,
+- [x] Implement live membership expansion, per-item list filtering/projection,
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing
   `require_operator`. The choke point is live on the generic resource API, with
   per-item list filtering, the allowlisted list-only projection, and
-  `metadata.effectiveLabels` on every response. Remaining: Controller writes
-  still go through `ResourceDefinition.allowedStatusControllerIds` rather than
-  RBAC, because a Controller is not a principal until its identity resource
-  exists; remove that allowlist once it is.
+  `metadata.effectiveLabels` on every response. Controllers are ordinary
+  `controller:<name>` principals evaluated by the same choke point; the
+  `ResourceDefinition.allowedStatusControllerIds` allowlist is removed.
 - [~] Add Role/policy audit and explain diagnostics for semantically inert
   configuration: no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
@@ -238,7 +237,7 @@ and secret handling remain kind-specific prerequisites.
   User names and exact SSO mappings.
 - [ ] Migrate `ServiceAccount` as an Organization child and trust mappings as
   `ServiceAccountTrustPolicy` children.
-- [ ] Migrate `Controller` as a root built-in and trust mappings as
+- [x] Migrate `Controller` as a root built-in and trust mappings as
   `ControllerTrustPolicy` children.
 - [ ] Migrate `Deployment` as a Project child after pagination and Watch;
   controllers update it through registered `status` and `finalizers`

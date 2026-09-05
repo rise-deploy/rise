@@ -20,7 +20,7 @@ algorithm/claim disambiguation rules, see the engineering reference in
 | **[Workload identity](#workload-identity-rs256)** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment_controller.identity_token_ttl_seconds` |
 | **[User login (OIDC)](#user-login-oidc)** | Accepted | per IdP | — | Rise (JWKS of `auth.issuer`) | `auth.issuer`, `auth.client_id`, `auth.client_secret` |
 | **[Service account](#service-accounts-cicd)** | Accepted | RS256 (JWKS) | project-scoped | Rise (JWKS of the SA issuer) | per-project (CLI/API managed) |
-| **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per identity | Rise (JWKS of controller issuer) | `auth.controllers[]` |
+| **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per policy | Rise (JWKS of the trust policy's issuer) | `Controller` + `ControllerTrustPolicy` resources |
 
 ## Tokens Rise issues
 
@@ -167,16 +167,24 @@ workflow in the Rise user documentation.
 
 ### Controllers
 
-Trusted external controllers authenticate with OIDC JWTs declared under
-`auth.controllers[]` — each entry binds a stable `id`, an `issuer`, and required
-`claims` (`aud` is mandatory; add `sub`/`scope`/etc. as needed; `*` wildcards are
-supported). Use a dedicated issuer or audience per controller to keep identities
-unambiguous.
+Trusted external controllers authenticate with OIDC JWTs matched against live
+`ControllerTrustPolicy` resources rather than static config. An operator
+creates a root-scoped `Controller` resource for the identity, then one or more
+`ControllerTrustPolicy` children under it, each declaring an `issuer` and
+required `claims` (`aud` is mandatory; add `sub`/`scope`/etc. as needed; `*`
+wildcards are supported). Several trust policies matching the *same*
+Controller is an ordinary match — a Controller may accept more than one
+issuer or claim shape; policies matching *different* Controllers make a token
+ambiguous and the request is refused with `409`. `spec.issuer` must equal the
+token's `iss` byte-for-byte, matching `UserIdentity`.
 
-> Controllers authenticate against the generic resource API
-> (`/api/v1/resources`). Today, built-in resources do not yet grant controllers
-> write access (their `allowed_status_controller_ids` is empty), so configuring
-> controllers is currently forward-looking — it is safe to set up ahead of time.
+> A Controller authenticates against the generic resource API
+> (`/api/v1/resources`) as the ordinary principal `controller:<name>`. What it
+> may do is decided by RBAC alone: grant it `update` on the `status` and
+> `finalizers` subresources of a kind (or any other verb) through a
+> `PlatformRoleBinding` naming that subject. See
+> [Controller authorization](/operator-docs/resources/api/#controller-authorization)
+> for the full model and a worked example.
 
 ## Security checklist
 

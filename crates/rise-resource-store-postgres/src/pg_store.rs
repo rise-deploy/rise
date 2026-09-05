@@ -2091,8 +2091,7 @@ impl ResourceStore for PgResourceStore {
         let mut connection = self.connection().await?;
         let row = sqlx::query(
             r#"
-            SELECT rd.uid, rd.group_name, rd.kind, rd.versions,
-                   rd.allowed_status_controller_ids, r.spec
+            SELECT rd.uid, rd.group_name, rd.kind, rd.versions, r.spec
             FROM resource_store.resource_definitions rd
             JOIN resource_store.resources r ON r.uid = rd.uid
             WHERE rd.plural = $1
@@ -2167,8 +2166,7 @@ impl ResourceStore for PgResourceStore {
         let mut connection = self.connection().await?;
         let row = sqlx::query(
             r#"
-            SELECT rd.uid, rd.group_name, rd.kind, rd.versions,
-                   rd.allowed_status_controller_ids, r.spec
+            SELECT rd.uid, rd.group_name, rd.kind, rd.versions, r.spec
             FROM resource_store.resource_definitions rd
             JOIN resource_store.resources r ON r.uid = rd.uid
             WHERE rd.group_name = $1 AND rd.plural = $2
@@ -2225,10 +2223,6 @@ impl ResourceStore for PgResourceStore {
             .collect();
         let api_version = Self::api_version(group, version);
 
-        let allowed: Vec<String> = row
-            .try_get("allowed_status_controller_ids")
-            .map_err(Self::db_error)?;
-
         let kind: String = row.try_get("kind").map_err(Self::db_error)?;
 
         // Use the cached validator, or compile one and store it in the cache. A schema that
@@ -2267,7 +2261,6 @@ impl ResourceStore for PgResourceStore {
             kind,
             parent: spec.parent,
             spec_validator: schema_validator,
-            allowed_status_controller_ids: allowed,
         }))
     }
 
@@ -2572,9 +2565,9 @@ impl ResourceStore for PgResourceStore {
             }
         };
 
-        // The mutable fields (versions, allowed_status_controller_ids) live in
-        // `spec`, which the `resources` UPDATE above already wrote — the
-        // `resource_definitions` view reflects it with no separate sync.
+        // The mutable `versions` field lives in `spec`, which the `resources`
+        // UPDATE above already wrote — the `resource_definitions` view
+        // reflects it with no separate sync.
         tx.commit().await.map_err(Self::db_error)?;
 
         self.invalidate_schema_cache_on_commit(&new_spec.group, &new_spec.plural);

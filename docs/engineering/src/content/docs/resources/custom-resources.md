@@ -48,8 +48,7 @@ curl -X POST \
             }
           }
         }
-      ],
-      "allowedStatusControllerIds": ["controller.example.com"]
+      ]
     }
   }' \
   https://rise.example.com/api/v1/resources/rise.dev/v1alpha1/resourcedefinitions
@@ -64,7 +63,6 @@ Naming convention: `ResourceDefinition.metadata.name` is `<plural>.<group>` (e.g
 - `plural` — DNS-label collection name (`widgets`). Globally unique across external definitions.
 - `parent` — optional `{apiVersion, kind}` of the parent collection. Omit for root-scoped kinds. The parent's `ResourceDefinition` must already exist; cyclic chains are rejected at registration.
 - `versions` — at least one entry; exactly one must have `storage: true`; at least one must have `served: true`. Each version may declare a JSON Schema for spec validation.
-- `allowedStatusControllerIds` — list of controller IDs allowed to write under `status.controllers` and `finalizers` for this collection. Empty list is default-deny; populate it with the controller IDs that should own status writes.
 
 ### Identity immutability
 
@@ -84,20 +82,20 @@ Status writes use a separate URL (`.../<name>/status`) and a separate body shape
 {"status": {"phase": "Ready", "lastReconciledAt": "2026-05-26T00:00:00Z"}}
 ```
 
-The body's `status` value is stored verbatim under `status.controllers[<id>]`, where `<id>` is the controller's `identity_id` (the stable string from its `ControllerIdentity`). Other controller slots are unaffected. The update applies unconditionally to the latest row and bumps `revision`.
+The body's `status` value is stored verbatim under `status.controllers[<name>]`, where `<name>` is the calling Controller's resource name. Other controller slots are unaffected. The update applies unconditionally to the latest row and bumps `revision`. Access is an ordinary RBAC decision — see [Controller authorization](/operator-docs/resources/api/#controller-authorization) for how to grant a controller `update` on this subresource.
 
 Operator status writes use the same endpoint and store under `status.controllers["operator:<email>"]`. This is the recovery path when a controller has been deprovisioned and its status slot needs to be cleared or overridden.
 
 ## Controller-owned finalizers
 
-A finalizer is a string token in `metadata.finalizers` that blocks hard-delete while present. The convention is `<controller-id>/<reason>` (e.g. `controller.example.com/cleanup`). Controllers add their finalizer when they take ownership, do their cleanup on observing `metadata.deletionTimestamp`, then remove it.
+A finalizer is a string token in `metadata.finalizers` that blocks hard-delete while present. The convention is `<controller-name>/<reason>` (e.g. `widget-controller/cleanup`), where `<controller-name>` is the calling Controller's resource name. Controllers add their finalizer when they take ownership, do their cleanup on observing `metadata.deletionTimestamp`, then remove it.
 
 ```http
 PUT /api/v1/resources/example.dev/v1/widgets/acme/my-widget/finalizers
-{"add": ["controller.example.com/cleanup"], "remove": []}
+{"add": ["widget-controller/cleanup"], "remove": []}
 ```
 
-Controllers can only manipulate finalizers whose name corresponds to a controller-owned token. The reserved `system.rise.dev/*` prefix is rejected by the controller-finalizer path regardless of `controller_id` — this includes the cascade-deletion finalizer the store manages itself.
+A controller can only manipulate finalizers named `<its own resource name>` or `<its own resource name>/<reason>`. The reserved `system.rise.dev/*` prefix is rejected by the controller-finalizer path regardless of caller — this includes the cascade-deletion finalizer the store manages itself.
 
 ## Version lifecycle and controller-driven migration
 

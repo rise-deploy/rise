@@ -364,7 +364,6 @@ impl ResourceStore for FakeStore {
                 kind: parent.clone(),
             }),
             spec_validator: Arc::new(NoOpValidator),
-            allowed_status_controller_ids: Vec::new(),
         }))
     }
     async fn register_resource_definition(

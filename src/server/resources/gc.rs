@@ -570,7 +570,6 @@ mod tests {
                     "plural": "widgets",
                     "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": [CONTROLLER_ID]
                 }),
                 validator: None,
             })

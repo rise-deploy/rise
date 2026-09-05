@@ -201,11 +201,21 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Lightweight guard: skip JWKS fetch if neither a controller nor any SA
-        // uses this issuer. Controller issuers are in static config (O(1));
-        // SA issuers require a DB round-trip and are only checked when the
-        // issuer isn't already a known controller issuer.
-        if !state.controllers_by_issuer.contains_key(&issuer) {
+        // Lightweight guard: skip JWKS fetch unless a live controller trust
+        // policy or a known SA uses this issuer. The controller check is a
+        // single indexed query; the SA check is only run when it doesn't
+        // already answer yes.
+        let is_controller_issuer =
+            crate::server::auth::controller::controller_issuer_exists(&state.db_pool, &issuer)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to check controller issuer existence: {:#}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Database error".to_string(),
+                    )
+                })?;
+        if !is_controller_issuer {
             let sa_issuer_exists = service_accounts::issuer_exists(&state.db_pool, &issuer)
                 .await
                 .map_err(|e| {

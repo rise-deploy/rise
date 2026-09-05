@@ -10,6 +10,7 @@ use rise_resource_api::{
 use rise_resource_store_postgres::{
     BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
     PgResourceStore, SerializableTransaction, TrustPolicyLookup,
+    CONTROLLER_CANDIDATES_BY_ISSUER_SQL,
 };
 use serde_json::json;
 use sqlx::Executor;
@@ -63,7 +64,6 @@ async fn generic_create_rejects_resource_definitions(pool: sqlx::PgPool) -> sqlx
                 "kind": "User",
                 "plural": "users",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -135,7 +135,6 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
                     "kind": "Widget",
                     "plural": plural,
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": []
                 }),
                 validator: None,
             })
@@ -422,7 +421,6 @@ async fn update_api_version_collision_returns_name_conflict(
                     "kind": "Widget",
                     "plural": plural,
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": []
                 }),
                 validator: None,
             })
@@ -796,7 +794,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                 "kind": "Widget",
                 "plural": "widgets",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -839,7 +836,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                     {"name": "v1", "served": false, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
                 ],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -865,7 +861,6 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -905,7 +900,6 @@ async fn delete_resource_definition_rejects_existing_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let definition = store
@@ -971,7 +965,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let definition = store
@@ -1017,7 +1010,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
     let definition = store
         .update_resource_definition(
@@ -1053,7 +1045,6 @@ async fn register_resource_definition_rejects_reserved_plural(
         "kind": "Organization",
         "plural": "organizations",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1098,7 +1089,6 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
                 "kind": "ResourceDefinition",
                 "plural": "customdefinitions",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -1128,7 +1118,6 @@ async fn database_guard_rejects_post_activation_legacy_definition_bypass(
         "kind": "User",
         "plural": "users",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     }))
     .execute(&pool)
     .await
@@ -1156,7 +1145,6 @@ async fn register_resource_definition_rejects_zero_served_versions(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": false, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1195,7 +1183,6 @@ async fn register_resource_definition_root_and_parent_validation(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     store
         .register_resource_definition(CreateResourceParams {
@@ -1220,7 +1207,6 @@ async fn register_resource_definition_root_and_parent_validation(
         "plural": "gadgets",
         "parent": {"apiVersion": "no-slash", "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let err = store
         .register_resource_definition(CreateResourceParams {
@@ -1256,7 +1242,6 @@ async fn register_resource_definition_rejects_parent_cycles(
             "kind": kind,
             "plural": plural,
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": []
         });
         if let Some(pk) = parent_kind {
             spec["parent"] = json!({"apiVersion": "cycle.dev/v1", "kind": pk});
@@ -1338,7 +1323,6 @@ async fn register_resource_definition_rejects_duplicate_identity(
             "kind": kind,
             "plural": plural,
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": []
         }),
         validator: None,
     };
@@ -1611,7 +1595,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1639,7 +1622,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let updated = store
@@ -1679,7 +1661,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let rd = store
@@ -1722,7 +1703,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
 
     store
@@ -1772,7 +1752,6 @@ async fn update_resource_definition_rejects_identity_change(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1797,7 +1776,6 @@ async fn update_resource_definition_rejects_identity_change(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1839,7 +1817,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let rd = store
@@ -1882,7 +1859,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v2", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let err = store
         .update_resource_definition(
@@ -1912,7 +1888,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     store
         .update_resource_definition(
@@ -1944,7 +1919,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "plural": "widgets",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1969,7 +1943,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "plural": "widgets",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": "Project"},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -2011,7 +1984,6 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false, "schema": {"type": "not-a-json-schema-type"}}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -2058,7 +2030,6 @@ async fn update_resource_definition_invalidates_schema_cache(
                 "properties": {"color": {"type": "string"}}
             }
         }],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -2101,7 +2072,6 @@ async fn update_resource_definition_invalidates_schema_cache(
                 "properties": {"size": {"type": "number"}}
             }
         }],
-        "allowedStatusControllerIds": []
     });
 
     store
@@ -2152,7 +2122,6 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         "kind": "Gadget",
         "plural": "gadgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -2515,7 +2484,6 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         "kind": "Blocked",
         "plural": "blockeds",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let register_error = store
         .register_resource_definition(CreateResourceParams {
@@ -2573,7 +2541,6 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
                 "kind": "Organization",
                 "plural": "custom-organizations",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -2732,7 +2699,6 @@ async fn register_example_widget_rd(store: &PgResourceStore) {
                     {"name": "v1", "served": true, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
                 ],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -3851,6 +3817,188 @@ async fn narrow_identity_trust_and_membership_lookups_filter_live_builtin_facts(
     Ok(())
 }
 
+#[sqlx::test]
+async fn controller_candidates_by_issuer_filters_live_controllers_and_ignores_other_kinds(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let issuer = Issuer::new("https://token.example").unwrap();
+
+    let controller = create_builtin_resource(
+        &store,
+        CONTROLLER_KIND,
+        "reconciler",
+        None,
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-a",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-a"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-b",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-b"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A second, live Controller with its own policy on the same issuer — a
+    // real match, since a caller collapses candidates by controller_uid and
+    // more than one distinct uid is what makes a token ambiguous.
+    let other_controller =
+        create_builtin_resource(&store, CONTROLLER_KIND, "watcher", None, json!({}), vec![])
+            .await
+            .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-c",
+        Some(other_controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-c"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A tombstoned Controller's policy must not surface, even though the
+    // policy row itself is still live.
+    let decommissioned = create_builtin_resource(
+        &store,
+        CONTROLLER_KIND,
+        "decommissioned",
+        None,
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "orphaned",
+        Some(decommissioned.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(decommissioned.uid).await.unwrap();
+
+    // A tombstoned policy under a live Controller must not surface either.
+    let deleted_policy = create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "deleted",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(deleted_policy.uid).await.unwrap();
+
+    // A ServiceAccountTrustPolicy on the same issuer is a different kind and
+    // must not surface.
+    let org = create_org(&store, "candidate-org").await;
+    let service_account = create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_KIND,
+        "deployer",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_TRUST_POLICY_KIND,
+        "ci",
+        Some(service_account.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let trust = TrustPolicyLookup::new(pool.clone());
+    let candidates = trust
+        .controller_candidates_by_issuer(&issuer)
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| (
+                candidate.controller_name.as_str(),
+                candidate.policy_name.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("reconciler", "github-a"),
+            ("reconciler", "github-b"),
+            ("watcher", "github-c"),
+        ]
+    );
+    assert_eq!(candidates[0].controller_uid, controller.uid);
+    assert_eq!(candidates[2].controller_uid, other_controller.uid);
+
+    assert!(trust
+        .controller_candidates_by_issuer(&Issuer::new("https://other.example").unwrap())
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert!(trust.controller_issuer_exists(&issuer).await.unwrap());
+    assert!(!trust
+        .controller_issuer_exists(&Issuer::new("https://other.example").unwrap())
+        .await
+        .unwrap());
+
+    // The candidates query has no leading-column condition on `policy`, so at
+    // this table's tiny test-scale row count the planner can satisfy it via a
+    // controller-first nested loop through unrelated indexes instead of the
+    // dedicated partial index this migration adds. Drop those alternate paths
+    // so the assertion actually exercises whether the SQL text still matches
+    // `controller_trust_policies_issuer`'s predicate — the real regression this
+    // guards, since the predicate must be repeated verbatim (see
+    // `maximum_identity_index_keys_fit_and_projection_queries_use_their_indexes`).
+    let mut connection = pool.acquire().await?;
+    connection
+        .execute("DROP INDEX resource_store.workload_trust_parent_issuer")
+        .await?;
+    connection
+        .execute("DROP INDEX resource_store.resources_child_kind_name_unique")
+        .await?;
+    connection.execute("SET enable_seqscan = off").await?;
+    let plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        CONTROLLER_CANDIDATES_BY_ISSUER_SQL
+    ))
+    .bind("https://token.example")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        plan.join("\n").contains("controller_trust_policies_issuer"),
+        "{}",
+        plan.join("\n")
+    );
+    Ok(())
+}
+
 async fn execute_resource_migration(pool: &sqlx::PgPool, version: i64) -> Result<(), sqlx::Error> {
     let migrator = sqlx::migrate!("./migrations");
     let migration = migrator
@@ -4179,7 +4327,6 @@ async fn register_org_widget_rd(store: &PgResourceStore) {
                 "plural": "orgwidgets",
                 "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })

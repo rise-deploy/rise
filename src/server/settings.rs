@@ -733,11 +733,6 @@ pub struct AuthSettings {
     /// as `admin_idp_groups`.
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub operator_idp_groups: Vec<String>,
-    /// Trusted external controller identities. Each entry binds a stable
-    /// controller ID to an OIDC issuer plus required claim constraints.
-    /// Used by generic-resource controller endpoints.
-    #[serde(default)]
-    pub controllers: Vec<crate::server::auth::controller::ControllerIdentity>,
     /// Platform access control configuration
     #[serde(default)]
     pub platform_access: PlatformAccessConfig,

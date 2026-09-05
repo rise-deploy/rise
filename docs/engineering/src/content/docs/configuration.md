@@ -233,7 +233,6 @@ auth:
   admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
   operator_idp_groups: ["..."]  # IdP groups whose members are Operators (array, optional)
-  controllers: []               # Trusted external controller identities (array, optional)
   allow_team_creation: true     # Allow regular users to create teams (default: true)
                                 # When false, only admins can create teams
 ```
@@ -278,21 +277,8 @@ Three consequences:
 
 The same resolution backs `platform_access.allowed_idp_groups`.
 
-**Controllers (`auth.controllers`):**
-Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. Controller endpoints are not yet available; this configuration takes effect when the generic resource API is introduced in a future release. Use a dedicated issuer or a dedicated audience per controller to keep identities unambiguous.
-
-```yaml
-auth:
-  controllers:
-    - id: "controller.example.com/my-ctrl"  # DNS subdomain + optional /name suffix
-      issuer: "https://controller-idp.example.com"
-      claims:                                # required; wildcard match per claim
-        aud: "rise-controller"               # required; string or array JWT `aud` may match
-        sub: "my-controller-*"               # optional subject constraint
-        scope: "controller"
-```
-
-`claims.aud` is required for every controller identity. Other constraints, including `sub`, are configured in `claims`. Controller endpoints require a token that matches one configured controller identity. Service-account endpoints still use project-scoped service-account claims; a token that matches a configured controller identity is rejected as a service-account token.
+**Controllers:**
+Controller identities are not configured here — they are `Controller` and `ControllerTrustPolicy` resources managed through the generic resource API. See [Authentication & Tokens — Controllers](/operator-docs/authentication/#controllers) for how to register one.
 
 **Team Creation Control:**
 - `allow_team_creation = true` (default): All authenticated users can create teams

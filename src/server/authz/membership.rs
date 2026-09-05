@@ -59,16 +59,21 @@ pub struct OperatorSelectors {
 }
 
 /// Resolves live Group ties and operator standing for one request.
+///
+/// A Controller principal holds neither: `user` is `None` for it, and
+/// `resolve` answers empty without consulting the store, matching the engine's
+/// contract that non-User principals hold no Group ties or operator standing.
 pub struct RiseMembershipResolver {
     session: PgSession,
     store: Arc<dyn ResourceStore>,
     memberships: MembershipLookup,
     operators: OperatorSelectors,
-    /// The authenticated User this resolver answers for. Authentication already
-    /// resolved the credential to this row, and the principal carries its UID,
+    /// The authenticated User this resolver answers for, or `None` for a
+    /// non-User principal (a Controller). Authentication already resolved the
+    /// credential to this row when present, and the principal carries its UID,
     /// so the resolver reads the *live* facts — Group ties and IdP groups —
     /// rather than re-resolving who the caller is.
-    user: User,
+    user: Option<User>,
 }
 
 impl RiseMembershipResolver {
@@ -79,7 +84,7 @@ impl RiseMembershipResolver {
         session: PgSession,
         store: Arc<dyn ResourceStore>,
         operators: OperatorSelectors,
-        user: User,
+        user: Option<User>,
     ) -> Self {
         Self {
             memberships: MembershipLookup::in_session(session.clone()),
@@ -148,7 +153,7 @@ impl RiseMembershipResolver {
     /// would take an advisory lock on the user id here and in every
     /// `team_members` writer — the same remedy, and the same reasoning, as the
     /// `TODO(multi-org)` in `resources/organization.rs`.
-    async fn is_operator(&self) -> Result<bool, AuthorizationError> {
+    async fn is_operator(&self, user: &User) -> Result<bool, AuthorizationError> {
         let mut connection = self.session.acquire().await?;
         // The checked form: inside the write path this runs on the
         // transaction's own connection, where a lost race is an instruction to
@@ -158,7 +163,7 @@ impl RiseMembershipResolver {
             &mut *connection,
             &self.operators.users,
             &self.operators.idp_groups,
-            &self.user,
+            user,
         )
         .await
         .map_err(|error| {
@@ -214,22 +219,29 @@ impl MembershipResolver for RiseMembershipResolver {
     ) -> Result<PrincipalMembership, AuthorizationError> {
         // Group ties and operator standing belong to Users alone (ADR-0001 §1);
         // the engine rejects a resolver that claims either for a workload
-        // identity, so answering empty here is the contract, not a shortcut.
+        // identity (a Controller), so answering empty here is the contract,
+        // not a shortcut.
         if !principal.is_user() {
             return Ok(PrincipalMembership::default());
         }
+        let user = self.user.as_ref().ok_or_else(|| {
+            AuthorizationError::Membership(
+                "resolver was built without a User but was asked about a user principal"
+                    .to_string(),
+            )
+        })?;
         // The resolver is built for one request's principal; answering for
         // another would attribute one caller's ties to another.
-        if principal.subject_uid() != self.user.id {
+        if principal.subject_uid() != user.id {
             return Err(AuthorizationError::Membership(format!(
                 "resolver holds user {} but was asked about {}",
-                self.user.id,
+                user.id,
                 principal.subject_uid()
             )));
         }
         Ok(PrincipalMembership {
             groups: self.group_ties(principal.subject()).await?,
-            is_operator: self.is_operator().await?,
+            is_operator: self.is_operator(user).await?,
         })
     }
 
