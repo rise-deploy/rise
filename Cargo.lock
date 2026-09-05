@@ -4329,7 +4329,6 @@ dependencies = [
  "jsonwebtoken 10.4.0",
  "rand 0.10.2",
  "rsa",
- "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2 0.11.0",
