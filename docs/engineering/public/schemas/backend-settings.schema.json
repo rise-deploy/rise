@@ -131,14 +131,6 @@
         "client_secret": {
           "type": "string"
         },
-        "controllers": {
-          "default": [],
-          "description": "Trusted external controller identities. Each entry binds a stable\ncontroller ID to an OIDC issuer plus required claim constraints.\nUsed by generic-resource controller endpoints.",
-          "items": {
-            "$ref": "#/$defs/ControllerIdentity"
-          },
-          "type": "array"
-        },
         "idp_group_claim": {
           "default": "groups",
           "description": "Claim in the IdP ID token that contains group names (default: \"groups\").\nFor example, AWS Cognito commonly exposes groups as \"cognito:groups\".",
@@ -205,32 +197,6 @@
         "issuer",
         "client_id",
         "client_secret"
-      ],
-      "type": "object"
-    },
-    "ControllerIdentity": {
-      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow [`validate_custom_claims`]\nglob rules (`*` matches any sequence of characters).",
-      "properties": {
-        "claims": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "description": "Expected string-valued claim constraints. `aud` is required and may\nmatch either a string JWT `aud` or one member of an array JWT `aud`.\nPut `sub` here when a subject constraint is needed. Glob `*` supported.",
-          "type": "object"
-        },
-        "id": {
-          "description": "Stable controller ID written under `status.controllers`. Must be a\nDNS subdomain with an optional single `/name` suffix, e.g.\n`controller.example.com` or `controller.example.com/my-ctrl`.",
-          "type": "string"
-        },
-        "issuer": {
-          "description": "OIDC issuer URL. Used for JWKS discovery and `iss` validation.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "issuer"
       ],
       "type": "object"
     },

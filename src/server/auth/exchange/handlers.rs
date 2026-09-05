@@ -12,12 +12,12 @@ use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine as _};
 
 use crate::db::{projects, service_accounts, users};
+use crate::server::auth::controller::{self, ControllerResolution};
 use crate::server::auth::sa_match::{match_service_account, SaMatchError};
 use crate::server::rate_limit::extract_client_ip;
 use crate::server::state::AppState;
 use rise_backend_auth::{
-    is_rise_issued_jwt, match_controller_identity, verify_external_jwt, AuthError, ControllerMatch,
-    PrincipalClaims, Scope,
+    is_rise_issued_jwt, verify_external_jwt, AuthError, PrincipalClaims, Scope,
 };
 
 use super::models::{
@@ -101,19 +101,29 @@ async fn exchange_inner(
         ));
     }
 
-    // 2. Issuer guard: only configured controllers or known SA issuers. Avoid
-    //    leaking unknown-issuer vs no-match beyond the coarse invalid_grant.
-    let issuer_known = state.controllers_by_issuer.contains_key(&issuer) || {
-        match service_accounts::issuer_exists(&state.db_pool, &issuer).await {
-            Ok(exists) => exists,
-            Err(e) => {
-                tracing::error!("Token exchange: failed to check issuer existence: {:?}", e);
-                return Err(ExchangeError::temporarily_unavailable(
-                    "issuer lookup failed",
-                ));
+    // 2. Issuer guard: only live controller trust policies or known SA
+    //    issuers. Avoid leaking unknown-issuer vs no-match beyond the coarse
+    //    invalid_grant.
+    let issuer_known = controller::controller_issuer_exists(&state.db_pool, &issuer)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "Token exchange: failed to check controller issuer existence: {:?}",
+                e
+            );
+            ExchangeError::temporarily_unavailable("issuer lookup failed")
+        })?
+        || {
+            match service_accounts::issuer_exists(&state.db_pool, &issuer).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::error!("Token exchange: failed to check issuer existence: {:?}", e);
+                    return Err(ExchangeError::temporarily_unavailable(
+                        "issuer lookup failed",
+                    ));
+                }
             }
-        }
-    };
+        };
     if !issuer_known {
         return Err(ExchangeError::invalid_grant(
             "subject_token could not be validated",
@@ -158,16 +168,9 @@ async fn exchange_inner(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        resolve_service_account(
-            &state.db_pool,
-            &state.controllers_by_issuer,
-            identity,
-            &issuer,
-            claims,
-        )
-        .await?
+        resolve_service_account(&state.db_pool, identity, &issuer, claims).await?
     } else {
-        resolve_controller(state, &issuer, claims)?
+        resolve_controller(&state.db_pool, &issuer, claims).await?
     };
 
     // 6. Mint the access token, TTL-clamped.
@@ -192,8 +195,9 @@ async fn exchange_inner(
             jti = %minted.jti,
             "Token exchange: minted service-account access token"
         ),
-        AuditSubject::Controller { identity_id } => tracing::info!(
-            controller_identity_id = %identity_id,
+        AuditSubject::Controller { name, uid } => tracing::info!(
+            controller = %name,
+            controller_uid = %uid,
             source_iss = %issuer,
             source_sub = %source_sub,
             jti = %minted.jti,
@@ -213,7 +217,7 @@ async fn exchange_inner(
 #[derive(Debug)]
 enum AuditSubject {
     ServiceAccount { sa_id: uuid::Uuid, project: String },
-    Controller { identity_id: String },
+    Controller { name: String, uid: uuid::Uuid },
 }
 
 /// Resolve a project service-account exchange. `identity` is the SA's
@@ -224,10 +228,6 @@ enum AuditSubject {
 /// cannot be enumerated through this endpoint.
 async fn resolve_service_account(
     pool: &sqlx::PgPool,
-    controllers_by_issuer: &std::collections::HashMap<
-        String,
-        Vec<crate::server::auth::controller::ControllerIdentity>,
-    >,
     identity: &str,
     issuer: &str,
     claims: &serde_json::Value,
@@ -236,6 +236,20 @@ async fn resolve_service_account(
     // assumed with this token" outcome (unknown email, not-an-SA, wrong issuer,
     // claim mismatch). Must stay byte-identical so the cases are indistinguishable.
     let reject = || ExchangeError::invalid_grant("subject_token could not be validated");
+
+    // A token satisfying a live controller trust policy is never a service
+    // account, whatever claims it also happens to carry.
+    match controller::resolve_external(pool, issuer, claims)
+        .await
+        .map_err(|e| {
+            tracing::error!("Token exchange: controller lookup failed: {:?}", e);
+            ExchangeError::temporarily_unavailable("controller lookup failed")
+        })? {
+        ControllerResolution::Controller(_) | ControllerResolution::Ambiguous(_) => {
+            return Err(reject());
+        }
+        ControllerResolution::NotAController => {}
+    }
 
     // identity (email) -> synthetic user.
     let user = match users::find_by_email(pool, identity).await {
@@ -268,15 +282,10 @@ async fn resolve_service_account(
         return Err(reject());
     }
 
-    // Validate the token's claims against the SA (and reject controller tokens).
-    // The slice is single-element, so `Ambiguous` is unreachable, but it is
-    // handled defensively rather than via `unreachable!`.
-    match match_service_account(
-        claims,
-        issuer,
-        std::slice::from_ref(&sa),
-        controllers_by_issuer,
-    ) {
+    // Validate the token's claims against the SA. The slice is single-element,
+    // so `Ambiguous` is unreachable, but it is handled defensively rather than
+    // via `unreachable!`.
+    match match_service_account(claims, std::slice::from_ref(&sa)) {
         Ok(_) => {}
         Err(SaMatchError::MalformedClaims(sa_id)) => {
             tracing::error!(
@@ -287,7 +296,7 @@ async fn resolve_service_account(
                 "service account claims configuration is invalid",
             ));
         }
-        // ControllerToken / NoMatch / Ambiguous(*) all fail closed and coarse.
+        // NoMatch / Ambiguous(*) both fail closed and coarse.
         Err(_) => return Err(reject()),
     };
 
@@ -332,37 +341,38 @@ async fn resolve_service_account(
 }
 
 /// Resolve a controller exchange (no `identity` supplied).
-fn resolve_controller(
-    state: &AppState,
+async fn resolve_controller(
+    pool: &sqlx::PgPool,
     issuer: &str,
     claims: &serde_json::Value,
 ) -> Result<(String, PrincipalClaims, AuditSubject), ExchangeError> {
-    let Some(candidates) = state.controllers_by_issuer.get(issuer) else {
-        // Issuer is a known SA issuer but no identity was supplied and it is not a
-        // controller issuer — nothing to exchange.
-        return Err(ExchangeError::invalid_grant(
-            "identity is required for this token",
-        ));
-    };
-
-    match match_controller_identity(claims, candidates) {
-        ControllerMatch::Single(ident) => {
-            let principal = PrincipalClaims::Controller {
-                identity_id: ident.id.clone(),
+    match controller::resolve_external(pool, issuer, claims)
+        .await
+        .map_err(|e| {
+            tracing::error!("Token exchange: controller lookup failed: {:?}", e);
+            ExchangeError::temporarily_unavailable("controller lookup failed")
+        })? {
+        ControllerResolution::Controller(principal) => {
+            let claim = PrincipalClaims::Controller {
+                name: principal.name.clone(),
+                uid: principal.uid,
             };
             Ok((
-                format!("rise:ctrl:{}", ident.id),
-                principal,
+                format!("controller:{}", principal.name),
+                claim,
                 AuditSubject::Controller {
-                    identity_id: ident.id.clone(),
+                    name: principal.name,
+                    uid: principal.uid,
                 },
             ))
         }
-        ControllerMatch::Multiple(_) => Err(ExchangeError::invalid_grant(
+        ControllerResolution::Ambiguous(_) => Err(ExchangeError::invalid_grant(
             "subject_token matched multiple controller identities (ambiguous configuration)",
         )),
-        ControllerMatch::Unmatched(_) => Err(ExchangeError::invalid_grant(
-            "subject_token could not be validated",
+        // Issuer is a known SA issuer but no identity was supplied and it is
+        // not a controller issuer — nothing to exchange.
+        ControllerResolution::NotAController => Err(ExchangeError::invalid_grant(
+            "identity is required for this token",
         )),
     }
 }
@@ -405,6 +415,11 @@ mod tests {
         /// Create a project + SA trusting `issuer` with `sub`-matching claims;
         /// return `(sa_id, project_id, the SA's synthetic-user email)`.
         async fn setup(pool: &sqlx::PgPool, issuer: &str) -> (uuid::Uuid, uuid::Uuid, String) {
+            // resolve_service_account also checks live controller trust
+            // policies, which live in the resource-store schema.
+            rise_resource_store_postgres::run_migrations(pool)
+                .await
+                .expect("resource store migrations");
             let owner = users::create(pool, "owner@example.com").await.unwrap();
             let project = projects::create(
                 pool,
@@ -444,15 +459,10 @@ mod tests {
             let (sa_id, project_id, email) = setup(&pool, "https://gitlab.com").await;
             let token_claims =
                 serde_json::json!({ "sub": "deploy-bot", "iss": "https://gitlab.com" });
-            let (sub, principal, _audit) = resolve_service_account(
-                &pool,
-                &HashMap::new(),
-                &email,
-                "https://gitlab.com",
-                &token_claims,
-            )
-            .await
-            .unwrap();
+            let (sub, principal, _audit) =
+                resolve_service_account(&pool, &email, "https://gitlab.com", &token_claims)
+                    .await
+                    .unwrap();
             assert_eq!(sub, format!("rise:sa:{sa_id}"));
             match principal {
                 PrincipalClaims::ServiceAccount { project_id: p, .. } => assert_eq!(p, project_id),
@@ -468,24 +478,22 @@ mod tests {
             let (_sa, _proj, email) = setup(&pool, "https://gitlab.com").await;
             let token_claims =
                 serde_json::json!({ "sub": "deploy-bot", "iss": "https://evil.example" });
-            let err = resolve_service_account(
-                &pool,
-                &HashMap::new(),
-                &email,
-                "https://evil.example",
-                &token_claims,
-            )
-            .await
-            .unwrap_err();
+            let err = resolve_service_account(&pool, &email, "https://evil.example", &token_claims)
+                .await
+                .unwrap_err();
             assert!(is_invalid_grant(&err));
         }
 
         #[sqlx::test]
         async fn rejects_unknown_identity(pool: sqlx::PgPool) {
+            // resolve_service_account also checks live controller trust
+            // policies, which live in the resource-store schema.
+            rise_resource_store_postgres::run_migrations(&pool)
+                .await
+                .expect("resource store migrations");
             let token_claims = serde_json::json!({ "sub": "x", "iss": "https://gitlab.com" });
             let err = resolve_service_account(
                 &pool,
-                &HashMap::new(),
                 "nobody+0@sa.rise.local",
                 "https://gitlab.com",
                 &token_claims,

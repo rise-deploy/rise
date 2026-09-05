@@ -11,7 +11,6 @@ use crate::server::registry::{
 use rise_backend_auth::RiseTokenSigner;
 
 use crate::db::models::User;
-use crate::server::auth::controller::ControllerIdentity;
 #[cfg(feature = "backend")]
 use crate::server::registry::{
     models::{EcrConfig, GitLabRegistryConfig, JfrogConfig, JfrogTokenProvider},
@@ -77,12 +76,6 @@ pub struct AppState {
     pub operator_users: Arc<Vec<String>>,
     /// IdP groups whose members hold the Operator role.
     pub operator_idp_groups: Arc<Vec<String>>,
-    /// Controller identities keyed by `id`. Consumed by future generic
-    /// resource endpoints; unused in PR3.
-    #[allow(dead_code)]
-    pub controllers: Arc<HashMap<String, ControllerIdentity>>,
-    /// Controller identities indexed by issuer URL for middleware lookup.
-    pub controllers_by_issuer: Arc<HashMap<String, Vec<ControllerIdentity>>>,
     /// Generic-resource store used by the `/api/v1/resources` HTTP API and
     /// (later) by internal controllers wanting to reconcile against Rise state
     /// without a network round-trip.
@@ -1161,21 +1154,6 @@ impl AppState {
             },
         );
 
-        // Validate and index configured controller identities
-        let controller_indexes =
-            crate::server::auth::controller::build_controller_indexes(&settings.auth.controllers)
-                .context("Failed to load controller identities from auth.controllers")?;
-        let controllers = Arc::new(controller_indexes.by_id);
-        let controllers_by_issuer = Arc::new(controller_indexes.by_issuer);
-        if !controllers.is_empty() {
-            let ids: Vec<&str> = controllers.keys().map(String::as_str).collect();
-            tracing::info!(
-                "Configured {} controller identity(ies): {:?}",
-                controllers.len(),
-                ids
-            );
-        }
-
         // Store auth settings for issuer comparison
         let auth_settings = Arc::new(settings.auth.clone());
 
@@ -2029,8 +2007,6 @@ impl AppState {
             admin_idp_groups,
             operator_users,
             operator_idp_groups,
-            controllers,
-            controllers_by_issuer,
             #[cfg(feature = "backend")]
             resource_store,
             #[cfg(feature = "backend")]

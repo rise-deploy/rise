@@ -1049,11 +1049,7 @@ async fn dispatch_put_controller(
             // that is not on it must not learn whether the item it named
             // exists. Collection existence it can already observe (see above),
             // and that is the whole of what it learns here.
-            enforce_controller_allowed(
-                &resolved.info,
-                &resolved.collection,
-                &controller.0.identity_id,
-            )?;
+            enforce_controller_allowed(&resolved.info, &resolved.collection, &controller.0.name)?;
             let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
             match subresource {
                 Subresource::Status => {
@@ -1820,12 +1816,12 @@ async fn apply_controller_status(
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let updated = ctx
         .store
-        .update_controller_status(row.uid, &controller.0.identity_id, body.status)
+        .update_controller_status(row.uid, &controller.0.name, body.status)
         .await
         .map_err(store_error_to_server_error)?;
     tracing::info!(
         target: "rise::audit",
-        actor = %controller.0.identity_id,
+        actor = %controller.0.name,
         uid = %row.uid,
         api_version = %row.api_version,
         kind = %row.kind,
@@ -1844,12 +1840,12 @@ async fn apply_controller_finalizers(
 ) -> Result<Json<rise_resource_api::Resource>, ServerError> {
     let updated = ctx
         .store
-        .update_controller_finalizers(row.uid, &controller.0.identity_id, &body.add, &body.remove)
+        .update_controller_finalizers(row.uid, &controller.0.name, &body.add, &body.remove)
         .await
         .map_err(store_error_to_server_error)?;
     tracing::info!(
         target: "rise::audit",
-        actor = %controller.0.identity_id,
+        actor = %controller.0.name,
         uid = %row.uid,
         api_version = %row.api_version,
         kind = %row.kind,
@@ -2095,10 +2091,9 @@ mod dispatch_tests {
     /// An `AnyAuth` carrying a controller token with the given controller id.
     fn any_controller(id: &str) -> AnyAuth {
         AnyAuth::Controller(ControllerAuthContext(
-            crate::server::auth::controller::VerifiedControllerToken {
-                identity_id: id.to_string(),
-                issuer: "https://issuer.example.com".into(),
-                claims: json!({}),
+            crate::server::auth::controller::ControllerPrincipal {
+                name: id.to_string(),
+                uid: Uuid::new_v4(),
             },
         ))
     }

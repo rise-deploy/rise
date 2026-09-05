@@ -100,8 +100,14 @@ pub enum PrincipalClaims {
     },
     /// A trusted controller identity.
     Controller {
-        /// The matched controller's stable identity id.
-        identity_id: String,
+        /// The Controller resource's canonical name (also the subject
+        /// `controller:<name>` names, and the writer key stored under
+        /// `status.controllers`).
+        name: String,
+        /// The Controller resource's UID. Plays the `rise_uid` role ADR-0001
+        /// describes for other identities: a recreated same-name Controller
+        /// gets a fresh uid, invalidating tokens minted for the old one.
+        uid: Uuid,
     },
 }
 
@@ -130,9 +136,10 @@ impl std::fmt::Debug for PrincipalClaims {
                 .field("allowed_environment_ids", allowed_environment_ids)
                 .field("scopes", scopes)
                 .finish(),
-            PrincipalClaims::Controller { identity_id } => f
+            PrincipalClaims::Controller { name, uid } => f
                 .debug_struct("Controller")
-                .field("identity_id", identity_id)
+                .field("name", name)
+                .field("uid", uid)
                 .finish(),
         }
     }
@@ -155,7 +162,7 @@ pub struct AccessClaims {
     pub iss: String,
     /// Audience (Rise public URL) — verified by the middleware like a session token.
     pub aud: String,
-    /// Stable principal id: `rise:sa:<sa_id>`, `rise:ctrl:<id>`, or a user uuid.
+    /// Stable principal id: `rise:sa:<sa_id>`, `controller:<name>`, or a user uuid.
     pub sub: String,
     /// Issued at timestamp.
     pub iat: u64,

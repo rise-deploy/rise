@@ -1228,11 +1228,7 @@ pub async fn create_deployment(
     // Only mask auth failures (401/403) as 404 to prevent project existence leakage;
     // preserve 409 (SA collision) and 5xx (misconfiguration) for diagnosability.
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2182,11 +2178,7 @@ pub async fn update_deployment_status_by_project(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2279,11 +2271,7 @@ pub async fn update_deployment_status(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2334,11 +2322,7 @@ pub async fn list_deployments(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2456,11 +2440,7 @@ pub async fn stop_deployments_by_group(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2581,11 +2561,7 @@ pub async fn stop_deployment(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2722,11 +2698,7 @@ pub async fn get_deployment_by_project(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2816,11 +2788,7 @@ pub async fn list_deployment_groups(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2996,11 +2964,7 @@ pub async fn list_deployment_containers(
     // Mirrors the log endpoint: a caller who cannot see the project is told it
     // does not exist, so existence itself does not leak.
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -3087,11 +3051,7 @@ pub async fn list_deployment_events(
     // Mirrors the log endpoint: a caller who cannot see the project is told it
     // does not exist, so existence itself does not leak.
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -3218,11 +3178,7 @@ pub async fn stream_deployment_logs(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -3408,11 +3364,7 @@ pub async fn query_deployment_log_volume(
         .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
 
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {

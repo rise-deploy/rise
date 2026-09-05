@@ -391,7 +391,7 @@ impl RiseTokenSigner {
     /// [`RiseToken::Access`] (and the session/ingress adapters reject it).
     ///
     /// # Arguments
-    /// * `sub` - stable principal id (`rise:sa:<id>`, `rise:ctrl:<id>`, ...)
+    /// * `sub` - stable principal id (`rise:sa:<id>`, `controller:<name>`, ...)
     /// * `principal` - the fully-resolved principal to embed
     /// * `aud` - the `aud` claim (the Rise public URL)
     /// * `ttl_secs` - token lifetime in seconds (caller clamps to the max TTL)

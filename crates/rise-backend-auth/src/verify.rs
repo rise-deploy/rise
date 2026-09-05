@@ -343,7 +343,8 @@ mod tests {
 
     fn controller_principal() -> crate::PrincipalClaims {
         crate::PrincipalClaims::Controller {
-            identity_id: "controller.example.com".to_string(),
+            name: "controller-example".to_string(),
+            uid: uuid::Uuid::nil(),
         }
     }
 
@@ -352,7 +353,7 @@ mod tests {
         let signer = create_test_signer();
         let (token, minted) = signer
             .sign_access_jwt(
-                "rise:ctrl:controller.example.com",
+                "controller:controller-example",
                 controller_principal(),
                 "https://rise.test",
                 600,
@@ -366,7 +367,7 @@ mod tests {
 
         match signer.verify_rise_jwt(&token).unwrap() {
             RiseToken::Access(c) => {
-                assert_eq!(c.sub, "rise:ctrl:controller.example.com");
+                assert_eq!(c.sub, "controller:controller-example");
                 assert_eq!(c.aud, "https://rise.test");
                 assert_eq!(c.iss, "https://rise.test");
                 assert_eq!(c.jti, minted.jti);
@@ -384,7 +385,7 @@ mod tests {
         let signer = create_test_signer();
         let (token, _) = signer
             .sign_access_jwt(
-                "rise:ctrl:x",
+                "controller:x",
                 controller_principal(),
                 "https://rise.test",
                 600,
@@ -414,7 +415,7 @@ mod tests {
             "aud": "https://rise.test",
             "iat": now(),
             "exp": now() + 3600,
-            "principal": { "kind": "controller", "identity_id": "x" },
+            "principal": { "kind": "controller", "name": "x", "uid": "00000000-0000-0000-0000-000000000000" },
         });
         let header = Header::new(Algorithm::HS256); // default typ "JWT"
         let token = encode(&header, &claims, &hs256_key()).unwrap();
@@ -451,7 +452,7 @@ mod tests {
         // AccessClaims-shaped).
         let (access_token, _) = signer
             .sign_access_jwt(
-                "rise:ctrl:x",
+                "controller:x",
                 controller_principal(),
                 "https://rise.test",
                 600,
