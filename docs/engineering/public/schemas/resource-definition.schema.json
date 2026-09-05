@@ -37,14 +37,8 @@
       "type": "object"
     },
     "ResourceDefinitionSpec": {
+      "additionalProperties": false,
       "properties": {
-        "allowedStatusControllerIds": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
         "group": {
           "type": "string"
         },

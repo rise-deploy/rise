@@ -233,7 +233,7 @@ pub struct OrganizationStatus {
 pub type OrganizationResource = Resource<OrganizationSpec, OrganizationStatus>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceDefinitionSpec {
     pub group: String,
     pub kind: String,
@@ -243,8 +243,6 @@ pub struct ResourceDefinitionSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ResourceParentRef>,
     pub versions: Vec<ResourceDefinitionVersion>,
-    #[serde(default)]
-    pub allowed_status_controller_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

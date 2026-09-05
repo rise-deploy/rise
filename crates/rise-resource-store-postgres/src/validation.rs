@@ -1,8 +1,8 @@
 use rise_resource_api::{
     is_reserved_collection_name, is_reserved_resource_kind, validate_collection_name,
-    validate_controller_id, validate_resource_group, validate_resource_kind,
-    validate_resource_version, OrganizationSpec, OrganizationStatus, ResourceDefinitionSpec,
-    ResourceDefinitionStatus, SpecValidator, ValidationError, RESOURCE_DEFINITION_KIND,
+    validate_resource_group, validate_resource_kind, validate_resource_version, OrganizationSpec,
+    OrganizationStatus, ResourceDefinitionSpec, ResourceDefinitionStatus, SpecValidator,
+    ValidationError, RESOURCE_DEFINITION_KIND,
 };
 
 pub struct OrganizationValidator;
@@ -97,10 +97,6 @@ impl SpecValidator for ResourceDefinitionValidator {
             validate_resource_version(&v.name)?;
         }
 
-        for id in &parsed.allowed_status_controller_ids {
-            validate_controller_id(id)?;
-        }
-
         Ok(())
     }
 
@@ -156,7 +152,6 @@ mod tests {
             "kind": kind,
             "plural": plural,
             "versions": [{"name":"v1", "served":true, "storage":true}],
-            "allowedStatusControllerIds": []
         })
     }
 

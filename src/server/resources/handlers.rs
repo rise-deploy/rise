@@ -1,17 +1,15 @@
 //! HTTP handlers for the generic resource API.
 //!
-//! Every user-authenticated path is authorized through the choke point in
-//! `crate::server::authz` — one `(verb, ResourceKind, subresource?)` decision
-//! per resource, evaluated against that resource's own ancestry and effective
-//! labels (ADR-0001 §4), plus the write-time grant gate on any change that
-//! delegates authority (§5). Operators reach everything because the seeded
-//! `system-admin` binding says so, not because of a check in front of the API.
-//!
-//! The controller-specific status/finalizer endpoints are the exception: they
-//! authenticate via the `AnyAuth` extractor and remain gated to controllers
-//! listed in the collection's `allowed_status_controller_ids` (default-deny on
-//! an empty list). Controllers become ordinary principals — and that allowlist
-//! goes away — when Controller identity resources go live.
+//! Every authenticated path — User or Controller alike — is authorized
+//! through the choke point in `crate::server::authz` — one
+//! `(verb, ResourceKind, subresource?)` decision per resource, evaluated
+//! against that resource's own ancestry and effective labels (ADR-0001 §4),
+//! plus the write-time grant gate on any change that delegates authority
+//! (§5). Operators reach everything because the seeded `system-admin`
+//! binding says so, not because of a check in front of the API. A Controller
+//! reaches its `status` and `finalizers` subresources the same way: through
+//! ordinary `PlatformRoleBinding`s naming its `controller:<name>` subject,
+//! never through a per-collection allowlist.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1255,37 +1253,6 @@ async fn owner_is_live(authz: &AuthorizationContext, uid: Uuid) -> Result<bool, 
         .is_some_and(|row| row.deletion_timestamp.is_none()))
 }
 
-/// `allowedStatusControllerIds` is an authorization decision, and the only one
-/// the grant gate cannot express.
-///
-/// Every id on a `ResourceDefinition`'s list grants that controller `status` and
-/// `finalizers` writes over every resource of the kind, in every organization —
-/// but a controller is not a subject the engine can evaluate until its identity
-/// resource exists, so there is no binding to diff and no recipient to compare a
-/// writer against. Until then, changing the list stays operator authority:
-/// otherwise an ordinary `update` on a `ResourceDefinition` would confer
-/// authority no `RoleBinding` granted and no gate ever weighed. The allowlist
-/// goes away entirely once Controller identities are live (`ROADMAP.md` §1).
-fn require_operator_for_controller_allowlist(
-    authz: &AuthorizationContext,
-    before: &serde_json::Value,
-    after: &serde_json::Value,
-) -> Result<(), ServerError> {
-    let ids = |spec: &serde_json::Value| -> Vec<serde_json::Value> {
-        spec.get("allowedStatusControllerIds")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default()
-    };
-    if ids(before) == ids(after) || authz.is_operator() {
-        return Ok(());
-    }
-    Err(ServerError::forbidden(
-        "changing allowedStatusControllerIds requires operator standing: it grants \
-         controllers status and finalizer writes outside the authorization model",
-    ))
-}
-
 /// Run the grant gate over every authorization-changing effect of one write.
 ///
 /// The caller has already established ordinary write authority; this is the
@@ -1381,9 +1348,6 @@ async fn create_resource(
     let spec = serde_json::to_value(&body.spec)
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
-    if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
-        require_operator_for_controller_allowlist(authz, &serde_json::Value::Null, &spec)?;
-    }
     authorize_owner_references(authz, None, &[], &body.metadata.owner_references).await?;
 
     let mut changes = change_for_create(
@@ -1541,9 +1505,6 @@ async fn update_resource(
     let spec = serde_json::to_value(&body.spec)
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
-    if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
-        require_operator_for_controller_allowlist(authz, &row.spec, &spec)?;
-    }
     authorize_owner_references(
         authz,
         Some(&target),
@@ -1781,7 +1742,6 @@ mod tests {
             kind: "Organization".into(),
             parent: None,
             spec_validator: std::sync::Arc::new(NoOpValidator),
-            allowed_status_controller_ids: vec![],
         };
 
         // Matching apiVersion and kind must be accepted.
@@ -1985,10 +1945,8 @@ mod dispatch_tests {
     }
 
     /// Register a root-scoped `widgets` collection (group `example.dev`) served
-    /// at both `v1` and `v2`, with `v1` as the storage version. `allowed`
-    /// becomes the collection's `allowedStatusControllerIds`.
-    async fn register_widget_rd(ctx: &ResourceApiCtx, allowed: &[&str]) {
-        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+    /// at both `v1` and `v2`, with `v1` as the storage version.
+    async fn register_widget_rd(ctx: &ResourceApiCtx) {
         let spec = json!({
             "group": "example.dev",
             "kind": "Widget",
@@ -1997,7 +1955,6 @@ mod dispatch_tests {
                 {"name": "v1", "served": true, "storage": true},
                 {"name": "v2", "served": true, "storage": false},
             ],
-            "allowedStatusControllerIds": allowed,
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
@@ -2018,16 +1975,13 @@ mod dispatch_tests {
 
     /// Register an Organization-scoped `gadgets` collection whose declared
     /// parent is the built-in `rise.dev/v1alpha1` `Organization` (depth 1).
-    /// `allowed` becomes the collection's `allowedStatusControllerIds`.
-    async fn register_gadget_rd(ctx: &ResourceApiCtx, allowed: &[&str]) {
-        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+    async fn register_gadget_rd(ctx: &ResourceApiCtx) {
         let spec = json!({
             "group": "example.dev",
             "kind": "Gadget",
             "plural": "gadgets",
             "parent": {"apiVersion": "rise.dev/v1alpha1", "kind": "Organization"},
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": allowed,
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
@@ -2055,7 +2009,6 @@ mod dispatch_tests {
             "plural": "gizmos",
             "parent": {"apiVersion": "example.dev/v1", "kind": "Gadget"},
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": [],
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
@@ -2174,7 +2127,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn labels_round_trip_through_the_http_surface(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let resp = dispatch_post_inner(
             &ctx,
@@ -2270,7 +2223,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn list_without_a_grant_is_masked_empty(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
 
         let resp = dispatch_get_inner(
@@ -2292,7 +2245,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn item_without_a_grant_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
 
         let refused = dispatch_get_inner(
@@ -2376,7 +2329,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_stored_finalizer_is_not_reported_to_a_caller_who_cannot_read_it(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_at(
             &ctx,
             "example.dev/v1/widgets",
@@ -2415,7 +2368,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_create_under_an_invisible_parent_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         let body = json!({
             "apiVersion": "example.dev/v1",
@@ -2481,7 +2434,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_readable_item_refuses_a_write_by_name(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let widget = create_widget(&ctx, "example.dev/v1", "one").await;
         grant_authenticated(
             &ctx,
@@ -2519,7 +2472,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn write_without_a_grant_is_refused(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let err = dispatch_post_inner(
             &ctx,
@@ -2552,7 +2505,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn list_grant_projects_metadata_and_get_expands_it(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
         grant_authenticated(
             &ctx,
@@ -2615,7 +2568,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn effective_labels_resolve_through_the_ancestor_chain(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_at(
             &ctx,
             "rise.dev/v1alpha1/organizations",
@@ -2689,7 +2642,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_main_write_cannot_change_finalizers(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         let created = create_widget(&ctx, "example.dev/v1", "held").await;
         let uid = uid_of(&created);
         ctx.store
@@ -2763,7 +2716,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_create_cannot_plant_a_reserved_finalizer(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let err = dispatch_post_inner(
             &ctx,
@@ -2791,7 +2744,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_status_write_does_not_return_the_spec(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
         grant_authenticated(
             &ctx,
@@ -2835,60 +2788,6 @@ mod dispatch_tests {
         assert_eq!(body["spec"]["size"], "large");
     }
 
-    /// `allowedStatusControllerIds` grants controllers status and finalizer
-    /// writes outside the authorization model, so changing it stays operator
-    /// authority until Controller identities make it expressible as policy.
-    #[sqlx::test]
-    async fn changing_the_controller_allowlist_requires_an_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        grant_authenticated(
-            &ctx,
-            "rd-editor",
-            json!([{
-                "effect": "Allow",
-                "kinds": ["rise.dev/ResourceDefinition"],
-                "verbs": ["get", "list", "update"],
-            }]),
-        )
-        .await;
-
-        let fetched = dispatch_get_inner(
-            &ctx,
-            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            auth(OPERATOR),
-            PendingDeletionQuery::default(),
-        )
-        .await
-        .expect("read the RD");
-        let (_, fetched) = read(fetched).await;
-        let mut spec = fetched["spec"].clone();
-        spec["allowedStatusControllerIds"] = json!(["ci.example.com"]);
-
-        let err = dispatch_put_inner(
-            &ctx,
-            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            auth(PLAIN_USER),
-            json!({
-                "apiVersion": "rise.dev/v1alpha1",
-                "kind": "ResourceDefinition",
-                "metadata": {
-                    "name": "widgets.example.dev",
-                    "revision": fetched["metadata"]["revision"],
-                },
-                "spec": spec,
-            }),
-        )
-        .await
-        .expect_err("only an operator may widen the controller allowlist");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        assert!(
-            err.message.contains("allowedStatusControllerIds"),
-            "{}",
-            err.message
-        );
-    }
-
     // -------------------------------------------------------------------------
     // Owner references are a lifecycle edge, and attaching one needs authority
     // -------------------------------------------------------------------------
@@ -2902,7 +2801,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn attaching_an_owner_reference_needs_delete_on_the_dependent(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         let victim = create_widget(&ctx, "example.dev/v1", "victim").await;
         // The caller may edit widgets and use the owner, but may not delete.
@@ -2948,7 +2847,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn attaching_an_owner_reference_needs_use_on_the_owner(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         // Everything except `use` on the owner.
         grant_authenticated(
@@ -3023,7 +2922,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn detaching_an_owner_reference_needs_use_on_the_owner(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         let owner_reference = json!({
             "apiVersion": "example.dev/v1",
@@ -3128,7 +3027,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn holding_an_owner_open_needs_delete_on_it(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         // Everything except `delete`.
         grant_authenticated(
@@ -3205,7 +3104,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn detaching_from_a_deleted_owner_is_ungated(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         let dependent = create_at(
             &ctx,
@@ -3280,7 +3179,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn deletion_blockers_are_filtered_per_item(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
             &ctx,
@@ -3343,7 +3242,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn creation_may_label_a_new_resource_for_its_creator(pool: sqlx::PgPool) {
         let ctx = ctx(pool.clone()).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_authenticated(
             &ctx,
             "widget-author",
@@ -3392,7 +3291,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn relabelling_ownership_without_holding_it_is_refused(pool: sqlx::PgPool) {
         let ctx = ctx(pool.clone()).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // An editor: they may write the resource, but hold none of the
         // `resource-owner` set that owning it would confer (no `delete`).
         grant_authenticated(
@@ -3466,7 +3365,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn an_owner_may_transfer_ownership(pool: sqlx::PgPool) {
         let ctx = ctx(pool.clone()).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_authenticated(
             &ctx,
             "widget-author",
@@ -3528,7 +3427,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn grant_gate_refuses_delegating_authority_the_writer_lacks(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // The caller may author platform bindings, and may list Widgets. That is
         // the whole of their authority.
         grant_authenticated(&ctx, "binding-author", json!([{
@@ -3586,7 +3485,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn attaching_a_policy_row_to_an_owner_is_gated_as_a_delete(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // A platform Deny nobody may lift, capping every authenticated caller.
         create_at(
             &ctx,
@@ -3688,7 +3587,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn deleting_an_organization_is_gated_on_the_policy_it_would_take(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
             &ctx,
@@ -3872,7 +3771,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn activation_is_gated_on_the_names_group_ties(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
             &ctx,
@@ -4014,7 +3913,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn grant_gate_permits_delegating_authority_the_writer_holds(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_authenticated(&ctx, "binding-author", json!([{
             "effect": "Allow",
             "kinds": ["rise.dev/PlatformRoleBinding", "rise.dev/PlatformRole", "example.dev/Widget"],
@@ -4070,7 +3969,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn operator_path_allows_operator_by_idp_group(pool: sqlx::PgPool) {
         let ctx = ctx_with_operators(pool.clone(), vec![], vec!["platform-operators".into()]).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let user = crate::db::users::create(&pool, "grouped@example.com")
             .await
@@ -4148,7 +4047,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn operator_path_allows_operator(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let resp = dispatch_get_inner(
             &ctx,
@@ -4171,7 +4070,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn status_subresource_rejects_a_user_holding_neither_grant(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         // Holding neither the subresource grant nor `get` on the resource, the
@@ -4228,7 +4127,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn status_subresource_allows_operator_user(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         // An operator user can write status and finalizers without a controller token.
@@ -4260,7 +4159,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn bound_controller_can_write_status_and_finalizers(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
         grant_controller(
             &ctx,
@@ -4326,7 +4225,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn unbound_controller_is_masked_like_any_other_ungranted_principal(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "real").await;
 
         let present = dispatch_put_inner(
@@ -4356,7 +4255,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn controller_without_finalizer_grant_gets_named_403(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
         grant_controller(
             &ctx,
@@ -4391,7 +4290,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn controller_with_full_grant_can_create_update_delete_items(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_controller(
             &ctx,
             "reconciler",
@@ -4445,7 +4344,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn controller_get_and_list_honor_rbac(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         let err = dispatch_get_inner(
@@ -4509,7 +4408,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn wrong_method_on_collection_yields_405(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // PUT is not valid for a collection path.
         let err = dispatch_put_inner(
@@ -4532,7 +4431,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn get_on_subresource_yields_405(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         let err = dispatch_get_inner(
@@ -4549,7 +4448,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn post_on_item_yields_405(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         // POST is only valid for collection paths.
@@ -4608,7 +4507,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn item_not_found_yields_404(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // Collection exists, item does not.
         let err = dispatch_get_inner(
             &ctx,
@@ -4628,7 +4527,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn resource_created_via_v1_listed_via_v2_keeps_requested_version(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // Create through the v1 served version.
         let created = create_widget(&ctx, "example.dev/v1", "w1").await;
@@ -4669,7 +4568,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn create_via_undefined_version_yields_404(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // The `widgets` plural exists but `v3` is not a version it declares. An
         // undefined (or unserved) version is not addressable — 404, as
         // Kubernetes returns for an unserved apiVersion.
@@ -4688,7 +4587,7 @@ mod dispatch_tests {
     async fn write_to_non_storage_version_yields_422(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         // `register_widget_rd` registers v1 as storage, v2 as served non-storage.
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // POST to the non-storage served version v2 must be rejected with 422.
         let err = dispatch_post_inner(
@@ -4742,7 +4641,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn duplicate_name_create_yields_409(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "dup").await;
 
         // Creating a second widget with the same name in the same scope.
@@ -4764,7 +4663,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn stale_revision_update_yields_409(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let created = create_widget(&ctx, "example.dev/v1", "w1").await;
         let revision = created["metadata"]["revision"].as_i64().unwrap();
 
@@ -4811,7 +4710,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_listing_under_a_missing_ancestor_is_masked_empty(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
 
         // `gadgets` is Organization-scoped (depth 1). The ancestor *type* is
         // derived from the ResourceDefinition graph and cannot be mistyped in
@@ -4862,7 +4761,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn excess_segments_for_root_collection_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // `widgets` is root-scoped (depth 0): a path may carry at most an item
         // name plus a subresource keyword. More name segments than that is a
@@ -4885,7 +4784,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn create_get_update_delete_lifecycle(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // Create.
         let created = create_widget(&ctx, "example.dev/v1", "lifecycle").await;
@@ -5179,7 +5078,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn create_with_mismatched_kind_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let err = dispatch_post_inner(
             &ctx,
@@ -5204,7 +5103,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn pending_deletion_lists_tombstoned_resources(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let created = create_widget(&ctx, "example.dev/v1", "w1").await;
         let uid: Uuid = created["metadata"]["uid"]
@@ -5260,7 +5159,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn deletion_blockers_reports_blocking_relationships(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = ctx
             .store
             .create(CreateResourceParams {
@@ -5337,7 +5236,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_malformed_create_under_an_invisible_parent_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         let bogus = json!({
             "apiVersion": "example.dev/v1",
@@ -5412,7 +5311,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_writer_without_get_has_finalizers_preserved_not_reported(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_at(
             &ctx,
             "example.dev/v1/widgets",
@@ -5538,7 +5437,6 @@ mod dispatch_tests {
                 {"name": "v1", "served": false, "storage": true},
                 {"name": "v2", "served": true, "storage": false},
             ],
-            "allowedStatusControllerIds": [],
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
@@ -5611,7 +5509,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn depth_1_chain_classifies_list_item_subresource(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &["controller.example.com"]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
 
         // Create a gadget under acme — POST to the depth-1 list path.
@@ -5680,7 +5578,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn depth_2_chain_resolves_list_and_item(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         register_gizmo_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
@@ -5730,8 +5628,8 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn uid_form_resolves_nested_resource_without_ancestors(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         let gadget = create_at(
             &ctx,
@@ -5770,7 +5668,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn uid_token_mid_chain_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
 
         // A `uid:` token is valid only as the sole identifier segment; following
         // an ancestor name it is a 400 — and the parent-chain walk is not even
@@ -5789,7 +5687,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn leaf_resource_named_status_resolves_as_item(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "status").await;
 
         // `widgets` is depth 0, so `widgets/status` is D + 1 segments: the
@@ -5817,7 +5715,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn update_resource_definition_via_put(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // Step 1: GET the RD through the HTTP layer to obtain its current revision.
         let resp = dispatch_get_inner(
@@ -5843,7 +5741,6 @@ mod dispatch_tests {
                 {"name": "v2", "served": true, "storage": false},
                 {"name": "v3", "served": true, "storage": false},
             ],
-            "allowedStatusControllerIds": [],
         });
         let resp = dispatch_put_inner(
             &ctx,

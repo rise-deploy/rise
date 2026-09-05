@@ -64,7 +64,6 @@ async fn generic_create_rejects_resource_definitions(pool: sqlx::PgPool) -> sqlx
                 "kind": "User",
                 "plural": "users",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -136,7 +135,6 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
                     "kind": "Widget",
                     "plural": plural,
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": []
                 }),
                 validator: None,
             })
@@ -423,7 +421,6 @@ async fn update_api_version_collision_returns_name_conflict(
                     "kind": "Widget",
                     "plural": plural,
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": []
                 }),
                 validator: None,
             })
@@ -797,7 +794,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                 "kind": "Widget",
                 "plural": "widgets",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -840,7 +836,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                     {"name": "v1", "served": false, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
                 ],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -866,7 +861,6 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -906,7 +900,6 @@ async fn delete_resource_definition_rejects_existing_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let definition = store
@@ -972,7 +965,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let definition = store
@@ -1018,7 +1010,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
     let definition = store
         .update_resource_definition(
@@ -1054,7 +1045,6 @@ async fn register_resource_definition_rejects_reserved_plural(
         "kind": "Organization",
         "plural": "organizations",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1099,7 +1089,6 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
                 "kind": "ResourceDefinition",
                 "plural": "customdefinitions",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -1129,7 +1118,6 @@ async fn database_guard_rejects_post_activation_legacy_definition_bypass(
         "kind": "User",
         "plural": "users",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     }))
     .execute(&pool)
     .await
@@ -1157,7 +1145,6 @@ async fn register_resource_definition_rejects_zero_served_versions(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": false, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1196,7 +1183,6 @@ async fn register_resource_definition_root_and_parent_validation(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     store
         .register_resource_definition(CreateResourceParams {
@@ -1221,7 +1207,6 @@ async fn register_resource_definition_root_and_parent_validation(
         "plural": "gadgets",
         "parent": {"apiVersion": "no-slash", "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let err = store
         .register_resource_definition(CreateResourceParams {
@@ -1257,7 +1242,6 @@ async fn register_resource_definition_rejects_parent_cycles(
             "kind": kind,
             "plural": plural,
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": []
         });
         if let Some(pk) = parent_kind {
             spec["parent"] = json!({"apiVersion": "cycle.dev/v1", "kind": pk});
@@ -1339,7 +1323,6 @@ async fn register_resource_definition_rejects_duplicate_identity(
             "kind": kind,
             "plural": plural,
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": []
         }),
         validator: None,
     };
@@ -1612,7 +1595,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1640,7 +1622,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let updated = store
@@ -1680,7 +1661,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let rd = store
@@ -1723,7 +1703,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
 
     store
@@ -1773,7 +1752,6 @@ async fn update_resource_definition_rejects_identity_change(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1798,7 +1776,6 @@ async fn update_resource_definition_rejects_identity_change(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1840,7 +1817,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let rd = store
@@ -1883,7 +1859,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v2", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let err = store
         .update_resource_definition(
@@ -1913,7 +1888,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     store
         .update_resource_definition(
@@ -1945,7 +1919,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "plural": "widgets",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1970,7 +1943,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "plural": "widgets",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": "Project"},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -2012,7 +1984,6 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false, "schema": {"type": "not-a-json-schema-type"}}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -2059,7 +2030,6 @@ async fn update_resource_definition_invalidates_schema_cache(
                 "properties": {"color": {"type": "string"}}
             }
         }],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -2102,7 +2072,6 @@ async fn update_resource_definition_invalidates_schema_cache(
                 "properties": {"size": {"type": "number"}}
             }
         }],
-        "allowedStatusControllerIds": []
     });
 
     store
@@ -2153,7 +2122,6 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         "kind": "Gadget",
         "plural": "gadgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -2516,7 +2484,6 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         "kind": "Blocked",
         "plural": "blockeds",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let register_error = store
         .register_resource_definition(CreateResourceParams {
@@ -2574,7 +2541,6 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
                 "kind": "Organization",
                 "plural": "custom-organizations",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -2733,7 +2699,6 @@ async fn register_example_widget_rd(store: &PgResourceStore) {
                     {"name": "v1", "served": true, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
                 ],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -4362,7 +4327,6 @@ async fn register_org_widget_rd(store: &PgResourceStore) {
                 "plural": "orgwidgets",
                 "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })

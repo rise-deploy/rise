@@ -226,7 +226,6 @@ pub struct CollectionInfo {
     pub kind: String,
     pub parent: Option<ResourceParentRef>,
     pub spec_validator: Arc<dyn SpecValidator>,
-    pub allowed_status_controller_ids: Vec<String>,
 }
 
 /// The remotable half of the resource contract (ADR-0004 §3): the operations a
@@ -284,15 +283,20 @@ pub trait ResourceApi: Send + Sync {
     /// retain the owner. A resource without blocking dependents or finalizers is
     /// deleted immediately.
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
-    /// Merge one allowed controller's value under `status.controllers`.
+    /// Merge the calling Controller's value under
+    /// `status.controllers[<controller_id>]`. `controller_id` is the
+    /// authorized Controller subject's resource name, not a config-declared
+    /// identity — access to this method is an ordinary RBAC decision made
+    /// before it is called.
     async fn update_controller_status(
         &self,
         uid: Uuid,
         controller_id: &str,
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError>;
-    /// Atomically add/remove finalizers owned by an allowed controller while
+    /// Atomically add/remove finalizers owned by the calling Controller while
     /// rejecting the reserved system namespace and other controllers' keys.
+    /// `controller_id` is the authorized Controller subject's resource name.
     async fn update_controller_finalizers(
         &self,
         uid: Uuid,
