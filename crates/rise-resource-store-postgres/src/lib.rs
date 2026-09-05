@@ -10,8 +10,9 @@ mod models;
 
 pub use builtin::{BuiltInRegistration, BuiltInRegistry};
 pub use lookup::{
-    GroupMembershipFact, IdentityLookup, MembershipLookup, TrustPolicyFact, TrustPolicyLookup,
-    UserIdentityFact, CONTROLLER_TRUST_POLICIES_SQL, GROUPS_FOR_USER_SQL,
+    ControllerCandidate, GroupMembershipFact, IdentityLookup, MembershipLookup, TrustPolicyFact,
+    TrustPolicyLookup, UserIdentityFact, CONTROLLER_CANDIDATES_BY_ISSUER_SQL,
+    CONTROLLER_ISSUER_EXISTS_SQL, CONTROLLER_TRUST_POLICIES_SQL, GROUPS_FOR_USER_SQL,
     GROUP_TIES_BY_USER_NAME_SQL, SERVICE_ACCOUNT_TRUST_POLICIES_SQL,
     USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
 };

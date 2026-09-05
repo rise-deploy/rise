@@ -25,6 +25,22 @@ pub struct TrustPolicyFact<T> {
     pub spec: T,
 }
 
+/// One controller candidate matching a token's issuer: a live
+/// `ControllerTrustPolicy` and its live root `Controller` parent.
+///
+/// Distinct from [`TrustPolicyFact`] because a candidate search is keyed by
+/// issuer alone (the controller identity is what authentication is trying to
+/// resolve), while `for_controller` is target-bound and already knows the
+/// Controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerCandidate {
+    pub controller_uid: Uuid,
+    pub controller_name: String,
+    pub policy_uid: Uuid,
+    pub policy_name: String,
+    pub spec: ControllerTrustPolicySpec,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupMembershipFact {
     pub membership_uid: Uuid,
@@ -80,6 +96,59 @@ WHERE policy.api_version = 'rise.dev/v1alpha1'
   AND policy.parent_uid = target.uid
   AND (policy.spec->>'issuer') COLLATE "C" = $2 COLLATE "C"
 ORDER BY policy.name, policy.uid
+"#;
+
+/// Every live `ControllerTrustPolicy` matching a token's issuer, joined to its
+/// live root `Controller` parent. Unlike [`CONTROLLER_TRUST_POLICIES_SQL`] this
+/// is not target-bound: authentication does not yet know which Controller the
+/// token belongs to, which is exactly what this resolves.
+///
+/// The predicate on `policy` must match the partial index
+/// `controller_trust_policies_issuer` byte-for-byte (the `split_part` check
+/// included, even though `api_version` is also compared as a literal) for the
+/// planner to use it.
+#[doc(hidden)]
+pub const CONTROLLER_CANDIDATES_BY_ISSUER_SQL: &str = r#"
+SELECT controller.uid AS controller_uid,
+       controller.name AS controller_name,
+       policy.uid AS policy_uid,
+       policy.name AS policy_name,
+       policy.spec AS policy_spec
+FROM resource_store.resources policy
+JOIN resource_store.resources controller
+  ON controller.uid = policy.parent_uid
+ AND controller.api_version = 'rise.dev/v1alpha1'
+ AND controller.kind = 'Controller'
+ AND controller.parent_uid IS NULL
+ AND controller.deletion_timestamp IS NULL
+WHERE policy.api_version = 'rise.dev/v1alpha1'
+  AND split_part(policy.api_version, '/', 1) = 'rise.dev'
+  AND policy.kind = 'ControllerTrustPolicy'
+  AND policy.deletion_timestamp IS NULL
+  AND (policy.spec->>'issuer') COLLATE "C" = $1 COLLATE "C"
+ORDER BY controller.name, controller.uid, policy.name, policy.uid
+"#;
+
+/// Whether any live `ControllerTrustPolicy` under a live Controller declares
+/// this issuer — the cheap existence check the auth middleware uses to decide
+/// whether an unrecognized issuer is worth a JWKS fetch at all.
+#[doc(hidden)]
+pub const CONTROLLER_ISSUER_EXISTS_SQL: &str = r#"
+SELECT EXISTS (
+    SELECT 1
+    FROM resource_store.resources policy
+    JOIN resource_store.resources controller
+      ON controller.uid = policy.parent_uid
+     AND controller.api_version = 'rise.dev/v1alpha1'
+     AND controller.kind = 'Controller'
+     AND controller.parent_uid IS NULL
+     AND controller.deletion_timestamp IS NULL
+    WHERE policy.api_version = 'rise.dev/v1alpha1'
+      AND split_part(policy.api_version, '/', 1) = 'rise.dev'
+      AND policy.kind = 'ControllerTrustPolicy'
+      AND policy.deletion_timestamp IS NULL
+      AND (policy.spec->>'issuer') COLLATE "C" = $1 COLLATE "C"
+)
 "#;
 
 #[doc(hidden)]
@@ -214,6 +283,30 @@ impl TrustPolicyLookup {
             .map_err(StoreError::backend)?;
         parse_trust_rows(rows)
     }
+
+    /// Every live Controller candidate for a token's issuer, keyed only by
+    /// issuer since authentication does not yet know the Controller's uid.
+    pub async fn controller_candidates_by_issuer(
+        &self,
+        issuer: &Issuer,
+    ) -> Result<Vec<ControllerCandidate>, StoreError> {
+        let rows = sqlx::query_as::<_, ControllerCandidateRow>(CONTROLLER_CANDIDATES_BY_ISSUER_SQL)
+            .bind(issuer.as_str())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::backend)?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// Whether any live `ControllerTrustPolicy` declares this issuer, without
+    /// fetching or parsing the candidates themselves.
+    pub async fn controller_issuer_exists(&self, issuer: &Issuer) -> Result<bool, StoreError> {
+        sqlx::query_scalar(CONTROLLER_ISSUER_EXISTS_SQL)
+            .bind(issuer.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::backend)
+    }
 }
 
 #[derive(Clone)]
@@ -338,6 +431,29 @@ struct TrustFactRow {
     name: String,
     parent_uid: Uuid,
     spec: serde_json::Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct ControllerCandidateRow {
+    controller_uid: Uuid,
+    controller_name: String,
+    policy_uid: Uuid,
+    policy_name: String,
+    policy_spec: serde_json::Value,
+}
+
+impl TryFrom<ControllerCandidateRow> for ControllerCandidate {
+    type Error = StoreError;
+
+    fn try_from(row: ControllerCandidateRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            controller_uid: row.controller_uid,
+            controller_name: row.controller_name,
+            policy_uid: row.policy_uid,
+            policy_name: row.policy_name,
+            spec: parse_spec(row.policy_spec, "ControllerTrustPolicy")?,
+        })
+    }
 }
 
 fn parse_trust_rows<T>(rows: Vec<TrustFactRow>) -> Result<Vec<TrustPolicyFact<T>>, StoreError>

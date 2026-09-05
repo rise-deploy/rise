@@ -10,6 +10,7 @@ use rise_resource_api::{
 use rise_resource_store_postgres::{
     BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
     PgResourceStore, SerializableTransaction, TrustPolicyLookup,
+    CONTROLLER_CANDIDATES_BY_ISSUER_SQL,
 };
 use serde_json::json;
 use sqlx::Executor;
@@ -3847,6 +3848,188 @@ async fn narrow_identity_trust_and_membership_lookups_filter_live_builtin_facts(
             .unwrap()
             .len(),
         1
+    );
+    Ok(())
+}
+
+#[sqlx::test]
+async fn controller_candidates_by_issuer_filters_live_controllers_and_ignores_other_kinds(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let issuer = Issuer::new("https://token.example").unwrap();
+
+    let controller = create_builtin_resource(
+        &store,
+        CONTROLLER_KIND,
+        "reconciler",
+        None,
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-a",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-a"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-b",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-b"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A second, live Controller with its own policy on the same issuer — a
+    // real match, since a caller collapses candidates by controller_uid and
+    // more than one distinct uid is what makes a token ambiguous.
+    let other_controller =
+        create_builtin_resource(&store, CONTROLLER_KIND, "watcher", None, json!({}), vec![])
+            .await
+            .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-c",
+        Some(other_controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-c"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A tombstoned Controller's policy must not surface, even though the
+    // policy row itself is still live.
+    let decommissioned = create_builtin_resource(
+        &store,
+        CONTROLLER_KIND,
+        "decommissioned",
+        None,
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "orphaned",
+        Some(decommissioned.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(decommissioned.uid).await.unwrap();
+
+    // A tombstoned policy under a live Controller must not surface either.
+    let deleted_policy = create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "deleted",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(deleted_policy.uid).await.unwrap();
+
+    // A ServiceAccountTrustPolicy on the same issuer is a different kind and
+    // must not surface.
+    let org = create_org(&store, "candidate-org").await;
+    let service_account = create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_KIND,
+        "deployer",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_TRUST_POLICY_KIND,
+        "ci",
+        Some(service_account.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let trust = TrustPolicyLookup::new(pool.clone());
+    let candidates = trust
+        .controller_candidates_by_issuer(&issuer)
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| (
+                candidate.controller_name.as_str(),
+                candidate.policy_name.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("reconciler", "github-a"),
+            ("reconciler", "github-b"),
+            ("watcher", "github-c"),
+        ]
+    );
+    assert_eq!(candidates[0].controller_uid, controller.uid);
+    assert_eq!(candidates[2].controller_uid, other_controller.uid);
+
+    assert!(trust
+        .controller_candidates_by_issuer(&Issuer::new("https://other.example").unwrap())
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert!(trust.controller_issuer_exists(&issuer).await.unwrap());
+    assert!(!trust
+        .controller_issuer_exists(&Issuer::new("https://other.example").unwrap())
+        .await
+        .unwrap());
+
+    // The candidates query has no leading-column condition on `policy`, so at
+    // this table's tiny test-scale row count the planner can satisfy it via a
+    // controller-first nested loop through unrelated indexes instead of the
+    // dedicated partial index this migration adds. Drop those alternate paths
+    // so the assertion actually exercises whether the SQL text still matches
+    // `controller_trust_policies_issuer`'s predicate — the real regression this
+    // guards, since the predicate must be repeated verbatim (see
+    // `maximum_identity_index_keys_fit_and_projection_queries_use_their_indexes`).
+    let mut connection = pool.acquire().await?;
+    connection
+        .execute("DROP INDEX resource_store.workload_trust_parent_issuer")
+        .await?;
+    connection
+        .execute("DROP INDEX resource_store.resources_child_kind_name_unique")
+        .await?;
+    connection.execute("SET enable_seqscan = off").await?;
+    let plan: Vec<String> = sqlx::query_scalar(&format!(
+        "EXPLAIN (COSTS OFF) {}",
+        CONTROLLER_CANDIDATES_BY_ISSUER_SQL
+    ))
+    .bind("https://token.example")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        plan.join("\n").contains("controller_trust_policies_issuer"),
+        "{}",
+        plan.join("\n")
     );
     Ok(())
 }
