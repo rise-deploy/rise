@@ -41,18 +41,19 @@ When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` 
 
 ## Authorization
 
-Every user-authenticated request is authorized by the ADR-0001 engine: one
-`(verb, ResourceKind, subresource?)` decision per resource, evaluated against
-that resource's own ancestry and effective labels. There is no operator gate in
-front of the API any more. An operator reaches everything because the seeded
-`PlatformRoleBinding/system-admin` says so and because an operator's request
-ignores every `Deny`; anyone else reaches exactly what stored policy grants them.
+Every authenticated request — User or Controller alike — is authorized by the
+ADR-0001 engine: one `(verb, ResourceKind, subresource?)` decision per
+resource, evaluated against that resource's own ancestry and effective labels.
+There is no operator gate in front of the API any more. An operator reaches
+everything because the seeded `PlatformRoleBinding/system-admin` says so and
+because an operator's request ignores every `Deny`; anyone else reaches
+exactly what stored policy grants them.
 
 | Caller | How it is authorized |
 |---|---|
 | Operator (`auth.operator_users`, `auth.operator_idp_groups`) | Expands to `system:operators`, whose seeded binding allows every verb on every kind and subresource |
 | Any other authenticated user | Live RBAC: bindings that name them, one of their Groups, `org:<name>`, or `system:authenticated`, plus dynamic ownership bindings resolved from `rise.dev/owner` |
-| Controller (`auth.controllers` JWT) | PUT `status` and `finalizers` only, gated by the collection's `allowedStatusControllerIds` |
+| Controller (a live `Controller` resource) | Live RBAC like any other principal: bindings naming its `controller:<name>` subject. See [Controller authorization](#controller-authorization) |
 
 The verbs map onto the HTTP surface directly: `list` and `get` for reads,
 `create` for POST, `update` for item PUT and for the `status`/`finalizers`
@@ -201,9 +202,54 @@ Resource lifecycle operations are audit-logged on the `rise::audit` target. Reco
 
 ### Controller authorization
 
-A controller JWT is verified by `auth_middleware` against the configured `ControllerIdentity` (issuer + JWKS + claim constraints) and yields a `ControllerAuthContext` carrying the controller's `identity_id` (the stable string written under `status.controllers`).
+A controller JWT is matched against live `ControllerTrustPolicy` resources
+beneath a live root `Controller` and resolves to the ordinary principal
+`controller:<name>`, where `<name>` is the Controller resource's name. From
+there a Controller is authorized exactly like a User: the choke point
+evaluates `(verb, ResourceKind, subresource?)` against stored policy, with no
+separate controller-specific gate. An org `RoleBinding` never reaches a
+Controller — it belongs to no organization (ADR-0001 §3) — so a Controller's
+grants are always `PlatformRoleBinding`s.
 
-For a status/finalizer write, the handler additionally checks that the controller's `identity_id` appears in the resolved collection's `allowedStatusControllerIds`. An empty allowlist is **default-deny** — built-in collections (Organization, ResourceDefinition) currently have an empty allowlist, so controllers cannot write their status to built-ins until a future phase wires controller ownership for them.
+To let a controller reconcile a kind, create its identity and grant it access:
+
+```jsonc
+// 1. The Controller identity — root-scoped, one per controller process.
+POST /api/v1/resources/rise.dev/v1alpha1/controllers
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "Controller",
+  "metadata": { "name": "widget-controller" }, "spec": {} }
+
+// 2. What issuer/claims a token must present to authenticate as it.
+POST /api/v1/resources/rise.dev/v1alpha1/controllertrustpolicies/widget-controller
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "ControllerTrustPolicy",
+  "metadata": { "name": "github-actions" },
+  "spec": { "issuer": "https://token.actions.githubusercontent.com",
+            "claims": { "aud": "rise-controller", "sub": "repo:acme/widget-controller:*" } } }
+
+// 3. The permission to grant.
+POST /api/v1/resources/rise.dev/v1alpha1/platformroles
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "PlatformRole",
+  "metadata": { "name": "widget-controller-role" },
+  "spec": { "statements": [{ "effect": "Allow", "kinds": ["example.dev/Widget"],
+                              "verbs": ["get", "list", "update"],
+                              "subresources": ["status", "finalizers"] }] } }
+
+// 4. Bind it to the controller subject.
+POST /api/v1/resources/rise.dev/v1alpha1/platformrolebindings
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "PlatformRoleBinding",
+  "metadata": { "name": "widget-controller-binding" },
+  "spec": { "subject": "controller:widget-controller",
+            "roleRef": { "kind": "PlatformRole", "name": "widget-controller-role" } } }
+```
+
+Several trust policies matching the *same* Controller are an ordinary match — a
+Controller may accept more than one issuer or claim shape. Policies matching
+*different* Controllers make a token ambiguous and the request is refused with
+`409`. Deleting or tombstoning a Controller resource invalidates every token
+minted for it on the next request; a controller that still holds finalizers
+when its `PlatformRoleBinding` is removed can no longer clear them itself — a
+user with the same subresource grant can, through the same finalizers
+endpoint (see below).
 
 ## Request and response envelopes
 
@@ -270,7 +316,7 @@ Authorization: Bearer <operator-jwt>
     "name": "my-widget",
     "revision": 7,
     "annotations": {"team": "platform"},
-    "finalizers": ["controller.example.com/cleanup"],
+    "finalizers": ["widget-controller/cleanup"],
     "ownerReferences": []
   },
   "spec": {"color": "red"}
@@ -295,7 +341,7 @@ Authorization: Bearer <controller-jwt>
 {"status": {"phase": "Ready", "message": "all good"}}
 ```
 
-The body's `status` is stored under `status.controllers[<id>]` where `<id>` is the caller's `identity_id` (for controller tokens) or `operator:<email>` (for user writes, authorized by `(update, Kind, status)`). Other controller slots in `status.controllers` are unaffected. A controller can only write its own slot; a user write lands in its own writer-keyed slot and never overwrites a controller's.
+The body's `status` is stored under `status.controllers[<key>]` where `<key>` is the calling Controller's resource name (for a controller token) or `operator:<email>` (for a user write, authorized by `(update, Kind, status)`). Other slots in `status.controllers` are unaffected. A controller can only write its own slot; a user write lands in its own writer-keyed slot and never overwrites a controller's.
 
 The status update applies unconditionally to the latest row (no revision needed) and increments `revision`.
 
@@ -306,10 +352,10 @@ PUT /api/v1/resources/example.dev/v1/widgets/acme/my-widget/finalizers
 Content-Type: application/json
 Authorization: Bearer <controller-jwt>
 
-{"add": ["controller.example.com/cleanup"], "remove": []}
+{"add": ["widget-controller/cleanup"], "remove": []}
 ```
 
-`add` and `remove` are applied in a single transaction. Both lists may be empty. Adding or removing a `system.rise.dev/*` finalizer is rejected with `400`. Controllers can only add or remove finalizers whose name corresponds to a controller-owned token; a user write authorized by `(update, Kind, finalizers)` bypasses the controller-ownership check — that path is the deadlock-break for stuck cascade deletions — but the reserved-prefix guard still applies.
+`add` and `remove` are applied in a single transaction. Both lists may be empty. Adding or removing a `system.rise.dev/*` finalizer is rejected with `400`. A controller can only add or remove finalizers named `<its own resource name>` or `<its own resource name>/<reason>`; a user write authorized by `(update, Kind, finalizers)` bypasses that ownership check — that path is the deadlock-break for stuck cascade deletions — but the reserved-prefix guard still applies.
 
 ### Delete (cascade)
 

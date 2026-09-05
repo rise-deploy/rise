@@ -31,6 +31,42 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Controllers are RBAC principals; `auth.controllers` and the status/finalizer
+  allowlist are removed.** *Breaking.* A controller now authenticates by
+  matching a live `ControllerTrustPolicy` resource beneath a live root
+  `Controller` resource, not the `auth.controllers[]` config list — delete
+  that key, it is silently ignored if left in place. What a controller may do
+  is decided by RBAC alone: grant it `update` on a kind's `status` and
+  `finalizers` subresources (or any other verb) through an ordinary
+  `PlatformRoleBinding` naming its `controller:<name>` subject. There is no
+  more per-collection allowlist:
+  `ResourceDefinition.spec.allowedStatusControllerIds` is gone from the API
+  (a client that still sends it gets `400`) and is stripped from stored
+  definitions by migration.
+
+  Action required if you configured `auth.controllers` or
+  `allowedStatusControllerIds`:
+  - Create a `Controller` resource and one `ControllerTrustPolicy` child per
+    accepted issuer/claim shape, replacing each `auth.controllers[]` entry.
+  - Grant each controller a `PlatformRoleBinding` for the kinds and
+    subresources it needs — an empty grant now means the controller reaches
+    nothing, not that it reaches whatever `allowedStatusControllerIds` listed.
+  - If a controller is mid-reconcile with finalizers outstanding, grant its
+    binding *before* removing the allowlist entry (or grant it in the same
+    change), so it can still clear its own finalizers rather than needing an
+    operator's `operator_update_finalizers` recovery path.
+  - Re-exchange any cached access tokens: an exchanged controller token's
+    `sub` is now `controller:<name>` (was `rise:ctrl:<id>`) and its
+    `principal` claim carries `{kind: controller, name, uid}` instead of a
+    bare `identity_id`.
+  - The controller's writer key under `status.controllers` is now its
+    resource *name* (a DNS label), not the old config `id` (a DNS subdomain);
+    update finalizer prefixes (`<name>/<reason>`) to match.
+
+  See [Authentication & Tokens — Controllers](/operator-docs/authentication/#controllers)
+  and [Controller authorization](/operator-docs/resources/api/#controller-authorization)
+  for the full setup.
+
 - **ECS: a `capacity` setting, and service network configuration now converges.**
   *Config change.* `deployment_controller.capacity` selects where workload tasks
   run — `fargate` (the default, and what every existing install keeps doing) or
@@ -601,3 +637,13 @@ listed here so operators can anticipate them:
   path. The `rise::deprecation` raw-external-token metric (above) tells you when
   raw-token traffic has drained and it is safe to upgrade. Tracked in
   [#374](https://github.com/rise-deploy/rise/issues/374).
+- **Future — org-scoped controller enablement and API-group claims.** Now that
+  `allowedStatusControllerIds` is removed, a controller that loses its
+  `PlatformRoleBinding` mid-reconcile can no longer clear its own finalizers
+  (an operator can, via the existing recovery path). A design for
+  org-opt-in enablement and an exclusive, operator-granted API-group claim on
+  `Controller` is tracked in
+  [#437](https://github.com/rise-deploy/rise/issues/437); it does not change
+  anything documented above, but will add a required enablement step for
+  controllers registering `ResourceDefinition`s in an organization's own API
+  group.

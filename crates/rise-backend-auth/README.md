@@ -86,7 +86,7 @@ The signer (`RiseTokenSigner`) mints all four kinds — `sign_user_jwt` (Session
 `JwksKeySource`, verifies the RS256 signature against the matching `kid`, and
 enforces `iss` + `exp`. Audience and any custom-claim constraints are validated
 **separately** by the pure matchers ([`validate_custom_claims`],
-[`match_controller_identity`]) over the resulting `ExternalClaims`.
+[`match_trust_candidates`]) over the resulting `ExternalClaims`.
 
 ## Roadmap (still deferred)
 
@@ -109,10 +109,11 @@ enforces `iss` + `exp`. Audience and any custom-claim constraints are validated
   access tokens / `principal`-carrying tokens).
 - Claims: [`RiseClaims`], [`AccessClaims`], [`PrincipalClaims`], [`Scope`],
   [`WorkloadClaims`], [`WorkloadSubjectInfo`], [`ExternalClaims`].
-- Matchers / config: [`ControllerIdentity`], [`ControllerIndexes`],
-  [`ControllerMatch`], `match_controller_identity`, `build_controller_indexes`,
-  `validate_custom_claims`, `audience_matches`, `matches_wildcard_pattern`,
-  `validate_controller_id`, `validate_oidc_issuer`.
+- Matchers: [`TrustCandidate`], [`TrustMatch`], [`match_trust_candidates`]
+  (shape-agnostic claim matching a caller builds from its own trust-policy
+  resources — Controller, ServiceAccount — since this crate cannot depend on
+  `rise-resource-api`), `validate_custom_claims`, `audience_matches`,
+  `matches_wildcard_pattern`, `validate_oidc_issuer`.
 - Routing helper: `is_rise_issued_jwt`.
 - Errors: [`AuthError`], [`JwtSignerError`].
 
@@ -126,10 +127,9 @@ enforces `iss` + `exp`. Audience and any custom-claim constraints are validated
 [`WorkloadSubjectInfo`]: src/claims.rs
 [`RiseTokenSigner`]: src/signer.rs
 [`compute_key_id`]: src/signer.rs
-[`ControllerIdentity`]: src/matchers.rs
-[`ControllerIndexes`]: src/matchers.rs
-[`ControllerMatch`]: src/matchers.rs
+[`TrustCandidate`]: src/matchers.rs
+[`TrustMatch`]: src/matchers.rs
 [`validate_custom_claims`]: src/matchers.rs
-[`match_controller_identity`]: src/matchers.rs
+[`match_trust_candidates`]: src/matchers.rs
 [`AuthError`]: src/error.rs
 [`JwtSignerError`]: src/error.rs

@@ -275,13 +275,12 @@ shared. Rise applies the same machinery to `/finalizers` as a deliberate
 hardening extension: finalizers remain part of `metadata`, but main writes
 preserve them and only `(update, ResourceKind, finalizers)` may change them.
 
-The target model removes `ResourceDefinition.allowedStatusControllerIds` and
-the corresponding collection metadata. A Controller is an authenticated
-subject, so its `status` and `finalizers` access comes solely from ordinary
-RoleBindings over the registered subresource tuples above. The legacy allowlist
-remains transitional only until controller requests pass through the unified
-authorization choke point; it is not a second authorization mechanism in the
-target API.
+`ResourceDefinition.allowedStatusControllerIds` and the corresponding
+collection metadata no longer exist. A Controller is an authenticated
+subject — `controller:<name>` — so its `status` and `finalizers` access comes
+solely from ordinary RoleBindings over the registered subresource tuples
+above, evaluated by the same choke point every other principal goes through.
+There is no separate controller authorization mechanism.
 
 This ADR standardizes that shared authorization and handler seam, plus
 the concrete `status`, `finalizers`, and `token` strategies. Streaming,
