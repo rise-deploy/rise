@@ -361,6 +361,13 @@ impl TrustPolicyClaims {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
     }
+
+    /// The underlying claim map, for callers matching against it directly
+    /// (e.g. `rise_backend_auth::match_trust_candidates`, which cannot depend
+    /// on this crate).
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.0
+    }
 }
 
 impl<'de> Deserialize<'de> for TrustPolicyClaims {

@@ -4,7 +4,7 @@
 //! perform no I/O. They back the controller-identity and service-account
 //! matching paths in rise-deploy.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,89 @@ pub enum ControllerMatch<'a> {
     Unmatched(String),
     /// Two or more identities matched — configuration is ambiguous.
     Multiple(Vec<&'a ControllerIdentity>),
+}
+
+/// One candidate in a trust-policy match: a borrowed label (for diagnostics)
+/// and its expected claim constraints.
+///
+/// Shape-agnostic so this crate never depends on how a caller stores its
+/// candidates — `rise-resource-api`'s `ControllerTrustPolicySpec` in
+/// particular, which this crate cannot depend on without an orphan-rule
+/// cycle. A caller borrows its own facts into this type, matches, and maps
+/// the returned index back.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustCandidate<'a> {
+    pub label: &'a str,
+    pub claims: &'a BTreeMap<String, String>,
+}
+
+/// Outcome of matching JWT claims against a list of [`TrustCandidate`]s,
+/// identifying matches by their position in the input slice so a caller can
+/// map back to its own fact type without this crate knowing its shape.
+#[derive(Debug)]
+pub enum TrustMatch {
+    /// Exactly one candidate matched, at this index.
+    Single(usize),
+    /// No candidate matched. The contained string lists all per-candidate
+    /// rejection reasons, joined by `"; "`, for diagnostics.
+    Unmatched(String),
+    /// Two or more candidates matched — configuration is ambiguous.
+    Multiple(Vec<usize>),
+}
+
+/// Match a verified JWT's claims against a list of [`TrustCandidate`]s.
+///
+/// Pure helper, and the shape-agnostic twin of [`match_controller_identity`]:
+/// same matching rules (mandatory `aud`, remaining claims via
+/// [`validate_custom_claims`]), but over borrowed candidates rather than a
+/// concrete config type, so it also backs trust-policy resources.
+pub fn match_trust_candidates(
+    token_claims: &serde_json::Value,
+    candidates: &[TrustCandidate<'_>],
+) -> TrustMatch {
+    let mut matched: Vec<usize> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some(expected_aud) = candidate.claims.get("aud") else {
+            errors.push(format!(
+                "candidate {:?}: missing required claims.aud constraint",
+                candidate.label
+            ));
+            continue;
+        };
+        let aud_claim = token_claims.get("aud").unwrap_or(&serde_json::Value::Null);
+        if !audience_matches(aud_claim, expected_aud) {
+            errors.push(format!(
+                "candidate {:?}: aud claim does not match expected audience {:?}",
+                candidate.label, expected_aud
+            ));
+            continue;
+        }
+
+        let expected_string_claims: HashMap<String, String> = candidate
+            .claims
+            .iter()
+            .filter(|(key, _)| key.as_str() != "aud")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        match validate_custom_claims(token_claims, &expected_string_claims) {
+            Ok(()) => matched.push(index),
+            Err(e) => {
+                errors.push(format!("candidate {:?}: {}", candidate.label, e));
+            }
+        }
+    }
+
+    match matched.len() {
+        1 => TrustMatch::Single(matched[0]),
+        0 => TrustMatch::Unmatched(if errors.is_empty() {
+            "no candidates".to_string()
+        } else {
+            errors.join("; ")
+        }),
+        _ => TrustMatch::Multiple(matched),
+    }
 }
 
 /// Validate custom claims (supports exact matching and wildcard patterns)
@@ -959,5 +1042,164 @@ mod tests {
     fn test_match_empty_candidates() {
         let m = match_controller_identity(&serde_json::json!({}), &[]);
         assert!(matches!(m, ControllerMatch::Unmatched(_)));
+    }
+    fn claims_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_trust_match_none_without_audience_constraint() {
+        let claims = claims_map(&[]);
+        let candidates = [TrustCandidate {
+            label: "a",
+            claims: &claims,
+        }];
+        let token = serde_json::json!({"sub": "anyone", "aud": "anything"});
+        let m = match_trust_candidates(&token, &candidates);
+        match m {
+            TrustMatch::Unmatched(detail) => assert!(detail.contains("claims.aud"), "{detail}"),
+            other => panic!("expected Unmatched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trust_match_single_with_constraints() {
+        let claims = claims_map(&[("aud", "rise"), ("sub", "ctrl-*"), ("scope", "controller")]);
+        let candidates = [TrustCandidate {
+            label: "a",
+            claims: &claims,
+        }];
+        let token = serde_json::json!({
+            "sub": "ctrl-abc",
+            "aud": "rise",
+            "scope": "controller",
+        });
+        let m = match_trust_candidates(&token, &candidates);
+        assert!(matches!(m, TrustMatch::Single(0)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_trust_match_audience_array() {
+        let claims = claims_map(&[("aud", "rise")]);
+        let candidates = [TrustCandidate {
+            label: "a",
+            claims: &claims,
+        }];
+        let token = serde_json::json!({"sub": "x", "aud": ["other", "rise"]});
+        let m = match_trust_candidates(&token, &candidates);
+        assert!(matches!(m, TrustMatch::Single(0)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_trust_match_audience_array_no_match() {
+        let claims = claims_map(&[("aud", "rise")]);
+        let candidates = [TrustCandidate {
+            label: "a",
+            claims: &claims,
+        }];
+        let token = serde_json::json!({"sub": "x", "aud": ["other"]});
+        let m = match_trust_candidates(&token, &candidates);
+        match m {
+            TrustMatch::Unmatched(detail) => {
+                assert!(detail.contains("aud claim does not match"), "got: {detail}")
+            }
+            other => panic!("expected Unmatched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trust_match_none_when_subject_mismatches() {
+        let claims = claims_map(&[("aud", "rise"), ("sub", "ctrl-*")]);
+        let candidates = [TrustCandidate {
+            label: "a",
+            claims: &claims,
+        }];
+        let token = serde_json::json!({"aud": "rise", "sub": "other-bot"});
+        let m = match_trust_candidates(&token, &candidates);
+        match m {
+            TrustMatch::Unmatched(detail) => assert!(detail.contains("\"a\""), "{detail}"),
+            other => panic!("expected Unmatched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trust_match_none_when_extra_claim_missing() {
+        let claims = claims_map(&[("aud", "rise"), ("scope", "controller")]);
+        let candidates = [TrustCandidate {
+            label: "a",
+            claims: &claims,
+        }];
+        let token = serde_json::json!({"aud": "rise", "sub": "x"});
+        let m = match_trust_candidates(&token, &candidates);
+        assert!(matches!(m, TrustMatch::Unmatched(_)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_trust_match_multiple_when_constraints_ambiguous() {
+        let claims_a = claims_map(&[("aud", "rise")]);
+        let claims_b = claims_map(&[("aud", "rise")]);
+        let candidates = [
+            TrustCandidate {
+                label: "a",
+                claims: &claims_a,
+            },
+            TrustCandidate {
+                label: "b",
+                claims: &claims_b,
+            },
+        ];
+        let token = serde_json::json!({"aud": "rise", "sub": "x"});
+        let m = match_trust_candidates(&token, &candidates);
+        match m {
+            TrustMatch::Multiple(indices) => assert_eq!(indices, vec![0, 1]),
+            other => panic!("expected Multiple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trust_match_disambiguates_by_audience() {
+        let claims_a = claims_map(&[("aud", "rise-a")]);
+        let claims_b = claims_map(&[("aud", "rise-b")]);
+        let candidates = [
+            TrustCandidate {
+                label: "a",
+                claims: &claims_a,
+            },
+            TrustCandidate {
+                label: "b",
+                claims: &claims_b,
+            },
+        ];
+        let token = serde_json::json!({"sub": "x", "aud": "rise-b"});
+        let m = match_trust_candidates(&token, &candidates);
+        assert!(matches!(m, TrustMatch::Single(1)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_trust_match_disambiguates_by_subject() {
+        let claims_a = claims_map(&[("aud", "rise"), ("sub", "ctrl-a")]);
+        let claims_b = claims_map(&[("aud", "rise"), ("sub", "ctrl-b")]);
+        let candidates = [
+            TrustCandidate {
+                label: "a",
+                claims: &claims_a,
+            },
+            TrustCandidate {
+                label: "b",
+                claims: &claims_b,
+            },
+        ];
+        let token = serde_json::json!({"aud": "rise", "sub": "ctrl-b"});
+        let m = match_trust_candidates(&token, &candidates);
+        assert!(matches!(m, TrustMatch::Single(1)), "got {m:?}");
+    }
+
+    #[test]
+    fn test_trust_match_empty_candidates() {
+        let m = match_trust_candidates(&serde_json::json!({}), &[]);
+        assert!(matches!(m, TrustMatch::Unmatched(_)));
     }
 }

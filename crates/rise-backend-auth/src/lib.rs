@@ -23,9 +23,9 @@ pub use claims::{
 };
 pub use error::{AuthError, JwtSignerError};
 pub use matchers::{
-    audience_matches, build_controller_indexes, match_controller_identity,
+    audience_matches, build_controller_indexes, match_controller_identity, match_trust_candidates,
     matches_wildcard_pattern, validate_controller_id, validate_custom_claims, validate_oidc_issuer,
-    ControllerIdentity, ControllerIndexes, ControllerMatch,
+    ControllerIdentity, ControllerIndexes, ControllerMatch, TrustCandidate, TrustMatch,
 };
 pub use signer::{compute_key_id, RiseTokenSigner, RISE_ACCESS_TYP};
 pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
