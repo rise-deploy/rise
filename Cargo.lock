@@ -990,6 +990,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64-simd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4240,11 +4246,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -4345,7 +4351,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "regex",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "rise-deployment-spec",
  "schemars 1.2.2",
  "serde",
@@ -4368,7 +4374,7 @@ dependencies = [
  "bollard",
  "chrono",
  "futures",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "rise-backend-auth",
  "rise-backend-core",
  "rise-backend-traefik",
@@ -4419,7 +4425,7 @@ name = "rise-backend-traefik"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "rise-backend-core",
  "rise-deployment-spec",
  "serde",
@@ -4469,7 +4475,7 @@ dependencies = [
  "openssl",
  "rand 0.10.2",
  "regex",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "rise-authz",
  "rise-backend-auth",
  "rise-backend-core",
@@ -4641,9 +4647,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5541,7 +5547,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5764,9 +5770,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap 2.14.0",
  "serde_core",
@@ -6312,7 +6318,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
