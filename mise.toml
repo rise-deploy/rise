@@ -3,7 +3,7 @@ railpack = "github:railwayapp/railpack"
 buildkit = "github:moby/buildkit"
 
 [tools]
-minikube = "1.38.1"
+minikube = "1.39.0"
 pack = "0.40.9"
 railpack = "0.15.1"
 buildkit = "0.28.0"
