@@ -87,6 +87,30 @@ Merged to `develop`:
   tokens. The typed-table exchange at `POST /api/v1/auth/token` and the CLI
   are unchanged. See [Authentication & Tokens](/operator-docs/authentication/#identity-rs256--the-token-subresource).
 
+- **ECS: workload identity.** *Config change.* ECS deployments now get the
+  workload identity files every other backend delivers — the bootstrap
+  credential for `rise identity token`, and the `[identity].audiences` token
+  files — so a deployment declaring `[identity]` is no longer rejected. Every
+  new ECS task runs an identity sidecar (`rise identity agent`, the Rise image)
+  next to the app; see [ECS › Workload identity](/operator-docs/ecs/#workload-identity).
+  Nothing to configure on a typical install, but know that:
+
+  - Deployments already running when you upgrade keep running **without** the
+    sidecar, and gain it on their next deploy. Upgrading does not roll them.
+  - Tasks must reach the sidecar's image and the token endpoint. The image
+    defaults to the control plane's own (read from the ECS task metadata), and
+    the endpoint to the public URL. Set
+    `deployment_controller.identity_agent_image` /
+    `identity_exchange_url` (`RISE_ECS_IDENTITY_AGENT_IMAGE` /
+    `RISE_ECS_IDENTITY_EXCHANGE_URL`) if they cannot.
+  - `identity_token_ttl_seconds` is now env-driven on ECS
+    (`RISE_IDENTITY_TOKEN_TTL_SECONDS`; `rise-ecs` exposes
+    `identity_token_ttl_seconds`).
+  - A new endpoint, `POST /api/v1/identity/audience-tokens`, serves the
+    sidecar: it mints the credential's deployment's declared audiences with
+    `identity_token_ttl_seconds`, exactly what the other backends write to the
+    token files.
+
 - **ECS: a `capacity` setting, and service network configuration now converges.**
   *Config change.* `deployment_controller.capacity` selects where workload tasks
   run — `fargate` (the default, and what every existing install keeps doing) or

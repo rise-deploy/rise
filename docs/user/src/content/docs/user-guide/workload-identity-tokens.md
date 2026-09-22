@@ -34,9 +34,10 @@ impersonate another project or environment.
 
 ## Consuming tokens
 
-Every Rise deployment gets a `rise-identity` Secret mounted at a standard,
-read-only path. Everything is exposed as files — no environment variables are
-injected:
+Every Rise deployment gets its identity files at a standard, read-only path —
+on Kubernetes a mounted `rise-identity` Secret, on Docker and Amazon ECS the
+same files written by Rise. Everything is exposed as files — no environment
+variables are injected:
 
 | Path | Contents |
 |---|---|
@@ -57,7 +58,7 @@ the Rise `project`/`environment` identity. Use these when you want trust policie
 keyed on the Rise identity rather than on Kubernetes.
 :::
 
-### 1. Auto-mounted token files (Kubernetes)
+### 1. Auto-mounted token files
 
 List the audiences you need in `.rise.toml`:
 
@@ -76,8 +77,10 @@ Secret, and re-mints them before they expire. Your app just reads the files:
 /var/run/secrets/rise/identity/tokens/vault   → JWT with aud=https://vault.example.com
 ```
 
-The kubelet keeps the mounted files up to date as Rise refreshes them, so
-**always re-read the file** rather than caching the first read.
+The files are kept up to date as Rise refreshes them — by the kubelet on
+Kubernetes, by the controller on Docker, by a small identity sidecar in each
+task on Amazon ECS — so **always re-read the file** rather than caching the
+first read.
 
 ### 2. The token-exchange endpoint
 

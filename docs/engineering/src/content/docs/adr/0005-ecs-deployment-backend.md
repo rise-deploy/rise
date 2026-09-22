@@ -534,9 +534,12 @@ server's public URL — the same URL the workload itself uses for `rise identity
 token`). Set it to an internal address when tasks have no route to the public
 one.
 
-**The agent image.** `identity_agent_image`, defaulting to the Rise image of the
-running version (`modules/rise-ecs` pins it to the control plane's own image).
-The image is **excluded from the task-definition content hash**: including it
+**The agent image.** `identity_agent_image`, defaulting to the image the control
+plane itself runs, read from the ECS task metadata at startup — so it follows
+the operator's own reference (tag, digest or mirror) and stays in step on
+upgrade with no configuration; a control plane not on ECS falls back to the
+released image of its version. The image is **excluded from the task-definition
+content hash**: including it
 would roll every ECS service in the install on every Rise upgrade. New
 deployments pick up the new agent; running ones keep theirs, which is why the
 agent's protocol must stay backwards compatible with newer servers.
@@ -547,9 +550,8 @@ resync. Revocation is unchanged — the endpoint refuses a deployment that shoul
 not have infrastructure, so a stopped deployment's sidecar can no longer mint.
 The in-container contract a workload reads is byte-identical across all three
 backends. Costs: one extra container per task (2 of the 10 allowed), a 32 MiB
-reservation, and an agent image pulled by the execution role — installs whose
-tasks reach only VPC endpoints must mirror the Rise image into ECR and set
-`identity_agent_image`.
+reservation, and an agent image the execution role must be able to pull — by
+default from wherever the control plane's own image comes from.
 
 **Rejected alternatives.** The controller writing files over ECS Exec (needs SSM
 agent sessions and `enableExecuteCommand` on every task, and an audit trail
