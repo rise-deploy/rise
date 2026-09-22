@@ -440,6 +440,8 @@ async fn init_ecs_backend(
         controller_class_name,
         reconcile_interval_secs,
         health_probes,
+        identity_agent_image,
+        identity_exchange_url,
         ..
     } = settings
     else {
@@ -520,6 +522,14 @@ async fn init_ecs_backend(
         );
     }
 
+    let identity_agent_image = match identity_agent_image {
+        Some(image) => image.clone(),
+        None => own_ecs_image()
+            .await
+            .unwrap_or_else(default_identity_agent_image),
+    };
+    tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
+
     let reconciler = EcsReconciler::new(
         ecs,
         ssm,
@@ -555,6 +565,10 @@ async fn init_ecs_backend(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
+            identity_agent_image,
+            identity_exchange_url: identity_exchange_url
+                .clone()
+                .unwrap_or_else(|| public_url.to_string()),
         },
     );
     let reconciler_handle = reconciler.spawn(shutdown);
@@ -569,6 +583,53 @@ async fn init_ecs_backend(
             resource_prefix: resource_prefix.clone(),
         },
     ))
+}
+
+/// The image this server's own container runs, from the ECS task metadata
+/// endpoint, when the control plane itself runs on ECS.
+///
+/// The best default for the identity sidecar: it carries exactly this server's
+/// `rise identity agent`, however the operator references it -- a tag, a
+/// digest, a mirror -- and needs no configuration to stay in step on upgrade.
+#[cfg(feature = "backend")]
+async fn own_ecs_image() -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct ContainerMetadata {
+        #[serde(rename = "Image")]
+        image: String,
+    }
+
+    let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").ok()?;
+    let result = async {
+        reqwest::Client::new()
+            .get(&uri)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<ContainerMetadata>()
+            .await
+    }
+    .await;
+    match result {
+        Ok(metadata) if !metadata.image.trim().is_empty() => Some(metadata.image),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(
+                "Could not read this container's image from the ECS task metadata; \
+                 the identity sidecar falls back to the released image of this version: {:?}",
+                e
+            );
+            None
+        }
+    }
+}
+
+/// The released Rise image of this server's version, for a control plane that
+/// does not run on ECS. Release images are tagged with the bare version.
+#[cfg(feature = "backend")]
+fn default_identity_agent_image() -> String {
+    format!("ghcr.io/rise-deploy/rise:{}", env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(feature = "backend")]

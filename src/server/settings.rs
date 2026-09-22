@@ -1884,11 +1884,30 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens. Accepted for
-        /// forward-compatibility; ECS v1 does not deliver identity material and
-        /// rejects deployments that request it.
-        #[serde(default = "default_identity_token_ttl_seconds")]
+        /// Lifetime in seconds of the auto-minted `[identity]` workload tokens.
+        /// The identity sidecar in each task fetches fresh ones at half this.
+        #[serde(
+            default = "default_identity_token_ttl_seconds",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
         identity_token_ttl_seconds: u64,
+
+        /// Image of the workload-identity sidecar every task runs (`rise
+        /// identity agent`). Defaults to the image the control plane itself
+        /// runs, read from the ECS task metadata, or — for a control plane not
+        /// on ECS — the released image of this server's version on GHCR.
+        /// Changing it affects new deployments only: running services keep the
+        /// sidecar they started with.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        identity_agent_image: Option<String>,
+
+        /// Base URL at which the identity sidecar reaches the Rise API to fetch
+        /// `[identity]` tokens. Defaults to the server `public_url` — the URL
+        /// the workload itself uses for `rise identity token`. Set it to an
+        /// internal address when tasks have no route to the public one.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        identity_exchange_url: Option<String>,
     },
 }
 

@@ -148,6 +148,15 @@ deployment_controller:
   # API such a deployment never becomes Healthy.
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-}"
 
+  # Workload identity. Every task runs a small sidecar (the Rise image, `rise
+  # identity agent`) that writes the credential and [identity] token files to
+  # /var/run/secrets/rise/identity. The image defaults to the control plane's
+  # own (read from the ECS task metadata); the sidecar fetches tokens from the
+  # public URL unless an internal one is set.
+  identity_agent_image: "${RISE_ECS_IDENTITY_AGENT_IMAGE:-}"
+  identity_exchange_url: "${RISE_ECS_IDENTITY_EXCHANGE_URL:-}"
+  identity_token_ttl_seconds: "${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"
+
   access_classes:
     public:
       display_name: Public

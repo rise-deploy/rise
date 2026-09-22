@@ -832,9 +832,25 @@
               ],
               "description": "Health probe configuration."
             },
+            "identity_agent_image": {
+              "default": null,
+              "description": "Image of the workload-identity sidecar every task runs (`rise\nidentity agent`). Defaults to the image the control plane itself\nruns, read from the ECS task metadata, or — for a control plane not\non ECS — the released image of this server's version on GHCR.\nChanging it affects new deployments only: running services keep the\nsidecar they started with.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "identity_exchange_url": {
+              "default": null,
+              "description": "Base URL at which the identity sidecar reaches the Rise API to fetch\n`[identity]` tokens. Defaults to the server `public_url` — the URL\nthe workload itself uses for `rise identity token`. Set it to an\ninternal address when tasks have no route to the public one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens. Accepted for\nforward-compatibility; ECS v1 does not deliver identity material and\nrejects deployments that request it.",
+              "description": "Lifetime in seconds of the auto-minted `[identity]` workload tokens.\nThe identity sidecar in each task fetches fresh ones at half this.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"

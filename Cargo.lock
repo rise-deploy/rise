@@ -4399,6 +4399,7 @@ dependencies = [
  "aws-sdk-ssm",
  "aws-sdk-sts",
  "chrono",
+ "rise-backend-auth",
  "rise-backend-core",
  "rise-backend-traefik",
  "rise-deployment-spec",

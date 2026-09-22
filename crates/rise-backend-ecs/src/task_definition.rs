@@ -17,11 +17,16 @@
 //!    reads container `dockerLabels` and nothing else; putting the labels
 //!    anywhere else means the router is never created and the app is simply
 //!    unreachable, with no error anywhere.
+//!
+//! Every task also carries the workload-identity sidecar (ADR-0005 D8), which
+//! writes the identity files onto a volume shared with the app; see
+//! [`IdentityAgentSpec`].
 
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Result};
 use rise_backend_core::desired::DesiredContainer;
+use rise_backend_core::identity::IDENTITY_MOUNT_PATH;
 use rise_backend_core::labels::{ns_key, SUFFIX_CONTROLLER_CLASS};
 use rise_backend_core::naming::sanitize_ecs_name;
 use rise_backend_traefik::render::{render_traefik_labels_for, TraefikRenderConfig};
@@ -37,6 +42,58 @@ pub const MAX_TASK_DEFINITION_BYTES: usize = 64 * 1024;
 
 /// ECS allows at most 10 container definitions per task.
 pub const MAX_CONTAINERS_PER_TASK: usize = 10;
+
+/// Container name of the workload-identity sidecar. Reserved: an app container
+/// by this name is rejected rather than silently shadowed.
+pub const IDENTITY_AGENT_CONTAINER: &str = "rise-identity-agent";
+
+/// Task volume shared by the sidecar (read-write) and the app (read-only).
+pub const IDENTITY_VOLUME: &str = "rise-identity";
+
+/// Where the Rise image keeps its binary; the sidecar's health check runs it.
+const RISE_BINARY: &str = "/usr/local/bin/rise";
+
+/// Environment variable the sidecar reads its bootstrap credential from.
+pub const IDENTITY_CREDENTIAL_ENV: &str = "RISE_IDENTITY_CREDENTIAL";
+
+/// Environment variable naming the endpoint the sidecar fetches tokens from.
+/// Set only when the deployment declares `[identity].audiences`.
+pub const IDENTITY_TOKENS_URL_ENV: &str = "RISE_IDENTITY_TOKENS_URL";
+
+/// Memory the sidecar reserves out of the task's size. A soft reservation, not
+/// a limit: it keeps placement honest without capping an agent that briefly
+/// needs more.
+pub const IDENTITY_AGENT_MEMORY_RESERVATION_MIB: i32 = 32;
+
+/// What the workload-identity sidecar needs to be rendered for one deployment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityAgentSpec {
+    /// The Rise image the sidecar runs (`rise identity agent`).
+    pub image: String,
+    /// SSM parameter holding this deployment's bootstrap credential.
+    pub credential_parameter: String,
+    /// Full URL of the audience-tokens endpoint, or `None` when the deployment
+    /// declares no `[identity].audiences` and the credential is all it gets.
+    pub tokens_url: Option<String>,
+}
+
+/// A container's view of a task volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountPointSpec {
+    pub source_volume: String,
+    pub container_path: String,
+    pub read_only: bool,
+}
+
+/// A container health check, in ECS's terms (seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthCheckSpec {
+    pub command: Vec<String>,
+    pub interval: i32,
+    pub timeout: i32,
+    pub retries: i32,
+    pub start_period: i32,
+}
 
 /// A secret env var, resolved to the SSM parameter holding its value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +134,24 @@ pub struct ContainerDefinitionSpec {
     /// rotating the secret's contents needs no redeploy — but pointing at a
     /// different secret does, which is why the ARN is part of `content_hash`.
     pub repository_credentials_secret_arn: Option<String>,
+    /// Whether the task stops when this container does. `false` only for the
+    /// identity sidecar, which ECS restarts in place instead.
+    pub essential: bool,
+    /// Arguments to the image's entrypoint. Empty keeps the image's own `CMD`.
+    pub command: Vec<String>,
+    pub mount_points: Vec<MountPointSpec>,
+    /// Containers that must report `HEALTHY` before this one starts.
+    pub depends_on_healthy: Vec<String>,
+    pub health_check: Option<HealthCheckSpec>,
+    /// Restart the container in place when it exits (ECS container restart
+    /// policy). Only meaningful for a non-essential container.
+    pub restart_on_exit: bool,
+    pub memory_reservation_mib: Option<i32>,
+    /// Whether the image is part of [`TaskDefinitionSpec::content_hash`]. `false`
+    /// only for the identity sidecar: its image follows the Rise version, and
+    /// hashing it would roll every service in the install on every upgrade.
+    /// New deployments still get the new image; running ones keep theirs.
+    pub image_in_hash: bool,
 }
 
 /// A complete ECS task definition, ready to convert to SDK input.
@@ -88,12 +163,21 @@ pub struct TaskDefinitionSpec {
     pub cpu_architecture: String,
     pub execution_role_arn: Option<String>,
     pub task_role_arn: Option<String>,
+    /// The app container first, then any sidecars. Code that means "the app"
+    /// goes through [`TaskDefinitionSpec::app`].
     pub containers: Vec<ContainerDefinitionSpec>,
+    /// Task-scoped volumes (no host path), by name.
+    pub volumes: Vec<String>,
     /// Resolved size, retained so the reconciler can log a round-up.
     pub size: TaskSize,
 }
 
 impl TaskDefinitionSpec {
+    /// The app container. [`build`] always renders it first.
+    pub fn app(&self) -> &ContainerDefinitionSpec {
+        &self.containers[0]
+    }
+
     /// Rough serialized size, used to fail early against the 64 KiB ceiling.
     /// Deliberately an over-estimate of the JSON payload rather than an exact
     /// one: being conservative here costs nothing, while under-estimating means
@@ -118,8 +202,21 @@ impl TaskDefinitionSpec {
             if let Some(log) = &c.log_config {
                 n += log.log_group.len() + log.region.len() + log.stream_prefix.len() + 64;
             }
+            n += c.command.iter().map(|a| a.len() + 4).sum::<usize>();
+            for m in &c.mount_points {
+                n += m.source_volume.len() + m.container_path.len() + 64;
+            }
+            n += c
+                .depends_on_healthy
+                .iter()
+                .map(|d| d.len() + 48)
+                .sum::<usize>();
+            if let Some(hc) = &c.health_check {
+                n += hc.command.iter().map(|a| a.len() + 4).sum::<usize>() + 96;
+            }
+            n += 96; // essential, restart policy, memory reservation
         }
-        n
+        n + self.volumes.iter().map(|v| v.len() + 24).sum::<usize>()
     }
 
     /// Content hash over everything that determines the registered revision.
@@ -142,7 +239,11 @@ impl TaskDefinitionSpec {
         field(self.task_role_arn.as_deref().unwrap_or("").as_bytes());
         for c in &self.containers {
             field(c.name.as_bytes());
-            field(c.image.as_bytes());
+            field(if c.image_in_hash {
+                c.image.as_bytes()
+            } else {
+                b""
+            });
             field(c.port.map(|p| p.to_string()).unwrap_or_default().as_bytes());
             for (k, v) in &c.environment {
                 field(k.as_bytes());
@@ -171,6 +272,38 @@ impl TaskDefinitionSpec {
                     .unwrap_or("")
                     .as_bytes(),
             );
+            field(&[u8::from(c.essential), u8::from(c.restart_on_exit)]);
+            field(&(c.command.len() as u64).to_le_bytes());
+            for arg in &c.command {
+                field(arg.as_bytes());
+            }
+            field(&(c.mount_points.len() as u64).to_le_bytes());
+            for m in &c.mount_points {
+                field(m.source_volume.as_bytes());
+                field(m.container_path.as_bytes());
+                field(&[u8::from(m.read_only)]);
+            }
+            field(&(c.depends_on_healthy.len() as u64).to_le_bytes());
+            for d in &c.depends_on_healthy {
+                field(d.as_bytes());
+            }
+            match &c.health_check {
+                Some(hc) => {
+                    field(&(hc.command.len() as u64).to_le_bytes());
+                    for arg in &hc.command {
+                        field(arg.as_bytes());
+                    }
+                    for v in [hc.interval, hc.timeout, hc.retries, hc.start_period] {
+                        field(&v.to_le_bytes());
+                    }
+                }
+                None => field(b""),
+            }
+            field(&c.memory_reservation_mib.unwrap_or(0).to_le_bytes());
+        }
+        field(&(self.volumes.len() as u64).to_le_bytes());
+        for v in &self.volumes {
+            field(v.as_bytes());
         }
         hasher
             .finalize()
@@ -249,11 +382,22 @@ pub fn family_name(
 /// `secrets` maps env var name → SSM parameter name/ARN; those names are removed
 /// from the plain environment. The caller (the reconciler) has already written
 /// the parameters, so a name appearing here is guaranteed resolvable.
+///
+/// `identity` adds the workload-identity sidecar and the volume it shares with
+/// the app. `None` renders the app alone, for a deployment that was already
+/// running before the sidecar existed (see the reconciler).
 pub fn build(
     desired: &DesiredContainer,
     secrets: &[SecretRef],
+    identity: Option<&IdentityAgentSpec>,
     cfg: &TaskDefinitionConfig<'_>,
 ) -> Result<TaskDefinitionSpec> {
+    if desired.container == IDENTITY_AGENT_CONTAINER {
+        bail!(
+            "container name {IDENTITY_AGENT_CONTAINER:?} is reserved for Rise's workload-identity \
+             sidecar on the ECS backend; rename the container"
+        );
+    }
     let size = sizing::resolve(&desired.cpu, &desired.memory, cfg.compatibility)?;
 
     // Secrets are injected by ECS; their names must not also appear as plain
@@ -294,6 +438,44 @@ pub fn build(
         ),
     });
 
+    let mut app = ContainerDefinitionSpec {
+        name: desired.container.clone(),
+        image: desired.image.clone(),
+        port: desired.port,
+        environment,
+        secrets: secrets.to_vec(),
+        docker_labels,
+        log_config,
+        repository_credentials_secret_arn: cfg
+            .repository_credentials_secret_arn
+            .map(str::to_string),
+        essential: true,
+        command: Vec::new(),
+        mount_points: Vec::new(),
+        depends_on_healthy: Vec::new(),
+        health_check: None,
+        restart_on_exit: false,
+        memory_reservation_mib: None,
+        image_in_hash: true,
+    };
+    let mut containers = Vec::new();
+    let mut volumes = Vec::new();
+    if let Some(identity) = identity {
+        app.mount_points.push(MountPointSpec {
+            source_volume: IDENTITY_VOLUME.to_string(),
+            container_path: IDENTITY_MOUNT_PATH.to_string(),
+            read_only: true,
+        });
+        // The files must exist before the app's process first looks for them.
+        app.depends_on_healthy
+            .push(IDENTITY_AGENT_CONTAINER.to_string());
+        containers.push(app);
+        containers.push(identity_agent_container(desired, identity, cfg));
+        volumes.push(IDENTITY_VOLUME.to_string());
+    } else {
+        containers.push(app);
+    }
+
     let spec = TaskDefinitionSpec {
         family: family_name(
             cfg.resource_prefix,
@@ -306,18 +488,8 @@ pub fn build(
         cpu_architecture: canonical_cpu_architecture(cfg.cpu_architecture)?.to_string(),
         execution_role_arn: cfg.execution_role_arn.map(str::to_string),
         task_role_arn: cfg.task_role_arn.map(str::to_string),
-        containers: vec![ContainerDefinitionSpec {
-            name: desired.container.clone(),
-            image: desired.image.clone(),
-            port: desired.port,
-            environment,
-            secrets: secrets.to_vec(),
-            docker_labels,
-            log_config,
-            repository_credentials_secret_arn: cfg
-                .repository_credentials_secret_arn
-                .map(str::to_string),
-        }],
+        containers,
+        volumes,
         size,
     };
 
@@ -336,6 +508,74 @@ pub fn build(
         );
     }
     Ok(spec)
+}
+
+/// The workload-identity sidecar's container definition.
+///
+/// Non-essential with a restart policy: a crashed agent comes back in place
+/// rather than taking the app's task down. It carries no Traefik labels --
+/// Traefik runs with `exposedByDefault=false` and must never route to it -- and
+/// logs under its own stream prefix, outside the `{prefix}/{project}/{deployment}/`
+/// subtree the deployment log reader lists, so `rise deployment logs` shows the
+/// app alone, as on the other backends.
+fn identity_agent_container(
+    desired: &DesiredContainer,
+    identity: &IdentityAgentSpec,
+    cfg: &TaskDefinitionConfig<'_>,
+) -> ContainerDefinitionSpec {
+    let mut environment = BTreeMap::new();
+    if let Some(url) = &identity.tokens_url {
+        environment.insert(IDENTITY_TOKENS_URL_ENV.to_string(), url.clone());
+    }
+    let log_config = cfg.log_group.map(|group| LogConfig {
+        log_group: group.to_string(),
+        region: cfg.region.to_string(),
+        stream_prefix: format!(
+            "{}-identity/{}/{}",
+            sanitize_ecs_name(cfg.resource_prefix),
+            desired.project_uuid,
+            desired.deployment_uuid
+        ),
+    });
+    ContainerDefinitionSpec {
+        name: IDENTITY_AGENT_CONTAINER.to_string(),
+        image: identity.image.clone(),
+        port: None,
+        environment,
+        secrets: vec![SecretRef {
+            name: IDENTITY_CREDENTIAL_ENV.to_string(),
+            value_from: identity.credential_parameter.clone(),
+        }],
+        docker_labels: BTreeMap::new(),
+        log_config,
+        // The Rise image is not in the app's private registry.
+        repository_credentials_secret_arn: None,
+        essential: false,
+        command: vec!["identity".to_string(), "agent".to_string()],
+        mount_points: vec![MountPointSpec {
+            source_volume: IDENTITY_VOLUME.to_string(),
+            container_path: IDENTITY_MOUNT_PATH.to_string(),
+            read_only: false,
+        }],
+        depends_on_healthy: Vec::new(),
+        health_check: Some(HealthCheckSpec {
+            command: vec![
+                "CMD".to_string(),
+                RISE_BINARY.to_string(),
+                "identity".to_string(),
+                "agent".to_string(),
+                "--check".to_string(),
+            ],
+            // ECS's minimums, so the app starts as soon as the files exist.
+            interval: 5,
+            timeout: 2,
+            retries: 3,
+            start_period: 5,
+        }),
+        restart_on_exit: true,
+        memory_reservation_mib: Some(IDENTITY_AGENT_MEMORY_RESERVATION_MIB),
+        image_in_hash: false,
+    }
 }
 
 #[cfg(test)]
@@ -425,7 +665,7 @@ mod tests {
                 "arn:aws:ssm:eu-central-1:1:parameter/rise/myapp/default/20260101-120000/API_KEY"
                     .to_string(),
         }];
-        let spec = build(&desired(), &secrets, &cfg(&classes)).expect("builds");
+        let spec = build(&desired(), &secrets, None, &cfg(&classes)).expect("builds");
         let container = &spec.containers[0];
 
         assert!(
@@ -455,7 +695,7 @@ mod tests {
         let mut cfg = cfg(&classes);
         cfg.controller_class = "pr-457";
         cfg.traefik.controller_class = "pr-457";
-        let spec = build(&desired(), &[], &cfg).expect("build");
+        let spec = build(&desired(), &[], None, &cfg).expect("build");
         let labels = &spec.containers[0].docker_labels;
 
         assert_eq!(
@@ -475,7 +715,7 @@ mod tests {
         // Emit them anywhere else and the router is never created — the app is
         // unreachable and no component logs an error.
         let classes = access_classes();
-        let spec = build(&desired(), &[], &cfg(&classes)).expect("builds");
+        let spec = build(&desired(), &[], None, &cfg(&classes)).expect("builds");
         let labels = &spec.containers[0].docker_labels;
 
         assert_eq!(
@@ -499,7 +739,7 @@ mod tests {
         // ECS tasks are on awsvpc ENIs. traefik.docker.network would make the
         // ECS provider try to resolve a Docker network that does not exist.
         let classes = access_classes();
-        let spec = build(&desired(), &[], &cfg(&classes)).expect("builds");
+        let spec = build(&desired(), &[], None, &cfg(&classes)).expect("builds");
         assert!(
             !spec.containers[0]
                 .docker_labels
@@ -517,7 +757,7 @@ mod tests {
         let mut worker = desired();
         worker.port = None;
         worker.routes = vec![];
-        let spec = build(&worker, &[], &cfg(&classes)).expect("builds");
+        let spec = build(&worker, &[], None, &cfg(&classes)).expect("builds");
         // The scope label is about ownership, not routing, so it is still here;
         // what must be absent is anything Traefik would act on. Without
         // `traefik.enable=true` the container stays undiscovered either way.
@@ -538,13 +778,15 @@ mod tests {
         // tick; too insensitive and a changed image never rolls out.
         let classes = access_classes();
         let c = cfg(&classes);
-        let base = build(&desired(), &[], &c).expect("builds");
+        let base = build(&desired(), &[], None, &c).expect("builds");
 
         let mut reordered = desired();
         reordered.env.reverse();
         assert_eq!(
             base.content_hash(),
-            build(&reordered, &[], &c).expect("builds").content_hash(),
+            build(&reordered, &[], None, &c)
+                .expect("builds")
+                .content_hash(),
             "env ordering must not move the hash — it would re-register every tick"
         );
 
@@ -552,7 +794,9 @@ mod tests {
         new_image.image = "registry/myapp:20260101-130000".to_string();
         assert_ne!(
             base.content_hash(),
-            build(&new_image, &[], &c).expect("builds").content_hash(),
+            build(&new_image, &[], None, &c)
+                .expect("builds")
+                .content_hash(),
             "a new image must move the hash or the deploy never rolls out"
         );
 
@@ -560,7 +804,9 @@ mod tests {
         new_env.env.push(("EXTRA".to_string(), "1".to_string()));
         assert_ne!(
             base.content_hash(),
-            build(&new_env, &[], &c).expect("builds").content_hash()
+            build(&new_env, &[], None, &c)
+                .expect("builds")
+                .content_hash()
         );
     }
 
@@ -568,7 +814,7 @@ mod tests {
     fn log_stream_prefix_is_immutable_and_part_of_the_hash() {
         let classes = access_classes();
         let c = cfg(&classes);
-        let base = build(&desired(), &[], &c).expect("builds");
+        let base = build(&desired(), &[], None, &c).expect("builds");
         assert_eq!(
             base.containers[0]
                 .log_config
@@ -579,12 +825,12 @@ mod tests {
 
         let mut other = desired();
         other.deployment_uuid = "33333333-3333-3333-3333-333333333333".to_string();
-        let changed = build(&other, &[], &c).expect("builds");
+        let changed = build(&other, &[], None, &c).expect("builds");
         assert_ne!(base.content_hash(), changed.content_hash());
 
         let mut renamed = desired();
         renamed.project = "renamed-project".to_string();
-        let renamed = build(&renamed, &[], &c).expect("builds");
+        let renamed = build(&renamed, &[], None, &c).expect("builds");
         assert_eq!(
             base.containers[0].log_config, renamed.containers[0].log_config,
             "mutable project names must not determine historical log identity"
@@ -623,14 +869,14 @@ mod tests {
         let mut c = cfg(&classes);
         c.cpu_architecture = "amd64";
         assert_eq!(
-            build(&desired(), &[], &c)
+            build(&desired(), &[], None, &c)
                 .expect("normalises")
                 .cpu_architecture,
             "X86_64"
         );
 
         c.cpu_architecture = "riscv64";
-        let err = build(&desired(), &[], &c).expect_err("must reject");
+        let err = build(&desired(), &[], None, &c).expect_err("must reject");
         assert!(err.to_string().contains("riscv64"), "unhelpful: {err}");
     }
 
@@ -642,14 +888,14 @@ mod tests {
         // only re-reads the secret when a task starts.
         let classes = access_classes();
         let mut c = cfg(&classes);
-        let anonymous = build(&desired(), &[], &c).expect("builds");
+        let anonymous = build(&desired(), &[], None, &c).expect("builds");
         assert!(anonymous.containers[0]
             .repository_credentials_secret_arn
             .is_none());
 
         c.repository_credentials_secret_arn =
             Some("arn:aws:secretsmanager:eu-central-1:1:secret:reg-a");
-        let with_creds = build(&desired(), &[], &c).expect("builds");
+        let with_creds = build(&desired(), &[], None, &c).expect("builds");
         assert_eq!(
             with_creds.containers[0]
                 .repository_credentials_secret_arn
@@ -660,7 +906,7 @@ mod tests {
 
         c.repository_credentials_secret_arn =
             Some("arn:aws:secretsmanager:eu-central-1:1:secret:reg-b");
-        let rotated = build(&desired(), &[], &c).expect("builds");
+        let rotated = build(&desired(), &[], None, &c).expect("builds");
         assert_ne!(with_creds.content_hash(), rotated.content_hash());
     }
 
@@ -678,6 +924,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value_from: "/rise/myapp/default/dep-a/API_KEY".to_string(),
             }],
+            None,
             &c,
         )
         .expect("builds");
@@ -687,6 +934,7 @@ mod tests {
                 name: "API_KEY".to_string(),
                 value_from: "/rise/myapp/default/dep-b/API_KEY".to_string(),
             }],
+            None,
             &c,
         )
         .expect("builds");
@@ -713,10 +961,151 @@ mod tests {
         huge.env = (0..500)
             .map(|i| (format!("VAR_{i}"), "x".repeat(200)))
             .collect();
-        let err = build(&huge, &[], &cfg(&classes)).expect_err("must be rejected");
+        let err = build(&huge, &[], None, &cfg(&classes)).expect_err("must be rejected");
         assert!(
             err.to_string().contains("over the ECS limit"),
             "unhelpful message: {err}"
         );
+    }
+
+    fn identity(tokens_url: Option<&str>) -> IdentityAgentSpec {
+        IdentityAgentSpec {
+            image: "ghcr.io/rise-deploy/rise:1.0.0".to_string(),
+            credential_parameter: "/rise/myapp/default/20260101-120000/rise-identity/credential"
+                .to_string(),
+            tokens_url: tokens_url.map(str::to_string),
+        }
+    }
+
+    /// The contract the app reads is a directory the sidecar fills. The app
+    /// must see it read-only and must not start before it is filled; the
+    /// sidecar must be the only holder of the credential.
+    #[test]
+    fn the_identity_sidecar_shares_a_volume_the_app_mounts_read_only() {
+        let classes = access_classes();
+        let spec = build(
+            &desired(),
+            &[],
+            Some(&identity(Some(
+                "https://rise.dev/api/v1/identity/audience-tokens",
+            ))),
+            &cfg(&classes),
+        )
+        .expect("builds");
+
+        assert_eq!(spec.volumes, vec![IDENTITY_VOLUME.to_string()]);
+        let app = spec.app();
+        assert_eq!(app.name, "app", "the app must stay first");
+        assert!(app.essential);
+        assert_eq!(
+            app.mount_points,
+            vec![MountPointSpec {
+                source_volume: IDENTITY_VOLUME.to_string(),
+                container_path: "/var/run/secrets/rise/identity".to_string(),
+                read_only: true,
+            }]
+        );
+        assert_eq!(app.depends_on_healthy, vec![IDENTITY_AGENT_CONTAINER]);
+        assert!(
+            !app.secrets
+                .iter()
+                .any(|s| s.name == IDENTITY_CREDENTIAL_ENV),
+            "the credential must never reach the app's environment"
+        );
+
+        let agent = &spec.containers[1];
+        assert_eq!(agent.name, IDENTITY_AGENT_CONTAINER);
+        assert!(!agent.essential, "a crashed agent must not stop the app");
+        assert!(agent.restart_on_exit);
+        assert_eq!(agent.command, vec!["identity", "agent"]);
+        assert!(agent.mount_points.iter().all(|m| !m.read_only));
+        assert_eq!(
+            agent.secrets,
+            vec![SecretRef {
+                name: IDENTITY_CREDENTIAL_ENV.to_string(),
+                value_from: "/rise/myapp/default/20260101-120000/rise-identity/credential"
+                    .to_string(),
+            }]
+        );
+        assert_eq!(
+            agent
+                .environment
+                .get(IDENTITY_TOKENS_URL_ENV)
+                .map(String::as_str),
+            Some("https://rise.dev/api/v1/identity/audience-tokens")
+        );
+        assert!(
+            agent.health_check.is_some(),
+            "HEALTHY dependency needs a check"
+        );
+        assert!(
+            agent.docker_labels.is_empty(),
+            "Traefik must never route to the sidecar: {:?}",
+            agent.docker_labels
+        );
+        assert!(agent.repository_credentials_secret_arn.is_none());
+    }
+
+    #[test]
+    fn a_deployment_without_audiences_gets_the_credential_but_no_token_endpoint() {
+        let classes = access_classes();
+        let spec = build(&desired(), &[], Some(&identity(None)), &cfg(&classes)).expect("builds");
+        let agent = &spec.containers[1];
+        assert!(!agent.environment.contains_key(IDENTITY_TOKENS_URL_ENV));
+        assert_eq!(agent.secrets.len(), 1, "the credential is universal");
+    }
+
+    /// Only the app's logs belong to the deployment's log view. The reader
+    /// lists `{prefix}/{project}/{deployment}/`; the sidecar must sit outside it.
+    #[test]
+    fn the_sidecar_logs_outside_the_deployment_log_prefix() {
+        let classes = access_classes();
+        let spec = build(&desired(), &[], Some(&identity(None)), &cfg(&classes)).expect("builds");
+        let app_prefix = format!("{}/", spec.app().log_config.as_ref().unwrap().stream_prefix);
+        let agent_prefix = &spec.containers[1]
+            .log_config
+            .as_ref()
+            .unwrap()
+            .stream_prefix;
+        assert!(
+            !format!("{agent_prefix}/").starts_with(&app_prefix)
+                && !agent_prefix.starts_with("rise/"),
+            "sidecar stream {agent_prefix:?} would appear in the app's logs"
+        );
+    }
+
+    /// The agent image follows the Rise version. Hashing it would roll every
+    /// service on every upgrade; everything else about the sidecar still rolls.
+    #[test]
+    fn the_agent_image_alone_does_not_move_the_hash() {
+        let classes = access_classes();
+        let c = cfg(&classes);
+        let base = build(&desired(), &[], Some(&identity(None)), &c).expect("builds");
+
+        let mut upgraded = identity(None);
+        upgraded.image = "ghcr.io/rise-deploy/rise:2.0.0".to_string();
+        let upgraded = build(&desired(), &[], Some(&upgraded), &c).expect("builds");
+        assert_eq!(
+            upgraded.containers[1].image,
+            "ghcr.io/rise-deploy/rise:2.0.0"
+        );
+        assert_eq!(base.content_hash(), upgraded.content_hash());
+
+        let with_tokens =
+            build(&desired(), &[], Some(&identity(Some("https://x/t"))), &c).expect("builds");
+        assert_ne!(base.content_hash(), with_tokens.content_hash());
+
+        let without_sidecar = build(&desired(), &[], None, &c).expect("builds");
+        assert_ne!(base.content_hash(), without_sidecar.content_hash());
+    }
+
+    #[test]
+    fn an_app_container_cannot_take_the_sidecar_s_name() {
+        let classes = access_classes();
+        let mut clash = desired();
+        clash.container = IDENTITY_AGENT_CONTAINER.to_string();
+        let err = build(&clash, &[], Some(&identity(None)), &cfg(&classes))
+            .expect_err("must be rejected");
+        assert!(err.to_string().contains("reserved"), "unhelpful: {err}");
     }
 }
