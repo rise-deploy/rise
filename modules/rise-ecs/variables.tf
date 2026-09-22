@@ -739,3 +739,9 @@ variable "traefik_constraints" {
   type        = string
   default     = ""
 }
+
+variable "identity_token_ttl_seconds" {
+  description = "Lifetime of the auto-minted [identity] workload tokens. The identity sidecar in each task refreshes them at half this. Null keeps Rise's default (3600)."
+  type        = number
+  default     = null
+}

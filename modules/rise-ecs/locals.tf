@@ -147,4 +147,6 @@ module "control_plane_env" {
   }
 
   repository_credentials_secret_arn = var.repository_credentials_secret_arn
+
+  identity_token_ttl_seconds = var.identity_token_ttl_seconds
 }

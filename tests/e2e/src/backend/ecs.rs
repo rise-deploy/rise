@@ -1307,6 +1307,17 @@ impl Backend for EcsBackend {
         cli::run(c)
     }
 
+    fn workload_api_url(&self) -> Result<Option<String>> {
+        self.run_output("rise_internal_url").map(Some)
+    }
+
+    fn supports_source_build(&self) -> bool {
+        // Built locally, pushed to ECR with the credentials Rise mints, pulled
+        // by the task execution role -- the path `registry-build-push-pull`
+        // proves.
+        true
+    }
+
     fn wait_registry_ready(&self, project: &str) -> Result<()> {
         let repo = format!("{}{project}", self.scoped_repo_prefix());
         let deadline = std::time::Instant::now() + Duration::from_secs(90);

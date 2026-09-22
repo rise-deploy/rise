@@ -56,6 +56,15 @@ locals {
       RISE_MAX_REPLICAS  = tostring(var.max_replicas)
       RISE_REGISTRY_TYPE = var.registry.type
     },
+    var.identity_token_ttl_seconds != null ? {
+      RISE_IDENTITY_TOKEN_TTL_SECONDS = tostring(var.identity_token_ttl_seconds)
+    } : {},
+    var.identity_agent_image != null ? {
+      RISE_ECS_IDENTITY_AGENT_IMAGE = var.identity_agent_image
+    } : {},
+    var.identity_exchange_url != null ? {
+      RISE_ECS_IDENTITY_EXCHANGE_URL = var.identity_exchange_url
+    } : {},
     var.repository_credentials_secret_arn != null ? {
       RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN = var.repository_credentials_secret_arn
     } : {},

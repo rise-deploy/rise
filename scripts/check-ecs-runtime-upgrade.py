@@ -232,7 +232,12 @@ def verify(log, repo):
             }
             assert fields <= e2e_fields[address], (case, address, fields)
         for name, delta in item["test_plan"].get("output_changes", {}).items():
-            assert delta["actions"] == ["no-op"], (case, "changed output", name)
+            # A new output changes nothing the baseline state already holds.
+            assert delta["actions"] in (["no-op"], ["create"]), (
+                case,
+                "changed output",
+                name,
+            )
         checked.add(case)
         print(
             f"{case}: {len(moves)} state moves; "

@@ -816,7 +816,7 @@ impl Scenario for HelmIdempotency {
     }
 }
 
-// ---- (b) workload identity (jfrog-vault registry mode only) ----------------
+// ---- (b) workload identity (every backend with a source-build registry) ----
 
 struct WorkloadIdentity;
 
@@ -827,7 +827,8 @@ impl Scenario for WorkloadIdentity {
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
         // Builds the fixture from source, which needs a registry the runtime can
-        // pull from: the host docker daemon (Docker) or minikube's jfrog-vault mode.
+        // pull from: the host docker daemon (Docker), ECR (ECS), or minikube's
+        // jfrog-vault mode.
         if b.supports_source_build() {
             Applicability::Run
         } else {
@@ -841,6 +842,26 @@ impl Scenario for WorkloadIdentity {
         b.prepare_workload_identity()?;
         let project = unique("e2e-id");
         create_public_project(b, &project)?;
+        b.wait_registry_ready(&project)?;
+        // Where the fixture sends its own requests to Rise, when workloads cannot
+        // route to the public URL. Set before the deploy, which snapshots env.
+        if let Some(api_url) = b.workload_api_url()? {
+            expect_ok(
+                b.rise_cli(
+                    &[
+                        "env",
+                        "set",
+                        "-p",
+                        &project,
+                        "RISE_E2E_API_URL",
+                        &api_url,
+                        "--plain",
+                    ],
+                    None,
+                )?,
+                "point the identity fixture at the in-cluster Rise API",
+            )?;
+        }
         // Build & deploy the identity fixture from source (needs the docker socket).
         expect_ok(
             b.rise_cli_build(
@@ -928,15 +949,18 @@ impl Scenario for WorkloadIdentity {
             resp.body
         );
 
-        // The controller re-mints the file token in place at half its (short) TTL
-        // (identity_token_ttl_seconds in values-ci). Assert this in two stages so a
-        // failure pinpoints *where* it broke:
+        // The file token is re-minted in place at half its (short) TTL
+        // (identity_token_ttl_seconds in values-ci, the Docker overlay, and the ECS
+        // run stack) — by the controller on Kubernetes and Docker, by the identity
+        // sidecar on ECS. Assert this in two stages so a failure pinpoints *where*
+        // it broke:
         //   1. the controller re-mints at the source it writes (the K8s Secret) —
         //      deterministic, independent of in-pod mount propagation;
         //   2. the pod's mounted file then reflects the new token — exercising the
         //      Kubernetes secret-volume propagation deployed apps depend on.
         // On a backend with no source distinct from the mounted file (Docker
-        // bind-mounts the controller's file directly), stage 1 is a no-op
+        // bind-mounts the controller's file directly; ECS's sidecar writes the
+        // shared volume the app mounts), stage 1 is a no-op
         // (`minted_token_jti` → None) and stage 2 alone proves re-minting.
         let first_jti = id["file_token"]["claims"]["jti"]
             .as_str()

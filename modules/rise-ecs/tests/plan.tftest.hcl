@@ -82,6 +82,16 @@ run "creates_a_whole_install" {
     condition     = local.rise_environment["RISE_ECS_LOG_RETENTION_HINT"] == "30d"
     error_message = "the CloudWatch retention policy must reach Rise's empty-log status hint"
   }
+  # The identity sidecar defaults to the control plane's own image (read from
+  # the task metadata at startup) and to the public URL: workloads reach the
+  # control plane only through the edge.
+  assert {
+    condition = alltrue([
+      for key in ["RISE_ECS_IDENTITY_AGENT_IMAGE", "RISE_ECS_IDENTITY_EXCHANGE_URL", "RISE_IDENTITY_TOKEN_TTL_SECONDS"] :
+      !contains(keys(local.rise_environment), key)
+    ])
+    error_message = "the identity sidecar must keep Rise's defaults unless configured"
+  }
 }
 
 run "loads_a_secret_local_config_overlay" {

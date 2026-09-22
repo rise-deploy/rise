@@ -112,7 +112,8 @@ pub trait Backend {
 
     /// Whether this backend can build & deploy an app from source
     /// (`deploy --backend docker:build`) — i.e. it has a registry the runtime can
-    /// pull from. Only minikube's jfrog-vault mode does, in the harness.
+    /// pull from: the host daemon (Docker), ECR (ECS), or minikube's jfrog-vault
+    /// mode.
     fn supports_source_build(&self) -> bool {
         false
     }
@@ -221,6 +222,15 @@ pub trait Backend {
             "app_container_envs is not supported by the {} backend",
             self.name()
         )
+    }
+
+    /// Base URL a deployed workload must use to call the Rise API, when it
+    /// differs from the public URL (`RISE_ISSUER`) a production workload would
+    /// use. `None` where the public URL is reachable from workloads. ECS
+    /// returns the in-VPC address: its edge admits only the harness's own
+    /// address, so a task cannot route to the public one.
+    fn workload_api_url(&self) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Backend-specific preparation before the workload-identity scenario (e.g.
