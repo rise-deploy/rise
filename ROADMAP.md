@@ -121,22 +121,23 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   scenario, including multi-org admins, membership removal, UID-bound token
   invalidation, token caps, and grant/revocation races. A `/// ADR-0001
   scenario N` marker on each covering test is enforced by `mise run
-  adr:conformance:check`; scenario 10's operator-selector and JIT-login halves
-  remain deferred until the `operatorIdentities`/JIT-login item below lands.
+  adr:conformance:check`; scenario 10's operator-selector half remains
+  deferred until the `operatorIdentities` item below lands.
 - [ ] Add the constrained Project ServiceAccount lifecycle operation. It uses
   fresh never-reused canonical names and atomically creates/deletes only its
   fixed Project-scoped policy and trust bundle, applying the effective-delta
   subset check to the result; ordinary Project users do not receive generic
   ServiceAccount or Role/RoleBinding creation authority.
-- [ ] Load `operatorIdentities` `(issuer, subject)` selectors at process startup;
-  JIT-create a generated User plus first UserIdentity after a validated unknown
-  login, and derive operator status live when any identity attached to that User
-  is active and matches the configured set. An inactive exact identity or
-  inactive parent User fails without JIT; deleting a mapping permits a later
-  login to provision a fresh User UID, so durable disablement uses `active:
-  false`. Reject email linking and hot reload; configuration changes complete
-  only after all old instances are drained. Operators remain the recovery tier;
-  legacy admins become qualifying default-org RoleBindings.
+- [x] JIT-create a generated User plus first UserIdentity after a validated
+  unknown login. An inactive exact identity or inactive parent User fails
+  without JIT; deleting a mapping permits a later login to provision a fresh
+  User UID, so durable disablement uses `active: false`. Email never links
+  accounts.
+- [ ] Load `operatorIdentities` `(issuer, subject)` selectors at process startup
+  and derive operator status live when any identity attached to that User is
+  active and matches the configured set. Reject hot reload; configuration
+  changes complete only after all old instances are drained. Operators remain
+  the recovery tier; legacy admins become qualifying default-org RoleBindings.
 
 ### Resource API maturation
 
@@ -188,9 +189,11 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 
 ### Target convergence
 
-- [ ] Issue User sessions with canonical `sub` plus immutable `rise_uid`
+- [x] Issue User sessions with canonical `sub` plus immutable `rise_uid`
   after exact live, active `UserIdentity (issuer, subject)` and active parent
-  User resolution.
+  User resolution. Sessions carry `typ: rise-session+jwt` and are re-resolved
+  on every request; an ID token from `auth.issuer` is exchangeable for one at
+  `POST /api/v1/auth/token`.
 - [x] Move workload token exchange to each ServiceAccount or Controller `/token`
   subresource, introduced additively per kind: a resource-API-backed identity
   gains its `/token` route without touching any other, not-yet-migrated identity

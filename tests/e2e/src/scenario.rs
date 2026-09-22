@@ -413,10 +413,50 @@ impl ResourceTokenExchange {
     const RESOURCES: &'static str = "/api/v1/resources/rise.dev/v1alpha1";
     const TOKEN_EXCHANGE_GRANT: &'static str = "urn:ietf:params:oauth:grant-type:token-exchange";
     const JWT_TOKEN_TYPE: &'static str = "urn:ietf:params:oauth:token-type:jwt";
+    const ID_TOKEN_TYPE: &'static str = "urn:ietf:params:oauth:token-type:id_token";
+
+    /// A Rise session for the stack's operator (`admin@example.com`): a Dex
+    /// login exchanged at `/api/v1/auth/token`, which resolves it to its
+    /// `User` resource exactly as an interactive login does. The resource API
+    /// authorizes that User; the offline-minted CI bearer names none.
+    fn operator_session(b: &dyn Backend, dexep: &dex::DexEndpoint) -> Result<String> {
+        let id_token = dex::mint_password_token(dexep, "admin@example.com", "password")
+            .context("mint Dex OIDC token for the operator")?;
+        let resp = b.api_post_as(
+            "/api/v1/auth/token",
+            None,
+            &serde_json::json!({
+                "grant_type": Self::TOKEN_EXCHANGE_GRANT,
+                "subject_token": id_token,
+                "subject_token_type": Self::ID_TOKEN_TYPE,
+            }),
+        )?;
+        anyhow::ensure!(
+            resp.status == 200,
+            "id_token exchange returned {}:\n{}",
+            resp.status,
+            resp.body
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&resp.body).context("parse id_token exchange response")?;
+        body["access_token"]
+            .as_str()
+            .map(str::to_string)
+            .context("no access_token in id_token exchange response")
+    }
 
     /// POST a resource as the operator and assert `201`.
-    fn create(b: &dyn Backend, collection: &str, body: serde_json::Value) -> Result<()> {
-        let resp = b.api_post(&format!("{}/{collection}", Self::RESOURCES), &body)?;
+    fn create(
+        b: &dyn Backend,
+        operator: &str,
+        collection: &str,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let resp = b.api_post_as(
+            &format!("{}/{collection}", Self::RESOURCES),
+            Some(operator),
+            &body,
+        )?;
         anyhow::ensure!(
             resp.status == 201,
             "create {collection} {} returned {}:\n{}",
@@ -455,11 +495,13 @@ impl Scenario for ResourceTokenExchange {
         let org = unique("e2e-org");
         let sa_path = format!("serviceaccounts/{org}/ci");
         let token_path = format!("{}/{sa_path}/token", Self::RESOURCES);
+        let operator = Self::operator_session(b, dexep)?;
 
         // As the operator: an Organization, a ServiceAccount beneath it, and one
         // trust policy accepting the Dex id_token the password grant mints.
         Self::create(
             b,
+            &operator,
             "organizations",
             serde_json::json!({
                 "apiVersion": "rise.dev/v1alpha1",
@@ -470,6 +512,7 @@ impl Scenario for ResourceTokenExchange {
         )?;
         Self::create(
             b,
+            &operator,
             &format!("serviceaccounts/{org}"),
             serde_json::json!({
                 "apiVersion": "rise.dev/v1alpha1",
@@ -480,6 +523,7 @@ impl Scenario for ResourceTokenExchange {
         )?;
         Self::create(
             b,
+            &operator,
             &format!("serviceaccounttrustpolicies/{org}/ci"),
             serde_json::json!({
                 "apiVersion": "rise.dev/v1alpha1",
@@ -531,6 +575,7 @@ impl Scenario for ResourceTokenExchange {
         // the token.
         Self::create(
             b,
+            &operator,
             "platformroles",
             serde_json::json!({
                 "apiVersion": "rise.dev/v1alpha1",
@@ -543,6 +588,7 @@ impl Scenario for ResourceTokenExchange {
         )?;
         Self::create(
             b,
+            &operator,
             "platformrolebindings",
             serde_json::json!({
                 "apiVersion": "rise.dev/v1alpha1",
@@ -596,7 +642,7 @@ impl Scenario for ResourceTokenExchange {
 
         // Delegated issuance: the operator holds token-create on everything and
         // mints without any assertion.
-        let delegated = b.api_post(&token_path, &serde_json::json!({}))?;
+        let delegated = b.api_post_as(&token_path, Some(&operator), &serde_json::json!({}))?;
         anyhow::ensure!(
             delegated.status == 200,
             "delegated issuance returned {}:\n{}",
@@ -608,7 +654,11 @@ impl Scenario for ResourceTokenExchange {
         // check the RS256 signature against Rise's published JWKS and its own
         // audience. Rise's API refuses it.
         let audience = "https://vault.example.com";
-        let external = b.api_post(&token_path, &serde_json::json!({"audience": audience}))?;
+        let external = b.api_post_as(
+            &token_path,
+            Some(&operator),
+            &serde_json::json!({"audience": audience}),
+        )?;
         anyhow::ensure!(
             external.status == 200,
             "audience-bound issuance returned {}:\n{}",
@@ -655,7 +705,10 @@ impl Scenario for ResourceTokenExchange {
         );
 
         // Tidy up: the Organization cascades over everything beneath it.
-        let _ = b.api_delete(&format!("{}/organizations/{org}", Self::RESOURCES));
+        let _ = http::delete_auth(
+            &format!("{}{}/organizations/{org}", b.api_base(), Self::RESOURCES),
+            &operator,
+        );
         Ok(())
     }
 }

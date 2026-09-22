@@ -13,7 +13,9 @@ use uuid::Uuid;
 /// leaks via `{:?}` (e.g. in logs or panic messages).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RiseClaims {
-    /// User ID from IdP
+    /// The subject. On a session token ([`crate::RISE_SESSION_TYP`]) this is
+    /// the canonical `user:<name>` of the Rise `User` resource; on an ingress
+    /// token and a legacy session it is the upstream IdP's `sub`.
     pub sub: String,
     /// User email
     pub email: String,
@@ -32,6 +34,11 @@ pub struct RiseClaims {
     pub iss: String,
     /// Audience (Rise UI URL or project URL)
     pub aud: String,
+    /// The UID of the `User` resource `sub` names (ADR-0001 §7). Present
+    /// exactly on a session token carrying [`crate::RISE_SESSION_TYP`]; the
+    /// verifier rejects it on any other shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_uid: Option<uuid::Uuid>,
 }
 
 impl std::fmt::Debug for RiseClaims {
@@ -45,6 +52,7 @@ impl std::fmt::Debug for RiseClaims {
             .field("exp", &self.exp)
             .field("iss", &self.iss)
             .field("aud", &self.aud)
+            .field("rise_uid", &self.rise_uid)
             .finish()
     }
 }

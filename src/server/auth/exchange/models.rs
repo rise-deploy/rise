@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 pub const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 /// RFC 8693 token type for a JWT subject / issued token.
 pub const TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+/// RFC 8693 token type for an OIDC ID token: a User login at `auth.issuer`,
+/// exchanged for a Rise session.
+pub const TOKEN_TYPE_ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
 
 /// Maximum accepted `subject_token` length (bytes), to blunt oversized-token
 /// CPU/DoS before any parsing.
@@ -21,7 +24,8 @@ pub struct ExchangeRequest {
     pub grant_type: String,
     /// The source OIDC JWT being exchanged.
     pub subject_token: String,
-    /// Must be [`TOKEN_TYPE_JWT`].
+    /// [`TOKEN_TYPE_JWT`] for a workload token, or [`TOKEN_TYPE_ID_TOKEN`]
+    /// for an ID token from the configured IdP (`auth.issuer`).
     pub subject_token_type: String,
     /// The identity to assume: a service account's synthetic-user email
     /// (`{project}+{seq}@sa.rise.local`). Present → project service-account
@@ -34,7 +38,8 @@ pub struct ExchangeRequest {
 /// Success response (RFC 8693 §2.2.1).
 #[derive(Debug, Serialize)]
 pub struct ExchangeResponse {
-    /// The minted Rise access token (HS256).
+    /// The minted Rise access token, or the Rise session for an ID token
+    /// (both HS256).
     pub access_token: String,
     /// Always `Bearer`.
     pub token_type: String,
@@ -86,6 +91,16 @@ impl ExchangeError {
         Self::OAuth {
             status: StatusCode::BAD_REQUEST,
             error: "invalid_grant",
+            description: Some(desc.into()),
+        }
+    }
+
+    /// `403 access_denied` — the subject token is valid but names a disabled
+    /// account.
+    pub fn access_denied(desc: impl Into<String>) -> Self {
+        Self::OAuth {
+            status: StatusCode::FORBIDDEN,
+            error: "access_denied",
             description: Some(desc.into()),
         }
     }

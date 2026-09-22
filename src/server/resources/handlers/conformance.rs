@@ -250,9 +250,9 @@ async fn editing_the_org_admin_baseline_moves_every_org_while_a_scoped_deny_move
 /// ADR-0001 scenario 10
 ///
 /// Removing a User from a Group revokes Group-derived access on the next
-/// request, re-adding restores it, and deactivating the User (the testable
-/// half of scenario 10 today) revokes everything the name reaches until it
-/// is reactivated.
+/// request, re-adding restores it, and deactivating the User revokes
+/// everything the name reaches until it is reactivated. Login and session
+/// resolution for scenario 10 are covered in `auth::user_identity`.
 #[sqlx::test]
 async fn membership_removal_and_deactivation_revoke_group_access_on_the_next_request(
     pool: sqlx::PgPool,
@@ -976,7 +976,7 @@ async fn delegation_stops_at_the_platform_depth_limit(pool: sqlx::PgPool) {
     .await;
 
     let operator = auth(OPERATOR);
-    let operator_id = operator.user().unwrap().id;
+    let operator_id = operator.user_principal().unwrap().clone();
 
     let resp = post_as(
         &ctx,
@@ -1030,7 +1030,7 @@ async fn delegation_stops_at_the_platform_depth_limit(pool: sqlx::PgPool) {
     let act1 = act2.act.expect("act");
     assert_eq!(act1.sub, "serviceaccount:acme/s1");
     let act0 = act1.act.expect("act");
-    assert_eq!(act0.sub, format!("user:{operator_id}"));
+    assert_eq!(act0.sub, operator_id.subject().to_string());
     assert!(act0.act.is_none());
 
     let as_s4 = identity_auth(&ctx, &t4).await;
@@ -1351,4 +1351,25 @@ async fn a_request_snapshot_is_local_to_the_request(pool: sqlx::PgPool) {
         status_of(get_as(&ctx, "example.dev/v1/widgets/w", auth(PLAIN_USER)).await),
         StatusCode::NOT_FOUND
     );
+}
+
+/// A session issued before identity resolution names no `User` resource. It
+/// keeps the typed APIs until it expires, but the generic resource API cannot
+/// tie it to a principal and refuses it — even for an allowlisted operator.
+#[sqlx::test]
+async fn a_legacy_session_naming_no_user_is_refused(pool: sqlx::PgPool) {
+    let ctx = ctx(pool).await;
+    let legacy = AnyAuth::User(AuthContext::User(
+        crate::db::models::User {
+            id: Uuid::new_v4(),
+            email: OPERATOR.to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+        None,
+    ));
+    let err = get_as(&ctx, "rise.dev/v1alpha1/organizations", legacy)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::UNAUTHORIZED, "{}", err.message);
 }

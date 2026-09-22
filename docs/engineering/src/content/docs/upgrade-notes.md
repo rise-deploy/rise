@@ -31,6 +31,31 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **User logins resolve to `User` resources; sessions carry `rise_uid`.**
+  *Action required.* Every interactive login (browser, CLI code and device
+  flows, app ingress sign-in) now resolves the ID token's exact `(iss, sub)`
+  to a `rise.dev/User` through a `UserIdentity`, creating both on a first
+  login. New session tokens carry `typ: rise-session+jwt`, `sub =
+  user:<name>` and the User's `rise_uid`, and are re-resolved on every request.
+  The generic resource API authorizes that User — `user:<name>` in a binding
+  names it.
+  - **Log in again to use the resource API.** A session issued before the
+    upgrade keeps working on the typed APIs (projects, teams, deployments)
+    until it expires, but `/api/v1/resources` answers it with `401`.
+  - **`auth.issuer` must be canonical** — the exact `iss` your IdP stamps, no
+    trailing slash — or the server refuses to start. IdPs whose `iss` ends in
+    `/` are not supported yet.
+  - **Disable a user with `spec.active: false`** on their `User` (every login
+    and session ends) or on one `UserIdentity` (that login only). Deleting a
+    `UserIdentity` merely unlinks it; the next login provisions a new User.
+  - **New:** `POST /api/v1/auth/token` accepts an ID token from `auth.issuer`
+    (`subject_token_type: urn:ietf:params:oauth:token-type:id_token`) and
+    returns a session through the same resolution.
+  - Migration `20260922000001` adds `users.resource_user_uid`, linking each
+    typed user to the `User` resource it last logged in as.
+  - Operator standing is unchanged: still `auth.operator_users` /
+    `auth.operator_idp_groups`, matched against the login's typed user.
+
 - **Controllers are RBAC principals; `auth.controllers` and the status/finalizer
   allowlist are removed.** *Breaking.* A controller now authenticates by
   matching a live `ControllerTrustPolicy` resource beneath a live root

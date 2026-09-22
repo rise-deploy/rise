@@ -11,11 +11,12 @@ policy and identity resources, the evaluation engine, the write-time grant
 gate, and the centralized choke point. §7's `token` subresource is live for
 `ServiceAccount` and `Controller`: target-bound workload exchange, delegated
 issuance, the `rise.dev/rbac` authorization-detail ceiling, UID-bound
-re-resolution on every request, and the bounded `act` chain. The conformance
-suite covers appendix scenarios 1–57 and is enforced by `mise run
-adr:conformance:check`. Still open: live `User`/`UserIdentity` resolution with
-operator selectors and JIT login — which also completes scenario 10's
-operator-selector halves — and retirement of the typed-table exchange
+re-resolution on every request, and the bounded `act` chain. Interactive logins
+resolve to live `User`/`UserIdentity` resources with JIT provisioning, and User
+sessions carry canonical `sub` plus `rise_uid`. The conformance suite covers
+appendix scenarios 1–57 and is enforced by `mise run adr:conformance:check`.
+Still open: `operatorIdentities` selectors — which complete scenario 10's
+operator-selector half — and retirement of the typed-table exchange
 endpoint. `ROADMAP.md` §§1–3 hold the remaining steps.
 
 scope: the generic resource API (`/api/v1/resources/...`) and

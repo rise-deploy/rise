@@ -139,6 +139,27 @@ pub async fn auth_middleware(
                     return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
                 }
 
+                // A session naming a `User` resource is re-resolved on every
+                // request: an inactive, deleted, or recreated User ends every
+                // session issued for it (ADR-0001 §7). A legacy session names
+                // none; it keeps the typed APIs until it expires, and the
+                // resource API refuses it.
+                if let Some(rise_uid) = claims.rise_uid {
+                    let principal = state
+                        .user_logins
+                        .resolve_session(&claims.sub, rise_uid)
+                        .await
+                        .map_err(|rejection| {
+                            tracing::warn!(
+                                sub = %claims.sub,
+                                rise_uid = %rise_uid,
+                                "Auth middleware: session rejected: {rejection}"
+                            );
+                            (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
+                        })?;
+                    req.extensions_mut().insert(principal);
+                }
+
                 let email = &claims.email;
                 tracing::debug!("Rise session JWT validated for user");
 
@@ -348,6 +369,22 @@ pub async fn optional_auth_middleware(
                             if let Ok(rise_claims) =
                                 state.jwt_signer.verify_user_jwt(&token, &state.public_url)
                             {
+                                // A session whose User no longer resolves is
+                                // no authentication at all.
+                                let principal = match rise_claims.rise_uid {
+                                    Some(rise_uid) => match state
+                                        .user_logins
+                                        .resolve_session(&rise_claims.sub, rise_uid)
+                                        .await
+                                    {
+                                        Ok(principal) => Some(principal),
+                                        Err(_) => return next.run(req).await,
+                                    },
+                                    None => None,
+                                };
+                                if let Some(principal) = principal {
+                                    req.extensions_mut().insert(principal);
+                                }
                                 let email = &rise_claims.email;
                                 // Mirror the strict auth path: never create a user
                                 // row without the matching default-Org membership.

@@ -15,3 +15,4 @@ pub mod roles;
 pub mod routes;
 pub mod sa_match;
 pub mod token_storage;
+pub mod user_identity;

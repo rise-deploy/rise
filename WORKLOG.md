@@ -68,14 +68,18 @@ scope and avoiding dead-end compatibility layers.
    trust policies, delegated issuance under `(create, <kind>, token)`, the
    identity token with `rise_uid`, `authorization_details` parsing into the
    engine's cap, UID-bound re-resolution on every request, and the bounded
-   `act` chain. 10b (planned) is live User/UserIdentity resolution, operator
-   selection, and JIT login.
+   `act` chain. 10b is live User/UserIdentity resolution, operator
+   selection, and JIT login, delivered in three parts: 10b-1 (implemented)
+   resolves logins to `User` resources with JIT provisioning and issues
+   `rise_uid` sessions; 10b-2 (planned) adds `operatorIdentities` selectors;
+   10b-3 (planned) turns legacy admins into default-org RoleBindings.
 11. **Implemented — full conformance and finalization.** Close every
    applicable ADR-0001 acceptance scenario (1-57) across three test tiers,
    index them with a marker convention enforced in lint and CI, and update
    documentation/status accordingly. Scenarios 58-60 (§9 deferred) and 61
    (product-operation deferred) stay excluded; scenario 10's
-   operator-selector/JIT halves follow 10b.
+   JIT-login half landed with 10b-1 and its operator-selector half follows
+   10b-2.
 
 ## Increment 1 — dependency-light resource authorization foundation
 
@@ -1923,6 +1927,71 @@ idempotent when a read-modify-write client replays the stored spec.
     grant, and dying with its UID; a two-hop delegation chain; caps applied to
     `get` and `list`; create-only enforcement; the Rise-issuer guard.
 
+## Increment 10b-1 — live User identity, JIT login, `rise_uid` sessions
+
+- State: implemented on branch `claude/increment-10b-user-jit-vnhxai`.
+- Acceptance criteria:
+  - Every interactive login — CLI code and device flows, the UI callback, and
+    the app-ingress callback — resolves the ID token's exact `(auth.issuer,
+    sub)` to a live `UserIdentity` and its `User`, including inactive rows.
+    An inactive mapping or an active one under an inactive User fails the
+    login and never provisions.
+  - An unknown pair provisions a generated `u-<ulid>` User and its first
+    `UserIdentity` in one `SERIALIZABLE` transaction, on a fresh store too;
+    concurrent first logins converge on one User; a deleted mapping lets the
+    next login provision a fresh User UID; a shared email never links two
+    subjects.
+  - Sessions carry `typ: rise-session+jwt`, `sub = user:<name>`, and
+    `rise_uid`, and are re-resolved on every request: a deactivated, deleted,
+    or same-name-recreated User fails every session issued for it, on the
+    typed APIs as well. `rise_uid` is admitted only with the session `typ`.
+  - The resource API principal is `user:<name>` with the User resource's UID;
+    a legacy session (no `rise_uid`) keeps the typed APIs and gets `401` from
+    the resource API. Delegated `/token` issuance records the User resource
+    as its actor.
+  - `POST /api/v1/auth/token` exchanges an ID token from `auth.issuer` for a
+    session through the same resolution; it never resolves to a workload.
+  - The typed `users` row records the User resource it last logged in as.
+- Decisions:
+  - JIT is a raw store write, not a choke-point write: there is no principal
+    to authorize yet, and the ADR makes it the configuration-rooted exception
+    to grant-gated linking. It only ever creates a new User; it cannot attach
+    to an existing one.
+  - A returning login is one pool read; only a miss opens the transaction,
+    which re-reads the mapping before creating. A unique-index conflict, a name
+    collision, and a serialization failure all mean "a concurrent login won"
+    and retry into the read.
+  - `auth.issuer` must already be canonical (`Issuer::new`), checked at
+    startup. Silently trimming a trailing slash would store an issuer the IdP
+    never stamps; IdPs with a trailing-slash `iss` are therefore unsupported
+    until the issuer grammar decides how to represent them.
+  - The session keeps `email`: the typed APIs still find users by it. Ingress
+    tokens keep the IdP `sub` and never carry `rise_uid`, because deployed
+    apps read them.
+  - Legacy sessions are not rejected wholesale, so the upgrade does not log
+    every user out of the typed APIs; they cannot reach the resource API
+    because nothing ties them to a User.
+  - Group sync still runs before resolution, so the session's `groups` claim
+    is current; the duplicate second sync in the UI callback is gone.
+  - ULIDs are generated in-crate (48-bit ms timestamp + 80 random bits,
+    lowercase Crockford) rather than through a new dependency.
+  - Operator standing is untouched: still the email and IdP-group lists,
+    matched against the typed user the session also carries. 10b-2 replaces
+    that derivation behind the same resolver.
+  - The e2e harness keeps its offline-minted legacy bearer for the typed APIs,
+    which also survives the upgrade-from-older-release flow; the resource
+    scenario logs the operator in through Dex and the ID-token exchange.
+- Verification:
+  - `rise-backend-auth`: the session round trip, `rise_uid` bound to the
+    session `typ` in both directions, ingress tokens never carrying it, and the
+    ingress adapter accepting a typed session.
+  - `rise-deploy` against Postgres: first-login provisioning, concurrent
+    convergence, inactive identity/User refusal without reprovisioning,
+    reprovisioning after mapping deletion, email non-linking, session
+    re-resolution (unknown UID, name mismatch, recreated User), and the legacy
+    session refused by the resource API.
+  - e2e: `cargo clippy` and `cargo test` for the harness.
+
 ## Increment 11 — full conformance
 
 - State: implemented on branch `claude/adr-0001-conformance-suite-utm9mo`.
@@ -1938,9 +2007,9 @@ idempotent when a read-modify-write client replays the stored spec.
     prior tiers already covered most scenarios, so this increment retrofits
     markers there and adds new tests only for the gaps.
   - Scenario 10 (operator selectors, JIT login, User tokens with `rise_uid`)
-    stays blocked on 10b: only its "inactive User loses access" half is
-    tested now, and the rest is documented as following live identity
-    resolution rather than faked.
+    stayed blocked on 10b: only its "inactive User loses access" half was
+    tested then. 10b-1 adds its JIT-login and session halves; the
+    operator-selector half follows 10b-2.
   - Multi-org admins, membership/admin removal taking effect on the next
     request, and UID-bound token invalidation each get dedicated coverage in
     the engine and Postgres/HTTP tiers, closing the gaps `ROADMAP.md`'s

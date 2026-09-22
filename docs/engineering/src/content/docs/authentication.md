@@ -41,6 +41,15 @@ to the Rise API and UI. It is symmetric (HS256), signed with
 Lifetime is `server.jwt_expiry_seconds` (default 24h). Session tokens are an
 internal concern — they are never verified outside Rise.
 
+A session names the user's Rise `User` resource: its header `typ` is
+`rise-session+jwt`, `sub` is the canonical `user:<name>`, and `rise_uid` is the
+User's UID. Every request re-resolves that pair to one live, active User, so
+setting `spec.active: false` on the User — or deleting it — ends every session
+already issued for it. `email` stays in the token for the typed APIs. A session
+issued before this shape (default `typ`, the IdP's `sub`, no `rise_uid`) keeps
+working on the typed APIs until it expires, but the generic resource API refuses
+it with `401`; log in again.
+
 ### Access (HS256) — token exchange
 
 A short-lived, Rise-issued token that encodes a **fully-resolved principal** (a
@@ -206,6 +215,41 @@ applying per-identity claim constraints.
 Interactive login federates to your IdP via `auth.issuer` / `auth.client_id` /
 `auth.client_secret` / `auth.scopes`. On success Rise mints a **Session** token
 (above). This is how operators wire Rise to Dex, Okta, Entra ID, Google, etc.
+
+Each login is resolved to a Rise `User` resource by the ID token's exact
+`(iss, sub)` pair, recorded in a `UserIdentity` child of the User (ADR-0001 §1):
+
+- **First login.** No live `UserIdentity` holds the pair, so Rise creates a new
+  `User` named `u-<ulid>` and its first `UserIdentity` in one transaction.
+  Concurrent first logins converge on one User. The new User holds no grants of
+  its own.
+- **Returning login.** The pair resolves to its User. Email never links
+  accounts: a different `sub` with the same email is a different User.
+- **Disabled.** An inactive `UserIdentity`, or an active one under an inactive
+  User, refuses the login (`403`); it is never treated as unknown. Deleting the
+  `UserIdentity` instead only unlinks it — the next login provisions a fresh
+  User with a new UID — so disable with `spec.active: false`.
+
+`auth.issuer` must be in its canonical form — the exact `iss` the IdP stamps,
+with no trailing slash — or the server refuses to start. The IdP must issue a
+stable `sub`.
+
+Automation that already holds an ID token from `auth.issuer` for Rise's own
+client (`aud` = `auth.client_id`) can exchange it for a session without a
+browser, through the same resolution:
+
+```http
+POST /api/v1/auth/token
+Content-Type: application/json
+
+{"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+ "subject_token": "<id_token>",
+ "subject_token_type": "urn:ietf:params:oauth:token-type:id_token"}
+```
+
+This is not a workload exchange: the token never resolves to a ServiceAccount
+or Controller, whose external assertions go to their own `/token`
+subresource.
 
 ### Service accounts (CI/CD)
 
