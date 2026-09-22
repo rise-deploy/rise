@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Request body for `POST /api/v1/identity/token`.
@@ -21,4 +23,16 @@ pub struct ExchangeTokenResponse {
     pub expires_in: u64,
     /// The audience the token was minted for.
     pub audience: String,
+}
+
+/// Response from `POST /api/v1/identity/audience-tokens`.
+#[derive(Debug, Serialize)]
+pub struct AudienceTokensResponse {
+    /// In-container token filename → signed workload JWT, one per declared
+    /// `[identity].audiences` entry. Empty when the deployment declares none.
+    pub tokens: BTreeMap<String, String>,
+    /// Lifetime of every token in `tokens`, in seconds.
+    pub expires_in: u64,
+    /// When the caller should fetch fresh tokens, in seconds from now.
+    pub refresh_after_secs: u64,
 }

@@ -1,42 +1,53 @@
-use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
+use std::collections::BTreeMap;
+
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, response::Response, Json};
 
 use crate::db::{
-    deployments as db_deployments, environments as db_environments, projects as db_projects,
+    deployments as db_deployments, environments as db_environments, models::Deployment,
+    models::Project, projects as db_projects,
 };
 use crate::server::auth::middleware::extract_bearer_token;
 use crate::server::deployment::webhook::should_have_infrastructure;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::rate_limit::{extract_client_ip, rate_limit_response};
 use crate::server::state::AppState;
-use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
-use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
+use crate::server::workload_tokens::models::{
+    AudienceTokensResponse, ExchangeTokenRequest, ExchangeTokenResponse,
+};
+use crate::server::workload_tokens::{
+    remint_after_secs, sha256_hex, sign_audience_tokens, workload_subject, NO_ENVIRONMENT,
+};
 use rise_backend_auth::WorkloadSubjectInfo;
 
-/// Exchange a deployment's bootstrap credential for a workload identity token.
-///
-/// This route is unauthenticated: the bootstrap credential presented in the
-/// `Authorization: Bearer` header *is* the authentication. A missing deployment
-/// and a deployment without live infrastructure are both reported as an invalid
-/// credential, so a caller cannot distinguish the two.
-pub async fn exchange_token(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<ExchangeTokenRequest>,
-) -> Result<impl IntoResponse, ServerError> {
-    let ip = extract_client_ip(&headers);
+/// The deployment a bootstrap credential authenticates as, with what minting a
+/// token for it needs.
+struct CredentialSubject {
+    deployment: Deployment,
+    project: Project,
+    environment: Option<String>,
+}
 
-    let credential = extract_bearer_token(&headers)
+impl CredentialSubject {
+    fn sub(&self) -> String {
+        workload_subject(&self.project.name, self.environment.as_deref())
+    }
+}
+
+/// Authenticate the bootstrap credential in the `Authorization: Bearer` header.
+///
+/// `Ok(Err(response))` is a rate-limited request, answered with that response.
+/// A missing deployment and a deployment without live infrastructure are both
+/// reported as a rejected credential, so a caller cannot distinguish the two.
+async fn authenticate_credential(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Result<CredentialSubject, Response>, ServerError> {
+    let ip = extract_client_ip(headers);
+
+    let credential = extract_bearer_token(headers)
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .ok_or_else(|| ServerError::unauthorized("Missing bootstrap credential"))?;
-
-    let audience = req.audience.trim();
-    if audience.is_empty() {
-        return Err(ServerError::bad_request("audience must not be empty"));
-    }
-    if audience.len() > 1024 {
-        return Err(ServerError::bad_request("audience value too long"));
-    }
 
     let hash = sha256_hex(credential.as_bytes());
     let deployment_by_credential =
@@ -53,7 +64,7 @@ pub async fn exchange_token(
         .increment_and_check(&ip, None, &rate_limit_key)
         .await
     {
-        return Ok(rate_limit_response(retry_after).into_response());
+        return Ok(Err(rate_limit_response(retry_after).into_response()));
     }
 
     let deployment = match deployment_by_credential {
@@ -88,7 +99,40 @@ pub async fn exchange_token(
         None => None,
     };
 
-    let sub = workload_subject(&project.name, environment.as_deref());
+    Ok(Ok(CredentialSubject {
+        deployment,
+        project,
+        environment,
+    }))
+}
+
+/// Exchange a deployment's bootstrap credential for a workload identity token.
+///
+/// This route is unauthenticated: the bootstrap credential presented in the
+/// `Authorization: Bearer` header *is* the authentication.
+pub async fn exchange_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ExchangeTokenRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    let audience = req.audience.trim();
+    if audience.is_empty() {
+        return Err(ServerError::bad_request("audience must not be empty"));
+    }
+    if audience.len() > 1024 {
+        return Err(ServerError::bad_request("audience value too long"));
+    }
+
+    let subject = match authenticate_credential(&state, &headers).await? {
+        Ok(subject) => subject,
+        Err(rate_limited) => return Ok(rate_limited),
+    };
+    let CredentialSubject {
+        deployment,
+        project,
+        environment,
+    } = &subject;
+    let sub = subject.sub();
 
     let max_ttl = state.server_settings.workload_token_max_ttl_seconds;
     let ttl = req.ttl_seconds.map(|t| t.min(max_ttl)).unwrap_or(max_ttl);
@@ -126,9 +170,101 @@ pub async fn exchange_token(
     .into_response())
 }
 
+/// Mint the tokens for every `[identity].audiences` entry the credential's
+/// deployment declares, keyed by in-container filename.
+///
+/// This is the pre-minted file-token contract served over HTTP, for a backend
+/// that writes the token files from inside the workload (the ECS identity
+/// sidecar) rather than from the controller. It therefore mints exactly what
+/// the Kubernetes webhook and the Docker reconciler put in those files: the
+/// deployment's declared audiences — never caller-chosen ones — signed by the
+/// same helper with the same `identity_token_ttl_seconds`, not the exchange
+/// endpoint's shorter cap. That grants the credential holder nothing new: it
+/// can already mint any audience through `exchange_token`, and read the file
+/// tokens themselves on the other backends. `refresh_after_secs` carries the
+/// shared re-mint policy so the caller need not duplicate it.
+pub async fn audience_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ServerError> {
+    let subject = match authenticate_credential(&state, &headers).await? {
+        Ok(subject) => subject,
+        Err(rate_limited) => return Ok(rate_limited),
+    };
+    let CredentialSubject {
+        deployment,
+        project,
+        environment,
+    } = &subject;
+    let sub = subject.sub();
+
+    let audiences = declared_audiences(&deployment.identity_audiences);
+
+    let ttl = state.identity_token_ttl_seconds;
+    let tokens = sign_audience_tokens(
+        &state.jwt_signer,
+        &WorkloadSubjectInfo {
+            sub: &sub,
+            project: &project.name,
+            environment: environment.as_deref().unwrap_or(NO_ENVIRONMENT),
+            deployment_group: &deployment.deployment_group,
+            deployment_id: &deployment.deployment_id,
+        },
+        &audiences,
+        ttl,
+    )
+    .map_err(|e| ServerError::internal(format!("Failed to sign workload tokens: {:?}", e)))?;
+
+    tracing::debug!(
+        project = %project.name,
+        deployment_group = %deployment.deployment_group,
+        deployment_id = %deployment.deployment_id,
+        count = tokens.len(),
+        ttl_seconds = ttl,
+        "Issued workload identity audience tokens"
+    );
+
+    Ok(Json(AudienceTokensResponse {
+        tokens,
+        expires_in: ttl,
+        refresh_after_secs: remint_after_secs(ttl),
+    })
+    .into_response())
+}
+
+/// A deployment's `[identity].audiences` as filename → audience. Filenames are
+/// validated at deploy time; unsafe ones are dropped again here because they
+/// become paths in the workload.
+fn declared_audiences(identity_audiences: &serde_json::Value) -> BTreeMap<String, String> {
+    serde_json::from_value::<BTreeMap<String, String>>(identity_audiences.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(filename, _)| rise_backend_core::identity::is_safe_token_filename(filename))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The audience-tokens endpoint mints exactly what the deployment declared,
+    /// never a filename that could escape the tokens directory.
+    #[test]
+    fn declared_audiences_are_the_safe_entries_of_the_identity_block() {
+        let audiences = declared_audiences(&serde_json::json!({
+            "e2e": "rise-e2e-audience",
+            "aws": "sts.amazonaws.com",
+            "../credential": "evil",
+        }));
+        assert_eq!(
+            audiences.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["aws", "e2e"]
+        );
+        assert_eq!(audiences["e2e"], "rise-e2e-audience");
+
+        assert!(declared_audiences(&serde_json::json!({})).is_empty());
+        assert!(declared_audiences(&serde_json::Value::Null).is_empty());
+    }
 
     /// The empty-audience guard is pure input validation: an audience that is
     /// only whitespace is rejected as a bad request.

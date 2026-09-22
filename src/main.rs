@@ -403,6 +403,18 @@ enum IdentityCommands {
         #[arg(long)]
         ttl_seconds: Option<u64>,
     },
+    /// Run the workload-identity sidecar the ECS backend adds to every task
+    ///
+    /// Writes the bootstrap credential and the deployment's audience tokens to
+    /// /var/run/secrets/rise/identity and keeps the tokens fresh. Rise starts
+    /// it; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Agent {
+        /// Exit 0 if the agent has written everything the app needs (the
+        /// container health check), non-zero otherwise
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1229,6 +1241,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // The identity agent runs as a sidecar with no CLI config and must not
+    // reach for a backend on startup: its health check runs every few seconds.
+    if let Commands::Identity(IdentityCommands::Agent { check }) = &cli_command {
+        return cli::identity::agent_command(&Client::new(), *check).await;
+    }
+
     // Load CLI config for client commands
     let http_client = Client::new();
     let mut config = config::Config::load()?;
@@ -1857,6 +1875,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            IdentityCommands::Agent { .. } => unreachable!("handled before config load"),
         },
         Commands::Skill(skill_cmd) => match skill_cmd {
             SkillCommands::Install {
