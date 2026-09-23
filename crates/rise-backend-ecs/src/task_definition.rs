@@ -56,9 +56,16 @@ const RISE_BINARY: &str = "/usr/local/bin/rise";
 /// Environment variable the sidecar reads its bootstrap credential from.
 pub const IDENTITY_CREDENTIAL_ENV: &str = "RISE_IDENTITY_CREDENTIAL";
 
-/// Environment variable naming the endpoint the sidecar fetches tokens from.
-/// Set only when the deployment declares `[identity].audiences`.
-pub const IDENTITY_TOKENS_URL_ENV: &str = "RISE_IDENTITY_TOKENS_URL";
+/// Environment variable naming the token-exchange endpoint the sidecar mints
+/// the token files from. Set only when the deployment declares audiences.
+pub const IDENTITY_TOKEN_URL_ENV: &str = "RISE_IDENTITY_TOKEN_URL";
+
+/// Environment variable carrying `[identity].audiences` (filename → audience)
+/// as a JSON object. Not secret: it is the deployment's own `rise.toml`.
+pub const IDENTITY_AUDIENCES_ENV: &str = "RISE_IDENTITY_AUDIENCES";
+
+/// Environment variable carrying the token lifetime the sidecar asks for.
+pub const IDENTITY_TOKEN_TTL_ENV: &str = "RISE_IDENTITY_TOKEN_TTL_SECONDS";
 
 /// Memory the sidecar reserves out of the task's size. A soft reservation, not
 /// a limit: it keeps placement honest without capping an agent that briefly
@@ -72,9 +79,14 @@ pub struct IdentityAgentSpec {
     pub image: String,
     /// SSM parameter holding this deployment's bootstrap credential.
     pub credential_parameter: String,
-    /// Full URL of the audience-tokens endpoint, or `None` when the deployment
-    /// declares no `[identity].audiences` and the credential is all it gets.
-    pub tokens_url: Option<String>,
+    /// Full URL of the token-exchange endpoint.
+    pub token_url: String,
+    /// `[identity].audiences`, filename → audience. Empty when the deployment
+    /// declares none: the credential is then all it gets.
+    pub audiences: BTreeMap<String, String>,
+    /// Lifetime to request for each token: `identity_token_ttl_seconds`, the
+    /// lifetime the other backends give the token files.
+    pub token_ttl_seconds: u64,
 }
 
 /// A container's view of a task volume.
@@ -524,8 +536,19 @@ fn identity_agent_container(
     cfg: &TaskDefinitionConfig<'_>,
 ) -> ContainerDefinitionSpec {
     let mut environment = BTreeMap::new();
-    if let Some(url) = &identity.tokens_url {
-        environment.insert(IDENTITY_TOKENS_URL_ENV.to_string(), url.clone());
+    if !identity.audiences.is_empty() {
+        environment.insert(
+            IDENTITY_TOKEN_URL_ENV.to_string(),
+            identity.token_url.clone(),
+        );
+        environment.insert(
+            IDENTITY_AUDIENCES_ENV.to_string(),
+            serde_json::to_string(&identity.audiences).unwrap_or_default(),
+        );
+        environment.insert(
+            IDENTITY_TOKEN_TTL_ENV.to_string(),
+            identity.token_ttl_seconds.to_string(),
+        );
     }
     let log_config = cfg.log_group.map(|group| LogConfig {
         log_group: group.to_string(),
@@ -968,12 +991,17 @@ mod tests {
         );
     }
 
-    fn identity(tokens_url: Option<&str>) -> IdentityAgentSpec {
+    /// `audience`, when set, declares one `[identity]` audience (file `e2e`).
+    fn identity(audience: Option<&str>) -> IdentityAgentSpec {
         IdentityAgentSpec {
             image: "ghcr.io/rise-deploy/rise:1.0.0".to_string(),
             credential_parameter: "/rise/myapp/default/20260101-120000/rise-identity/credential"
                 .to_string(),
-            tokens_url: tokens_url.map(str::to_string),
+            token_url: "https://rise.dev/api/v1/identity/token".to_string(),
+            audiences: audience
+                .map(|a| BTreeMap::from([("e2e".to_string(), a.to_string())]))
+                .unwrap_or_default(),
+            token_ttl_seconds: 3600,
         }
     }
 
@@ -986,9 +1014,7 @@ mod tests {
         let spec = build(
             &desired(),
             &[],
-            Some(&identity(Some(
-                "https://rise.dev/api/v1/identity/audience-tokens",
-            ))),
+            Some(&identity(Some("rise-e2e-audience"))),
             &cfg(&classes),
         )
         .expect("builds");
@@ -1027,13 +1053,16 @@ mod tests {
                     .to_string(),
             }]
         );
+        let env = |k: &str| agent.environment.get(k).map(String::as_str);
         assert_eq!(
-            agent
-                .environment
-                .get(IDENTITY_TOKENS_URL_ENV)
-                .map(String::as_str),
-            Some("https://rise.dev/api/v1/identity/audience-tokens")
+            env(IDENTITY_TOKEN_URL_ENV),
+            Some("https://rise.dev/api/v1/identity/token")
         );
+        assert_eq!(
+            env(IDENTITY_AUDIENCES_ENV),
+            Some(r#"{"e2e":"rise-e2e-audience"}"#)
+        );
+        assert_eq!(env(IDENTITY_TOKEN_TTL_ENV), Some("3600"));
         assert!(
             agent.health_check.is_some(),
             "HEALTHY dependency needs a check"
@@ -1051,7 +1080,7 @@ mod tests {
         let classes = access_classes();
         let spec = build(&desired(), &[], Some(&identity(None)), &cfg(&classes)).expect("builds");
         let agent = &spec.containers[1];
-        assert!(!agent.environment.contains_key(IDENTITY_TOKENS_URL_ENV));
+        assert!(agent.environment.is_empty(), "{:?}", agent.environment);
         assert_eq!(agent.secrets.len(), 1, "the credential is universal");
     }
 
@@ -1091,8 +1120,7 @@ mod tests {
         );
         assert_eq!(base.content_hash(), upgraded.content_hash());
 
-        let with_tokens =
-            build(&desired(), &[], Some(&identity(Some("https://x/t"))), &c).expect("builds");
+        let with_tokens = build(&desired(), &[], Some(&identity(Some("aud"))), &c).expect("builds");
         assert_ne!(base.content_hash(), with_tokens.content_hash());
 
         let without_sidecar = build(&desired(), &[], None, &c).expect("builds");

@@ -18,7 +18,7 @@
 //!    between drift detection and readiness, and a task definition
 //!    is registered only when its content hash actually moves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -433,11 +433,13 @@ pub struct ReconcilerConfig {
     pub identity_agent_image: String,
     /// Base URL of the Rise API as the sidecar reaches it.
     pub identity_exchange_url: String,
+    /// Lifetime of the `[identity]` token files the sidecar mints.
+    pub identity_token_ttl_seconds: u64,
 }
 
-/// Path of the endpoint the identity sidecar fetches audience tokens from,
-/// under [`ReconcilerConfig::identity_exchange_url`].
-const AUDIENCE_TOKENS_PATH: &str = "/api/v1/identity/audience-tokens";
+/// Path of the token-exchange endpoint the identity sidecar mints the token
+/// files from, under [`ReconcilerConfig::identity_exchange_url`].
+const TOKEN_EXCHANGE_PATH: &str = "/api/v1/identity/token";
 
 /// Whether `deployment` carries the workload-identity sidecar.
 ///
@@ -454,6 +456,17 @@ fn carries_identity_sidecar(deployment: &Deployment) -> bool {
             deployment.status,
             DeploymentStatus::Pushed | DeploymentStatus::Deploying
         )
+}
+
+/// A deployment's `[identity].audiences` as filename → audience. Filenames are
+/// validated at deploy time; unsafe ones are dropped again here because the
+/// sidecar turns them into paths.
+fn declared_audiences(identity_audiences: &serde_json::Value) -> BTreeMap<String, String> {
+    serde_json::from_value::<BTreeMap<String, String>>(identity_audiences.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(filename, _)| rise_backend_core::identity::is_safe_token_filename(filename))
+        .collect()
 }
 
 /// Whether a service whose deployment resolved to `status` should be collected.
@@ -1425,19 +1438,15 @@ impl EcsReconciler {
                 deployment_uuid: deployment.id,
                 provision: deployment.identity_credential_hash.is_none(),
             });
-        let declares_audiences = deployment
-            .identity_audiences
-            .as_object()
-            .is_some_and(|m| !m.is_empty());
         let identity_agent = identity_credential.as_ref().map(|plan| IdentityAgentSpec {
             image: self.config.identity_agent_image.clone(),
             credential_parameter: plan.parameter.clone(),
-            tokens_url: declares_audiences.then(|| {
-                format!(
-                    "{}{AUDIENCE_TOKENS_PATH}",
-                    self.config.identity_exchange_url.trim_end_matches('/')
-                )
-            }),
+            token_url: format!(
+                "{}{TOKEN_EXCHANGE_PATH}",
+                self.config.identity_exchange_url.trim_end_matches('/')
+            ),
+            audiences: declared_audiences(&deployment.identity_audiences),
+            token_ttl_seconds: self.config.identity_token_ttl_seconds,
         });
 
         // Everything build() rejects -- an unsatisfiable Fargate size, an
@@ -3409,6 +3418,21 @@ mod tests {
                 "a provisioned {serving:?} deployment must keep its sidecar"
             );
         }
+    }
+
+    #[test]
+    fn declared_audiences_are_the_safe_entries_of_the_identity_block() {
+        let audiences = super::declared_audiences(&serde_json::json!({
+            "e2e": "rise-e2e-audience",
+            "aws": "sts.amazonaws.com",
+            "../credential": "evil",
+        }));
+        assert_eq!(
+            audiences.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["aws", "e2e"]
+        );
+        assert!(super::declared_audiences(&serde_json::json!({})).is_empty());
+        assert!(super::declared_audiences(&serde_json::Value::Null).is_empty());
     }
 
     /// The rejection text is what `rise deploy` shows the user. The marker in

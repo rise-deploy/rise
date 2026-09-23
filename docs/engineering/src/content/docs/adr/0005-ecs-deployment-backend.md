@@ -64,9 +64,9 @@ default path is byte-for-byte unchanged.
 
 CloudWatch logs (D11) have since shipped, and so has workload identity (D8), as
 amended below: every task carries an identity sidecar, the credential is minted
-by the control plane into SSM, and the sidecar fetches the deployment's audience
-tokens through a dedicated server endpoint so their TTL matches the other
-backends.
+by the control plane into SSM, and the sidecar mints the deployment's token
+files through the existing exchange endpoint, now capped by the same
+`identity_token_ttl_seconds` as the token files on every backend.
 
 Deliberately deferred, each **failing closed**: the deployment is marked Failed
 on its first reconcile, carrying the reason as its failure message rather than
@@ -513,21 +513,26 @@ register a new revision and roll every service in the fleet on upgrade. It gains
 the sidecar on its next deploy. Only deployments still coming up
 (`Pushed`/`Deploying`) or already provisioned get it.
 
-**Tokens come from one server-side call, not one exchange per audience.** The
-public exchange endpoint (`POST /api/v1/identity/token`) caps TTLs at
-`workload_token_max_ttl_seconds` (900 s by default), while the file tokens the
-other backends deliver live `identity_token_ttl_seconds` (3600 s by default); a
-sidecar built on it would hand ECS workloads shorter-lived tokens than the same
-`rise.toml` gets elsewhere, and make one rate-limited request per audience per
-replica. The sidecar instead calls `POST /api/v1/identity/audience-tokens` with
-the credential as its bearer, and the server returns the tokens for exactly the
-deployment's declared `[identity].audiences`, minted by the same
-`sign_audience_tokens` helper and with the same TTL as the Kubernetes webhook
-and the Docker reconciler, plus a `refresh_after_secs` from
-`remint_after_secs`. So the audience set, the claim set, the TTL and the refresh
-policy all stay server-side, and the sidecar is a file writer. This is no new
-capability: the credential already lets its holder mint tokens for any audience,
-and the workload can already read the file tokens.
+**Tokens come from the existing exchange endpoint, under one lifetime cap.**
+The sidecar mints each token file with `POST /api/v1/identity/token` — the
+endpoint `rise identity token` uses — once per declared audience, asking for
+`identity_token_ttl_seconds`. The controller hands it the `[identity].audiences`
+map (filename → audience) as plain environment: it is the deployment's own
+`rise.toml`, not a secret, and cannot change within a deployment. It refreshes
+at half the lifetime the endpoint reports, the policy every backend follows,
+with up to 20 % random jitter so a deployment's tasks do not refresh — or
+retry against the shared rate limiter — in lockstep.
+
+That makes `identity_token_ttl_seconds` the **single cap on every workload
+identity token**: the lifetime of the token files on all three backends, and
+the maximum (and default) lifetime of a token from the exchange endpoint. The
+endpoint previously had a separate, shorter cap; with one cap an exchanged
+token can live exactly as long as the file tokens a workload can already read,
+and no longer, and the ECS files cannot drift from the other backends'. The
+claims match too: the endpoint signs with the same subject information and key
+as the controllers' `sign_audience_tokens`. A dedicated "mint my declared
+audiences" endpoint was considered and dropped — it would have been a second
+public token surface for a saving of one call per extra audience per refresh.
 
 The sidecar reaches that endpoint at `identity_exchange_url` (default: the
 server's public URL — the same URL the workload itself uses for `rise identity

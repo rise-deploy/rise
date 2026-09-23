@@ -178,7 +178,10 @@ Two paths produce these tokens:
   re-mints once a token passes half its lifetime.
 - Apps may also call `POST /api/v1/identity/token` directly, exchanging their
   deployment bootstrap credential (`Authorization: Bearer <credential>`) for a
-  token with a requested audience.
+  token with a requested audience. Its lifetime is capped by the same
+  `identity_token_ttl_seconds` — one cap for every workload identity token —
+  and defaults to it. On ECS the identity sidecar writes the token files through
+  this endpoint.
 
 ### The RS256 key is operationally load-bearing
 

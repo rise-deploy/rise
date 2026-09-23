@@ -398,8 +398,9 @@ enum IdentityCommands {
         /// every Rise deployment (/var/run/secrets/rise/identity/credential).
         #[arg(long)]
         credential: Option<String>,
-        /// Requested token lifetime in seconds. Capped by the server's configured maximum
-        /// (default 900). Omitting this field uses the server maximum.
+        /// Requested token lifetime in seconds. Capped by the server's configured maximum,
+        /// the lifetime of the auto-minted token files (default 3600). Omitting this field
+        /// uses the server maximum.
         #[arg(long)]
         ttl_seconds: Option<u64>,
     },

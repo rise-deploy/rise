@@ -242,11 +242,15 @@ the app starts.
   (`/{ssm_parameter_prefix}/…/{deployment_id}/rise-identity/credential`), so the
   execution role's existing grant covers it and it is deleted with the
   deployment. Only the sidecar receives it.
-- **Tokens** for `[identity].audiences` are fetched from
-  `POST /api/v1/identity/audience-tokens` at `identity_exchange_url` (default:
-  the public URL) and refreshed at half their TTL. Tasks therefore need a route
-  to that URL; set `identity_exchange_url` to an internal address if they have
-  none.
+- **Tokens** for `[identity].audiences` are minted one per audience from the
+  token-exchange endpoint (`POST /api/v1/identity/token`) at
+  `identity_exchange_url` (default: the public URL), with a lifetime of
+  `identity_token_ttl_seconds`, and refreshed at half that. Tasks therefore need
+  a route to that URL; set `identity_exchange_url` to an internal address if
+  they have none. The calls share the endpoint's rate limiter (per client IP,
+  per project, install-wide); a large deployment starting behind one NAT address
+  may be briefly throttled, in which case the sidecar backs off and the app
+  starts a little later.
 - **The image** defaults to the control plane's own, read from the ECS task
   metadata at startup, so the agent always matches the server. Override it with
   `identity_agent_image`. It is left out of the task-definition hash: a new

@@ -106,10 +106,18 @@ Merged to `develop`:
   - `identity_token_ttl_seconds` is now env-driven on ECS
     (`RISE_IDENTITY_TOKEN_TTL_SECONDS`; `rise-ecs` exposes
     `identity_token_ttl_seconds`).
-  - A new endpoint, `POST /api/v1/identity/audience-tokens`, serves the
-    sidecar: it mints the credential's deployment's declared audiences with
-    `identity_token_ttl_seconds`, exactly what the other backends write to the
-    token files.
+
+- **One lifetime cap for workload identity tokens; `server.workload_token_max_ttl_seconds`
+  is removed.** *Breaking.* Tokens from the token-exchange endpoint
+  (`POST /api/v1/identity/token`, `rise identity token`) are now capped by
+  `deployment_controller.identity_token_ttl_seconds` — the lifetime of the
+  auto-minted `[identity]` token files — on every backend. **The default
+  lifetime of an exchanged token rises from 900 s to 3600 s**, matching the
+  token files a workload could already read; a request's `ttl_seconds` still
+  lowers it. The server **refuses to start** while
+  `server.workload_token_max_ttl_seconds` is set, rather than silently
+  lengthening tokens you had capped: remove the key and set
+  `identity_token_ttl_seconds` to the lifetime you want.
 
 - **ECS: a `capacity` setting, and service network configuration now converges.**
   *Config change.* `deployment_controller.capacity` selects where workload tasks

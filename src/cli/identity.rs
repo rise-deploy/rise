@@ -43,14 +43,30 @@ pub async fn token_command(
         .context("RISE_ISSUER is not set; this command runs inside a Rise deployment")?;
     let url = format!("{}/api/v1/identity/token", issuer.trim_end_matches('/'));
 
+    let token = exchange(http_client, &url, &credential, audience, ttl_seconds).await?;
+
+    eprintln!("expires_in: {}s", token.expires_in);
+    println!("{}", token.token);
+    Ok(())
+}
+
+/// Exchange the bootstrap credential at the token endpoint `url` for one token.
+async fn exchange(
+    http_client: &Client,
+    url: &str,
+    credential: &str,
+    audience: &str,
+    ttl_seconds: Option<u64>,
+) -> Result<ExchangeTokenResponse> {
     let mut body = serde_json::json!({ "audience": audience });
     if let Some(ttl) = ttl_seconds {
         body["ttl_seconds"] = serde_json::json!(ttl);
     }
 
     let response = http_client
-        .post(&url)
+        .post(url)
         .header("Authorization", format!("Bearer {}", credential))
+        .timeout(std::time::Duration::from_secs(30))
         .json(&body)
         .send()
         .await
@@ -65,14 +81,10 @@ pub async fn token_command(
         anyhow::bail!("Token exchange failed (status {}): {}", status, body);
     }
 
-    let token: ExchangeTokenResponse = response
+    response
         .json()
         .await
-        .context("Failed to parse token exchange response")?;
-
-    eprintln!("expires_in: {}s", token.expires_in);
-    println!("{}", token.token);
-    Ok(())
+        .context("Failed to parse token exchange response")
 }
 
 // ── identity agent ───────────────────────────────────────────────────────────
@@ -80,9 +92,9 @@ pub async fn token_command(
 // The workload-identity sidecar the ECS backend runs in every task (ADR-0005
 // D8). ECS has no Secret volume and no way to write a file into a running
 // container, so the files the other backends deliver from the controller are
-// written from inside the task instead, onto a volume shared with the app.
-// The agent is deliberately a file writer and nothing more: which audiences to
-// mint, their TTL and when to refresh them are all decided by the server.
+// written from inside the task instead, onto a volume shared with the app. The
+// tokens come from the same exchange endpoint `rise identity token` uses, at
+// the lifetime the other backends give the token files.
 
 /// Root of the shared identity volume, as the app sees it.
 const IDENTITY_DIR: &str = "/var/run/secrets/rise/identity";
@@ -95,10 +107,42 @@ const AGENT_READY_FILE: &str = "/tmp/rise-identity-agent-ready";
 const AGENT_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(2);
 const AGENT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
-#[derive(Debug, Deserialize)]
-struct AudienceTokensResponse {
-    tokens: std::collections::BTreeMap<String, String>,
-    refresh_after_secs: u64,
+/// What the agent fetches, read from the environment the controller sets.
+struct AgentConfig {
+    credential: String,
+    /// The exchange endpoint. `None` when the deployment declares no audiences:
+    /// the credential is then all the app gets.
+    token_url: Option<String>,
+    /// `[identity].audiences`: token filename → audience.
+    audiences: std::collections::BTreeMap<String, String>,
+    /// The lifetime to ask for; the server caps it either way.
+    ttl_seconds: Option<u64>,
+}
+
+impl AgentConfig {
+    fn from_env() -> Result<Self> {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let credential = var("RISE_IDENTITY_CREDENTIAL")
+            .map(|c| c.trim().to_string())
+            .context(
+                "RISE_IDENTITY_CREDENTIAL is not set; the identity agent runs as a Rise sidecar",
+            )?;
+        let audiences = match var("RISE_IDENTITY_AUDIENCES") {
+            Some(raw) => serde_json::from_str(&raw)
+                .context("RISE_IDENTITY_AUDIENCES is not a JSON object of filename → audience")?,
+            None => Default::default(),
+        };
+        let ttl_seconds = var("RISE_IDENTITY_TOKEN_TTL_SECONDS")
+            .map(|t| t.parse())
+            .transpose()
+            .context("RISE_IDENTITY_TOKEN_TTL_SECONDS is not a number of seconds")?;
+        Ok(Self {
+            credential,
+            token_url: var("RISE_IDENTITY_TOKEN_URL"),
+            audiences,
+            ttl_seconds,
+        })
+    }
 }
 
 /// Where the agent writes, and where it reports readiness. Overridable so the
@@ -126,11 +170,8 @@ impl AgentPaths {
 
 /// Run the identity agent, or with `check` report whether it is ready.
 ///
-/// Reads the bootstrap credential from `RISE_IDENTITY_CREDENTIAL` and, when the
-/// deployment declares `[identity].audiences`, the token endpoint from
-/// `RISE_IDENTITY_TOKENS_URL`. Ready means every file the app will look for
-/// exists: the credential, plus the tokens when there are any to fetch. Until
-/// then the app container does not start.
+/// Ready means every file the app will look for exists: the credential, plus a
+/// token per declared audience. Until then the app container does not start.
 pub async fn agent_command(http_client: &Client, check: bool) -> Result<()> {
     let paths = AgentPaths::from_env();
     if check {
@@ -142,27 +183,17 @@ pub async fn agent_command(http_client: &Client, check: bool) -> Result<()> {
         return Ok(());
     }
 
-    let credential = std::env::var("RISE_IDENTITY_CREDENTIAL")
-        .ok()
-        .map(|c| c.trim().to_string())
-        .filter(|c| !c.is_empty())
-        .context(
-            "RISE_IDENTITY_CREDENTIAL is not set; the identity agent runs as a Rise sidecar",
-        )?;
-    let tokens_url = std::env::var("RISE_IDENTITY_TOKENS_URL")
-        .ok()
-        .filter(|u| !u.trim().is_empty());
-
+    let config = AgentConfig::from_env()?;
     // A restarted agent must not report ready off a previous run's marker
     // before it has written anything itself.
     let _ = std::fs::remove_file(&paths.ready_file);
-    write_credential(&paths.dir, &credential)?;
+    write_credential(&paths.dir, &config.credential)?;
     tracing::info!(dir = %paths.dir.display(), "Wrote the workload identity credential");
 
     let run = async {
-        match tokens_url {
-            Some(url) => refresh_tokens_forever(http_client, &url, &credential, &paths).await,
-            None => {
+        match (&config.token_url, config.audiences.is_empty()) {
+            (Some(url), false) => refresh_tokens_forever(http_client, url, &config, &paths).await,
+            _ => {
                 // No audiences declared: the credential is everything the app
                 // gets. Stay up so ECS does not treat the sidecar as failed.
                 mark_ready(&paths.ready_file)?;
@@ -204,41 +235,43 @@ async fn terminate_signal() {
     }
 }
 
-/// Fetch the deployment's audience tokens, write them, and repeat when the
-/// server says they are due — forever, retrying failures with backoff. A failed
-/// refresh leaves the previous tokens in place: they stay valid for the second
-/// half of their lifetime, which is the margin the refresh schedule exists for.
+/// Mint a token per declared audience, write them, and repeat at half their
+/// lifetime — forever, retrying failures with backoff. A failed refresh leaves
+/// the previous tokens in place: they stay valid for the second half of their
+/// lifetime, which is the margin the refresh schedule exists for.
 async fn refresh_tokens_forever(
     http_client: &Client,
     url: &str,
-    credential: &str,
+    config: &AgentConfig,
     paths: &AgentPaths,
 ) -> Result<()> {
     let mut retry = AGENT_RETRY_INITIAL;
     let mut ready = false;
     loop {
-        let wait = match fetch_audience_tokens(http_client, url, credential).await {
-            Ok(response) => {
-                write_tokens(&paths.dir, &response.tokens)?;
+        let wait = match fetch_tokens(http_client, url, config).await {
+            Ok((tokens, expires_in)) => {
+                write_tokens(&paths.dir, &tokens)?;
                 if !ready {
                     mark_ready(&paths.ready_file)?;
                     ready = true;
                 }
+                retry = AGENT_RETRY_INITIAL;
+                let wait = jittered(refresh_after(expires_in));
                 tracing::info!(
-                    count = response.tokens.len(),
-                    refresh_after_secs = response.refresh_after_secs,
+                    count = tokens.len(),
+                    expires_in_secs = expires_in,
+                    refresh_in_secs = wait.as_secs(),
                     "Wrote workload identity tokens"
                 );
-                retry = AGENT_RETRY_INITIAL;
-                std::time::Duration::from_secs(response.refresh_after_secs.max(1))
+                wait
             }
             Err(e) => {
+                let wait = jittered(retry);
                 tracing::warn!(
-                    retry_in_secs = retry.as_secs(),
+                    retry_in_secs = wait.as_secs(),
                     "Failed to fetch workload identity tokens: {:?}",
                     e
                 );
-                let wait = retry;
                 retry = (retry * 2).min(AGENT_RETRY_MAX);
                 wait
             }
@@ -247,27 +280,44 @@ async fn refresh_tokens_forever(
     }
 }
 
-async fn fetch_audience_tokens(
+/// One token per declared audience, keyed by filename, and the shortest
+/// lifetime among them. All or nothing: a partial set is retried whole, so the
+/// app never starts with some token files missing.
+async fn fetch_tokens(
     http_client: &Client,
     url: &str,
-    credential: &str,
-) -> Result<AudienceTokensResponse> {
-    let response = http_client
-        .post(url)
-        .header("Authorization", format!("Bearer {}", credential))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+    config: &AgentConfig,
+) -> Result<(std::collections::BTreeMap<String, String>, u64)> {
+    let mut tokens = std::collections::BTreeMap::new();
+    let mut expires_in = u64::MAX;
+    for (filename, audience) in &config.audiences {
+        let token = exchange(
+            http_client,
+            url,
+            &config.credential,
+            audience,
+            config.ttl_seconds,
+        )
         .await
-        .with_context(|| format!("Failed to reach {url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("{url} answered {status}: {body}");
+        .with_context(|| format!("audience {audience:?} (token file {filename:?})"))?;
+        expires_in = expires_in.min(token.expires_in);
+        tokens.insert(filename.clone(), token.token);
     }
-    response
-        .json()
-        .await
-        .context("Failed to parse the audience-tokens response")
+    Ok((tokens, expires_in))
+}
+
+/// Re-mint at half the lifetime, the policy every backend follows
+/// (`rise_backend_core::token_ttl::remint_after_secs`, which a CLI-only build
+/// cannot link).
+fn refresh_after(expires_in_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs((expires_in_secs / 2).max(1))
+}
+
+/// Up to 20% earlier than `d`, at random. Every task of a deployment starts at
+/// once; without this their refreshes, and their retries against a rate
+/// limit, would stay in lockstep for the life of the deployment.
+fn jittered(d: std::time::Duration) -> std::time::Duration {
+    d.mul_f64(1.0 - rand::random::<f64>() * 0.2)
 }
 
 fn write_credential(dir: &std::path::Path, credential: &str) -> Result<()> {
@@ -282,7 +332,7 @@ fn write_tokens(
     let tokens_dir = dir.join("tokens");
     ensure_dir(&tokens_dir)?;
     for (filename, jwt) in tokens {
-        // The server filters these already; they become paths, so check again.
+        // Validated at deploy time; checked again because these become paths.
         if !is_safe_token_filename(filename) {
             tracing::warn!(filename = %filename, "Skipping a token with an unsafe filename");
             continue;
@@ -372,6 +422,19 @@ mod tests {
         }
         // No staging file is left behind for the app to trip over.
         assert!(!dir.path().join("tokens").join(".e2e.tmp").exists());
+    }
+
+    #[test]
+    fn tokens_refresh_at_half_their_lifetime_jittered_earlier_never_later() {
+        assert_eq!(refresh_after(3600).as_secs(), 1800);
+        assert_eq!(refresh_after(1).as_secs(), 1, "never a busy loop");
+        for _ in 0..100 {
+            let d = jittered(std::time::Duration::from_secs(1800));
+            assert!(
+                d.as_secs_f64() <= 1800.0 && d.as_secs_f64() >= 1440.0,
+                "{d:?}"
+            );
+        }
     }
 
     #[test]

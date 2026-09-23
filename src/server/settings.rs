@@ -414,12 +414,6 @@ pub struct ServerSettings {
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
 
-    /// Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.
-    /// Requests that specify a higher TTL are silently capped to this value.
-    /// Default: 900 (15 minutes).
-    #[serde(default = "default_workload_token_max_ttl_seconds")]
-    pub workload_token_max_ttl_seconds: u64,
-
     /// Lifetime in seconds of Rise access tokens minted by the auth
     /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
     /// exchanged token cannot be revoked mid-life. Default: 600 (10 minutes).
@@ -616,10 +610,6 @@ fn default_jwt_claims() -> Vec<String> {
 
 fn default_jwt_expiry_seconds() -> u64 {
     86400 // 24 hours
-}
-
-fn default_workload_token_max_ttl_seconds() -> u64 {
-    900 // 15 minutes
 }
 
 fn default_auth_token_max_ttl_seconds() -> u64 {
@@ -1453,9 +1443,10 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens auto-minted by the controller
-        /// and mounted into deployment pods. The controller re-mints tokens when they
-        /// are older than half this value. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those auto-minted by
+        /// the controller and mounted into deployment pods (re-minted once older
+        /// than half this value), and the cap on tokens from the token-exchange
+        /// endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1642,8 +1633,9 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens minted for
-        /// deployments. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those minted into
+        /// the `[identity]` token files, and the cap on tokens from the
+        /// token-exchange endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1884,8 +1876,9 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of the auto-minted `[identity]` workload tokens.
-        /// The identity sidecar in each task fetches fresh ones at half this.
+        /// Lifetime in seconds of workload identity tokens: the `[identity]`
+        /// token files, which the identity sidecar in each task refreshes at half
+        /// this, and the cap on tokens from the token-exchange endpoint.
         #[serde(
             default = "default_identity_token_ttl_seconds",
             deserialize_with = "deserialize_u64_flexible"
@@ -2279,6 +2272,23 @@ impl Settings {
             unused_fields.push(path.to_string());
         })
         .map_err(|e| ConfigError::Message(format!("Failed to deserialize settings: {}", e)))?;
+
+        // A removed key that capped token lifetimes must not be silently
+        // ignored: an operator who set it chose a shorter lifetime, and ignoring
+        // it would lengthen every exchanged token behind their back.
+        if unused_fields
+            .iter()
+            .any(|f| f == "server.workload_token_max_ttl_seconds")
+        {
+            return Err(ConfigError::Message(
+                "server.workload_token_max_ttl_seconds has been removed. Workload identity \
+                 tokens from the token-exchange endpoint are now capped by \
+                 deployment_controller.identity_token_ttl_seconds, the same lifetime as the \
+                 auto-minted [identity] token files. Remove the key and set \
+                 identity_token_ttl_seconds to the lifetime you want."
+                    .to_string(),
+            ));
+        }
 
         // Warn about unused fields
         for field in &unused_fields {
@@ -3075,6 +3085,41 @@ unknown_top_level: "also unknown"
             result.is_ok(),
             "Config should load despite unknown fields: {:?}",
             result.err()
+        );
+    }
+
+    /// Removing the exchanged-token cap must not silently lengthen tokens for an
+    /// operator who had set it: the key fails startup with its replacement.
+    #[test]
+    fn the_removed_exchange_ttl_cap_fails_startup_instead_of_being_ignored() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("development.yaml"),
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+  workload_token_max_ttl_seconds: 300
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let err =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+                .expect_err("the removed key must be refused");
+        assert!(
+            err.to_string().contains("identity_token_ttl_seconds"),
+            "should name the replacement: {err}"
         );
     }
 

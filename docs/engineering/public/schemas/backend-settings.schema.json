@@ -394,7 +394,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens auto-minted by the controller\nand mounted into deployment pods. The controller re-mints tokens when they\nare older than half this value. Default: 3600 (1 hour).",
+              "description": "Lifetime in seconds of workload identity tokens: those auto-minted by\nthe controller and mounted into deployment pods (re-minted once older\nthan half this value), and the cap on tokens from the token-exchange\nendpoint. Default: 3600 (1 hour).",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -634,7 +634,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens minted for\ndeployments. Default: 3600 (1 hour).",
+              "description": "Lifetime in seconds of workload identity tokens: those minted into\nthe `[identity]` token files, and the cap on tokens from the\ntoken-exchange endpoint. Default: 3600 (1 hour).",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -850,7 +850,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of the auto-minted `[identity]` workload tokens.\nThe identity sidecar in each task fetches fresh ones at half this.",
+              "description": "Lifetime in seconds of workload identity tokens: the `[identity]`\ntoken files, which the identity sidecar in each task refreshes at half\nthis, and the cap on tokens from the token-exchange endpoint.",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -2220,13 +2220,6 @@
             "string",
             "null"
           ]
-        },
-        "workload_token_max_ttl_seconds": {
-          "default": 900,
-          "description": "Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.\nRequests that specify a higher TTL are silently capped to this value.\nDefault: 900 (15 minutes).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
         }
       },
       "required": [

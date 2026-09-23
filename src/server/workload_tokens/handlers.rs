@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, response::Response, Json};
 
 use crate::db::{
@@ -11,12 +9,8 @@ use crate::server::deployment::webhook::should_have_infrastructure;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::rate_limit::{extract_client_ip, rate_limit_response};
 use crate::server::state::AppState;
-use crate::server::workload_tokens::models::{
-    AudienceTokensResponse, ExchangeTokenRequest, ExchangeTokenResponse,
-};
-use crate::server::workload_tokens::{
-    remint_after_secs, sha256_hex, sign_audience_tokens, workload_subject, NO_ENVIRONMENT,
-};
+use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
+use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
 
 /// The deployment a bootstrap credential authenticates as, with what minting a
@@ -106,10 +100,23 @@ async fn authenticate_credential(
     }))
 }
 
+/// The lifetime of an exchanged token: what the caller asked for, capped at
+/// `identity_token_ttl_seconds`, or that cap when the caller did not ask.
+///
+/// One cap for every workload identity token. It is also the lifetime of the
+/// auto-minted token files, which a workload can read anyway, so an exchanged
+/// token may live as long as those do and no longer. The ECS identity sidecar
+/// writes those files through this endpoint, so the two cannot drift.
+fn capped_ttl(requested: Option<u64>, cap: u64) -> u64 {
+    requested.map_or(cap, |t| t.min(cap))
+}
+
 /// Exchange a deployment's bootstrap credential for a workload identity token.
 ///
 /// This route is unauthenticated: the bootstrap credential presented in the
-/// `Authorization: Bearer` header *is* the authentication.
+/// `Authorization: Bearer` header *is* the authentication. Callers are the
+/// workload itself (`rise identity token`) and, on ECS, the identity sidecar
+/// writing the `[identity]` token files.
 pub async fn exchange_token(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -134,8 +141,7 @@ pub async fn exchange_token(
     } = &subject;
     let sub = subject.sub();
 
-    let max_ttl = state.server_settings.workload_token_max_ttl_seconds;
-    let ttl = req.ttl_seconds.map(|t| t.min(max_ttl)).unwrap_or(max_ttl);
+    let ttl = capped_ttl(req.ttl_seconds, state.identity_token_ttl_seconds);
 
     let token = state
         .jwt_signer
@@ -170,104 +176,18 @@ pub async fn exchange_token(
     .into_response())
 }
 
-/// Mint the tokens for every `[identity].audiences` entry the credential's
-/// deployment declares, keyed by in-container filename.
-///
-/// This is the pre-minted file-token contract served over HTTP, for a backend
-/// that writes the token files from inside the workload (the ECS identity
-/// sidecar) rather than from the controller. It therefore mints exactly what
-/// the Kubernetes webhook and the Docker reconciler put in those files: the
-/// deployment's declared audiences — never caller-chosen ones — signed by the
-/// same helper with the same `identity_token_ttl_seconds`, not the exchange
-/// endpoint's shorter cap. That grants the credential holder nothing new: it
-/// can already mint any audience through `exchange_token`, and read the file
-/// tokens themselves on the other backends. `refresh_after_secs` carries the
-/// shared re-mint policy so the caller need not duplicate it.
-pub async fn audience_tokens(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ServerError> {
-    let subject = match authenticate_credential(&state, &headers).await? {
-        Ok(subject) => subject,
-        Err(rate_limited) => return Ok(rate_limited),
-    };
-    let CredentialSubject {
-        deployment,
-        project,
-        environment,
-    } = &subject;
-    let sub = subject.sub();
-
-    let audiences = declared_audiences(&deployment.identity_audiences);
-
-    let ttl = state.identity_token_ttl_seconds;
-    let tokens = sign_audience_tokens(
-        &state.jwt_signer,
-        &WorkloadSubjectInfo {
-            sub: &sub,
-            project: &project.name,
-            environment: environment.as_deref().unwrap_or(NO_ENVIRONMENT),
-            deployment_group: &deployment.deployment_group,
-            deployment_id: &deployment.deployment_id,
-        },
-        &audiences,
-        ttl,
-    )
-    .map_err(|e| ServerError::internal(format!("Failed to sign workload tokens: {:?}", e)))?;
-
-    tracing::debug!(
-        project = %project.name,
-        deployment_group = %deployment.deployment_group,
-        deployment_id = %deployment.deployment_id,
-        count = tokens.len(),
-        ttl_seconds = ttl,
-        "Issued workload identity audience tokens"
-    );
-
-    Ok(Json(AudienceTokensResponse {
-        tokens,
-        expires_in: ttl,
-        refresh_after_secs: remint_after_secs(ttl),
-    })
-    .into_response())
-}
-
-/// A deployment's `[identity].audiences` as filename → audience. Filenames are
-/// validated at deploy time; unsafe ones are dropped again here because they
-/// become paths in the workload.
-fn declared_audiences(identity_audiences: &serde_json::Value) -> BTreeMap<String, String> {
-    serde_json::from_value::<BTreeMap<String, String>>(identity_audiences.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(filename, _)| rise_backend_core::identity::is_safe_token_filename(filename))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The audience-tokens endpoint mints exactly what the deployment declared,
-    /// never a filename that could escape the tokens directory.
     #[test]
-    fn declared_audiences_are_the_safe_entries_of_the_identity_block() {
-        let audiences = declared_audiences(&serde_json::json!({
-            "e2e": "rise-e2e-audience",
-            "aws": "sts.amazonaws.com",
-            "../credential": "evil",
-        }));
-        assert_eq!(
-            audiences.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["aws", "e2e"]
-        );
-        assert_eq!(audiences["e2e"], "rise-e2e-audience");
-
-        assert!(declared_audiences(&serde_json::json!({})).is_empty());
-        assert!(declared_audiences(&serde_json::Value::Null).is_empty());
+    fn exchanged_tokens_live_at_most_as_long_as_the_token_files() {
+        assert_eq!(capped_ttl(None, 3600), 3600, "omitted means the cap");
+        assert_eq!(capped_ttl(Some(600), 3600), 600);
+        assert_eq!(capped_ttl(Some(3600), 3600), 3600);
+        assert_eq!(capped_ttl(Some(86_400), 3600), 3600);
     }
 
-    /// The empty-audience guard is pure input validation: an audience that is
-    /// only whitespace is rejected as a bad request.
     #[test]
     fn empty_audience_is_rejected() {
         for raw in ["", "   ", "\t\n"] {

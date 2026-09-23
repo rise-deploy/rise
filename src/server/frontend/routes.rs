@@ -300,7 +300,6 @@ mod tests {
             docs_dir: Some(docs_dir),
             ssrf: Default::default(),
             oauth_rate_limit: OAuthRateLimitSettings::default(),
-            workload_token_max_ttl_seconds: 900,
             auth_token_max_ttl_seconds: 600,
         }
     }

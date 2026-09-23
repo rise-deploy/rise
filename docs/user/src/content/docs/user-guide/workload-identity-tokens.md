@@ -98,8 +98,12 @@ Content-Type: application/json
 Response:
 
 ```json
-{ "token": "<JWT>", "token_type": "Bearer", "expires_in": 900 }
+{ "token": "<JWT>", "token_type": "Bearer", "expires_in": 3600 }
 ```
+
+Pass `"ttl_seconds"` to ask for a shorter lifetime. The maximum, and the
+default, is the lifetime your Rise operator configured for workload identity
+tokens (one hour unless changed) — the same as the token files.
 
 The bootstrap credential stops working once the deployment is torn down or
 superseded.
