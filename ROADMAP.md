@@ -187,13 +187,33 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ ] Finish raw-external-token deprecation telemetry, then disable and remove
   direct external JWT acceptance from ordinary resource endpoints.
 
+### Authentication entry points
+
+Every way a credential enters Rise, and whether it stays. A new credential path
+is added to this table in the same change that introduces it, and nothing
+permanent is built on an endpoint marked *retires*.
+
+| Entry point | Credential presented | Status | Why / gate |
+|---|---|---|---|
+| Browser login (`/auth/signin` → `/auth/callback`) | IdP authorization code | Stays | Human UI login; ID token received on the back channel, bound by PKCE, `state`, `nonce` |
+| CLI login (`/auth/code/exchange`, `/auth/device/exchange`) | IdP code or device code | Stays | Human CLI login, same binding |
+| App sign-in (`/auth/signin?project=…`, checked by `/auth/ingress`) | IdP authorization code | Stays | End users of private apps; the app-scoped ingress token keeps the IdP `sub` because apps read it |
+| `/token` on ServiceAccount / Controller — workload exchange | External assertion (Kubernetes projected token, CI OIDC, …) | Stays | The target design for every non-human caller; checked only against the target's trust policies |
+| `/token` on ServiceAccount / Controller — delegated issuance | Rise bearer holding `(create, <kind>, token)` | Stays | Minting for another identity, optionally for an external audience |
+| `POST /api/v1/identity/token` | Deployed app's bootstrap credential | Stays | Outbound federation from deployed apps (AWS STS, GCP WIF, Vault); not authentication to Rise |
+| Raw external JWTs on API endpoints (`auth.allow_raw_external_tokens`) | Third-party JWT, unexchanged | Retires | Disabled, then removed, once deprecation telemetry shows no use (item above) |
+| `POST /api/v1/auth/token` with `identity` | CI OIDC JWT for a typed project service account | Retires | Replaced by ServiceAccount `/token`; gated on every typed service account migrating and its traffic draining to zero (item below) |
+| `POST /api/v1/auth/token` without `identity` | External JWT matching a `ControllerTrustPolicy` | Retires | Duplicates Controller `/token`; removed once the remaining controllers (`rise-k8s-controller`, §5) use `/token`. With the row above gone, the endpoint is deleted |
+| Legacy session tokens (no `rise_uid`) | Session issued before User resolution | Retires | No longer minted; they lapse within one session lifetime and are refused by the resource API meanwhile |
+| Operator standing by email / IdP group (`auth.operator_users`, `auth.operator_idp_groups`) | — (configuration) | Retires | Replaced by `operatorIdentities` selectors (§1) |
+| ID-token exchange for sessions | Presented IdP ID token | Rejected | Would honor any ID token the IdP issues for Rise's client (cross-client trust, token exchange, multi-audience) with no PKCE/`state`/`nonce` binding, and provision Users from it. Reconsidered only behind an opt-in setting, off by default, with a single `aud`, `azp == client_id`, and the session capped at the ID token's expiry |
+
 ### Target convergence
 
 - [x] Issue User sessions with canonical `sub` plus immutable `rise_uid`
   after exact live, active `UserIdentity (issuer, subject)` and active parent
   User resolution. Sessions carry `typ: rise-session+jwt` and are re-resolved
-  on every request; an ID token from `auth.issuer` is exchangeable for one at
-  `POST /api/v1/auth/token`.
+  on every request.
 - [x] Move workload token exchange to each ServiceAccount or Controller `/token`
   subresource, introduced additively per kind: a resource-API-backed identity
   gains its `/token` route without touching any other, not-yet-migrated identity

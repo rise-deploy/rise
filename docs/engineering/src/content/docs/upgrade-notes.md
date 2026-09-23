@@ -42,15 +42,13 @@ Merged to `develop`:
   - **Log in again to use the resource API.** A session issued before the
     upgrade keeps working on the typed APIs (projects, teams, deployments)
     until it expires, but `/api/v1/resources` answers it with `401`.
-  - **`auth.issuer` must be canonical** — the exact `iss` your IdP stamps, no
-    trailing slash — or the server refuses to start. IdPs whose `iss` ends in
-    `/` are not supported yet.
+  - **`auth.issuer` must be spelled exactly as your IdP stamps `iss`**
+    (trailing slash included if the IdP uses one) and otherwise canonical, or
+    the server refuses to start. The same rule now admits trailing-slash
+    issuers in `ServiceAccountTrustPolicy` / `ControllerTrustPolicy`.
   - **Disable a user with `spec.active: false`** on their `User` (every login
     and session ends) or on one `UserIdentity` (that login only). Deleting a
     `UserIdentity` merely unlinks it; the next login provisions a new User.
-  - **New:** `POST /api/v1/auth/token` accepts an ID token from `auth.issuer`
-    (`subject_token_type: urn:ietf:params:oauth:token-type:id_token`) and
-    returns a session through the same resolution.
   - Migration `20260922000001` adds `users.resource_user_uid`, linking each
     typed user to the `User` resource it last logged in as.
   - Operator standing is unchanged: still `auth.operator_users` /

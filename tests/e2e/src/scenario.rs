@@ -413,36 +413,14 @@ impl ResourceTokenExchange {
     const RESOURCES: &'static str = "/api/v1/resources/rise.dev/v1alpha1";
     const TOKEN_EXCHANGE_GRANT: &'static str = "urn:ietf:params:oauth:grant-type:token-exchange";
     const JWT_TOKEN_TYPE: &'static str = "urn:ietf:params:oauth:token-type:jwt";
-    const ID_TOKEN_TYPE: &'static str = "urn:ietf:params:oauth:token-type:id_token";
 
-    /// A Rise session for the stack's operator (`admin@example.com`): a Dex
-    /// login exchanged at `/api/v1/auth/token`, which resolves it to its
-    /// `User` resource exactly as an interactive login does. The resource API
-    /// authorizes that User; the offline-minted CI bearer names none.
+    /// A Rise session for the stack's operator (`admin@example.com`), from a
+    /// real login: Rise's PKCE code flow against Dex, driven headlessly. That
+    /// login resolves to the operator's `User` resource, which is what the
+    /// resource API authorizes; the offline-minted CI bearer names none.
     fn operator_session(b: &dyn Backend, dexep: &dex::DexEndpoint) -> Result<String> {
-        let id_token = dex::mint_password_token(dexep, "admin@example.com", "password")
-            .context("mint Dex OIDC token for the operator")?;
-        let resp = b.api_post_as(
-            "/api/v1/auth/token",
-            None,
-            &serde_json::json!({
-                "grant_type": Self::TOKEN_EXCHANGE_GRANT,
-                "subject_token": id_token,
-                "subject_token_type": Self::ID_TOKEN_TYPE,
-            }),
-        )?;
-        anyhow::ensure!(
-            resp.status == 200,
-            "id_token exchange returned {}:\n{}",
-            resp.status,
-            resp.body
-        );
-        let body: serde_json::Value =
-            serde_json::from_str(&resp.body).context("parse id_token exchange response")?;
-        body["access_token"]
-            .as_str()
-            .map(str::to_string)
-            .context("no access_token in id_token exchange response")
+        crate::login::login(b.api_base(), dexep, "admin@example.com", "password")
+            .context("log the operator in through Dex")
     }
 
     /// POST a resource as the operator and assert `201`.

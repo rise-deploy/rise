@@ -255,20 +255,6 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
     SAFE_FALLBACK.to_string()
 }
 
-/// Validate an ID token from the configured IdP: signature, `iss ==
-/// auth.issuer`, expiry, and `aud == auth.client_id`.
-pub(crate) async fn validate_id_token(
-    state: &AppState,
-    id_token: &str,
-) -> anyhow::Result<serde_json::Value> {
-    let mut expected_claims = HashMap::new();
-    expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
-    state
-        .jwt_validator
-        .validate(id_token, &state.auth_settings.issuer, &expected_claims)
-        .await
-}
-
 /// Helper function to sync IdP groups after login
 ///
 /// This validates the token and syncs the user's team memberships from IdP groups.
@@ -282,27 +268,23 @@ async fn sync_groups_after_login(
         return Ok(());
     }
 
-    // Validate token to get claims
-    let claims_value = validate_id_token(state, id_token).await.map_err(|e| {
-        tracing::warn!("Failed to validate token for group sync: {:#}", e);
-        (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-    })?;
-    sync_groups_from_claims(state, &claims_value).await
-}
+    // Build expected claims for validation
+    let mut expected_claims = HashMap::new();
+    expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
 
-/// Sync the user's team memberships from the IdP groups in already-validated
-/// ID-token claims. A no-op unless IdP group sync is enabled.
-pub(crate) async fn sync_groups_from_claims(
-    state: &AppState,
-    claims_value: &serde_json::Value,
-) -> Result<(), (StatusCode, String)> {
-    if !state.auth_settings.idp_group_sync_enabled {
-        return Ok(());
-    }
+    // Validate token to get claims
+    let claims_value = state
+        .jwt_validator
+        .validate(id_token, &state.auth_settings.issuer, &expected_claims)
+        .await
+        .map_err(|e| {
+            tracing::warn!("Failed to validate token for group sync: {:#}", e);
+            (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
+        })?;
 
     // Parse claims
     let claims = crate::server::auth::jwt::Claims::from_value_with_group_claim(
-        claims_value.clone(),
+        claims_value,
         &state.auth_settings.idp_group_claim,
     )
     .map_err(|e| {
@@ -359,7 +341,7 @@ pub(crate) async fn sync_groups_from_claims(
 
 /// Why a validated upstream login did not produce a Rise session.
 #[derive(Debug)]
-pub(crate) enum LoginFailure {
+enum LoginFailure {
     /// The ID token has no `email`, which the typed APIs key users on.
     MissingEmail,
     /// The exact identity mapping, or its User, is inactive (ADR-0001 §1).
@@ -372,7 +354,7 @@ pub(crate) enum LoginFailure {
 
 impl LoginFailure {
     /// The status and message a login endpoint answers with.
-    pub(crate) fn response(&self) -> (StatusCode, String) {
+    fn response(&self) -> (StatusCode, String) {
         match self {
             Self::MissingEmail => (StatusCode::BAD_REQUEST, "Email claim missing".to_string()),
             Self::Disabled => (
@@ -389,12 +371,12 @@ impl LoginFailure {
 }
 
 /// The two identities a validated login resolves to.
-pub(crate) struct ResolvedLogin {
+struct ResolvedLogin {
     /// The typed-API user, found or created by email.
-    pub user: crate::db::User,
+    user: crate::db::User,
     /// The live `User` resource, found by exact `(issuer, subject)` or
     /// provisioned on first sight (ADR-0001 §1).
-    pub principal: UserPrincipal,
+    principal: UserPrincipal,
 }
 
 /// Resolve an ID token already validated against `auth.issuer` to its typed
@@ -402,7 +384,7 @@ pub(crate) struct ResolvedLogin {
 ///
 /// An inactive mapping or User fails here, before anything is issued — the
 /// ingress flow included, since a disabled User may not log in anywhere.
-pub(crate) async fn resolve_login(
+async fn resolve_login(
     state: &AppState,
     claims: &serde_json::Value,
 ) -> Result<ResolvedLogin, LoginFailure> {
@@ -470,7 +452,7 @@ pub(crate) async fn resolve_login(
 }
 
 /// Issue the Rise session token for a resolved login.
-pub(crate) async fn issue_session(
+async fn issue_session(
     state: &AppState,
     claims: &serde_json::Value,
     login: &ResolvedLogin,

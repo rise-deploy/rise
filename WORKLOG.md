@@ -1949,8 +1949,9 @@ idempotent when a read-modify-write client replays the stored spec.
     a legacy session (no `rise_uid`) keeps the typed APIs and gets `401` from
     the resource API. Delegated `/token` issuance records the User resource
     as its actor.
-  - `POST /api/v1/auth/token` exchanges an ID token from `auth.issuer` for a
-    session through the same resolution; it never resolves to a workload.
+  - There is no way to trade a presented ID token for a session: every User
+    session comes from a login flow that received its ID token from the IdP
+    over the back channel.
   - The typed `users` row records the User resource it last logged in as.
 - Decisions:
   - JIT is a raw store write, not a choke-point write: there is no principal
@@ -1962,9 +1963,17 @@ idempotent when a read-modify-write client replays the stored spec.
     collision, and a serialization failure all mean "a concurrent login won"
     and retry into the read.
   - `auth.issuer` must already be canonical (`Issuer::new`), checked at
-    startup. Silently trimming a trailing slash would store an issuer the IdP
-    never stamps; IdPs with a trailing-slash `iss` are therefore unsupported
-    until the issuer grammar decides how to represent them.
+    startup. The issuer grammar now takes the IdP's exact `iss` spelling as
+    canonical, with or without one trailing slash: OIDC compares issuers as
+    exact strings and IdPs differ (Dex omits the slash, Auth0 includes it), so
+    trimming would store an issuer the IdP never stamps. A mapping written in
+    the other spelling can never match a token, so admitting both creates no
+    alias that bypasses deactivation.
+  - An ID-token exchange for non-browser logins was built and then removed:
+    it would honor any ID token the IdP issues for Rise's client (cross-client
+    trust, token exchange, multi-audience tokens) with no PKCE, `state`, or
+    `nonce` binding, and provision Users from it. `ROADMAP.md` §2 records it
+    as rejected.
   - The session keeps `email`: the typed APIs still find users by it. Ingress
     tokens keep the IdP `sub` and never carry `rise_uid`, because deployed
     apps read them.
@@ -1980,7 +1989,8 @@ idempotent when a read-modify-write client replays the stored spec.
     that derivation behind the same resolver.
   - The e2e harness keeps its offline-minted legacy bearer for the typed APIs,
     which also survives the upgrade-from-older-release flow; the resource
-    scenario logs the operator in through Dex and the ID-token exchange.
+    scenario logs the operator in through the real CLI PKCE code flow, driving
+    Dex's login form headlessly.
 - Verification:
   - `rise-backend-auth`: the session round trip, `rise_uid` bound to the
     session `typ` in both directions, ingress tokens never carrying it, and the
@@ -1990,7 +2000,10 @@ idempotent when a read-modify-write client replays the stored spec.
     reprovisioning after mapping deletion, email non-linking, session
     re-resolution (unknown UID, name mismatch, recreated User), and the legacy
     session refused by the resource API.
-  - e2e: `cargo clippy` and `cargo test` for the harness.
+  - `rise-resource-api`: issuer spellings with and without one trailing slash
+    accepted, every other alias refused.
+  - e2e: `cargo clippy` and `cargo test` for the harness, including the Dex
+    login-form and redirect parsing.
 
 ## Increment 11 — full conformance
 

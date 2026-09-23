@@ -411,10 +411,13 @@ mod tests {
         // Checked before any connection is made, so a lazy pool suffices.
         let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
         let store = Arc::new(PgResourceStore::new(pool.clone()));
-        let error = UserLogins::new(store, pool, "https://idp.example.com/")
+        let error = UserLogins::new(store.clone(), pool.clone(), "https://IDP.example.com")
             .err()
-            .expect("a trailing slash is not canonical");
+            .expect("an upper-case host is not canonical");
         assert!(error.to_string().contains("auth.issuer"), "{error}");
+        // The IdP's own spelling is kept, trailing slash included.
+        let logins = UserLogins::new(store, pool, "https://tenant.auth0.example/").unwrap();
+        assert_eq!(logins.issuer.as_str(), "https://tenant.auth0.example/");
     }
 
     /// ADR-0001 scenario 10

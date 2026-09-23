@@ -22,9 +22,8 @@ use rise_backend_auth::{
 
 use super::models::{
     ExchangeError, ExchangeRequest, ExchangeResponse, GRANT_TYPE_TOKEN_EXCHANGE,
-    MAX_SUBJECT_TOKEN_LEN, TOKEN_TYPE_ID_TOKEN, TOKEN_TYPE_JWT,
+    MAX_SUBJECT_TOKEN_LEN, TOKEN_TYPE_JWT,
 };
-use crate::server::auth::handlers::{issue_session, resolve_login, LoginFailure};
 
 /// The fixed scope set granted to a service-account access token (matching what
 /// a service account can do today — per-SA configurable scopes are deferred).
@@ -44,8 +43,7 @@ fn peek_issuer(token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// `POST /api/v1/auth/token` — exchange an external OIDC token for a Rise
-/// access token, or an ID token from the configured IdP for a Rise session.
+/// `POST /api/v1/auth/token` — exchange an external OIDC token for a Rise access token.
 pub async fn exchange(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -68,15 +66,11 @@ async fn exchange_inner(
     if req.grant_type != GRANT_TYPE_TOKEN_EXCHANGE {
         return Err(ExchangeError::invalid_request("unsupported grant_type"));
     }
-    let is_id_token = match req.subject_token_type.as_str() {
-        TOKEN_TYPE_JWT => false,
-        TOKEN_TYPE_ID_TOKEN => true,
-        _ => {
-            return Err(ExchangeError::invalid_request(
-                "unsupported subject_token_type",
-            ))
-        }
-    };
+    if req.subject_token_type != TOKEN_TYPE_JWT {
+        return Err(ExchangeError::invalid_request(
+            "unsupported subject_token_type",
+        ));
+    }
     let subject_token = req.subject_token.trim();
     if subject_token.is_empty() {
         return Err(ExchangeError::invalid_request(
@@ -105,10 +99,6 @@ async fn exchange_inner(
         return Err(ExchangeError::invalid_grant(
             "subject_token must be an external token",
         ));
-    }
-
-    if is_id_token {
-        return exchange_id_token(state, &ip, subject_token, &issuer, &req).await;
     }
 
     // 2. Issuer guard: only live controller trust policies or known SA
@@ -385,80 +375,6 @@ async fn resolve_controller(
             "identity is required for this token",
         )),
     }
-}
-
-/// Exchange an ID token from the configured IdP for a Rise session: the
-/// non-interactive form of an interactive login (ADR-0001 §7 flow 1), for the
-/// CLI's `RISE_TOKEN` and automation that already holds an ID token.
-///
-/// It is not a workload exchange. Only an ID token issued by `auth.issuer` to
-/// Rise's own OIDC client (`aud == auth.client_id`) is accepted, and it
-/// resolves through the same exact `(issuer, subject)` lookup and first-login
-/// provisioning as the browser and device flows — never to a ServiceAccount or
-/// Controller, whose external assertions go to their own `/token`
-/// subresource.
-async fn exchange_id_token(
-    state: &AppState,
-    ip: &str,
-    subject_token: &str,
-    issuer: &str,
-    req: &ExchangeRequest,
-) -> Result<ExchangeResponse, ExchangeError> {
-    if req.identity.is_some() {
-        return Err(ExchangeError::invalid_request(
-            "identity is not supported for an id_token exchange",
-        ));
-    }
-    if issuer != state.auth_settings.issuer {
-        return Err(ExchangeError::invalid_grant(
-            "subject_token could not be validated",
-        ));
-    }
-    state
-        .oauth_rate_limiter
-        .increment_and_check(ip, None, issuer)
-        .await
-        .map_err(ExchangeError::rate_limited)?;
-
-    let claims = crate::server::auth::handlers::validate_id_token(state, subject_token)
-        .await
-        .map_err(|e| {
-            tracing::warn!("Token exchange: id_token verification failed: {:?}", e);
-            ExchangeError::invalid_grant("subject_token could not be validated")
-        })?;
-
-    // The same group sync an interactive login runs, so a CLI session carries
-    // the same IdP-managed teams.
-    if let Err(e) = crate::server::auth::handlers::sync_groups_from_claims(state, &claims).await {
-        tracing::warn!("Group sync failed during id_token exchange: {:?}", e);
-    }
-
-    let failure = |failure: LoginFailure| match failure {
-        LoginFailure::Disabled => ExchangeError::access_denied("the account is disabled"),
-        LoginFailure::MissingEmail | LoginFailure::InvalidSubject(_) => {
-            ExchangeError::invalid_grant("subject_token could not be validated")
-        }
-        LoginFailure::Internal => {
-            ExchangeError::temporarily_unavailable("failed to resolve the login")
-        }
-    };
-    let login = resolve_login(state, &claims).await.map_err(failure)?;
-    let token = issue_session(state, &claims, &login)
-        .await
-        .map_err(failure)?;
-
-    tracing::info!(
-        user = %login.principal.name,
-        user_uid = %login.principal.uid,
-        source_iss = %issuer,
-        "Token exchange: issued a User session for an id_token"
-    );
-    Ok(ExchangeResponse {
-        access_token: token,
-        token_type: "Bearer".to_string(),
-        issued_token_type: TOKEN_TYPE_JWT.to_string(),
-        expires_in: state.jwt_signer.default_expiry_seconds,
-    })
 }
 
 #[cfg(test)]

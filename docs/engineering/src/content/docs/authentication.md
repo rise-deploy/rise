@@ -230,26 +230,16 @@ Each login is resolved to a Rise `User` resource by the ID token's exact
   `UserIdentity` instead only unlinks it — the next login provisions a fresh
   User with a new UID — so disable with `spec.active: false`.
 
-`auth.issuer` must be in its canonical form — the exact `iss` the IdP stamps,
-with no trailing slash — or the server refuses to start. The IdP must issue a
+`auth.issuer` must be spelled exactly as the IdP stamps `iss` — with or
+without its trailing slash, as the IdP does — and otherwise canonical (lower-case
+host, no default port), or the server refuses to start. The IdP must issue a
 stable `sub`.
 
-Automation that already holds an ID token from `auth.issuer` for Rise's own
-client (`aud` = `auth.client_id`) can exchange it for a session without a
-browser, through the same resolution:
-
-```http
-POST /api/v1/auth/token
-Content-Type: application/json
-
-{"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
- "subject_token": "<id_token>",
- "subject_token_type": "urn:ietf:params:oauth:token-type:id_token"}
-```
-
-This is not a workload exchange: the token never resolves to a ServiceAccount
-or Controller, whose external assertions go to their own `/token`
-subresource.
+There is deliberately no way to trade an ID token for a session outside these
+login flows: they receive the ID token from the IdP over the back channel,
+bound to the login by PKCE, `state`, and `nonce`, while an endpoint accepting
+presented ID tokens would honor any token the IdP issues for Rise's client,
+from any flow.
 
 ### Service accounts (CI/CD)
 
