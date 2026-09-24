@@ -136,15 +136,47 @@ def prepare(repo, work, baseline):
             )
         runs = ""
         for phase, command in [("baseline", "apply"), ("current", "plan")]:
+            # Inputs the current module requires that the baseline predates.
+            added = (
+                'variables {\n    rise_cli_image_tag = "0.23.0"\n  }\n  '
+                if phase == "current" and case != "e2e"
+                else ""
+            )
             runs += f'''run "{phase}" {{
   command = {command}
   state_key = "{case}"
-  module {{ source = "./{phase}/{relative}" }}
+  {added}module {{ source = "./{phase}/{relative}" }}
 }}
 '''
         (work / "tests" / f"{case}.tftest.hcl").write_text(
             MOCKS + overrides + "\n" + variables + "\n" + runs,
         )
+
+
+# Control-plane environment variables the current module adds on top of the
+# baseline. An upgrade that adds one re-registers the control plane's task
+# definition, and that must be the whole of the change.
+ADDED_CONTROL_PLANE_ENV = {"RISE_ECS_IDENTITY_AGENT_IMAGE"}
+CONTROL_PLANE_TASK = "module.runtime.aws_ecs_task_definition.rise"
+
+
+def only_added_env(before, after):
+    """Whether two container_definitions differ only by ADDED_CONTROL_PLANE_ENV."""
+
+    def strip(raw):
+        containers = json.loads(raw) if isinstance(raw, str) else raw
+        for container in containers:
+            container["environment"] = sorted(
+                (
+                    e
+                    for e in container.get("environment") or []
+                    if e["name"] not in ADDED_CONTROL_PLANE_ENV
+                ),
+                key=lambda e: e["name"],
+            )
+        return containers
+
+    return strip(before) == strip(after)
 
 
 def verify(log, repo):
@@ -218,6 +250,21 @@ def verify(log, repo):
             address, delta = change["address"], change["change"]
             if delta["actions"] == ["no-op"]:
                 continue
+            if (
+                address == CONTROL_PLANE_TASK
+                and delta["actions"] == ["update"]
+                and {
+                    k
+                    for k in delta["before"].keys() | delta["after"].keys()
+                    if delta["before"].get(k) != delta["after"].get(k)
+                }
+                == {"container_definitions"}
+                and only_added_env(
+                    delta["before"]["container_definitions"],
+                    delta["after"]["container_definitions"],
+                )
+            ):
+                continue
             assert case == "e2e" and address in e2e_fields, (
                 case,
                 address,
@@ -232,6 +279,19 @@ def verify(log, repo):
             }
             assert fields <= e2e_fields[address], (case, address, fields)
         for name, delta in item["test_plan"].get("output_changes", {}).items():
+            if (
+                name == "rise_task_environment"
+                and delta["actions"] == ["update"]
+                and isinstance(delta.get("before"), dict)
+                and isinstance(delta.get("after"), dict)
+                and {
+                    k: v
+                    for k, v in delta["after"].items()
+                    if k not in ADDED_CONTROL_PLANE_ENV
+                }
+                == delta["before"]
+            ):
+                continue
             # A new output changes nothing the baseline state already holds.
             assert delta["actions"] in (["no-op"], ["create"]), (
                 case,
@@ -244,7 +304,7 @@ def verify(log, repo):
             + (
                 "only expected E2E task/service updates"
                 if case == "e2e"
-                else "no resource actions"
+                else "no resource actions beyond the added control-plane environment"
             )
         )
     assert checked == {"nlb", "alb", "brought", "dex", "endpoints", "e2e"}, (

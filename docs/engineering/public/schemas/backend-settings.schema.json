@@ -833,12 +833,9 @@
               "description": "Health probe configuration."
             },
             "identity_agent_image": {
-              "default": null,
-              "description": "Image of the workload-identity sidecar every task runs (`rise\nidentity agent`). Defaults to the image the control plane itself\nruns, read from the ECS task metadata; a control plane not running\non ECS must set it, and startup fails otherwise. The workload\nexecution role must be able to pull it. Changing it affects new\ndeployments only: running services keep the sidecar they started\nwith.",
-              "type": [
-                "string",
-                "null"
-              ]
+              "default": "",
+              "description": "The `rise-cli` image the workload-identity sidecar in every task\nruns (`rise identity agent`), normally the same release as this\nserver. Required, like the server's own image: nothing infers it.\nThe workload execution role must be able to pull it. Changing it\naffects new deployments only: running services keep the sidecar they\nstarted with.",
+              "type": "string"
             },
             "identity_exchange_url": {
               "default": null,

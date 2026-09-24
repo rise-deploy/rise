@@ -72,6 +72,8 @@ const CONTROLLER_CLASS_TAG: &str = "rise.dev/controller-class";
 pub struct EcsBackend {
     repo_root: PathBuf,
     image_repository: String,
+    /// The `rise-cli` image the identity sidecar runs, at `image_tag`.
+    cli_image_repository: String,
     image_tag: String,
     /// Environment name — the bootstrap's `name`, and the SSM path its outputs
     /// are published under.
@@ -145,6 +147,8 @@ impl EcsBackend {
             .context("resolve repo root")?;
         let image_repository = std::env::var("RISE_IMAGE_REPOSITORY")
             .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise".to_string());
+        let cli_image_repository = std::env::var("RISE_CLI_IMAGE_REPOSITORY")
+            .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise-cli".to_string());
         let image_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the ecs backend (ECS pulls it from GHCR)")?;
         let env_name = std::env::var("RISE_E2E_ENV").unwrap_or_else(|_| "rise-e2e".to_string());
@@ -172,6 +176,7 @@ impl EcsBackend {
         Ok(Self {
             repo_root,
             image_repository,
+            cli_image_repository,
             image_tag,
             env_name,
             region,
@@ -548,6 +553,7 @@ impl EcsBackend {
             format!("state_bucket       = {}", q(&env.state_bucket)),
             format!("rise_image         = {}", q(&self.image_repository)),
             format!("rise_image_tag     = {}", q(&self.image_tag)),
+            format!("rise_cli_image     = {}", q(&self.cli_image_repository)),
             format!("scope              = {}", q(&self.scope)),
             format!("dns_zone_name      = {}", q(&env.dns_zone_name)),
             format!("jwt_signing_secret = {}", q(&self.jwt_secret_b64)),

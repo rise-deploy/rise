@@ -114,10 +114,11 @@ module "control_plane_env" {
   # See `local.controller_class`: this is what isolates one run from another.
   controller_class_name = local.controller_class
 
-  # The identity sidecar fetches tokens over the in-VPC address: the edge
-  # admits only the harness, not the tasks' public addresses. Its image is left
-  # to the default -- the control plane's own, the image under test. A short
+  # The identity sidecar runs the rise-cli image built from the same commit as
+  # the control plane under test, and fetches tokens over the in-VPC address:
+  # the edge admits only the harness, not the tasks' public addresses. A short
   # TTL lets the workload-identity scenario watch a refresh.
+  identity_agent_image       = "${var.rise_cli_image}:${var.rise_image_tag}"
   identity_exchange_url      = local.auth_backend_url
   identity_token_ttl_seconds = 120
 

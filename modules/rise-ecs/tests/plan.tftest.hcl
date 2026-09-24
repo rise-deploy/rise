@@ -40,6 +40,7 @@ variables {
   ingress_domain      = "rise.example.com"
   admin_email         = "ops@example.com"
   rise_image_tag      = "0.23.0"
+  rise_cli_image_tag  = "0.23.0"
   acme_email          = "ops@example.com"
   controller_role_arn = "arn:aws:iam::123456789012:role/rise"
   execution_role_arn  = "arn:aws:iam::123456789012:role/rise-ecs-execution"
@@ -82,15 +83,19 @@ run "creates_a_whole_install" {
     condition     = local.rise_environment["RISE_ECS_LOG_RETENTION_HINT"] == "30d"
     error_message = "the CloudWatch retention policy must reach Rise's empty-log status hint"
   }
-  # The identity sidecar defaults to the control plane's own image (read from
-  # the task metadata at startup) and to the public URL: workloads reach the
-  # control plane only through the edge.
+  # The sidecar image is required, like the control plane's; the exchange URL
+  # and token lifetime keep Rise's defaults unless configured, and workloads
+  # reach the control plane only through the edge.
+  assert {
+    condition     = local.rise_environment["RISE_ECS_IDENTITY_AGENT_IMAGE"] == "ghcr.io/rise-deploy/rise-cli:0.23.0"
+    error_message = "the identity sidecar must run the configured rise-cli image"
+  }
   assert {
     condition = alltrue([
-      for key in ["RISE_ECS_IDENTITY_AGENT_IMAGE", "RISE_ECS_IDENTITY_EXCHANGE_URL", "RISE_IDENTITY_TOKEN_TTL_SECONDS"] :
+      for key in ["RISE_ECS_IDENTITY_EXCHANGE_URL", "RISE_IDENTITY_TOKEN_TTL_SECONDS"] :
       !contains(keys(local.rise_environment), key)
     ])
-    error_message = "the identity sidecar must keep Rise's defaults unless configured"
+    error_message = "the identity exchange URL and TTL must keep Rise's defaults unless configured"
   }
 }
 
@@ -167,14 +172,15 @@ run "identity_sidecar_settings_reach_the_control_plane" {
   command = plan
 
   variables {
-    identity_agent_image       = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/rise:mirror"
+    rise_cli_image_tag         = null
+    rise_cli_image_ref         = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/rise-cli@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     identity_exchange_url      = "http://rise.internal:3000"
     identity_token_ttl_seconds = 900
   }
 
   assert {
     condition = alltrue([
-      local.rise_environment["RISE_ECS_IDENTITY_AGENT_IMAGE"] == "123456789012.dkr.ecr.eu-central-1.amazonaws.com/rise:mirror",
+      local.rise_environment["RISE_ECS_IDENTITY_AGENT_IMAGE"] == "123456789012.dkr.ecr.eu-central-1.amazonaws.com/rise-cli@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       local.rise_environment["RISE_ECS_IDENTITY_EXCHANGE_URL"] == "http://rise.internal:3000",
       local.rise_environment["RISE_IDENTITY_TOKEN_TTL_SECONDS"] == "900",
     ])

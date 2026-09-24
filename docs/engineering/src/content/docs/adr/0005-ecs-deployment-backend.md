@@ -478,7 +478,7 @@ the sidecar in every task, not only in tasks that want pre-minted tokens.
   Fargate ephemeral bind mount, and a daemon-managed volume on EC2 capacity) is
   mounted at `/var/run/secrets/rise/identity`: read-write in the sidecar,
   **read-only** in the app.
-- The sidecar, `rise-identity-agent`, runs the Rise image (`rise identity
+- The sidecar, `rise-identity-agent`, runs the `rise-cli` image (`rise identity
   agent`). It is the only container that receives the bootstrap credential,
   injected through ECS `secrets` from a per-deployment SSM `SecureString` (D7's
   mechanism, at `…/{deployment_id}/rise-identity/credential`), so the credential
@@ -551,14 +551,15 @@ server's public URL — the same URL the workload itself uses for `rise identity
 token`). Set it to an internal address when tasks have no route to the public
 one.
 
-**The agent image.** `identity_agent_image`, defaulting to the image the control
-plane itself runs, read from the ECS task metadata at startup — so it follows
-the operator's own reference (tag, digest or mirror) and stays in step on
-upgrade with no configuration. A control plane not on ECS must configure it;
-there is no guessed fallback, since a released image of some version may predate
-the agent and a sidecar that cannot run stops every task it is in. The image is **excluded from the task-definition
-content hash**: including it
-would roll every ECS service in the install on every Rise upgrade. New
+**The agent image.** `rise-cli`: the CLI alone on a distroless base, about
+16 MB compressed against the full Rise image's 68 MB. Fargate keeps no image
+cache between tasks, so the sidecar is pulled on every task start, and often
+through a NAT gateway that bills per GB. It is published beside the Rise image
+at the same tag. `identity_agent_image` is **required**, exactly like the
+control plane's own image: nothing infers it, since a guessed image may predate
+the agent and a sidecar that cannot run stops every task it is in. The image is
+**excluded from the task-definition content hash**: including it would roll
+every ECS service in the install on every Rise upgrade. New
 deployments pick up the new agent; running ones keep theirs, which is why the
 agent's protocol must stay backwards compatible with newer servers.
 
@@ -568,8 +569,8 @@ resync. Revocation is unchanged — the endpoint refuses a deployment that shoul
 not have infrastructure, so a stopped deployment's sidecar can no longer mint.
 The in-container contract a workload reads is byte-identical across all three
 backends. Costs: one extra container per task (2 of the 10 allowed), a 32 MiB
-reservation, and an agent image the execution role must be able to pull — by
-default from wherever the control plane's own image comes from.
+reservation, and an agent image the workload execution role must be able to
+pull.
 
 **Rejected alternatives.** The controller writing files over ECS Exec (needs SSM
 agent sessions and `enableExecuteCommand` on every task, and an audit trail

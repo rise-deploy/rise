@@ -231,7 +231,7 @@ which is what makes "reading ECS reveals only a parameter name" hold.
 
 ECS offers no way to write a file into a running task, so every task Rise
 creates carries a small **identity sidecar**, `rise-identity-agent`, next to
-the app. It runs `rise identity agent` from the Rise image and writes the
+the app. It runs `rise identity agent` from the `rise-cli` image and writes the
 [workload identity](/docs/user-guide/workload-identity-tokens/) files onto a
 task volume the app mounts read-only at `/var/run/secrets/rise/identity`. The
 app container waits for it (`dependsOn … HEALTHY`), so the files exist before
@@ -253,15 +253,14 @@ the app starts.
   sidecar has ECS's full five-minute start period to write its files before
   failed health checks count, so a brief throttle or control-plane restart
   delays the app rather than failing the task.
-- **The image** defaults to the control plane's own, read from the ECS task
-  metadata at startup, so the agent always matches the server. A control plane
-  that does not run on ECS must set `identity_agent_image`; startup fails
-  otherwise, rather than guessing an image that may predate the agent. The
-  workload execution role pulls it with no registry credentials, so if the
-  control plane's image lives in another account's ECR or a registry that needs
-  credentials, grant that role access or point `identity_agent_image` at a
-  mirror it can pull. The image is left out of the task-definition hash: a new
-  image reaches new deployments without rolling running ones.
+- **The image** is `rise-cli` — the CLI alone on a distroless base, published
+  beside the Rise image at the same tag — and `identity_agent_image` is
+  **required**, like the control plane's own image (`rise_cli_image_tag` or
+  `rise_cli_image_ref` in `rise-ecs`); normally set it to the same release. The
+  workload execution role pulls it with no registry credentials, so mirror it
+  somewhere that role can pull if GHCR is out of reach. The image is left out of
+  the task-definition hash: a new image reaches new deployments without rolling
+  running ones.
 - **Cost:** one extra, non-essential container per task (restarted in place if
   it exits) with a 32 MiB memory reservation out of the task's size.
 

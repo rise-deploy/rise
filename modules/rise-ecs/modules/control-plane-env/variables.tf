@@ -234,9 +234,13 @@ variable "repository_credentials_secret_arn" {
 }
 
 variable "identity_agent_image" {
-  description = "Image of the workload-identity sidecar every workload task runs. Null uses the image the control plane itself runs, read from the ECS task metadata."
+  description = "The rise-cli image the workload-identity sidecar in every workload task runs, normally the same release as the control plane."
   type        = string
-  default     = null
+
+  validation {
+    condition     = trimspace(var.identity_agent_image) != ""
+    error_message = "identity_agent_image is required."
+  }
 }
 
 variable "identity_exchange_url" {

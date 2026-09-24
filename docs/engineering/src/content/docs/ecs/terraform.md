@@ -46,6 +46,10 @@ module "rise_ecs" {
   ingress_domain = "rise.example.com"
   rise_image_tag = "0.23.0"
   admin_email    = "ops@example.com"
+
+  # The rise-cli image the workload-identity sidecar runs. Required, like the
+  # control plane's image; normally the same release.
+  rise_cli_image_tag = "0.23.0"
   acme_email     = "ops@example.com"
 
   controller_role_arn = module.rise_aws.role_arn

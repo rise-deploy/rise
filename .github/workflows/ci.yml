@@ -21,6 +21,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: rise-deploy/rise
   BUILDER_IMAGE_NAME: rise-deploy/rise-builder
+  # The CLI alone, on distroless: the ECS workload-identity sidecar's image.
+  CLI_IMAGE_NAME: rise-deploy/rise-cli
   CHART_REGISTRY: ghcr.io/rise-deploy
   NODE_VERSION: "24"
   # renovate: datasource=github-tags depName=rust packageName=rust-lang/rust extractVersion=^(?<version>\d+\.\d+\.\d+)$
@@ -447,6 +449,17 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: false
 
+      - name: Build and optionally push CLI image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile
+          target: rise-cli
+          push: ${{ needs.prepare.outputs.should_publish == 'true' }}
+          tags: ${{ env.REGISTRY }}/${{ env.CLI_IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
+          provenance: false
+
   package-image:
     name: Build / Image manifest
     runs-on: blacksmith
@@ -494,6 +507,7 @@ jobs:
 
           publish_manifest "${REGISTRY}/${IMAGE_NAME}"
           publish_manifest "${REGISTRY}/${BUILDER_IMAGE_NAME}"
+          publish_manifest "${REGISTRY}/${CLI_IMAGE_NAME}"
 
       - name: Skip manifest publishing
         if: needs.prepare.outputs.should_publish != 'true'

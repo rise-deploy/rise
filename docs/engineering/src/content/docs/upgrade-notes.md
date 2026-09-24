@@ -87,31 +87,31 @@ Merged to `develop`:
   tokens. The typed-table exchange at `POST /api/v1/auth/token` and the CLI
   are unchanged. See [Authentication & Tokens](/operator-docs/authentication/#identity-rs256--the-token-subresource).
 
-- **ECS: workload identity.** *Config change.* ECS deployments now get the
+- **ECS: workload identity.** *Breaking.* ECS deployments now get the
   workload identity files every other backend delivers — the bootstrap
   credential for `rise identity token`, and the `[identity].audiences` token
   files — so a deployment declaring `[identity]` is no longer rejected. Every
-  new ECS task runs an identity sidecar (`rise identity agent`, the Rise image)
-  next to the app; see [ECS › Workload identity](/operator-docs/ecs/#workload-identity).
-  Nothing to configure on a typical install, but know that:
+  new ECS task runs an identity sidecar (`rise identity agent`, from the new
+  `ghcr.io/rise-deploy/rise-cli` image) next to the app; see
+  [ECS › Workload identity](/operator-docs/ecs/#workload-identity).
+
+  - **Action required: set the sidecar image.** The server refuses to start
+    without `deployment_controller.identity_agent_image`
+    (`RISE_ECS_IDENTITY_AGENT_IMAGE`), normally
+    `ghcr.io/rise-deploy/rise-cli:<the same version>`. The `rise-ecs` module
+    requires `rise_cli_image_tag` (or `rise_cli_image_ref`), exactly like
+    `rise_image_tag`. The workload execution role must be able to pull it.
 
   - **Upgrading rolls every running ECS service once.** The first reconcile
     tick provisions each running deployment's credential and adds the sidecar,
     which registers a new task-definition revision; ECS replaces the tasks as a
     rolling update, without a routing gap. Expect a burst of
     `RegisterTaskDefinition` calls (throttled to 1/s) on large installs.
-  - Tasks must reach the sidecar's image and the token endpoint. The image
-    defaults to the control plane's own (read from the ECS task metadata), and
-    the endpoint to the public URL. Set
-    `deployment_controller.identity_agent_image` /
-    `identity_exchange_url` (`RISE_ECS_IDENTITY_AGENT_IMAGE` /
-    `RISE_ECS_IDENTITY_EXCHANGE_URL`) if they cannot.
+  - Tasks must reach the token endpoint, the public URL by default. Set
+    `identity_exchange_url` (`RISE_ECS_IDENTITY_EXCHANGE_URL`) if they cannot.
   - `identity_token_ttl_seconds` is now env-driven on ECS
     (`RISE_IDENTITY_TOKEN_TTL_SECONDS`), and `rise-ecs` exposes it along with
-    `identity_agent_image` and `identity_exchange_url`.
-  - A control plane that does not itself run on ECS must set
-    `identity_agent_image`: the default is read from the ECS task metadata, and
-    startup fails when it cannot be.
+    `identity_exchange_url`.
 
 - **The workload identity token-exchange endpoint has its own rate limiter.**
   *Config change.* `POST /api/v1/identity/token` no longer shares the OAuth

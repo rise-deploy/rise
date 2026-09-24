@@ -463,6 +463,34 @@ variable "rise_image_ref" {
   }
 }
 
+variable "rise_cli_image" {
+  description = "Rise CLI image repository: the workload-identity sidecar every workload task runs. The workload execution role pulls it with no registry credentials."
+  type        = string
+  default     = "ghcr.io/rise-deploy/rise-cli"
+}
+
+variable "rise_cli_image_tag" {
+  description = "CLI image tag, normally the same release as the control plane. Set this or rise_cli_image_ref, but not both."
+  type        = string
+  default     = null
+}
+
+variable "rise_cli_image_ref" {
+  description = "Complete immutable CLI image reference, such as ghcr.io/rise-deploy/rise-cli@sha256:…. Set this or rise_cli_image_tag, but not both."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = (var.rise_cli_image_ref == null) != (var.rise_cli_image_tag == null)
+    error_message = "Set exactly one of rise_cli_image_ref or rise_cli_image_tag."
+  }
+
+  validation {
+    condition     = var.rise_cli_image_ref == null || strcontains(var.rise_cli_image_ref, "@sha256:")
+    error_message = "rise_cli_image_ref must be an OCI digest reference containing @sha256:."
+  }
+}
+
 variable "rise_cpu" {
   description = "Control-plane task CPU units."
   type        = string
@@ -738,12 +766,6 @@ variable "traefik_constraints" {
   EOT
   type        = string
   default     = ""
-}
-
-variable "identity_agent_image" {
-  description = "Image of the workload-identity sidecar every workload task runs. Null uses the image the control plane runs; set it when workload tasks pull from somewhere the control plane's image reference does not reach."
-  type        = string
-  default     = null
 }
 
 variable "identity_exchange_url" {

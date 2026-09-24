@@ -128,17 +128,20 @@ jobs:
       - name: Wait for the image under test
         env:
           IMAGE: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.image_tag }}
+          # The identity sidecar's image, published by the same ci.yml step.
+          CLI_IMAGE: ghcr.io/${{ github.repository }}-cli:${{ steps.meta.outputs.image_tag }}
         run: |
           set -uo pipefail
           for attempt in $(seq 1 40); do
-            if docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
-              echo "Found $IMAGE"
+            if docker manifest inspect "$IMAGE" >/dev/null 2>&1 \
+              && docker manifest inspect "$CLI_IMAGE" >/dev/null 2>&1; then
+              echo "Found $IMAGE and $CLI_IMAGE"
               exit 0
             fi
-            echo "Attempt ${attempt}/40: $IMAGE not published yet; waiting 30s."
+            echo "Attempt ${attempt}/40: $IMAGE or $CLI_IMAGE not published yet; waiting 30s."
             sleep 30
           done
-          echo "::error::$IMAGE never appeared."
+          echo "::error::$IMAGE or $CLI_IMAGE never appeared."
           echo "ci.yml publishes it for this same commit, so either that build is"
           echo "still running, or it failed, or this run resolved a tag it never"
           echo "builds -- on a 'labeled' event GITHUB_SHA is a merge commit"
@@ -162,6 +165,7 @@ jobs:
           RISE_E2E_SCOPE: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || 'nightly' }}
           AWS_REGION: ${{ env.AWS_E2E_REGION }}
           RISE_IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+          RISE_CLI_IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}-cli
           RISE_IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
         run: ./tests/e2e/target/release/rise-e2e
 

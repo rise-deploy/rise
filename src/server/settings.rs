@@ -1939,15 +1939,14 @@ pub enum DeploymentControllerSettings {
         #[schemars(with = "u64")]
         identity_token_ttl_seconds: u64,
 
-        /// Image of the workload-identity sidecar every task runs (`rise
-        /// identity agent`). Defaults to the image the control plane itself
-        /// runs, read from the ECS task metadata; a control plane not running
-        /// on ECS must set it, and startup fails otherwise. The workload
-        /// execution role must be able to pull it. Changing it affects new
-        /// deployments only: running services keep the sidecar they started
-        /// with.
-        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
-        identity_agent_image: Option<String>,
+        /// The `rise-cli` image the workload-identity sidecar in every task
+        /// runs (`rise identity agent`), normally the same release as this
+        /// server. Required, like the server's own image: nothing infers it.
+        /// The workload execution role must be able to pull it. Changing it
+        /// affects new deployments only: running services keep the sidecar they
+        /// started with.
+        #[serde(default)]
+        identity_agent_image: String,
 
         /// Base URL at which the identity sidecar reaches the Rise API to fetch
         /// `[identity]` tokens. Defaults to the server `public_url` — the URL
@@ -2620,6 +2619,7 @@ impl Settings {
             ref capacity,
             ref execution_role_arn,
             ref repository_credentials_secret_arn,
+            ref identity_agent_image,
             ..
         }) = settings.deployment_controller
         {
@@ -2663,6 +2663,19 @@ impl Settings {
             if cluster.trim().is_empty() {
                 return Err(ConfigError::Message(
                     "deployment_controller.cluster must name an ECS cluster".to_string(),
+                ));
+            }
+
+            // Every task runs the identity sidecar, so without an image no task
+            // can start. Required rather than inferred: a guessed image may
+            // predate the agent.
+            if identity_agent_image.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.identity_agent_image (RISE_ECS_IDENTITY_AGENT_IMAGE) \
+                     must name the rise-cli image the workload-identity sidecar runs, \
+                     normally the same release as this server, e.g. \
+                     ghcr.io/rise-deploy/rise-cli:<version>"
+                        .to_string(),
                 ));
             }
 
@@ -3704,6 +3717,10 @@ auth:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
@@ -3814,6 +3831,19 @@ server:
         assert_eq!(settings.server.port, 3000);
     }
 
+    /// Every task runs the identity sidecar; with no image, none can start.
+    #[test]
+    fn ecs_config_without_an_identity_agent_image_is_rejected_at_load() {
+        let mut env = ecs_base_env();
+        env.remove("RISE_ECS_IDENTITY_AGENT_IMAGE");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("identity_agent_image"),
+            "should name the missing setting: {err}"
+        );
+    }
+
     #[test]
     fn ecs_config_without_subnets_is_rejected_at_load() {
         // A task with no subnet cannot be placed at all, and ECS only says so on
@@ -3821,6 +3851,10 @@ server:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "");
         env.insert("RISE_ECS_SECURITY_GROUPS", "");
 
@@ -3878,6 +3912,10 @@ server:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "subnet-abc");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");

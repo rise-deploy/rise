@@ -60,6 +60,9 @@ locals {
   rise_image_ref = var.rise_image_ref != null ? var.rise_image_ref : (
     var.rise_image_tag != null ? "${var.rise_image}:${var.rise_image_tag}" : ""
   )
+  rise_cli_image_ref = var.rise_cli_image_ref != null ? var.rise_cli_image_ref : (
+    var.rise_cli_image_tag != null ? "${var.rise_cli_image}:${var.rise_cli_image_tag}" : ""
+  )
 
   # --- Control-plane environment -------------------------------------------
   # Both runtime callers compose the environment and labels through this module.
@@ -148,7 +151,7 @@ module "control_plane_env" {
 
   repository_credentials_secret_arn = var.repository_credentials_secret_arn
 
-  identity_agent_image       = var.identity_agent_image
+  identity_agent_image       = local.rise_cli_image_ref
   identity_exchange_url      = var.identity_exchange_url
   identity_token_ttl_seconds = var.identity_token_ttl_seconds
 }

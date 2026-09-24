@@ -525,17 +525,6 @@ async fn init_ecs_backend(
         );
     }
 
-    let identity_agent_image = match identity_agent_image {
-        Some(image) => image.clone(),
-        None => own_ecs_image().await.context(
-            "ECS deployment backend: could not determine the workload-identity sidecar image. \
-             It defaults to the image this control plane runs, read from the ECS task \
-             metadata, which is unavailable here (the control plane is not running on ECS, \
-             or the metadata endpoint did not answer). Set \
-             `deployment_controller.identity_agent_image` (RISE_ECS_IDENTITY_AGENT_IMAGE) to \
-             a Rise image of this version.",
-        )?,
-    };
     tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
 
     let reconciler = EcsReconciler::new(
@@ -573,7 +562,7 @@ async fn init_ecs_backend(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
-            identity_agent_image,
+            identity_agent_image: identity_agent_image.clone(),
             identity_exchange_url: identity_exchange_url
                 .clone()
                 .unwrap_or_else(|| public_url.to_string()),
@@ -592,53 +581,6 @@ async fn init_ecs_backend(
             resource_prefix: resource_prefix.clone(),
         },
     ))
-}
-
-/// The image this server's own container runs, from the ECS task metadata
-/// endpoint, when the control plane itself runs on ECS.
-///
-/// The identity sidecar's default: it carries exactly this server's `rise
-/// identity agent`, however the operator references it -- a tag, a digest, a
-/// mirror -- and needs no configuration to stay in step on upgrade. There is
-/// deliberately no guessed fallback: a released image of some version may
-/// predate the agent, and a sidecar that cannot run stops every task it is in.
-/// Retried briefly, since the endpoint can lag the container's start.
-#[cfg(feature = "backend")]
-async fn own_ecs_image() -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct ContainerMetadata {
-        #[serde(rename = "Image")]
-        image: String,
-    }
-
-    let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").ok()?;
-    let client = reqwest::Client::new();
-    for attempt in 1..=3u32 {
-        let result = async {
-            client
-                .get(&uri)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<ContainerMetadata>()
-                .await
-        }
-        .await;
-        match result {
-            Ok(metadata) if !metadata.image.trim().is_empty() => return Some(metadata.image),
-            Ok(_) => return None,
-            Err(e) => {
-                tracing::warn!(
-                    attempt,
-                    "Could not read this container's image from the ECS task metadata: {:?}",
-                    e
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt))).await;
-            }
-        }
-    }
-    None
 }
 
 #[cfg(feature = "backend")]
