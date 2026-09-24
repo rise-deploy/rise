@@ -485,21 +485,6 @@ pub struct CodeExchangeRequest {
     pub redirect_uri: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeviceExchangeRequest {
-    pub device_code: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DeviceExchangeResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_description: Option<String>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub token: String,
@@ -516,6 +501,10 @@ pub struct AuthorizeRequest {
     /// For authorization code flow: the PKCE code challenge method
     #[serde(default)]
     pub code_challenge_method: Option<String>,
+    /// For device flow: a name for the requesting machine (e.g. its hostname),
+    /// shown on the confirmation page
+    #[serde(default)]
+    pub client_name: Option<String>,
     /// Flow type: "code" for authorization code flow, "device" for device flow
     pub flow: String,
 }
@@ -545,10 +534,17 @@ pub struct AuthorizeResponse {
     pub interval: Option<u64>,
 }
 
+/// Rate-limit bucket shared by every device-login start.
+const DEVICE_START_RATE_LIMIT_BUCKET: &str = "auth-device-start";
+
 /// Build OAuth2 authorization URL or initiate device flow (for CLI)
-#[instrument(skip(state))]
+///
+/// The device flow is served by Rise itself (see [`super::device`]): the user
+/// confirms the code on Rise's `/device` page, not at the IdP.
+#[instrument(skip(state, headers))]
 pub async fn authorize(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<AuthorizeRequest>,
 ) -> Result<Json<AuthorizeResponse>, (StatusCode, String)> {
     match payload.flow.as_str() {
@@ -597,23 +593,38 @@ pub async fn authorize(
             }))
         }
         "device" => {
-            // Device authorization flow
-            let device_response = state.oauth_client.device_flow_start().await.map_err(|e| {
-                tracing::error!("Failed to start device flow: {:#}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to start device flow: {}", e),
-                )
-            })?;
+            let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+            // Unauthenticated, and each start stores a row until it expires.
+            state
+                .oauth_rate_limiter
+                .increment_and_check(&client_ip, None, DEVICE_START_RATE_LIMIT_BUCKET)
+                .await
+                .map_err(|retry_after| {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!("Too many device logins started; retry in {retry_after}s"),
+                    )
+                })?;
+            let client_ip = (client_ip != "unknown").then_some(client_ip);
+            let started = super::device::DeviceFlow::new(&state)
+                .start(payload.client_name.as_deref(), client_ip.as_deref())
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to start device flow: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to start device flow".to_string(),
+                    )
+                })?;
 
             Ok(Json(AuthorizeResponse {
                 authorization_url: None,
-                device_code: Some(device_response.device_code),
-                user_code: Some(device_response.user_code),
-                verification_uri: Some(device_response.verification_uri.clone()),
-                verification_uri_complete: Some(device_response.verification_uri_complete),
-                expires_in: Some(device_response.expires_in),
-                interval: Some(device_response.interval),
+                device_code: Some(started.device_code),
+                user_code: Some(started.user_code),
+                verification_uri: Some(started.verification_uri),
+                verification_uri_complete: Some(started.verification_uri_complete),
+                expires_in: Some(started.expires_in),
+                interval: Some(started.interval),
             }))
         }
         _ => Err((
@@ -705,120 +716,6 @@ pub async fn code_exchange(
     );
 
     Ok(Json(LoginResponse { token: rise_jwt }))
-}
-
-/// Exchange device code for token (Device Flow)
-#[instrument(skip(state, payload))]
-pub async fn device_exchange(
-    State(state): State<AppState>,
-    Json(payload): Json<DeviceExchangeRequest>,
-) -> Json<DeviceExchangeResponse> {
-    tracing::debug!(
-        "Device exchange request: device_code={}...",
-        &payload.device_code[..8.min(payload.device_code.len())]
-    );
-
-    // Poll the identity provider's token endpoint with the device code
-    match state
-        .oauth_client
-        .device_flow_poll(&payload.device_code)
-        .await
-    {
-        Ok(Some(token_info)) => {
-            tracing::info!("Device authorization successful");
-
-            // Sync IdP groups after successful login
-            if let Err(e) = sync_groups_after_login(&state, &token_info.id_token).await {
-                tracing::warn!("Group sync failed during device exchange: {:?}", e);
-                // Don't fail the login if group sync fails
-            }
-
-            // Validate the IdP JWT to extract claims
-            let mut expected_claims = HashMap::new();
-            expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
-
-            let claims = match state
-                .jwt_validator
-                .validate(
-                    &token_info.id_token,
-                    &state.auth_settings.issuer,
-                    &expected_claims,
-                )
-                .await
-            {
-                Ok(claims) => claims,
-                Err(e) => {
-                    tracing::error!("Failed to validate ID token: {:#}", e);
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("invalid_token".to_string()),
-                        error_description: Some("Failed to validate ID token".to_string()),
-                    });
-                }
-            };
-
-            let issued = match resolve_login(&state, &claims).await {
-                Ok(login) => issue_session(&state, &claims, &login)
-                    .await
-                    .map(|jwt| (login.user, jwt)),
-                Err(failure) => Err(failure),
-            };
-            let (user, rise_jwt) = match issued {
-                Ok(issued) => issued,
-                Err(failure) => {
-                    let (error, description) = match &failure {
-                        LoginFailure::Internal => ("server_error", failure.response().1),
-                        LoginFailure::Disabled => ("access_denied", failure.response().1),
-                        LoginFailure::MissingEmail | LoginFailure::InvalidSubject(_) => {
-                            ("invalid_token", failure.response().1)
-                        }
-                    };
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some(error.to_string()),
-                        error_description: Some(description),
-                    });
-                }
-            };
-
-            tracing::info!(
-                "CLI device login successful for user {} - issued Rise JWT",
-                user.email
-            );
-
-            Json(DeviceExchangeResponse {
-                token: Some(rise_jwt),
-                error: None,
-                error_description: None,
-            })
-        }
-        Ok(None) => {
-            // authorization_pending - user hasn't authorized yet
-            tracing::debug!("Device authorization pending");
-            Json(DeviceExchangeResponse {
-                token: None,
-                error: Some("authorization_pending".to_string()),
-                error_description: None,
-            })
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            tracing::warn!("Device authorization error: {}", error_msg);
-
-            // Check for standard OAuth2 device flow errors
-            let (error, description) = if error_msg.contains("slow_down") {
-                ("slow_down".to_string(), None)
-            } else {
-                ("access_denied".to_string(), Some(error_msg))
-            };
-
-            Json(DeviceExchangeResponse {
-                token: None,
-                error: Some(error),
-                error_description: description,
-            })
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]

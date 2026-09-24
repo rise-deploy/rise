@@ -9,7 +9,7 @@ use jsonwebtoken::decode_header;
 use serde::Deserialize;
 
 use crate::db::{service_accounts, users, User};
-use crate::server::auth::context::VerifiedExternalToken;
+use crate::server::auth::context::{SessionDetails, VerifiedExternalToken};
 use crate::server::auth::cookie_helpers;
 use crate::server::auth::identity::{resolve_identity, ResourcePrincipal};
 use crate::server::auth::user_identity::TokenStanding;
@@ -152,8 +152,13 @@ pub async fn auth_middleware(
                 let uids = claims.rise_uid.zip(claims.rise_identity_uid);
                 match state.user_logins.check_token(&claims.sub, uids).await {
                     Ok(TokenStanding::Active(principal)) => {
-                        if let Some(principal) = principal {
+                        if let (Some(principal), Some((_, identity_uid))) = (principal, uids) {
                             req.extensions_mut().insert(principal);
+                            req.extensions_mut().insert(SessionDetails {
+                                identity_uid,
+                                name: claims.name.clone(),
+                                issued_at: claims.iat,
+                            });
                         }
                     }
                     Ok(TokenStanding::Rejected(rejection)) => {

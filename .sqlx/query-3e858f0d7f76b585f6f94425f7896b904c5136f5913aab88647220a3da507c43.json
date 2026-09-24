@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE device_authorizations\n        SET last_polled_at = NOW(), interval_seconds = $2\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e858f0d7f76b585f6f94425f7896b904c5136f5913aab88647220a3da507c43"
+}

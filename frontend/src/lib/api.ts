@@ -49,6 +49,25 @@ class RiseAPI {
         return this.request('/users/me');
     }
 
+    // Device login (`rise login --device`) confirmation
+    async getDeviceAuthorization(userCode) {
+        return this.request(`/auth/device?user_code=${encodeURIComponent(userCode)}`);
+    }
+
+    async approveDevice(userCode) {
+        return this.request('/auth/device/approve', {
+            method: 'POST',
+            body: JSON.stringify({ user_code: userCode })
+        });
+    }
+
+    async denyDevice(userCode) {
+        return this.request('/auth/device/deny', {
+            method: 'POST',
+            body: JSON.stringify({ user_code: userCode })
+        });
+    }
+
     async lookupUsers(emails) {
         return this.request('/users/lookup', {
             method: 'POST',

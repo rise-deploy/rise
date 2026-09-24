@@ -196,7 +196,8 @@ permanent is built on an endpoint marked *retires*.
 | Entry point | Credential presented | Status | Why / gate |
 |---|---|---|---|
 | Browser login (`/auth/signin` → `/auth/callback`) | IdP authorization code | Stays | Human UI login; ID token received on the back channel, bound by PKCE, `state`, `nonce` |
-| CLI login (`/auth/code/exchange`, `/auth/device/exchange`) | IdP code or device code | Stays | Human CLI login, same binding |
+| CLI login (`/auth/code/exchange`) | IdP authorization code | Stays | Human CLI login, same binding |
+| CLI device login (`/auth/device/exchange`) | Rise-issued device code, approved on Rise's `/device` page | Stays | Machines without a local browser. The approving session must be fresh (≤ 10 min, so it traces back to a bound browser login) and must name its User and identity. The device session is minted for that same `(User, UserIdentity)` and re-checked when redeemed. The code is single-use, stored hashed, and expires in 10 min. No IdP token is presented |
 | App sign-in (`/auth/signin?project=…`, checked by `/auth/ingress`) | IdP authorization code | Stays | End users of private apps; the app-scoped ingress token keeps the IdP `sub` because apps read it |
 | `/token` on ServiceAccount / Controller — workload exchange | External assertion (Kubernetes projected token, CI OIDC, …) | Stays | The target design for every non-human caller; checked only against the target's trust policies |
 | `/token` on ServiceAccount / Controller — delegated issuance | Rise bearer holding `(create, <kind>, token)` | Stays | Minting for another identity, optionally for an external audience |
