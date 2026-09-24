@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod cli;
 pub mod compose;
+pub mod device_login;
 pub mod dex;
 pub mod http;
 pub mod login;

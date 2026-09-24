@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE device_authorizations\n        SET status = 'approved', approved_user_id = $2, approved_session = $3\n        WHERE user_code = $1 AND status = 'pending' AND expires_at > NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "09fe199b6bb77f73b24ecbc9b8c8caf5e6531708e1279032ccb6f5911760df71"
+}

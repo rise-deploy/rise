@@ -22,6 +22,22 @@ pub struct VerifiedExternalToken {
     pub claims: serde_json::Value,
 }
 
+/// What the auth middleware verified about a Rise session that names a
+/// `User` resource, beyond the [`UserPrincipal`] itself.
+///
+/// Present in request extensions exactly when a `UserPrincipal` is: legacy
+/// sessions carry neither. Device-login approval reads it to mint a session
+/// bound to the same identity, and to require a recent sign-in.
+#[derive(Clone, Debug)]
+pub struct SessionDetails {
+    /// The `UserIdentity` the session was minted through.
+    pub identity_uid: uuid::Uuid,
+    /// The session's `name` claim, if it carries one.
+    pub name: Option<String>,
+    /// The session's `iat`, in seconds since the Unix epoch.
+    pub issued_at: u64,
+}
+
 /// Authentication context for request handlers.
 ///
 /// This replaces `Extension<User>` in all handlers and supports two-phase

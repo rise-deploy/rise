@@ -20,6 +20,26 @@ If `RISE_URL` is already set in your environment, you can omit `--url`:
 rise login
 ```
 
+### Device Flow
+
+Where the CLI can't open a browser or receive the local callback — an SSH
+session, a container, a remote VM — log in with a code instead:
+
+```bash
+rise login --device
+```
+
+The CLI prints a URL on your Rise instance (`https://rise.example.com/device?user_code=…`)
+and a code such as `BCDF-GHJK`. Open the URL in any browser, sign in, check that the
+page shows the same code, and click **Approve**. The CLI picks up the token on its next
+poll.
+
+- The code is confirmed on Rise itself, so this works with any identity provider.
+- Approval needs a recent sign-in: if your browser session is older than a few
+  minutes, the page asks you to sign in again first.
+- Codes expire after 10 minutes and work once. Only approve a code you requested
+  yourself — approving signs that terminal in as you.
+
 ### Token Storage
 
 Tokens are stored in `~/.config/rise/config.json` (plain JSON).
@@ -89,7 +109,8 @@ Aliases: `rise project app-user rm`, `rise project app-user del`
 
 - **"Failed to start local callback server"** — ports 8765-8767 are in use
 - **"Code exchange failed"** — check that the backend and identity provider are running
-- **Token expired** — run `rise login` (tokens expire after 1 hour by default)
+- **"The login code expired or was already used"** (`--device`) — run `rise login --device` again and approve within 10 minutes
+- **Token expired** — run `rise login` (tokens expire after 24 hours by default)
 - **"The 'aud' claim is required"** — add `--claim aud=https://rise.example.net` to service account
 - **"No service account matched"** — check claims match exactly (case-sensitive), verify issuer URL has no trailing slash
 - **"Multiple service accounts matched"** — make claims more specific to avoid ambiguity

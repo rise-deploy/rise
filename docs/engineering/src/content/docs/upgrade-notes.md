@@ -31,6 +31,14 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **`rise login --device` is served by Rise, not the IdP.** *Config change.*
+  The device code is now confirmed on Rise's own `/device` page, after a fresh
+  browser sign-in. The IdP no longer needs to support, or enable, the OAuth
+  device grant, and a device-grant setting on Rise's IdP client can be removed.
+  The bundled Dex config drops `urn:ietf:params:oauth:grant-type:device_code`.
+  Existing CLIs keep working: the endpoints and responses are unchanged. Migration
+  `20260924000001` adds the `device_authorizations` table.
+
 - **User logins resolve to `User` resources; sessions carry `rise_uid`.**
   *Action required.* Every interactive login (browser, CLI code and device
   flows, app ingress sign-in) now resolves the ID token's exact `(iss, sub)`

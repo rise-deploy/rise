@@ -249,6 +249,33 @@ bound to the login by PKCE, `state`, and `nonce`, while an endpoint accepting
 presented ID tokens would honor any token the IdP issues for Rise's client,
 from any flow.
 
+#### Device login (`rise login --device`)
+
+Rise is the RFC 8628 authorization server itself; the IdP needs no device grant.
+
+1. The CLI calls `POST /api/v1/auth/authorize {"flow": "device"}` and gets a
+   device code, a user code (`XXXX-XXXX`, from the RFC's consonant alphabet) and
+   `verification_uri_complete = {public_url}/device?user_code=…`. The row lands
+   in `device_authorizations`, holding only a SHA-256 of the device code; it
+   expires after 10 minutes. The endpoint is unauthenticated, so starts count
+   against `server.oauth_rate_limit` (per client IP, and in their own bucket).
+2. The user opens `/device` in the Rise UI, signs in the usual way, and approves
+   (`POST /api/v1/auth/device/approve`) or denies. Approval requires a session
+   that names its User and identity and was issued at most 10 minutes ago;
+   otherwise the answer is `401` and the page sends the user through
+   `/auth/signin/start` first. The approval records that session's User UID and
+   `UserIdentity` UID.
+3. The CLI polls `POST /api/v1/auth/device/exchange`. Answers are the RFC's
+   `authorization_pending`, `slow_down` (the interval grows by 5s),
+   `access_denied` and `expired_token`, plus `server_error` for a transient
+   failure. An approved row is deleted as it is redeemed, so it yields one
+   session. The User and identity are re-resolved first, and the session is
+   minted for exactly that pair. Disabling either one ends the device session,
+   just like the browser session that approved it.
+
+No IdP token is presented at any step. Every device session traces back to a
+recent browser login that was bound by PKCE, `state` and `nonce`.
+
 ### Service accounts (CI/CD)
 
 Project-scoped identities for automation (e.g. pipelines) that present an OIDC

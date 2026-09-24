@@ -231,7 +231,8 @@ enum Commands {
         /// Use browser-based OAuth2 authorization code flow (default)
         #[arg(long, conflicts_with = "device")]
         browser: bool,
-        /// Use device authorization flow
+        /// Use device authorization flow: confirm a code on the Rise web UI
+        /// (for SSH sessions and other machines without a local browser)
         #[arg(long, conflicts_with = "browser")]
         device: bool,
     },

@@ -32,6 +32,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(RegistryBuildPushPull),
         Box::new(SaTokenExchange),
         Box::new(ResourceTokenExchange),
+        Box::new(DeviceLogin),
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
@@ -400,6 +401,93 @@ impl Scenario for SaTokenExchange {
             !raw.success(),
             "expected the un-exchanged external token to be rejected, but it succeeded:\n{}",
             raw.combined()
+        );
+        Ok(())
+    }
+}
+
+// ---- (c'') device login confirmed on Rise's /device page -------------------
+
+/// `rise login --device` end to end, with Rise as the device authorization
+/// server: the approving browser session comes from a real Dex login, and the
+/// device session it yields names the same `User` and `UserIdentity`.
+struct DeviceLogin;
+
+impl Scenario for DeviceLogin {
+    fn id(&self) -> &'static str {
+        "device-login"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.dex() {
+            Some(_) => Applicability::Run,
+            None => Applicability::Skip("the stack exposes no Dex to sign the approver in"),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        use crate::device_login;
+
+        let api = b.api_base();
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let session = crate::login::login(api, dexep, "admin@example.com", "password")
+            .context("sign the approver in through Dex")?;
+
+        // Approve: the CLI's poll turns into a session for the approver.
+        let started = device_login::start(api)?;
+        anyhow::ensure!(
+            started
+                .verification_uri_complete
+                .ends_with(&format!("/device?user_code={}", started.user_code)),
+            "verification URI is not Rise's /device page: {}",
+            started.verification_uri_complete
+        );
+        let pending = device_login::poll(api, &started.device_code)?;
+        anyhow::ensure!(
+            pending.as_ref().err().map(String::as_str) == Some("authorization_pending"),
+            "expected authorization_pending before approval, got {pending:?}"
+        );
+        let request = device_login::lookup(api, &session, &started.user_code)?;
+        anyhow::ensure!(
+            request["reauth_required"] == false && request["client_name"] == "rise-e2e",
+            "unexpected device lookup for a fresh session:\n{request}"
+        );
+        device_login::decide(api, &session, &started.user_code, true)?;
+        let token = device_login::poll(api, &started.device_code)?
+            .map_err(|error| anyhow::anyhow!("expected a token after approval, got {error}"))?;
+
+        let (approver, device) = (
+            device_login::claims(&session)?,
+            device_login::claims(&token)?,
+        );
+        for claim in ["sub", "rise_uid", "rise_identity_uid"] {
+            anyhow::ensure!(
+                !approver[claim].is_null() && approver[claim] == device[claim],
+                "device session {claim} {} differs from the approver's {}",
+                device[claim],
+                approver[claim]
+            );
+        }
+        let me = http::get_auth(&format!("{api}/api/v1/users/me"), &token)?;
+        anyhow::ensure!(
+            me.status == 200 && me.body.contains("admin@example.com"),
+            "device session was not accepted by /users/me ({}):\n{}",
+            me.status,
+            me.body
+        );
+        let reused = device_login::poll(api, &started.device_code)?;
+        anyhow::ensure!(
+            reused.as_ref().err().map(String::as_str) == Some("expired_token"),
+            "a redeemed device code must not yield a second session, got {reused:?}"
+        );
+
+        // Deny: the CLI is told so.
+        let denied = device_login::start(api)?;
+        device_login::decide(api, &session, &denied.user_code, false)?;
+        let answer = device_login::poll(api, &denied.device_code)?;
+        anyhow::ensure!(
+            answer.as_ref().err().map(String::as_str) == Some("access_denied"),
+            "expected access_denied after denial, got {answer:?}"
         );
         Ok(())
     }
