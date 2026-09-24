@@ -162,6 +162,8 @@ def verify(log, repo):
     e2e_fields = {
         "module.runtime.aws_ecs_task_definition.rise": {"container_definitions"},
         "module.runtime.aws_ecs_task_definition.traefik": {"container_definitions"},
+        # Embeds dev/dex/config.yaml, which has changed since the baseline.
+        "aws_ecs_task_definition.dex": {"container_definitions"},
         "module.runtime.aws_ecs_service.rise": {"enable_execute_command"},
         "module.runtime.aws_ecs_service.traefik": {
             "deployment_minimum_healthy_percent",
