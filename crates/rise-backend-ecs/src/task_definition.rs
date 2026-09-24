@@ -72,6 +72,10 @@ pub const IDENTITY_TOKEN_TTL_ENV: &str = "RISE_IDENTITY_TOKEN_TTL_SECONDS";
 /// needs more.
 pub const IDENTITY_AGENT_MEMORY_RESERVATION_MIB: i32 = 32;
 
+/// How long the sidecar may take to write its files before failed health checks
+/// count against it — ECS's maximum.
+pub const IDENTITY_AGENT_START_PERIOD_SECS: i32 = 300;
+
 /// What the workload-identity sidecar needs to be rendered for one deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentityAgentSpec {
@@ -589,11 +593,15 @@ fn identity_agent_container(
                 "agent".to_string(),
                 "--check".to_string(),
             ],
-            // ECS's minimums, so the app starts as soon as the files exist.
+            // A short interval so the app starts as soon as the files exist, and
+            // ECS's longest start period, during which failed checks do not
+            // count: a sidecar briefly throttled or waiting out a control-plane
+            // restart keeps retrying instead of being marked unhealthy, which
+            // would stop the task before the app ever ran.
             interval: 5,
             timeout: 2,
             retries: 3,
-            start_period: 5,
+            start_period: IDENTITY_AGENT_START_PERIOD_SECS,
         }),
         restart_on_exit: true,
         memory_reservation_mib: Some(IDENTITY_AGENT_MEMORY_RESERVATION_MIB),
@@ -1063,9 +1071,13 @@ mod tests {
             Some(r#"{"e2e":"rise-e2e-audience"}"#)
         );
         assert_eq!(env(IDENTITY_TOKEN_TTL_ENV), Some("3600"));
-        assert!(
-            agent.health_check.is_some(),
-            "HEALTHY dependency needs a check"
+        let check = agent
+            .health_check
+            .as_ref()
+            .expect("HEALTHY dependency needs a check");
+        assert_eq!(
+            check.start_period, 300,
+            "a throttled or restarting control plane must not fail the task at startup"
         );
         assert!(
             agent.docker_labels.is_empty(),

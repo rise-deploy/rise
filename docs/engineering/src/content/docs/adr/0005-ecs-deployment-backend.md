@@ -522,7 +522,18 @@ map (filename → audience) as plain environment: it is the deployment's own
 `rise.toml`, not a secret, and cannot change within a deployment. It refreshes
 at half the lifetime the endpoint reports, the policy every backend follows,
 with up to 20 % random jitter so a deployment's tasks do not refresh — or
-retry against the shared rate limiter — in lockstep.
+retry — in lockstep.
+
+The endpoint's rate limiting keys on the caller the credential proves, not on
+its address. Every sidecar in an install may share one address — a NAT gateway,
+or no proxy headers at all over an internal URL — so a per-IP budget would
+throttle the whole install as one client. The endpoint therefore has its own
+limiter, apart from the OAuth one: a valid credential counts against its
+deployment's budget only, and the per-IP budget counts only credentials that
+match nothing, which is what slows guessing. And because a throttled or
+restarting control plane at task start must not fail the task, the sidecar's
+health check uses ECS's longest start period (300 s): failed checks inside it do
+not count, while the first passing one still releases the app at once.
 
 That makes `identity_token_ttl_seconds` the **single cap on every workload
 identity token**: the lifetime of the token files on all three backends, and
@@ -543,8 +554,9 @@ one.
 **The agent image.** `identity_agent_image`, defaulting to the image the control
 plane itself runs, read from the ECS task metadata at startup — so it follows
 the operator's own reference (tag, digest or mirror) and stays in step on
-upgrade with no configuration; a control plane not on ECS falls back to the
-released image of its version. The image is **excluded from the task-definition
+upgrade with no configuration. A control plane not on ECS must configure it;
+there is no guessed fallback, since a released image of some version may predate
+the agent and a sidecar that cannot run stops every task it is in. The image is **excluded from the task-definition
 content hash**: including it
 would roll every ECS service in the install on every Rise upgrade. New
 deployments pick up the new agent; running ones keep theirs, which is why the

@@ -740,6 +740,18 @@ variable "traefik_constraints" {
   default     = ""
 }
 
+variable "identity_agent_image" {
+  description = "Image of the workload-identity sidecar every workload task runs. Null uses the image the control plane runs; set it when workload tasks pull from somewhere the control plane's image reference does not reach."
+  type        = string
+  default     = null
+}
+
+variable "identity_exchange_url" {
+  description = "Base URL at which the identity sidecar reaches the Rise API. Null uses the public URL, which workloads reach through the edge; set an internal address only if the apps security group can reach it."
+  type        = string
+  default     = null
+}
+
 variable "identity_token_ttl_seconds" {
   description = "Lifetime of the auto-minted [identity] workload tokens. The identity sidecar in each task refreshes them at half this. Null keeps Rise's default (3600)."
   type        = number

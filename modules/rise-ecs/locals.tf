@@ -148,5 +148,7 @@ module "control_plane_env" {
 
   repository_credentials_secret_arn = var.repository_credentials_secret_arn
 
+  identity_agent_image       = var.identity_agent_image
+  identity_exchange_url      = var.identity_exchange_url
   identity_token_ttl_seconds = var.identity_token_ttl_seconds
 }

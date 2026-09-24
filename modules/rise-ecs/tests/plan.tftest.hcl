@@ -163,6 +163,25 @@ run "uses_an_external_traefik_role_without_creating_iam" {
   }
 }
 
+run "identity_sidecar_settings_reach_the_control_plane" {
+  command = plan
+
+  variables {
+    identity_agent_image       = "123456789012.dkr.ecr.eu-central-1.amazonaws.com/rise:mirror"
+    identity_exchange_url      = "http://rise.internal:3000"
+    identity_token_ttl_seconds = 900
+  }
+
+  assert {
+    condition = alltrue([
+      local.rise_environment["RISE_ECS_IDENTITY_AGENT_IMAGE"] == "123456789012.dkr.ecr.eu-central-1.amazonaws.com/rise:mirror",
+      local.rise_environment["RISE_ECS_IDENTITY_EXCHANGE_URL"] == "http://rise.internal:3000",
+      local.rise_environment["RISE_IDENTITY_TOKEN_TTL_SECONDS"] == "900",
+    ])
+    error_message = "the identity sidecar settings must be configurable through the root module"
+  }
+}
+
 run "alb_uses_https_and_group_restricted_auth" {
   command = plan
 

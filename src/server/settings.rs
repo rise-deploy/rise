@@ -414,6 +414,10 @@ pub struct ServerSettings {
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
 
+    /// Rate limiting for the workload identity token-exchange endpoint.
+    #[serde(default)]
+    pub workload_token_rate_limit: WorkloadTokenRateLimitSettings,
+
     /// Lifetime in seconds of Rise access tokens minted by the auth
     /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
     /// exchanged token cannot be revoked mid-life. Default: 600 (10 minutes).
@@ -461,6 +465,55 @@ pub struct OAuthRateLimitSettings {
     /// Window in seconds for the global limit (default: 60)
     #[serde(default = "default_oauth_global_window_secs")]
     pub global_window_secs: u64,
+}
+
+/// Rate limiting for the workload identity token-exchange endpoint
+/// (`POST /api/v1/identity/token`), kept apart from the OAuth limiter so login
+/// traffic and token minting never share a budget.
+///
+/// A valid bootstrap credential is 256 random bits naming one deployment, a
+/// better caller identity than an address: workloads behind one NAT gateway, or
+/// reaching Rise over an internal address with no proxy headers, would all look
+/// like one client. So a request with a valid credential counts only against its
+/// deployment's budget, and the per-IP budget counts only rejected credentials —
+/// which is what slows guessing without throttling every task behind a NAT.
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+pub struct WorkloadTokenRateLimitSettings {
+    /// Maximum requests per deployment (valid credential) per window (default: 500)
+    #[serde(default = "default_workload_token_per_deployment_max")]
+    pub per_deployment_max: u32,
+    /// Window for the per-deployment limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub per_deployment_window_secs: u64,
+    /// Maximum rejected credentials per client IP per window (default: 50)
+    #[serde(default = "default_workload_token_rejected_per_ip_max")]
+    pub rejected_per_ip_max: u32,
+    /// Window for the rejected-credential limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub rejected_per_ip_window_secs: u64,
+}
+
+impl Default for WorkloadTokenRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            per_deployment_max: default_workload_token_per_deployment_max(),
+            per_deployment_window_secs: default_workload_token_window_secs(),
+            rejected_per_ip_max: default_workload_token_rejected_per_ip_max(),
+            rejected_per_ip_window_secs: default_workload_token_window_secs(),
+        }
+    }
+}
+
+fn default_workload_token_per_deployment_max() -> u32 {
+    500
+}
+
+fn default_workload_token_rejected_per_ip_max() -> u32 {
+    50
+}
+
+fn default_workload_token_window_secs() -> u64 {
+    60
 }
 
 impl Default for OAuthRateLimitSettings {
@@ -1888,10 +1941,11 @@ pub enum DeploymentControllerSettings {
 
         /// Image of the workload-identity sidecar every task runs (`rise
         /// identity agent`). Defaults to the image the control plane itself
-        /// runs, read from the ECS task metadata, or — for a control plane not
-        /// on ECS — the released image of this server's version on GHCR.
-        /// Changing it affects new deployments only: running services keep the
-        /// sidecar they started with.
+        /// runs, read from the ECS task metadata; a control plane not running
+        /// on ECS must set it, and startup fails otherwise. The workload
+        /// execution role must be able to pull it. Changing it affects new
+        /// deployments only: running services keep the sidecar they started
+        /// with.
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
         identity_agent_image: Option<String>,
 

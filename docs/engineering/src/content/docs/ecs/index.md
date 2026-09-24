@@ -247,13 +247,20 @@ the app starts.
   `identity_exchange_url` (default: the public URL), with a lifetime of
   `identity_token_ttl_seconds`, and refreshed at half that. Tasks therefore need
   a route to that URL; set `identity_exchange_url` to an internal address if
-  they have none. The calls share the endpoint's rate limiter (per client IP,
-  per project, install-wide); a large deployment starting behind one NAT address
-  may be briefly throttled, in which case the sidecar backs off and the app
-  starts a little later.
+  they have none. The endpoint budgets a valid credential per deployment
+  (`server.workload_token_rate_limit`, 500 requests a minute by default), not
+  per address, so tasks sharing a NAT gateway do not throttle each other. The
+  sidecar has ECS's full five-minute start period to write its files before
+  failed health checks count, so a brief throttle or control-plane restart
+  delays the app rather than failing the task.
 - **The image** defaults to the control plane's own, read from the ECS task
-  metadata at startup, so the agent always matches the server. Override it with
-  `identity_agent_image`. It is left out of the task-definition hash: a new
+  metadata at startup, so the agent always matches the server. A control plane
+  that does not run on ECS must set `identity_agent_image`; startup fails
+  otherwise, rather than guessing an image that may predate the agent. The
+  workload execution role pulls it with no registry credentials, so if the
+  control plane's image lives in another account's ECR or a registry that needs
+  credentials, grant that role access or point `identity_agent_image` at a
+  mirror it can pull. The image is left out of the task-definition hash: a new
   image reaches new deployments without rolling running ones.
 - **Cost:** one extra, non-essential container per task (restarted in place if
   it exits) with a 32 MiB memory reservation out of the task's size.

@@ -834,7 +834,7 @@
             },
             "identity_agent_image": {
               "default": null,
-              "description": "Image of the workload-identity sidecar every task runs (`rise\nidentity agent`). Defaults to the image the control plane itself\nruns, read from the ECS task metadata, or — for a control plane not\non ECS — the released image of this server's version on GHCR.\nChanging it affects new deployments only: running services keep the\nsidecar they started with.",
+              "description": "Image of the workload-identity sidecar every task runs (`rise\nidentity agent`). Defaults to the image the control plane itself\nruns, read from the ECS task metadata; a control plane not running\non ECS must set it, and startup fails otherwise. The workload\nexecution role must be able to pull it. Changing it affects new\ndeployments only: running services keep the sidecar they started\nwith.",
               "type": [
                 "string",
                 "null"
@@ -2220,6 +2220,10 @@
             "string",
             "null"
           ]
+        },
+        "workload_token_rate_limit": {
+          "$ref": "#/$defs/WorkloadTokenRateLimitSettings",
+          "description": "Rate limiting for the workload identity token-exchange endpoint."
         }
       },
       "required": [
@@ -2250,6 +2254,40 @@
             "type": "string"
           },
           "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "WorkloadTokenRateLimitSettings": {
+      "description": "Rate limiting for the workload identity token-exchange endpoint\n(`POST /api/v1/identity/token`), kept apart from the OAuth limiter so login\ntraffic and token minting never share a budget.\n\nA valid bootstrap credential is 256 random bits naming one deployment, a\nbetter caller identity than an address: workloads behind one NAT gateway, or\nreaching Rise over an internal address with no proxy headers, would all look\nlike one client. So a request with a valid credential counts only against its\ndeployment's budget, and the per-IP budget counts only rejected credentials —\nwhich is what slows guessing without throttling every task behind a NAT.",
+      "properties": {
+        "per_deployment_max": {
+          "default": 500,
+          "description": "Maximum requests per deployment (valid credential) per window (default: 500)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_deployment_window_secs": {
+          "default": 60,
+          "description": "Window for the per-deployment limit in seconds (default: 60)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rejected_per_ip_max": {
+          "default": 50,
+          "description": "Maximum rejected credentials per client IP per window (default: 50)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rejected_per_ip_window_secs": {
+          "default": 60,
+          "description": "Window for the rejected-credential limit in seconds (default: 60)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"

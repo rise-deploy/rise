@@ -107,8 +107,20 @@ Merged to `develop`:
     `identity_exchange_url` (`RISE_ECS_IDENTITY_AGENT_IMAGE` /
     `RISE_ECS_IDENTITY_EXCHANGE_URL`) if they cannot.
   - `identity_token_ttl_seconds` is now env-driven on ECS
-    (`RISE_IDENTITY_TOKEN_TTL_SECONDS`; `rise-ecs` exposes
-    `identity_token_ttl_seconds`).
+    (`RISE_IDENTITY_TOKEN_TTL_SECONDS`), and `rise-ecs` exposes it along with
+    `identity_agent_image` and `identity_exchange_url`.
+  - A control plane that does not itself run on ECS must set
+    `identity_agent_image`: the default is read from the ECS task metadata, and
+    startup fails when it cannot be.
+
+- **The workload identity token-exchange endpoint has its own rate limiter.**
+  *Config change.* `POST /api/v1/identity/token` no longer shares the OAuth
+  limiter. A request with a valid bootstrap credential counts against that
+  deployment's budget only; the per-IP budget applies only to credentials that
+  match no deployment. Configure it under `server.workload_token_rate_limit`
+  (`per_deployment_max`/`per_deployment_window_secs`, default 500 per 60 s;
+  `rejected_per_ip_max`/`rejected_per_ip_window_secs`, default 50 per 60 s).
+  `server.oauth_rate_limit` no longer applies to this endpoint.
 
 - **One lifetime cap for workload identity tokens; `server.workload_token_max_ttl_seconds`
   is removed.** *Breaking.* Tokens from the token-exchange endpoint

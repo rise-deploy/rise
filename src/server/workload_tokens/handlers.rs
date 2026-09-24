@@ -49,15 +49,19 @@ async fn authenticate_credential(
             .await
             .internal_err("Failed to look up deployment")?;
 
-    let rate_limit_key = deployment_by_credential
-        .as_ref()
-        .map(|d| d.id.to_string())
-        .unwrap_or_else(|| "invalid-credential".to_string());
-    if let Err(retry_after) = state
-        .oauth_rate_limiter
-        .increment_and_check(&ip, None, &rate_limit_key)
-        .await
-    {
+    // A valid credential is the caller's identity; the address is used only to
+    // slow down credentials that match nothing. See
+    // `WorkloadTokenRateLimitSettings`.
+    let limited = match &deployment_by_credential {
+        Some(d) => {
+            state
+                .workload_token_rate_limiter
+                .authenticated(&d.id.to_string())
+                .await
+        }
+        None => state.workload_token_rate_limiter.rejected(&ip).await,
+    };
+    if let Err(retry_after) = limited {
         return Ok(Err(rate_limit_response(retry_after).into_response()));
     }
 

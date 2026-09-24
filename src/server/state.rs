@@ -141,6 +141,8 @@ pub struct AppState {
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
     /// Rate limiter for OAuth endpoints (token, authorize, callback)
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
+    /// Rate limiter for the workload identity token-exchange endpoint.
+    pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
     /// Project-name labels reserved for control-plane hosts. Normalized to
@@ -525,9 +527,14 @@ async fn init_ecs_backend(
 
     let identity_agent_image = match identity_agent_image {
         Some(image) => image.clone(),
-        None => own_ecs_image()
-            .await
-            .unwrap_or_else(default_identity_agent_image),
+        None => own_ecs_image().await.context(
+            "ECS deployment backend: could not determine the workload-identity sidecar image. \
+             It defaults to the image this control plane runs, read from the ECS task \
+             metadata, which is unavailable here (the control plane is not running on ECS, \
+             or the metadata endpoint did not answer). Set \
+             `deployment_controller.identity_agent_image` (RISE_ECS_IDENTITY_AGENT_IMAGE) to \
+             a Rise image of this version.",
+        )?,
     };
     tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
 
@@ -590,9 +597,12 @@ async fn init_ecs_backend(
 /// The image this server's own container runs, from the ECS task metadata
 /// endpoint, when the control plane itself runs on ECS.
 ///
-/// The best default for the identity sidecar: it carries exactly this server's
-/// `rise identity agent`, however the operator references it -- a tag, a
-/// digest, a mirror -- and needs no configuration to stay in step on upgrade.
+/// The identity sidecar's default: it carries exactly this server's `rise
+/// identity agent`, however the operator references it -- a tag, a digest, a
+/// mirror -- and needs no configuration to stay in step on upgrade. There is
+/// deliberately no guessed fallback: a released image of some version may
+/// predate the agent, and a sidecar that cannot run stops every task it is in.
+/// Retried briefly, since the endpoint can lag the container's start.
 #[cfg(feature = "backend")]
 async fn own_ecs_image() -> Option<String> {
     #[derive(serde::Deserialize)]
@@ -602,36 +612,33 @@ async fn own_ecs_image() -> Option<String> {
     }
 
     let uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4").ok()?;
-    let result = async {
-        reqwest::Client::new()
-            .get(&uri)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<ContainerMetadata>()
-            .await
-    }
-    .await;
-    match result {
-        Ok(metadata) if !metadata.image.trim().is_empty() => Some(metadata.image),
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!(
-                "Could not read this container's image from the ECS task metadata; \
-                 the identity sidecar falls back to the released image of this version: {:?}",
-                e
-            );
-            None
+    let client = reqwest::Client::new();
+    for attempt in 1..=3u32 {
+        let result = async {
+            client
+                .get(&uri)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ContainerMetadata>()
+                .await
+        }
+        .await;
+        match result {
+            Ok(metadata) if !metadata.image.trim().is_empty() => return Some(metadata.image),
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::warn!(
+                    attempt,
+                    "Could not read this container's image from the ECS task metadata: {:?}",
+                    e
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(u64::from(attempt))).await;
+            }
         }
     }
-}
-
-/// The released Rise image of this server's version, for a control plane that
-/// does not run on ECS. Release images are tagged with the bare version.
-#[cfg(feature = "backend")]
-fn default_identity_agent_image() -> String {
-    format!("ghcr.io/rise-deploy/rise:{}", env!("CARGO_PKG_VERSION"))
+    None
 }
 
 #[cfg(feature = "backend")]
@@ -1944,6 +1951,11 @@ impl AppState {
                 .build(),
         );
 
+        let workload_token_rate_limiter =
+            Arc::new(crate::server::rate_limit::WorkloadTokenRateLimiter::new(
+                &settings.server.workload_token_rate_limit,
+            ));
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -2108,6 +2120,7 @@ impl AppState {
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,
+            workload_token_rate_limiter,
             access_classes,
             reserved_project_names,
             signin_base_url,
