@@ -3,6 +3,7 @@ use crate::db::service_accounts;
 use crate::server::auth::controller::{self, ControllerAuthContext, ControllerResolution};
 use crate::server::auth::identity::ResourcePrincipal;
 use crate::server::auth::sa_match::{match_service_account, SaMatchError};
+use crate::server::auth::user_identity::UserPrincipal;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::resources::error_map::store_error_to_server_error;
 use crate::server::state::AppState;
@@ -31,7 +32,10 @@ pub struct VerifiedExternalToken {
 ///   accounts via `resolve_for_project`.
 #[derive(Clone, Debug)]
 pub enum AuthContext {
-    User(User),
+    /// A Rise session. The `UserPrincipal` is the live `User` resource the
+    /// session names; a legacy session (issued before identity resolution)
+    /// names none and reaches only the typed APIs.
+    User(User, Option<UserPrincipal>),
     ExternalToken(VerifiedExternalToken),
     /// A Rise access token (RFC 8693 exchanged principal). In Phase 1 this is
     /// only ever a service account or controller — the exchange never mints a
@@ -45,6 +49,14 @@ pub enum AuthContext {
 }
 
 impl AuthContext {
+    /// The live `User` resource a session names, if it names one.
+    pub fn user_principal(&self) -> Option<&UserPrincipal> {
+        match self {
+            AuthContext::User(_, principal) => principal.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Get the authenticated Rise user.
     ///
     /// Returns the user for Rise JWTs. Returns 401 for service-account / access
@@ -52,7 +64,7 @@ impl AuthContext {
     /// should call this).
     pub fn user(&self) -> Result<&User, ServerError> {
         match self {
-            AuthContext::User(user) => Ok(user),
+            AuthContext::User(user, _) => Ok(user),
             AuthContext::ExternalToken(_) | AuthContext::Access(_) | AuthContext::Identity(_) => {
                 Err(ServerError::unauthorized(
                     "This endpoint does not support service account authentication",
@@ -85,7 +97,7 @@ impl AuthContext {
         project: &crate::db::models::Project,
     ) -> Result<(User, bool), ServerError> {
         match self {
-            AuthContext::User(user) => Ok((user.clone(), false)),
+            AuthContext::User(user, _) => Ok((user.clone(), false)),
             AuthContext::Access(claims) => resolve_access_for_project(pool, project, claims).await,
             // A resource principal is not bound to a typed Project; the typed
             // APIs converge onto it with the typed-object migration.
@@ -204,7 +216,7 @@ impl AuthContext {
                 matches!(&claims.principal, PrincipalClaims::ServiceAccount { .. })
             }
             AuthContext::Identity(principal) => principal.subject.kind() == "serviceaccount",
-            AuthContext::User(_) => false,
+            AuthContext::User(..) => false,
         }
     }
 }
@@ -292,7 +304,8 @@ impl FromRequestParts<AppState> for AuthContext {
     ) -> Result<Self, Self::Rejection> {
         // Try User extension first (Rise JWT path)
         if let Some(user) = parts.extensions.get::<User>().cloned() {
-            return Ok(AuthContext::User(user));
+            let principal = parts.extensions.get::<UserPrincipal>().cloned();
+            return Ok(AuthContext::User(user, principal));
         }
 
         // Try the exchanged access-token extension (Rise access token path)
@@ -331,15 +344,21 @@ pub enum AnyAuth {
 
 #[cfg(test)]
 impl AnyAuth {
-    /// Get the authenticated Rise user, for tests that need the underlying
-    /// `User` row after building an `AnyAuth` for a dispatch call.
-    pub fn user(&self) -> Result<&User, ServerError> {
+    /// The `User` resource a session names, for tests that bind or assert on
+    /// the caller's own subject.
+    pub fn user_principal(&self) -> Option<&UserPrincipal> {
         match self {
-            AnyAuth::User(auth_ctx) => auth_ctx.user(),
-            AnyAuth::Controller(_) => Err(ServerError::unauthorized(
-                "This endpoint does not support controller authentication",
-            )),
+            AnyAuth::User(auth_ctx) => auth_ctx.user_principal(),
+            AnyAuth::Controller(_) => None,
         }
+    }
+
+    /// The canonical `user:<name>` subject of the session's User.
+    pub fn user_subject(&self) -> String {
+        self.user_principal()
+            .expect("a User session")
+            .subject()
+            .to_string()
     }
 }
 
@@ -711,7 +730,7 @@ mod tests {
         .await
         .unwrap();
 
-        let auth = AuthContext::User(user.clone());
+        let auth = AuthContext::User(user.clone(), None);
         let (resolved_user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
         assert!(!is_sa);
         assert_eq!(resolved_user.id, user.id);

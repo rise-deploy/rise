@@ -12,6 +12,7 @@ use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::VerifiedExternalToken;
 use crate::server::auth::cookie_helpers;
 use crate::server::auth::identity::{resolve_identity, ResourcePrincipal};
+use crate::server::auth::user_identity::TokenStanding;
 use crate::server::state::AppState;
 use rise_backend_auth::{is_rise_issued_jwt, AccessClaims, PrincipalClaims, RiseToken};
 
@@ -137,6 +138,42 @@ pub async fn auth_middleware(
                 if claims.aud != state.public_url {
                     tracing::warn!("Auth middleware: session token audience mismatch");
                     return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+                }
+
+                // Every session is re-checked on every request (ADR-0001 §7).
+                // One naming a `User` resource re-resolves its User and
+                // minting identity: an inactive, deleted, or recreated User
+                // ends all of its sessions, and an inactive or deleted identity
+                // the sessions it minted. A legacy session carries the IdP's
+                // `sub` instead and is checked through that identity's
+                // mapping; it keeps the typed APIs until it expires, and the
+                // resource API refuses it. A store failure is a server error,
+                // never a logout.
+                let uids = claims.rise_uid.zip(claims.rise_identity_uid);
+                match state.user_logins.check_token(&claims.sub, uids).await {
+                    Ok(TokenStanding::Active(principal)) => {
+                        if let Some(principal) = principal {
+                            req.extensions_mut().insert(principal);
+                        }
+                    }
+                    Ok(TokenStanding::Rejected(rejection)) => {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            rise_uid = ?claims.rise_uid,
+                            "Auth middleware: session rejected: {rejection}"
+                        );
+                        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            sub = %claims.sub,
+                            "Auth middleware: failed to re-resolve the session's User: {error:?}"
+                        );
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Database error".to_string(),
+                        ));
+                    }
                 }
 
                 let email = &claims.email;
@@ -348,6 +385,25 @@ pub async fn optional_auth_middleware(
                             if let Ok(rise_claims) =
                                 state.jwt_signer.verify_user_jwt(&token, &state.public_url)
                             {
+                                // A token whose User or identity no longer
+                                // resolves is no authentication at all; nor,
+                                // for this best-effort layer, is one the store
+                                // could not check.
+                                let uids = rise_claims.rise_uid.zip(rise_claims.rise_identity_uid);
+                                match state.user_logins.check_token(&rise_claims.sub, uids).await {
+                                    Ok(TokenStanding::Active(principal)) => {
+                                        if let Some(principal) = principal {
+                                            req.extensions_mut().insert(principal);
+                                        }
+                                    }
+                                    Ok(TokenStanding::Rejected(_)) => return next.run(req).await,
+                                    Err(error) => {
+                                        tracing::error!(
+                                            "Optional auth: failed to re-resolve the session's User: {error:?}"
+                                        );
+                                        return next.run(req).await;
+                                    }
+                                }
                                 let email = &rise_claims.email;
                                 // Mirror the strict auth path: never create a user
                                 // row without the matching default-Org membership.

@@ -33,6 +33,27 @@ pub const RISE_ACCESS_TYP: &str = "rise-access+jwt";
 /// Matched exclusively, like [`RISE_ACCESS_TYP`].
 pub const RISE_IDENTITY_TYP: &str = "rise-identity+jwt";
 
+/// JWT header `typ` for Rise User session tokens (ADR-0001 §7).
+///
+/// A session carrying it names a `User` resource: `sub` is its canonical
+/// `user:<name>`, `rise_uid` its UID, and `rise_identity_uid` the
+/// `UserIdentity` whose login minted it; all three must still identify one
+/// live, active User and identity on every request. Matched exclusively, like
+/// [`RISE_ACCESS_TYP`]; an HS256 token without it is a legacy session, which
+/// carries the IdP's `sub` and no `rise_uid`.
+pub const RISE_SESSION_TYP: &str = "rise-session+jwt";
+
+/// The Rise `User` resource a session token is issued for.
+#[derive(Debug, Clone)]
+pub struct SessionUser {
+    /// Canonical `user:<name>` subject.
+    pub subject: String,
+    /// The `User` resource's UID.
+    pub rise_uid: uuid::Uuid,
+    /// The `UserIdentity` the login resolved through.
+    pub identity_uid: uuid::Uuid,
+}
+
 /// What an identity token is minted for.
 ///
 /// The signer stamps `iss`, `iat`/`exp`, and a random `jti`; everything
@@ -309,16 +330,22 @@ impl RiseTokenSigner {
             exp,
             iss: self.issuer.clone(),
             aud: aud.to_string(),
+            rise_uid: None,
+            rise_identity_uid: None,
         })
     }
 
-    /// Sign a new Rise JWT for user authentication (HS256)
+    /// Sign a Rise session token for a resolved `User` (HS256).
     ///
-    /// This JWT is used for authenticating users to Rise (both UI and CLI).
-    /// Uses HS256 symmetric encryption and sets aud to the Rise public URL.
+    /// This JWT authenticates users to Rise (UI and CLI). It carries the
+    /// header `typ` [`RISE_SESSION_TYP`], `sub` = the User's canonical subject,
+    /// `rise_uid` = its UID, `rise_identity_uid` = the minting `UserIdentity`,
+    /// and `aud` = the Rise public URL. `email` and
+    /// `name` still come from the IdP claims: the typed APIs key on the email.
     ///
     /// # Arguments
     /// * `idp_claims` - Claims from the IdP JWT (must contain at least "sub" and "email")
+    /// * `user` - The `User` resource the login resolved to
     /// * `groups` - The user's Rise team names, placed directly into the `groups` claim.
     ///   Callers resolve these (e.g. via the DB) and pass them in; the signer never
     ///   touches the database.
@@ -327,14 +354,19 @@ impl RiseTokenSigner {
     pub fn sign_user_jwt(
         &self,
         idp_claims: &serde_json::Value,
+        user: &SessionUser,
         groups: Option<Vec<String>>,
         rise_public_url: &str,
         expiry_override: Option<u64>,
     ) -> Result<String, JwtSignerError> {
-        let claims =
+        let mut claims =
             self.build_rise_claims(idp_claims, groups, rise_public_url, expiry_override)?;
+        claims.sub = user.subject.clone();
+        claims.rise_uid = Some(user.rise_uid);
+        claims.rise_identity_uid = Some(user.identity_uid);
 
-        let header = Header::new(Algorithm::HS256);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some(RISE_SESSION_TYP.to_string());
         let token = encode(&header, &claims, &self.hs256_encoding_key)?;
 
         Ok(token)
@@ -556,12 +588,13 @@ impl RiseTokenSigner {
         // Defense-in-depth (§4.1 ingress hardening): the `typ` discriminator above
         // already routes a Rise access or identity token to its own variant, but
         // because `RiseClaims` intentionally does NOT use `deny_unknown_fields`,
-        // a token *without* that `typ` that nonetheless carries a `principal` or
-        // `rise_uid` claim would deserialize cleanly as a session/ingress token
-        // (extra field ignored). Reject any such token outright so a
-        // principal-shaped payload can never be accepted on the ingress path.
-        // The payload was just signature-verified, so this peek reads
-        // authenticated bytes.
+        // a token *without* that `typ` that nonetheless carries a `principal`
+        // claim would deserialize cleanly as a session/ingress token (extra
+        // field ignored). Reject any such token outright so a principal-shaped
+        // payload can never be accepted on the ingress path. `rise_uid` needs
+        // no peek: `RiseClaims` reads it, and the verifier admits it only on a
+        // session token wearing `RISE_SESSION_TYP`. The payload was just
+        // signature-verified, so this peek reads authenticated bytes.
         if rise_jwt_payload_has_principal(token) {
             return Err(JwtSignerError::SigningFailed(
                 jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
@@ -573,9 +606,8 @@ impl RiseTokenSigner {
 }
 
 /// Whether a (already signature-verified) JWT's payload carries a top-level
-/// `principal` or `rise_uid` claim — the fields that mark an access token and
-/// an identity token respectively. Used to fail-close the ingress path against
-/// principal-shaped tokens (§4.1). Returns `false` if the payload cannot be
+/// `principal` claim — the field that marks an access token. Used to
+/// fail-close the ingress path against principal-shaped tokens (§4.1). Returns `false` if the payload cannot be
 /// parsed (the caller has already verified the signature, so this only guards
 /// the claim shape).
 fn rise_jwt_payload_has_principal(token: &str) -> bool {
@@ -587,10 +619,7 @@ fn rise_jwt_payload_has_principal(token: &str) -> bool {
     };
     serde_json::from_slice::<serde_json::Value>(&payload)
         .ok()
-        .and_then(|v| {
-            v.as_object()
-                .map(|obj| obj.contains_key("principal") || obj.contains_key("rise_uid"))
-        })
+        .and_then(|v| v.as_object().map(|obj| obj.contains_key("principal")))
         .unwrap_or(false)
 }
 

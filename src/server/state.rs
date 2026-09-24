@@ -87,6 +87,10 @@ pub struct AppState {
     /// `SERIALIZABLE` transaction.
     #[cfg(feature = "backend")]
     pub resource_authorizer: crate::server::authz::ResourceAuthorizer,
+    /// Resolves interactive logins and User sessions to live `User` resources
+    /// (ADR-0001 §1, §7), provisioning a User on a first login.
+    #[cfg(feature = "backend")]
+    pub user_logins: crate::server::auth::user_identity::UserLogins,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
@@ -1164,6 +1168,13 @@ impl AppState {
             },
         );
 
+        #[cfg(feature = "backend")]
+        let user_logins = crate::server::auth::user_identity::UserLogins::new(
+            pg_resource_store.clone(),
+            db_pool.clone(),
+            &settings.auth.issuer,
+        )?;
+
         // Store auth settings for issuer comparison
         let auth_settings = Arc::new(settings.auth.clone());
 
@@ -2021,6 +2032,8 @@ impl AppState {
             resource_store,
             #[cfg(feature = "backend")]
             resource_authorizer,
+            #[cfg(feature = "backend")]
+            user_logins,
             #[cfg(feature = "backend")]
             default_organization_uid,
             #[cfg(feature = "backend")]

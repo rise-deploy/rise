@@ -38,17 +38,22 @@ verifier; callers enforce audience per context).
 |---|---|---|---|
 | HS256 | `"rise-access+jwt"` | `RiseToken::Access(AccessClaims)` | exchanged SA / controller principal (RFC 8693), `aud = public_url` (checked by the API middleware, not here) |
 | HS256 | `"rise-identity+jwt"` | **rejected** (`InvalidAlgorithm`) | identity tokens are never HS256 |
-| HS256 | any other (incl. default `"JWT"`, missing, unknown) | `RiseToken::Session(RiseClaims)` | UI / CLI user login, `aud = public_url` (checked by the API middleware, not here) |
+| HS256 | `"rise-session+jwt"` | `RiseToken::Session(RiseClaims)` with `rise_uid` | UI / CLI user login naming a `User` resource: `sub = user:<name>`, `rise_uid` = its UID, `rise_identity_uid` = the minting `UserIdentity` (ADR-0001 §7); a payload missing either is **rejected**. `aud = public_url` and the `(sub, rise_uid)` liveness check are the API middleware's |
+| HS256 | any other (incl. default `"JWT"`, missing, unknown) | `RiseToken::Session(RiseClaims)` without `rise_uid` | legacy user session (IdP `sub`), `aud = public_url` (checked by the API middleware, not here); a payload carrying `rise_uid` or `rise_identity_uid` is **rejected** |
 | RS256 | `"rise-identity+jwt"` | `RiseToken::Identity(IdentityClaims)` | ServiceAccount / Controller *resource* principal minted by a `/token` subresource (ADR-0001 §7), for Rise's own audience or an external one; `aud = public_url` and the `(sub, rise_uid)` liveness check are the API middleware's, an external audience verifies via the JWKS |
-| RS256 | any other (incl. default `"JWT"`) | `RiseToken::Ingress(RiseClaims)` | deployed-app ingress auth, `aud = project_url` (not checked here) |
+| RS256 | `"rise-session+jwt"` | **rejected** (`InvalidAlgorithm`) | sessions are never RS256 |
+| RS256 | any other (incl. default `"JWT"`) | `RiseToken::Ingress(RiseClaims)` | deployed-app ingress auth, `aud = project_url` (not checked here); a payload carrying `rise_uid` or `rise_identity_uid` is **rejected** |
 | anything else | — | **rejected** (`InvalidAlgorithm`) | only HS256 / RS256 are accepted |
 
 **Dispatch:** both branches read the header `typ` **first**. RS256: the identity
-`typ` (`rise-identity+jwt`) → `Identity`; anything else → `Ingress`. HS256: the
-access `typ` (`rise-access+jwt`) → `Access`; the identity `typ` is rejected;
-anything else → `Session`. The special `typ`s are matched *exclusively*; legacy
-session and ingress tokens carry the default `"JWT"`, so neither is ever
-required to set a specific `typ`. The
+`typ` (`rise-identity+jwt`) → `Identity`; the session `typ` is rejected;
+anything else → `Ingress`. HS256: the access `typ` (`rise-access+jwt`) →
+`Access`; the identity `typ` is rejected; the session `typ`
+(`rise-session+jwt`) → `Session` with `rise_uid`; anything else → a legacy
+`Session`. The special `typ`s are matched *exclusively*; legacy session and
+ingress tokens carry the default `"JWT"`. `rise_uid` and `rise_identity_uid` are bound to
+the session `typ` in both directions, so a legacy-shaped token can never
+smuggle one. The
 `rise_token_disambiguation_matrix` unit test pins this table against the real
 `verify_rise_jwt`.
 
@@ -58,9 +63,9 @@ Two notes on the RS256 / HS256 boundaries:
   `#[serde(deny_unknown_fields)]`, so they are not serde-distinguishable — the
   `header.typ` discriminator is what keeps them apart. `AccessClaims` *does* use
   `deny_unknown_fields`, as does `IdentityClaims`. The ingress adapter
-  (`verify_jwt_skip_aud`) additionally rejects any token carrying a `principal` or
-  `rise_uid` claim, so an access- or identity-shaped payload can never be honored
-  on the ingress path.
+  (`verify_jwt_skip_aud`) additionally rejects any token carrying a `principal`
+  claim, so an access-shaped payload can never be honored on the ingress path;
+  `rise_uid` is already admitted only on a `rise-session+jwt` session.
 - **Workload vs. Ingress (RS256).** Rise also mints **Workload** tokens (RS256,
   same key, default `typ:"JWT"`), but they are **sign-only** — `verify_rise_jwt`
   never returns a `Workload` variant. The *only* thing currently keeping a Workload
@@ -76,7 +81,7 @@ Two notes on the RS256 / HS256 boundaries:
 |---|---|---|---|---|
 | Workload (`WorkloadClaims`) | RS256 | `"JWT"` | n/a — sign-only; verified **externally** via the published JWKS (AWS STS / GCP WIF / Vault), never by Rise | outbound federation |
 
-The signer (`RiseTokenSigner`) mints all five kinds — `sign_user_jwt` (Session),
+The signer (`RiseTokenSigner`) mints all five kinds — `sign_user_jwt` (Session, always `rise-session+jwt`),
 `sign_access_jwt` (Access), `sign_identity_jwt` (Identity), `sign_ingress_jwt`
 (Ingress), `sign_workload_jwt` (Workload) — but the verifier classifies only the
 four inbound kinds above. `sign_identity_jwt` signs with the RS256 key whatever

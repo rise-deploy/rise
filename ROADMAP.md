@@ -121,22 +121,23 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   scenario, including multi-org admins, membership removal, UID-bound token
   invalidation, token caps, and grant/revocation races. A `/// ADR-0001
   scenario N` marker on each covering test is enforced by `mise run
-  adr:conformance:check`; scenario 10's operator-selector and JIT-login halves
-  remain deferred until the `operatorIdentities`/JIT-login item below lands.
+  adr:conformance:check`; scenario 10's operator-selector half remains
+  deferred until the `operatorIdentities` item below lands.
 - [ ] Add the constrained Project ServiceAccount lifecycle operation. It uses
   fresh never-reused canonical names and atomically creates/deletes only its
   fixed Project-scoped policy and trust bundle, applying the effective-delta
   subset check to the result; ordinary Project users do not receive generic
   ServiceAccount or Role/RoleBinding creation authority.
-- [ ] Load `operatorIdentities` `(issuer, subject)` selectors at process startup;
-  JIT-create a generated User plus first UserIdentity after a validated unknown
-  login, and derive operator status live when any identity attached to that User
-  is active and matches the configured set. An inactive exact identity or
-  inactive parent User fails without JIT; deleting a mapping permits a later
-  login to provision a fresh User UID, so durable disablement uses `active:
-  false`. Reject email linking and hot reload; configuration changes complete
-  only after all old instances are drained. Operators remain the recovery tier;
-  legacy admins become qualifying default-org RoleBindings.
+- [x] JIT-create a generated User plus first UserIdentity after a validated
+  unknown login. An inactive exact identity or inactive parent User fails
+  without JIT; deleting a mapping permits a later login to provision a fresh
+  User UID, so durable disablement uses `active: false`. Email never links
+  accounts.
+- [ ] Load `operatorIdentities` `(issuer, subject)` selectors at process startup
+  and derive operator status live when any identity attached to that User is
+  active and matches the configured set. Reject hot reload; configuration
+  changes complete only after all old instances are drained. Operators remain
+  the recovery tier; legacy admins become qualifying default-org RoleBindings.
 
 ### Resource API maturation
 
@@ -186,11 +187,33 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ ] Finish raw-external-token deprecation telemetry, then disable and remove
   direct external JWT acceptance from ordinary resource endpoints.
 
+### Authentication entry points
+
+Every way a credential enters Rise, and whether it stays. A new credential path
+is added to this table in the same change that introduces it, and nothing
+permanent is built on an endpoint marked *retires*.
+
+| Entry point | Credential presented | Status | Why / gate |
+|---|---|---|---|
+| Browser login (`/auth/signin` → `/auth/callback`) | IdP authorization code | Stays | Human UI login; ID token received on the back channel, bound by PKCE, `state`, `nonce` |
+| CLI login (`/auth/code/exchange`, `/auth/device/exchange`) | IdP code or device code | Stays | Human CLI login, same binding |
+| App sign-in (`/auth/signin?project=…`, checked by `/auth/ingress`) | IdP authorization code | Stays | End users of private apps; the app-scoped ingress token keeps the IdP `sub` because apps read it |
+| `/token` on ServiceAccount / Controller — workload exchange | External assertion (Kubernetes projected token, CI OIDC, …) | Stays | The target design for every non-human caller; checked only against the target's trust policies |
+| `/token` on ServiceAccount / Controller — delegated issuance | Rise bearer holding `(create, <kind>, token)` | Stays | Minting for another identity, optionally for an external audience |
+| `POST /api/v1/identity/token` | Deployed app's bootstrap credential | Stays | Outbound federation from deployed apps (AWS STS, GCP WIF, Vault); not authentication to Rise |
+| Raw external JWTs on API endpoints (`auth.allow_raw_external_tokens`) | Third-party JWT, unexchanged | Retires | Disabled, then removed, once deprecation telemetry shows no use (item above) |
+| `POST /api/v1/auth/token` with `identity` | CI OIDC JWT for a typed project service account | Retires | Replaced by ServiceAccount `/token`; gated on every typed service account migrating and its traffic draining to zero (item below) |
+| `POST /api/v1/auth/token` without `identity` | External JWT matching a `ControllerTrustPolicy` | Retires | Duplicates Controller `/token`; removed once the remaining controllers (`rise-k8s-controller`, §5) use `/token`. With the row above gone, the endpoint is deleted |
+| Legacy session tokens (no `rise_uid`) | Session issued before User resolution | Retires | No longer minted; they lapse within one session lifetime and are refused by the resource API meanwhile |
+| Operator standing by email / IdP group (`auth.operator_users`, `auth.operator_idp_groups`) | — (configuration) | Retires | Replaced by `operatorIdentities` selectors (§1) |
+| ID-token exchange for sessions | Presented IdP ID token | Rejected | Would honor any ID token the IdP issues for Rise's client (cross-client trust, token exchange, multi-audience) with no PKCE/`state`/`nonce` binding, and provision Users from it. Reconsidered only behind an opt-in setting, off by default, with a single `aud`, `azp == client_id`, and the session capped at the ID token's expiry |
+
 ### Target convergence
 
-- [ ] Issue User sessions with canonical `sub` plus immutable `rise_uid`
+- [x] Issue User sessions with canonical `sub` plus immutable `rise_uid`
   after exact live, active `UserIdentity (issuer, subject)` and active parent
-  User resolution.
+  User resolution. Sessions carry `typ: rise-session+jwt` and are re-resolved
+  on every request.
 - [x] Move workload token exchange to each ServiceAccount or Controller `/token`
   subresource, introduced additively per kind: a resource-API-backed identity
   gains its `/token` route without touching any other, not-yet-migrated identity

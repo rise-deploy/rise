@@ -41,6 +41,23 @@ to the Rise API and UI. It is symmetric (HS256), signed with
 Lifetime is `server.jwt_expiry_seconds` (default 24h). Session tokens are an
 internal concern — they are never verified outside Rise.
 
+A session names the user's Rise `User` resource: its header `typ` is
+`rise-session+jwt`, `sub` is the canonical `user:<name>`, `rise_uid` is the
+User's UID, and `rise_identity_uid` is the `UserIdentity` the login came
+through. Every request re-resolves them:
+
+- `spec.active: false` on the User, or deleting it, ends every session issued
+  for it;
+- `spec.active: false` on one UserIdentity, or deleting it, ends the sessions
+  minted through that identity, and leaves the User's other logins alone.
+
+`email` stays in the token for the typed APIs. A session issued before this
+shape (default `typ`, the IdP's `sub`, no `rise_uid`) keeps working on the typed
+APIs until it expires, and ends early once any login has mapped its IdP `sub`
+and that identity or its User is disabled; the generic resource API refuses it
+with `401` — log in again. If the store cannot be reached to re-check a session,
+the request fails with `500` rather than logging the user out.
+
 ### Access (HS256) — token exchange
 
 A short-lived, Rise-issued token that encodes a **fully-resolved principal** (a
@@ -206,6 +223,31 @@ applying per-identity claim constraints.
 Interactive login federates to your IdP via `auth.issuer` / `auth.client_id` /
 `auth.client_secret` / `auth.scopes`. On success Rise mints a **Session** token
 (above). This is how operators wire Rise to Dex, Okta, Entra ID, Google, etc.
+
+Each login is resolved to a Rise `User` resource by the ID token's exact
+`(iss, sub)` pair, recorded in a `UserIdentity` child of the User (ADR-0001 §1):
+
+- **First login.** No live `UserIdentity` holds the pair, so Rise creates a new
+  `User` named `u-<ulid>` and its first `UserIdentity` in one transaction.
+  Concurrent first logins converge on one User. The new User holds no grants of
+  its own.
+- **Returning login.** The pair resolves to its User. Email never links
+  accounts: a different `sub` with the same email is a different User.
+- **Disabled.** An inactive `UserIdentity`, or an active one under an inactive
+  User, refuses the login (`403`); it is never treated as unknown. Deleting the
+  `UserIdentity` instead only unlinks it — the next login provisions a fresh
+  User with a new UID — so disable with `spec.active: false`.
+
+`auth.issuer` must be spelled exactly as the IdP stamps `iss` — with or
+without its trailing slash, as the IdP does — and otherwise canonical (lower-case
+host, no default port), or the server refuses to start. The IdP must issue a
+stable `sub`.
+
+There is deliberately no way to trade an ID token for a session outside these
+login flows: they receive the ID token from the IdP over the back channel,
+bound to the login by PKCE, `state`, and `nonce`, while an endpoint accepting
+presented ID tokens would honor any token the IdP issues for Rise's client,
+from any flow.
 
 ### Service accounts (CI/CD)
 

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE users SET resource_user_uid = NULL, updated_at = NOW()\n        WHERE resource_user_uid = $2 AND id <> $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5985c62bab3554660bde7974f5dc17ea70ccadae10a77d405a782d1e6abc5f9b"
+}

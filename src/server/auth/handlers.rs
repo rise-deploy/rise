@@ -5,6 +5,7 @@ use crate::server::auth::{
         generate_code_challenge, generate_code_verifier, generate_state_token,
         CompletedAuthSession, OAuth2State,
     },
+    user_identity::{LoginError, LoginProfile, ResolvedIdentity, TokenStanding},
 };
 use crate::server::frontend::load_auth_template;
 use crate::server::state::AppState;
@@ -15,6 +16,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use rise_backend_auth::SessionUser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::instrument;
@@ -337,6 +339,145 @@ async fn sync_groups_after_login(
     Ok(())
 }
 
+/// Why a validated upstream login did not produce a Rise session.
+#[derive(Debug)]
+enum LoginFailure {
+    /// The ID token has no `email`, which the typed APIs key users on.
+    MissingEmail,
+    /// The exact identity mapping, or its User, is inactive (ADR-0001 §1).
+    Disabled,
+    /// The upstream `sub` cannot be recorded as a `UserIdentity` subject.
+    InvalidSubject(String),
+    /// A database or signing failure; already logged.
+    Internal,
+}
+
+impl LoginFailure {
+    /// The status and message a login endpoint answers with.
+    fn response(&self) -> (StatusCode, String) {
+        match self {
+            Self::MissingEmail => (StatusCode::BAD_REQUEST, "Email claim missing".to_string()),
+            Self::Disabled => (
+                StatusCode::FORBIDDEN,
+                "This account is disabled. Contact your Rise administrator.".to_string(),
+            ),
+            Self::InvalidSubject(reason) => (StatusCode::UNAUTHORIZED, reason.clone()),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to process user".to_string(),
+            ),
+        }
+    }
+}
+
+/// The two identities a validated login resolves to.
+struct ResolvedLogin {
+    /// The typed-API user, found or created by email.
+    user: crate::db::User,
+    /// The live `User` resource and the `UserIdentity` the login came
+    /// through, found by exact `(issuer, subject)` or provisioned on first
+    /// sight (ADR-0001 §1).
+    identity: ResolvedIdentity,
+}
+
+/// Resolve an ID token already validated against `auth.issuer` to its typed
+/// user and its `User` resource.
+///
+/// An inactive mapping or User fails here, before anything is issued — the
+/// ingress flow included, since a disabled User may not log in anywhere.
+async fn resolve_login(
+    state: &AppState,
+    claims: &serde_json::Value,
+) -> Result<ResolvedLogin, LoginFailure> {
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .ok_or(LoginFailure::MissingEmail)?;
+    // `JwtValidator` verified the signature and `iss`; `sub` is required there
+    // too, so an absent one is a malformed token rather than an unknown user.
+    let subject = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LoginFailure::InvalidSubject("Subject claim missing".to_string()))?;
+
+    let profile = LoginProfile {
+        email: Some(email.to_string()),
+        display_name: claims
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    };
+    let identity = state
+        .user_logins
+        .resolve_or_provision(subject, &profile)
+        .await
+        .map_err(|error| match error {
+            LoginError::Inactive => {
+                tracing::warn!("Login refused: the identity or its User is inactive");
+                LoginFailure::Disabled
+            }
+            LoginError::InvalidSubject(reason) => {
+                tracing::warn!("Login refused: {reason}");
+                LoginFailure::InvalidSubject("Invalid subject claim".to_string())
+            }
+            LoginError::Store(error) => {
+                tracing::error!("Failed to resolve the login's User: {error:?}");
+                LoginFailure::Internal
+            }
+        })?;
+
+    // Paired with a default-Org membership in one transaction.
+    let user = users::find_or_create_with_default_organization(
+        &state.db_pool,
+        email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to find/create user: {:#}", e);
+        LoginFailure::Internal
+    })?;
+
+    // A cross-reference only: nothing authenticates through it, so losing a
+    // race for it must not fail the login.
+    let resource_uid = identity.principal.uid;
+    if let Err(e) = users::link_resource_user(&state.db_pool, user.id, resource_uid).await {
+        tracing::warn!(
+            user_id = %user.id,
+            resource_user_uid = %resource_uid,
+            "Failed to link the typed user to its User resource: {:?}",
+            e
+        );
+    }
+
+    Ok(ResolvedLogin { user, identity })
+}
+
+/// Issue the Rise session token for a resolved login.
+async fn issue_session(
+    state: &AppState,
+    claims: &serde_json::Value,
+    login: &ResolvedLogin,
+) -> Result<String, LoginFailure> {
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
+    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, login.user.id)
+        .await
+        .ok();
+    let session_user = SessionUser {
+        subject: login.identity.principal.subject().to_string(),
+        rise_uid: login.identity.principal.uid,
+        identity_uid: login.identity.identity_uid,
+    };
+    state
+        .jwt_signer
+        .sign_user_jwt(claims, &session_user, groups, &state.public_url, None)
+        .map_err(|e| {
+            tracing::error!("Failed to sign Rise JWT: {:#}", e);
+            LoginFailure::Internal
+        })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CodeExchangeRequest {
     pub code: String,
@@ -550,44 +691,13 @@ pub async fn code_exchange(
             (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
         })?;
 
-    // Extract email from claims
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Email claim missing".to_string()))?;
-
-    // Find or create user (paired with default-Org membership in one transaction)
-    let user = users::find_or_create_with_default_organization(
-        &state.db_pool,
-        email,
-        state.default_organization_uid,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to find/create user: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to process user".to_string(),
-        )
-    })?;
-
-    // Resolve the user's team memberships for the groups claim; on a DB error,
-    // fall back to no groups rather than failing the login.
-    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+    let login = resolve_login(&state, &claims)
         .await
-        .ok();
-
-    // Issue Rise JWT for user authentication (consumed by the CLI)
-    let rise_jwt = state
-        .jwt_signer
-        .sign_user_jwt(&claims, groups, &state.public_url, None)
-        .map_err(|e| {
-            tracing::error!("Failed to sign Rise JWT: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create token".to_string(),
-            )
-        })?;
+        .map_err(|failure| failure.response())?;
+    let rise_jwt = issue_session(&state, &claims, &login)
+        .await
+        .map_err(|failure| failure.response())?;
+    let user = login.user;
 
     tracing::info!(
         "CLI login successful for user {} - issued Rise JWT",
@@ -647,60 +757,29 @@ pub async fn device_exchange(
                 }
             };
 
-            // Extract email from claims
-            let email = match claims.get("email").and_then(|v| v.as_str()) {
-                Some(email) => email,
-                None => {
-                    tracing::error!("Email claim missing from ID token");
+            let issued = match resolve_login(&state, &claims).await {
+                Ok(login) => issue_session(&state, &claims, &login)
+                    .await
+                    .map(|jwt| (login.user, jwt)),
+                Err(failure) => Err(failure),
+            };
+            let (user, rise_jwt) = match issued {
+                Ok(issued) => issued,
+                Err(failure) => {
+                    let (error, description) = match &failure {
+                        LoginFailure::Internal => ("server_error", failure.response().1),
+                        LoginFailure::Disabled => ("access_denied", failure.response().1),
+                        LoginFailure::MissingEmail | LoginFailure::InvalidSubject(_) => {
+                            ("invalid_token", failure.response().1)
+                        }
+                    };
                     return Json(DeviceExchangeResponse {
                         token: None,
-                        error: Some("invalid_token".to_string()),
-                        error_description: Some("Email claim missing".to_string()),
+                        error: Some(error.to_string()),
+                        error_description: Some(description),
                     });
                 }
             };
-
-            // Find or create user (paired with default-Org membership in one transaction)
-            let user = match users::find_or_create_with_default_organization(
-                &state.db_pool,
-                email,
-                state.default_organization_uid,
-            )
-            .await
-            {
-                Ok(user) => user,
-                Err(e) => {
-                    tracing::error!("Failed to find/create user: {:#}", e);
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("server_error".to_string()),
-                        error_description: Some("Failed to process user".to_string()),
-                    });
-                }
-            };
-
-            // Resolve the user's team memberships for the groups claim; on a DB
-            // error, fall back to no groups rather than failing the login.
-            let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
-                .await
-                .ok();
-
-            // Issue Rise JWT for user authentication (consumed by the CLI)
-            let rise_jwt =
-                match state
-                    .jwt_signer
-                    .sign_user_jwt(&claims, groups, &state.public_url, None)
-                {
-                    Ok(jwt) => jwt,
-                    Err(e) => {
-                        tracing::error!("Failed to sign Rise JWT: {:#}", e);
-                        return Json(DeviceExchangeResponse {
-                            token: None,
-                            error: Some("server_error".to_string()),
-                            error_description: Some("Failed to create token".to_string()),
-                        });
-                    }
-                };
 
             tracing::info!(
                 "CLI device login successful for user {} - issued Rise JWT",
@@ -1178,27 +1257,12 @@ pub async fn oauth_callback(
             project
         );
 
-        // Get user email from claims
-        let user_email = claims["email"].as_str().ok_or_else(|| {
-            tracing::error!("No email in JWT claims");
-            (StatusCode::UNAUTHORIZED, "Invalid token claims".to_string())
-        })?;
-
-        // Find or create user to get user_id for team lookup (paired with
-        // default-Org membership in one transaction)
-        let user = users::find_or_create_with_default_organization(
-            &state.db_pool,
-            user_email,
-            state.default_organization_uid,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to find/create user: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
-        })?;
+        // A disabled User may not log in to an app either. The ingress token
+        // itself keeps its app-facing shape: the IdP's `sub`, no Rise UID.
+        let user = resolve_login(&state, &claims)
+            .await
+            .map_err(|failure| failure.response())?
+            .user;
 
         // Issue Rise JWT with user's team memberships
         // Use custom domain URL as audience when available, otherwise build from ingress template
@@ -1289,72 +1353,12 @@ pub async fn oauth_callback(
     // Regular OAuth flow (not ingress auth) - UI login
     tracing::info!("Using Rise JWT for UI session");
 
-    // Get claims from IdP token (use existing validation from earlier in the function)
-    let mut expected_claims = HashMap::new();
-    expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
-
-    let claims = state
-        .jwt_validator
-        .validate(
-            &token_info.id_token,
-            &state.auth_settings.issuer,
-            &expected_claims,
-        )
+    let login = resolve_login(&state, &claims)
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to validate ID token: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to validate token".to_string(),
-            )
-        })?;
-
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            tracing::error!("Email claim missing from ID token");
-            (
-                StatusCode::BAD_REQUEST,
-                "Email claim missing from token".to_string(),
-            )
-        })?;
-
-    // Find or create user (paired with default-Org membership in one transaction)
-    let user = users::find_or_create_with_default_organization(
-        &state.db_pool,
-        email,
-        state.default_organization_uid,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to find or create user: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to process user".to_string(),
-        )
-    })?;
-
-    // Sync groups after login
-    sync_groups_after_login(&state, &token_info.id_token).await?;
-
-    // Resolve the user's team memberships for the groups claim; on a DB error,
-    // fall back to no groups rather than failing the login.
-    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+        .map_err(|failure| failure.response())?;
+    let rise_jwt = issue_session(&state, &claims, &login)
         .await
-        .ok();
-
-    // Issue Rise HS256 JWT for user authentication (consumed by the UI)
-    let rise_jwt = state
-        .jwt_signer
-        .sign_user_jwt(&claims, groups, &state.public_url, None)
-        .map_err(|e| {
-            tracing::error!("Failed to sign user JWT: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create authentication token".to_string(),
-            )
-        })?;
+        .map_err(|failure| failure.response())?;
 
     let cookie = cookie_helpers::create_rise_jwt_cookie(&rise_jwt, &state.cookie_settings, max_age);
 
@@ -1732,6 +1736,32 @@ pub async fn ingress_auth(
             return Ok(unauthenticated("Invalid or expired session"));
         }
     };
+
+    // A disabled User or identity loses app access with every other token: a
+    // session re-resolves its User and minting identity, and an ingress token
+    // — which keeps the IdP's `sub` — is checked against that identity's
+    // mapping.
+    let uids = ingress_claims
+        .rise_uid
+        .zip(ingress_claims.rise_identity_uid);
+    match state
+        .user_logins
+        .check_token(&ingress_claims.sub, uids)
+        .await
+    {
+        Ok(TokenStanding::Active(_)) => {}
+        Ok(TokenStanding::Rejected(rejection)) => {
+            tracing::warn!("Ingress token rejected: {rejection}");
+            return Ok(unauthenticated("Invalid or expired session"));
+        }
+        Err(error) => {
+            tracing::error!("Failed to re-resolve the ingress token's User: {error:?}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            ));
+        }
+    }
 
     let email = ingress_claims.email;
 
