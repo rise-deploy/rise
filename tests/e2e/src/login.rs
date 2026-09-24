@@ -47,10 +47,17 @@ pub fn login(api_base: &str, dex: &DexEndpoint, username: &str, password: &str) 
     let authorization_url = authorize["authorization_url"]
         .as_str()
         .context("authorize response has no authorization_url")?;
-    let expected_state =
-        query_param(authorization_url, "state")?.context("authorization URL carries no state")?;
+    // The CLI flow is bound by PKCE and carries no `state` of its own; when
+    // one is present, the callback must echo it.
+    let expected_state = query_param(authorization_url, "state")?;
 
-    let code = run_dex_login(dex, authorization_url, &expected_state, username, password)?;
+    let code = run_dex_login(
+        dex,
+        authorization_url,
+        expected_state.as_deref(),
+        username,
+        password,
+    )?;
 
     let exchanged = crate::http::post_json(
         &format!("{api_base}/api/v1/auth/code/exchange"),
@@ -79,7 +86,7 @@ pub fn login(api_base: &str, dex: &DexEndpoint, username: &str, password: &str) 
 fn run_dex_login(
     dex: &DexEndpoint,
     authorization_url: &str,
-    expected_state: &str,
+    expected_state: Option<&str>,
     username: &str,
     password: &str,
 ) -> Result<String> {
@@ -194,14 +201,14 @@ fn query_param(url: &str, name: &str) -> Result<Option<String>> {
 }
 
 /// The code from the final redirect, after checking it answers this login.
-fn code_from_callback(callback: &str, expected_state: &str) -> Result<String> {
+fn code_from_callback(callback: &str, expected_state: Option<&str>) -> Result<String> {
     if let Some(error) = query_param(callback, "error")? {
         anyhow::bail!("Dex refused the login: {error}");
     }
     let state = query_param(callback, "state")?;
     anyhow::ensure!(
-        state.as_deref() == Some(expected_state),
-        "callback state {state:?} does not match the authorize request"
+        state.as_deref() == expected_state,
+        "callback state {state:?} does not match the authorize request ({expected_state:?})"
     );
     query_param(callback, "code")?.context("callback carries no code")
 }
@@ -335,9 +342,18 @@ mod tests {
     #[test]
     fn the_callback_must_answer_this_login() {
         let ok = "http://localhost:8765/callback?code=the-code&state=s1";
-        assert_eq!(code_from_callback(ok, "s1").unwrap(), "the-code");
-        assert!(code_from_callback(ok, "s2").is_err());
+        assert_eq!(code_from_callback(ok, Some("s1")).unwrap(), "the-code");
+        assert!(code_from_callback(ok, Some("s2")).is_err());
+        assert!(
+            code_from_callback(ok, None).is_err(),
+            "an unrequested state"
+        );
         let refused = "http://localhost:8765/callback?error=access_denied&state=s1";
-        assert!(code_from_callback(refused, "s1").is_err());
+        assert!(code_from_callback(refused, Some("s1")).is_err());
+
+        // Rise's CLI flow is bound by PKCE and sends no state.
+        let stateless = "http://localhost:8765/callback?code=the-code";
+        assert_eq!(code_from_callback(stateless, None).unwrap(), "the-code");
+        assert!(code_from_callback(stateless, Some("s1")).is_err());
     }
 }
