@@ -42,13 +42,21 @@ Lifetime is `server.jwt_expiry_seconds` (default 24h). Session tokens are an
 internal concern — they are never verified outside Rise.
 
 A session names the user's Rise `User` resource: its header `typ` is
-`rise-session+jwt`, `sub` is the canonical `user:<name>`, and `rise_uid` is the
-User's UID. Every request re-resolves that pair to one live, active User, so
-setting `spec.active: false` on the User — or deleting it — ends every session
-already issued for it. `email` stays in the token for the typed APIs. A session
-issued before this shape (default `typ`, the IdP's `sub`, no `rise_uid`) keeps
-working on the typed APIs until it expires, but the generic resource API refuses
-it with `401`; log in again.
+`rise-session+jwt`, `sub` is the canonical `user:<name>`, `rise_uid` is the
+User's UID, and `rise_identity_uid` is the `UserIdentity` the login came
+through. Every request re-resolves them:
+
+- `spec.active: false` on the User, or deleting it, ends every session issued
+  for it;
+- `spec.active: false` on one UserIdentity, or deleting it, ends the sessions
+  minted through that identity, and leaves the User's other logins alone.
+
+`email` stays in the token for the typed APIs. A session issued before this
+shape (default `typ`, the IdP's `sub`, no `rise_uid`) keeps working on the typed
+APIs until it expires, and ends early once any login has mapped its IdP `sub`
+and that identity or its User is disabled; the generic resource API refuses it
+with `401` — log in again. If the store cannot be reached to re-check a session,
+the request fails with `500` rather than logging the user out.
 
 ### Access (HS256) — token exchange
 

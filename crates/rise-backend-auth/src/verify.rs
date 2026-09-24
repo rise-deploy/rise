@@ -58,7 +58,8 @@ impl RiseTokenSigner {
     ///   Legacy session and ingress tokens carry the default `"JWT"`, so the
     ///   special `typ`s are matched *exclusively*.
     ///
-    /// `rise_uid` is bound to the session `typ` in both directions: a token
+    /// `rise_uid` and `rise_identity_uid` are bound to the session `typ` in
+    /// both directions: a token
     /// without the `typ` that carries one, or an ingress token carrying one, is
     /// not something Rise mints and is refused.
     ///
@@ -96,7 +97,9 @@ impl RiseTokenSigner {
                     let claims =
                         decode::<RiseClaims>(token, self.hs256_decoding_key(), &validation)?.claims;
                     let typed = header.typ.as_deref() == Some(RISE_SESSION_TYP);
-                    if typed != claims.rise_uid.is_some() {
+                    if typed != claims.rise_uid.is_some()
+                        || typed != claims.rise_identity_uid.is_some()
+                    {
                         return Err(invalid_shape());
                     }
                     Ok(RiseToken::Session(claims))
@@ -119,7 +122,7 @@ impl RiseTokenSigner {
                 }
                 let claims =
                     decode::<RiseClaims>(token, self.rs256_decoding_key(), &validation)?.claims;
-                if claims.rise_uid.is_some() {
+                if claims.rise_uid.is_some() || claims.rise_identity_uid.is_some() {
                     return Err(invalid_shape());
                 }
                 Ok(RiseToken::Ingress(claims))
@@ -218,6 +221,7 @@ mod tests {
             iss: "https://rise.test".to_string(),
             aud: "https://myapp.apps.rise.dev".to_string(),
             rise_uid: None,
+            rise_identity_uid: None,
         };
         let token = signer
             .sign_ingress_jwt(
@@ -255,6 +259,7 @@ mod tests {
             RiseToken::Session(c) => {
                 assert_eq!(c.sub, session_user().subject);
                 assert_eq!(c.rise_uid, Some(session_user().rise_uid));
+                assert_eq!(c.rise_identity_uid, Some(session_user().identity_uid));
                 assert_eq!(c.email, "user@example.com");
                 assert_eq!(c.aud, "https://rise.test");
             }
@@ -340,6 +345,7 @@ mod tests {
             iss: "https://rise.test".to_string(),
             aud: "https://rise.test".to_string(),
             rise_uid: None,
+            rise_identity_uid: None,
         };
         let token = signer
             .sign_ingress_jwt(
@@ -392,6 +398,7 @@ mod tests {
             iss: "https://rise.test".to_string(),
             aud: "https://rise.test".to_string(),
             rise_uid: None,
+            rise_identity_uid: None,
         }
     }
 
@@ -399,6 +406,7 @@ mod tests {
         crate::SessionUser {
             subject: "user:u-01jz0000000000000000000000".to_string(),
             rise_uid: uuid::Uuid::from_u128(7),
+            identity_uid: uuid::Uuid::from_u128(8),
         }
     }
 
@@ -597,7 +605,16 @@ mod tests {
         let key = hs256_key();
         let mut with_uid = serde_json::to_value(session_claims()).unwrap();
         with_uid["rise_uid"] = serde_json::json!(uuid::Uuid::new_v4());
+        with_uid["rise_identity_uid"] = serde_json::json!(uuid::Uuid::new_v4());
         let without_uid = serde_json::to_value(session_claims()).unwrap();
+        // Half the pair is as malformed as none of it.
+        let mut user_only = with_uid.clone();
+        user_only
+            .as_object_mut()
+            .unwrap()
+            .remove("rise_identity_uid");
+        let mut identity_only = with_uid.clone();
+        identity_only.as_object_mut().unwrap().remove("rise_uid");
         let encode_hs256 = |typ: Option<&str>, claims: &serde_json::Value| {
             let mut header = Header::new(Algorithm::HS256);
             header.typ = typ.map(str::to_string);
@@ -610,9 +627,15 @@ mod tests {
         assert!(signer.verify_rise_jwt(&untyped_with_uid).is_err());
         assert!(signer.verify_jwt_skip_aud(&untyped_with_uid).is_err());
 
-        // The session typ without `rise_uid` is refused the same way.
-        let typed_without_uid = encode_hs256(Some(crate::RISE_SESSION_TYP), &without_uid);
-        assert!(signer.verify_rise_jwt(&typed_without_uid).is_err());
+        // The session typ without the pair is refused the same way.
+        for claims in [&without_uid, &user_only, &identity_only] {
+            let typed = encode_hs256(Some(crate::RISE_SESSION_TYP), claims);
+            assert!(signer.verify_rise_jwt(&typed).is_err(), "{claims}");
+            let untyped = encode_hs256(None, claims);
+            if claims != &without_uid {
+                assert!(signer.verify_rise_jwt(&untyped).is_err(), "{claims}");
+            }
+        }
 
         // The matching pair is a session, including on the ingress path, which
         // accepts a user's session cookie as well as an app-scoped token.
@@ -643,6 +666,7 @@ mod tests {
             RiseToken::Ingress(claims) => {
                 assert_eq!(claims.sub, "idp-sub");
                 assert_eq!(claims.rise_uid, None);
+                assert_eq!(claims.rise_identity_uid, None);
             }
             other => panic!("expected Ingress, got {other:?}"),
         }
@@ -830,6 +854,7 @@ mod tests {
             iss: "https://rise.test".to_string(),
             aud: "https://rise.test".to_string(),
             rise_uid: None,
+            rise_identity_uid: None,
         };
         let header = Header::new(Algorithm::HS384);
         // Sign with the wrong alg using a throwaway secret; verify must fail.

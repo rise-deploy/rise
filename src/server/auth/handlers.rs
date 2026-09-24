@@ -5,7 +5,7 @@ use crate::server::auth::{
         generate_code_challenge, generate_code_verifier, generate_state_token,
         CompletedAuthSession, OAuth2State,
     },
-    user_identity::{LoginError, LoginProfile, SessionRejection, UserPrincipal},
+    user_identity::{LoginError, LoginProfile, ResolvedIdentity, TokenStanding},
 };
 use crate::server::frontend::load_auth_template;
 use crate::server::state::AppState;
@@ -374,9 +374,10 @@ impl LoginFailure {
 struct ResolvedLogin {
     /// The typed-API user, found or created by email.
     user: crate::db::User,
-    /// The live `User` resource, found by exact `(issuer, subject)` or
-    /// provisioned on first sight (ADR-0001 §1).
-    principal: UserPrincipal,
+    /// The live `User` resource and the `UserIdentity` the login came
+    /// through, found by exact `(issuer, subject)` or provisioned on first
+    /// sight (ADR-0001 §1).
+    identity: ResolvedIdentity,
 }
 
 /// Resolve an ID token already validated against `auth.issuer` to its typed
@@ -406,7 +407,7 @@ async fn resolve_login(
             .and_then(|v| v.as_str())
             .map(str::to_string),
     };
-    let principal = state
+    let identity = state
         .user_logins
         .resolve_or_provision(subject, &profile)
         .await
@@ -439,16 +440,17 @@ async fn resolve_login(
 
     // A cross-reference only: nothing authenticates through it, so losing a
     // race for it must not fail the login.
-    if let Err(e) = users::link_resource_user(&state.db_pool, user.id, principal.uid).await {
+    let resource_uid = identity.principal.uid;
+    if let Err(e) = users::link_resource_user(&state.db_pool, user.id, resource_uid).await {
         tracing::warn!(
             user_id = %user.id,
-            resource_user_uid = %principal.uid,
+            resource_user_uid = %resource_uid,
             "Failed to link the typed user to its User resource: {:?}",
             e
         );
     }
 
-    Ok(ResolvedLogin { user, principal })
+    Ok(ResolvedLogin { user, identity })
 }
 
 /// Issue the Rise session token for a resolved login.
@@ -463,8 +465,9 @@ async fn issue_session(
         .await
         .ok();
     let session_user = SessionUser {
-        subject: login.principal.subject().to_string(),
-        rise_uid: login.principal.uid,
+        subject: login.identity.principal.subject().to_string(),
+        rise_uid: login.identity.principal.uid,
+        identity_uid: login.identity.identity_uid,
     };
     state
         .jwt_signer
@@ -1734,32 +1737,23 @@ pub async fn ingress_auth(
         }
     };
 
-    // A disabled User loses app access with every other token: a session
-    // re-resolves its `(sub, rise_uid)`, and an ingress token — which keeps
-    // the IdP's `sub` — is checked against that identity's mapping.
-    let still_active = match ingress_claims.rise_uid {
-        Some(rise_uid) => match state
-            .user_logins
-            .resolve_session(&ingress_claims.sub, rise_uid)
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(SessionRejection::Store(error)) => Err(error),
-            Err(rejection) => {
-                tracing::warn!("Ingress session rejected: {rejection}");
-                Ok(false)
-            }
-        },
-        None => {
-            state
-                .user_logins
-                .external_subject_active(&ingress_claims.sub)
-                .await
+    // A disabled User or identity loses app access with every other token: a
+    // session re-resolves its User and minting identity, and an ingress token
+    // — which keeps the IdP's `sub` — is checked against that identity's
+    // mapping.
+    let uids = ingress_claims
+        .rise_uid
+        .zip(ingress_claims.rise_identity_uid);
+    match state
+        .user_logins
+        .check_token(&ingress_claims.sub, uids)
+        .await
+    {
+        Ok(TokenStanding::Active(_)) => {}
+        Ok(TokenStanding::Rejected(rejection)) => {
+            tracing::warn!("Ingress token rejected: {rejection}");
+            return Ok(unauthenticated("Invalid or expired session"));
         }
-    };
-    match still_active {
-        Ok(true) => {}
-        Ok(false) => return Ok(unauthenticated("Invalid or expired session")),
         Err(error) => {
             tracing::error!("Failed to re-resolve the ingress token's User: {error:?}");
             return Err((

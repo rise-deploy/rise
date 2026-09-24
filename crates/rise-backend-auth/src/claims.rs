@@ -39,6 +39,11 @@ pub struct RiseClaims {
     /// verifier rejects it on any other shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rise_uid: Option<uuid::Uuid>,
+    /// The UID of the `UserIdentity` whose login minted this session. Present
+    /// exactly when `rise_uid` is: deactivating or deleting that identity ends
+    /// the sessions it minted, and only those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_identity_uid: Option<uuid::Uuid>,
 }
 
 impl std::fmt::Debug for RiseClaims {
@@ -53,6 +58,7 @@ impl std::fmt::Debug for RiseClaims {
             .field("iss", &self.iss)
             .field("aud", &self.aud)
             .field("rise_uid", &self.rise_uid)
+            .field("rise_identity_uid", &self.rise_identity_uid)
             .finish()
     }
 }

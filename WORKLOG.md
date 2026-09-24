@@ -1941,10 +1941,15 @@ idempotent when a read-modify-write client replays the stored spec.
     concurrent first logins converge on one User; a deleted mapping lets the
     next login provision a fresh User UID; a shared email never links two
     subjects.
-  - Sessions carry `typ: rise-session+jwt`, `sub = user:<name>`, and
-    `rise_uid`, and are re-resolved on every request: a deactivated, deleted,
-    or same-name-recreated User fails every session issued for it, on the
-    typed APIs as well. `rise_uid` is admitted only with the session `typ`.
+  - Sessions carry `typ: rise-session+jwt`, `sub = user:<name>`, `rise_uid`,
+    and `rise_identity_uid`, and are re-resolved on every request: a
+    deactivated, deleted, or same-name-recreated User fails every session
+    issued for it, on the typed APIs as well, and a deactivated or deleted
+    UserIdentity fails the sessions minted through it and no others. Both
+    UIDs are admitted only with the session `typ`.
+  - Legacy sessions and app-ingress tokens, which carry the IdP `sub`, are
+    re-checked through that identity's mapping; a store failure while
+    re-checking any token is a `500`, never a `401`.
   - The resource API principal is `user:<name>` with the User resource's UID;
     a legacy session (no `rise_uid`) keeps the typed APIs and gets `401` from
     the resource API. Delegated `/token` issuance records the User resource
@@ -1980,6 +1985,14 @@ idempotent when a read-modify-write client replays the stored spec.
   - Legacy sessions are not rejected wholesale, so the upgrade does not log
     every user out of the typed APIs; they cannot reach the resource API
     because nothing ties them to a User.
+  - A session records the identity it was minted through, so switching off
+    one UserIdentity ends exactly the sessions that identity produced: the
+    ADR forbids ending the User's other logins, and without the claim the
+    only enforceable choices were "none" or "all".
+  - One `UserLogins::check_token` decides liveness for every Rise-issued User
+    token — the API middleware, the optional middleware, and ingress auth all
+    call it — so the three paths cannot drift apart on which shapes are
+    checked or how a store failure is answered.
   - Group sync still runs before resolution, so the session's `groups` claim
     is current; the duplicate second sync in the UI callback is gone.
   - ULIDs are generated in-crate (48-bit ms timestamp + 80 random bits,

@@ -47,8 +47,11 @@ Merged to `develop`:
     the server refuses to start. The same rule now admits trailing-slash
     issuers in `ServiceAccountTrustPolicy` / `ControllerTrustPolicy`.
   - **Disable a user with `spec.active: false`** on their `User` (every login
-    and session ends) or on one `UserIdentity` (that login only). Deleting a
-    `UserIdentity` merely unlinks it; the next login provisions a new User.
+    and session ends) or on one `UserIdentity` (that login and the sessions
+    it minted). Deleting a `UserIdentity` ends its sessions too but merely
+    unlinks it: the next login through it provisions a new User. A session
+    from before the upgrade ends early too, once a login has mapped its IdP
+    `sub`.
   - Migration `20260922000001` adds `users.resource_user_uid`, linking each
     typed user to the `User` resource it last logged in as.
   - Operator standing is unchanged: still `auth.operator_users` /

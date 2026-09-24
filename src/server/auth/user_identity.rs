@@ -2,9 +2,11 @@
 //!
 //! A validated upstream login is resolved through its exact `UserIdentity
 //! (issuer, subject)` mapping to the parent `User` resource, and the session
-//! Rise issues names that User by canonical subject plus UID. Every later
-//! request re-resolves the pair, so deactivating or deleting the User ends
-//! every session already issued for it.
+//! Rise issues names that User by canonical subject plus UID, and records the
+//! identity it was minted through. Every later request re-resolves them, so
+//! deactivating or deleting the User ends every session already issued for
+//! it, and deactivating or deleting one identity ends the sessions minted
+//! through that identity.
 //!
 //! **JIT provisioning is the configuration-rooted exception to grant-gated
 //! identity linking.** A login whose pair has no live mapping creates a fresh
@@ -51,6 +53,25 @@ impl UserPrincipal {
     }
 }
 
+/// What a login resolved to: the User, and the `UserIdentity` it came
+/// through. A session records both, so deactivating that one identity ends
+/// the sessions it minted without touching the User's other logins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIdentity {
+    pub principal: UserPrincipal,
+    pub identity_uid: Uuid,
+}
+
+/// Whether a Rise-issued User token still authenticates.
+#[derive(Debug)]
+pub enum TokenStanding {
+    /// It does. A session names its User resource; a token carrying the IdP's
+    /// `sub` (legacy session, app-ingress token) names none.
+    Active(Option<UserPrincipal>),
+    /// It no longer does: its User or identity is inactive, gone, or replaced.
+    Rejected(SessionRejection),
+}
+
 /// Non-authoritative presentation data a login supplies for a new User.
 #[derive(Debug, Default, Clone)]
 pub struct LoginProfile {
@@ -82,6 +103,10 @@ pub enum SessionRejection {
     NameMismatch,
     #[error("the User is inactive")]
     Inactive,
+    #[error("no live UserIdentity of this User carries the session's identity UID")]
+    IdentityUnknown,
+    #[error("the UserIdentity the session was minted through is inactive")]
+    IdentityInactive,
     #[error("identity store error: {0}")]
     Store(#[from] StoreError),
 }
@@ -119,24 +144,24 @@ impl UserLogins {
         &self,
         subject: &str,
         profile: &LoginProfile,
-    ) -> Result<UserPrincipal, LoginError> {
+    ) -> Result<ResolvedIdentity, LoginError> {
         let subject = ExternalSubject::new(subject)
             .map_err(|error| LoginError::InvalidSubject(error.to_string()))?;
 
         // The common case — a returning user — needs no transaction.
-        if let Some(principal) = IdentityLookup::new(self.pool.clone())
+        if let Some(resolved) = IdentityLookup::new(self.pool.clone())
             .by_external_identity(&self.issuer, &subject)
             .await
             .map_err(LoginError::Store)
             .and_then(|fact| fact.map(admit).transpose())?
         {
-            return Ok(principal);
+            return Ok(resolved);
         }
 
         let mut attempt = 1;
         loop {
             match self.provision_once(&subject, profile).await {
-                Ok(principal) => return Ok(principal),
+                Ok(resolved) => return Ok(resolved),
                 // A concurrent first login for the same pair won the unique
                 // mapping index (or the transaction lost the serialization
                 // race over it): the next attempt reads the winner's mapping.
@@ -152,7 +177,7 @@ impl UserLogins {
         &self,
         subject: &ExternalSubject,
         profile: &LoginProfile,
-    ) -> Result<UserPrincipal, LoginError> {
+    ) -> Result<ResolvedIdentity, LoginError> {
         let tx = SerializableTransaction::begin(&self.pool).await?;
         let store = self.store.in_session(tx.session());
 
@@ -179,7 +204,7 @@ impl UserLogins {
                 ..Default::default()
             })
             .await?;
-        store
+        let identity = store
             .create(CreateResourceParams {
                 api_version: API_VERSION_V1ALPHA1.to_string(),
                 kind: USER_IDENTITY_KIND.to_string(),
@@ -201,23 +226,29 @@ impl UserLogins {
             issuer = %self.issuer.as_str(),
             "Provisioned a User for a first login"
         );
-        Ok(UserPrincipal {
-            name: user.name,
-            uid: user.uid,
+        Ok(ResolvedIdentity {
+            principal: UserPrincipal {
+                name: user.name,
+                uid: user.uid,
+            },
+            identity_uid: identity.uid,
         })
     }
 
-    /// Re-resolve a session's `(sub, rise_uid)` to the live, active User it
-    /// was issued for.
+    /// Re-resolve a session's `(sub, rise_uid, rise_identity_uid)` to the
+    /// live, active User it was issued for and the live, active identity it
+    /// was minted through.
     ///
-    /// Both halves must name the same resource: a User deleted and recreated
-    /// under the same name has a new UID, so sessions issued for the old one
-    /// never revive. An inactive UserIdentity does not end the session — only
-    /// the User's own `active` flag does (ADR-0001 §1).
+    /// The subject and UID must name the same resource: a User deleted and
+    /// recreated under the same name has a new UID, so sessions issued for
+    /// the old one never revive. The identity must still be a live child of
+    /// that User: deactivating or deleting it ends the sessions it minted, and
+    /// only those — the User's other identities keep theirs (ADR-0001 §1).
     pub async fn resolve_session(
         &self,
         subject: &str,
         rise_uid: Uuid,
+        identity_uid: Uuid,
     ) -> Result<UserPrincipal, SessionRejection> {
         let subject: SubjectId = subject.parse().map_err(|_| SessionRejection::NotAUser)?;
         if subject.kind() != "user" {
@@ -232,19 +263,53 @@ impl UserLogins {
         if row.name != subject.name() {
             return Err(SessionRejection::NameMismatch);
         }
-        let spec: UserSpec = serde_json::from_value(row.spec).map_err(|error| {
-            StoreError::backend(std::io::Error::other(format!(
-                "stored User '{}' is not valid: {error}",
-                row.name
-            )))
-        })?;
+        let spec: UserSpec = parse_spec(&row)?;
         if !spec.active {
             return Err(SessionRejection::Inactive);
+        }
+
+        let identity = self
+            .store
+            .get(identity_uid)
+            .await?
+            .filter(|identity| is_live_identity_of(identity, row.uid))
+            .ok_or(SessionRejection::IdentityUnknown)?;
+        let identity_spec: UserIdentitySpec = parse_spec(&identity)?;
+        if !identity_spec.active {
+            return Err(SessionRejection::IdentityInactive);
         }
         Ok(UserPrincipal {
             name: row.name,
             uid: row.uid,
         })
+    }
+
+    /// Whether a Rise-issued User token still authenticates, for every token
+    /// shape: a session names its User and identity by UID, while a legacy
+    /// session or an app-ingress token carries the IdP's `sub` and is checked
+    /// through that identity's mapping.
+    ///
+    /// `Err` is a store failure, not a verdict — callers answer it as a server
+    /// error rather than logging the user out.
+    pub async fn check_token(
+        &self,
+        subject: &str,
+        uids: Option<(Uuid, Uuid)>,
+    ) -> Result<TokenStanding, StoreError> {
+        match uids {
+            Some((rise_uid, identity_uid)) => {
+                match self.resolve_session(subject, rise_uid, identity_uid).await {
+                    Ok(principal) => Ok(TokenStanding::Active(Some(principal))),
+                    Err(SessionRejection::Store(error)) => Err(error),
+                    Err(rejection) => Ok(TokenStanding::Rejected(rejection)),
+                }
+            }
+            None => Ok(if self.external_subject_active(subject).await? {
+                TokenStanding::Active(None)
+            } else {
+                TokenStanding::Rejected(SessionRejection::Inactive)
+            }),
+        }
     }
 }
 
@@ -271,14 +336,34 @@ impl UserLogins {
 /// A found mapping authenticates only while both it and its User are active.
 fn admit(
     fact: rise_resource_store_postgres::UserIdentityFact,
-) -> Result<UserPrincipal, LoginError> {
+) -> Result<ResolvedIdentity, LoginError> {
     if !fact.identity.active || !fact.user.active {
         return Err(LoginError::Inactive);
     }
-    Ok(UserPrincipal {
-        name: fact.user_name,
-        uid: fact.user_uid,
+    Ok(ResolvedIdentity {
+        principal: UserPrincipal {
+            name: fact.user_name,
+            uid: fact.user_uid,
+        },
+        identity_uid: fact.identity_uid,
     })
+}
+
+/// A stored spec that will not parse is corrupt data, not an inactive row.
+fn parse_spec<T: serde::de::DeserializeOwned>(row: &ResourceRow) -> Result<T, StoreError> {
+    serde_json::from_value(row.spec.clone()).map_err(|error| {
+        StoreError::backend(std::io::Error::other(format!(
+            "stored {} '{}' is not valid: {error}",
+            row.kind, row.name
+        )))
+    })
+}
+
+fn is_live_identity_of(row: &ResourceRow, user_uid: Uuid) -> bool {
+    row.api_version.split('/').next() == Some("rise.dev")
+        && row.kind == USER_IDENTITY_KIND
+        && row.parent_uid == Some(user_uid)
+        && row.deletion_timestamp.is_none()
 }
 
 fn is_live_user(row: &ResourceRow) -> bool {
@@ -420,14 +505,46 @@ mod tests {
         assert_eq!(logins.issuer.as_str(), "https://tenant.auth0.example/");
     }
 
+    /// A second identity under `user`, as a governed linking flow would add.
+    async fn link_identity(logins: &UserLogins, user: &UserPrincipal, subject: &str) -> Uuid {
+        logins
+            .store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: USER_IDENTITY_KIND.to_string(),
+                name: generated_name("id"),
+                parent_uid: Some(user.uid),
+                spec: serde_json::json!({"issuer": ISSUER, "subject": subject}),
+                ..Default::default()
+            })
+            .await
+            .expect("link a second identity")
+            .uid
+    }
+
+    /// Re-resolve the session a login would have minted.
+    async fn session_of(
+        logins: &UserLogins,
+        login: &ResolvedIdentity,
+    ) -> Result<UserPrincipal, SessionRejection> {
+        logins
+            .resolve_session(
+                login.principal.subject().as_ref(),
+                login.principal.uid,
+                login.identity_uid,
+            )
+            .await
+    }
+
     /// ADR-0001 scenario 10
     #[sqlx::test]
     async fn a_first_login_provisions_a_user_and_its_identity(pool: PgPool) {
         let logins = logins(&pool).await;
-        let user = logins
+        let login = logins
             .resolve_or_provision("subject-1", &profile("ada@example.com"))
             .await
             .expect("a first login provisions");
+        let user = &login.principal;
         assert!(user.name.starts_with("u-"), "{}", user.name);
 
         let row = logins.store.get(user.uid).await.unwrap().expect("the User");
@@ -439,20 +556,22 @@ mod tests {
         assert_eq!(spec.primary_email.as_deref(), Some("ada@example.com"));
         assert_eq!(spec.display_name.as_deref(), Some("Ada"));
 
-        let rows = identities(&logins, &user).await;
+        let rows = identities(&logins, user).await;
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].uid, login.identity_uid);
         let identity: UserIdentitySpec = serde_json::from_value(rows[0].spec.clone()).unwrap();
         assert_eq!(identity.issuer.as_str(), ISSUER);
         assert_eq!(identity.subject.as_str(), "subject-1");
         assert!(identity.active);
 
-        // A returning login resolves to the same User and provisions nothing.
+        // A returning login resolves to the same User and identity, and
+        // provisions nothing.
         let again = logins
             .resolve_or_provision("subject-1", &profile("renamed@example.com"))
             .await
             .unwrap();
-        assert_eq!(again, user);
-        assert_eq!(identities(&logins, &user).await.len(), 1);
+        assert_eq!(again, login);
+        assert_eq!(identities(&logins, user).await.len(), 1);
     }
 
     /// ADR-0001 scenario 10
@@ -467,16 +586,16 @@ mod tests {
                     .await
             })
         });
-        let users: Vec<UserPrincipal> = futures::future::join_all(attempts)
+        let resolved: Vec<ResolvedIdentity> = futures::future::join_all(attempts)
             .await
             .into_iter()
             .map(|joined| joined.expect("task").expect("every attempt resolves"))
             .collect();
         assert!(
-            users.iter().all(|user| user == &users[0]),
-            "every concurrent login resolves to one User: {users:?}"
+            resolved.iter().all(|login| login == &resolved[0]),
+            "every concurrent login resolves to one User and identity: {resolved:?}"
         );
-        assert_eq!(identities(&logins, &users[0]).await.len(), 1);
+        assert_eq!(identities(&logins, &resolved[0].principal).await.len(), 1);
         let mapped = IdentityLookup::new(pool.clone())
             .by_external_identity(
                 &Issuer::new(ISSUER).unwrap(),
@@ -485,7 +604,8 @@ mod tests {
             .await
             .unwrap()
             .expect("the winning mapping");
-        assert_eq!(mapped.user_uid, users[0].uid);
+        assert_eq!(mapped.user_uid, resolved[0].principal.uid);
+        assert_eq!(mapped.identity_uid, resolved[0].identity_uid);
     }
 
     /// ADR-0001 scenario 9
@@ -493,30 +613,21 @@ mod tests {
     #[sqlx::test]
     async fn an_inactive_mapping_or_user_is_refused_and_never_reprovisioned(pool: PgPool) {
         let logins = logins(&pool).await;
-        let user = logins
+        let login = logins
             .resolve_or_provision("subject-1", &profile("ada@example.com"))
             .await
             .unwrap();
-        let identity = identities(&logins, &user).await.remove(0);
 
-        set_active(&logins, identity.uid, false).await;
+        set_active(&logins, login.identity_uid, false).await;
         assert!(matches!(
             logins
                 .resolve_or_provision("subject-1", &profile("ada@example.com"))
                 .await,
             Err(LoginError::Inactive)
         ));
-        // An inactive identity does not end the User's sessions.
-        assert_eq!(
-            logins
-                .resolve_session(user.subject().as_ref(), user.uid)
-                .await
-                .unwrap(),
-            user
-        );
 
-        set_active(&logins, identity.uid, true).await;
-        set_active(&logins, user.uid, false).await;
+        set_active(&logins, login.identity_uid, true).await;
+        set_active(&logins, login.principal.uid, false).await;
         assert!(matches!(
             logins
                 .resolve_or_provision("subject-1", &profile("ada@example.com"))
@@ -525,9 +636,7 @@ mod tests {
         ));
         // An inactive User fails every session already issued for it.
         assert!(matches!(
-            logins
-                .resolve_session(user.subject().as_ref(), user.uid)
-                .await,
+            session_of(&logins, &login).await,
             Err(SessionRejection::Inactive)
         ));
 
@@ -541,6 +650,64 @@ mod tests {
     }
 
     /// ADR-0001 scenario 10
+    ///
+    /// A session is bound to the identity whose login minted it: switching
+    /// that identity off, or deleting it, ends those sessions, while sessions
+    /// minted through the User's other identities carry on.
+    #[sqlx::test]
+    async fn a_session_ends_with_the_identity_that_minted_it(pool: PgPool) {
+        let logins = logins(&pool).await;
+        let first = logins
+            .resolve_or_provision("subject-1", &profile("ada@example.com"))
+            .await
+            .unwrap();
+        link_identity(&logins, &first.principal, "subject-2").await;
+        let second = logins
+            .resolve_or_provision("subject-2", &profile("ada@example.com"))
+            .await
+            .unwrap();
+        assert_eq!(second.principal, first.principal, "one User, two logins");
+        assert_ne!(second.identity_uid, first.identity_uid);
+
+        set_active(&logins, first.identity_uid, false).await;
+        assert!(matches!(
+            session_of(&logins, &first).await,
+            Err(SessionRejection::IdentityInactive)
+        ));
+        assert_eq!(
+            session_of(&logins, &second).await.unwrap(),
+            second.principal
+        );
+
+        logins.store.delete(second.identity_uid).await.unwrap();
+        assert!(matches!(
+            session_of(&logins, &second).await,
+            Err(SessionRejection::IdentityUnknown)
+        ));
+    }
+
+    #[sqlx::test]
+    async fn a_session_cannot_borrow_another_users_identity(pool: PgPool) {
+        let logins = logins(&pool).await;
+        let ada = logins
+            .resolve_or_provision("subject-1", &profile("ada@example.com"))
+            .await
+            .unwrap();
+        let bob = logins
+            .resolve_or_provision("subject-2", &profile("bob@example.com"))
+            .await
+            .unwrap();
+        let forged = ResolvedIdentity {
+            principal: ada.principal.clone(),
+            identity_uid: bob.identity_uid,
+        };
+        assert!(matches!(
+            session_of(&logins, &forged).await,
+            Err(SessionRejection::IdentityUnknown)
+        ));
+    }
+
+    /// ADR-0001 scenario 10
     #[sqlx::test]
     async fn deleting_a_mapping_lets_the_next_login_provision_a_fresh_user(pool: PgPool) {
         let logins = logins(&pool).await;
@@ -548,18 +715,17 @@ mod tests {
             .resolve_or_provision("subject-1", &profile("ada@example.com"))
             .await
             .unwrap();
-        let identity = identities(&logins, &first).await.remove(0);
-        logins.store.delete(identity.uid).await.unwrap();
+        logins.store.delete(first.identity_uid).await.unwrap();
 
         let second = logins
             .resolve_or_provision("subject-1", &profile("ada@example.com"))
             .await
             .unwrap();
         assert_ne!(
-            second.uid, first.uid,
+            second.principal.uid, first.principal.uid,
             "deletion is unlinking, not disablement"
         );
-        assert_ne!(second.name, first.name);
+        assert_ne!(second.principal.name, first.principal.name);
     }
 
     /// ADR-0001 scenario 9
@@ -575,42 +741,43 @@ mod tests {
             .resolve_or_provision("subject-2", &profile("shared@example.com"))
             .await
             .unwrap();
-        assert_ne!(one.uid, two.uid);
+        assert_ne!(one.principal.uid, two.principal.uid);
     }
 
     #[sqlx::test]
     async fn a_session_resolves_only_to_the_same_live_user(pool: PgPool) {
         let logins = logins(&pool).await;
-        let user = logins
+        let login = logins
             .resolve_or_provision("subject-1", &profile("ada@example.com"))
             .await
             .unwrap();
+        let user = login.principal.clone();
         let subject = user.subject().to_string();
+        let identity = login.identity_uid;
 
-        assert_eq!(
-            logins.resolve_session(&subject, user.uid).await.unwrap(),
-            user
-        );
+        assert_eq!(session_of(&logins, &login).await.unwrap(), user);
         assert!(matches!(
-            logins.resolve_session(&subject, Uuid::new_v4()).await,
+            logins
+                .resolve_session(&subject, Uuid::new_v4(), identity)
+                .await,
             Err(SessionRejection::Unknown)
         ));
         assert!(matches!(
             logins
-                .resolve_session("user:u-someone-else", user.uid)
+                .resolve_session("user:u-someone-else", user.uid, identity)
                 .await,
             Err(SessionRejection::NameMismatch)
         ));
         assert!(matches!(
-            logins.resolve_session("controller:k8s", user.uid).await,
+            logins
+                .resolve_session("controller:k8s", user.uid, identity)
+                .await,
             Err(SessionRejection::NotAUser)
         ));
 
         // A User recreated under the same name is a new UID: the old session
         // does not revive.
-        for identity in identities(&logins, &user).await {
-            logins.store.delete(identity.uid).await.unwrap();
-        }
+        logins.store.delete(identity).await.unwrap();
         logins.store.delete(user.uid).await.unwrap();
         let recreated = logins
             .store
@@ -625,23 +792,63 @@ mod tests {
             .unwrap();
         assert_ne!(recreated.uid, user.uid);
         assert!(matches!(
-            logins.resolve_session(&subject, user.uid).await,
+            session_of(&logins, &login).await,
             Err(SessionRejection::Unknown)
         ));
     }
 
+    /// Every token shape goes through `check_token`: a session by its UIDs,
+    /// and a legacy session or app-ingress token by its IdP `sub`.
     #[sqlx::test]
-    async fn an_ingress_subject_follows_its_mapping(pool: PgPool) {
+    async fn check_token_covers_every_token_shape(pool: PgPool) {
         let logins = logins(&pool).await;
-        // No mapping: nothing to disable, so the token stands.
-        assert!(logins.external_subject_active("unmapped").await.unwrap());
+        // An unmapped IdP subject has nothing to disable, so it stands.
+        assert!(matches!(
+            logins.check_token("unmapped", None).await.unwrap(),
+            TokenStanding::Active(None)
+        ));
 
-        let user = logins
+        let login = logins
             .resolve_or_provision("subject-1", &profile("ada@example.com"))
             .await
             .unwrap();
-        assert!(logins.external_subject_active("subject-1").await.unwrap());
-        set_active(&logins, user.uid, false).await;
-        assert!(!logins.external_subject_active("subject-1").await.unwrap());
+        let uids = Some((login.principal.uid, login.identity_uid));
+        let subject = login.principal.subject().to_string();
+        assert!(matches!(
+            logins.check_token(&subject, uids).await.unwrap(),
+            TokenStanding::Active(Some(principal)) if principal == login.principal
+        ));
+        assert!(matches!(
+            logins.check_token("subject-1", None).await.unwrap(),
+            TokenStanding::Active(None)
+        ));
+
+        // Disabling the User ends both shapes.
+        set_active(&logins, login.principal.uid, false).await;
+        assert!(matches!(
+            logins.check_token(&subject, uids).await.unwrap(),
+            TokenStanding::Rejected(SessionRejection::Inactive)
+        ));
+        assert!(matches!(
+            logins.check_token("subject-1", None).await.unwrap(),
+            TokenStanding::Rejected(_)
+        ));
+    }
+
+    /// A store that cannot answer is an error for the caller to report, never
+    /// a verdict that logs the user out.
+    #[sqlx::test]
+    async fn check_token_reports_store_failures_as_errors(pool: PgPool) {
+        let logins = logins(&pool).await;
+        let login = logins
+            .resolve_or_provision("subject-1", &profile("ada@example.com"))
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let subject = login.principal.subject().to_string();
+        let uids = Some((login.principal.uid, login.identity_uid));
+        assert!(logins.check_token(&subject, uids).await.is_err());
+        assert!(logins.check_token("subject-1", None).await.is_err());
     }
 }

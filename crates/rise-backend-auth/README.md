@@ -38,11 +38,11 @@ verifier; callers enforce audience per context).
 |---|---|---|---|
 | HS256 | `"rise-access+jwt"` | `RiseToken::Access(AccessClaims)` | exchanged SA / controller principal (RFC 8693), `aud = public_url` (checked by the API middleware, not here) |
 | HS256 | `"rise-identity+jwt"` | **rejected** (`InvalidAlgorithm`) | identity tokens are never HS256 |
-| HS256 | `"rise-session+jwt"` | `RiseToken::Session(RiseClaims)` with `rise_uid` | UI / CLI user login naming a `User` resource: `sub = user:<name>`, `rise_uid` = its UID (ADR-0001 §7); a payload without `rise_uid` is **rejected**. `aud = public_url` and the `(sub, rise_uid)` liveness check are the API middleware's |
-| HS256 | any other (incl. default `"JWT"`, missing, unknown) | `RiseToken::Session(RiseClaims)` without `rise_uid` | legacy user session (IdP `sub`), `aud = public_url` (checked by the API middleware, not here); a payload carrying `rise_uid` is **rejected** |
+| HS256 | `"rise-session+jwt"` | `RiseToken::Session(RiseClaims)` with `rise_uid` | UI / CLI user login naming a `User` resource: `sub = user:<name>`, `rise_uid` = its UID, `rise_identity_uid` = the minting `UserIdentity` (ADR-0001 §7); a payload missing either is **rejected**. `aud = public_url` and the `(sub, rise_uid)` liveness check are the API middleware's |
+| HS256 | any other (incl. default `"JWT"`, missing, unknown) | `RiseToken::Session(RiseClaims)` without `rise_uid` | legacy user session (IdP `sub`), `aud = public_url` (checked by the API middleware, not here); a payload carrying `rise_uid` or `rise_identity_uid` is **rejected** |
 | RS256 | `"rise-identity+jwt"` | `RiseToken::Identity(IdentityClaims)` | ServiceAccount / Controller *resource* principal minted by a `/token` subresource (ADR-0001 §7), for Rise's own audience or an external one; `aud = public_url` and the `(sub, rise_uid)` liveness check are the API middleware's, an external audience verifies via the JWKS |
 | RS256 | `"rise-session+jwt"` | **rejected** (`InvalidAlgorithm`) | sessions are never RS256 |
-| RS256 | any other (incl. default `"JWT"`) | `RiseToken::Ingress(RiseClaims)` | deployed-app ingress auth, `aud = project_url` (not checked here); a payload carrying `rise_uid` is **rejected** |
+| RS256 | any other (incl. default `"JWT"`) | `RiseToken::Ingress(RiseClaims)` | deployed-app ingress auth, `aud = project_url` (not checked here); a payload carrying `rise_uid` or `rise_identity_uid` is **rejected** |
 | anything else | — | **rejected** (`InvalidAlgorithm`) | only HS256 / RS256 are accepted |
 
 **Dispatch:** both branches read the header `typ` **first**. RS256: the identity
@@ -51,8 +51,9 @@ anything else → `Ingress`. HS256: the access `typ` (`rise-access+jwt`) →
 `Access`; the identity `typ` is rejected; the session `typ`
 (`rise-session+jwt`) → `Session` with `rise_uid`; anything else → a legacy
 `Session`. The special `typ`s are matched *exclusively*; legacy session and
-ingress tokens carry the default `"JWT"`. `rise_uid` is bound to the session
-`typ` in both directions, so a legacy-shaped token can never smuggle one. The
+ingress tokens carry the default `"JWT"`. `rise_uid` and `rise_identity_uid` are bound to
+the session `typ` in both directions, so a legacy-shaped token can never
+smuggle one. The
 `rise_token_disambiguation_matrix` unit test pins this table against the real
 `verify_rise_jwt`.
 

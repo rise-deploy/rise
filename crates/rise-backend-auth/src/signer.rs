@@ -36,8 +36,9 @@ pub const RISE_IDENTITY_TYP: &str = "rise-identity+jwt";
 /// JWT header `typ` for Rise User session tokens (ADR-0001 §7).
 ///
 /// A session carrying it names a `User` resource: `sub` is its canonical
-/// `user:<name>` and `rise_uid` its UID, and both must still identify one live,
-/// active User on every request. Matched exclusively, like
+/// `user:<name>`, `rise_uid` its UID, and `rise_identity_uid` the
+/// `UserIdentity` whose login minted it; all three must still identify one
+/// live, active User and identity on every request. Matched exclusively, like
 /// [`RISE_ACCESS_TYP`]; an HS256 token without it is a legacy session, which
 /// carries the IdP's `sub` and no `rise_uid`.
 pub const RISE_SESSION_TYP: &str = "rise-session+jwt";
@@ -49,6 +50,8 @@ pub struct SessionUser {
     pub subject: String,
     /// The `User` resource's UID.
     pub rise_uid: uuid::Uuid,
+    /// The `UserIdentity` the login resolved through.
+    pub identity_uid: uuid::Uuid,
 }
 
 /// What an identity token is minted for.
@@ -328,6 +331,7 @@ impl RiseTokenSigner {
             iss: self.issuer.clone(),
             aud: aud.to_string(),
             rise_uid: None,
+            rise_identity_uid: None,
         })
     }
 
@@ -335,7 +339,8 @@ impl RiseTokenSigner {
     ///
     /// This JWT authenticates users to Rise (UI and CLI). It carries the
     /// header `typ` [`RISE_SESSION_TYP`], `sub` = the User's canonical subject,
-    /// `rise_uid` = its UID, and `aud` = the Rise public URL. `email` and
+    /// `rise_uid` = its UID, `rise_identity_uid` = the minting `UserIdentity`,
+    /// and `aud` = the Rise public URL. `email` and
     /// `name` still come from the IdP claims: the typed APIs key on the email.
     ///
     /// # Arguments
@@ -358,6 +363,7 @@ impl RiseTokenSigner {
             self.build_rise_claims(idp_claims, groups, rise_public_url, expiry_override)?;
         claims.sub = user.subject.clone();
         claims.rise_uid = Some(user.rise_uid);
+        claims.rise_identity_uid = Some(user.identity_uid);
 
         let mut header = Header::new(Algorithm::HS256);
         header.typ = Some(RISE_SESSION_TYP.to_string());
