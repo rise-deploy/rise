@@ -49,7 +49,7 @@ pub fn login(api_base: &str, dex: &DexEndpoint, username: &str, password: &str) 
         .context("authorize response has no authorization_url")?;
     // The CLI flow is bound by PKCE and carries no `state` of its own; when
     // one is present, the callback must echo it.
-    let expected_state = query_param(authorization_url, "state")?;
+    let expected_state = query_param(authorization_url, "state")?.filter(|state| !state.is_empty());
 
     let code = run_dex_login(
         dex,
@@ -205,7 +205,8 @@ fn code_from_callback(callback: &str, expected_state: Option<&str>) -> Result<St
     if let Some(error) = query_param(callback, "error")? {
         anyhow::bail!("Dex refused the login: {error}");
     }
-    let state = query_param(callback, "state")?;
+    // Dex echoes an empty `state=` when the request carried none.
+    let state = query_param(callback, "state")?.filter(|state| !state.is_empty());
     anyhow::ensure!(
         state.as_deref() == expected_state,
         "callback state {state:?} does not match the authorize request ({expected_state:?})"
@@ -354,6 +355,9 @@ mod tests {
         // Rise's CLI flow is bound by PKCE and sends no state.
         let stateless = "http://localhost:8765/callback?code=the-code";
         assert_eq!(code_from_callback(stateless, None).unwrap(), "the-code");
+        // ...which Dex echoes back as an empty parameter.
+        let echoed = "http://localhost:8765/callback?code=the-code&state=";
+        assert_eq!(code_from_callback(echoed, None).unwrap(), "the-code");
         assert!(code_from_callback(stateless, Some("s1")).is_err());
     }
 }
