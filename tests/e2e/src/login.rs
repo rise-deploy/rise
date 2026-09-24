@@ -141,16 +141,9 @@ fn run_dex_login(
                     "Dex showed its login form again — are {username}'s credentials right?"
                 );
                 submitted_login = true;
-                vec![
-                    ("login".to_string(), username.to_string()),
-                    ("password".to_string(), password.to_string()),
-                ]
+                with_hidden(form.hidden, [("login", username), ("password", password)])
             }
-            FormKind::Approval => {
-                let mut fields = form.hidden;
-                fields.push(("approval".to_string(), "approve".to_string()));
-                fields
-            }
+            FormKind::Approval => with_hidden(form.hidden, [("approval", "approve")]),
         };
         url = target;
         response = client
@@ -160,6 +153,24 @@ fn run_dex_login(
             .with_context(|| format!("POST {url}"))?;
     }
     anyhow::bail!("Dex login did not reach the callback within {MAX_STEPS} steps")
+}
+
+/// A form's hidden fields plus the values the harness fills in. A filled-in
+/// value replaces a hidden field of the same name rather than doubling it.
+fn with_hidden<const N: usize>(
+    hidden: Vec<(String, String)>,
+    filled: [(&str, &str); N],
+) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = hidden
+        .into_iter()
+        .filter(|(name, _)| !filled.iter().any(|(filled, _)| filled == name))
+        .collect();
+    fields.extend(
+        filled
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    fields
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -319,6 +330,38 @@ mod tests {
         assert!(form
             .hidden
             .contains(&("req".to_string(), "req-123".to_string())));
+    }
+
+    #[test]
+    fn submissions_carry_the_forms_hidden_fields() {
+        let html = r#"<form method="post" action="/dex/auth/local/login?state=abc">
+              <input type="hidden" name="req" value="req-123">
+              <input name="login" type="text">
+              <input name="password" type="password">
+            </form>"#;
+        let form = parse_form(html).expect("a login form");
+        assert_eq!(form.kind, FormKind::Login);
+        assert_eq!(
+            with_hidden(form.hidden, [("login", "ada"), ("password", "pw")]),
+            vec![
+                ("req".to_string(), "req-123".to_string()),
+                ("login".to_string(), "ada".to_string()),
+                ("password".to_string(), "pw".to_string()),
+            ]
+        );
+
+        // The approval form's own hidden `approval` is replaced, not doubled.
+        let approval = vec![
+            ("req".to_string(), "r".to_string()),
+            ("approval".to_string(), "approve".to_string()),
+        ];
+        assert_eq!(
+            with_hidden(approval, [("approval", "approve")]),
+            vec![
+                ("req".to_string(), "r".to_string()),
+                ("approval".to_string(), "approve".to_string()),
+            ]
+        );
     }
 
     #[test]
