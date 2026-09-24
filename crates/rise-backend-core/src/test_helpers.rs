@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 
 use super::desired::{DesiredContainer, DesiredRoute};
 use super::diff::ActualContainer;
-use super::models::{Deployment, DeploymentStatus};
 use super::naming;
 
 pub fn desired(container: &str, image: &str, hash: &str) -> DesiredContainer {
@@ -139,44 +138,4 @@ pub fn all_healthy(actual: &[ActualContainer]) -> HashMap<String, bool> {
         .iter()
         .filter_map(|a| a.identity().map(|id| (id, true)))
         .collect()
-}
-
-/// A single-container deployment row in `status`, with no identity credential
-/// on record and no `[identity]` audiences.
-pub fn deployment(status: DeploymentStatus) -> Deployment {
-    Deployment {
-        id: uuid::Uuid::nil(),
-        deployment_id: "20260101-120000".to_string(),
-        project_id: uuid::Uuid::nil(),
-        created_by_id: uuid::Uuid::nil(),
-        status,
-        deployment_group: "default".to_string(),
-        environment_id: None,
-        expires_at: None,
-        termination_reason: None,
-        completed_at: None,
-        error_message: None,
-        build_logs: None,
-        controller_metadata: serde_json::Value::Null,
-        image: None,
-        image_digest: None,
-        rolled_back_from_deployment_id: None,
-        http_port: 8080,
-        needs_reconcile: false,
-        is_active: false,
-        deploying_started_at: None,
-        first_healthy_at: None,
-        job_url: None,
-        pull_request_url: None,
-        git_repository_url: None,
-        replicas: 1,
-        cpu: "500m".to_string(),
-        memory: "256Mi".to_string(),
-        identity_credential_hash: None,
-        identity_audiences: serde_json::json!({}),
-        containers: None,
-        routes: None,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    }
 }

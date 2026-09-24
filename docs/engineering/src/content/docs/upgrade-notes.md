@@ -95,8 +95,11 @@ Merged to `develop`:
   next to the app; see [ECS › Workload identity](/operator-docs/ecs/#workload-identity).
   Nothing to configure on a typical install, but know that:
 
-  - Deployments already running when you upgrade keep running **without** the
-    sidecar, and gain it on their next deploy. Upgrading does not roll them.
+  - **Upgrading rolls every running ECS service once.** The first reconcile
+    tick provisions each running deployment's credential and adds the sidecar,
+    which registers a new task-definition revision; ECS replaces the tasks as a
+    rolling update, without a routing gap. Expect a burst of
+    `RegisterTaskDefinition` calls (throttled to 1/s) on large installs.
   - Tasks must reach the sidecar's image and the token endpoint. The image
     defaults to the control plane's own (read from the ECS task metadata), and
     the endpoint to the public URL. Set

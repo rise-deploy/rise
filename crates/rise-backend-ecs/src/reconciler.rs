@@ -441,23 +441,6 @@ pub struct ReconcilerConfig {
 /// files from, under [`ReconcilerConfig::identity_exchange_url`].
 const TOKEN_EXCHANGE_PATH: &str = "/api/v1/identity/token";
 
-/// Whether `deployment` carries the workload-identity sidecar.
-///
-/// Every deployment does -- the credential is universal on every backend --
-/// except one that was already serving before this backend delivered identity:
-/// it has no credential on record, and adding the sidecar would register a new
-/// revision and roll it, so an upgrade would roll every ECS service in the
-/// install at once. It gains the sidecar on its next deploy instead. A
-/// deployment still coming up has nothing running to roll, and one with a
-/// credential on record already has the sidecar.
-fn carries_identity_sidecar(deployment: &Deployment) -> bool {
-    deployment.identity_credential_hash.is_some()
-        || matches!(
-            deployment.status,
-            DeploymentStatus::Pushed | DeploymentStatus::Deploying
-        )
-}
-
 /// A deployment's `[identity].audiences` as filename → audience. Filenames are
 /// validated at deploy time; unsafe ones are dropped again here because the
 /// sidecar turns them into paths.
@@ -1427,27 +1410,29 @@ impl EcsReconciler {
             Self::permanent(ssm::validate(key, value))?;
         }
 
-        let identity_credential =
-            carries_identity_sidecar(deployment).then(|| IdentityCredentialPlan {
-                parameter: ssm::identity_credential_parameter(
-                    &self.config.ssm_parameter_prefix,
-                    &project.name,
-                    &deployment.deployment_group,
-                    &deployment.deployment_id,
-                ),
-                deployment_uuid: deployment.id,
-                provision: deployment.identity_credential_hash.is_none(),
-            });
-        let identity_agent = identity_credential.as_ref().map(|plan| IdentityAgentSpec {
+        // Every task carries the identity sidecar: the credential is universal
+        // on every backend. A deployment already serving without one gains it
+        // here too, which registers a new revision and rolls it once.
+        let identity_credential = IdentityCredentialPlan {
+            parameter: ssm::identity_credential_parameter(
+                &self.config.ssm_parameter_prefix,
+                &project.name,
+                &deployment.deployment_group,
+                &deployment.deployment_id,
+            ),
+            deployment_uuid: deployment.id,
+            provision: deployment.identity_credential_hash.is_none(),
+        };
+        let identity_agent = IdentityAgentSpec {
             image: self.config.identity_agent_image.clone(),
-            credential_parameter: plan.parameter.clone(),
+            credential_parameter: identity_credential.parameter.clone(),
             token_url: format!(
                 "{}{TOKEN_EXCHANGE_PATH}",
                 self.config.identity_exchange_url.trim_end_matches('/')
             ),
             audiences: declared_audiences(&deployment.identity_audiences),
             token_ttl_seconds: self.config.identity_token_ttl_seconds,
-        });
+        };
 
         // Everything build() rejects -- an unsatisfiable Fargate size, an
         // environment past the task-definition limit -- is a property of the
@@ -1455,7 +1440,7 @@ impl EcsReconciler {
         let task_def = Self::permanent(task_definition::build(
             &desired_container,
             &secrets,
-            identity_agent.as_ref(),
+            Some(&identity_agent),
             &TaskDefinitionConfig {
                 resource_prefix: &self.config.resource_prefix,
                 cpu_architecture: &self.config.cpu_architecture,
@@ -1512,7 +1497,7 @@ impl EcsReconciler {
             task_definition_hash: task_def.content_hash(),
             desired_count: replica_count as i32,
             shape: self.desired_shape(),
-            identity_credential,
+            identity_credential: Some(identity_credential),
             tags: ServiceTags {
                 project: project.name.clone(),
                 project_uuid: project.id.to_string(),
@@ -3387,35 +3372,6 @@ mod tests {
             assert!(
                 !super::rejection_fails_deployment(&live),
                 "{live:?} must not be failed -- its services would be deleted under it"
-            );
-        }
-    }
-
-    /// Every deployment carries the identity sidecar -- the credential is
-    /// universal on every backend -- except one already serving without a
-    /// credential on record: giving it the sidecar would roll it, and an
-    /// upgrade would roll every ECS service in the install at once.
-    #[test]
-    fn the_identity_sidecar_is_added_without_rolling_a_serving_deployment() {
-        use rise_backend_core::models::DeploymentStatus;
-        use rise_backend_core::test_helpers::deployment;
-
-        for coming_up in [DeploymentStatus::Pushed, DeploymentStatus::Deploying] {
-            assert!(
-                super::carries_identity_sidecar(&deployment(coming_up.clone())),
-                "{coming_up:?} has nothing running to roll"
-            );
-        }
-        for serving in [DeploymentStatus::Healthy, DeploymentStatus::Unhealthy] {
-            let mut legacy = deployment(serving.clone());
-            assert!(
-                !super::carries_identity_sidecar(&legacy),
-                "a {serving:?} deployment without a credential predates the sidecar"
-            );
-            legacy.identity_credential_hash = Some("hash".to_string());
-            assert!(
-                super::carries_identity_sidecar(&legacy),
-                "a provisioned {serving:?} deployment must keep its sidecar"
             );
         }
     }

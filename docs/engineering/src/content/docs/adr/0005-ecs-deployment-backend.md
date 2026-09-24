@@ -508,10 +508,11 @@ the hash is persisted the parameter is never rewritten, and it is deleted with
 the deployment's other parameters when the service is retired.
 
 A deployment that was **already running** without a credential (anything
-deployed to ECS before this shipped) is left alone: adding the sidecar would
-register a new revision and roll every service in the fleet on upgrade. It gains
-the sidecar on its next deploy. Only deployments still coming up
-(`Pushed`/`Deploying`) or already provisioned get it.
+deployed to ECS before this shipped) gets the sidecar too, on the first tick
+after the upgrade: the reconciler provisions its credential and registers a new
+revision, and ECS rolls it once. That rolls every ECS service in the install
+once, accepted in exchange for one code path — every task carries the sidecar,
+with no deployment-age exception to reason about.
 
 **Tokens come from the existing exchange endpoint, under one lifetime cap.**
 The sidecar mints each token file with `POST /api/v1/identity/token` — the
