@@ -1885,6 +1885,14 @@
             "region": {
               "type": "string"
             },
+            "registry_host": {
+              "default": null,
+              "description": "Registry host images are pushed to and pulled from, as `host[:port]`\nwith no scheme or path. Empty uses\n`<account_id>.dkr.ecr.<region>.amazonaws.com`; set it for another\nECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "repo_prefix": {
               "default": "rise/",
               "description": "Literal prefix for ECR repository names (e.g., \"rise/\" → repos named \"rise/{project}\")",

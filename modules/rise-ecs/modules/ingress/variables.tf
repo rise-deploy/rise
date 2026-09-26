@@ -35,8 +35,13 @@ variable "edge" {
 }
 
 variable "dns" {
-  description = "Ingress domain and optional Route 53 zone for apex and wildcard records."
+  description = <<-EOT
+    Ingress domain and optional Route 53 zone for apex and wildcard records.
+    `create` decides the record count on its own, because a zone created in
+    the same apply has no ID until then.
+  EOT
   type = object({
+    create  = bool
     zone_id = string
     domain  = string
   })

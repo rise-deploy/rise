@@ -125,6 +125,21 @@ variable "ecr_auto_remove" {
   default     = false
 }
 
+variable "ecr_registry_host" {
+  description = <<-EOT
+    Registry host Rise pushes to and deploys from, as host[:port]. Null uses
+    <account>.dkr.ecr.<region>.amazonaws.com; set it for another ECR endpoint
+    (FIPS, dual-stack) or an ECR-compatible emulator.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ecr_registry_host == null || can(regex("^[^/:]+(:[0-9]+)?$", var.ecr_registry_host))
+    error_message = "ecr_registry_host must be a bare host[:port], with no scheme or path."
+  }
+}
+
 variable "oci_registry_url" {
   description = "Registry host for registry_type = \"oci-client-auth\". Must be reachable from the task subnets."
   type        = string
@@ -382,9 +397,35 @@ variable "traefik_refresh_seconds" {
 }
 
 variable "route53_zone_id" {
-  description = "Route 53 zone to create the apex and wildcard alias records in. Leave null to manage DNS yourself."
+  description = <<-EOT
+    Route 53 zone to create the apex and wildcard alias records in. Leave null
+    to manage DNS yourself. When the ID comes from a zone created in the same
+    apply, also set create_dns_records to true so resource counts stay known
+    during the first plan.
+  EOT
   type        = string
   default     = null
+}
+
+variable "create_dns_records" {
+  description = <<-EOT
+    Whether this module writes the apex and wildcard records into
+    route53_zone_id. Null infers the decision from route53_zone_id for
+    compatibility with plan-known zone IDs. Set true explicitly when the zone
+    ID is unknown until apply; Terraform requires resource count decisions to
+    be known during planning.
+  EOT
+  type        = bool
+  default     = null
+
+  validation {
+    condition = var.create_dns_records == null || (
+      var.create_dns_records
+      ? var.route53_zone_id != null
+      : var.route53_zone_id == null
+    )
+    error_message = "create_dns_records must be true with a route53_zone_id, or false without one."
+  }
 }
 
 # -----------------------------------------------------------------------------

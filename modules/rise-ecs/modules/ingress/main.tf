@@ -147,7 +147,7 @@ resource "aws_efs_access_point" "acme" {
 # <project>.<domain>, and groups and environments add another label.
 
 resource "aws_route53_record" "apex" {
-  count = var.dns.zone_id != null ? 1 : 0
+  count = var.dns.create ? 1 : 0
 
   zone_id = var.dns.zone_id
   name    = var.dns.domain
@@ -161,7 +161,7 @@ resource "aws_route53_record" "apex" {
 }
 
 resource "aws_route53_record" "wildcard" {
-  count = var.dns.zone_id != null ? 1 : 0
+  count = var.dns.create ? 1 : 0
 
   zone_id = var.dns.zone_id
   name    = "*.${var.dns.domain}"

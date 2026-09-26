@@ -26,7 +26,6 @@ use crate::{cli, http, report};
 /// Must match `name` in `aws-install/variables.tf`. Everything the install
 /// creates is named after it, which is what the leftover check keys on.
 const NAME: &str = "rise-floci";
-const DOMAIN: &str = "rise-floci.test";
 
 /// Attributes Floci reports differently from what it was sent, so a second plan
 /// always shows them. Each one is Floci's gap, not the module's: anything not
@@ -42,7 +41,6 @@ pub fn run() -> Result<()> {
     let install = Install::from_env()?;
 
     report::step("Floci is reachable", || install.wait_floci())?;
-    let zone_id = report::step_value("hosted zone", || install.create_zone())?;
 
     report::step("terraform init", || {
         // Local state that outlived its emulator describes nothing that exists.
@@ -55,7 +53,6 @@ pub fn run() -> Result<()> {
     let vars = [
         format!("-var=endpoint={}", install.endpoint),
         format!("-var=region={}", install.region),
-        format!("-var=route53_zone_id={zone_id}"),
     ];
     let with_vars = |args: &[&str]| -> Command {
         let mut all: Vec<&str> = args.to_vec();
@@ -83,8 +80,6 @@ pub fn run() -> Result<()> {
         cli::run_checked(with_vars(&["destroy", "-auto-approve", "-input=false"])).map(|_| ())
     })
     .and_then(|()| report::step("nothing left behind", || install.assert_nothing_left()));
-
-    let _ = install.aws(&["route53", "delete-hosted-zone", "--id", &zone_id]);
 
     match (checks, destroyed) {
         (Ok(()), Ok(())) => {
@@ -175,30 +170,6 @@ impl Install {
             "Floci health",
             || Ok(http::get(&url, None)?.status == 200),
         )
-    }
-
-    /// The zone exists before the apply, as an operator's does: rise-ecs
-    /// decides at plan time whether to write records from `route53_zone_id`,
-    /// so the ID cannot come from a zone created in the same apply.
-    fn create_zone(&self) -> Result<String> {
-        let reference = format!(
-            "rise-e2e-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        );
-        let zone = self.aws_json(&[
-            "route53",
-            "create-hosted-zone",
-            "--name",
-            DOMAIN,
-            "--caller-reference",
-            &reference,
-        ])?;
-        let id = zone["HostedZone"]["Id"]
-            .as_str()
-            .context("create-hosted-zone returned no Id")?;
-        Ok(id.trim_start_matches("/hostedzone/").to_string())
     }
 
     /// A second plan against what the first apply built must change nothing.
@@ -462,9 +433,9 @@ impl Install {
             "Vpcs[].Tags[?Key=='Name'].Value[]",
         )?;
         check(
-            "DNS record",
+            "hosted zone",
             &["route53", "list-hosted-zones"],
-            "HostedZones[?ResourceRecordSetCount > `2`].Name",
+            "HostedZones[].Name",
         )?;
         anyhow::ensure!(
             left.is_empty(),

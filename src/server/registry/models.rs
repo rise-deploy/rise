@@ -33,6 +33,10 @@ pub struct EcrConfig {
     /// If false, repos are tagged as orphaned instead
     #[serde(default)]
     pub auto_remove: bool,
+    /// Registry host override; `None` (or empty) derives
+    /// `{account_id}.dkr.ecr.{region}.amazonaws.com`
+    #[serde(default)]
+    pub registry_host: Option<String>,
 }
 
 #[cfg(feature = "backend")]

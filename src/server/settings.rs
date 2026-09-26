@@ -1924,6 +1924,13 @@ pub enum RegistrySettings {
         #[serde(default)]
         #[allow(dead_code)]
         secret_access_key: Option<String>,
+        /// Registry host images are pushed to and pulled from, as `host[:port]`
+        /// with no scheme or path. Empty uses
+        /// `<account_id>.dkr.ecr.<region>.amazonaws.com`; set it for another
+        /// ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+        #[serde(default)]
+        #[allow(dead_code)]
+        registry_host: Option<String>,
     },
     #[serde(rename = "oci-client-auth")]
     OciClientAuth {
@@ -2355,9 +2362,18 @@ impl Settings {
             account_id,
             push_role_arn,
             repo_prefix,
+            registry_host,
             ..
         }) = &settings.registry
         {
+            if let Some(host) = registry_host.as_deref().filter(|h| !h.is_empty()) {
+                if host.contains("://") || host.contains('/') || host.trim() != host {
+                    return Err(ConfigError::Message(format!(
+                        "registry.registry_host must be a bare host[:port], with no scheme \
+                         or path, got {host:?}"
+                    )));
+                }
+            }
             if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
                 return Err(ConfigError::Message(format!(
                     "registry.account_id must be a 12-digit AWS account ID, got {account_id:?}"
@@ -3786,6 +3802,7 @@ server:
         let Some(RegistrySettings::Ecr {
             account_id,
             repo_prefix,
+            registry_host,
             ..
         }) = settings.registry
         else {
@@ -3793,6 +3810,50 @@ server:
         };
         assert_eq!(account_id, "123456789012");
         assert_eq!(repo_prefix, "rise/");
+        // Unset means the regional endpoint; the provider treats empty as unset.
+        assert!(registry_host.unwrap_or_default().is_empty());
+    }
+
+    fn ecs_ecr_env() -> std::collections::HashMap<&'static str, &'static str> {
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+        env.insert(
+            "RISE_ECS_EXECUTION_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-exec",
+        );
+        env
+    }
+
+    #[test]
+    fn the_ecr_registry_host_can_be_overridden_from_the_environment() {
+        let mut env = ecs_ecr_env();
+        env.insert(
+            "RISE_ECR_REGISTRY_HOST",
+            "123456789012.dkr.ecr.us-east-1.localhost:4566",
+        );
+        let settings = load_shipped_ecs_config(&env).expect("a host:port must load");
+        let Some(RegistrySettings::Ecr { registry_host, .. }) = settings.registry else {
+            panic!("expected the ECR registry");
+        };
+        assert_eq!(
+            registry_host.as_deref(),
+            Some("123456789012.dkr.ecr.us-east-1.localhost:4566")
+        );
+    }
+
+    #[test]
+    fn an_ecr_registry_host_with_a_scheme_or_path_is_rejected() {
+        for bad in ["https://registry.example.com", "registry.example.com/rise"] {
+            let mut env = ecs_ecr_env();
+            env.insert("RISE_ECR_REGISTRY_HOST", bad);
+            let err = load_shipped_ecs_config(&env).expect_err(bad);
+            assert!(err.to_string().contains("registry_host"), "{bad}: {err}");
+        }
     }
 
     #[test]

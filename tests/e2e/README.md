@@ -83,8 +83,8 @@ to start an ECS task with it on (Docker rejects its `--dns` alongside the
 `container:` network mode it uses) and ships without the helper image it needs.
 Traefik discovers tasks by exactly that address, and Rise reaches Postgres and
 Dex through the Cloud Map names that resolve to it, so neither works until
-Floci fixes that. Rise's ECR provider also derives the registry host as
-`<account>.dkr.ecr.<region>.amazonaws.com`, with no override for an emulator.
+Floci fixes that. (Pushing to Floci's registry is covered: point
+`registry.registry_host` at it.)
 
 ### On the machine
 
@@ -237,10 +237,6 @@ It needs no credentials, so CI runs it on every pull request, forks included
 (`E2E / AWS install (Floci)`). What it cannot say is whether Rise *runs* on
 ECS: Floci is started with ECS tasks, RDS, ELBv2 and EC2 mocked, so no
 container behind the install starts. That is the ECS suite's job.
-
-The hosted zone is created by the suite before the apply rather than in the
-workspace: rise-ecs decides from `route53_zone_id` at plan time whether to write
-records, so a zone created in the same apply fails the plan.
 
 ## Layout
 

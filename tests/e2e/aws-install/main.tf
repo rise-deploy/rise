@@ -71,6 +71,12 @@ module "rise_aws" {
   tags = local.tags
 }
 
+resource "aws_route53_zone" "this" {
+  name          = var.ingress_domain
+  force_destroy = true
+  tags          = local.tags
+}
+
 module "rise_ecs" {
   source = "../../../modules/rise-ecs"
 
@@ -90,10 +96,10 @@ module "rise_ecs" {
   ecr_repo_prefix          = local.ecr_prefix
   ssm_parameter_prefix     = local.ssm_prefix
 
-  # A zone that already exists, as it does for an operator: the module decides
-  # whether to write records from this ID at plan time, so it cannot come from
-  # a zone created in the same apply.
-  route53_zone_id = var.route53_zone_id
+  # Created in this same apply, so its ID is unknown at plan time; the flag
+  # keeps the record count known.
+  route53_zone_id    = aws_route53_zone.this.zone_id
+  create_dns_records = true
 
   # Self-contained identity, so the install needs nothing outside Floci.
   deploy_dex                = true

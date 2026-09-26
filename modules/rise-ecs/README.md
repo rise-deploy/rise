@@ -71,6 +71,22 @@ Then create the DNS records from the `dns_records_required` output, or pass
 projects are served at `<project>.<domain>`, and groups and environments add
 another label.
 
+If the zone is created in the same configuration, its ID is unknown until
+apply, so also set `create_dns_records = true`: the module decides how many
+records to write at plan time.
+
+```hcl
+resource "aws_route53_zone" "rise" {
+  name = "rise.example.com"
+}
+
+module "rise_ecs" {
+  # ...
+  route53_zone_id    = aws_route53_zone.rise.zone_id
+  create_dns_records = true
+}
+```
+
 ## New cluster, or one you already run
 
 Both the VPC and the cluster are create-or-bring. Omit them and the module

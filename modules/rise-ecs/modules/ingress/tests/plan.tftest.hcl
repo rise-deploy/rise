@@ -14,7 +14,7 @@ variables {
   network         = { vpc_id = "vpc-abc", public_subnet_ids = ["subnet-a", "subnet-b"], private_subnets_by_key = { a = "subnet-c", b = "subnet-d" } }
   security_groups = { edge = "sg-edge", efs = "sg-efs" }
   edge            = { mode = "nlb-traefik-acme", acm_certificate_arn = null, deletion_protection = true }
-  dns             = { zone_id = null, domain = "rise.example.com" }
+  dns             = { create = false, zone_id = null, domain = "rise.example.com" }
   traefik_role    = { create = true, arn = null, account_id = "123456789012" }
 }
 

@@ -29,8 +29,3 @@ variable "rise_image_tag" {
   type        = string
   default     = "latest"
 }
-
-variable "route53_zone_id" {
-  description = "Hosted zone for `ingress_domain`, created by run.sh before the apply."
-  type        = string
-}

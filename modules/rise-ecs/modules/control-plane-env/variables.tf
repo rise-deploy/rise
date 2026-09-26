@@ -212,6 +212,7 @@ variable "registry" {
     push_role_arn = optional(string)
     repo_prefix   = optional(string, "rise/")
     auto_remove   = optional(bool, false)
+    registry_host = optional(string)
     registry_url  = optional(string)
     namespace     = optional(string, "rise-apps")
   })

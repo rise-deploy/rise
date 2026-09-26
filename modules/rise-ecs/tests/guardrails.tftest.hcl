@@ -176,6 +176,38 @@ run "rejects_module_owned_traefik_mode_with_an_external_arn" {
   expect_failures = [var.create_traefik_task_role]
 }
 
+run "rejects_an_ecr_registry_host_with_a_scheme" {
+  command = plan
+
+  variables {
+    ecr_registry_host = "https://123456789012.dkr.ecr.eu-central-1.amazonaws.com"
+  }
+
+  expect_failures = [var.ecr_registry_host]
+}
+
+run "rejects_dns_records_without_a_zone" {
+  command = plan
+
+  variables {
+    create_dns_records = true
+    route53_zone_id    = null
+  }
+
+  expect_failures = [var.create_dns_records]
+}
+
+run "rejects_a_zone_with_dns_records_turned_off" {
+  command = plan
+
+  variables {
+    create_dns_records = false
+    route53_zone_id    = "Z0123456789ABCDEFGHIJ"
+  }
+
+  expect_failures = [var.create_dns_records]
+}
+
 run "rejects_an_install_with_no_identity_provider" {
   command = plan
 

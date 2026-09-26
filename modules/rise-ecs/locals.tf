@@ -50,6 +50,10 @@ locals {
   oidc_issuer = var.deploy_dex ? "https://dex.${var.ingress_domain}/dex" : var.oidc_issuer
 
   workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
+  create_dns_records = coalesce(
+    var.create_dns_records,
+    var.route53_zone_id != null,
+  )
   create_traefik_task_role = coalesce(
     var.create_traefik_task_role,
     var.traefik_task_role_arn == null,
@@ -140,6 +144,7 @@ module "control_plane_env" {
     push_role_arn = var.ecr_push_role_arn
     repo_prefix   = var.ecr_repo_prefix
     auto_remove   = var.ecr_auto_remove
+    registry_host = var.ecr_registry_host
     } : {
     type         = "oci-client-auth"
     registry_url = var.oci_registry_url

@@ -64,6 +64,7 @@ module "ingress" {
     deletion_protection = var.deletion_protection
   }
   dns = {
+    create  = local.create_dns_records
     zone_id = var.route53_zone_id
     domain  = var.ingress_domain
   }
