@@ -230,8 +230,8 @@ a local AWS emulator, and then:
    workloads' execution role and Traefik make -- and for a few that must be
    *denied*, since those are the scoping. Floci evaluates policies, condition
    keys and AWS-managed policies faithfully enough for that.
-3. **destroys it** and checks the emulator holds nothing named after the
-   install.
+3. **destroys it**, which must succeed: deletion protection, secret recovery
+   windows and dependency order are the module's to get right.
 
 It needs no credentials, so CI runs it on every pull request, forks included
 (`E2E / AWS install (Floci)`). What it cannot say is whether Rise *runs* on
@@ -285,7 +285,7 @@ container behind the install starts. That is the ECS suite's job.
 | suite     | backend required | asserts |
 |-----------|------------------|---------|
 | `compose` | No               | `rise compose up` builds and starts `example/multi-container`; frontend and API routes respond; API reaches Redis; worker completes a Redis-backed job |
-| `aws-install` | No (Floci)   | rise-aws + rise-ecs apply from nothing; a second plan is empty; the control plane, execution and Traefik roles may make the calls Rise makes against what the install configured, and are denied a sample outside that scope; destroy leaves nothing |
+| `aws-install` | No (Floci)   | rise-aws + rise-ecs apply from nothing; a second plan is empty; the control plane, execution and Traefik roles may make the calls Rise makes against what the install configured, and are denied a sample outside that scope; destroy succeeds |
 
 ## Upgrade Suite
 

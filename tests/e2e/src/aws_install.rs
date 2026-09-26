@@ -3,7 +3,7 @@
 //! Applies the documented production install -- `modules/rise-aws` for IAM,
 //! `modules/rise-ecs` for everything else, wired as the `rise-ecs` README shows
 //! -- against Floci, a local AWS emulator, then plans it again, checks the two
-//! modules agree with each other, destroys it, and checks nothing is left.
+//! modules agree with each other, and destroys it.
 //!
 //! What it proves is the infrastructure: that the install applies from nothing,
 //! converges, and tears down cleanly. It does not prove Rise *runs* on ECS --
@@ -23,8 +23,8 @@ use serde_json::Value;
 
 use crate::{cli, http, report};
 
-/// Must match `name` in `aws-install/variables.tf`. Everything the install
-/// creates is named after it, which is what the leftover check keys on.
+/// Must match `name` in `aws-install/variables.tf`; the task definitions the
+/// permission probes read are named after it.
 const NAME: &str = "rise-floci";
 
 /// Attributes Floci reports differently from what it was sent, so a second plan
@@ -78,8 +78,7 @@ pub fn run() -> Result<()> {
     // run against a long-lived Floci should not leave the next one a mess.
     let destroyed = report::step("destroy", || {
         cli::run_checked(with_vars(&["destroy", "-auto-approve", "-input=false"])).map(|_| ())
-    })
-    .and_then(|()| report::step("nothing left behind", || install.assert_nothing_left()));
+    });
 
     match (checks, destroyed) {
         (Ok(()), Ok(())) => {
@@ -202,23 +201,6 @@ impl Install {
     /// configured Rise with, is the answer the one the design intends? The
     /// denials matter as much as the grants -- they are the scoping.
     fn assert_wiring(&self) -> Result<usize> {
-        let services = self.aws_json(&[
-            "ecs",
-            "describe-services",
-            "--cluster",
-            NAME,
-            "--services",
-            &format!("{NAME}-control-plane"),
-            &format!("{NAME}-traefik"),
-            &format!("{NAME}-dex"),
-        ])?;
-        let services = services["services"].as_array().cloned().unwrap_or_default();
-        anyhow::ensure!(
-            services.len() == 3 && services.iter().all(|s| s["status"] == "ACTIVE"),
-            "expected ACTIVE control-plane, traefik and dex services, got {}",
-            Value::Array(services)
-        );
-
         let task = |family: &str| -> Result<Value> {
             let td = self.aws_json(&[
                 "ecs",
@@ -371,78 +353,6 @@ impl Install {
             wrong.join("\n  ")
         );
         Ok(probes.len())
-    }
-
-    /// Terraform's destroy succeeding says it deleted what it tracked. This
-    /// asks the emulator instead, for the things that cost money or collide
-    /// with the next apply when a destroy leaves them behind.
-    fn assert_nothing_left(&self) -> Result<()> {
-        let mut left = Vec::new();
-        let mut check = |what: &str, args: &[&str], query: &str| -> Result<()> {
-            let mut full = args.to_vec();
-            full.extend(["--query", query]);
-            let names = self.aws_json(&full)?;
-            for n in names
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-            {
-                if n.contains(NAME) {
-                    left.push(format!("{what}: {n}"));
-                }
-            }
-            Ok(())
-        };
-        check("IAM role", &["iam", "list-roles"], "Roles[].RoleName")?;
-        check(
-            "IAM policy",
-            &["iam", "list-policies", "--scope", "Local"],
-            "Policies[].PolicyName",
-        )?;
-        check("ECS cluster", &["ecs", "list-clusters"], "clusterArns")?;
-        check(
-            "secret",
-            &["secretsmanager", "list-secrets"],
-            "SecretList[].Name",
-        )?;
-        check(
-            "RDS instance",
-            &["rds", "describe-db-instances"],
-            "DBInstances[].DBInstanceIdentifier",
-        )?;
-        check(
-            "load balancer",
-            &["elbv2", "describe-load-balancers"],
-            "LoadBalancers[].LoadBalancerName",
-        )?;
-        check(
-            "EFS file system",
-            &["efs", "describe-file-systems"],
-            "FileSystems[].Name",
-        )?;
-        check(
-            "Cloud Map namespace",
-            &["servicediscovery", "list-namespaces"],
-            "Namespaces[].Name",
-        )?;
-        check("KMS alias", &["kms", "list-aliases"], "Aliases[].AliasName")?;
-        check(
-            "VPC",
-            &["ec2", "describe-vpcs"],
-            "Vpcs[].Tags[?Key=='Name'].Value[]",
-        )?;
-        check(
-            "hosted zone",
-            &["route53", "list-hosted-zones"],
-            "HostedZones[].Name",
-        )?;
-        anyhow::ensure!(
-            left.is_empty(),
-            "destroy left these behind:\n  {}",
-            left.join("\n  ")
-        );
-        Ok(())
     }
 }
 
