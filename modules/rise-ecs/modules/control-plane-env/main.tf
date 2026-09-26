@@ -65,6 +65,9 @@ locals {
       RISE_ECR_REPO_PREFIX   = var.registry.repo_prefix
       RISE_ECR_AUTO_REMOVE   = tostring(var.registry.auto_remove)
     } : {},
+    var.registry.type == "ecr" && var.registry.registry_host != null ? {
+      RISE_ECR_REGISTRY_HOST = var.registry.registry_host
+    } : {},
     var.registry.type == "oci-client-auth" ? {
       RISE_REGISTRY_URL       = var.registry.registry_url
       RISE_REGISTRY_NAMESPACE = var.registry.namespace

@@ -176,6 +176,16 @@ run "rejects_module_owned_traefik_mode_with_an_external_arn" {
   expect_failures = [var.create_traefik_task_role]
 }
 
+run "rejects_an_ecr_registry_host_with_a_scheme" {
+  command = plan
+
+  variables {
+    ecr_registry_host = "https://123456789012.dkr.ecr.eu-central-1.amazonaws.com"
+  }
+
+  expect_failures = [var.ecr_registry_host]
+}
+
 run "rejects_an_install_with_no_identity_provider" {
   command = plan
 

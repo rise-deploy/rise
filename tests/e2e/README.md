@@ -37,6 +37,15 @@ AWS_PROFILE=<scratch> AWS_REGION=eu-central-1 \
 RISE_E2E_BACKEND=ecs RISE_E2E_ENV=rise-e2e RISE_IMAGE_TAG=<published-tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
+# AWS install suite (no Rise backend, no AWS account; needs terraform, aws v2
+# and a running Floci -- see "AWS Install Suite" below).
+docker run -d --name floci -p 4566:4566 \
+  -e FLOCI_SERVICES_ECS_MOCK=true -e FLOCI_SERVICES_RDS_MOCK=true \
+  -e FLOCI_SERVICES_ELBV2_MOCK=true -e FLOCI_SERVICES_EC2_MOCK=true \
+  floci/floci:nightly-09252026
+RISE_E2E_SUITE=aws-install \
+  cargo run --manifest-path tests/e2e/Cargo.toml
+
 # Local compose suite (no Rise backend; needs Docker and a rise CLI).
 RISE_E2E_SUITE=compose \
 RISE_BIN=./target/debug/rise \
@@ -60,10 +69,22 @@ bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
 
 ## ECS Backend
 
-Unlike the other two backends this one runs against **real AWS** — LocalStack
-puts ECS behind a paid plan, Cloud Map behind its top one, and publishes task
-ports randomly enough that the Traefik ECS provider cannot discover them. There
-is setup to do once per account before the first run.
+Unlike the other two backends this one runs against **real AWS**. There is
+setup to do once per account before the first run.
+
+The infrastructure half of it -- does the install apply, converge, grant what
+Rise needs and tear down -- runs against an emulator on every pull request; see
+[AWS Install Suite](#aws-install-suite). The runtime half cannot yet: LocalStack
+puts ECS behind a paid plan and Cloud Map behind its top one, and
+[Floci](https://github.com/floci-io/floci), which runs ECS tasks as real
+containers for free, reports awsvpc task addresses that nothing can route to.
+Its security-group mode maps those addresses onto the containers, but refuses
+to start an ECS task with it on (Docker rejects its `--dns` alongside the
+`container:` network mode it uses) and ships without the helper image it needs.
+Traefik discovers tasks by exactly that address, and Rise reaches Postgres and
+Dex through the Cloud Map names that resolve to it, so neither works until
+Floci fixes that. (Pushing to Floci's registry is covered: point
+`registry.registry_host` at it.)
 
 ### On the machine
 
@@ -189,6 +210,34 @@ and leaves the edge open until you destroy it:
 terraform -chdir=tests/e2e/run destroy -auto-approve
 ```
 
+## AWS Install Suite
+
+`RISE_E2E_SUITE=aws-install` applies the documented production install --
+[`rise-aws`](../../modules/rise-aws) wired into
+[`rise-ecs`](../../modules/rise-ecs) as that module's README shows, from
+[`aws-install/`](aws-install) -- against [Floci](https://github.com/floci-io/floci),
+a local AWS emulator, and then:
+
+1. **plans it again.** Anything a second plan would change is a perpetual diff
+   an operator's every `apply` would churn. Attributes Floci itself reports
+   back differently are listed, with the reason, in `EMULATOR_DRIFT`
+   ([`src/aws_install.rs`](src/aws_install.rs)); anything else fails.
+2. **asks IAM whether the two modules agree.** rise-aws scopes its policies by
+   names it derives independently of rise-ecs, so a mismatch applies cleanly
+   and fails only when Rise first makes the call. The suite reads Rise's
+   environment off the control-plane task definition and runs
+   `iam simulate-principal-policy` for each call the control plane, its
+   workloads' execution role and Traefik make -- and for a few that must be
+   *denied*, since those are the scoping. Floci evaluates policies, condition
+   keys and AWS-managed policies faithfully enough for that.
+3. **destroys it**, which must succeed: deletion protection, secret recovery
+   windows and dependency order are the module's to get right.
+
+It needs no credentials, so CI runs it on every pull request, forks included
+(`E2E / AWS install (Floci)`). What it cannot say is whether Rise *runs* on
+ECS: Floci is started with ECS tasks, RDS, ELBv2 and EC2 mocked, so no
+container behind the install starts. That is the ECS suite's job.
+
 ## Layout
 
 - `src/backend/` — the `Backend` driver seam. Both backends self-provision their
@@ -199,6 +248,8 @@ terraform -chdir=tests/e2e/run destroy -auto-approve
   persistent cluster, where Traefik, Postgres, Dex and Rise all run as ECS
   services (CLI extraction via `docker cp`, reach via Traefik's address with an
   explicit `Host` header).
+- `aws-install/` — the production install (rise-aws + rise-ecs) pointed at
+  Floci, driven by `src/aws_install.rs`.
 - `bootstrap/` — the persistent shell (VPC, cluster, zone, state bucket) and its
   IAM, applied by hand.
 - `run/` — Traefik, Dex, Postgres and the control plane, applied and destroyed
@@ -234,6 +285,7 @@ terraform -chdir=tests/e2e/run destroy -auto-approve
 | suite     | backend required | asserts |
 |-----------|------------------|---------|
 | `compose` | No               | `rise compose up` builds and starts `example/multi-container`; frontend and API routes respond; API reaches Redis; worker completes a Redis-backed job |
+| `aws-install` | No (Floci)   | rise-aws + rise-ecs apply from nothing; a second plan is empty; the control plane, execution and Traefik roles may make the calls Rise makes against what the install configured, and are denied a sample outside that scope; destroy succeeds |
 
 ## Upgrade Suite
 

@@ -156,6 +156,25 @@ Merged to `develop`:
   the plan identity intentionally cannot call `secretsmanager:GetSecretValue`.
   After the first apply, normal refresh uses `ListSecretVersionIds`.
 
+- **Config change — `registry.registry_host` for ECR.** Overrides the host
+  images are pushed to and deployed from (default
+  `<account_id>.dkr.ecr.<region>.amazonaws.com`), for FIPS or dual-stack ECR
+  endpoints and ECR-compatible emulators. `RISE_ECR_REGISTRY_HOST` on ECS;
+  `ecr_registry_host` in `rise-ecs`. Unset keeps the current behavior.
+
+- **Breaking (release candidates) — `rise-ecs` takes `route53_zone`, not
+  `route53_zone_id`.** It takes the zone as an object, so a zone created in the
+  same configuration works in one apply instead of failing the plan with
+  "Invalid count argument". Replace `route53_zone_id = "Z..."` with
+  `route53_zone = { zone_id = "Z..." }`, or pass the zone resource or data
+  source itself. The records keep their addresses; nothing is recreated.
+
+- **`rise-ecs` secret versions stop changing on every plan.** Each secret
+  version's `secret_string_wo_version` was a hash too large for the AWS provider
+  to store exactly, so every `terraform plan` replaced all four secret versions.
+  The next apply updates each one a final time, with the same value; after that
+  they stay put. Nothing to do.
+
 - **ECS runtime log access names the exact log group.** `rise-aws` requires
   `ecs_log_group_name` whenever `enable_ecs = true`, and grants
   `FilterLogEvents`/`StartLiveTail` on the wildcard-suffixed and bare log-group

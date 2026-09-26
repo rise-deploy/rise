@@ -58,6 +58,11 @@ run "creates_a_whole_install" {
     error_message = "ECR account must be the caller's own account"
   }
 
+  assert {
+    condition     = !contains(keys(local.rise_environment), "RISE_ECR_REGISTRY_HOST")
+    error_message = "Without ecr_registry_host Rise derives the regional ECR endpoint itself"
+  }
+
   # Never the public URL. Traefik calls it for every forwardAuth subrequest, and
   # the backend refuses to start when it is empty.
   assert {
@@ -338,5 +343,18 @@ run "brings_an_existing_vpc_and_cluster" {
   assert {
     condition     = local.rise_environment["RISE_ECS_CLUSTER"] == "existing-cluster"
     error_message = "the backend should be pointed at the brought cluster"
+  }
+}
+
+run "points_rise_at_another_ecr_registry_host" {
+  command = plan
+
+  variables {
+    ecr_registry_host = "123456789012.dkr.ecr.eu-central-1.localhost:4566"
+  }
+
+  assert {
+    condition     = local.rise_environment["RISE_ECR_REGISTRY_HOST"] == "123456789012.dkr.ecr.eu-central-1.localhost:4566"
+    error_message = "ecr_registry_host must reach the control plane as RISE_ECR_REGISTRY_HOST"
   }
 }

@@ -59,7 +59,8 @@ module "rise_ecs" {
 ```
 
 Point a wildcard DNS record at the load balancer — `dns_records_required` says
-exactly what to create, or pass `route53_zone_id` and the module makes them.
+exactly what to create, or pass `route53_zone` (the zone resource or data source, or
+`{ zone_id = "Z..." }`) and the module makes them.
 `*.<domain>` is required, not optional: projects are served at
 `<project>.<domain>` and groups and environments add another label.
 

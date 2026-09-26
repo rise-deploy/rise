@@ -58,14 +58,32 @@ module "rise_ecs" {
 }
 ```
 
+CI applies this pairing, re-plans it, checks the IAM grants against it and
+destroys it on every pull request, against an AWS emulator — see the
+[AWS install suite](../../tests/e2e/README.md#aws-install-suite).
+
 `rise_image_ref` accepts a digest-pinned public image directly, for example
 `ghcr.io/rise-deploy/rise@sha256:…`. Set exactly one of `rise_image_ref` and
 `rise_image_tag`.
 
 Then create the DNS records from the `dns_records_required` output, or pass
-`route53_zone_id` and let the module make them. **The wildcard is required**:
+`route53_zone` and let the module make them. **The wildcard is required**:
 projects are served at `<project>.<domain>`, and groups and environments add
 another label.
+
+`route53_zone` takes the zone itself, so a zone created in the same
+configuration works in a single apply:
+
+```hcl
+resource "aws_route53_zone" "rise" {
+  name = "rise.example.com"
+}
+
+module "rise_ecs" {
+  # ...
+  route53_zone = aws_route53_zone.rise   # or data.aws_route53_zone.x, or { zone_id = "Z..." }
+}
+```
 
 ## New cluster, or one you already run
 

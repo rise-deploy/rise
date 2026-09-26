@@ -151,10 +151,10 @@ env.SQLX_OFFLINE = true
 [tasks."terraform:check"]
 description = "Format-check, validate and unit-test the Terraform modules and e2e workspaces."
 run = """
-terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run
+terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run tests/e2e/aws-install
 # -backend=false so the e2e workspaces, which declare an S3 backend, check
 # without credentials or a bucket.
-for dir in modules/*/ modules/rise-ecs/modules/*/ tests/e2e/bootstrap tests/e2e/run; do
+for dir in modules/*/ modules/rise-ecs/modules/*/ tests/e2e/bootstrap tests/e2e/run tests/e2e/aws-install; do
   echo "==> $dir"
   terraform -chdir="$dir" init -backend=false -input=false >/dev/null
   terraform -chdir="$dir" validate

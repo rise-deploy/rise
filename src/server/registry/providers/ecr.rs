@@ -12,6 +12,18 @@ use crate::server::registry::{
     ImageTagType, RegistryProvider,
 };
 
+/// The host images are pushed to and pulled from: the configured override, or
+/// the account's regional ECR endpoint.
+fn registry_host(config: &EcrConfig) -> String {
+    match config.registry_host.as_deref().filter(|h| !h.is_empty()) {
+        Some(host) => host.to_string(),
+        None => format!(
+            "{}.dkr.ecr.{}.amazonaws.com",
+            config.account_id, config.region
+        ),
+    }
+}
+
 /// AWS ECR registry provider with scoped credentials via STS AssumeRole
 pub struct EcrProvider {
     config: EcrConfig,
@@ -50,11 +62,7 @@ impl EcrProvider {
 
         let sts_client = StsClient::new(&aws_config);
 
-        // Build registry_host: {account}.dkr.ecr.{region}.amazonaws.com
-        let registry_host = format!(
-            "{}.dkr.ecr.{}.amazonaws.com",
-            config.account_id, config.region
-        );
+        let registry_host = registry_host(&config);
 
         // Build registry_url: {registry_host}/{repo_prefix}
         // repo_prefix is literal (e.g., "rise/" → "rise/hello")
@@ -299,5 +307,46 @@ impl RegistryProvider for EcrProvider {
         // ECR doesn't differentiate between client and internal - always use same path
         let repo_name = format!("{}{}", self.config.repo_prefix, repository);
         format!("{}/{}:{}", self.registry_host, repo_name, tag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(registry_host: Option<&str>) -> EcrConfig {
+        EcrConfig {
+            region: "eu-west-1".into(),
+            account_id: "459109751375".into(),
+            access_key_id: None,
+            secret_access_key: None,
+            repo_prefix: "rise/".into(),
+            push_role_arn: "arn:aws:iam::459109751375:role/rise-ecr-push".into(),
+            auto_remove: false,
+            registry_host: registry_host.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_host_defaults_to_the_regional_ecr_endpoint() {
+        assert_eq!(
+            registry_host(&config(None)),
+            "459109751375.dkr.ecr.eu-west-1.amazonaws.com"
+        );
+        // The ECS config interpolates an unset env var to an empty string.
+        assert_eq!(
+            registry_host(&config(Some(""))),
+            "459109751375.dkr.ecr.eu-west-1.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn a_configured_host_replaces_the_endpoint() {
+        assert_eq!(
+            registry_host(&config(Some(
+                "459109751375.dkr.ecr.eu-west-1.localhost:4566"
+            ))),
+            "459109751375.dkr.ecr.eu-west-1.localhost:4566"
+        );
     }
 }

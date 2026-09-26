@@ -304,7 +304,15 @@ account_id = "123456789012"
 repo_prefix = "rise/"
 push_role_arn = "arn:aws:iam::..."
 auto_remove = true
+# Optional: the registry host images are pushed to and deployed from, as
+# host[:port]. Defaults to <account_id>.dkr.ecr.<region>.amazonaws.com; set it
+# for another ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+# The ECR API endpoint itself follows the AWS SDK (`AWS_ENDPOINT_URL`).
+# registry_host = "123456789012.dkr.ecr.us-east-1.localhost:4566"
 ```
+
+On ECS (`config/ecs.yaml`) this is `RISE_ECR_REGISTRY_HOST`, which the
+`rise-ecs` module sets from `ecr_registry_host`.
 
 #### OCI Registry (Docker, Harbor, Quay)
 
