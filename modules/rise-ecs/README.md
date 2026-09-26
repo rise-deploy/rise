@@ -58,6 +58,10 @@ module "rise_ecs" {
 }
 ```
 
+CI applies this pairing, re-plans it, checks the IAM grants against it and
+destroys it on every pull request, against an AWS emulator — see the
+[AWS install suite](../../tests/e2e/README.md#aws-install-suite).
+
 `rise_image_ref` accepts a digest-pinned public image directly, for example
 `ghcr.io/rise-deploy/rise@sha256:…`. Set exactly one of `rise_image_ref` and
 `rise_image_tag`.

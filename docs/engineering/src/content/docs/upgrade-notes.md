@@ -156,6 +156,12 @@ Merged to `develop`:
   the plan identity intentionally cannot call `secretsmanager:GetSecretValue`.
   After the first apply, normal refresh uses `ListSecretVersionIds`.
 
+- **`rise-ecs` secret versions stop changing on every plan.** Each secret
+  version's `secret_string_wo_version` was a hash too large for the AWS provider
+  to store exactly, so every `terraform plan` replaced all four secret versions.
+  The next apply updates each one a final time, with the same value; after that
+  they stay put. Nothing to do.
+
 - **ECS runtime log access names the exact log group.** `rise-aws` requires
   `ecs_log_group_name` whenever `enable_ecs = true`, and grants
   `FilterLogEvents`/`StartLiveTail` on the wildcard-suffixed and bare log-group

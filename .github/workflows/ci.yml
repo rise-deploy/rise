@@ -644,6 +644,57 @@ jobs:
           RISE_BIN: ./target/release/rise
         run: cargo run --manifest-path tests/e2e/Cargo.toml
 
+  # The documented AWS install (modules/rise-aws + modules/rise-ecs) applied,
+  # re-planned, permission-probed and destroyed against Floci, a local AWS
+  # emulator. Needs no credentials and no published image, so unlike the ECS
+  # suite (e2e-ecs.yml) it runs on every pull request, forks included.
+  e2e-aws-install:
+    name: E2E / AWS install (Floci)
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - e2e-harness-build
+    timeout-minutes: 20
+    services:
+      floci:
+        # A dated nightly, digest-pinned: the release current at the time
+        # (2.1.0) drops task-definition dockerLabels and tags, which reads as a
+        # perpetual diff. Move to the first release that carries the fix.
+        image: floci/floci:nightly-09252026@sha256:3f73224f568a218bf41436dca986f19516f4adb0ad72e4ed04de00890e620221
+        ports:
+          - 4566:4566
+        env:
+          # The suite tests infrastructure, not a running Rise: with these
+          # mocked, Floci starts no containers and needs no Docker socket.
+          FLOCI_SERVICES_ECS_MOCK: "true"
+          FLOCI_SERVICES_RDS_MOCK: "true"
+          FLOCI_SERVICES_ELBV2_MOCK: "true"
+          FLOCI_SERVICES_EC2_MOCK: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+          install_args: terraform
+
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
+
+      - name: Run the AWS install suite
+        env:
+          RISE_E2E_SUITE: aws-install
+          RISE_E2E_FLOCI_ENDPOINT: http://localhost:4566
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
+
   # Self-provisions its own compose stack and runs every Docker scenario
   # (public deploy, SA token exchange, private/forwardAuth, health-rolling
   # cutover, workload identity).
