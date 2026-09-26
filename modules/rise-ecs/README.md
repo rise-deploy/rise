@@ -67,13 +67,12 @@ destroys it on every pull request, against an AWS emulator — see the
 `rise_image_tag`.
 
 Then create the DNS records from the `dns_records_required` output, or pass
-`route53_zone_id` and let the module make them. **The wildcard is required**:
+`route53_zone` and let the module make them. **The wildcard is required**:
 projects are served at `<project>.<domain>`, and groups and environments add
 another label.
 
-If the zone is created in the same configuration, its ID is unknown until
-apply, so also set `create_dns_records = true`: the module decides how many
-records to write at plan time.
+`route53_zone` takes the zone itself, so a zone created in the same
+configuration works in a single apply:
 
 ```hcl
 resource "aws_route53_zone" "rise" {
@@ -82,8 +81,7 @@ resource "aws_route53_zone" "rise" {
 
 module "rise_ecs" {
   # ...
-  route53_zone_id    = aws_route53_zone.rise.zone_id
-  create_dns_records = true
+  route53_zone = aws_route53_zone.rise   # or data.aws_route53_zone.x, or { zone_id = "Z..." }
 }
 ```
 

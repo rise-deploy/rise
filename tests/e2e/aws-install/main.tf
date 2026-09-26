@@ -96,10 +96,8 @@ module "rise_ecs" {
   ecr_repo_prefix          = local.ecr_prefix
   ssm_parameter_prefix     = local.ssm_prefix
 
-  # Created in this same apply, so its ID is unknown at plan time; the flag
-  # keeps the record count known.
-  route53_zone_id    = aws_route53_zone.this.zone_id
-  create_dns_records = true
+  # Created in this same apply, so its ID is unknown at plan time.
+  route53_zone = aws_route53_zone.this
 
   # Self-contained identity, so the install needs nothing outside Floci.
   deploy_dex                = true

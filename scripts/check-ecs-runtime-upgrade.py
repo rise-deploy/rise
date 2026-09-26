@@ -124,6 +124,7 @@ def prepare(repo, work, baseline):
   dex_admin_password_bcrypt = "$2y$10$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   nat_gateway_mode = "per_az"
   route53_zone_id = "Z0123456789"
+  route53_zone = { zone_id = "Z0123456789" }
 }"""
             )
         if case == "endpoints":

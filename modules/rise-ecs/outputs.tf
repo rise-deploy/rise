@@ -77,7 +77,7 @@ output "public_url" {
 
 output "dns_records_required" {
   description = <<-EOT
-    DNS records to create, unless route53_zone_id was set and the module made
+    DNS records to create, unless route53_zone was set and the module made
     them. The wildcard is required, not optional: projects are served at
     <project>.<domain>, and groups and environments add another label.
   EOT

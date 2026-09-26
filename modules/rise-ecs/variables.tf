@@ -396,36 +396,20 @@ variable "traefik_refresh_seconds" {
   default     = 15
 }
 
-variable "route53_zone_id" {
+variable "route53_zone" {
   description = <<-EOT
-    Route 53 zone to create the apex and wildcard alias records in. Leave null
-    to manage DNS yourself. When the ID comes from a zone created in the same
-    apply, also set create_dns_records to true so resource counts stay known
-    during the first plan.
-  EOT
-  type        = string
-  default     = null
-}
+    Route 53 zone to create the apex and wildcard alias records in. Pass the
+    zone itself -- `aws_route53_zone.this` or `data.aws_route53_zone.this` --
+    or `{ zone_id = "Z..." }`. Leave null to manage DNS yourself.
 
-variable "create_dns_records" {
-  description = <<-EOT
-    Whether this module writes the apex and wildcard records into
-    route53_zone_id. Null infers the decision from route53_zone_id for
-    compatibility with plan-known zone IDs. Set true explicitly when the zone
-    ID is unknown until apply; Terraform requires resource count decisions to
-    be known during planning.
+    An object rather than a bare ID so that a zone created in the same apply
+    works: the module decides how many records to write at plan time, and
+    whether an object is null is known then even while its zone_id is not.
   EOT
-  type        = bool
-  default     = null
-
-  validation {
-    condition = var.create_dns_records == null || (
-      var.create_dns_records
-      ? var.route53_zone_id != null
-      : var.route53_zone_id == null
-    )
-    error_message = "create_dns_records must be true with a route53_zone_id, or false without one."
-  }
+  type = object({
+    zone_id = string
+  })
+  default = null
 }
 
 # -----------------------------------------------------------------------------

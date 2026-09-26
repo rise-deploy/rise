@@ -50,10 +50,7 @@ locals {
   oidc_issuer = var.deploy_dex ? "https://dex.${var.ingress_domain}/dex" : var.oidc_issuer
 
   workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
-  create_dns_records = coalesce(
-    var.create_dns_records,
-    var.route53_zone_id != null,
-  )
+  create_dns_records     = var.route53_zone != null
   create_traefik_task_role = coalesce(
     var.create_traefik_task_role,
     var.traefik_task_role_arn == null,

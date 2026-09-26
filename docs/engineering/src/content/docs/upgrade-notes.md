@@ -162,10 +162,12 @@ Merged to `develop`:
   endpoints and ECR-compatible emulators. `RISE_ECR_REGISTRY_HOST` on ECS;
   `ecr_registry_host` in `rise-ecs`. Unset keeps the current behavior.
 
-- **Config change — `rise-ecs` `create_dns_records`.** Set it to `true` when
-  `route53_zone_id` comes from a zone created in the same apply; the plan
-  otherwise fails with "Invalid count argument". Unset keeps inferring it from
-  `route53_zone_id`, as before.
+- **Breaking (release candidates) — `rise-ecs` takes `route53_zone`, not
+  `route53_zone_id`.** It takes the zone as an object, so a zone created in the
+  same configuration works in one apply instead of failing the plan with
+  "Invalid count argument". Replace `route53_zone_id = "Z..."` with
+  `route53_zone = { zone_id = "Z..." }`, or pass the zone resource or data
+  source itself. The records keep their addresses; nothing is recreated.
 
 - **`rise-ecs` secret versions stop changing on every plan.** Each secret
   version's `secret_string_wo_version` was a hash too large for the AWS provider

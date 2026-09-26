@@ -37,6 +37,6 @@ run "writes_records_into_a_zone_created_in_the_same_apply" {
 
   assert {
     condition     = length(output.dns_records_required) == 0
-    error_message = "With create_dns_records the module writes the records itself."
+    error_message = "Given a zone, the module writes the records itself."
   }
 }

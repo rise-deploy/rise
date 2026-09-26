@@ -16,8 +16,7 @@ module "rise" {
   ecr_push_role_arn   = "arn:aws:iam::123456789012:role/rise-ecr-push"
   oidc_issuer         = "https://id.example.com"
   oidc_client_secret  = "s3cret"
-  route53_zone_id     = aws_route53_zone.this.zone_id
-  create_dns_records  = true
+  route53_zone        = aws_route53_zone.this
 }
 
 output "dns_records_required" {
