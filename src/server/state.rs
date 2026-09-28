@@ -562,7 +562,7 @@ async fn init_ecs_backend(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
-            identity_agent_image: identity_agent_image.clone(),
+            identity_agent_image: identity_agent_image.trim().to_string(),
             identity_exchange_url: identity_exchange_url
                 .clone()
                 .unwrap_or_else(|| public_url.to_string()),
