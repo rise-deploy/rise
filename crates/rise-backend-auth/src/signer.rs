@@ -38,7 +38,8 @@ pub const RISE_IDENTITY_TYP: &str = "rise-identity+jwt";
 /// A session carrying it names a `User` resource: `sub` is its canonical
 /// `user:<name>`, `rise_uid` its UID, and `rise_identity_uid` the
 /// `UserIdentity` whose login minted it; all three must still identify one
-/// live, active User and identity on every request. Matched exclusively, like
+/// live, active User and identity on every request. `rise_client` records
+/// whether it was issued to the browser or the CLI. Matched exclusively, like
 /// [`RISE_ACCESS_TYP`]; an HS256 token without it is a legacy session, which
 /// carries the IdP's `sub` and no `rise_uid`.
 pub const RISE_SESSION_TYP: &str = "rise-session+jwt";
@@ -52,6 +53,8 @@ pub struct SessionUser {
     pub rise_uid: uuid::Uuid,
     /// The `UserIdentity` the login resolved through.
     pub identity_uid: uuid::Uuid,
+    /// The kind of client the session is issued to.
+    pub client: crate::SessionClient,
 }
 
 /// What an identity token is minted for.
@@ -332,6 +335,7 @@ impl RiseTokenSigner {
             aud: aud.to_string(),
             rise_uid: None,
             rise_identity_uid: None,
+            rise_client: None,
         })
     }
 
@@ -364,6 +368,7 @@ impl RiseTokenSigner {
         claims.sub = user.subject.clone();
         claims.rise_uid = Some(user.rise_uid);
         claims.rise_identity_uid = Some(user.identity_uid);
+        claims.rise_client = Some(user.client);
 
         let mut header = Header::new(Algorithm::HS256);
         header.typ = Some(RISE_SESSION_TYP.to_string());

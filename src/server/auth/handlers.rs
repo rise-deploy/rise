@@ -16,7 +16,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
-use rise_backend_auth::SessionUser;
+use rise_backend_auth::{SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::instrument;
@@ -453,11 +453,12 @@ async fn resolve_login(
     Ok(ResolvedLogin { user, identity })
 }
 
-/// Issue the Rise session token for a resolved login.
+/// Issue the Rise session token for a resolved login, to `client`.
 async fn issue_session(
     state: &AppState,
     claims: &serde_json::Value,
     login: &ResolvedLogin,
+    client: SessionClient,
 ) -> Result<String, LoginFailure> {
     // Resolve the user's team memberships for the groups claim; on a DB error,
     // fall back to no groups rather than failing the login.
@@ -468,6 +469,7 @@ async fn issue_session(
         subject: login.identity.principal.subject().to_string(),
         rise_uid: login.identity.principal.uid,
         identity_uid: login.identity.identity_uid,
+        client,
     };
     state
         .jwt_signer
@@ -705,7 +707,7 @@ pub async fn code_exchange(
     let login = resolve_login(&state, &claims)
         .await
         .map_err(|failure| failure.response())?;
-    let rise_jwt = issue_session(&state, &claims, &login)
+    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Cli)
         .await
         .map_err(|failure| failure.response())?;
     let user = login.user;
@@ -1253,7 +1255,7 @@ pub async fn oauth_callback(
     let login = resolve_login(&state, &claims)
         .await
         .map_err(|failure| failure.response())?;
-    let rise_jwt = issue_session(&state, &claims, &login)
+    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Browser)
         .await
         .map_err(|failure| failure.response())?;
 

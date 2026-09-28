@@ -11,7 +11,7 @@ interface DeviceAuthorization {
     client_ip?: string;
     created_at: string;
     expires_at: string;
-    /** The current session may not approve: it is too old, or predates identity-bound sessions. */
+    /** The current session may not approve: it is not a browser sign-in from the last few minutes. */
     reauth_required: boolean;
 }
 
@@ -59,6 +59,17 @@ function signInAgain(userCode: string): boolean {
     return true;
 }
 
+/**
+ * Forget the sign-in round-trip once it is over, so the next code looked up in
+ * this tab may start its own.
+ */
+function clearReauthMarker() {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has(REAUTH_MARKER)) return;
+    url.searchParams.delete(REAUTH_MARKER);
+    window.history.replaceState(window.history.state, '', url.pathname + url.search + url.hash);
+}
+
 const REAUTH_FAILED =
     'Rise could not confirm a recent sign-in. Sign out, sign in again, and reopen the link from your terminal.';
 
@@ -78,6 +89,8 @@ export function DeviceLogin() {
                 }
                 return;
             }
+            // A fresh session is confirmed: the round-trip, if any, is done.
+            clearReauthMarker();
             setPhase({ kind: 'confirm', request });
         } catch (err) {
             setPhase({ kind: 'error', message: errorMessage(err) });
@@ -110,11 +123,13 @@ export function DeviceLogin() {
         e.preventDefault();
         const code = input.trim();
         if (!code) return;
+        clearReauthMarker();
         if (code === userCode) lookup(code);
         else setUserCode(code);
     };
 
     const startOver = () => {
+        clearReauthMarker();
         setUserCode(null);
         setInput('');
         setPhase({ kind: 'enter' });

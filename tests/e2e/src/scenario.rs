@@ -409,8 +409,10 @@ impl Scenario for SaTokenExchange {
 // ---- (c'') device login confirmed on Rise's /device page -------------------
 
 /// `rise login --device` end to end, with Rise as the device authorization
-/// server: the approving browser session comes from a real Dex login, and the
-/// device session it yields names the same `User` and `UserIdentity`.
+/// server: the approving browser session comes from a real Dex sign-in through
+/// the web UI's flow, and the device session it yields names the same `User`
+/// and `UserIdentity`. CLI sessions, the device session included, may not
+/// approve, so no CLI session can mint its own successor.
 struct DeviceLogin;
 
 impl Scenario for DeviceLogin {
@@ -419,9 +421,11 @@ impl Scenario for DeviceLogin {
     }
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
-        match b.dex() {
-            Some(_) => Applicability::Run,
-            None => Applicability::Skip("the stack exposes no Dex to sign the approver in"),
+        match b.kind() {
+            BackendKind::Docker | BackendKind::Minikube => Applicability::Run,
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack's Dex serves only the password grant, not a browser sign-in",
+            ),
         }
     }
 
@@ -430,8 +434,8 @@ impl Scenario for DeviceLogin {
 
         let api = b.api_base();
         let dexep = b.dex().context("backend exposes no reachable Dex")?;
-        let session = crate::login::login(api, dexep, "admin@example.com", "password")
-            .context("sign the approver in through Dex")?;
+        let session = crate::login::browser_login(api, dexep, "admin@example.com", "password")
+            .context("sign the approver in through the web UI's Dex sign-in")?;
 
         // Approve: the CLI's poll turns into a session for the approver.
         let started = device_login::start(api)?;
@@ -475,6 +479,24 @@ impl Scenario for DeviceLogin {
             me.status,
             me.body
         );
+        // Neither the device session nor a `rise login` session may approve.
+        let cli = crate::login::login(api, dexep, "admin@example.com", "password")
+            .context("log in through the CLI's PKCE flow")?;
+        let next = device_login::start(api)?;
+        for (label, bearer) in [("device", &token), ("CLI", &cli)] {
+            let resp = http::post_json(
+                &format!("{api}/api/v1/auth/device/approve"),
+                Some(bearer),
+                &serde_json::json!({"user_code": next.user_code}),
+            )?;
+            anyhow::ensure!(
+                resp.status == 401,
+                "a {label} session approved a device login ({}):\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
         let reused = device_login::poll(api, &started.device_code)?;
         anyhow::ensure!(
             reused.as_ref().err().map(String::as_str) == Some("expired_token"),

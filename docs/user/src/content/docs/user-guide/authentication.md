@@ -35,8 +35,9 @@ page shows the same code, and click **Approve**. The CLI picks up the token on i
 poll.
 
 - The code is confirmed on Rise itself, so this works with any identity provider.
-- Approval needs a recent sign-in: if your browser session is older than a few
-  minutes, the page asks you to sign in again first.
+- Approval needs a recent sign-in in the browser: if your browser session is
+  older than a few minutes, the page asks you to sign in again first. A CLI
+  login can't approve a device login.
 - Codes expire after 10 minutes and work once. Only approve a code you requested
   yourself — approving signs that terminal in as you.
 

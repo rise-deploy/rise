@@ -1,12 +1,16 @@
-//! A real Rise login, driven headlessly: the CLI's PKCE authorization-code flow
-//! against the test Dex, with the harness filling in Dex's login form instead
-//! of a browser.
+//! Real Rise logins, driven headlessly against the test Dex, with the harness
+//! filling in Dex's login form instead of a person:
 //!
-//! This is the same path `rise login` takes — Rise builds the authorize URL,
-//! Dex authenticates the user, and Rise exchanges the code on the back channel
-//! — so the session it yields names the user's `User` resource exactly as an
-//! interactive login's does. There is deliberately no shortcut that trades a
-//! presented ID token for a session.
+//! - [`login`] is the CLI's PKCE authorization-code flow, the path `rise login`
+//!   takes, and yields a CLI session.
+//! - [`browser_login`] is the web UI's sign-in (`/auth/signin/start` →
+//!   `/auth/callback`), and yields the browser session the UI keeps in its
+//!   `rise_jwt` cookie.
+//!
+//! Either way Rise builds the authorize URL, Dex authenticates the user, and
+//! Rise exchanges the code on the back channel, so the session names the
+//! user's `User` resource exactly as an interactive login's does. There is
+//! deliberately no shortcut that trades a presented ID token for a session.
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -51,13 +55,8 @@ pub fn login(api_base: &str, dex: &DexEndpoint, username: &str, password: &str) 
     // one is present, the callback must echo it.
     let expected_state = query_param(authorization_url, "state")?.filter(|state| !state.is_empty());
 
-    let code = run_dex_login(
-        dex,
-        authorization_url,
-        expected_state.as_deref(),
-        username,
-        password,
-    )?;
+    let callback = run_dex_login(dex, authorization_url, REDIRECT_URI, username, password)?;
+    let code = code_from_callback(&callback, expected_state.as_deref())?;
 
     let exchanged = crate::http::post_json(
         &format!("{api_base}/api/v1/auth/code/exchange"),
@@ -82,22 +81,92 @@ pub fn login(api_base: &str, dex: &DexEndpoint, username: &str, password: &str) 
         .context("code exchange response has no token")
 }
 
-/// Walk Dex from the authorize URL to the redirect carrying the code.
-fn run_dex_login(
+/// Log `username` in through the web UI's sign-in and return the browser
+/// session Rise sets as its `rise_jwt` cookie.
+pub fn browser_login(
+    api_base: &str,
     dex: &DexEndpoint,
-    authorization_url: &str,
-    expected_state: Option<&str>,
     username: &str,
     password: &str,
 ) -> Result<String> {
-    // Redirects are followed by hand: the last one targets the CLI's loopback
-    // callback, which nothing serves, and every URL Dex hands out is spelled
-    // with its issuer host, which the harness may not be able to resolve.
-    let client = reqwest::blocking::Client::builder()
+    let client = no_redirect_client()?;
+    let start = format!("{api_base}/api/v1/auth/signin/start");
+    let response = client
+        .get(&start)
+        .send()
+        .with_context(|| format!("GET {start}"))?;
+    anyhow::ensure!(
+        response.status().is_redirection(),
+        "sign-in start answered {} instead of redirecting to Dex",
+        response.status()
+    );
+    let authorization_url = location(&response)?;
+    // Rise's own callback, spelled with its public URL, which the harness may
+    // not resolve: it is reached through `api_base` instead.
+    let redirect_uri = query_param(&authorization_url, "redirect_uri")?
+        .context("authorize URL carries no redirect_uri")?;
+
+    let callback = run_dex_login(dex, &authorization_url, &redirect_uri, username, password)?;
+    if let Some(error) = query_param(&callback, "error")? {
+        anyhow::bail!("Dex refused the login: {error}");
+    }
+    let api = Url::parse(api_base).context("parse API base")?;
+    let callback = reroute(&Url::parse(&callback)?, &Url::parse(&redirect_uri)?, &api);
+    let response = client
+        .get(callback.clone())
+        .send()
+        .with_context(|| format!("GET {callback}"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "sign-in callback answered {}",
+        response.status()
+    );
+    session_cookie(response.headers()).context("sign-in callback set no rise_jwt cookie")
+}
+
+/// The non-empty `rise_jwt` among a response's cookies. A cleared legacy
+/// cookie of the same name may accompany it.
+fn session_cookie(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|cookie| cookie.split(';').next()?.trim().strip_prefix("rise_jwt="))
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn no_redirect_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .context("build Dex login client")?;
+        .context("build login client")
+}
+
+fn location(response: &reqwest::blocking::Response) -> Result<String> {
+    response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .context("redirect without a Location")
+}
+
+/// Walk Dex from the authorize URL to the redirect back to `callback`, and
+/// return that redirect's URL (carrying the code, or an error).
+fn run_dex_login(
+    dex: &DexEndpoint,
+    authorization_url: &str,
+    callback: &str,
+    username: &str,
+    password: &str,
+) -> Result<String> {
+    // Redirects are followed by hand: the last one targets the login's
+    // callback, which the caller handles (nothing serves the CLI's loopback
+    // one), and every URL Dex hands out is spelled with its issuer host, which
+    // the harness may not be able to resolve.
+    let client = no_redirect_client()?;
     let reachable = reachable_base(dex)?;
     let issuer = Url::parse(&dex.issuer).context("parse Dex issuer")?;
 
@@ -110,14 +179,11 @@ fn run_dex_login(
     for _ in 0..MAX_STEPS {
         let status = response.status();
         if status.is_redirection() {
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .context("redirect without a Location")?;
-            let next = url.join(location).context("resolve redirect")?;
-            if next.as_str().starts_with(REDIRECT_URI) {
-                return code_from_callback(next.as_str(), expected_state);
+            let next = url
+                .join(&location(&response)?)
+                .context("resolve redirect")?;
+            if next.as_str().starts_with(callback) {
+                return Ok(next.into());
             }
             url = reroute(&next, &issuer, &reachable);
             response = client
@@ -402,5 +468,22 @@ mod tests {
         let echoed = "http://localhost:8765/callback?code=the-code&state=";
         assert_eq!(code_from_callback(echoed, None).unwrap(), "the-code");
         assert!(code_from_callback(stateless, Some("s1")).is_err());
+    }
+
+    #[test]
+    fn the_session_cookie_is_the_non_empty_rise_jwt() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        for cookie in [
+            "other=1; Path=/",
+            "rise_jwt=; Domain=example.com; Max-Age=0",
+            "rise_jwt=the.session.token; HttpOnly; SameSite=Lax; Path=/",
+        ] {
+            headers.append(reqwest::header::SET_COOKIE, cookie.parse().unwrap());
+        }
+        assert_eq!(
+            session_cookie(&headers).as_deref(),
+            Some("the.session.token")
+        );
+        assert_eq!(session_cookie(&reqwest::header::HeaderMap::new()), None);
     }
 }

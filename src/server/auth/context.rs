@@ -27,7 +27,7 @@ pub struct VerifiedExternalToken {
 ///
 /// Present in request extensions exactly when a `UserPrincipal` is: legacy
 /// sessions carry neither. Device-login approval reads it to mint a session
-/// bound to the same identity, and to require a recent sign-in.
+/// bound to the same identity, and to require a recent browser sign-in.
 #[derive(Clone, Debug)]
 pub struct SessionDetails {
     /// The `UserIdentity` the session was minted through.
@@ -36,6 +36,9 @@ pub struct SessionDetails {
     pub name: Option<String>,
     /// The session's `iat`, in seconds since the Unix epoch.
     pub issued_at: u64,
+    /// The kind of client the session was issued to; `None` on sessions
+    /// minted before the claim existed.
+    pub client: Option<rise_backend_auth::SessionClient>,
 }
 
 /// Authentication context for request handlers.

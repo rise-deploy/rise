@@ -10,10 +10,11 @@
 //! (ADR-0001 §1, §7).
 //!
 //! No IdP token is ever presented here: the only way in is a live,
-//! identity-bound session confirming a single-use code. Approval also demands
-//! a recent sign-in ([`APPROVAL_MAX_SESSION_AGE`]), so every CLI session
-//! traces back to a fresh IdP login rather than to however old a browser
-//! session happens to be.
+//! identity-bound session confirming a single-use code. Approval demands a
+//! *browser* session ([`SessionClient::Browser`]) signed in within
+//! [`APPROVAL_MAX_SESSION_AGE`]. So every CLI session traces back to a fresh
+//! IdP login, however old the browser session would otherwise be, and a CLI
+//! session (PKCE or device) can never approve, and so never renew, a login.
 
 use crate::db::device_authorizations::{
     self, DeviceAuthorization, DeviceAuthorizationStatus, NewDeviceAuthorization,
@@ -31,7 +32,7 @@ use axum::{
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use rand::{Rng, RngExt};
-use rise_backend_auth::{RiseTokenSigner, SessionUser};
+use rise_backend_auth::{RiseTokenSigner, SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -367,6 +368,7 @@ impl<'a> DeviceFlow<'a> {
             subject: approved.subject.clone(),
             rise_uid: approved.rise_uid,
             identity_uid: approved.identity_uid,
+            client: SessionClient::Cli,
         };
         match self
             .signer
@@ -416,7 +418,7 @@ impl<'a> DeviceFlow<'a> {
             client_ip: row.client_ip,
             created_at: row.created_at,
             expires_at: row.expires_at,
-            reauth_required: principal.is_none() || fresh_session(details).is_none(),
+            reauth_required: principal.is_none() || approving_session(details).is_none(),
         })
     }
 
@@ -429,7 +431,7 @@ impl<'a> DeviceFlow<'a> {
         user_code: &str,
     ) -> Result<(), ServerError> {
         let user_code = parse_user_code(user_code)?;
-        let (Some(principal), Some(details)) = (principal, fresh_session(details)) else {
+        let (Some(principal), Some(details)) = (principal, approving_session(details)) else {
             // 401, like a missing session: either way the answer is to sign in.
             return Err(ServerError::unauthorized(
                 "Sign in again to approve this device login",
@@ -468,10 +470,14 @@ impl<'a> DeviceFlow<'a> {
     }
 }
 
-/// Whether this session may approve a device login right now: only one issued
-/// recently may.
-fn fresh_session(details: Option<&SessionDetails>) -> Option<&SessionDetails> {
+/// Whether this session may approve a device login right now: only a browser
+/// session signed in recently may. A CLI session never may, or it could keep
+/// minting its own successors without going back to the IdP.
+fn approving_session(details: Option<&SessionDetails>) -> Option<&SessionDetails> {
     let details = details?;
+    if details.client != Some(SessionClient::Browser) {
+        return None;
+    }
     let now = Utc::now().timestamp().max(0) as u64;
     (now.saturating_sub(details.issued_at) <= APPROVAL_MAX_SESSION_AGE.as_secs()).then_some(details)
 }
@@ -594,24 +600,30 @@ mod tests {
         assert_ne!(hash_device_code(&a), hash_device_code(&b));
     }
 
-    fn details(issued_at: u64) -> SessionDetails {
+    fn details(issued_at: u64, client: Option<SessionClient>) -> SessionDetails {
         SessionDetails {
             identity_uid: Uuid::nil(),
             name: None,
             issued_at,
+            client,
         }
     }
 
     #[test]
-    fn only_recent_sessions_may_approve() {
+    fn only_recent_browser_sessions_may_approve() {
         let now = Utc::now().timestamp() as u64;
-        assert!(fresh_session(Some(&details(now))).is_some());
-        assert!(fresh_session(Some(&details(now - 60))).is_some());
-        assert!(fresh_session(Some(&details(
-            now - APPROVAL_MAX_SESSION_AGE.as_secs() - 60
+        let browser = Some(SessionClient::Browser);
+        assert!(approving_session(Some(&details(now, browser))).is_some());
+        assert!(approving_session(Some(&details(now - 60, browser))).is_some());
+        assert!(approving_session(Some(&details(
+            now - APPROVAL_MAX_SESSION_AGE.as_secs() - 60,
+            browser
         )))
         .is_none());
-        assert!(fresh_session(None).is_none());
+        assert!(approving_session(None).is_none());
+        // However fresh, a CLI session, or one that predates the claim, may not.
+        assert!(approving_session(Some(&details(now, Some(SessionClient::Cli)))).is_none());
+        assert!(approving_session(Some(&details(now, None))).is_none());
     }
 
     // ---- the flow, against Postgres ----------------------------------------
@@ -721,11 +733,13 @@ mod tests {
         }
     }
 
+    /// What the middleware exposes for a browser session of `identity`.
     fn session_details(identity: &ResolvedIdentity, issued_at: u64) -> SessionDetails {
         SessionDetails {
             identity_uid: identity.identity_uid,
             name: Some("Ada".to_string()),
             issued_at,
+            client: Some(SessionClient::Browser),
         }
     }
 
@@ -774,10 +788,42 @@ mod tests {
         assert_eq!(claims.rise_identity_uid, Some(identity.identity_uid));
         assert_eq!(claims.email, "ada@example.com");
         assert_eq!(claims.name.as_deref(), Some("Ada"));
+        assert_eq!(claims.rise_client, Some(SessionClient::Cli));
 
         let again = flow.exchange(&started.device_code).await;
         assert_eq!(error_of(&again), Some("expired_token"));
         assert!(again.token.is_none());
+
+        // The brand-new device session cannot approve its own successor: it
+        // is a CLI session, however fresh.
+        let next = flow.start(None, None).await.unwrap();
+        let device_session = SessionDetails {
+            identity_uid: claims.rise_identity_uid.unwrap(),
+            name: claims.name.clone(),
+            issued_at: claims.iat,
+            client: claims.rise_client,
+        };
+        let request = flow
+            .lookup(
+                Some(&identity.principal),
+                Some(&device_session),
+                &next.user_code,
+            )
+            .await
+            .unwrap();
+        assert!(request.reauth_required);
+        let err = flow
+            .approve(
+                &user,
+                Some(&identity.principal),
+                Some(&device_session),
+                &next.user_code,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        let pending = flow.exchange(&next.device_code).await;
+        assert_eq!(error_of(&pending), Some("authorization_pending"));
     }
 
     #[sqlx::test]
@@ -798,7 +844,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn only_a_fresh_identity_bound_session_may_approve(pool: PgPool) {
+    async fn only_a_fresh_identity_bound_browser_session_may_approve(pool: PgPool) {
         let fx = Fixture::new(pool).await;
         let flow = fx.flow();
         let (user, identity) = fx.sign_in("subject-1", "ada@example.com").await;
@@ -813,6 +859,22 @@ mod tests {
         assert!(request.reauth_required);
         let err = flow
             .approve(&user, Some(&identity.principal), Some(&stale), code)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+        // A fresh CLI session (from `rise login`) may not either.
+        let cli = SessionDetails {
+            client: Some(SessionClient::Cli),
+            ..session_details(&identity, now())
+        };
+        let request = flow
+            .lookup(Some(&identity.principal), Some(&cli), code)
+            .await
+            .unwrap();
+        assert!(request.reauth_required);
+        let err = flow
+            .approve(&user, Some(&identity.principal), Some(&cli), code)
             .await
             .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);

@@ -158,6 +158,7 @@ pub async fn auth_middleware(
                                 identity_uid,
                                 name: claims.name.clone(),
                                 issued_at: claims.iat,
+                                client: claims.rise_client,
                             });
                         }
                     }
