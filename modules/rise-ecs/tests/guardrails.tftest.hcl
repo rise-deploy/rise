@@ -37,6 +37,7 @@ variables {
   ingress_domain      = "rise.example.com"
   admin_email         = "ops@example.com"
   rise_image_tag      = "0.23.0"
+  rise_cli_image_tag  = "0.23.0"
   acme_email          = "ops@example.com"
   controller_role_arn = "arn:aws:iam::123456789012:role/rise"
   execution_role_arn  = "arn:aws:iam::123456789012:role/rise-ecs-execution"
@@ -71,6 +72,23 @@ run "rejects_an_image_without_tag_or_digest" {
     rise_image_tag = null
   }
   expect_failures = [var.rise_image_ref]
+}
+
+run "rejects_a_cli_image_with_both_tag_and_digest" {
+  command = plan
+  variables {
+    rise_cli_image_ref = "ghcr.io/rise-deploy/rise-cli@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+  expect_failures = [var.rise_cli_image_ref]
+}
+
+# The sidecar image is as required as the control plane's: nothing infers it.
+run "rejects_a_cli_image_without_tag_or_digest" {
+  command = plan
+  variables {
+    rise_cli_image_tag = null
+  }
+  expect_failures = [var.rise_cli_image_ref]
 }
 
 # The backend normalises common spellings, but the module should not be the

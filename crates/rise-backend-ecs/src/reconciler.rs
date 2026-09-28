@@ -18,7 +18,7 @@
 //!    between drift detection and readiness, and a task definition
 //!    is registered only when its content hash actually moves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -43,10 +43,12 @@ use uuid::Uuid;
 
 use crate::aws_error_detail;
 use crate::capacity::Capacity;
-use crate::service::{self, ActualService, DesiredService, ServiceAction};
+use crate::service::{self, ActualService, DesiredService, IdentityCredentialPlan, ServiceAction};
 use crate::ssm;
 use crate::tags::ServiceTags;
-use crate::task_definition::{self, SecretRef, TaskDefinitionConfig, TaskDefinitionSpec};
+use crate::task_definition::{
+    self, IdentityAgentSpec, SecretRef, TaskDefinitionConfig, TaskDefinitionSpec,
+};
 
 /// Leadership must remain valid for at least this long before we start a
 /// project's destructive work. Mirrors the Docker reconciler.
@@ -427,6 +429,27 @@ pub struct ReconcilerConfig {
     pub traefik_entrypoint: String,
     pub traefik_certresolver: Option<String>,
     pub traefik_api_url: Option<String>,
+    /// Image the workload-identity sidecar runs (ADR-0005 D8).
+    pub identity_agent_image: String,
+    /// Base URL of the Rise API as the sidecar reaches it.
+    pub identity_exchange_url: String,
+    /// Lifetime of the `[identity]` token files the sidecar mints.
+    pub identity_token_ttl_seconds: u64,
+}
+
+/// Path of the token-exchange endpoint the identity sidecar mints the token
+/// files from, under [`ReconcilerConfig::identity_exchange_url`].
+const TOKEN_EXCHANGE_PATH: &str = "/api/v1/identity/token";
+
+/// A deployment's `[identity].audiences` as filename → audience. Filenames are
+/// validated at deploy time; unsafe ones are dropped again here because the
+/// sidecar turns them into paths.
+fn declared_audiences(identity_audiences: &serde_json::Value) -> BTreeMap<String, String> {
+    serde_json::from_value::<BTreeMap<String, String>>(identity_audiences.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(filename, _)| rise_backend_core::identity::is_safe_token_filename(filename))
+        .collect()
 }
 
 /// Whether a service whose deployment resolved to `status` should be collected.
@@ -1155,7 +1178,7 @@ impl EcsReconciler {
 
         // Fail closed on the features v1 does not implement, rather than
         // deploying something that looks fine and is quietly broken.
-        Self::permanent(self.reject_unsupported(deployment, &container_specs))?;
+        Self::permanent(self.reject_unsupported(&container_specs))?;
 
         let environment = if let Some(env_id) = deployment.environment_id {
             self.store.find_environment(env_id).await?
@@ -1246,14 +1269,9 @@ impl EcsReconciler {
     /// implement.
     ///
     /// Explicit rejection, never silent degradation: a multi-container app whose
-    /// siblings cannot resolve each other, or a workload whose identity token
-    /// files never appear, would deploy "successfully" and then fail in ways that
-    /// look like application bugs.
-    fn reject_unsupported(
-        &self,
-        deployment: &Deployment,
-        container_specs: &[ContainerSpec],
-    ) -> Result<()> {
+    /// siblings cannot resolve each other would deploy "successfully" and then
+    /// fail in ways that look like application bugs.
+    fn reject_unsupported(&self, container_specs: &[ContainerSpec]) -> Result<()> {
         if container_specs.len() > 1 {
             anyhow::bail!(
                 "the ECS backend does not yet support multi-container deployments ({} \
@@ -1263,19 +1281,6 @@ impl EcsReconciler {
                  containers as separate Rise projects, or use the Kubernetes or Docker \
                  backend.",
                 container_specs.len()
-            );
-        }
-        let requests_identity = deployment
-            .identity_audiences
-            .as_object()
-            .is_some_and(|m| !m.is_empty());
-        if requests_identity {
-            anyhow::bail!(
-                "the ECS backend does not yet deliver workload-identity tokens, but this \
-                 deployment declares `[identity].audiences`. The token files would never \
-                 appear at /var/run/secrets/rise/identity/, so the workload would fail at \
-                 runtime. Remove the `[identity]` section, or use the Kubernetes or Docker \
-                 backend."
             );
         }
         Ok(())
@@ -1405,12 +1410,37 @@ impl EcsReconciler {
             Self::permanent(ssm::validate(key, value))?;
         }
 
+        // Every task carries the identity sidecar: the credential is universal
+        // on every backend. A deployment already serving without one gains it
+        // here too, which registers a new revision and rolls it once.
+        let identity_credential = IdentityCredentialPlan {
+            parameter: ssm::identity_credential_parameter(
+                &self.config.ssm_parameter_prefix,
+                &project.name,
+                &deployment.deployment_group,
+                &deployment.deployment_id,
+            ),
+            deployment_uuid: deployment.id,
+            provision: deployment.identity_credential_hash.is_none(),
+        };
+        let identity_agent = IdentityAgentSpec {
+            image: self.config.identity_agent_image.clone(),
+            credential_parameter: identity_credential.parameter.clone(),
+            token_url: format!(
+                "{}{TOKEN_EXCHANGE_PATH}",
+                self.config.identity_exchange_url.trim_end_matches('/')
+            ),
+            audiences: declared_audiences(&deployment.identity_audiences),
+            token_ttl_seconds: self.config.identity_token_ttl_seconds,
+        };
+
         // Everything build() rejects -- an unsatisfiable Fargate size, an
         // environment past the task-definition limit -- is a property of the
         // spec and will be rejected identically forever.
         let task_def = Self::permanent(task_definition::build(
             &desired_container,
             &secrets,
+            Some(&identity_agent),
             &TaskDefinitionConfig {
                 resource_prefix: &self.config.resource_prefix,
                 cpu_architecture: &self.config.cpu_architecture,
@@ -1467,6 +1497,7 @@ impl EcsReconciler {
             task_definition_hash: task_def.content_hash(),
             desired_count: replica_count as i32,
             shape: self.desired_shape(),
+            identity_credential: Some(identity_credential),
             tags: ServiceTags {
                 project: project.name.clone(),
                 project_uuid: project.id.to_string(),
@@ -1730,10 +1761,63 @@ impl EcsReconciler {
         project: &Project,
         entry: &(DesiredService, TaskDefinitionSpec, DesiredContainer),
     ) -> Result<String> {
-        let (_, task_def, desired_container) = entry;
+        let (desired, task_def, desired_container) = entry;
+        if let Some(plan) = &desired.identity_credential {
+            self.provision_identity_credential(project, plan).await?;
+        }
         self.put_secrets(project, desired_container, task_def)
             .await?;
         self.register_task_definition(task_def).await
+    }
+
+    /// Mint a deployment's workload-identity bootstrap credential, once.
+    ///
+    /// The order is what makes this safe to interrupt: the parameter is written
+    /// first and the hash persisted second, and both happen before the task
+    /// definition that references the parameter is registered. A failure at any
+    /// point leaves no service running with a credential the token endpoint does
+    /// not know, and the next tick -- still seeing no hash -- simply mints again,
+    /// overwriting a parameter nothing has read yet. Once the hash is on record
+    /// the plan stops asking for provisioning and the parameter is left alone.
+    async fn provision_identity_credential(
+        &self,
+        project: &Project,
+        plan: &IdentityCredentialPlan,
+    ) -> Result<()> {
+        if !plan.provision {
+            return Ok(());
+        }
+        let credential = rise_backend_auth::generate_bootstrap_credential();
+        let mut req = self
+            .ssm
+            .put_parameter()
+            .name(&plan.parameter)
+            .value(&credential)
+            .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+            .overwrite(true);
+        if let Some(key_id) = &self.config.ssm_kms_key_id {
+            req = req.key_id(key_id);
+        }
+        req.send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write the workload identity credential for project {} to SSM: {}",
+                project.name,
+                aws_error_detail(&e)
+            )
+        })?;
+        self.store
+            .set_identity_credential_hash(
+                plan.deployment_uuid,
+                &rise_backend_auth::sha256_hex(credential.as_bytes()),
+            )
+            .await
+            .context("Failed to persist the workload identity credential hash")?;
+        info!(
+            project = %project.name,
+            deployment = %plan.deployment_uuid,
+            "Provisioned the workload identity credential"
+        );
+        Ok(())
     }
 
     /// Write the deployment's secret env vars to SSM as `SecureString`s.
@@ -1743,7 +1827,7 @@ impl EcsReconciler {
         desired_container: &DesiredContainer,
         task_def: &TaskDefinitionSpec,
     ) -> Result<()> {
-        let secrets = &task_def.containers[0].secrets;
+        let secrets = &task_def.app().secrets;
         if secrets.is_empty() {
             return Ok(());
         }
@@ -1869,54 +1953,9 @@ impl EcsReconciler {
     async fn register_task_definition(&self, spec: &TaskDefinitionSpec) -> Result<String> {
         use aws_sdk_ecs::types as ecs_types;
 
-        let container = &spec.containers[0];
-        let mut cd = ecs_types::ContainerDefinition::builder()
-            .name(&container.name)
-            .image(&container.image)
-            .essential(true);
-
-        for (k, v) in &container.environment {
-            cd = cd.environment(ecs_types::KeyValuePair::builder().name(k).value(v).build());
-        }
-        for secret in &container.secrets {
-            cd = cd.secrets(
-                ecs_types::Secret::builder()
-                    .name(&secret.name)
-                    .value_from(&secret.value_from)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid secret reference: {e}"))?,
-            );
-        }
-        for (k, v) in &container.docker_labels {
-            cd = cd.docker_labels(k, v);
-        }
-        if let Some(arn) = &container.repository_credentials_secret_arn {
-            cd = cd.repository_credentials(
-                ecs_types::RepositoryCredentials::builder()
-                    .credentials_parameter(arn)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid repository credentials: {e}"))?,
-            );
-        }
-        if let Some(port) = container.port {
-            cd = cd.port_mappings(
-                ecs_types::PortMapping::builder()
-                    .container_port(port as i32)
-                    .protocol(ecs_types::TransportProtocol::Tcp)
-                    .build(),
-            );
-        }
-        if let Some(log) = &container.log_config {
-            cd = cd.log_configuration(
-                ecs_types::LogConfiguration::builder()
-                    .log_driver(ecs_types::LogDriver::Awslogs)
-                    .options("awslogs-group", &log.log_group)
-                    .options("awslogs-region", &log.region)
-                    .options("awslogs-stream-prefix", &log.stream_prefix)
-                    .options("awslogs-create-group", "true")
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid log configuration: {e}"))?,
-            );
+        let mut container_definitions = Vec::with_capacity(spec.containers.len());
+        for container in &spec.containers {
+            container_definitions.push(container_definition(container)?);
         }
 
         let mut req = self
@@ -1948,7 +1987,12 @@ impl EcsReconciler {
                     .operating_system_family(ecs_types::OsFamily::Linux)
                     .build(),
             )
-            .container_definitions(cd.build());
+            .set_container_definitions(Some(container_definitions));
+        for volume in &spec.volumes {
+            // No host path: a task-scoped volume that lives and dies with the
+            // task (an ephemeral bind mount on Fargate).
+            req = req.volumes(ecs_types::Volume::builder().name(volume).build());
+        }
         if let Some(arn) = &spec.execution_role_arn {
             req = req.execution_role_arn(arn);
         }
@@ -2718,9 +2762,14 @@ impl EcsReconciler {
                     .find(|d| d.name() == Some("privateIPv4Address"))
                     .and_then(|d| d.value())
                     .map(str::to_string);
-                // The first container is the app's: Rise runs one container per
-                // task definition, so its exit code is the task's.
-                let container = task.containers().first();
+                // The app's container, not the identity sidecar's: Rise runs one
+                // app container per task definition, so its exit code is the
+                // task's. ECS does not promise to list containers in
+                // task-definition order.
+                let container = task
+                    .containers()
+                    .iter()
+                    .find(|c| c.name() != Some(task_definition::IDENTITY_AGENT_CONTAINER));
                 views.push(TaskView {
                     name: name.clone(),
                     task_definition_arn: task.task_definition_arn().unwrap_or_default().to_string(),
@@ -2770,6 +2819,107 @@ impl rise_backend_core::lifecycle::SupersededHook for EcsReconciler {
         )
         .await
     }
+}
+
+/// Convert one container of a [`TaskDefinitionSpec`] to its SDK form.
+fn container_definition(
+    container: &task_definition::ContainerDefinitionSpec,
+) -> Result<aws_sdk_ecs::types::ContainerDefinition> {
+    use aws_sdk_ecs::types as ecs_types;
+
+    let mut cd = ecs_types::ContainerDefinition::builder()
+        .name(&container.name)
+        .image(&container.image)
+        .essential(container.essential);
+
+    for arg in &container.command {
+        cd = cd.command(arg);
+    }
+    for (k, v) in &container.environment {
+        cd = cd.environment(ecs_types::KeyValuePair::builder().name(k).value(v).build());
+    }
+    for secret in &container.secrets {
+        cd = cd.secrets(
+            ecs_types::Secret::builder()
+                .name(&secret.name)
+                .value_from(&secret.value_from)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid secret reference: {e}"))?,
+        );
+    }
+    for (k, v) in &container.docker_labels {
+        cd = cd.docker_labels(k, v);
+    }
+    if let Some(arn) = &container.repository_credentials_secret_arn {
+        cd = cd.repository_credentials(
+            ecs_types::RepositoryCredentials::builder()
+                .credentials_parameter(arn)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid repository credentials: {e}"))?,
+        );
+    }
+    if let Some(port) = container.port {
+        cd = cd.port_mappings(
+            ecs_types::PortMapping::builder()
+                .container_port(port as i32)
+                .protocol(ecs_types::TransportProtocol::Tcp)
+                .build(),
+        );
+    }
+    for mount in &container.mount_points {
+        cd = cd.mount_points(
+            ecs_types::MountPoint::builder()
+                .source_volume(&mount.source_volume)
+                .container_path(&mount.container_path)
+                .read_only(mount.read_only)
+                .build(),
+        );
+    }
+    for dependency in &container.depends_on_healthy {
+        cd = cd.depends_on(
+            ecs_types::ContainerDependency::builder()
+                .container_name(dependency)
+                .condition(ecs_types::ContainerCondition::Healthy)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid container dependency: {e}"))?,
+        );
+    }
+    if let Some(hc) = &container.health_check {
+        cd = cd.health_check(
+            ecs_types::HealthCheck::builder()
+                .set_command(Some(hc.command.clone()))
+                .interval(hc.interval)
+                .timeout(hc.timeout)
+                .retries(hc.retries)
+                .start_period(hc.start_period)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid health check: {e}"))?,
+        );
+    }
+    if container.restart_on_exit {
+        cd = cd.restart_policy(
+            ecs_types::ContainerRestartPolicy::builder()
+                .enabled(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid restart policy: {e}"))?,
+        );
+    }
+    if let Some(mib) = container.memory_reservation_mib {
+        cd = cd.memory_reservation(mib);
+    }
+    if let Some(log) = &container.log_config {
+        cd = cd.log_configuration(
+            ecs_types::LogConfiguration::builder()
+                .log_driver(ecs_types::LogDriver::Awslogs)
+                .options("awslogs-group", &log.log_group)
+                .options("awslogs-region", &log.region)
+                .options("awslogs-stream-prefix", &log.stream_prefix)
+                .options("awslogs-create-group", "true")
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid log configuration: {e}"))?,
+        );
+    }
+    Ok(cd.build())
 }
 
 /// One observed ECS task, reduced to what the readiness verdict needs.
@@ -3224,6 +3374,21 @@ mod tests {
                 "{live:?} must not be failed -- its services would be deleted under it"
             );
         }
+    }
+
+    #[test]
+    fn declared_audiences_are_the_safe_entries_of_the_identity_block() {
+        let audiences = super::declared_audiences(&serde_json::json!({
+            "e2e": "rise-e2e-audience",
+            "aws": "sts.amazonaws.com",
+            "../credential": "evil",
+        }));
+        assert_eq!(
+            audiences.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["aws", "e2e"]
+        );
+        assert!(super::declared_audiences(&serde_json::json!({})).is_empty());
+        assert!(super::declared_audiences(&serde_json::Value::Null).is_empty());
     }
 
     /// The rejection text is what `rise deploy` shows the user. The marker in

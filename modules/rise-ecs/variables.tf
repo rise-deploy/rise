@@ -463,6 +463,34 @@ variable "rise_image_ref" {
   }
 }
 
+variable "rise_cli_image" {
+  description = "Rise CLI image repository: the workload-identity sidecar every workload task runs. The workload execution role pulls it with no registry credentials."
+  type        = string
+  default     = "ghcr.io/rise-deploy/rise-cli"
+}
+
+variable "rise_cli_image_tag" {
+  description = "CLI image tag, normally the same release as the control plane. Set this or rise_cli_image_ref, but not both."
+  type        = string
+  default     = null
+}
+
+variable "rise_cli_image_ref" {
+  description = "Complete immutable CLI image reference, such as ghcr.io/rise-deploy/rise-cli@sha256:…. Set this or rise_cli_image_tag, but not both."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = (var.rise_cli_image_ref == null) != (var.rise_cli_image_tag == null)
+    error_message = "Set exactly one of rise_cli_image_ref or rise_cli_image_tag."
+  }
+
+  validation {
+    condition     = var.rise_cli_image_ref == null || strcontains(var.rise_cli_image_ref, "@sha256:")
+    error_message = "rise_cli_image_ref must be an OCI digest reference containing @sha256:."
+  }
+}
+
 variable "rise_cpu" {
   description = "Control-plane task CPU units."
   type        = string
@@ -738,4 +766,16 @@ variable "traefik_constraints" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "identity_exchange_url" {
+  description = "Base URL at which the identity sidecar reaches the Rise API. Null uses the public URL, which workloads reach through the edge; set an internal address only if the apps security group can reach it."
+  type        = string
+  default     = null
+}
+
+variable "identity_token_ttl_seconds" {
+  description = "Lifetime of the auto-minted [identity] workload tokens. The identity sidecar in each task refreshes them at half this. Null keeps Rise's default (3600)."
+  type        = number
+  default     = null
 }

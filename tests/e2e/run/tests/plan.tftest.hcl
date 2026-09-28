@@ -196,6 +196,19 @@ run "the_scope_isolates_dns_routing_and_collection" {
     error_message = "Rise's SSM parameters are not confined to this run"
   }
 
+  # The workload-identity scenario must exercise the sidecar from the rise-cli
+  # image of the commit under test, over an address the tasks can actually
+  # reach, with a TTL short enough to observe a refresh inside the scenario's
+  # window.
+  assert {
+    condition = alltrue([
+      module.control_plane_env.environment["RISE_ECS_IDENTITY_AGENT_IMAGE"] == "ghcr.io/rise-deploy/rise-cli:0.23.0",
+      module.control_plane_env.environment["RISE_ECS_IDENTITY_EXCHANGE_URL"] == local.auth_backend_url,
+      module.control_plane_env.environment["RISE_IDENTITY_TOKEN_TTL_SECONDS"] == "120",
+    ])
+    error_message = "the identity sidecar is not wired to the image under test, the in-VPC API and a short TTL"
+  }
+
   # Cloud Map is shared across runs, so per-run services need distinct names.
   assert {
     condition     = module.runtime.traefik.discovery_name == "traefik-pr-457"

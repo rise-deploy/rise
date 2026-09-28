@@ -1,7 +1,8 @@
-use axum::{extract::State, http::HeaderMap, response::IntoResponse, Json};
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, response::Response, Json};
 
 use crate::db::{
-    deployments as db_deployments, environments as db_environments, projects as db_projects,
+    deployments as db_deployments, environments as db_environments, models::Deployment,
+    models::Project, projects as db_projects,
 };
 use crate::server::auth::middleware::extract_bearer_token;
 use crate::server::deployment::webhook::should_have_infrastructure;
@@ -12,31 +13,35 @@ use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeToken
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_auth::WorkloadSubjectInfo;
 
-/// Exchange a deployment's bootstrap credential for a workload identity token.
-///
-/// This route is unauthenticated: the bootstrap credential presented in the
-/// `Authorization: Bearer` header *is* the authentication. A missing deployment
-/// and a deployment without live infrastructure are both reported as an invalid
-/// credential, so a caller cannot distinguish the two.
-pub async fn exchange_token(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(req): Json<ExchangeTokenRequest>,
-) -> Result<impl IntoResponse, ServerError> {
-    let ip = extract_client_ip(&headers);
+/// The deployment a bootstrap credential authenticates as, with what minting a
+/// token for it needs.
+struct CredentialSubject {
+    deployment: Deployment,
+    project: Project,
+    environment: Option<String>,
+}
 
-    let credential = extract_bearer_token(&headers)
+impl CredentialSubject {
+    fn sub(&self) -> String {
+        workload_subject(&self.project.name, self.environment.as_deref())
+    }
+}
+
+/// Authenticate the bootstrap credential in the `Authorization: Bearer` header.
+///
+/// `Ok(Err(response))` is a rate-limited request, answered with that response.
+/// A missing deployment and a deployment without live infrastructure are both
+/// reported as a rejected credential, so a caller cannot distinguish the two.
+async fn authenticate_credential(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Result<CredentialSubject, Response>, ServerError> {
+    let ip = extract_client_ip(headers);
+
+    let credential = extract_bearer_token(headers)
         .map(|c| c.trim().to_string())
         .filter(|c| !c.is_empty())
         .ok_or_else(|| ServerError::unauthorized("Missing bootstrap credential"))?;
-
-    let audience = req.audience.trim();
-    if audience.is_empty() {
-        return Err(ServerError::bad_request("audience must not be empty"));
-    }
-    if audience.len() > 1024 {
-        return Err(ServerError::bad_request("audience value too long"));
-    }
 
     let hash = sha256_hex(credential.as_bytes());
     let deployment_by_credential =
@@ -44,16 +49,20 @@ pub async fn exchange_token(
             .await
             .internal_err("Failed to look up deployment")?;
 
-    let rate_limit_key = deployment_by_credential
-        .as_ref()
-        .map(|d| d.id.to_string())
-        .unwrap_or_else(|| "invalid-credential".to_string());
-    if let Err(retry_after) = state
-        .oauth_rate_limiter
-        .increment_and_check(&ip, None, &rate_limit_key)
-        .await
-    {
-        return Ok(rate_limit_response(retry_after).into_response());
+    // A valid credential is the caller's identity; the address is used only to
+    // slow down credentials that match nothing. See
+    // `WorkloadTokenRateLimitSettings`.
+    let limited = match &deployment_by_credential {
+        Some(d) => {
+            state
+                .workload_token_rate_limiter
+                .authenticated(&d.id.to_string())
+                .await
+        }
+        None => state.workload_token_rate_limiter.rejected(&ip).await,
+    };
+    if let Err(retry_after) = limited {
+        return Ok(Err(rate_limit_response(retry_after).into_response()));
     }
 
     let deployment = match deployment_by_credential {
@@ -88,10 +97,55 @@ pub async fn exchange_token(
         None => None,
     };
 
-    let sub = workload_subject(&project.name, environment.as_deref());
+    Ok(Ok(CredentialSubject {
+        deployment,
+        project,
+        environment,
+    }))
+}
 
-    let max_ttl = state.server_settings.workload_token_max_ttl_seconds;
-    let ttl = req.ttl_seconds.map(|t| t.min(max_ttl)).unwrap_or(max_ttl);
+/// The lifetime of an exchanged token: what the caller asked for, capped at
+/// `identity_token_ttl_seconds`, or that cap when the caller did not ask.
+///
+/// One cap for every workload identity token. It is also the lifetime of the
+/// auto-minted token files, which a workload can read anyway, so an exchanged
+/// token may live as long as those do and no longer. The ECS identity sidecar
+/// writes those files through this endpoint, so the two cannot drift.
+fn capped_ttl(requested: Option<u64>, cap: u64) -> u64 {
+    requested.map_or(cap, |t| t.min(cap))
+}
+
+/// Exchange a deployment's bootstrap credential for a workload identity token.
+///
+/// This route is unauthenticated: the bootstrap credential presented in the
+/// `Authorization: Bearer` header *is* the authentication. Callers are the
+/// workload itself (`rise identity token`) and, on ECS, the identity sidecar
+/// writing the `[identity]` token files.
+pub async fn exchange_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ExchangeTokenRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    let audience = req.audience.trim();
+    if audience.is_empty() {
+        return Err(ServerError::bad_request("audience must not be empty"));
+    }
+    if audience.len() > 1024 {
+        return Err(ServerError::bad_request("audience value too long"));
+    }
+
+    let subject = match authenticate_credential(&state, &headers).await? {
+        Ok(subject) => subject,
+        Err(rate_limited) => return Ok(rate_limited),
+    };
+    let CredentialSubject {
+        deployment,
+        project,
+        environment,
+    } = &subject;
+    let sub = subject.sub();
+
+    let ttl = capped_ttl(req.ttl_seconds, state.identity_token_ttl_seconds);
 
     let token = state
         .jwt_signer
@@ -130,8 +184,14 @@ pub async fn exchange_token(
 mod tests {
     use super::*;
 
-    /// The empty-audience guard is pure input validation: an audience that is
-    /// only whitespace is rejected as a bad request.
+    #[test]
+    fn exchanged_tokens_live_at_most_as_long_as_the_token_files() {
+        assert_eq!(capped_ttl(None, 3600), 3600, "omitted means the cap");
+        assert_eq!(capped_ttl(Some(600), 3600), 600);
+        assert_eq!(capped_ttl(Some(3600), 3600), 3600);
+        assert_eq!(capped_ttl(Some(86_400), 3600), 3600);
+    }
+
     #[test]
     fn empty_audience_is_rejected() {
         for raw in ["", "   ", "\t\n"] {

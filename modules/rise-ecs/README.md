@@ -43,6 +43,10 @@ module "rise_ecs" {
   log_group_name = "/rise"
   rise_image_tag = "0.23.0"
   admin_email    = "ops@example.com"
+
+  # The workload-identity sidecar in every workload task. Required, like the
+  # control plane's image; normally the same release.
+  rise_cli_image_tag = "0.23.0"
   acme_email     = "ops@example.com"
 
   controller_role_arn      = module.rise_aws.role_arn
@@ -60,7 +64,8 @@ module "rise_ecs" {
 
 `rise_image_ref` accepts a digest-pinned public image directly, for example
 `ghcr.io/rise-deploy/rise@sha256:…`. Set exactly one of `rise_image_ref` and
-`rise_image_tag`.
+`rise_image_tag`, and likewise one of `rise_cli_image_ref` and
+`rise_cli_image_tag` for the `rise-cli` image the identity sidecar runs.
 
 Then create the DNS records from the `dns_records_required` output, or pass
 `route53_zone_id` and let the module make them. **The wildcard is required**:

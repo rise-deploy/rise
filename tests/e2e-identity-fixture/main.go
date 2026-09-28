@@ -16,6 +16,12 @@
 // "curl this app and check the JSON" — byte-for-byte identical across backends.
 // The reachability mechanism (Traefik vs. port-forward) is the only thing that
 // differs, and that lives in the per-backend e2e scripts.
+//
+// RISE_E2E_API_URL, when set, is where the fixture *sends* its requests to Rise
+// (discovery, JWKS, token exchange) instead of RISE_ISSUER. The issuer is still
+// what it reports and verifies against. It exists for a harness whose workloads
+// cannot route to the public URL they would use in production — the ECS
+// environment admits only the harness's own address at its edge.
 package main
 
 import (
@@ -67,6 +73,23 @@ func main() {
 
 func riseIssuer() string {
 	return strings.TrimRight(os.Getenv("RISE_ISSUER"), "/")
+}
+
+// apiBase is where requests to Rise go: RISE_E2E_API_URL if set, else the issuer.
+func apiBase() string {
+	if base := strings.TrimRight(os.Getenv("RISE_E2E_API_URL"), "/"); base != "" {
+		return base
+	}
+	return riseIssuer()
+}
+
+// reachable rewrites a URL Rise advertised under its issuer to go to apiBase.
+func reachable(url string) string {
+	issuer := riseIssuer()
+	if issuer != "" && strings.HasPrefix(url, issuer) {
+		return apiBase() + strings.TrimPrefix(url, issuer)
+	}
+	return url
 }
 
 // tokenResult is the per-token report returned to the harness.
@@ -164,7 +187,7 @@ func exchangeToken(credential, audience string) (string, error) {
 		return "", fmt.Errorf("bootstrap credential missing at %s", credentialPath)
 	}
 	body, _ := json.Marshal(map[string]string{"audience": audience})
-	req, err := http.NewRequest(http.MethodPost, riseIssuer()+"/api/v1/identity/token", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, apiBase()+"/api/v1/identity/token", bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -246,7 +269,7 @@ func fetchJWKS(issuer string) (*jwkSet, error) {
 	}
 	client := &http.Client{Timeout: 15 * time.Second}
 
-	discoResp, err := client.Get(issuer + "/.well-known/openid-configuration")
+	discoResp, err := client.Get(reachable(issuer + "/.well-known/openid-configuration"))
 	if err != nil {
 		return nil, fmt.Errorf("fetch discovery: %w", err)
 	}
@@ -264,7 +287,7 @@ func fetchJWKS(issuer string) (*jwkSet, error) {
 		return nil, fmt.Errorf("discovery advertised no jwks_uri")
 	}
 
-	jwksResp, err := client.Get(disco.JwksURI)
+	jwksResp, err := client.Get(reachable(disco.JwksURI))
 	if err != nil {
 		return nil, fmt.Errorf("fetch jwks: %w", err)
 	}

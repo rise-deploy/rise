@@ -17,6 +17,7 @@ module "rise" {
   ingress_domain           = "rise.example.com"
   admin_email              = "ops@example.com"
   rise_image_tag           = "0.23.0"
+  rise_cli_image_tag       = "0.23.0"
   acme_email               = "ops@example.com"
   controller_role_arn      = "arn:aws:iam::123456789012:role/rise"
   execution_role_arn       = "arn:aws:iam::123456789012:role/rise-ecs-execution"

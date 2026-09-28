@@ -414,11 +414,9 @@ pub struct ServerSettings {
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
 
-    /// Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.
-    /// Requests that specify a higher TTL are silently capped to this value.
-    /// Default: 900 (15 minutes).
-    #[serde(default = "default_workload_token_max_ttl_seconds")]
-    pub workload_token_max_ttl_seconds: u64,
+    /// Rate limiting for the workload identity token-exchange endpoint.
+    #[serde(default)]
+    pub workload_token_rate_limit: WorkloadTokenRateLimitSettings,
 
     /// Lifetime in seconds of Rise access tokens minted by the auth
     /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
@@ -467,6 +465,55 @@ pub struct OAuthRateLimitSettings {
     /// Window in seconds for the global limit (default: 60)
     #[serde(default = "default_oauth_global_window_secs")]
     pub global_window_secs: u64,
+}
+
+/// Rate limiting for the workload identity token-exchange endpoint
+/// (`POST /api/v1/identity/token`), kept apart from the OAuth limiter so login
+/// traffic and token minting never share a budget.
+///
+/// A valid bootstrap credential is 256 random bits naming one deployment, a
+/// better caller identity than an address: workloads behind one NAT gateway, or
+/// reaching Rise over an internal address with no proxy headers, would all look
+/// like one client. So a request with a valid credential counts only against its
+/// deployment's budget, and the per-IP budget counts only rejected credentials —
+/// which is what slows guessing without throttling every task behind a NAT.
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+pub struct WorkloadTokenRateLimitSettings {
+    /// Maximum requests per deployment (valid credential) per window (default: 500)
+    #[serde(default = "default_workload_token_per_deployment_max")]
+    pub per_deployment_max: u32,
+    /// Window for the per-deployment limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub per_deployment_window_secs: u64,
+    /// Maximum rejected credentials per client IP per window (default: 50)
+    #[serde(default = "default_workload_token_rejected_per_ip_max")]
+    pub rejected_per_ip_max: u32,
+    /// Window for the rejected-credential limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub rejected_per_ip_window_secs: u64,
+}
+
+impl Default for WorkloadTokenRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            per_deployment_max: default_workload_token_per_deployment_max(),
+            per_deployment_window_secs: default_workload_token_window_secs(),
+            rejected_per_ip_max: default_workload_token_rejected_per_ip_max(),
+            rejected_per_ip_window_secs: default_workload_token_window_secs(),
+        }
+    }
+}
+
+fn default_workload_token_per_deployment_max() -> u32 {
+    500
+}
+
+fn default_workload_token_rejected_per_ip_max() -> u32 {
+    50
+}
+
+fn default_workload_token_window_secs() -> u64 {
+    60
 }
 
 impl Default for OAuthRateLimitSettings {
@@ -616,10 +663,6 @@ fn default_jwt_claims() -> Vec<String> {
 
 fn default_jwt_expiry_seconds() -> u64 {
     86400 // 24 hours
-}
-
-fn default_workload_token_max_ttl_seconds() -> u64 {
-    900 // 15 minutes
 }
 
 fn default_auth_token_max_ttl_seconds() -> u64 {
@@ -1453,9 +1496,10 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens auto-minted by the controller
-        /// and mounted into deployment pods. The controller re-mints tokens when they
-        /// are older than half this value. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those auto-minted by
+        /// the controller and mounted into deployment pods (re-minted once older
+        /// than half this value), and the cap on tokens from the token-exchange
+        /// endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1642,8 +1686,9 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens minted for
-        /// deployments. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those minted into
+        /// the `[identity]` token files, and the cap on tokens from the
+        /// token-exchange endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1884,11 +1929,31 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens. Accepted for
-        /// forward-compatibility; ECS v1 does not deliver identity material and
-        /// rejects deployments that request it.
-        #[serde(default = "default_identity_token_ttl_seconds")]
+        /// Lifetime in seconds of workload identity tokens: the `[identity]`
+        /// token files, which the identity sidecar in each task refreshes at half
+        /// this, and the cap on tokens from the token-exchange endpoint.
+        #[serde(
+            default = "default_identity_token_ttl_seconds",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
         identity_token_ttl_seconds: u64,
+
+        /// The `rise-cli` image the workload-identity sidecar in every task
+        /// runs (`rise identity agent`), normally the same release as this
+        /// server. Required, like the server's own image: nothing infers it.
+        /// The workload execution role must be able to pull it. Changing it
+        /// affects new deployments only: running services keep the sidecar they
+        /// started with.
+        #[serde(default)]
+        identity_agent_image: String,
+
+        /// Base URL at which the identity sidecar reaches the Rise API to fetch
+        /// `[identity]` tokens. Defaults to the server `public_url` — the URL
+        /// the workload itself uses for `rise identity token`. Set it to an
+        /// internal address when tasks have no route to the public one.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        identity_exchange_url: Option<String>,
     },
 }
 
@@ -2261,6 +2326,23 @@ impl Settings {
         })
         .map_err(|e| ConfigError::Message(format!("Failed to deserialize settings: {}", e)))?;
 
+        // A removed key that capped token lifetimes must not be silently
+        // ignored: an operator who set it chose a shorter lifetime, and ignoring
+        // it would lengthen every exchanged token behind their back.
+        if unused_fields
+            .iter()
+            .any(|f| f == "server.workload_token_max_ttl_seconds")
+        {
+            return Err(ConfigError::Message(
+                "server.workload_token_max_ttl_seconds has been removed. Workload identity \
+                 tokens from the token-exchange endpoint are now capped by \
+                 deployment_controller.identity_token_ttl_seconds, the same lifetime as the \
+                 auto-minted [identity] token files. Remove the key and set \
+                 identity_token_ttl_seconds to the lifetime you want."
+                    .to_string(),
+            ));
+        }
+
         // Warn about unused fields
         for field in &unused_fields {
             tracing::warn!("Unknown configuration field in backend config: {}", field);
@@ -2537,6 +2619,7 @@ impl Settings {
             ref capacity,
             ref execution_role_arn,
             ref repository_credentials_secret_arn,
+            ref identity_agent_image,
             ..
         }) = settings.deployment_controller
         {
@@ -2580,6 +2663,19 @@ impl Settings {
             if cluster.trim().is_empty() {
                 return Err(ConfigError::Message(
                     "deployment_controller.cluster must name an ECS cluster".to_string(),
+                ));
+            }
+
+            // Every task runs the identity sidecar, so without an image no task
+            // can start. Required rather than inferred: a guessed image may
+            // predate the agent.
+            if identity_agent_image.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.identity_agent_image (RISE_ECS_IDENTITY_AGENT_IMAGE) \
+                     must name the rise-cli image the workload-identity sidecar runs, \
+                     normally the same release as this server, e.g. \
+                     ghcr.io/rise-deploy/rise-cli:<version>"
+                        .to_string(),
                 ));
             }
 
@@ -3056,6 +3152,41 @@ unknown_top_level: "also unknown"
             result.is_ok(),
             "Config should load despite unknown fields: {:?}",
             result.err()
+        );
+    }
+
+    /// Removing the exchanged-token cap must not silently lengthen tokens for an
+    /// operator who had set it: the key fails startup with its replacement.
+    #[test]
+    fn the_removed_exchange_ttl_cap_fails_startup_instead_of_being_ignored() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("development.yaml"),
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+  workload_token_max_ttl_seconds: 300
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let err =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+                .expect_err("the removed key must be refused");
+        assert!(
+            err.to_string().contains("identity_token_ttl_seconds"),
+            "should name the replacement: {err}"
         );
     }
 
@@ -3586,6 +3717,10 @@ auth:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
@@ -3696,6 +3831,19 @@ server:
         assert_eq!(settings.server.port, 3000);
     }
 
+    /// Every task runs the identity sidecar; with no image, none can start.
+    #[test]
+    fn ecs_config_without_an_identity_agent_image_is_rejected_at_load() {
+        let mut env = ecs_base_env();
+        env.remove("RISE_ECS_IDENTITY_AGENT_IMAGE");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("identity_agent_image"),
+            "should name the missing setting: {err}"
+        );
+    }
+
     #[test]
     fn ecs_config_without_subnets_is_rejected_at_load() {
         // A task with no subnet cannot be placed at all, and ECS only says so on
@@ -3703,6 +3851,10 @@ server:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "");
         env.insert("RISE_ECS_SECURITY_GROUPS", "");
 
@@ -3760,6 +3912,10 @@ server:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "subnet-abc");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");

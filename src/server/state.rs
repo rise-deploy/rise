@@ -145,6 +145,8 @@ pub struct AppState {
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
     /// Rate limiter for OAuth endpoints (token, authorize, callback)
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
+    /// Rate limiter for the workload identity token-exchange endpoint.
+    pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
     /// Project-name labels reserved for control-plane hosts. Normalized to
@@ -444,6 +446,9 @@ async fn init_ecs_backend(
         controller_class_name,
         reconcile_interval_secs,
         health_probes,
+        identity_agent_image,
+        identity_exchange_url,
+        identity_token_ttl_seconds,
         ..
     } = settings
     else {
@@ -524,6 +529,8 @@ async fn init_ecs_backend(
         );
     }
 
+    tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
+
     let reconciler = EcsReconciler::new(
         ecs,
         ssm,
@@ -559,6 +566,11 @@ async fn init_ecs_backend(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
+            identity_agent_image: identity_agent_image.trim().to_string(),
+            identity_exchange_url: identity_exchange_url
+                .clone()
+                .unwrap_or_else(|| public_url.to_string()),
+            identity_token_ttl_seconds: *identity_token_ttl_seconds,
         },
     );
     let reconciler_handle = reconciler.spawn(shutdown);
@@ -1892,6 +1904,11 @@ impl AppState {
                 .build(),
         );
 
+        let workload_token_rate_limiter =
+            Arc::new(crate::server::rate_limit::WorkloadTokenRateLimiter::new(
+                &settings.server.workload_token_rate_limit,
+            ));
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -2058,6 +2075,7 @@ impl AppState {
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,
+            workload_token_rate_limiter,
             access_classes,
             reserved_project_names,
             signin_base_url,

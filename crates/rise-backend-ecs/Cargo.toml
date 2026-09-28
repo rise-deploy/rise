@@ -25,6 +25,7 @@ aws-sdk-sts = { version = "1.80", default-features = false, features = [
     "sigv4a",
 ] }
 chrono = { workspace = true }
+rise-backend-auth = { path = "../rise-backend-auth" }
 rise-backend-core = { path = "../rise-backend-core" }
 rise-backend-traefik = { path = "../rise-backend-traefik" }
 rise-deployment-spec = { path = "../rise-deployment-spec" }
