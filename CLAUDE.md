@@ -310,6 +310,9 @@ Keep it current as work merges:
   multi-org routing, codebase decomposition). The Project owns *live status*.
   Don't duplicate rationale into the board, and don't create new
   `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files.
+  `ROADMAP.md` §2's *Authentication entry points* table lists every way a
+  credential enters Rise and whether it stays or retires; update it with any
+  new credential path, and never build permanent behavior on a retiring one.
   Architectural decisions are recorded as ADRs under
   `docs/engineering/src/content/docs/adr/` — an ADR records the decision, its
   rationale, and (via its Status field) implementation progress. Prefer an

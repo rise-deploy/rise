@@ -1,5 +1,5 @@
-//! Token helpers: mint the HS256 CI bearer (reusing the server's signer) the
-//! same way the backend signs sessions.
+//! Token helpers: mint the HS256 CI bearer — a legacy Rise session, signed
+//! offline over the shared secret.
 
 use anyhow::Result;
 use base64::Engine as _;
@@ -18,30 +18,42 @@ pub fn jwt_unverified_jti(jwt: &str) -> Option<String> {
     claims.get("jti")?.as_str().map(str::to_string)
 }
 
-/// Mint the admin CI bearer the same way the backend signs sessions: HS256 over
-/// the shared secret, `iss = public_url`, `email = admin@example.com` (an admin
-/// user, so it bypasses ownership checks).
+/// Mint the admin CI bearer: a legacy Rise session — HS256 over the shared
+/// secret, `iss = aud = public_url`, `email = admin@example.com` (an admin
+/// user, so it bypasses ownership checks on the typed APIs).
+///
+/// It names no `User` resource (no `rise-session+jwt` typ, no `rise_uid`),
+/// which is what lets the harness mint it offline before the stack is up and
+/// keep using it across an upgrade from an older release. The typed APIs
+/// accept it for its lifetime; the generic resource API does not, so a
+/// scenario authoring resources logs in through Dex instead (see
+/// `ResourceTokenExchange::operator_session`).
 pub fn mint_ci_token(secret_b64: &str, public_url: &str) -> Result<String> {
-    let signer = rise_backend_auth::RiseTokenSigner::new(
-        secret_b64,
-        public_url.to_string(),
-        // 6h TTL: a full minikube + jfrog-vault run (cluster bring-up, two 10m
-        // kubectl waits, all scenarios) can take well over an hour, and the bearer
-        // is minted once at construction — keep it valid for the whole run.
-        21_600,
-        vec!["sub".to_string(), "email".to_string(), "name".to_string()],
-        None,
-        None,
-    )
-    .map_err(|e| anyhow::anyhow!("build CI token signer: {e}"))?;
+    let secret = base64::engine::general_purpose::STANDARD
+        .decode(secret_b64)
+        .map_err(|e| anyhow::anyhow!("decode CI token secret: {e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
     let claims = serde_json::json!({
         "sub": "rise-ci",
         "email": "admin@example.com",
         "name": "Rise CI",
+        "iat": now,
+        // 6h TTL: a full minikube + jfrog-vault run (cluster bring-up, two 10m
+        // kubectl waits, all scenarios) can take well over an hour, and the
+        // bearer is minted once at construction — keep it valid for the whole
+        // run.
+        "exp": now + 21_600,
+        "iss": public_url,
+        "aud": public_url,
     });
-    signer
-        .sign_user_jwt(&claims, None, public_url, None)
-        .map_err(|e| anyhow::anyhow!("sign CI token: {e}"))
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(&secret),
+    )
+    .map_err(|e| anyhow::anyhow!("sign CI token: {e}"))
 }
 
 #[cfg(test)]
@@ -70,6 +82,7 @@ mod tests {
         let claims = signer.verify_user_jwt(&tok, url).expect("verify");
         assert_eq!(claims.email, "admin@example.com");
         assert_eq!(claims.iss, url);
+        assert_eq!(claims.rise_uid, None, "a legacy session names no User");
 
         // HS256 header.
         let header = tok.split('.').next().unwrap();

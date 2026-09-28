@@ -156,6 +156,53 @@ pub async fn find_or_create_with_executor(
     Ok(user)
 }
 
+/// Record that `user_id` last logged in as the `User` resource
+/// `resource_user_uid`, moving the link off any other row that held it.
+pub async fn link_resource_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    resource_user_uid: Uuid,
+) -> Result<()> {
+    let mut tx = pool.begin().await.context("Failed to start transaction")?;
+    sqlx::query!(
+        r#"
+        UPDATE users SET resource_user_uid = NULL, updated_at = NOW()
+        WHERE resource_user_uid = $2 AND id <> $1
+        "#,
+        user_id,
+        resource_user_uid
+    )
+    .execute(&mut *tx)
+    .await
+    .context("Failed to release the User resource link")?;
+    sqlx::query!(
+        r#"
+        UPDATE users SET resource_user_uid = $2, updated_at = NOW()
+        WHERE id = $1 AND resource_user_uid IS DISTINCT FROM $2
+        "#,
+        user_id,
+        resource_user_uid
+    )
+    .execute(&mut *tx)
+    .await
+    .context("Failed to link the User resource")?;
+    tx.commit().await.context("Failed to commit transaction")?;
+    Ok(())
+}
+
+/// The `User` resource a typed users row last logged in as, if any.
+#[cfg(test)]
+pub async fn linked_resource_user(pool: &PgPool, user_id: Uuid) -> Result<Option<Uuid>> {
+    let uid = sqlx::query_scalar!(
+        r#"SELECT resource_user_uid FROM users WHERE id = $1"#,
+        user_id
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to read the User resource link")?;
+    Ok(uid.flatten())
+}
+
 /// Batch fetch user emails by IDs
 pub async fn get_emails_batch(
     pool: &PgPool,
@@ -200,6 +247,27 @@ pub async fn get_users_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test]
+    async fn the_user_resource_link_moves_with_the_latest_login(pool: PgPool) -> Result<()> {
+        let old = create(&pool, "old@example.com").await?;
+        let new = create(&pool, "new@example.com").await?;
+        let resource = Uuid::new_v4();
+
+        link_resource_user(&pool, old.id, resource).await?;
+        assert_eq!(linked_resource_user(&pool, old.id).await?, Some(resource));
+
+        // The same User resource logging in under a changed email moves the
+        // link; at most one row holds it.
+        link_resource_user(&pool, new.id, resource).await?;
+        assert_eq!(linked_resource_user(&pool, new.id).await?, Some(resource));
+        assert_eq!(linked_resource_user(&pool, old.id).await?, None);
+
+        // Relinking is idempotent.
+        link_resource_user(&pool, new.id, resource).await?;
+        assert_eq!(linked_resource_user(&pool, new.id).await?, Some(resource));
+        Ok(())
+    }
 
     #[sqlx::test]
     async fn test_create_user(pool: PgPool) -> Result<()> {

@@ -9,6 +9,7 @@
 use super::*;
 use crate::db::models::User;
 use crate::server::auth::identity::resolve_identity;
+pub(super) use crate::server::auth::user_identity::UserPrincipal;
 use rise_backend_auth::{IdentityClaims, RiseToken};
 use rise_resource_api::RESOURCE_DEFINITION_KIND;
 use rise_resource_store_postgres::PgResourceStore;
@@ -60,16 +61,34 @@ pub(super) async fn ctx_with_operators(
     }
 }
 
-/// An `AnyAuth` carrying a User-backed `AuthContext`. `User` rows do not
-/// need to exist in the DB — the resource API authorizes purely on the
-/// email allowlists.
+/// A `UserPrincipal` naming a fresh User resource that does not exist.
+pub(super) fn test_user_principal() -> UserPrincipal {
+    let uid = Uuid::new_v4();
+    UserPrincipal {
+        name: format!("u-{}", uid.simple()),
+        uid,
+    }
+}
+
+/// An `AnyAuth` carrying a User session. Neither the typed `users` row nor
+/// the `User` resource the session names need exist — operator standing
+/// comes from the email allowlist, and a User resource matters only for
+/// Group ties and bindings naming it (see [`create_user_principal`]).
 pub(super) fn auth(email: &str) -> AnyAuth {
-    AnyAuth::User(AuthContext::User(User {
-        id: Uuid::new_v4(),
-        email: email.to_string(),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    }))
+    user_session(email, test_user_principal())
+}
+
+/// An `AnyAuth` for a session naming `principal`.
+pub(super) fn user_session(email: &str, principal: UserPrincipal) -> AnyAuth {
+    AnyAuth::User(AuthContext::User(
+        User {
+            id: Uuid::new_v4(),
+            email: email.to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+        Some(principal),
+    ))
 }
 
 /// An `AnyAuth` carrying a controller token with the given controller id.
@@ -288,18 +307,12 @@ pub(super) async fn create_org_with_admin(
     .await
 }
 
-/// Create a live root `User` resource whose name is a fresh UUID, and an
-/// `AnyAuth` for a session that authenticates as that same identity.
-///
-/// `AnyAuth::User` derives its subject as `user:<db user id>` (see
-/// `ResourceAuthorizer::principal`), so the resource-store `User`'s name
-/// has to be that same UUID for the two to name one subject — the shape a
-/// real login would produce once Users are JIT-provisioned by UID.
-/// Returns the subject string (`user:<uuid>`) alongside the auth.
+/// Create a live root `User` resource and an `AnyAuth` for a session naming
+/// it, as a login resolving to that User would produce. Returns the subject
+/// string (`user:<name>`) alongside the auth.
 pub(super) async fn create_user_principal(ctx: &ResourceApiCtx) -> (String, AnyAuth) {
-    let id = Uuid::new_v4();
-    let name = id.to_string();
-    create_at(
+    let name = test_user_principal().name;
+    let created = create_at(
         ctx,
         "rise.dev/v1alpha1/users",
         json!({
@@ -310,12 +323,13 @@ pub(super) async fn create_user_principal(ctx: &ResourceApiCtx) -> (String, AnyA
         }),
     )
     .await;
-    let auth = AnyAuth::User(AuthContext::User(User {
-        id,
-        email: format!("{name}@example.com"),
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-    }));
+    let auth = user_session(
+        &format!("{name}@example.com"),
+        UserPrincipal {
+            name: name.clone(),
+            uid: uid_of(&created),
+        },
+    );
     (format!("user:{name}"), auth)
 }
 

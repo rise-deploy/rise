@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE users SET resource_user_uid = $2, updated_at = NOW()\n        WHERE id = $1 AND resource_user_uid IS DISTINCT FROM $2\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "58c954697bbefb3c8583b9c23aa56f1cdbd6ba8ec1ea9af3f5bd4ebd54e9a260"
+}
