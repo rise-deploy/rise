@@ -419,6 +419,9 @@ dex:
           # Backend OAuth2 Proxy flow for ingress auth
           - "http://rise.example.com/api/v1/auth/callback"
           # CLI callback URLs
+          - "http://127.0.0.1:8765/callback"
+          - "http://127.0.0.1:8766/callback"
+          - "http://127.0.0.1:8767/callback"
           - "http://localhost:8765/callback"
           - "http://localhost:8766/callback"
           - "http://localhost:8767/callback"
