@@ -23,9 +23,9 @@ staticClients:
   # redirect_uri`. See the operator docs "Production caveat". e.g.:
   #   - https://rise.example.com/api/v1/auth/callback
   # CLI Auth
-  - http://localhost:8765/callback
-  - http://localhost:8766/callback
-  - http://localhost:8767/callback
+  - http://127.0.0.1:8765/callback
+  - http://127.0.0.1:8766/callback
+  - http://127.0.0.1:8767/callback
   # OAuth extension callbacks (for examples)
   - http://rise.local:3000/oidc/oauth-demo/oauth-dex/callback
   name: 'Rise Backend'

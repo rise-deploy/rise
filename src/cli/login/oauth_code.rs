@@ -6,6 +6,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::Ipv4Addr;
 use tokio::sync::oneshot;
 use tracing;
 
@@ -35,15 +36,20 @@ struct CallbackParams {
 async fn start_callback_server(
     backend_url: &str,
 ) -> Result<(String, tokio::sync::oneshot::Receiver<Result<String>>)> {
+    start_callback_server_on_ports(backend_url, &[8765, 8766, 8767]).await
+}
+
+async fn start_callback_server_on_ports(
+    backend_url: &str,
+    ports: &[u16],
+) -> Result<(String, tokio::sync::oneshot::Receiver<Result<String>>)> {
     use std::sync::Arc;
 
     // Try multiple ports in case one is in use
-    let ports = vec![8765, 8766, 8767];
     let mut last_error = None;
     let backend_url = backend_url.to_string();
 
-    for port in ports {
-        let redirect_uri = format!("http://localhost:{}/callback", port);
+    for &port in ports {
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
@@ -99,10 +105,11 @@ async fn start_callback_server(
             }),
         );
 
-        // Try to bind to this port
-        let addr = format!("localhost:{}", port);
-        match tokio::net::TcpListener::bind(&addr).await {
+        // The listener and redirect must use the same IP so a browser cannot
+        // reach a different service through localhost's other address family.
+        match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
             Ok(listener) => {
+                let redirect_uri = format!("http://{}/callback", listener.local_addr()?);
                 // Successfully bound, start the server in the background
                 tokio::spawn(async move {
                     let _ = axum::serve(listener, app).await;
@@ -116,8 +123,9 @@ async fn start_callback_server(
     }
 
     Err(anyhow::anyhow!(
-        "Failed to bind to any port (tried 8765-8767): {}",
-        last_error.unwrap()
+        "Failed to bind to any port (tried {:?}): {}",
+        ports,
+        last_error.context("No callback ports configured")?
     ))
 }
 
@@ -342,4 +350,76 @@ pub async fn handle_authorization_code_flow(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn callback_skips_occupied_ipv4_ports_and_receives_code() {
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        // Ephemeral ports isolate the test from local apps and parallel tests.
+        for occupied_count in 0..3 {
+            let mut occupied = Vec::new();
+            let mut ports = Vec::new();
+            for _ in 0..occupied_count {
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+                ports.push(listener.local_addr().unwrap().port());
+                occupied.push(listener);
+            }
+            ports.resize(3, 0);
+            let (redirect_uri, code_receiver) =
+                start_callback_server_on_ports("https://rise.example.com", &ports)
+                    .await
+                    .unwrap();
+            let redirect = url::Url::parse(&redirect_uri).unwrap();
+            assert_eq!(redirect.host_str(), Some("127.0.0.1"));
+            assert_eq!(redirect.path(), "/callback");
+            assert!(!ports.contains(&redirect.port().unwrap()));
+
+            let response = client
+                .get(format!("{redirect_uri}?code=test-code"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::SEE_OTHER);
+            assert_eq!(
+                response.headers()[reqwest::header::LOCATION],
+                "https://rise.example.com/api/v1/auth/cli-success?success=true"
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), code_receiver)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                "test-code"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_fails_when_all_ipv4_ports_are_occupied() {
+        let mut occupied = Vec::new();
+        let mut ports = Vec::new();
+        for _ in 0..3 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            ports.push(listener.local_addr().unwrap().port());
+            occupied.push(listener);
+        }
+
+        let error = start_callback_server_on_ports("https://rise.example.com", &ports)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Failed to bind to any port"));
+    }
 }

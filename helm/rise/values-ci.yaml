@@ -25,9 +25,9 @@ dex:
           # Minikube e2e stack runs with (default, and jfrog-vault mode).
           - "http://rise.local/api/v1/auth/callback"
           - "http://rise-ci-chart.rise-ci.svc.cluster.local:3000/api/v1/auth/callback"
-          - "http://localhost:8765/callback"
-          - "http://localhost:8766/callback"
-          - "http://localhost:8767/callback"
+          - "http://127.0.0.1:8765/callback"
+          - "http://127.0.0.1:8766/callback"
+          - "http://127.0.0.1:8767/callback"
         name: "Rise Backend"
         secret: "rise-backend-secret"
         grantTypes:

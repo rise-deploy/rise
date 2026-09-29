@@ -12,7 +12,15 @@ Rise uses JWT tokens for user authentication, service accounts for CI/CD workloa
 rise login --url https://rise.example.com
 ```
 
-This starts a local HTTP server (ports 8765-8767), opens your browser to the OAuth2/OIDC provider, and exchanges the auth code for a Rise JWT token using PKCE. The CLI stores your token and the server URL, so subsequent commands don't need `--url`.
+This starts a local HTTP server on `127.0.0.1`, trying ports 8765, 8766, then 8767 in order, opens your browser to the OAuth2/OIDC provider, and exchanges the auth code for a Rise JWT token using PKCE. The CLI stores your token and the server URL, so subsequent commands don't need `--url`.
+
+The identity provider's Rise client must allow these exact redirect URIs (in Keycloak, add them to **Valid redirect URIs**):
+
+- `http://127.0.0.1:8765/callback`
+- `http://127.0.0.1:8766/callback`
+- `http://127.0.0.1:8767/callback`
+
+The callback listener and redirect both use the IPv4 loopback address so the browser reaches the port reserved by the CLI.
 
 If `RISE_URL` is already set in your environment, you can omit `--url`:
 

@@ -20,7 +20,7 @@ use crate::dex::DexEndpoint;
 
 /// One of the CLI's loopback callbacks, registered on the test Dex client. The
 /// harness never listens on it: it reads the code off the final redirect.
-const REDIRECT_URI: &str = "http://localhost:8765/callback";
+const REDIRECT_URI: &str = "http://127.0.0.1:8765/callback";
 
 /// Upper bound on redirects and form posts before giving up.
 const MAX_STEPS: usize = 12;
@@ -445,27 +445,27 @@ mod tests {
             reroute(&at_issuer, &issuer, &reachable).as_str(),
             "http://127.0.0.1:5556/dex/auth?x=1"
         );
-        let elsewhere = Url::parse("http://localhost:8765/callback?code=c").unwrap();
+        let elsewhere = Url::parse("http://127.0.0.1:8765/callback?code=c").unwrap();
         assert_eq!(reroute(&elsewhere, &issuer, &reachable), elsewhere);
     }
 
     #[test]
     fn the_callback_must_answer_this_login() {
-        let ok = "http://localhost:8765/callback?code=the-code&state=s1";
+        let ok = "http://127.0.0.1:8765/callback?code=the-code&state=s1";
         assert_eq!(code_from_callback(ok, Some("s1")).unwrap(), "the-code");
         assert!(code_from_callback(ok, Some("s2")).is_err());
         assert!(
             code_from_callback(ok, None).is_err(),
             "an unrequested state"
         );
-        let refused = "http://localhost:8765/callback?error=access_denied&state=s1";
+        let refused = "http://127.0.0.1:8765/callback?error=access_denied&state=s1";
         assert!(code_from_callback(refused, Some("s1")).is_err());
 
         // Rise's CLI flow is bound by PKCE and sends no state.
-        let stateless = "http://localhost:8765/callback?code=the-code";
+        let stateless = "http://127.0.0.1:8765/callback?code=the-code";
         assert_eq!(code_from_callback(stateless, None).unwrap(), "the-code");
         // ...which Dex echoes back as an empty parameter.
-        let echoed = "http://localhost:8765/callback?code=the-code&state=";
+        let echoed = "http://127.0.0.1:8765/callback?code=the-code&state=";
         assert_eq!(code_from_callback(echoed, None).unwrap(), "the-code");
         assert!(code_from_callback(stateless, Some("s1")).is_err());
     }
