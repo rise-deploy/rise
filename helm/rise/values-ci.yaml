@@ -21,6 +21,10 @@ dex:
         redirectURIs:
           - "http://rise.example.com/"
           - "http://rise.example.com/api/v1/auth/callback"
+          # Rise's own callback for the web UI sign-in, at each public_url the
+          # Minikube e2e stack runs with (default, and jfrog-vault mode).
+          - "http://rise.local/api/v1/auth/callback"
+          - "http://rise-ci-chart.rise-ci.svc.cluster.local:3000/api/v1/auth/callback"
           - "http://localhost:8765/callback"
           - "http://localhost:8766/callback"
           - "http://localhost:8767/callback"
