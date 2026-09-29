@@ -12,6 +12,7 @@ import { Button } from './components/r-ui';
 import { Icon } from './components/icon';
 import { Home } from './features/home';
 import { Profile } from './features/profile';
+import { DeviceLogin } from './features/device-login';
 import { ProjectsList } from './features/projects-list';
 import { ProjectDetail } from './features/project-detail';
 import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployments';
@@ -192,6 +193,8 @@ export function App() {
         view = 'home';
     } else if (route === 'profile') {
         view = 'profile';
+    } else if (route === 'device') {
+        view = 'device';
     } else if (route === 'projects') {
         view = 'projects';
     } else if (route === 'teams') {
@@ -235,6 +238,7 @@ export function App() {
     switch (view) {
         case 'home':              breadcrumbs = [{ label: 'Home' }]; break;
         case 'profile':           breadcrumbs = [{ label: 'Profile' }]; break;
+        case 'device':            breadcrumbs = [{ label: 'Device login' }]; break;
         case 'projects':          breadcrumbs = [{ label: 'Projects' }]; break;
         case 'teams':             breadcrumbs = [{ label: 'Teams' }]; break;
         case 'project-detail':    breadcrumbs = [
@@ -307,6 +311,7 @@ export function App() {
                 <ErrorBoundary key={pathname}>
                     {view === 'home' && <Home user={user} />}
                     {view === 'profile' && <Profile user={user} />}
+                    {view === 'device' && <DeviceLogin />}
                     {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
                     {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
                     {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}

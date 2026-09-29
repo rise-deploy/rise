@@ -723,15 +723,37 @@ impl Backend for MinikubeBackend {
             })?;
         } else {
             report::step("helm upgrade --install", || {
-                let mut helm = Command::new("helm");
-                helm.args([
-                    "upgrade",
-                    "--install",
-                    RELEASE,
-                    &self.repo_path("helm/rise"),
-                ]);
-                helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
-                cli::run_checked(helm).context("helm upgrade --install")
+                let install = || {
+                    let mut helm = Command::new("helm");
+                    helm.args([
+                        "upgrade",
+                        "--install",
+                        RELEASE,
+                        &self.repo_path("helm/rise"),
+                    ]);
+                    helm.args(self.helm_args(&self.repo_path("helm/rise/values-ci.yaml")));
+                    cli::run_checked(helm)
+                };
+                match install() {
+                    // Helm applies the metacontroller subchart's CRDs and then
+                    // maps our CompositeController in the same command; if the
+                    // API server is not serving the new group yet, the mapping
+                    // fails before any release is stored. Wait for the CRD and
+                    // install once more.
+                    Err(e) if is_crd_mapping_race(&format!("{e:#}")) => {
+                        let mut wait = Command::new("kubectl");
+                        wait.args([
+                            "wait",
+                            "--for=condition=established",
+                            "--timeout=120s",
+                            "crd/compositecontrollers.metacontroller.k8s.io",
+                        ]);
+                        cli::run_checked(wait).context("wait for metacontroller CRDs")?;
+                        install()
+                    }
+                    other => other,
+                }
+                .context("helm upgrade --install")
             })?;
         }
 
@@ -1084,5 +1106,29 @@ impl Backend for MinikubeBackend {
                 self.compose(&["logs", "--no-color", "--tail=100"]),
             );
         }
+    }
+}
+
+/// Whether a failed `helm install` is the race where the metacontroller CRDs
+/// were applied but their kinds were not yet served when Helm mapped the
+/// chart's `CompositeController`.
+fn is_crd_mapping_race(error: &str) -> bool {
+    error.contains("resource mapping not found")
+        && error.contains("no matches for kind")
+        && error.contains("metacontroller.k8s.io")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn recognizes_the_metacontroller_crd_mapping_race() {
+        let race = "stderr: Error: unable to build kubernetes objects from release manifest: \
+            resource mapping not found for name: \"rise-project-controller\" namespace: \"\" \
+            from \"\": no matches for kind \"CompositeController\" in version \
+            \"metacontroller.k8s.io/v1alpha1\"";
+        assert!(super::is_crd_mapping_race(race));
+        assert!(!super::is_crd_mapping_race(
+            "stderr: Error: INSTALLATION FAILED: timed out waiting for the condition"
+        ));
     }
 }

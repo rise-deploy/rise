@@ -104,7 +104,7 @@ The codebase is organized into functional modules:
    - **Environment Variables** (`env_vars/`): Plain and encrypted per-project variables
    - **Custom Domains** (`custom_domains/`): Custom domain registration, verification, TLS wiring
    - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
-   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
+   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps — also used by the ECS identity sidecar (`rise identity agent`) to write a deployment's `[identity]` token files
    - **Generic Resources** (`resources/`): The generic resource API (`/api/v1/resources`) and its garbage collector, authorized through `authz/`
    - **Platform** (`platform/`): Platform/organization-level concerns
    - **Quickstart** (`quickstart/`): Catalog of ready-to-deploy templates (see `config/default.yaml`)
@@ -195,7 +195,7 @@ cargo build --all-features     # Full build with CLI + backend
      - [x] Snowflake OAuth provisioner for Snowflake security integrations
 
 3. **CLI Implementation** (`--features cli`, default) ✅
-   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and device flow
+   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
    - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`

@@ -32,6 +32,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(RegistryBuildPushPull),
         Box::new(SaTokenExchange),
         Box::new(ResourceTokenExchange),
+        Box::new(DeviceLogin),
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
@@ -400,6 +401,115 @@ impl Scenario for SaTokenExchange {
             !raw.success(),
             "expected the un-exchanged external token to be rejected, but it succeeded:\n{}",
             raw.combined()
+        );
+        Ok(())
+    }
+}
+
+// ---- (c'') device login confirmed on Rise's /device page -------------------
+
+/// `rise login --device` end to end, with Rise as the device authorization
+/// server: the approving browser session comes from a real Dex sign-in through
+/// the web UI's flow, and the device session it yields names the same `User`
+/// and `UserIdentity`. CLI sessions, the device session included, may not
+/// approve, so no CLI session can mint its own successor.
+struct DeviceLogin;
+
+impl Scenario for DeviceLogin {
+    fn id(&self) -> &'static str {
+        "device-login"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            BackendKind::Docker | BackendKind::Minikube => Applicability::Run,
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack's Dex serves only the password grant, not a browser sign-in",
+            ),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        use crate::device_login;
+
+        let api = b.api_base();
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let session = crate::login::browser_login(api, dexep, "admin@example.com", "password")
+            .context("sign the approver in through the web UI's Dex sign-in")?;
+
+        // Approve: the CLI's poll turns into a session for the approver.
+        let started = device_login::start(api)?;
+        anyhow::ensure!(
+            started
+                .verification_uri_complete
+                .ends_with(&format!("/device?user_code={}", started.user_code)),
+            "verification URI is not Rise's /device page: {}",
+            started.verification_uri_complete
+        );
+        let pending = device_login::poll(api, &started.device_code)?;
+        anyhow::ensure!(
+            pending.as_ref().err().map(String::as_str) == Some("authorization_pending"),
+            "expected authorization_pending before approval, got {pending:?}"
+        );
+        let request = device_login::lookup(api, &session, &started.user_code)?;
+        anyhow::ensure!(
+            request["reauth_required"] == false && request["client_name"] == "rise-e2e",
+            "unexpected device lookup for a fresh session:\n{request}"
+        );
+        device_login::decide(api, &session, &started.user_code, true)?;
+        let token = device_login::poll(api, &started.device_code)?
+            .map_err(|error| anyhow::anyhow!("expected a token after approval, got {error}"))?;
+
+        let (approver, device) = (
+            device_login::claims(&session)?,
+            device_login::claims(&token)?,
+        );
+        for claim in ["sub", "rise_uid", "rise_identity_uid"] {
+            anyhow::ensure!(
+                !approver[claim].is_null() && approver[claim] == device[claim],
+                "device session {claim} {} differs from the approver's {}",
+                device[claim],
+                approver[claim]
+            );
+        }
+        let me = http::get_auth(&format!("{api}/api/v1/users/me"), &token)?;
+        anyhow::ensure!(
+            me.status == 200 && me.body.contains("admin@example.com"),
+            "device session was not accepted by /users/me ({}):\n{}",
+            me.status,
+            me.body
+        );
+        // Neither the device session nor a `rise login` session may approve.
+        let cli = crate::login::login(api, dexep, "admin@example.com", "password")
+            .context("log in through the CLI's PKCE flow")?;
+        let next = device_login::start(api)?;
+        for (label, bearer) in [("device", &token), ("CLI", &cli)] {
+            let resp = http::post_json(
+                &format!("{api}/api/v1/auth/device/approve"),
+                Some(bearer),
+                &serde_json::json!({"user_code": next.user_code}),
+            )?;
+            anyhow::ensure!(
+                resp.status == 401,
+                "a {label} session approved a device login ({}):\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
+        let reused = device_login::poll(api, &started.device_code)?;
+        anyhow::ensure!(
+            reused.as_ref().err().map(String::as_str) == Some("expired_token"),
+            "a redeemed device code must not yield a second session, got {reused:?}"
+        );
+
+        // Deny: the CLI is told so.
+        let denied = device_login::start(api)?;
+        device_login::decide(api, &session, &denied.user_code, false)?;
+        let answer = device_login::poll(api, &denied.device_code)?;
+        anyhow::ensure!(
+            answer.as_ref().err().map(String::as_str) == Some("access_denied"),
+            "expected access_denied after denial, got {answer:?}"
         );
         Ok(())
     }
@@ -847,7 +957,7 @@ impl Scenario for HelmIdempotency {
     }
 }
 
-// ---- (b) workload identity (jfrog-vault registry mode only) ----------------
+// ---- (b) workload identity (every backend with a source-build registry) ----
 
 struct WorkloadIdentity;
 
@@ -858,7 +968,8 @@ impl Scenario for WorkloadIdentity {
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
         // Builds the fixture from source, which needs a registry the runtime can
-        // pull from: the host docker daemon (Docker) or minikube's jfrog-vault mode.
+        // pull from: the host docker daemon (Docker), ECR (ECS), or minikube's
+        // jfrog-vault mode.
         if b.supports_source_build() {
             Applicability::Run
         } else {
@@ -872,6 +983,28 @@ impl Scenario for WorkloadIdentity {
         b.prepare_workload_identity()?;
         let project = unique("e2e-id");
         create_public_project(b, &project)?;
+        b.wait_registry_ready(&project)?;
+        // Where the fixture sends its own requests to Rise, when workloads cannot
+        // route to the public URL. Set before the deploy, which snapshots env.
+        // Not `RISE_`-prefixed: that namespace is reserved for Rise-injected
+        // variables, and the API refuses to store user keys in it.
+        if let Some(api_url) = b.workload_api_url()? {
+            expect_ok(
+                b.rise_cli(
+                    &[
+                        "env",
+                        "set",
+                        "-p",
+                        &project,
+                        "E2E_RISE_API_URL",
+                        &api_url,
+                        "--plain",
+                    ],
+                    None,
+                )?,
+                "point the identity fixture at the in-cluster Rise API",
+            )?;
+        }
         // Build & deploy the identity fixture from source (needs the docker socket).
         expect_ok(
             b.rise_cli_build(
@@ -959,15 +1092,18 @@ impl Scenario for WorkloadIdentity {
             resp.body
         );
 
-        // The controller re-mints the file token in place at half its (short) TTL
-        // (identity_token_ttl_seconds in values-ci). Assert this in two stages so a
-        // failure pinpoints *where* it broke:
+        // The file token is re-minted in place at half its (short) TTL
+        // (identity_token_ttl_seconds in values-ci, the Docker overlay, and the ECS
+        // run stack) — by the controller on Kubernetes and Docker, by the identity
+        // sidecar on ECS. Assert this in two stages so a failure pinpoints *where*
+        // it broke:
         //   1. the controller re-mints at the source it writes (the K8s Secret) —
         //      deterministic, independent of in-pod mount propagation;
         //   2. the pod's mounted file then reflects the new token — exercising the
         //      Kubernetes secret-volume propagation deployed apps depend on.
         // On a backend with no source distinct from the mounted file (Docker
-        // bind-mounts the controller's file directly), stage 1 is a no-op
+        // bind-mounts the controller's file directly; ECS's sidecar writes the
+        // shared volume the app mounts), stage 1 is a no-op
         // (`minted_token_jti` → None) and stage 2 alone proves re-minting.
         let first_jti = id["file_token"]["claims"]["jti"]
             .as_str()

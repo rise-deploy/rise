@@ -233,3 +233,30 @@ variable "repository_credentials_secret_arn" {
   type        = string
   default     = null
 }
+
+variable "identity_agent_image" {
+  description = "The rise-cli image the workload-identity sidecar in every workload task runs, normally the same release as the control plane."
+  type        = string
+
+  validation {
+    condition     = trimspace(var.identity_agent_image) != ""
+    error_message = "identity_agent_image is required."
+  }
+}
+
+variable "identity_exchange_url" {
+  description = "Base URL at which the identity sidecar reaches the Rise API. Null uses the public URL; set an internal address only if workloads can route to it."
+  type        = string
+  default     = null
+}
+
+variable "identity_token_ttl_seconds" {
+  description = "Lifetime of the auto-minted [identity] workload tokens. The sidecar refreshes them at half this. Null keeps Rise's default (3600)."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.identity_token_ttl_seconds == null ? true : var.identity_token_ttl_seconds >= 60
+    error_message = "identity_token_ttl_seconds must be at least 60."
+  }
+}

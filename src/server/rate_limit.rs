@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::settings::OAuthRateLimitSettings;
+use super::settings::{OAuthRateLimitSettings, WorkloadTokenRateLimitSettings};
 
 /// Rate limiter for OAuth endpoints with four independent limits:
 /// - Per-project: keyed by project name (configurable, default 500 req/60s)
@@ -145,6 +145,80 @@ impl OAuthRateLimiter {
     }
 }
 
+/// One fixed-window counter per key, with the same semantics as the tiers of
+/// [`OAuthRateLimiter`].
+struct WindowCounter {
+    counters: Cache<String, Arc<AtomicU32>>,
+    max: u32,
+    window_secs: u64,
+}
+
+impl WindowCounter {
+    fn new(max: u32, window_secs: u64, capacity: u64) -> Self {
+        Self {
+            counters: Cache::builder()
+                .time_to_live(Duration::from_secs(window_secs))
+                .max_capacity(capacity)
+                .build(),
+            max,
+            window_secs,
+        }
+    }
+
+    /// Count one request against `key`: `Err(retry_after_secs)` once over the limit.
+    async fn hit(&self, key: &str) -> Result<(), u64> {
+        let counter = self
+            .counters
+            .entry_by_ref(key)
+            .or_insert_with(std::future::ready(Arc::new(AtomicU32::new(0))))
+            .await
+            .into_value();
+        if counter.fetch_add(1, Ordering::Relaxed) + 1 > self.max {
+            Err(self.window_secs)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Rate limiter for the workload identity token-exchange endpoint. See
+/// [`WorkloadTokenRateLimitSettings`] for why it keys on the deployment for a
+/// valid credential and on the address only for a rejected one.
+pub struct WorkloadTokenRateLimiter {
+    per_deployment: WindowCounter,
+    rejected_per_ip: WindowCounter,
+}
+
+impl WorkloadTokenRateLimiter {
+    const DEPLOYMENT_MAX_CAPACITY: u64 = 50_000;
+    const IP_MAX_CAPACITY: u64 = 50_000;
+
+    pub fn new(settings: &WorkloadTokenRateLimitSettings) -> Self {
+        Self {
+            per_deployment: WindowCounter::new(
+                settings.per_deployment_max,
+                settings.per_deployment_window_secs,
+                Self::DEPLOYMENT_MAX_CAPACITY,
+            ),
+            rejected_per_ip: WindowCounter::new(
+                settings.rejected_per_ip_max,
+                settings.rejected_per_ip_window_secs,
+                Self::IP_MAX_CAPACITY,
+            ),
+        }
+    }
+
+    /// Count a request that presented `deployment`'s valid credential.
+    pub async fn authenticated(&self, deployment: &str) -> Result<(), u64> {
+        self.per_deployment.hit(deployment).await
+    }
+
+    /// Count a request from `ip` whose credential matched no deployment.
+    pub async fn rejected(&self, ip: &str) -> Result<(), u64> {
+        self.rejected_per_ip.hit(ip).await
+    }
+}
+
 /// Extract the client IP address from request headers.
 ///
 /// Checks `X-Real-IP` first (set by the reverse proxy to the actual client IP), then falls back
@@ -225,6 +299,43 @@ pub fn rate_limit_response(retry_after: u64) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workload_limiter(max: u32) -> WorkloadTokenRateLimiter {
+        WorkloadTokenRateLimiter::new(&WorkloadTokenRateLimitSettings {
+            per_deployment_max: max,
+            per_deployment_window_secs: 60,
+            rejected_per_ip_max: max,
+            rejected_per_ip_window_secs: 60,
+        })
+    }
+
+    /// Every task of an install may share one address (a NAT gateway, or
+    /// "unknown" with no proxy headers). Valid credentials must therefore be
+    /// budgeted per deployment, never per address.
+    #[tokio::test]
+    async fn valid_credentials_are_budgeted_per_deployment_not_per_address() {
+        let limiter = workload_limiter(2);
+        for _ in 0..2 {
+            assert!(limiter.authenticated("dep-a").await.is_ok());
+        }
+        assert_eq!(limiter.authenticated("dep-a").await, Err(60));
+        // Another deployment behind the same address is untouched...
+        assert!(limiter.authenticated("dep-b").await.is_ok());
+        // ...and so is the address's budget for rejected credentials.
+        assert!(limiter.rejected("unknown").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_credentials_are_budgeted_per_address() {
+        let limiter = workload_limiter(2);
+        for _ in 0..2 {
+            assert!(limiter.rejected("203.0.113.7").await.is_ok());
+        }
+        assert_eq!(limiter.rejected("203.0.113.7").await, Err(60));
+        assert!(limiter.rejected("203.0.113.8").await.is_ok());
+        // Guessing from an address never spends a deployment's budget.
+        assert!(limiter.authenticated("dep-a").await.is_ok());
+    }
     use axum::http::{HeaderMap, HeaderValue};
 
     fn test_settings() -> OAuthRateLimitSettings {

@@ -99,6 +99,7 @@ impl RiseTokenSigner {
                     let typed = header.typ.as_deref() == Some(RISE_SESSION_TYP);
                     if typed != claims.rise_uid.is_some()
                         || typed != claims.rise_identity_uid.is_some()
+                        || (!typed && claims.rise_client.is_some())
                     {
                         return Err(invalid_shape());
                     }
@@ -122,7 +123,10 @@ impl RiseTokenSigner {
                 }
                 let claims =
                     decode::<RiseClaims>(token, self.rs256_decoding_key(), &validation)?.claims;
-                if claims.rise_uid.is_some() || claims.rise_identity_uid.is_some() {
+                if claims.rise_uid.is_some()
+                    || claims.rise_identity_uid.is_some()
+                    || claims.rise_client.is_some()
+                {
                     return Err(invalid_shape());
                 }
                 Ok(RiseToken::Ingress(claims))
@@ -222,6 +226,7 @@ mod tests {
             aud: "https://myapp.apps.rise.dev".to_string(),
             rise_uid: None,
             rise_identity_uid: None,
+            rise_client: None,
         };
         let token = signer
             .sign_ingress_jwt(
@@ -260,6 +265,7 @@ mod tests {
                 assert_eq!(c.sub, session_user().subject);
                 assert_eq!(c.rise_uid, Some(session_user().rise_uid));
                 assert_eq!(c.rise_identity_uid, Some(session_user().identity_uid));
+                assert_eq!(c.rise_client, Some(crate::SessionClient::Cli));
                 assert_eq!(c.email, "user@example.com");
                 assert_eq!(c.aud, "https://rise.test");
             }
@@ -346,6 +352,7 @@ mod tests {
             aud: "https://rise.test".to_string(),
             rise_uid: None,
             rise_identity_uid: None,
+            rise_client: None,
         };
         let token = signer
             .sign_ingress_jwt(
@@ -399,6 +406,7 @@ mod tests {
             aud: "https://rise.test".to_string(),
             rise_uid: None,
             rise_identity_uid: None,
+            rise_client: None,
         }
     }
 
@@ -407,6 +415,7 @@ mod tests {
             subject: "user:u-01jz0000000000000000000000".to_string(),
             rise_uid: uuid::Uuid::from_u128(7),
             identity_uid: uuid::Uuid::from_u128(8),
+            client: crate::SessionClient::Cli,
         }
     }
 
@@ -651,6 +660,34 @@ mod tests {
     }
 
     #[test]
+    fn test_rise_client_is_bound_to_the_session_typ() {
+        let signer = create_test_signer();
+        let key = hs256_key();
+        let mut legacy = serde_json::to_value(session_claims()).unwrap();
+        legacy["rise_client"] = serde_json::json!("browser");
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = None;
+        // A legacy (untyped) session never carried a client kind; one that
+        // does is not a shape Rise mints.
+        let token = encode(&header, &legacy, &key).unwrap();
+        assert!(signer.verify_rise_jwt(&token).is_err());
+        assert!(signer.verify_jwt_skip_aud(&token).is_err());
+
+        // A typed session keeps its client kind through verification.
+        let mut typed = legacy.clone();
+        typed["rise_uid"] = serde_json::json!(uuid::Uuid::new_v4());
+        typed["rise_identity_uid"] = serde_json::json!(uuid::Uuid::new_v4());
+        header.typ = Some(crate::RISE_SESSION_TYP.to_string());
+        let token = encode(&header, &typed, &key).unwrap();
+        match signer.verify_rise_jwt(&token).unwrap() {
+            RiseToken::Session(claims) => {
+                assert_eq!(claims.rise_client, Some(crate::SessionClient::Browser))
+            }
+            other => panic!("expected Session, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_ingress_tokens_never_carry_rise_uid() {
         let signer = create_test_signer();
         let token = signer
@@ -667,6 +704,7 @@ mod tests {
                 assert_eq!(claims.sub, "idp-sub");
                 assert_eq!(claims.rise_uid, None);
                 assert_eq!(claims.rise_identity_uid, None);
+                assert_eq!(claims.rise_client, None);
             }
             other => panic!("expected Ingress, got {other:?}"),
         }
@@ -855,6 +893,7 @@ mod tests {
             aud: "https://rise.test".to_string(),
             rise_uid: None,
             rise_identity_uid: None,
+            rise_client: None,
         };
         let header = Header::new(Algorithm::HS384);
         // Sign with the wrong alg using a throwaway secret; verify must fail.

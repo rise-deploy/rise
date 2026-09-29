@@ -31,6 +31,14 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **`rise login --device` is served by Rise, not the IdP.** *Config change.*
+  The device code is now confirmed on Rise's own `/device` page, after a fresh
+  browser sign-in. The IdP no longer needs to support, or enable, the OAuth
+  device grant, and a device-grant setting on Rise's IdP client can be removed.
+  The bundled Dex config drops `urn:ietf:params:oauth:grant-type:device_code`.
+  Existing CLIs keep working: the endpoints and responses are unchanged. Migration
+  `20260924000001` adds the `device_authorizations` table.
+
 - **User logins resolve to `User` resources; sessions carry `rise_uid`.**
   *Action required.* Every interactive login (browser, CLI code and device
   flows, app ingress sign-in) now resolves the ID token's exact `(iss, sub)`
@@ -112,6 +120,53 @@ Merged to `develop`:
   restart and across replicas exactly as it already does ingress and workload
   tokens. The typed-table exchange at `POST /api/v1/auth/token` and the CLI
   are unchanged. See [Authentication & Tokens](/operator-docs/authentication/#identity-rs256--the-token-subresource).
+
+- **ECS: workload identity.** *Breaking.* ECS deployments now get the
+  workload identity files every other backend delivers — the bootstrap
+  credential for `rise identity token`, and the `[identity].audiences` token
+  files — so a deployment declaring `[identity]` is no longer rejected. Every
+  new ECS task runs an identity sidecar (`rise identity agent`, from the new
+  `ghcr.io/rise-deploy/rise-cli` image) next to the app; see
+  [ECS › Workload identity](/operator-docs/ecs/#workload-identity).
+
+  - **Action required: set the sidecar image.** The server refuses to start
+    without `deployment_controller.identity_agent_image`
+    (`RISE_ECS_IDENTITY_AGENT_IMAGE`), normally
+    `ghcr.io/rise-deploy/rise-cli:<the same version>`. The `rise-ecs` module
+    requires `rise_cli_image_tag` (or `rise_cli_image_ref`), exactly like
+    `rise_image_tag`. The workload execution role must be able to pull it.
+
+  - **Upgrading rolls every running ECS service once.** The first reconcile
+    tick provisions each running deployment's credential and adds the sidecar,
+    which registers a new task-definition revision; ECS replaces the tasks as a
+    rolling update, without a routing gap. Expect a burst of
+    `RegisterTaskDefinition` calls (throttled to 1/s) on large installs.
+  - Tasks must reach the token endpoint, the public URL by default. Set
+    `identity_exchange_url` (`RISE_ECS_IDENTITY_EXCHANGE_URL`) if they cannot.
+  - `identity_token_ttl_seconds` is now env-driven on ECS
+    (`RISE_IDENTITY_TOKEN_TTL_SECONDS`), and `rise-ecs` exposes it along with
+    `identity_exchange_url`.
+
+- **The workload identity token-exchange endpoint has its own rate limiter.**
+  *Config change.* `POST /api/v1/identity/token` no longer shares the OAuth
+  limiter. A request with a valid bootstrap credential counts against that
+  deployment's budget only; the per-IP budget applies only to credentials that
+  match no deployment. Configure it under `server.workload_token_rate_limit`
+  (`per_deployment_max`/`per_deployment_window_secs`, default 500 per 60 s;
+  `rejected_per_ip_max`/`rejected_per_ip_window_secs`, default 50 per 60 s).
+  `server.oauth_rate_limit` no longer applies to this endpoint.
+
+- **One lifetime cap for workload identity tokens; `server.workload_token_max_ttl_seconds`
+  is removed.** *Breaking.* Tokens from the token-exchange endpoint
+  (`POST /api/v1/identity/token`, `rise identity token`) are now capped by
+  `deployment_controller.identity_token_ttl_seconds` — the lifetime of the
+  auto-minted `[identity]` token files — on every backend. **The default
+  lifetime of an exchanged token rises from 900 s to 3600 s**, matching the
+  token files a workload could already read; a request's `ttl_seconds` still
+  lowers it. The server **refuses to start** while
+  `server.workload_token_max_ttl_seconds` is set, rather than silently
+  lengthening tokens you had capped: remove the key and set
+  `identity_token_ttl_seconds` to the lifetime you want.
 
 - **ECS: a `capacity` setting, and service network configuration now converges.**
   *Config change.* `deployment_controller.capacity` selects where workload tasks

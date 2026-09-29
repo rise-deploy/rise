@@ -85,6 +85,25 @@ pub struct DesiredService {
     pub tags: ServiceTags,
     /// Service-level configuration: network placement and capacity.
     pub shape: DesiredShape,
+    /// The workload-identity credential the task definition references, when
+    /// the service carries the identity sidecar. Not part of the diff: it is
+    /// what must exist in SSM before the service can be created or rolled.
+    pub identity_credential: Option<IdentityCredentialPlan>,
+}
+
+/// Where a deployment's bootstrap credential lives, and whether this tick must
+/// mint it (ADR-0005 D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityCredentialPlan {
+    /// The SSM parameter the sidecar's `secrets` entry names.
+    pub parameter: String,
+    /// The deployment row whose `identity_credential_hash` authenticates it.
+    pub deployment_uuid: uuid::Uuid,
+    /// `true` while no hash is on record: generate a credential, write the
+    /// parameter, then persist the hash. Once the hash is persisted the
+    /// parameter is never rewritten, so every task of the deployment -- across
+    /// restarts, scale-out and rolls -- presents the same credential.
+    pub provision: bool,
 }
 
 /// One line of an ECS service's event narrative.
@@ -479,6 +498,7 @@ mod tests {
             desired_count: count,
             tags: tags(deployment_id),
             shape: shape(),
+            identity_credential: None,
         }
     }
 

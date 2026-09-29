@@ -84,8 +84,10 @@ module "rise_ecs" {
   ingress_domain = var.ingress_domain
   log_group_name = local.log_group
   rise_image_tag = var.rise_image_tag
-  admin_email    = "admin@example.com"
-  acme_email     = "admin@example.com"
+  # The identity sidecar's rise-cli image, from the same release.
+  rise_cli_image_tag = var.rise_image_tag
+  admin_email        = "admin@example.com"
+  acme_email         = "admin@example.com"
 
   controller_role_arn      = module.rise_aws.role_arn
   execution_role_arn       = module.rise_aws.ecs_execution_role_arn
