@@ -17,7 +17,7 @@
 // The reachability mechanism (Traefik vs. port-forward) is the only thing that
 // differs, and that lives in the per-backend e2e scripts.
 //
-// RISE_E2E_API_URL, when set, is where the fixture *sends* its requests to Rise
+// E2E_RISE_API_URL, when set, is where the fixture *sends* its requests to Rise
 // (discovery, JWKS, token exchange) instead of RISE_ISSUER. The issuer is still
 // what it reports and verifies against. It exists for a harness whose workloads
 // cannot route to the public URL they would use in production — the ECS
@@ -75,9 +75,9 @@ func riseIssuer() string {
 	return strings.TrimRight(os.Getenv("RISE_ISSUER"), "/")
 }
 
-// apiBase is where requests to Rise go: RISE_E2E_API_URL if set, else the issuer.
+// apiBase is where requests to Rise go: E2E_RISE_API_URL if set, else the issuer.
 func apiBase() string {
-	if base := strings.TrimRight(os.Getenv("RISE_E2E_API_URL"), "/"); base != "" {
+	if base := strings.TrimRight(os.Getenv("E2E_RISE_API_URL"), "/"); base != "" {
 		return base
 	}
 	return riseIssuer()

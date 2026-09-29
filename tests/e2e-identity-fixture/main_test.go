@@ -108,7 +108,7 @@ func TestRSAPublicKeyRoundTrip(t *testing.T) {
 
 func TestReachable_RewritesOnlyIssuerURLs(t *testing.T) {
 	t.Setenv("RISE_ISSUER", "http://rise.example.com/")
-	t.Setenv("RISE_E2E_API_URL", "http://rise.internal:3000")
+	t.Setenv("E2E_RISE_API_URL", "http://rise.internal:3000")
 	if got := reachable("http://rise.example.com/api/v1/auth/jwks"); got != "http://rise.internal:3000/api/v1/auth/jwks" {
 		t.Fatalf("issuer URL not rewritten: %s", got)
 	}
@@ -116,7 +116,7 @@ func TestReachable_RewritesOnlyIssuerURLs(t *testing.T) {
 		t.Fatalf("foreign URL rewritten: %s", got)
 	}
 
-	t.Setenv("RISE_E2E_API_URL", "")
+	t.Setenv("E2E_RISE_API_URL", "")
 	if got := reachable("http://rise.example.com/jwks"); got != "http://rise.example.com/jwks" {
 		t.Fatalf("rewritten without an override: %s", got)
 	}

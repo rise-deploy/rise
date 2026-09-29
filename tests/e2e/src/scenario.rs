@@ -986,6 +986,8 @@ impl Scenario for WorkloadIdentity {
         b.wait_registry_ready(&project)?;
         // Where the fixture sends its own requests to Rise, when workloads cannot
         // route to the public URL. Set before the deploy, which snapshots env.
+        // Not `RISE_`-prefixed: that namespace is reserved for Rise-injected
+        // variables, and the API refuses to store user keys in it.
         if let Some(api_url) = b.workload_api_url()? {
             expect_ok(
                 b.rise_cli(
@@ -994,7 +996,7 @@ impl Scenario for WorkloadIdentity {
                         "set",
                         "-p",
                         &project,
-                        "RISE_E2E_API_URL",
+                        "E2E_RISE_API_URL",
                         &api_url,
                         "--plain",
                     ],
