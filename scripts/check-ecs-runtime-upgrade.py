@@ -7,6 +7,7 @@ infrastructure are used.
 """
 
 import argparse
+import base64
 import json
 import re
 import shutil
@@ -180,6 +181,25 @@ def only_added_env(before, after):
     return strip(before) == strip(after)
 
 
+def only_updated_dex_callbacks(before, after):
+    """Allow only the three CLI redirect host changes in Dex's embedded config."""
+    containers = json.loads(before)
+    for container in containers:
+        if container["name"] != "dex":
+            continue
+        for env in container.get("environment") or []:
+            if env["name"] != "DEX_CONFIG_B64":
+                continue
+            config = base64.b64decode(env["value"], validate=True).decode()
+            for port in (8765, 8766, 8767):
+                config = config.replace(
+                    f"http://localhost:{port}/callback",
+                    f"http://127.0.0.1:{port}/callback",
+                )
+            env["value"] = base64.b64encode(config.encode()).decode()
+    return containers == json.loads(after)
+
+
 def verify(log, repo):
     checked = set()
     destinations_by_path = {
@@ -267,6 +287,22 @@ def verify(log, repo):
             if delta["actions"] == ["no-op"]:
                 continue
             if (
+                case == "dex"
+                and address == "module.dex.aws_ecs_task_definition.dex[0]"
+                and delta["actions"] == ["update"]
+                and {
+                    k
+                    for k in delta["before"].keys() | delta["after"].keys()
+                    if delta["before"].get(k) != delta["after"].get(k)
+                }
+                == {"container_definitions"}
+                and only_updated_dex_callbacks(
+                    delta["before"]["container_definitions"],
+                    delta["after"]["container_definitions"],
+                )
+            ):
+                continue
+            if (
                 address == CONTROL_PLANE_TASK
                 and delta["actions"] == ["update"]
                 and {
@@ -317,8 +353,8 @@ def verify(log, repo):
             + (
                 "only expected E2E task/service updates"
                 if case == "e2e"
-                else "only expected secret-version updates and the added"
-                " control-plane environment"
+                else "only expected secret-version updates and allowed"
+                " control-plane environment and Dex callback updates"
             )
         )
     assert checked == {"nlb", "alb", "brought", "dex", "endpoints", "e2e"}, (

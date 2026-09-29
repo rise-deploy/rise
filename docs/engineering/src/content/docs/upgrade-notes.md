@@ -31,6 +31,17 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **CLI browser login requires numeric IPv4 loopback callbacks.** *Breaking.*
+  The CLI listens and redirects on `127.0.0.1`, trying ports 8765, 8766, then
+  8767. Before upgrading the CLI, register these exact URLs on the identity
+  provider's Rise client (Keycloak: **Valid redirect URIs**):
+  `http://127.0.0.1:8765/callback`, `http://127.0.0.1:8766/callback`, and
+  `http://127.0.0.1:8767/callback`.
+  The bundled development, Helm, CI, and ECS Dex configurations allow only
+  these numeric CLI callbacks. CLIs that redirect to `localhost` cannot use
+  browser login with those configurations; upgrade the CLI alongside the
+  configuration, or use `rise login --device`.
+
 - **`rise login --device` is served by Rise, not the IdP.** *Config change.*
   The device code is now confirmed on Rise's own `/device` page, after a fresh
   browser sign-in. The IdP no longer needs to support, or enable, the OAuth
