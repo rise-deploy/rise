@@ -476,6 +476,7 @@ async fn run_ecr_controller_loop(
             auto_remove,
             access_key_id,
             secret_access_key,
+            registry_host,
         }) => EcrConfig {
             region: region.clone(),
             account_id: account_id.clone(),
@@ -484,6 +485,7 @@ async fn run_ecr_controller_loop(
             auto_remove: *auto_remove,
             access_key_id: access_key_id.clone(),
             secret_access_key: secret_access_key.clone(),
+            registry_host: registry_host.clone(),
         },
         _ => {
             anyhow::bail!("ECR controller requires ECR registry configuration");

@@ -935,6 +935,7 @@ impl AppState {
                     auto_remove,
                     access_key_id,
                     secret_access_key,
+                    registry_host,
                 } => {
                     let ecr_config = EcrConfig {
                         region: region.clone(),
@@ -944,6 +945,7 @@ impl AppState {
                         auto_remove: *auto_remove,
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
+                        registry_host: registry_host.clone(),
                     };
                     let provider = EcrProvider::new(ecr_config)
                         .await

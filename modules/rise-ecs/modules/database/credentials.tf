@@ -14,12 +14,13 @@ resource "aws_secretsmanager_secret" "database_url" {
   tags                    = var.tags
 }
 
+# The version hash is cut to 52 bits -- see modules/secrets for why.
 resource "aws_secretsmanager_secret_version" "database_url" {
   count = var.enabled ? 1 : 0
 
   secret_id                = aws_secretsmanager_secret.database_url[0].id
   secret_string_wo         = local.database_url
-  secret_string_wo_version = parseint(substr(sha256(local.database_url), 0, 15), 16)
+  secret_string_wo_version = parseint(substr(sha256(local.database_url), 0, 13), 16)
 }
 locals {
   database_url = var.enabled ? format(

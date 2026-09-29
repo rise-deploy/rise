@@ -9,6 +9,7 @@
 //! When it is unset, every test returns immediately, so the crate never tries to
 //! stand up a backend it wasn't asked to.
 
+pub mod aws_install;
 pub mod backend;
 pub mod cli;
 pub mod compose;

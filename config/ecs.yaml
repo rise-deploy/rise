@@ -76,6 +76,8 @@ registry:
   push_role_arn: "${RISE_ECR_PUSH_ROLE_ARN:-}"
   repo_prefix: "${RISE_ECR_REPO_PREFIX:-rise/}"
   auto_remove: "${RISE_ECR_AUTO_REMOVE:-false}"
+  # Empty uses <account_id>.dkr.ecr.<region>.amazonaws.com.
+  registry_host: "${RISE_ECR_REGISTRY_HOST:-}"
 
 deployment_controller:
   type: "ecs"
