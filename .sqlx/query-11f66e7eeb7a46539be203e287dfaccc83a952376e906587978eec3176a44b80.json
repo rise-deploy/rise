@@ -1,0 +1,82 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT id, user_code, status, approved_user_id, approved_session, client_name,\n               client_ip, interval_seconds, last_polled_at, created_at, expires_at\n        FROM device_authorizations\n        WHERE device_code_hash = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_code",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "status",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "approved_user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "approved_session",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "client_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "client_ip",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "interval_seconds",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_polled_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "11f66e7eeb7a46539be203e287dfaccc83a952376e906587978eec3176a44b80"
+}

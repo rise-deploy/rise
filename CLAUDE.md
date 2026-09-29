@@ -195,7 +195,7 @@ cargo build --all-features     # Full build with CLI + backend
      - [x] Snowflake OAuth provisioner for Snowflake security integrations
 
 3. **CLI Implementation** (`--features cli`, default) ✅
-   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and device flow
+   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
    - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`

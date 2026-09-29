@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE device_authorizations\n        SET status = 'denied'\n        WHERE user_code = $1 AND status = 'pending' AND expires_at > NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0b2974dc22382aa85d68d2b1546b8a3c79f54f65c664c12baa39f3f7bc91807d"
+}

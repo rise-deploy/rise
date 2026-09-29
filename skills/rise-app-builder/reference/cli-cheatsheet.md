@@ -6,7 +6,7 @@ Complete inventory of `rise` CLI commands. Verified against `src/main.rs` clap d
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `rise login` | `--url <url>`, `--browser` (default), `--device` | Authenticate with the Rise backend. Default: OAuth2 authorization-code flow with PKCE via browser. `--device`: device authorization flow. |
+| `rise login` | `--url <url>`, `--browser` (default), `--device` | Authenticate with the Rise backend. Default: OAuth2 authorization-code flow with PKCE via browser. `--device`: confirm a code on the Rise web UI instead (SSH sessions, headless machines). |
 
 ## Projects (`rise project` / `rise p`)
 
