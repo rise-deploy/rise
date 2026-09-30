@@ -1090,6 +1090,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
           ].filter(Boolean)));
 
     const tabs = [
+        { id: 'overview', label: 'Overview' },
         { id: 'logs', label: 'Logs' },
         // No count: the timeline's length is only known once the event log
         // is fetched, and the tab should not block on that to render.
@@ -1105,12 +1106,12 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     // A `?tab=` naming a tab this deployment has no data for — a build-output
     // link to a deployment with no build logs — falls back rather than showing
     // an empty page. Writing `null` for the default keeps a plain link clean.
-    const activeTab = tabs.some((t) => t.id === tabParam) ? (tabParam as string) : 'logs';
-    const setActiveTab = (id: string) => setTabParam(id === 'logs' ? null : id);
+    const activeTab = tabs.some((t) => t.id === tabParam) ? (tabParam as string) : 'overview';
+    const setActiveTab = (id: string) => setTabParam(id === 'overview' ? null : id);
 
-    const buildKv = (
+    const deploymentPanel = (
         <Panel>
-            <PanelHead title="Deploy" />
+            <PanelHead title="Deployment" />
             <PanelBody>
                 <KV>
                     <KVRow k="Image">
@@ -1127,37 +1128,64 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                         </KVRow>
                     ) : null}
                     <KVRow k="Created by">{deployment.created_by_email || '-'}</KVRow>
-                    <KVRow k="Started">
-                        <span title={formatISO8601(deployment.created)}>{formatRelativeTimeRounded(deployment.created)}</span>
-                    </KVRow>
-                    <KVRow k="Completed">{deployment.completed_at ? formatDate(deployment.completed_at) : '-'}</KVRow>
-                    {deployment.expires_at && (
-                        <KVRow k="Expires">{formatTimeRemaining(deployment.expires_at)}</KVRow>
-                    )}
-                    {(deployment.job_url || deployment.pull_request_url) && (
-                        <KVRow k="Source">
-                            <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} />
-                        </KVRow>
-                    )}
-                    {deployment.git_repository_url && (
-                        <KVRow k="Repository">
-                            {isSafeUrl(deployment.git_repository_url) ? (
+                    {[
+                        { label: 'Repository', url: deployment.git_repository_url },
+                        {
+                            label: /\/merge_requests(?:\/|$)/.test(deployment.pull_request_url || '') ? 'Merge request' : 'Pull request',
+                            url: deployment.pull_request_url,
+                        },
+                        { label: 'CI job', url: deployment.job_url },
+                    ].filter(source => source.url).map(source => (
+                        <KVRow key={source.label} k={source.label}>
+                            {isSafeUrl(source.url) ? (
                                 <a
-                                    className="r-link mono"
-                                    style={{ fontSize: 12.5, wordBreak: 'break-all' }}
-                                    href={deployment.git_repository_url}
+                                    className="r-link mono r-deployment-source-link"
+                                    href={source.url}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                 >
-                                    {stripUrlScheme(deployment.git_repository_url)}
+                                    <span>{stripUrlScheme(source.url)}</span>
+                                    <Icon name="ext" size={12} />
                                 </a>
                             ) : (
                                 <span className="mono" style={{ fontSize: 12.5, wordBreak: 'break-all' }}>
-                                    {deployment.git_repository_url}
+                                    {source.url}
                                 </span>
                             )}
                         </KVRow>
+                    ))}
+                </KV>
+            </PanelBody>
+        </Panel>
+    );
+
+    const lifecyclePanel = (
+        <Panel>
+            <PanelHead
+                title="Lifecycle"
+                right={<RButton size="sm" onClick={() => setActiveTab('timeline')}>View timeline</RButton>}
+            />
+            <PanelBody>
+                <KV>
+                    <KVRow k="Active deployment">
+                        {deployment.is_active ? 'Yes — active for this deployment group' : 'No'}
+                    </KVRow>
+                    <KVRow k="Started">
+                        <span title={formatISO8601(deployment.created)}>{formatDate(deployment.created)}</span>
+                    </KVRow>
+                    {deployment.updated && (
+                        <KVRow k="Last updated">
+                            <span title={formatISO8601(deployment.updated)}>{formatRelativeTimeRounded(deployment.updated)}</span>
+                        </KVRow>
                     )}
+                    {deployment.completed_at && (
+                        <KVRow k="Completed">{formatDate(deployment.completed_at)}</KVRow>
+                    )}
+                    <KVRow k="Expires">
+                        {deployment.expires_at ? (
+                            <span title={formatISO8601(deployment.expires_at)}>{formatTimeRemaining(deployment.expires_at)}</span>
+                        ) : 'No expiration'}
+                    </KVRow>
                 </KV>
             </PanelBody>
         </Panel>
@@ -1175,6 +1203,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         <Panel>
             <PanelHead
                 title="Resources"
+                sub="Configured allocation"
                 right={
                     isMultiContainer ? (
                         <RButton size="sm" onClick={() => setBreakdownOpen(true)}>
@@ -1207,7 +1236,12 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
     const routingPanel = (
         <Panel>
-            <PanelHead title="Routing" />
+            <PanelHead
+                title="Routing"
+                sub={!deployment.is_active && allDomains.length > 0
+                    ? 'These addresses may serve another deployment in this group.'
+                    : undefined}
+            />
             <PanelBody style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                 {allDomains.length > 0 ? (
                     allDomains.map((url) => (
@@ -1323,6 +1357,19 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
             <Tabs tabs={tabs} active={activeTab} onChange={setActiveTab} />
 
+            {activeTab === 'overview' && (
+                <div className="r-grid-2-1 r-deployment-overview">
+                    <div className="r-stack">
+                        {deploymentPanel}
+                        {lifecyclePanel}
+                    </div>
+                    <div className="r-stack">
+                        {routingPanel}
+                        {runtimeKv}
+                    </div>
+                </div>
+            )}
+
             {activeTab === 'logs' && (
                 <LogConsole
                     projectName={projectName}
@@ -1345,13 +1392,6 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             Full screen
                         </a>
                     }
-                    details={(
-                        <>
-                            {buildKv}
-                            {runtimeKv}
-                            {routingPanel}
-                        </>
-                    )}
                 />
             )}
 
