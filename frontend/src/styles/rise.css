@@ -774,6 +774,10 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
 .r-pill.env-global { color: var(--text-muted); background: var(--surface-2); border-color: transparent; }
 .r-pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 
+.r-project-status-link { display: inline-flex; border-radius: 999px; text-decoration: none; }
+.r-project-status-link:hover { outline: 1px solid var(--text-soft); }
+.r-project-status-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
 /* ---------- BasePill / Chip (two-tone: icon cell | name cell) ----------
    Shared base for EnvPill, GroupPill, and any future compound chip. Sized to
    match .r-status and .r-pill: font 11.75/1.45 + 1px y-padding + 1px border

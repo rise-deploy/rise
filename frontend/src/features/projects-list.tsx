@@ -13,6 +13,7 @@ interface Project {
     id?: string;
     name: string;
     status?: string;
+    active_deployment_id?: string;
     primary_url?: string;
     access_class?: string;
     owner?: { email?: string; name?: string; id?: string };

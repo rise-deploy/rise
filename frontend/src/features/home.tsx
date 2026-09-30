@@ -2,9 +2,10 @@
 import React, { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { Button, Panel, PanelBody, PanelHead, Stat, StatGrid, Status, colorFor, Avatar } from '../components/r-ui';
+import { Button, Panel, PanelBody, PanelHead, Stat, StatGrid, colorFor, Avatar } from '../components/r-ui';
 import { LoadingState, ErrorState } from '../components/states';
 import { formatRelativeTimeRounded } from '../lib/utils';
+import { ProjectStatusPill } from '../components/project-table';
 import { QuickstartPanel } from './quickstart-templates';
 
 interface HomeProps {
@@ -135,7 +136,7 @@ export function Home({ user }: HomeProps) {
                                                 </div>
                                             )}
                                         </td>
-                                        <td><Status status={p.status || 'Unknown'} /></td>
+                                        <td><ProjectStatusPill project={p} /></td>
                                         <td style={{ color: 'var(--text-muted)' }}>
                                             {p.owner?.email || p.owner?.name || '—'}
                                         </td>

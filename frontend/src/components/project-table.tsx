@@ -1,3 +1,4 @@
+import { navigate } from '../lib/navigation';
 import { Icon } from './icon';
 import { Panel, Status } from './r-ui';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
@@ -12,12 +13,33 @@ export interface ProjectRow {
     id?: string;
     name: string;
     status?: string;
+    active_deployment_id?: string;
     primary_url?: string;
     access_class?: string;
     owner?: ProjectOwner;
     created?: string;
     updated?: string;
     updated_at?: string;
+}
+
+export function ProjectStatusPill({ project }: { project: ProjectRow }) {
+    const status = <Status status={project.status || 'Unknown'} />;
+    if (!project.active_deployment_id) return status;
+
+    const href = `/deployment/${project.name}/${project.active_deployment_id}`;
+    return (
+        <a
+            className="r-project-status-link"
+            href={href}
+            aria-label={`Open active deployment for ${project.name}: ${project.status || 'Unknown'}`}
+            onClick={(e) => {
+                e.stopPropagation();
+                if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                e.preventDefault();
+                navigate(href);
+            }}
+        >{status}</a>
+    );
 }
 
 export interface AccessClassOption {
@@ -97,7 +119,7 @@ export function ProjectTable({
                                     <td style={{ maxWidth: 280 }}>
                                         <div style={{ fontWeight: 500, fontSize: 13.5 }}>{project.name}</div>
                                     </td>
-                                    <td><Status status={project.status || 'Unknown'} /></td>
+                                    <td><ProjectStatusPill project={project} /></td>
                                     <td style={{ maxWidth: 300 }}>
                                         {project.primary_url ? (
                                             <a

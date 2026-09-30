@@ -368,7 +368,7 @@ async fn projects_to_api(
             .await
             .internal_err("Failed to get active deployment info")?;
 
-    // Batch fetch active deployments to calculate URLs
+    // Batch fetch the public identifiers for active deployment links
     let deployment_ids: Vec<Uuid> = active_deployment_info
         .values()
         .filter_map(|info| info.as_ref().map(|i| i.id))
@@ -402,37 +402,24 @@ async fn projects_to_api(
         std::collections::HashMap::new()
     };
 
-    // Calculate URLs for all projects
+    // Project URLs depend on configuration, not deployment lifecycle state.
     let mut api_projects = Vec::new();
     for project in projects {
-        let (active_deployment_status, default_url, primary_url, custom_domain_urls) =
-            if let Some(Some(info)) = active_deployment_info.get(&project.id) {
-                if let Some(deployment) = deployments_map.get(&info.id) {
-                    match state
-                        .deployment_backend
-                        .get_deployment_urls(deployment, &project)
-                        .await
-                    {
-                        Ok(urls) => (
-                            Some(info.status.to_string()),
-                            Some(urls.default_url),
-                            Some(urls.primary_url),
-                            urls.custom_domain_urls,
-                        ),
-                        Err(e) => {
-                            return Err(ServerError::internal_anyhow(
-                                e,
-                                "Failed to calculate deployment URLs",
-                            )
-                            .with_context("project_name", &project.name));
-                        }
-                    }
-                } else {
-                    (Some(info.status.to_string()), None, None, vec![])
-                }
-            } else {
-                (None, None, None, vec![])
-            };
+        let active_info = active_deployment_info
+            .get(&project.id)
+            .and_then(Option::as_ref);
+        let active_deployment = active_info.and_then(|info| deployments_map.get(&info.id));
+        let active_deployment_status = active_info.map(|info| info.status.to_string());
+        let active_deployment_id =
+            active_deployment.map(|deployment| deployment.deployment_id.clone());
+        let urls = state
+            .deployment_backend
+            .get_project_urls(
+                &project,
+                crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
+            )
+            .await
+            .internal_err("Failed to calculate project URLs")?;
 
         let owner = if let Some(user_id) = project.owner_user_id {
             user_emails.get(&user_id).map(|email| {
@@ -461,9 +448,10 @@ async fn projects_to_api(
             access_class: project.access_class,
             owner,
             active_deployment_status,
-            default_url,
-            primary_url,
-            custom_domain_urls,
+            active_deployment_id,
+            default_url: Some(urls.default_url),
+            primary_url: Some(urls.primary_url),
+            custom_domain_urls: urls.custom_domain_urls,
             deployment_groups: None, // Not populated in list view for performance
             finalizers: vec![],      // Not populated in list view for performance
             app_users: vec![],       // Not populated in list view for performance
@@ -538,45 +526,21 @@ pub async fn get_project(
         )));
     }
 
-    // Calculate deployment URLs if there's an active deployment
-    let (default_url, primary_url, custom_domain_urls) =
-        match crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
-            .await
-        {
-            Ok(active_deployments) => {
-                // Find the active deployment in the default group
-                if let Some(deployment) = active_deployments.iter().find(|d| {
-                    d.deployment_group
-                        == crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP
-                }) {
-                    match state
-                        .deployment_backend
-                        .get_deployment_urls(deployment, &project)
-                        .await
-                    {
-                        Ok(urls) => (
-                            Some(urls.default_url),
-                            Some(urls.primary_url),
-                            urls.custom_domain_urls,
-                        ),
-                        Err(e) => {
-                            return Err(ServerError::internal_anyhow(
-                                e,
-                                "Failed to calculate URLs",
-                            ));
-                        }
-                    }
-                } else {
-                    (None, None, vec![])
-                }
-            }
-            Err(e) => {
-                return Err(ServerError::internal_anyhow(
-                    e,
-                    "Failed to get active deployments",
-                ));
-            }
-        };
+    let urls = state
+        .deployment_backend
+        .get_project_urls(
+            &project,
+            crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
+        )
+        .await
+        .internal_err("Failed to calculate project URLs")?;
+    let active_deployment = crate::db::deployments::find_active_deployment_for_group(
+        &state.db_pool,
+        project.id,
+        crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
+    )
+    .await
+    .internal_err("Failed to get active deployment")?;
 
     // Resolve owner info
     let owner_info = resolve_owner_info(&state, &project)
@@ -584,9 +548,13 @@ pub async fn get_project(
         .map_err(|e| ServerError::internal(format!("Failed to resolve owner info: {}", e)))?;
 
     let mut api_project = convert_project(project.clone(), owner_info, &state);
-    api_project.default_url = default_url;
-    api_project.primary_url = primary_url;
-    api_project.custom_domain_urls = custom_domain_urls;
+    api_project.default_url = Some(urls.default_url);
+    api_project.primary_url = Some(urls.primary_url);
+    api_project.custom_domain_urls = urls.custom_domain_urls;
+    if let Some(deployment) = active_deployment {
+        api_project.active_deployment_id = Some(deployment.deployment_id);
+        api_project.active_deployment_status = Some(deployment.status.to_string());
+    }
 
     // When no source URL is explicitly configured, resolve one from deployment
     // metadata (active primary deployment, else most recent deployment).
@@ -1192,10 +1160,11 @@ fn convert_project(
         access_class: project.access_class,
         owner,
         active_deployment_status: None, // Will be populated by caller if needed
-        default_url: None,              // Will be populated by caller
-        primary_url: None,              // Will be populated by caller
-        custom_domain_urls: vec![],     // Will be populated by caller
-        deployment_groups: None,        // Will be populated by caller if needed
+        active_deployment_id: None,
+        default_url: None,          // Will be populated by caller
+        primary_url: None,          // Will be populated by caller
+        custom_domain_urls: vec![], // Will be populated by caller
+        deployment_groups: None,    // Will be populated by caller if needed
         finalizers: project.finalizers.clone(),
         app_users: vec![], // Will be populated by caller if needed
         app_teams: vec![], // Will be populated by caller if needed

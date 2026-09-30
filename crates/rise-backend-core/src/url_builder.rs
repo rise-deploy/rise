@@ -336,12 +336,48 @@ impl DeploymentUrlBuilder {
         all_environments: &[Environment],
         custom_domains: &[CustomDomain],
     ) -> DeploymentUrls {
-        let default_url_host = self.full_ingress_url(project, deployment);
+        self.compute_urls_for_group(
+            project,
+            &deployment.deployment_group,
+            environment,
+            all_environments,
+            custom_domains,
+        )
+    }
+
+    pub fn compute_project_urls(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+        all_environments: &[Environment],
+        custom_domains: &[CustomDomain],
+    ) -> DeploymentUrls {
+        let environment = all_environments
+            .iter()
+            .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
+        self.compute_urls_for_group(
+            project,
+            deployment_group,
+            environment,
+            all_environments,
+            custom_domains,
+        )
+    }
+
+    fn compute_urls_for_group(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+        environment: Option<&Environment>,
+        all_environments: &[Environment],
+        custom_domains: &[CustomDomain],
+    ) -> DeploymentUrls {
+        let host = self.resolved_ingress_url_for_group(project, deployment_group);
+        let default_url_host = self.full_ingress_url_from_host(&host);
         let default_url = format!("{}://{}", self.ingress_schema, default_url_host);
 
-        let environment_for_group = environment.filter(|env| {
-            env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-        });
+        let environment_for_group = environment
+            .filter(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
 
         let environment_url = environment_for_group.and_then(|env| {
             self.resolved_environment_url(project, env).map(|url_host| {
@@ -373,7 +409,7 @@ impl DeploymentUrlBuilder {
 
         let templated_hosts = self.primary_ingress_hosts(
             project,
-            &deployment.deployment_group,
+            deployment_group,
             environment_for_group,
             &[],
             false,
@@ -387,55 +423,6 @@ impl DeploymentUrlBuilder {
                 all_urls.push(url);
             }
         }
-        for url in &custom_domain_urls {
-            if seen.insert(url.clone()) {
-                all_urls.push(url.clone());
-            }
-        }
-
-        DeploymentUrls {
-            default_url,
-            primary_url,
-            custom_domain_urls,
-            all_urls,
-        }
-    }
-
-    pub fn compute_project_urls(
-        &self,
-        project: &Project,
-        deployment_group: &str,
-        custom_domains: &[CustomDomain],
-    ) -> DeploymentUrls {
-        let url_host = self.resolved_ingress_url_for_group(project, deployment_group);
-        let full_host = self.full_ingress_url_from_host(&url_host);
-        let default_url = format!("{}://{}", self.ingress_schema, full_host);
-
-        let valid_custom_domains = self.filter_valid_custom_domains(custom_domains);
-
-        // No environment context here — keep the historical "default group hosts custom
-        // domains" rule to preserve preview-URL semantics for callers that haven't yet
-        // adopted the env-aware path.
-        let (custom_domain_urls, primary_url) = if deployment_group == DEFAULT_DEPLOYMENT_GROUP {
-            let starred = valid_custom_domains.iter().find(|d| d.is_primary);
-            let primary = if let Some(starred) = starred {
-                self.host_to_url(&starred.domain)
-            } else {
-                default_url.clone()
-            };
-
-            let urls: Vec<String> = valid_custom_domains
-                .iter()
-                .map(|d| self.host_to_url(&d.domain))
-                .collect();
-            (urls, primary)
-        } else {
-            (Vec::new(), default_url.clone())
-        };
-
-        let mut all_urls = vec![default_url.clone()];
-        let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(default_url.clone());
         for url in &custom_domain_urls {
             if seen.insert(url.clone()) {
                 all_urls.push(url.clone());
