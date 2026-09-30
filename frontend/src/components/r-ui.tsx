@@ -78,7 +78,7 @@ export function EnvPill({ projectName, env, color, tooltip, title }: { projectNa
             icon={<Icon name="layer" size={11} />}
             iconStyle={palette ? { background: palette.background, color: palette.color } : undefined}
             name={env}
-            href={`/project/${projectName}/environment/${env}`}
+            href={`/project/${projectName}/environments`}
             nameClassName="r-chip-name-strong"
             tooltip={tooltip}
             title={title}
