@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use reqwest::Client;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -81,9 +81,8 @@ fn resolve_project_name_with_config(
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Login profile to use, letting you manage multiple Rise accounts or
-    /// backends side by side. Falls back to the RISE_PROFILE environment
-    /// variable, then the profile selected by `rise profile use`.
+    /// Profile alias for the Rise backend. Falls back to RISE_PROFILE, the project's
+    /// targets.default entry, then the profile selected by `rise profile use`.
     /// `rise login --profile <name>` registers a new profile if needed.
     #[arg(long, global = true)]
     profile: Option<String>,
@@ -454,7 +453,7 @@ enum ProfileCommands {
     /// List registered login profiles
     #[command(visible_alias = "ls")]
     List,
-    /// Select the profile used when --profile and RISE_PROFILE are unset
+    /// Select the fallback profile when no explicit override or project target applies
     Use {
         /// Registered profile name (or "default")
         name: String,
@@ -1185,6 +1184,19 @@ fn ansi_enabled(rise_log_color: Option<&str>, no_color: Option<&str>, is_termina
     no_color.is_none_or(|v| v.is_empty())
 }
 
+/// Use the command's application path for project defaults, including positional paths.
+fn project_config_directory(matches: &clap::ArgMatches) -> &str {
+    if let Some((_, child)) = matches.subcommand() {
+        return project_config_directory(child);
+    }
+    matches
+        .try_get_one::<String>("path")
+        .ok()
+        .flatten()
+        .map(String::as_str)
+        .unwrap_or(".")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for all commands
@@ -1204,14 +1216,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let project_path = project_config_directory(&matches);
+    let cli = Cli::from_arg_matches(&matches)?;
 
-    // Resolve the active login profile once, up front: an explicit --profile
-    // sets a process-wide override (cleared for the literal value "default")
-    // so every independent config load later in the process — not just the
-    // one below — agrees on the same profile. This deliberately avoids
-    // std::env::set_var, which is unsound to mutate concurrently with reads
-    // from other threads once the async runtime's workers are running.
+    // An explicit profile takes priority for every config load in this process.
     if let Some(profile) = &cli.profile {
         config::validate_profile_name(profile).context("Invalid --profile value")?;
         if profile == "default" {
@@ -1249,9 +1258,30 @@ async fn main() -> Result<()> {
         return cli::identity::agent_command(&Client::new(), *check).await;
     }
 
+    // Keep config loads and credential writes on the same resolved target.
+    let url = match &cli_command {
+        Commands::Login { url, .. } => url.as_deref(),
+        _ => None,
+    };
+    let project_target = if config::Config::has_target_override(url)? {
+        None
+    } else {
+        build::config::load_default_target(project_path)?
+    };
+    let is_login = matches!(&cli_command, Commands::Login { .. });
+    config::set_target_override(config::Config::resolve_target(
+        url,
+        project_target.as_ref(),
+        is_login,
+    )?);
+
     // Load CLI config for client commands
     let http_client = Client::new();
-    let mut config = config::Config::load()?;
+    let mut config = if is_login {
+        config::Config::load_for_login()?
+    } else {
+        config::Config::load()?
+    };
     let backend_url = config.get_backend_url();
 
     // Commands that call the backend warn when the CLI and server versions differ.
@@ -1261,30 +1291,12 @@ async fn main() -> Result<()> {
     }
 
     match &cli_command {
-        Commands::Login {
-            url,
-            browser: _,
-            device,
-        } => {
-            // Use provided URL or fall back to config default
-            let login_url = url
-                .as_deref()
-                .map(config::normalize_backend_url)
-                .unwrap_or_else(|| backend_url.clone());
-
+        Commands::Login { device, .. } => {
             if *device {
-                // Device flow (explicit)
-                login::handle_device_flow(&http_client, &login_url, &mut config, url.as_deref())
-                    .await?;
+                login::handle_device_flow(&http_client, &backend_url, &mut config).await?;
             } else {
-                // Authorization code flow with PKCE (default)
-                login::handle_authorization_code_flow(
-                    &http_client,
-                    &login_url,
-                    &mut config,
-                    url.as_deref(),
-                )
-                .await?;
+                login::handle_authorization_code_flow(&http_client, &backend_url, &mut config)
+                    .await?;
             }
         }
         #[cfg(feature = "backend")]
@@ -2343,8 +2355,10 @@ mod log_color_tests {
 
 #[cfg(all(test, feature = "cli"))]
 mod deployment_output_cli_tests {
-    use super::{Cli, Commands, DeploymentCommands, EnvCommands, ProfileCommands};
-    use clap::Parser;
+    use super::{
+        project_config_directory, Cli, Commands, DeploymentCommands, EnvCommands, ProfileCommands,
+    };
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn deploy_accepts_json_and_status_file_flags() {
@@ -2479,6 +2493,23 @@ mod deployment_output_cli_tests {
         match cli.command {
             Commands::Profile(ProfileCommands::Use { name }) => assert_eq!(name, "work"),
             _ => panic!("expected profile use command"),
+        }
+    }
+
+    #[test]
+    fn project_target_directory_follows_command_path() {
+        for (args, expected) in [
+            (vec!["rise", "deploy", "app"], "app"),
+            (vec!["rise", "deployment", "create", "app"], "app"),
+            (vec!["rise", "project", "show", "--path", "app"], "app"),
+            (vec!["rise", "env", "list", "--path", "app"], "app"),
+            (vec!["rise", "run", "app"], "app"),
+            (vec!["rise", "compose", "up", "app"], "app"),
+            (vec!["rise", "login"], "."),
+            (vec!["rise", "project", "list"], "."),
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).unwrap();
+            assert_eq!(project_config_directory(&matches), expected);
         }
     }
 }

@@ -751,12 +751,9 @@ pub fn select_token_provider(
         Arc::new(StaticToken::new(token, "stored login token"))
     } else {
         // 5. Nothing.
-        let message = match Config::active_profile().ok().flatten() {
-            Some(profile) => format!(
-                "Not authenticated for profile '{profile}'. Run 'rise login --profile {profile}' first."
-            ),
-            None => "Not authenticated. Run 'rise login' first.".to_string(),
-        };
+        let message = format!(
+            "Not authenticated for backend '{backend_url}'. Run 'rise login --url {backend_url}' first."
+        );
         return Err(TokenSourceError::NoSource(message).into());
     };
 

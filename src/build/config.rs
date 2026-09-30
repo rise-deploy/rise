@@ -1,11 +1,48 @@
 // Project-level build configuration (rise.toml / .rise.toml)
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::{debug, info, warn};
 
 // Re-export shared config types from rise_toml module
 pub use crate::rise_toml::{ProjectBuildConfig, ProjectConfig};
+
+/// Read the default CLI target without loading unrelated build or deployment settings.
+pub fn load_default_target(app_path: &str) -> Result<Option<crate::rise_toml::TargetConfig>> {
+    #[derive(serde::Deserialize)]
+    struct TargetSettings {
+        version: Option<u32>,
+        #[serde(default)]
+        targets: std::collections::BTreeMap<String, crate::rise_toml::TargetConfig>,
+    }
+
+    let Some(path) = project_config_path(app_path) else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut config: TargetSettings = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse targets in {}", path.display()))?;
+    if config.version.is_some_and(|version| version != 1) {
+        anyhow::bail!("Unsupported rise.toml version: {}", config.version.unwrap());
+    }
+    Ok(config.targets.remove("default"))
+}
+
+fn project_config_path(app_path: &str) -> Option<std::path::PathBuf> {
+    let rise_toml = Path::new(app_path).join("rise.toml");
+    let dot_rise_toml = Path::new(app_path).join(".rise.toml");
+    if rise_toml.exists() && dot_rise_toml.exists() {
+        warn!("Both rise.toml and .rise.toml found. Using rise.toml.");
+    }
+    if rise_toml.exists() {
+        Some(rise_toml)
+    } else if dot_rise_toml.exists() {
+        Some(dot_rise_toml)
+    } else {
+        None
+    }
+}
 
 /// Load full project configuration from rise.toml or .rise.toml
 ///
@@ -13,25 +50,8 @@ pub use crate::rise_toml::{ProjectBuildConfig, ProjectConfig};
 /// Returns Ok(None) if no config file is found.
 /// Returns Err if file exists but cannot be read or parsed, or if version is unsupported.
 pub fn load_full_project_config(app_path: &str) -> Result<Option<ProjectBuildConfig>> {
-    let rise_toml = Path::new(app_path).join("rise.toml");
-    let dot_rise_toml = Path::new(app_path).join(".rise.toml");
-
-    // Warn if both files exist
-    if rise_toml.exists() && dot_rise_toml.exists() {
-        warn!("Both rise.toml and .rise.toml found. Using rise.toml.");
-    }
-
-    // Determine which config file to use
-    let config_path = if rise_toml.exists() {
-        Some(rise_toml)
-    } else if dot_rise_toml.exists() {
-        Some(dot_rise_toml)
-    } else {
-        None
-    };
-
     // Parse if found
-    if let Some(path) = config_path {
+    if let Some(path) = project_config_path(app_path) {
         info!("Loading project config from {}", path.display());
         let content = std::fs::read_to_string(&path)?;
 
@@ -103,6 +123,58 @@ mod tests {
     use super::*;
     use crate::rise_toml::EnvironmentConfig;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn default_target_is_optional_and_uses_project_file_precedence() {
+        use crate::rise_toml::TargetConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(load_default_target(path).unwrap(), None);
+        std::fs::write(
+            dir.path().join(".rise.toml"),
+            "[targets.default]\nprofile = 'work'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_default_target(path).unwrap(),
+            Some(TargetConfig::Profile("work".into()))
+        );
+        std::fs::write(
+            dir.path().join("rise.toml"),
+            "[targets.default]\nurl = 'https://rise.example.com'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_default_target(path).unwrap(),
+            Some(TargetConfig::Url("https://rise.example.com".into()))
+        );
+        std::fs::write(dir.path().join("rise.toml"), "[project]\nname = 'app'\n").unwrap();
+        assert_eq!(load_default_target(path).unwrap(), None);
+    }
+
+    #[test]
+    fn target_requires_exactly_one_url_or_profile() {
+        for target in [
+            "",
+            "url = 'https://rise.example.com'\nprofile = 'work'",
+            "urll = 'https://rise.example.com'",
+        ] {
+            let text = format!("[targets.default]\n{target}\n");
+            assert!(
+                toml::from_str::<ProjectBuildConfig>(&text).is_err(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn targets_round_trip_with_project_configuration() {
+        let text = "[targets.default]\nprofile = 'work'\n[targets.staging]\nurl = 'https://staging.example.com'\n";
+        let config: ProjectBuildConfig = toml::from_str(text).unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let parsed: ProjectBuildConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.targets, config.targets);
+    }
 
     /// A resource key put on the container table instead of its `deploy` table
     /// parses fine and does nothing, which is the shape of mistake most likely
@@ -275,6 +347,7 @@ FOO = "bar"
             build: None,
             deploy: None,
             identity: None,
+            targets: BTreeMap::new(),
             environments: BTreeMap::from([(
                 "staging".to_string(),
                 EnvironmentConfig {

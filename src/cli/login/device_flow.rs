@@ -57,7 +57,6 @@ pub async fn handle_device_flow(
     http_client: &Client,
     backend_url: &str,
     config: &mut Config,
-    backend_url_to_save: Option<&str>,
 ) -> Result<()> {
     let backend_url = normalize_backend_url(backend_url);
 
@@ -172,22 +171,18 @@ pub async fn handle_device_flow(
                 .context("Failed to parse device exchange response")?;
 
             if let Some(token) = exchange_response.token {
-                // Store the backend URL if provided
-                if let Some(url) = backend_url_to_save {
-                    config
-                        .set_backend_url(url.to_string())
-                        .context("Failed to save backend URL")?;
-                }
-
                 // Store the token
                 log_token_debug(&token, "device flow response");
                 config
-                    .set_token(token.clone())
+                    .save_login(&backend_url, token.clone())
                     .context("Failed to save authentication token")?;
 
                 println!("\n✓ Login successful!");
                 println!("  Profile: {}", Config::active_profile_label()?);
-                println!("  Token saved to: {}", Config::config_path()?.display());
+                println!(
+                    "  Token saved to: {}",
+                    Config::credential_path(backend_url.as_ref())?.display()
+                );
 
                 // Display token expiration
                 match format_token_expiration(&token) {

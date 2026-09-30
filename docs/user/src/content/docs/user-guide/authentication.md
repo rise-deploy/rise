@@ -51,12 +51,13 @@ poll.
 
 ### Token Storage
 
-Tokens are stored in `~/.config/rise/config.json` (plain JSON).
+Tokens are stored as private JSON files under `~/.config/rise/credentials/`, with
+one token per backend URL. All profiles pointing to that URL share the token;
+logging in again updates it for every alias.
 
 ### Multiple Profiles
 
-To manage more than one Rise account or backend side by side, log in with a
-named `--profile`:
+To give a backend URL a local alias, log in with a named `--profile`:
 
 ```bash
 rise login --profile work --url https://rise.work.example.com
