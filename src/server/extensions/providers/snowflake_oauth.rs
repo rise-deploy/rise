@@ -912,6 +912,7 @@ impl SnowflakeOAuthProvisioner {
                 "https://{}.snowflakecomputing.com/oauth/token-request",
                 self.account
             )),
+            token_endpoint_auth_method: Default::default(),
             scopes: effective_config.scopes,
         };
 

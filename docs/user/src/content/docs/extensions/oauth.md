@@ -2,7 +2,7 @@
 title: "OAuth Provider Extension"
 ---
 
-The `oauth` extension makes Rise act as an OAuth/OIDC proxy between your application and an upstream provider (Google, GitHub, Snowflake, custom SSO).
+The `oauth` extension makes Rise act as an OAuth/OIDC proxy between your application and an upstream provider (Google, GitHub, Snowflake, Notion, custom SSO).
 
 ## The Problem It Solves
 
@@ -47,6 +47,8 @@ Rise allows forwarding to any URL associated with the project as well as `localh
 
 - `authorization_endpoint`: explicit authorization endpoint for non-OIDC providers.
 - `token_endpoint`: explicit token endpoint for non-OIDC providers.
+- `token_endpoint_auth_method`: `client_secret_post` (default) sends the client credentials in the token request body; `client_secret_basic` sends them as an HTTP Basic `Authorization` header, as Notion requires.
+- `scopes`: may be `[]` for providers without scopes; the authorization request then carries no `scope` parameter.
 
 ## Setup Checklist
 
