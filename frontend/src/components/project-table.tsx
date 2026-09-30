@@ -22,8 +22,8 @@ export interface ProjectRow {
     updated_at?: string;
 }
 
-export function ProjectStatusPill({ project }: { project: ProjectRow }) {
-    const status = <Status status={project.status || 'Unknown'} />;
+export function ProjectStatusPill({ project, tooltip }: { project: ProjectRow; tooltip?: string }) {
+    const status = <Status status={project.status || 'Unknown'} tooltip={tooltip} />;
     if (!project.active_deployment_id) return status;
 
     const href = `/deployment/${project.name}/${project.active_deployment_id}`;

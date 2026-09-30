@@ -9,6 +9,7 @@ import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
 import { DeploymentsList } from './deployments';
+import { ProjectStatusPill } from '../components/project-table';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList } from './resources';
 import { AppUsersList } from './projects';
 import { useQuickstartTemplates } from './quickstart-templates';
@@ -127,8 +128,8 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                 <div className="title-stack">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title">{project.name}</h1>
-                        <Status
-                            status={project.status || 'Unknown'}
+                        <ProjectStatusPill
+                            project={project}
                             tooltip={`Lifecycle status: ${project.status || 'Unknown'}`}
                         />
                         <Pill
