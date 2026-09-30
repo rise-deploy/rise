@@ -53,12 +53,7 @@ fn service_account_hint(token: &str, backend_url: &str, project: Option<&str>) -
     // Unverified claims are diagnostic input only; the backend authenticates tokens.
     let data = jsonwebtoken::dangerous::insecure_decode::<Value>(token).ok()?;
     let issuer = data.claims.get("iss")?.as_str()?;
-    if issuer.trim_end_matches('/') == backend_url.trim_end_matches('/')
-        || matches!(
-            data.header.typ.as_deref(),
-            Some("rise-access+jwt" | "rise-identity+jwt" | "rise-session+jwt")
-        )
-    {
+    if issuer.trim_end_matches('/') == backend_url.trim_end_matches('/') {
         return None;
     }
     let audience = match data.claims.get("aud")? {
@@ -88,11 +83,23 @@ fn service_account_hint(token: &str, backend_url: &str, project: Option<&str>) -
     {
         return None;
     }
-    let command =
-        format!(
+    // SA claim matching treats every '*' as a wildcard, even when shell-quoted.
+    if audience.contains('*') || subject.contains('*') {
+        return Some(
+            "The external OIDC token was denied access. Its aud or sub claim contains '*', \
+             which Rise interprets as a wildcard in service-account trust rules. \
+             No setup command was generated; ask a project owner to choose narrowly scoped \
+             audience and identity claims."
+                .to_string(),
+        );
+    }
+    let command = format!(
         "RISE_URL={} rise service-account create --project {} --issuer {} --claim {} --claim {}",
-        shell_quote(backend_url), shell_quote(project), shell_quote(issuer),
-        shell_quote(&format!("aud={audience}")), shell_quote(&format!("sub={subject}")),
+        shell_quote(backend_url),
+        shell_quote(project),
+        shell_quote(issuer),
+        shell_quote(&format!("aud={audience}")),
+        shell_quote(&format!("sub={subject}")),
     );
     Some(format!(
         "The external OIDC token was denied access. If it needs a project service account, \
@@ -100,7 +107,9 @@ fn service_account_hint(token: &str, backend_url: &str, project: Option<&str>) -
          (with RISE_TOKEN, RISE_TOKEN_COMMAND, RISE_IDENTITY and GitHub Actions token variables unset):\n  \
          {command}\n\
          The aud claim is required; use the token's sub claim to restrict which identity can access the project. \
-         Replace any placeholders before running."
+         Replace any placeholders before running.\n\
+         For token exchange, set RISE_IDENTITY in your CLI or CI environment to the Email printed \
+         by this command before retrying."
     ))
 }
 
@@ -158,12 +167,37 @@ mod tests {
     #[test]
     fn rise_tokens_have_no_setup_hint() {
         for issuer in [BACKEND.to_string(), format!("{BACKEND}/")] {
-            let mut c = claims();
-            c["iss"] = json!(issuer);
-            assert!(service_account_hint(&jwt(c, "JWT"), BACKEND, None).is_none());
+            for typ in ["JWT", "arbitrary-token-type"] {
+                let mut c = claims();
+                c["iss"] = json!(issuer);
+                assert!(service_account_hint(&jwt(c, typ), BACKEND, None).is_none());
+            }
         }
-        for typ in ["rise-access+jwt", "rise-identity+jwt", "rise-session+jwt"] {
-            assert!(service_account_hint(&jwt(claims(), typ), BACKEND, None).is_none());
+    }
+
+    #[test]
+    fn external_issuer_gets_a_hint_regardless_of_header_type() {
+        assert!(
+            service_account_hint(&jwt(claims(), "arbitrary-token-type"), BACKEND, None)
+                .unwrap()
+                .contains("rise service-account create")
+        );
+    }
+
+    #[test]
+    fn wildcard_claims_produce_guidance_without_a_setup_command() {
+        for (key, value) in [
+            ("aud", json!("*")),
+            ("aud", json!(["rise-*"])),
+            ("sub", json!("*")),
+            ("sub", json!("repo:org/repo:environment:prod*")),
+        ] {
+            let mut c = claims();
+            c[key] = value;
+            let hint = service_account_hint(&jwt(c, "JWT"), BACKEND, Some("demo")).unwrap();
+            assert!(hint.contains("wildcard"));
+            assert!(hint.contains("narrowly scoped"));
+            assert!(!hint.contains("rise service-account create"));
         }
     }
 
@@ -218,6 +252,66 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_exchange_explains_how_to_select_the_new_service_account() {
+        use crate::cli::token_source::{
+            is_non_retryable_token_error, select_token_provider, ProviderInputs,
+        };
+        use std::time::Duration;
+
+        let app = axum::Router::new().route(
+            "/api/v1/auth/token",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                assert_eq!(body["identity"], "demo+1@sa.rise.local");
+                (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"error": "invalid_grant"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let provider = select_token_provider(
+            &http,
+            ProviderInputs {
+                rise_token: Some(jwt(claims(), "JWT")),
+                rise_token_command: None,
+                rise_token_command_ttl: Duration::from_secs(60),
+                rise_token_command_timeout: Duration::from_secs(5),
+                gha_request_url: None,
+                gha_request_token: None,
+                audience: None,
+                stored_token: None,
+                backend_url,
+                identity: Some("demo+1@sa.rise.local".to_string()),
+            },
+        )
+        .unwrap();
+        let log = LogBuffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let error = provider
+            .token()
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(is_non_retryable_token_error(&error));
+        assert!(error.to_string().contains("invalid_grant"));
+        let output = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("rise service-account create"));
+        assert!(output.contains("set RISE_IDENTITY in your CLI or CI environment to the Email printed by this command before retrying"));
     }
 
     #[tokio::test]
