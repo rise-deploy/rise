@@ -18,7 +18,7 @@
 //! An inactive mapping, or an active one under an inactive User, is found and
 //! refused — never treated as unknown.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 
 use rise_resource_api::{
     CreateResourceParams, ExternalSubject, Issuer, ResourceApi, ResourceRow, StoreError, SubjectId,
@@ -28,12 +28,41 @@ use rise_resource_store_postgres::{IdentityLookup, PgResourceStore, Serializable
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Attempts at the provisioning transaction before a login gives up.
-///
-/// A lost race against a concurrent first login for the same pair converges on
-/// the next attempt, which finds the winner's mapping; the bound only matters
-/// under pathological contention.
-const MAX_PROVISION_ATTEMPTS: u32 = 5;
+/// Bound contention retries to eight transactions and at most 900 ms of backoff.
+const MAX_PROVISION_ATTEMPTS: u32 = 8;
+const PROVISION_RETRY_INITIAL_MS: u64 = 20;
+const PROVISION_RETRY_MAX_MS: u64 = 200;
+
+/// Retry whole provisioning transactions after giving competing logins time to
+/// commit. Only retryable store conflicts incur a delay; other errors fail fast.
+async fn retry_provision<T, F, Fut>(mut provision: F) -> Result<T, LoginError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, LoginError>>,
+{
+    for attempt in 1..=MAX_PROVISION_ATTEMPTS {
+        match provision().await {
+            Err(LoginError::Store(
+                StoreError::Conflict(_) | StoreError::NameConflict | StoreError::Serialization,
+            )) if attempt < MAX_PROVISION_ATTEMPTS => {
+                // The failed transaction is dropped before sleeping and retrying.
+                tokio::time::sleep(provision_retry_delay(attempt)).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final provisioning attempt returns its result")
+}
+
+fn provision_retry_delay(attempt: u32) -> Duration {
+    use rand::RngExt;
+
+    let ceiling_ms = PROVISION_RETRY_INITIAL_MS
+        .saturating_mul(2u64.saturating_pow(attempt - 1))
+        .min(PROVISION_RETRY_MAX_MS);
+    // Equal jitter ensures a pause while spreading concurrent callers out.
+    Duration::from_millis(rand::rng().random_range(ceiling_ms / 2..=ceiling_ms))
+}
 
 /// The `User` resource an authenticated session belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,19 +187,7 @@ impl UserLogins {
             return Ok(resolved);
         }
 
-        let mut attempt = 1;
-        loop {
-            match self.provision_once(&subject, profile).await {
-                Ok(resolved) => return Ok(resolved),
-                // A concurrent first login for the same pair won the unique
-                // mapping index (or the transaction lost the serialization
-                // race over it): the next attempt reads the winner's mapping.
-                Err(LoginError::Store(
-                    StoreError::Conflict(_) | StoreError::NameConflict | StoreError::Serialization,
-                )) if attempt < MAX_PROVISION_ATTEMPTS => attempt += 1,
-                Err(error) => return Err(error),
-            }
-        }
+        retry_provision(|| self.provision_once(&subject, profile)).await
     }
 
     async fn provision_once(
@@ -411,6 +428,101 @@ fn ulid(at: std::time::SystemTime, random: u128) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn provisioning_success_has_no_retry_delay() {
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let value = retry_provision(|| {
+            attempts += 1;
+            std::future::ready(Ok::<_, LoginError>(42))
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 1);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provisioning_retries_conflicts_with_bounded_delays() {
+        let started = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let value = retry_provision(|| {
+            attempts += 1;
+            std::future::ready(if attempts == 8 {
+                Ok(42)
+            } else {
+                Err(LoginError::Store(match attempts % 3 {
+                    0 => StoreError::Conflict("concurrent identity".into()),
+                    1 => StoreError::Serialization,
+                    _ => StoreError::NameConflict,
+                }))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(attempts, 8);
+        // Seven sleeps add at most seven milliseconds of timer rounding.
+        assert!(
+            (Duration::from_millis(450)..=Duration::from_millis(907)).contains(&started.elapsed())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provisioning_exhaustion_returns_the_last_error_without_sleeping_again() {
+        let mut attempts = 0;
+        let mut last_attempt = tokio::time::Instant::now();
+        let error = retry_provision(|| {
+            attempts += 1;
+            last_attempt = tokio::time::Instant::now();
+            std::future::ready(Err::<(), _>(LoginError::Store(StoreError::Conflict(
+                format!("attempt {attempts}"),
+            ))))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 8);
+        assert!(
+            matches!(error, LoginError::Store(StoreError::Conflict(detail)) if detail == "attempt 8")
+        );
+        assert_eq!(last_attempt.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provisioning_non_retryable_errors_fail_immediately() {
+        for error in [
+            LoginError::Inactive,
+            LoginError::InvalidSubject("invalid".into()),
+            LoginError::Store(StoreError::Validation("invalid".into())),
+            LoginError::Store(StoreError::backend(std::io::Error::other("unavailable"))),
+        ] {
+            let expected = error.to_string();
+            let mut error = Some(error);
+            let started = tokio::time::Instant::now();
+            let actual = retry_provision(|| {
+                std::future::ready(Err::<(), _>(error.take().expect("must not retry")))
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(actual.to_string(), expected);
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[test]
+    fn provisioning_jitter_stays_within_the_exponential_cap() {
+        for (attempt, ceiling) in [20, 40, 80, 160, 200, 200, 200].into_iter().enumerate() {
+            for _ in 0..32 {
+                let delay = provision_retry_delay(attempt as u32 + 1);
+                assert!(
+                    (Duration::from_millis(ceiling / 2)..=Duration::from_millis(ceiling))
+                        .contains(&delay)
+                );
+            }
+        }
+    }
+
     #[test]
     fn ulid_is_26_lowercase_crockford_characters_ordered_by_time() {
         let earlier = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000);
@@ -578,9 +690,12 @@ mod tests {
     #[sqlx::test]
     async fn concurrent_first_logins_converge_on_one_user(pool: PgPool) {
         let logins = logins(&pool).await;
+        let start = Arc::new(tokio::sync::Barrier::new(8));
         let attempts = (0..8).map(|_| {
             let logins = logins.clone();
+            let start = start.clone();
             tokio::spawn(async move {
+                start.wait().await;
                 logins
                     .resolve_or_provision("racing-subject", &profile("race@example.com"))
                     .await
