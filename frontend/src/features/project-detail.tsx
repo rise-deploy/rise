@@ -9,6 +9,7 @@ import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
 import { DeploymentsList } from './deployments';
+import { ProjectStatusPill } from '../components/project-table';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList } from './resources';
 import { AppUsersList } from './projects';
 import { useQuickstartTemplates } from './quickstart-templates';
@@ -127,8 +128,8 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
                 <div className="title-stack">
                     <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
                         <h1 className="r-page-title">{project.name}</h1>
-                        <Status
-                            status={project.status || 'Unknown'}
+                        <ProjectStatusPill
+                            project={project}
                             tooltip={`Lifecycle status: ${project.status || 'Unknown'}`}
                         />
                         <Pill
@@ -303,7 +304,7 @@ function RecentDeploymentsPanel({ projectName, environments }: { projectName: st
                                 <td><Status status={d.status || 'Unknown'} /></td>
                                 <td>
                                     {d.environment ? (
-                                        <EnvPill env={d.environment} color={d.environment_color} />
+                                        <EnvPill projectName={projectName} env={d.environment} color={d.environment_color} />
                                     ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                 </td>
                                 <td>
@@ -311,6 +312,7 @@ function RecentDeploymentsPanel({ projectName, environments }: { projectName: st
                                         const env = (environments || []).find((e: any) => e.name === d.environment);
                                         return (
                                             <GroupPill
+                                                projectName={projectName}
                                                 group={d.deployment_group}
                                                 primary={!!env && env.primary_deployment_group === d.deployment_group}
                                             />
@@ -353,19 +355,17 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
     }
 
     return (
-        <Panel>
+        <Panel onClick={current ? () => navigate(`/deployment/${projectName}/${current.deployment_id}`) : undefined}>
             <PanelHead
                 title="Current production deployment"
                 sub={current ? `${current.deployment_group || 'default'} group` : undefined}
                 right={current && (
-                    <button
-                        type="button"
+                    <span
                         className="r-link"
-                        style={{ fontSize: 12.5, background: 'none', border: 'none', padding: 0, font: 'inherit' }}
-                        onClick={() => navigate(`/deployment/${projectName}/${current.deployment_id}`)}
+                        style={{ fontSize: 12.5 }}
                     >
                         View deployment →
-                    </button>
+                    </span>
                 )}
             />
             {deployments === null ? (
@@ -376,7 +376,9 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
                 <PanelBody style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 20 }}>
                     <div>
                         <div className="r-stat-label">Source</div>
-                        <div style={{ marginTop: 8 }} onClick={(e) => e.stopPropagation()}>
+                        <div style={{ marginTop: 8 }} onClick={(e) => {
+                            if ((e.target as HTMLElement).closest('a, button')) e.stopPropagation();
+                        }}>
                             {(current.pull_request_url || current.job_url) ? (
                                 <SourceLinkGroup
                                     jobUrl={current.job_url}
@@ -597,7 +599,7 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onUp
                                             }}
                                         >
                                             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                                                <EnvPill env={env.name} color={env.color} />
+                                                <EnvPill projectName={projectName} env={env.name} color={env.color} />
                                                 {env.is_production && env.name !== 'production' && (
                                                     <Pill kind="env-prod">production</Pill>
                                                 )}

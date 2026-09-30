@@ -317,10 +317,15 @@ impl ResourceBuilder {
         &self,
         project: &Project,
         deployment_group: &str,
+        environments: &[crate::db::models::Environment],
         custom_domains: &[CustomDomain],
     ) -> super::controller::DeploymentUrls {
-        self.url_builder
-            .compute_project_urls(project, deployment_group, custom_domains)
+        self.url_builder.compute_project_urls(
+            project,
+            deployment_group,
+            environments,
+            custom_domains,
+        )
     }
 
     // ── Labels ─────────────────────────────────────────────────────────
@@ -2509,6 +2514,61 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn project_urls_exist_without_a_deployment() {
+        let builder = test_resource_builder();
+        let mut project = test_project();
+        project.status = crate::db::models::ProjectStatus::Stopped;
+        let urls = builder.compute_project_urls(&project, "default", &[], &[]);
+        assert_eq!(urls.default_url, "https://demo.example.test");
+        assert_eq!(urls.primary_url, urls.default_url);
+    }
+
+    #[test]
+    fn project_urls_select_domains_from_the_groups_environment() {
+        let builder = test_resource_builder();
+        let project = test_project();
+        let production = test_environment("production", true, "default");
+        let mut staging = test_environment("staging", false, "staging");
+        staging.id = uuid::Uuid::new_v4();
+        let mut staging_domain = test_custom_domain("staging.example.org", true);
+        staging_domain.environment_id = staging.id;
+        let production_domain = test_custom_domain("app.example.org", true);
+        let urls = builder.compute_project_urls(
+            &project,
+            "default",
+            &[production, staging],
+            &[staging_domain, production_domain],
+        );
+        assert_eq!(urls.primary_url, "https://app.example.org");
+        assert_eq!(urls.custom_domain_urls, vec!["https://app.example.org"]);
+    }
+
+    #[test]
+    fn project_urls_match_deployment_urls_for_the_same_environment() {
+        let mut builder = test_resource_builder();
+        builder.url_builder.environment_ingress_url_template =
+            Some("{project_name}-{environment}.example.test".to_string());
+        let project = test_project();
+        let environment = test_environment("staging", false, "staging");
+        let environments = vec![environment.clone()];
+        let mut deployment = test_deployment();
+        deployment.deployment_group = "staging".to_string();
+        deployment.environment_id = Some(environment.id);
+        let before = builder.compute_deployment_urls(
+            &project,
+            &deployment,
+            Some(&environment),
+            &environments,
+            &[],
+        );
+        let after = builder.compute_project_urls(&project, "staging", &environments, &[]);
+        assert_eq!(after.primary_url, "https://demo-staging.example.test");
+        assert_eq!(after.default_url, before.default_url);
+        assert_eq!(after.primary_url, before.primary_url);
+        assert_eq!(after.all_urls, before.all_urls);
     }
 
     #[test]

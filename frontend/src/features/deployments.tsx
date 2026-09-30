@@ -350,7 +350,7 @@ export function ActiveDeploymentsSummary({ projectName }) {
                             {deployment.environment && (
                                 <div>
                                     <dt className="text-gray-600 dark:text-gray-400">Environment</dt>
-                                    <dd><EnvPill env={deployment.environment} color={deployment.environment_color} /></dd>
+                                    <dd><EnvPill projectName={projectName} env={deployment.environment} color={deployment.environment_color} /></dd>
                                 </div>
                             )}
                             {deployment.expires_at && (
@@ -397,14 +397,20 @@ export function DeploymentsList({ projectName }) {
     const [deployments, setDeployments] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
-    const [page, setPage] = useState(0);
+    const [pageParam, setPageParam] = useQueryParam('page');
+    const page = Math.max(0, Number.parseInt(pageParam || '0', 10) || 0);
+    const setPage = (value: number) => setPageParam(value > 0 ? String(value) : null);
     const [hasMore, setHasMore] = useState(true);
-    const [groupFilter, setGroupFilter] = useState('');
+    const [groupParam, setGroupFilter] = useQueryParam('group');
+    const groupFilter = groupParam || '';
     const [deploymentGroups, setDeploymentGroups] = useState([]);
     const [environments, setEnvironments] = useState([]);
-    const [envFilter, setEnvFilter] = useState('');
-    const [statusFilter, setStatusFilter] = useState('active');
-    const [search, setSearch] = useState('');
+    const [envParam, setEnvFilter] = useQueryParam('env');
+    const envFilter = envParam || '';
+    const [statusParam, setStatusFilter] = useQueryParam('status');
+    const statusFilter = statusParam || 'active';
+    const [searchParam, setSearch] = useQueryParam('search');
+    const search = searchParam || '';
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
     const [deploymentToStop, setDeploymentToStop] = useState(null);
     const [stopping, setStopping] = useState(false);
@@ -460,6 +466,8 @@ export function DeploymentsList({ projectName }) {
             setLoading(false);
         }
     }, [projectName, page, groupFilter]);
+
+    useEffect(() => { loadDeployments(); }, [loadDeployments]);
 
     // Auto-refresh every 5 seconds, paused when the tab is hidden.
     usePolling(loadDeployments, 5000);
@@ -643,12 +651,12 @@ export function DeploymentsList({ projectName }) {
                                     <td><Status status={d.status} /></td>
                                     <td>
                                         {d.environment ? (
-                                            <EnvPill env={d.environment} color={d.environment_color} />
+                                            <EnvPill projectName={projectName} env={d.environment} color={d.environment_color} />
                                         ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
                                     </td>
                                     <td>{d.deployment_group ? (() => {
                                         const env = environments.find((e) => e.name === d.environment);
-                                        return <GroupPill group={d.deployment_group} primary={!!env && env.primary_deployment_group === d.deployment_group} />;
+                                        return <GroupPill projectName={projectName} group={d.deployment_group} primary={!!env && env.primary_deployment_group === d.deployment_group} />;
                                     })() : null}</td>
                                     <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                                         {d.image ? d.image.split('/').pop() : '—'}
@@ -697,7 +705,7 @@ export function DeploymentsList({ projectName }) {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14 }}>
                 <RButton
                     size="sm"
-                    onClick={() => setPage(p => p - 1)}
+                    onClick={() => setPage(page - 1)}
                     disabled={page === 0}
                     icon="chevl"
                 >
@@ -711,7 +719,7 @@ export function DeploymentsList({ projectName }) {
                 </span>
                 <RButton
                     size="sm"
-                    onClick={() => setPage(p => p + 1)}
+                    onClick={() => setPage(page + 1)}
                     disabled={!hasMore}
                 >
                     Next
@@ -1282,6 +1290,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                         <Status status={deployment.status} tooltip={`Deployment status: ${deployment.status}`} />
                         {deployment.environment ? (
                             <EnvPill
+                                projectName={projectName}
                                 env={deployment.environment}
                                 color={deployment.environment_color}
                                 tooltip={
@@ -1300,6 +1309,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             const isPrimaryGroup = !!env && env.primary_deployment_group === deployment.deployment_group;
                             return (
                                 <GroupPill
+                                    projectName={projectName}
                                     group={deployment.deployment_group}
                                     primary={isPrimaryGroup}
                                     tooltip={

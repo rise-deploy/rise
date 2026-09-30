@@ -73,6 +73,8 @@ pub struct Project {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_deployment_status: Option<String>, // Status of the active deployment
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_deployment_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_url: Option<String>, // Default URL from ingress template
     #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_url: Option<String>, // Primary URL (starred custom domain, or default URL)

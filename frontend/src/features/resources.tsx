@@ -313,7 +313,7 @@ function EnvironmentCard({ env, projectName, deployments, onEdit, onDelete }) {
                                         </td>
                                         <td><RStatus status={d.status || 'Unknown'} /></td>
                                         <td>
-                                            <RGroupPill group={group} primary={groupIsPrimary} />
+                                            <RGroupPill projectName={projectName} group={group} primary={groupIsPrimary} />
                                         </td>
                                         <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
                                         <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
@@ -880,7 +880,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         return (
             <div key={env.id} style={{ marginBottom: 20 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 4px' }}>
-                    <REnvPill env={env.name} color={env.color} />
+                    <REnvPill projectName={projectName} env={env.name} color={env.color} />
                     {orphaned && (
                         <RTooltip content={`Environment '${env.name}' has no primary deployment group, so domains here aren't attached to any ingress. Set a primary group on the environment to publish them.`}>
                             <span style={{ display: 'inline-flex', color: 'var(--accent-warning, #fbbf24)', lineHeight: 0 }} aria-label="No primary deployment group">

@@ -86,11 +86,15 @@ impl DeploymentBackend for KubernetesBackend {
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
+        let environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
-        Ok(self
-            .resource_builder
-            .compute_project_urls(project, deployment_group, &custom_domains))
+        Ok(self.resource_builder.compute_project_urls(
+            project,
+            deployment_group,
+            &environments,
+            &custom_domains,
+        ))
     }
 
     async fn cleanup_environment(&self, project: &Project, _environment_name: &str) -> Result<()> {
