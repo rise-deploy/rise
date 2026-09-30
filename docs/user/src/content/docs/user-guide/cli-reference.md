@@ -44,7 +44,7 @@ rise project show
 
 | Variable | Description |
 |----------|-------------|
-| `RISE_URL` | Default backend URL |
+| `RISE_URL` | Backend URL override; credentials are loaded for this URL. Takes priority over the project target and profile URL. |
 | `RISE_PROFILE` | Login profile to use, equivalent to the global `--profile` flag. See [Login Profiles](../configuration#login-profiles). |
 | `RISE_TOKEN` | Authentication token (skips interactive login) |
 | `RISE_TOKEN_COMMAND` | Shell command whose stdout is used as the bearer token. JWT output uses the embedded `exp` claim; opaque output uses `RISE_TOKEN_COMMAND_TTL` as its assumed lifetime. |
@@ -86,4 +86,4 @@ For token sources that can mint new tokens, the CLI refreshes proactively so lon
 
 CLI settings are stored in `~/.config/rise/config.json`, created on first `rise login`. See [Project Configuration](../configuration#global-cli-config) for details.
 
-Multiple accounts/backends can be managed side by side with named login profiles (`--profile` / `RISE_PROFILE`, `rise profile list`/`use`/`remove`). See [Login Profiles](../configuration#login-profiles).
+Backend URLs can have named profile aliases (`--profile` / `RISE_PROFILE`, `rise profile list`/`use`/`remove`). See [Login Profiles](../configuration#login-profiles).

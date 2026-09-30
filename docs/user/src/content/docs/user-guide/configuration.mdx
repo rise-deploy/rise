@@ -138,18 +138,19 @@ For array fields (`buildpacks`, `args`), CLI values are **appended** to config f
 
 The CLI stores global configuration in `~/.config/rise/config.json`, including:
 
-- Authentication token (set by `rise login`)
 - Backend URL
 - Container CLI preference (`docker` or `podman`)
 - Managed BuildKit setting
 
-This file is created automatically on first `rise login`.
+This file is created automatically on first `rise login`. Login tokens are stored
+separately under `~/.config/rise/credentials/`, keyed by backend URL. URLs that
+differ only in trailing slashes share a credential. A URL without a saved token
+requires login or an explicit token source such as `RISE_TOKEN`.
 
 ## Login Profiles
 
-By default, `rise login` stores credentials in the config file above (the
-**default profile**). To manage more than one Rise account or backend side by
-side — e.g. a personal account and a work account — use a named profile:
+Profiles are local aliases for backend URLs. To give a backend a convenient name,
+log in with a named profile:
 
 ```bash
 # Log in and register a new profile named "work" (created if it doesn't exist)
@@ -168,19 +169,53 @@ rise profile use work
 # See every registered profile and which one is active
 rise profile list
 
-# Remove a profile's stored credentials
+# Remove the alias (the URL's saved login remains available)
 rise profile remove work
 ```
 
-Profile selection follows `--profile`, then `RISE_PROFILE`. When neither is set,
-`rise login --url` (or `RISE_URL`) selects the profile whose saved backend URL
-matches, ignoring trailing slashes. The default profile participates in matching.
-If multiple profiles match, the command errors and asks you to select one with
-`--profile` or `RISE_PROFILE`. With no URL or no matching profile, the profile
-selected by `rise profile use` applies. `rise profile use default` selects the default
-profile for future commands. A named profile's config is stored separately at
-`~/.config/rise/profiles/<name>.json`; the default selection is stored at
-`~/.config/rise/default-profile`.
+Profiles pointing to the same URL share one login token. Logging in through any
+of those profiles updates that shared token. You can also use a URL directly,
+without creating a named profile:
+
+```bash
+rise login --url https://rise.example.com
+RISE_URL=https://rise.example.com rise project list
+```
+
+`--profile` takes priority over `RISE_PROFILE`. `rise login --url` takes priority
+over `RISE_URL`; either URL override takes priority over the selected profile's
+URL. Credentials always belong to the effective URL.
+
+When no URL or profile override is set, Rise uses `targets.default` from the
+project configuration, then the profile selected by `rise profile use`, then the
+default profile's URL, and finally `http://localhost:3000`.
+`rise profile use default` selects the default profile for future commands.
+Named profile settings are stored at `~/.config/rise/profiles/<name>.json`; the
+default selection is stored at `~/.config/rise/default-profile`.
+
+## Project Targets
+
+The optional `targets.default` entry supplies a backend URL or a local profile
+name when no `--profile`, `RISE_PROFILE`, `rise login --url`, or `RISE_URL` override
+is set. Specify exactly one of `url` and `profile`:
+
+```toml
+[targets.default]
+url = "https://rise.example.com"
+```
+
+To use a local profile instead:
+
+```toml
+[targets.default]
+profile = "work"
+```
+
+A referenced profile must exist locally. The CLI reads `rise.toml` (or
+`.rise.toml`) from the command's application directory: its `--path` or positional
+path when supported, otherwise the current directory. If the section or its
+`default` entry is absent, the configured global default applies. Profile
+management commands operate on local aliases independently of project targets.
 
 ## Backend Configuration Schema
 

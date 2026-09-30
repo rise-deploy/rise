@@ -200,7 +200,6 @@ pub async fn handle_authorization_code_flow(
     http_client: &Client,
     backend_url: &str,
     config: &mut Config,
-    backend_url_to_save: Option<&str>,
 ) -> Result<()> {
     let backend_url = normalize_backend_url(backend_url);
 
@@ -323,22 +322,18 @@ pub async fn handle_authorization_code_flow(
         .await
         .context("Failed to parse code exchange response")?;
 
-    // Store the backend URL if provided
-    if let Some(url) = backend_url_to_save {
-        config
-            .set_backend_url(url.to_string())
-            .context("Failed to save backend URL")?;
-    }
-
     // Store the token
     log_token_debug(&exchange_response.token, "OAuth login response");
     config
-        .set_token(exchange_response.token.clone())
+        .save_login(&backend_url, exchange_response.token.clone())
         .context("Failed to save authentication token")?;
 
     println!("✓ Login successful!");
     println!("  Profile: {}", Config::active_profile_label()?);
-    println!("  Token saved to: {}", Config::config_path()?.display());
+    println!(
+        "  Token saved to: {}",
+        Config::credential_path(backend_url.as_ref())?.display()
+    );
 
     // Display token expiration
     match format_token_expiration(&exchange_response.token) {

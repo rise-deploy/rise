@@ -19,6 +19,10 @@ pub struct ProjectBuildConfig {
     #[serde(default)]
     pub project: Option<ProjectConfig>,
 
+    /// CLI backend targets. The `default` entry applies when no explicit URL or profile is set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<String, TargetConfig>,
+
     /// Build configuration (optional)
     #[serde(default)]
     pub build: Option<BuildConfig>,
@@ -47,6 +51,15 @@ pub struct ProjectBuildConfig {
     /// port is always the target container's `port`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, RouteConfig>,
+}
+
+/// A backend target specifies exactly one URL or local profile name.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum TargetConfig {
+    Url(String),
+    Profile(String),
 }
 
 /// Configuration for one container in a multi-container deployment.

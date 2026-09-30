@@ -172,106 +172,130 @@ fn ensure_config_dir(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub struct Config {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     pub backend_url: Option<String>,
     pub container_cli: Option<String>,
     pub managed_buildkit: Option<bool>,
 }
 
-/// Process-wide override for the active profile, set at most once by `main()`
-/// from an explicit `--profile` flag or the resolved client profile. The outer
-/// `Option` tracks whether an override was set; the inner `Option` is the
-/// resolved profile itself (`None` = the default profile, i.e. `--profile
-/// default`).
-///
-/// Using a `OnceLock` here — rather than round-tripping through
-/// `std::env::set_var`/`remove_var` — avoids mutating the process
-/// environment after the async runtime's worker threads are running, which
-/// is unsound if anything else reads the environment concurrently.
+/// The selected alias and effective backend URL for every config load in this process.
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub profile: Option<String>,
+    pub url: String,
+}
+
 static PROFILE_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+static TARGET_OVERRIDE: OnceLock<ResolvedTarget> = OnceLock::new();
 
 const DEFAULT_PROFILE_FILE: &str = "default-profile";
 
-/// Set the process-wide profile override before loading client configuration.
-/// The first call wins, so an explicit `--profile` takes priority over
-/// subsequent attempts to set the resolved profile.
 pub fn set_profile_override(profile: Option<String>) {
     let _ = PROFILE_OVERRIDE.set(profile);
 }
 
-impl Config {
-    /// The active login profile: process override, `RISE_PROFILE`, a unique
-    /// saved URL match for `RISE_URL`, then the persisted default selection.
-    pub fn active_profile() -> Result<Option<String>> {
-        Self::resolve_profile(None)
-    }
+pub fn set_target_override(target: ResolvedTarget) {
+    let _ = TARGET_OVERRIDE.set(target);
+}
 
-    /// Resolve the profile with an optional CLI URL taking priority over `RISE_URL`.
-    pub fn resolve_profile(url: Option<&str>) -> Result<Option<String>> {
-        if let Some(overridden) = PROFILE_OVERRIDE.get() {
-            return Ok(overridden.clone());
+impl Config {
+    /// Explicit profile selection, including the literal `default`.
+    fn explicit_profile() -> Result<Option<Option<String>>> {
+        if let Some(profile) = PROFILE_OVERRIDE.get() {
+            return Ok(Some(profile.clone()));
         }
         #[cfg(not(test))]
-        if let Ok(val) = std::env::var("RISE_PROFILE") {
-            let trimmed = val.trim();
-            if trimmed.is_empty() || trimmed == "default" {
-                return Ok(None);
+        if let Ok(value) = std::env::var("RISE_PROFILE") {
+            let name = value.trim();
+            if name.is_empty() || name == "default" {
+                return Ok(Some(None));
             }
-            validate_profile_name(trimmed)?;
-            return Ok(Some(trimmed.to_string()));
+            validate_profile_name(name)?;
+            return Ok(Some(Some(name.to_string())));
         }
+        Ok(None)
+    }
+
+    pub fn has_target_override(url: Option<&str>) -> Result<bool> {
+        Ok(url.is_some()
+            || Self::explicit_profile()?.is_some()
+            || (!cfg!(test) && std::env::var("RISE_URL").is_ok()))
+    }
+
+    /// Resolve the effective URL before looking up credentials. Project defaults
+    /// apply only in the absence of explicit URL and profile overrides.
+    pub fn resolve_target(
+        url: Option<&str>,
+        project_target: Option<&crate::rise_toml::TargetConfig>,
+        allow_new_profile: bool,
+    ) -> Result<ResolvedTarget> {
+        if let Some(target) = TARGET_OVERRIDE.get() {
+            return Ok(target.clone());
+        }
+        let explicit_profile = Self::explicit_profile()?;
+        let allow_new_profile = allow_new_profile && explicit_profile.is_some();
         let env_url = if cfg!(test) {
             None
         } else {
             std::env::var("RISE_URL").ok()
         };
-        if let Some(url) = url.or(env_url.as_deref()) {
-            if let Some(name) = Self::profile_matching_url(url)? {
-                return Ok((name != "default").then_some(name));
+        let mut url = url.or(env_url.as_deref()).map(str::to_string);
+        let profile = if let Some(profile) = explicit_profile {
+            profile
+        } else if url.is_some() {
+            None
+        } else if let Some(target) = project_target {
+            match target {
+                crate::rise_toml::TargetConfig::Url(value) => {
+                    url = Some(value.clone());
+                    None
+                }
+                crate::rise_toml::TargetConfig::Profile(name) => {
+                    validate_profile_name(name)?;
+                    if name == "default" {
+                        None
+                    } else {
+                        Some(name.clone())
+                    }
+                }
+            }
+        } else {
+            Self::default_profile()?
+        };
+        if let Some(name) = &profile {
+            if !Self::path_for(Some(name))?.exists() && !allow_new_profile {
+                anyhow::bail!("Profile '{}' does not exist; register it with 'rise login --profile {} --url <URL>' first", name, name);
             }
         }
+        let saved = Self::load_named(profile.as_deref())?;
+        let url = normalize_backend_url(
+            url.as_deref()
+                .or(saved.backend_url.as_deref())
+                .unwrap_or("http://localhost:3000"),
+        );
+        let parsed = url::Url::parse(&url).context("Invalid Rise backend URL")?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            anyhow::bail!("Rise backend URL must be an absolute HTTP or HTTPS URL");
+        }
+        Ok(ResolvedTarget { profile, url })
+    }
 
+    pub fn active_profile() -> Result<Option<String>> {
+        if let Some(target) = TARGET_OVERRIDE.get() {
+            return Ok(target.profile.clone());
+        }
+        if let Some(profile) = Self::explicit_profile()? {
+            return Ok(profile);
+        }
         #[cfg(not(test))]
-        return Self::default_profile();
-
+        return Ok(Self::resolve_target(None, None, false)?.profile);
         #[cfg(test)]
         Ok(None)
     }
 
-    /// Match only saved backend URLs; environment overrides and implicit URLs
-    /// do not identify a profile.
-    fn profile_matching_url(url: &str) -> Result<Option<String>> {
-        let url = normalize_backend_url(url);
-        let mut names = vec!["default".to_string()];
-        names.extend(Self::list_profiles()?);
-        let mut matches = Vec::new();
-        for name in names {
-            let key = (name != "default").then_some(name.as_str());
-            let config = Self::load_named(key)
-                .with_context(|| format!("Failed to inspect profile '{}'", name))?;
-            if config
-                .backend_url
-                .as_deref()
-                .map(normalize_backend_url)
-                .as_deref()
-                == Some(url.as_str())
-            {
-                matches.push(name);
-            }
-        }
-        if matches.len() > 1 {
-            anyhow::bail!(
-                "Multiple profiles match backend URL '{}': {}. Select one with --profile or RISE_PROFILE",
-                url,
-                matches.join(", ")
-            );
-        }
-        Ok(matches.pop())
-    }
-
-    /// The active profile's name for display purposes (`"default"` when unset).
     pub fn active_profile_label() -> Result<String> {
         Ok(Self::active_profile()?.unwrap_or_else(|| "default".to_string()))
     }
@@ -282,7 +306,7 @@ impl Config {
         Self::read_default_profile_file(&path)
     }
 
-    /// Select the fallback profile when no explicit profile or unique URL match applies.
+    /// Select the fallback profile when no explicit override or project target applies.
     pub fn set_default_profile(name: &str) -> Result<()> {
         validate_profile_name(name)?;
 
@@ -354,6 +378,15 @@ impl Config {
             anyhow::bail!("Profile '{}' does not exist", name);
         }
 
+        let config = Self::load_named((name != "default").then_some(name))?;
+        if let Some(url) = config.backend_url.as_deref() {
+            if !Self::credential_path(url)?.exists() {
+                if let Some(token) = Self::token_for_url(url)? {
+                    Self::write_credential(url, token)?;
+                }
+            }
+        }
+
         fs::remove_file(&path).context("Failed to remove profile config file")?;
         if Self::default_profile()?.as_deref() == Some(name) {
             Self::set_default_profile("default")?;
@@ -383,7 +416,24 @@ impl Config {
 
     /// Load the active profile's configuration from disk
     pub fn load() -> Result<Self> {
-        Self::load_named(Self::active_profile()?.as_deref())
+        Self::load_target(false)
+    }
+
+    /// Login can establish a credential even when existing saved tokens disagree.
+    pub fn load_for_login() -> Result<Self> {
+        Self::load_target(true)
+    }
+
+    fn load_target(for_login: bool) -> Result<Self> {
+        let target = Self::resolve_target(None, None, for_login)?;
+        let mut config = Self::load_named(target.profile.as_deref())?;
+        config.token = if for_login {
+            None
+        } else {
+            Self::token_for_url(&target.url)?
+        };
+        config.backend_url = Some(target.url);
+        Ok(config)
     }
 
     /// Load a specific profile's configuration from disk, independent of the
@@ -407,7 +457,20 @@ impl Config {
     /// Save configuration to disk
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path()?;
-        Self::write_config_file(&config_path, self)
+        // Remove once profile-local credentials are no longer supported.
+        let previous = Self::load_named(Self::active_profile()?.as_deref())?;
+        if previous.token.is_some() {
+            if let Some(url) = previous.backend_url.as_deref() {
+                if !Self::credential_path(url)?.exists() {
+                    if let Some(token) = Self::token_for_url(url)? {
+                        Self::write_credential(url, token)?;
+                    }
+                }
+            }
+        }
+        let mut settings = self.clone();
+        settings.token = None;
+        Self::write_config_file(&config_path, &settings)
     }
 
     /// Write configuration to a specific path with restrictive permissions on Unix
@@ -417,57 +480,99 @@ impl Config {
     }
 
     fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-        // On Unix, create/write the file with 0600 permissions
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
+        use std::io::Write;
+        // NamedTempFile uses 0600 on Unix; persist atomically replaces the destination.
+        let mut file =
+            tempfile::NamedTempFile::new_in(path.parent().context("Missing config directory")?)
                 .context("Failed to create config file")?;
-            file.write_all(contents)
-                .context("Failed to write config file")?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            fs::write(path, contents).context("Failed to write config file")?;
-        }
-
+        file.write_all(contents)
+            .context("Failed to write config file")?;
+        file.persist(path)
+            .context("Failed to persist config file")?;
         Ok(())
     }
 
-    /// Set the authentication token
-    pub fn set_token(&mut self, token: String) -> Result<()> {
+    /// Credentials are shared by every alias pointing at the same normalized URL.
+    pub fn credential_path(url: &str) -> Result<PathBuf> {
+        use sha2::{Digest, Sha256};
+        let dir = Self::config_dir()?.join("credentials");
+        ensure_config_dir(&dir)?;
+        let key: String = Sha256::digest(normalize_backend_url(url).as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(dir.join(format!("{key}.json")))
+    }
+
+    pub fn token_for_url(url: &str) -> Result<Option<String>> {
+        let url = normalize_backend_url(url);
+        let path = Self::credential_path(&url)?;
+        if path.exists() {
+            let contents = fs::read_to_string(&path).context("Failed to read saved credential")?;
+            let saved: Config =
+                serde_json::from_str(&contents).context("Failed to parse saved credential")?;
+            anyhow::ensure!(
+                saved.backend_url.as_deref() == Some(url.as_str()),
+                "Saved credential URL does not match its storage key"
+            );
+            return Ok(saved.token);
+        }
+
+        // Remove once profile-local credentials are no longer supported.
+        let mut names = vec!["default".to_string()];
+        names.extend(Self::list_profiles()?);
+        let mut token = None;
+        let mut matches = Vec::new();
+        let mut conflict = false;
+        for name in names {
+            let config = Self::load_named((name != "default").then_some(name.as_str()))?;
+            if config
+                .backend_url
+                .as_deref()
+                .map(normalize_backend_url)
+                .as_deref()
+                != Some(url.as_str())
+            {
+                continue;
+            }
+            if let Some(value) = config.token.filter(|value| !value.is_empty()) {
+                conflict |= token.as_ref().is_some_and(|existing| existing != &value);
+                token = Some(value);
+                matches.push(name);
+            }
+        }
+        if conflict {
+            anyhow::bail!("Profiles {} contain different saved tokens for '{}'. Run 'rise login --url {}' to establish the shared login", matches.join(", "), url, url);
+        }
+        Ok(token)
+    }
+
+    /// Save a successful login for its effective URL and persist the selected alias.
+    pub fn save_login(&mut self, url: &str, token: String) -> Result<()> {
+        let url = normalize_backend_url(url);
+        Self::write_credential(&url, token.clone())?;
+        self.backend_url = Some(url);
         self.token = Some(token);
         self.save()
     }
 
-    /// The token persisted in the config file (ignores RISE_TOKEN env).
-    ///
-    /// Token *source* selection (RISE_TOKEN, RISE_TOKEN_COMMAND, GitHub Actions
-    /// OIDC, then this stored token) lives in [`crate::cli::token_source`].
+    fn write_credential(url: &str, token: String) -> Result<()> {
+        let url = normalize_backend_url(url);
+        let credential = Config {
+            token: Some(token),
+            backend_url: Some(url.clone()),
+            ..Config::default()
+        };
+        Self::write_config_file(&Self::credential_path(&url)?, &credential)
+    }
+
+    /// The saved login token for the resolved URL (ignores RISE_TOKEN env).
     pub fn stored_token(&self) -> Option<String> {
         self.token.clone()
     }
 
-    /// Set the backend URL
-    pub fn set_backend_url(&mut self, url: String) -> Result<()> {
-        self.backend_url = Some(normalize_backend_url(&url));
-        self.save()
-    }
-
-    /// Get the backend URL (with default fallback)
-    /// Checks RISE_URL environment variable first, then falls back to config file, then to default
+    /// The effective URL is resolved before credentials are loaded.
     pub fn get_backend_url(&self) -> String {
-        #[cfg(not(test))]
-        if let Ok(url) = std::env::var("RISE_URL") {
-            return normalize_backend_url(&url);
-        }
         self.backend_url
             .as_deref()
             .map(normalize_backend_url)
@@ -550,6 +655,92 @@ fn detect_container_cli() -> ContainerCli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_persists_url_credentials_without_losing_previous_login() {
+        const CHILD: &str = "RISE_TEST_LOGIN_STORAGE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::config::tests::login_persists_url_credentials_without_losing_previous_login", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let previous_url = "https://previous.example.com";
+        let url = "https://rise.example.com";
+        Config::write_config_file(
+            &Config::path_for(Some("work")).unwrap(),
+            &Config {
+                backend_url: Some(previous_url.into()),
+                token: Some("previous-token".into()),
+                container_cli: Some("podman".into()),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        Config::write_config_file(
+            &Config::path_for(Some("other")).unwrap(),
+            &Config {
+                backend_url: Some(url.into()),
+                token: Some("other-token".into()),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        set_target_override(ResolvedTarget {
+            profile: Some("work".into()),
+            url: url.into(),
+        });
+
+        let mut config = Config::load_for_login().unwrap();
+        config
+            .save_login(&format!("{url}/"), "fresh-token".into())
+            .unwrap();
+        assert_eq!(
+            Config::token_for_url(previous_url).unwrap().as_deref(),
+            Some("previous-token")
+        );
+        assert_eq!(
+            Config::load().unwrap().stored_token().as_deref(),
+            Some("fresh-token")
+        );
+        let alias = Config::load_named(Some("work")).unwrap();
+        assert_eq!(alias.backend_url.as_deref(), Some(url));
+        assert_eq!(alias.container_cli.as_deref(), Some("podman"));
+        assert!(alias.token.is_none());
+
+        config.save_login(url, "refreshed-token".into()).unwrap();
+        assert_eq!(
+            Config::token_for_url(url).unwrap().as_deref(),
+            Some("refreshed-token")
+        );
+        assert_eq!(
+            Config::token_for_url("https://unknown.example.com").unwrap(),
+            None
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(Config::credential_path(url).unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
 
     fn config(overrides: impl FnOnce(&mut Config)) -> Config {
         let mut c = Config::default();
