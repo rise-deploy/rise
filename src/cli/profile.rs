@@ -1,6 +1,6 @@
 //! `rise profile` — inspect and manage the login profiles selected via the
-//! global `--profile` flag, `RISE_PROFILE` environment variable, or persisted
-//! default selection.
+//! global `--profile` flag, `RISE_PROFILE` environment variable, a unique URL
+//! match, or persisted default selection.
 //!
 //! A profile is "registered" simply by having a saved config file: `rise
 //! login --profile <name>` creates one on first use, so there is nothing to

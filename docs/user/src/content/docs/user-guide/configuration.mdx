@@ -172,8 +172,12 @@ rise profile list
 rise profile remove work
 ```
 
-Profile selection follows `--profile`, then `RISE_PROFILE`, then the profile
-selected by `rise profile use`. `rise profile use default` selects the default
+Profile selection follows `--profile`, then `RISE_PROFILE`. When neither is set,
+`rise login --url` (or `RISE_URL`) selects the profile whose saved backend URL
+matches, ignoring trailing slashes. The default profile participates in matching.
+If multiple profiles match, the command errors and asks you to select one with
+`--profile` or `RISE_PROFILE`. With no URL or no matching profile, the profile
+selected by `rise profile use` applies. `rise profile use default` selects the default
 profile for future commands. A named profile's config is stored separately at
 `~/.config/rise/profiles/<name>.json`; the default selection is stored at
 `~/.config/rise/default-profile`.

@@ -181,9 +181,8 @@ pub struct Config {
 }
 
 /// Process-wide override for the active profile, set at most once by `main()`
-/// from an explicit `--profile` flag. The outer `Option` tracks whether an
-/// override was set at all (unset = no `--profile` flag was given, so
-/// `RISE_PROFILE` should be consulted instead); the inner `Option` is the
+/// from an explicit `--profile` flag or the resolved client profile. The outer
+/// `Option` tracks whether an override was set; the inner `Option` is the
 /// resolved profile itself (`None` = the default profile, i.e. `--profile
 /// default`).
 ///
@@ -195,23 +194,22 @@ static PROFILE_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 
 const DEFAULT_PROFILE_FILE: &str = "default-profile";
 
-/// Set the process-wide profile override. Must be called at most once, before
-/// any other profile resolution — `main()` does this immediately after
-/// parsing CLI args, when `--profile` was passed.
+/// Set the process-wide profile override before loading client configuration.
+/// The first call wins, so an explicit `--profile` takes priority over
+/// subsequent attempts to set the resolved profile.
 pub fn set_profile_override(profile: Option<String>) {
     let _ = PROFILE_OVERRIDE.set(profile);
 }
 
 impl Config {
-    /// The active login profile, i.e. the one selected via `--profile` /
-    /// `RISE_PROFILE` for the lifetime of this process, or the configured
-    /// default profile.
-    ///
-    /// `--profile` is resolved once in `main()` into [`set_profile_override`],
-    /// so every independent config load in the process — not just the one in
-    /// `main()` — agrees on the same active profile. Absent that override,
-    /// falls back to `RISE_PROFILE`, then the persisted default selection.
+    /// The active login profile: process override, `RISE_PROFILE`, a unique
+    /// saved URL match for `RISE_URL`, then the persisted default selection.
     pub fn active_profile() -> Result<Option<String>> {
+        Self::resolve_profile(None)
+    }
+
+    /// Resolve the profile with an optional CLI URL taking priority over `RISE_URL`.
+    pub fn resolve_profile(url: Option<&str>) -> Result<Option<String>> {
         if let Some(overridden) = PROFILE_OVERRIDE.get() {
             return Ok(overridden.clone());
         }
@@ -224,11 +222,53 @@ impl Config {
             validate_profile_name(trimmed)?;
             return Ok(Some(trimmed.to_string()));
         }
+        let env_url = if cfg!(test) {
+            None
+        } else {
+            std::env::var("RISE_URL").ok()
+        };
+        if let Some(url) = url.or(env_url.as_deref()) {
+            if let Some(name) = Self::profile_matching_url(url)? {
+                return Ok((name != "default").then_some(name));
+            }
+        }
+
         #[cfg(not(test))]
         return Self::default_profile();
 
         #[cfg(test)]
         Ok(None)
+    }
+
+    /// Match only saved backend URLs; environment overrides and implicit URLs
+    /// do not identify a profile.
+    fn profile_matching_url(url: &str) -> Result<Option<String>> {
+        let url = normalize_backend_url(url);
+        let mut names = vec!["default".to_string()];
+        names.extend(Self::list_profiles()?);
+        let mut matches = Vec::new();
+        for name in names {
+            let key = (name != "default").then_some(name.as_str());
+            let config = Self::load_named(key)
+                .with_context(|| format!("Failed to inspect profile '{}'", name))?;
+            if config
+                .backend_url
+                .as_deref()
+                .map(normalize_backend_url)
+                .as_deref()
+                == Some(url.as_str())
+            {
+                matches.push(name);
+            }
+        }
+        if matches.len() > 1 {
+            anyhow::bail!(
+                "Multiple profiles match backend URL '{}': {}. Select one with --profile or RISE_PROFILE",
+                url,
+                matches.join(", ")
+            );
+        }
+        Ok(matches.pop())
     }
 
     /// The active profile's name for display purposes (`"default"` when unset).
@@ -242,7 +282,7 @@ impl Config {
         Self::read_default_profile_file(&path)
     }
 
-    /// Select the profile used when neither `--profile` nor `RISE_PROFILE` is set.
+    /// Select the fallback profile when no explicit profile or unique URL match applies.
     pub fn set_default_profile(name: &str) -> Result<()> {
         validate_profile_name(name)?;
 

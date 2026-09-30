@@ -83,7 +83,8 @@ fn resolve_project_name_with_config(
 pub struct Cli {
     /// Login profile to use, letting you manage multiple Rise accounts or
     /// backends side by side. Falls back to the RISE_PROFILE environment
-    /// variable, then the profile selected by `rise profile use`.
+    /// variable, a unique saved profile matching the URL, then the profile
+    /// selected by `rise profile use`.
     /// `rise login --profile <name>` registers a new profile if needed.
     #[arg(long, global = true)]
     profile: Option<String>,
@@ -454,7 +455,7 @@ enum ProfileCommands {
     /// List registered login profiles
     #[command(visible_alias = "ls")]
     List,
-    /// Select the profile used when --profile and RISE_PROFILE are unset
+    /// Select the fallback profile when no explicit profile or URL match applies
     Use {
         /// Registered profile name (or "default")
         name: String,
@@ -1206,12 +1207,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Resolve the active login profile once, up front: an explicit --profile
-    // sets a process-wide override (cleared for the literal value "default")
-    // so every independent config load later in the process — not just the
-    // one below — agrees on the same profile. This deliberately avoids
-    // std::env::set_var, which is unsound to mutate concurrently with reads
-    // from other threads once the async runtime's workers are running.
+    // An explicit profile takes priority for every config load in this process.
     if let Some(profile) = &cli.profile {
         config::validate_profile_name(profile).context("Invalid --profile value")?;
         if profile == "default" {
@@ -1248,6 +1244,13 @@ async fn main() -> Result<()> {
     if let Commands::Identity(IdentityCommands::Agent { check }) = &cli_command {
         return cli::identity::agent_command(&Client::new(), *check).await;
     }
+
+    // Keep config loads and credential writes on the same resolved profile.
+    let url = match &cli_command {
+        Commands::Login { url, .. } => url.as_deref(),
+        _ => None,
+    };
+    config::set_profile_override(config::Config::resolve_profile(url)?);
 
     // Load CLI config for client commands
     let http_client = Client::new();
