@@ -791,6 +791,9 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     white-space: nowrap;
     vertical-align: middle;
 }
+a.r-chip { text-decoration: none; }
+a.r-chip:hover { border-color: var(--accent); }
+a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .r-chip-icon {
     display: inline-flex;
     align-items: center;

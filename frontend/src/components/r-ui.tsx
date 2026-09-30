@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { isSafeUrl } from '../lib/utils';
+import { navigate } from '../lib/navigation';
 import { Icon } from './icon';
 
 export function cx(...parts: Array<string | false | null | undefined>) {
@@ -36,17 +37,33 @@ export interface BasePillProps {
     iconStyle?: React.CSSProperties;
     nameClassName?: string;
     primary?: boolean;
+    href?: string;
     /** Plain-text hover hint via the HTML `title` attribute. Use `tooltip` for rich content. */
     title?: string;
     /** Rich tooltip content. When set, wraps the chip with the shared <Tooltip>. */
     tooltip?: React.ReactNode;
 }
-export function BasePill({ icon, name, iconStyle, nameClassName, primary, title, tooltip }: BasePillProps) {
-    const chip = (
-        <span className={cx('r-chip', primary && 'primary')} title={tooltip ? undefined : title}>
-            <span className="r-chip-icon" style={iconStyle} aria-hidden>{icon}</span>
-            <span className={cx('r-chip-name', nameClassName)}>{name}</span>
-        </span>
+export function BasePill({ icon, name, iconStyle, nameClassName, primary, href, title, tooltip }: BasePillProps) {
+    const content = <>
+        <span className="r-chip-icon" style={iconStyle} aria-hidden>{icon}</span>
+        <span className={cx('r-chip-name', nameClassName)}>{name}</span>
+    </>;
+    const className = cx('r-chip', primary && 'primary');
+    const chip = href ? (
+        <a
+            className={className}
+            href={href}
+            title={tooltip ? undefined : title}
+            onClick={(e) => {
+                e.stopPropagation();
+                if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                e.preventDefault();
+                navigate(href);
+            }}
+            onKeyDown={(e) => e.stopPropagation()}
+        >{content}</a>
+    ) : (
+        <span className={className} title={tooltip ? undefined : title}>{content}</span>
     );
     return tooltip ? <Tooltip content={tooltip}>{chip}</Tooltip> : chip;
 }
@@ -54,13 +71,14 @@ export function BasePill({ icon, name, iconStyle, nameClassName, primary, title,
 // Icon cell tinted with the environment's color; name cell neutral. The color
 // signal is concentrated in the icon so different envs read as variants of
 // the same chip shape.
-export function EnvPill({ env, color, tooltip, title }: { env: string; color?: string; tooltip?: React.ReactNode; title?: string }) {
+export function EnvPill({ projectName, env, color, tooltip, title }: { projectName: string; env: string; color?: string; tooltip?: React.ReactNode; title?: string }) {
     const palette = color ? ENV_COLOR_STYLES[color] : undefined;
     return (
         <BasePill
             icon={<Icon name="layer" size={11} />}
             iconStyle={palette ? { background: palette.background, color: palette.color } : undefined}
             name={env}
+            href={`/project/${projectName}/environment/${env}`}
             nameClassName="r-chip-name-strong"
             tooltip={tooltip}
             title={title}
@@ -73,11 +91,12 @@ export function EnvPill({ env, color, tooltip, title }: { env: string; color?: s
 // group) tints the icon cell with the accent color — same role the env color
 // plays in EnvPill. Name renders mono since groups are technical identifiers
 // (branch names, PR slugs, 'default').
-export function GroupPill({ group, primary, tooltip, title }: { group: string; primary?: boolean; tooltip?: React.ReactNode; title?: string }) {
+export function GroupPill({ projectName, group, primary, tooltip, title }: { projectName: string; group: string; primary?: boolean; tooltip?: React.ReactNode; title?: string }) {
     return (
         <BasePill
             icon={<Icon name="branch" size={11} />}
             name={group}
+            href={`/project/${projectName}/deployments?${new URLSearchParams({ group, status: 'all' })}`}
             nameClassName="mono"
             primary={primary}
             tooltip={tooltip}
@@ -318,7 +337,12 @@ export function Panel({ children, className, style, onClick }: { children: React
                 onClick={onClick}
                 role="button"
                 tabIndex={0}
-                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
+                onKeyDown={(e) => {
+                    if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+                        e.preventDefault();
+                        onClick();
+                    }
+                }}
             >
                 {children}
             </div>
