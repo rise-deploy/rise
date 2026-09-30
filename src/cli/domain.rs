@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{Context, Result};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Table};
 use reqwest::Client;
@@ -48,7 +49,7 @@ pub async fn add_domain(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await?;
 
     if !response.status().is_success() {
@@ -90,7 +91,7 @@ pub async fn list_domains(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await?;
 
     if !response.status().is_success() {
@@ -158,7 +159,7 @@ pub async fn remove_domain(
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await?;
 
     if !response.status().is_success() {

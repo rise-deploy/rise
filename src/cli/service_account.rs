@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{Context, Result};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
@@ -51,7 +52,7 @@ pub async fn create_service_account(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request_body)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send create service account request")?;
 
@@ -104,7 +105,7 @@ pub async fn list_service_accounts(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send list service accounts request")?;
 
@@ -182,7 +183,7 @@ pub async fn show_service_account(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send show service account request")?;
 
@@ -236,7 +237,7 @@ pub async fn delete_service_account(
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send delete service account request")?;
 
