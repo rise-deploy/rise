@@ -49,7 +49,6 @@ import {
   AwsRdsDetailView,
   AwsRdsExtensionUI,
   OAuthDetailView,
-  OAuthExtensionUI,
   SnowflakeOAuthDetailView,
   SnowflakeOAuthExtensionUI,
   getExtensionDetailView,

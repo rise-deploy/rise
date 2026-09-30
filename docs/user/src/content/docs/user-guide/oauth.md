@@ -95,7 +95,10 @@ OIDC-compliant providers expose an OpenID configuration document, so Rise can di
 | `issuer_url` | Required | Required |
 | `authorization_endpoint` | Auto-discovered | Required |
 | `token_endpoint` | Auto-discovered | Required |
-| `scopes` | Provider-specific | Provider-specific |
+| `token_endpoint_auth_method` | Optional, `client_secret_post` by default | Optional, `client_secret_post` by default |
+| `scopes` | Provider-specific | Provider-specific; `[]` for providers without scopes |
+
+`token_endpoint_auth_method` sets how Rise authenticates to the upstream token endpoint: `client_secret_post` sends `client_id` and `client_secret` in the request body, `client_secret_basic` sends them as an HTTP Basic `Authorization` header (RFC 6749 §2.3.1). Query parameters in `authorization_endpoint` are kept on the authorization request.
 
 Examples:
 
@@ -106,6 +109,7 @@ Examples:
 | Auth0 | Yes | `https://<tenant>.auth0.com` | Auto-discovered | Auto-discovered | `openid`, `email`, `profile` |
 | GitHub | No | `https://github.com` | `https://github.com/login/oauth/authorize` | `https://github.com/login/oauth/access_token` | `read:user`, `user:email` |
 | Snowflake | No | Your Snowflake account URL | Provider-specific authorization endpoint | Provider-specific token endpoint | Provider-specific |
+| Notion | No | `https://api.notion.com` | `https://api.notion.com/v1/oauth/authorize?owner=user` | `https://api.notion.com/v1/oauth/token` | None (`[]`); needs `client_secret_basic` |
 
 For non-OIDC providers, add the manual endpoints to the same extension spec:
 
@@ -120,6 +124,23 @@ For non-OIDC providers, add the manual endpoints to the same extension spec:
   "scopes": ["read:user", "user:email"]
 }
 ```
+
+Notion requires HTTP Basic client authentication and has no scopes:
+
+```json
+{
+  "provider_name": "Notion",
+  "client_id": "<notion-oauth-client-id>",
+  "client_secret_encrypted": "<encrypted>",
+  "issuer_url": "https://api.notion.com",
+  "authorization_endpoint": "https://api.notion.com/v1/oauth/authorize?owner=user",
+  "token_endpoint": "https://api.notion.com/v1/oauth/token",
+  "token_endpoint_auth_method": "client_secret_basic",
+  "scopes": []
+}
+```
+
+The **Configure** tab in the Rise UI offers these providers as templates.
 
 ## Application Usage
 
@@ -284,6 +305,10 @@ GET /oidc/{project}/{extension}/jwks
 - Verify `client_id` and `client_secret_encrypted`.
 - Check that the provider redirect URI matches the Rise callback URL.
 - Review provider logs for the upstream OAuth error.
+
+**"Token exchange failed with status 401"** with `invalid_client`
+
+- The provider may reject client credentials in the request body. Set `"token_endpoint_auth_method": "client_secret_basic"`.
 
 **"No cached state found for state token"**
 

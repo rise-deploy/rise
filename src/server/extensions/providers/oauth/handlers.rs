@@ -155,6 +155,42 @@ mod redirect_tests {
     }
 }
 
+#[cfg(test)]
+mod authorization_url_tests {
+    use super::upstream_authorization_url;
+    use crate::server::extensions::providers::oauth::models::OAuthExtensionSpec;
+
+    fn query(endpoint: &str, scopes: &[&str]) -> Vec<(String, String)> {
+        let spec: OAuthExtensionSpec = serde_json::from_value(serde_json::json!({
+            "provider_name": "Test",
+            "client_id": "cid",
+            "issuer_url": "https://idp.example.com",
+            "scopes": scopes,
+        }))
+        .unwrap();
+        upstream_authorization_url(endpoint, &spec, "https://rise/cb", "st", "cc")
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect()
+    }
+
+    #[test]
+    fn empty_scopes_send_no_scope_parameter() {
+        let pairs = query("https://api.notion.com/v1/oauth/authorize?owner=user", &[]);
+
+        assert!(pairs.iter().all(|(k, _)| k != "scope"));
+        assert_eq!(pairs[0], ("owner".into(), "user".into()));
+    }
+
+    #[test]
+    fn scopes_are_sent_space_delimited() {
+        let pairs = query("https://idp.example.com/authorize", &["openid", "email"]);
+
+        assert!(pairs.contains(&("scope".into(), "openid email".into())));
+    }
+}
+
 /// Resolved OAuth endpoints from spec or OIDC discovery
 #[derive(Debug, Clone)]
 struct ResolvedEndpoints {
@@ -724,28 +760,52 @@ pub async fn authorize(
             )
         })?;
 
-    // Build authorization URL
-    let mut auth_url = Url::parse(&endpoints.authorization_endpoint).map_err(|e| {
+    let auth_url = upstream_authorization_url(
+        &endpoints.authorization_endpoint,
+        &spec,
+        &redirect_uri,
+        &state_token,
+        &code_challenge,
+    )
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Invalid authorization endpoint: {}", e),
         )
     })?;
 
-    auth_url
-        .query_pairs_mut()
-        .append_pair("client_id", &spec.client_id)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("response_type", "code")
-        .append_pair("scope", &spec.scopes.join(" "))
-        .append_pair("state", &state_token)
-        .append_pair("code_challenge", &code_challenge)
-        .append_pair("code_challenge_method", "S256");
-
     debug!("Redirecting to OAuth provider: {}", auth_url.as_str());
 
     // Redirect to OAuth provider
     Ok(Redirect::to(auth_url.as_str()).into_response())
+}
+
+/// The upstream authorization request. Query parameters already in the
+/// endpoint (e.g. Notion's `owner=user`) are kept, and `scope` is left out when
+/// the spec requests no scopes.
+fn upstream_authorization_url(
+    authorization_endpoint: &str,
+    spec: &OAuthExtensionSpec,
+    redirect_uri: &str,
+    state_token: &str,
+    code_challenge: &str,
+) -> Result<Url, url::ParseError> {
+    let mut auth_url = Url::parse(authorization_endpoint)?;
+    {
+        let mut query = auth_url.query_pairs_mut();
+        query
+            .append_pair("client_id", &spec.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("response_type", "code");
+        if !spec.scopes.is_empty() {
+            query.append_pair("scope", &spec.scopes.join(" "));
+        }
+        query
+            .append_pair("state", state_token)
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256");
+    }
+    Ok(auth_url)
 }
 
 /// Handle OAuth callback from provider
@@ -934,26 +994,27 @@ pub async fn callback(
 
     // Exchange authorization code for tokens (with PKCE code verifier)
     let http_client = crate::server::ssrf::safe_client(ssrf_config);
-    let response = http_client
-        .post(&endpoints.token_endpoint)
-        .header("Accept", "application/json")
-        .form(&[
+    let response = super::provider::upstream_token_request(
+        &http_client,
+        &endpoints.token_endpoint,
+        &spec,
+        &client_secret,
+        &[
             ("grant_type", "authorization_code"),
             ("code", &req.code),
-            ("client_id", &spec.client_id),
-            ("client_secret", &client_secret),
             ("redirect_uri", &redirect_uri),
             ("code_verifier", &claimed_state.code_verifier),
-        ])
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Token exchange request failed: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Token exchange request failed: {}", e),
-            )
-        })?;
+        ],
+    )
+    .send()
+    .await
+    .map_err(|e| {
+        error!("Token exchange request failed: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Token exchange request failed: {}", e),
+        )
+    })?;
 
     // Branch based on flow type: test flows skip token parsing/encryption
     if is_test_flow {
