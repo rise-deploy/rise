@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{bail, Result};
 use reqwest::Client;
 use serde::Deserialize;
@@ -400,7 +401,11 @@ async fn fetch_project_info(
 ) -> Result<ProjectInfo> {
     let url = format!("{}/api/v1/projects/{}", backend_url, project);
 
-    let response = http_client.get(&url).bearer_auth(token).send().await?;
+    let response = http_client
+        .get(&url)
+        .bearer_auth(token)
+        .send_with_auth_hint(backend_url)
+        .await?;
 
     if !response.status().is_success() {
         bail!("Failed to fetch project info");

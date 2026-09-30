@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{bail, Context, Result};
 use comfy_table::{
     modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Color, Table,
@@ -212,7 +213,7 @@ pub async fn fetch_deployment(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch deployment")?;
 
@@ -262,7 +263,7 @@ pub async fn fetch_deployment_events(
         let response = http_client
             .get(&url)
             .bearer_auth(token)
-            .send()
+            .send_with_auth_hint(backend_url)
             .await
             .context("Failed to fetch deployment events")?;
 
@@ -313,7 +314,7 @@ pub async fn fetch_latest_deployment_events(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch deployment events")?;
 
@@ -368,7 +369,7 @@ pub async fn list_deployments(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to list deployments")?;
 
@@ -628,7 +629,7 @@ pub async fn stop_deployments_by_group(
     let response = http_client
         .post(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to stop deployments")?;
 
@@ -960,7 +961,7 @@ async fn fetch_deployment_registry_credentials(
     let response = http_client
         .get(&url)
         .bearer_auth(&token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch registry credentials")?;
 
@@ -1000,7 +1001,7 @@ async fn fetch_backend_platform_hint(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch platform capabilities")?;
 
@@ -2233,7 +2234,7 @@ async fn call_create_deployment_api(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to create deployment")?;
 
@@ -2275,7 +2276,7 @@ async fn cancel_deployment(
         .patch(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to cancel deployment")?;
 
@@ -2353,7 +2354,7 @@ async fn update_deployment_status_with(
         .patch(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await;
 
     // Don't fail deployment if status update fails, just log it
@@ -2438,7 +2439,7 @@ pub async fn get_logs(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await?;
 
     // Check status
@@ -2870,7 +2871,7 @@ pub(super) async fn open_log_stream(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .map_err(|e| LogStreamError::Other(anyhow::anyhow!("Failed to connect: {}", e)))?;
 

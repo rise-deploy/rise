@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -47,7 +48,7 @@ pub async fn encrypt_command(config: &Config, plaintext: Option<String>) -> Resu
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&EncryptRequest { plaintext })
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to call encrypt endpoint")?;
 
