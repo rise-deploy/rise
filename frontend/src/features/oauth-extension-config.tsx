@@ -192,6 +192,9 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
     const [clientId, setClientId] = useState(spec.client_id || '');
     const [clientSecretEncrypted, setClientSecretEncrypted] = useState(spec.client_secret_encrypted || '');
     const [clientSecretPlaintext, setClientSecretPlaintext] = useState('');
+    // The plaintext `clientSecretEncrypted` was produced from; '' while it is
+    // the secret the spec arrived with.
+    const [encryptedFor, setEncryptedFor] = useState('');
     const [isEncrypting, setIsEncrypting] = useState(false);
     const [showSecret, setShowSecret] = useState(false);
     const [endpointMode, setEndpointMode] = useState<EndpointMode>(
@@ -216,7 +219,7 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
     const extensionName = instanceName || (isEnabled ? '' : 'YOUR_EXTENSION_NAME');
     const redirectUri = `${backendUrl}/oidc/${projectName || 'YOUR_PROJECT'}/${extensionName}/callback`;
     const scopeList = parseScopes(scopes);
-    const secretPending = clientSecretPlaintext.trim() !== '';
+    const secretPending = clientSecretPlaintext.trim() !== '' && clientSecretPlaintext !== encryptedFor;
 
     const applyTemplate = (next: ProviderTemplate) => {
         const previousName = template?.name;
@@ -233,26 +236,34 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
     };
 
     // Encrypt the secret shortly after typing stops (or on blur) so a pasted
-    // secret is never lost by forgetting to press a button.
+    // secret is never lost by forgetting to press a button. The input keeps its
+    // text: typing on after a pause makes the encryption stale and re-runs it
+    // on the whole value.
     const plaintextRef = useRef('');
     plaintextRef.current = clientSecretPlaintext;
+    const mountedRef = useRef(false);
+    const lastSpecRef = useRef<OAuthSpec>({});
     const encryptTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
     const encryptRequestRef = useRef(0);
     const encryptNow = async () => {
         clearTimeout(encryptTimerRef.current);
         const plaintext = plaintextRef.current;
-        if (plaintext.trim() === '') return;
+        if (plaintext.trim() === '' || plaintext === encryptedForRef.current) return;
         const request = ++encryptRequestRef.current;
         setIsEncrypting(true);
         try {
             const response = await api.encryptSecret(plaintext);
-            // Typing during the request makes the result stale; the next run replaces it.
-            if (request !== encryptRequestRef.current || plaintextRef.current !== plaintext) return;
-            setClientSecretEncrypted(response.encrypted);
-            setClientSecretPlaintext('');
-            setShowSecret(false);
-        } catch (err) {
+            if (!mountedRef.current) {
+                // The form closed (e.g. a tab switch) mid-request; hand the
+                // final secret to the parent directly so it is not dropped.
+                if (plaintext === plaintextRef.current) onChangeRef.current({ ...lastSpecRef.current, client_secret_encrypted: response.encrypted });
+                return;
+            }
             if (request !== encryptRequestRef.current) return;
+            setClientSecretEncrypted(response.encrypted);
+            setEncryptedFor(plaintext);
+        } catch (err) {
+            if (!mountedRef.current || request !== encryptRequestRef.current) return;
             const message = err instanceof Error ? err.message : String(err);
             showToast(
                 message.includes('429') || message.includes('rate limit')
@@ -261,14 +272,23 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
                 'error',
             );
         } finally {
-            if (request === encryptRequestRef.current) setIsEncrypting(false);
+            if (mountedRef.current && request === encryptRequestRef.current) setIsEncrypting(false);
         }
     };
+    const encryptedForRef = useRef('');
+    encryptedForRef.current = encryptedFor;
     useEffect(() => {
         if (!secretPending) return;
         encryptTimerRef.current = setTimeout(encryptNow, ENCRYPT_DEBOUNCE_MS);
         return () => clearTimeout(encryptTimerRef.current);
     }, [clientSecretPlaintext]);
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            encryptNow();
+        };
+    }, []);
 
     useEffect(() => {
         const next: OAuthSpec = {
@@ -279,7 +299,7 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
             scopes: scopeList,
         };
         if (description.trim() !== '') next.description = description;
-        // A secret still being typed withholds the stored one, so saving in
+        // A secret not yet encrypted withholds the stored one, so saving in
         // that moment fails validation instead of silently keeping the old secret.
         if (clientSecretEncrypted && !secretPending) next.client_secret_encrypted = clientSecretEncrypted;
         if (endpointMode === 'manual') {
@@ -287,6 +307,7 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
             if (tokenEndpoint.trim() !== '') next.token_endpoint = tokenEndpoint.trim();
         }
         if (authMethod !== 'client_secret_post') next.token_endpoint_auth_method = authMethod;
+        lastSpecRef.current = next;
         onChangeRef.current(next);
     }, [providerName, description, clientId, clientSecretEncrypted, secretPending, endpointMode, issuerUrl, authorizationEndpoint, tokenEndpoint, authMethod, scopes]);
 
@@ -303,7 +324,9 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
         ? 'Encrypting…'
         : secretPending
             ? 'Encrypted automatically when you stop typing.'
-            : clientSecretEncrypted
+            : clientSecretPlaintext.trim() !== ''
+                ? 'Encrypted. It replaces the stored secret when you save.'
+                : clientSecretEncrypted
                 ? 'Stored encrypted. Enter a new value to replace it.'
                 : 'Paste the client secret from your provider. It is encrypted before it is saved.';
 
@@ -382,7 +405,7 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
                                 <Button
                                     icon={showSecret ? 'eyeoff' : 'eye'}
                                     onClick={() => setShowSecret(!showSecret)}
-                                    disabled={!secretPending}
+                                    disabled={clientSecretPlaintext === ''}
                                     aria-label={showSecret ? 'Hide secret' : 'Show secret'}
                                 />
                             </div>
