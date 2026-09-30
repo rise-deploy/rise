@@ -1421,41 +1421,64 @@ export function EnvVarsList({ projectName, deploymentId }) {
         );
     };
 
-    // Deployment snapshot mode: a single read-only table.
+    // Deployment snapshots separate injected system values by their API source.
     if (deploymentId) {
+        const groups = [
+            {
+                id: 'configured',
+                title: 'Configured variables',
+                description: 'From project settings, environments, and extensions',
+                vars: envVars.filter(env => env.source !== 'system'),
+            },
+            {
+                id: 'system',
+                title: 'System variables',
+                description: 'Provided automatically by Rise',
+                vars: envVars.filter(env => env.source === 'system'),
+            },
+        ];
         return (
             <div>
-                <RPanel>
+                <div className="r-stack">
                     {envVars.length === 0 ? (
                         <REmpty title="No environment variables">
                             <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
                                 This deployment has no environment variables.
                             </div>
                         </REmpty>
-                    ) : (
-                        <table className="r-table r-table-fixed">
-                            <colgroup>
-                                <col style={{ width: '28%' }} />
-                                <col />
-                                <col style={{ width: 110 }} />
-                                <col style={{ width: 150 }} />
-                            </colgroup>
-                            <thead>
-                                <tr><th>Key</th><th>Value</th><th>Type</th><th>Source</th></tr>
-                            </thead>
-                            <tbody>
-                                {envVars.map(env => (
-                                    <tr key={`${env.key}-${env.environment || ''}`}>
-                                        <td className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{env.key}</td>
-                                        <td><ValueCell envVar={env} /></td>
-                                        <td><TypeTag envVar={env} /></td>
-                                        <td><EnvVarSourceTag source={env.source} environments={environments} /></td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    )}
-                </RPanel>
+                    ) : groups.filter(group => group.vars.length > 0).map(group => (
+                        <RPanel key={group.id}>
+                            <RPanelHead
+                                title={group.title}
+                                sub={group.description}
+                                right={<span className="r-pill">{group.vars.length} variable{group.vars.length === 1 ? '' : 's'}</span>}
+                            />
+                            <div className="r-deployment-vars-table" role="region" aria-label={group.title} tabIndex={0}>
+                                <table className="r-table r-table-fixed" aria-label={group.title}>
+                                    <colgroup>
+                                        <col style={{ width: '28%' }} />
+                                        <col />
+                                        <col style={{ width: 110 }} />
+                                        <col style={{ width: 150 }} />
+                                    </colgroup>
+                                    <thead>
+                                        <tr><th scope="col">Key</th><th scope="col">Value</th><th scope="col">Type</th><th scope="col">Source</th></tr>
+                                    </thead>
+                                    <tbody>
+                                        {group.vars.map(env => (
+                                            <tr key={`${env.key}-${env.environment || ''}`}>
+                                                <td className="mono" style={{ fontSize: 13, fontWeight: 500, overflowWrap: 'anywhere' }}>{env.key}</td>
+                                                <td><ValueCell envVar={env} /></td>
+                                                <td><TypeTag envVar={env} /></td>
+                                                <td><EnvVarSourceTag source={env.source} environments={environments} /></td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </RPanel>
+                    ))}
+                </div>
                 <p style={{ marginTop: 16, fontSize: 12.5, color: 'var(--text-muted)' }}>
                     Environment variables are read-only snapshots taken at deployment time.
                     Secret values are always masked unless revealed.

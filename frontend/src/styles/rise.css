@@ -1374,6 +1374,18 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     color: var(--text-muted);
 }
 
+/* ---------- Deployment overview and variable snapshots ---------- */
+.r-deployment-overview { align-items: start; }
+.r-deployment-overview > *, .r-deployment-overview .r-kv dd { min-width: 0; }
+.r-deployment-overview .r-kv { grid-template-columns: max-content minmax(0, 1fr); }
+.r-deployment-overview .r-kv dd { overflow-wrap: anywhere; }
+.r-deployment-source-link { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; font-size: 12.5px; }
+.r-deployment-source-link span { min-width: 0; overflow-wrap: anywhere; }
+.r-deployment-source-link svg { flex-shrink: 0; color: var(--text-soft); }
+.r-deployment-vars-table { overflow-x: auto; }
+.r-deployment-vars-table:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.r-deployment-vars-table .r-table { min-width: 720px; }
+
 /* ---------- Grid helpers ---------- */
 .r-grid-2-1 { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
 .r-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
