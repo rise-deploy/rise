@@ -252,12 +252,13 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
     );
 }
 
-function RecentDeploymentsPanel({ projectName, environments }: { projectName: string; environments: any[] }) {
+// The deployment currently serving each environment's groups.
+function ActiveDeploymentsPanel({ projectName, environments }: { projectName: string; environments: any[] }) {
     const [rows, setRows] = useState<any[] | null>(null);
 
     const load = useCallback(() => {
         let cancelled = false;
-        api.getProjectDeployments(projectName, { limit: 6 })
+        api.getProjectDeployments(projectName, { active: true, limit: 100 })
             .then((d: any[]) => { if (!cancelled) setRows(Array.isArray(d) ? d : []); })
             .catch(() => { if (!cancelled) setRows([]); });
         return () => { cancelled = true; };
@@ -277,11 +278,24 @@ function RecentDeploymentsPanel({ projectName, environments }: { projectName: st
 
     return (
         <Panel>
-            <PanelHead title="Recent deployments" sub="Latest deployments across all environments" />
+            <PanelHead
+                title="Active deployments"
+                sub="Currently serving across all environments and groups"
+                right={
+                    <a
+                        className="r-link"
+                        style={{ fontSize: 12.5 }}
+                        href={`/project/${projectName}/deployments`}
+                        onClick={(e) => { e.preventDefault(); navigate(`/project/${projectName}/deployments`); }}
+                    >
+                        All deployments →
+                    </a>
+                }
+            />
             {rows === null ? (
                 <PanelBody><div style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>Loading…</div></PanelBody>
             ) : rows.length === 0 ? (
-                <PanelBody><Empty title="No deployments yet" /></PanelBody>
+                <PanelBody><Empty title="No active deployments" /></PanelBody>
             ) : (
                 <table className="r-table">
                     <thead>
@@ -337,7 +351,7 @@ function CurrentDeploymentPanel({ projectName, environments }: { projectName: st
 
     useEffect(() => {
         let cancelled = false;
-        api.getProjectDeployments(projectName, { limit: 100 })
+        api.getProjectDeployments(projectName, { active: true, limit: 100 })
             .then((d: any[]) => { if (!cancelled) setDeployments(Array.isArray(d) ? d : []); })
             .catch(() => { if (!cancelled) setDeployments([]); });
         return () => { cancelled = true; };
@@ -530,7 +544,7 @@ function ProjectOverview({ project, projectName, accessLabel, environments, onUp
             <div className="r-stack">
                 <CurrentDeploymentPanel projectName={projectName} environments={environments} />
 
-                <RecentDeploymentsPanel projectName={projectName} environments={environments} />
+                <ActiveDeploymentsPanel projectName={projectName} environments={environments} />
             </div>
 
             <div className="r-stack">

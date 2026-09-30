@@ -2337,6 +2337,9 @@ pub async fn update_deployment_status(
 pub struct ListDeploymentsQuery {
     #[serde(rename = "group")]
     pub deployment_group: Option<String>,
+    /// `true` lists only the deployments currently serving their group,
+    /// `false` only the rest.
+    pub active: Option<bool>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -2349,8 +2352,8 @@ pub async fn list_deployments(
     Query(query): Query<ListDeploymentsQuery>,
 ) -> Result<Json<Vec<Deployment>>, ServerError> {
     debug!(
-        "Listing deployments for project: {} (group: {:?})",
-        project_name, query.deployment_group
+        "Listing deployments for project: {} (group: {:?}, active: {:?})",
+        project_name, query.deployment_group, query.active
     );
 
     // Find the project by name
@@ -2378,11 +2381,12 @@ pub async fn list_deployments(
             .map_err(|_| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
     }
 
-    // Get deployments from database (optionally filtered by group, with pagination)
-    let db_deployments = db_deployments::list_for_project_and_group(
+    // Get deployments from database (optionally filtered, with pagination)
+    let db_deployments = db_deployments::list_for_project_filtered(
         &state.db_pool,
         project.id,
         query.deployment_group.as_deref(),
+        query.active,
         query.limit,
         query.offset,
     )

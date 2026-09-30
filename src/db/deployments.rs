@@ -1490,82 +1490,50 @@ pub async fn find_last_for_project_and_group(
     Ok(deployment)
 }
 
-/// List deployments for a project with optional group filter
-pub async fn list_for_project_and_group(
+/// List a project's deployments, newest first, optionally narrowed to one
+/// deployment group and/or to deployments whose `is_active` matches `active`.
+pub async fn list_for_project_filtered(
     pool: &PgPool,
     project_id: Uuid,
     group: Option<&str>,
+    active: Option<bool>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<Deployment>> {
-    let limit_value = limit.unwrap_or(10);
-    let offset_value = offset.unwrap_or(0);
-
-    let deployments = if let Some(g) = group {
-        sqlx::query_as!(
-            Deployment,
-            r#"
-            SELECT
-                id, deployment_id, project_id, created_by_id,
-                status as "status: DeploymentStatus",
-                deployment_group, environment_id, expires_at,
-                termination_reason as "termination_reason: _",
-                completed_at, error_message, build_logs,
-                controller_metadata as "controller_metadata: serde_json::Value",
-                image, image_digest, rolled_back_from_deployment_id,
-                http_port, needs_reconcile, is_active,
-                deploying_started_at,
-                first_healthy_at, job_url, pull_request_url, git_repository_url,
-                replicas, cpu, memory,
-                created_at, updated_at, identity_credential_hash,
-                identity_audiences as "identity_audiences: serde_json::Value",
-                containers as "containers: serde_json::Value",
-                routes as "routes: serde_json::Value"
-            FROM deployments
-            WHERE project_id = $1 AND deployment_group = $2
-            ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
-            "#,
-            project_id,
-            g,
-            limit_value,
-            offset_value
-        )
-        .fetch_all(pool)
-        .await?
-    } else {
-        // No group filter - return all for project with pagination
-        sqlx::query_as!(
-            Deployment,
-            r#"
-            SELECT
-                id, deployment_id, project_id, created_by_id,
-                status as "status: DeploymentStatus",
-                deployment_group, environment_id, expires_at,
-                termination_reason as "termination_reason: _",
-                completed_at, error_message, build_logs,
-                controller_metadata as "controller_metadata: serde_json::Value",
-                image, image_digest, rolled_back_from_deployment_id,
-                http_port, needs_reconcile, is_active,
-                deploying_started_at,
-                first_healthy_at, job_url, pull_request_url, git_repository_url,
-                replicas, cpu, memory,
-                created_at, updated_at, identity_credential_hash,
-                identity_audiences as "identity_audiences: serde_json::Value",
-                containers as "containers: serde_json::Value",
-                routes as "routes: serde_json::Value"
-            FROM deployments
-            WHERE project_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-            project_id,
-            limit_value,
-            offset_value
-        )
-        .fetch_all(pool)
-        .await?
-    };
+    let deployments = sqlx::query_as!(
+        Deployment,
+        r#"
+        SELECT
+            id, deployment_id, project_id, created_by_id,
+            status as "status: DeploymentStatus",
+            deployment_group, environment_id, expires_at,
+            termination_reason as "termination_reason: _",
+            completed_at, error_message, build_logs,
+            controller_metadata as "controller_metadata: serde_json::Value",
+            image, image_digest, rolled_back_from_deployment_id,
+            http_port, needs_reconcile, is_active,
+            deploying_started_at,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
+            replicas, cpu, memory,
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
+        FROM deployments
+        WHERE project_id = $1
+          AND ($2::text IS NULL OR deployment_group = $2)
+          AND ($3::bool IS NULL OR is_active = $3)
+        ORDER BY created_at DESC
+        LIMIT $4 OFFSET $5
+        "#,
+        project_id,
+        group,
+        active,
+        limit.unwrap_or(10),
+        offset.unwrap_or(0)
+    )
+    .fetch_all(pool)
+    .await?;
 
     Ok(deployments)
 }
@@ -2347,6 +2315,54 @@ mod tests {
         assert!(
             !keys.contains(&"superseded_by".to_string()),
             "no successor key at all, not a null one: {keys:?}",
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_for_project_filtered_narrows_by_group_and_active(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        for (deployment_id, group, is_active) in [
+            ("20260930-000001", "default", false),
+            ("20260930-000002", "default", true),
+            ("20260930-000003", "preview", true),
+            ("20260930-000004", "preview", false),
+        ] {
+            sqlx::query(
+                "INSERT INTO deployments
+                     (deployment_id, project_id, created_by_id, status, deployment_group, is_active)
+                 VALUES ($1, $2, $3, 'Healthy', $4, $5)",
+            )
+            .bind(deployment_id)
+            .bind(project_id)
+            .bind(user_id)
+            .bind(group)
+            .bind(is_active)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let ids = |rows: Vec<Deployment>| {
+            let mut ids: Vec<String> = rows.into_iter().map(|d| d.deployment_id).collect();
+            ids.sort();
+            ids
+        };
+        let list = |group, active| {
+            list_for_project_filtered(&pool, project_id, group, active, Some(100), None)
+        };
+
+        assert_eq!(ids(list(None, None).await.unwrap()).len(), 4);
+        assert_eq!(
+            ids(list(None, Some(true)).await.unwrap()),
+            ["20260930-000002", "20260930-000003"],
+        );
+        assert_eq!(
+            ids(list(Some("preview"), Some(false)).await.unwrap()),
+            ["20260930-000004"],
+        );
+        assert_eq!(
+            ids(list(Some("default"), None).await.unwrap()),
+            ["20260930-000001", "20260930-000002"],
         );
     }
 

@@ -407,8 +407,9 @@ export function DeploymentsList({ projectName }) {
     const [environments, setEnvironments] = useState([]);
     const [envParam, setEnvFilter] = useQueryParam('env');
     const envFilter = envParam || '';
-    const [statusParam, setStatusFilter] = useQueryParam('status');
-    const statusFilter = statusParam || 'active';
+    const [statusParam, setStatusParam] = useQueryParam('status');
+    const statusFilter = statusParam || 'all';
+    const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
     const [searchParam, setSearch] = useQueryParam('search');
     const search = searchParam || '';
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
