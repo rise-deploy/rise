@@ -29,6 +29,8 @@ LOG_LEVEL = "info"
 | `name` | String | Project name (used for URLs, registry paths, and as default for `-p` flag) |
 | `env` | Object | Plain-text environment variables applied as deployment overrides (source: `toml`) |
 
+Keys starting with `RISE_` are reserved for variables Rise injects into the workload and are rejected when `rise.toml` is loaded — in `[project.env]`, `[environments.<name>.env]` and `[containers.<name>.env]` alike.
+
 ### `[build]` Section
 
 ```toml

@@ -81,6 +81,10 @@ pub struct ContainerConfig {
     /// Plain-text environment variables scoped to this container. Merged on top
     /// of any project-level env vars; container-scoped values win on conflict.
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
+    )]
     pub env: BTreeMap<String, String>,
 
     /// Deployment resource configuration (replicas, cpu, memory, health_check).
@@ -659,6 +663,10 @@ pub struct EnvironmentConfig {
 
     /// Plain-text environment variables scoped to this environment
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
+    )]
     pub env: BTreeMap<String, String>,
 
     /// Environment-specific deployment resource overrides
@@ -705,6 +713,10 @@ pub struct ProjectConfig {
 
     /// Plain-text environment variables (non-secret)
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
+    )]
     pub env: BTreeMap<String, String>,
 }
 
