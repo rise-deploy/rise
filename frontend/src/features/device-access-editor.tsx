@@ -155,22 +155,23 @@ export function AccessEditor({
                                 key={index}
                                 style={{ border: '1px solid var(--line, #8883)', borderRadius: 6, padding: 12, display: 'flex', flexDirection: 'column', gap: 10 }}
                             >
-                                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-end' }}>
-                                    <div style={{ flex: '1 1 140px' }}>
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                                    <div style={{ flex: '1 1 0', minWidth: 0 }}>
                                         <Field label="Project">
                                             <Input value={row.project} onChange={(e) => update(index, { project: e.target.value })} className="mono" />
                                         </Field>
                                     </div>
-                                    <div style={{ flex: '1 1 140px' }}>
-                                        <Field label="Environment" hint="Empty: the whole project">
+                                    <div style={{ flex: '1 1 0', minWidth: 0 }}>
+                                        <Field label="Environment">
                                             <Input
+                                                placeholder="whole project"
                                                 value={row.environment}
                                                 onChange={(e) => update(index, { environment: e.target.value })}
                                                 className="mono"
                                             />
                                         </Field>
                                     </div>
-                                    <div style={{ flex: '1 1 140px' }}>
+                                    <div style={{ flex: '1 1 0', minWidth: 0 }}>
                                         <Field label="Access">
                                             <Select
                                                 value={preset}
@@ -187,9 +188,12 @@ export function AccessEditor({
                                             />
                                         </Field>
                                     </div>
-                                    <Button icon="close" onClick={() => onChange(full, rows.filter((_, i) => i !== index))}>
-                                        Remove
-                                    </Button>
+                                    <Button
+                                        icon="close"
+                                        title="Remove"
+                                        aria-label="Remove"
+                                        onClick={() => onChange(full, rows.filter((_, i) => i !== index))}
+                                    />
                                 </div>
                                 <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap' }}>
                                     {PERMISSIONS.filter((p) => !environmentRow || p.environment).map((permission) => (
