@@ -33,6 +33,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(SaTokenExchange),
         Box::new(ResourceTokenExchange),
         Box::new(DeviceLogin),
+        Box::new(ScopedDeviceLogin),
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
@@ -54,7 +55,17 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
     let mut skipped = 0u32;
     let mut failed: Vec<&'static str> = Vec::new();
 
+    // `RISE_E2E_SCENARIOS=a,b` runs only those scenario ids, for local runs.
+    let only: Option<Vec<String>> = std::env::var("RISE_E2E_SCENARIOS")
+        .ok()
+        .map(|ids| ids.split(',').map(|id| id.trim().to_string()).collect());
     for s in all() {
+        if only
+            .as_ref()
+            .is_some_and(|ids| !ids.iter().any(|id| id == s.id()))
+        {
+            continue;
+        }
         match s.applies_to(b) {
             Applicability::Skip(reason) => {
                 skipped += 1;
@@ -510,6 +521,332 @@ impl Scenario for DeviceLogin {
         anyhow::ensure!(
             answer.as_ref().err().map(String::as_str) == Some("access_denied"),
             "expected access_denied after denial, got {answer:?}"
+        );
+        Ok(())
+    }
+}
+
+// ---- (c''') a device login scoped to one environment (ADR-0006) -----------
+
+/// `rise login --device` asking for, and granted, deploy access to one
+/// environment of one project. The session it yields sees that project, that
+/// environment and its deployments, deploys there through the real CLI — and
+/// nothing else: not the project's other environment or its deployments, not
+/// another project, nothing project- or install-wide, not the resource API.
+/// The approver is an admin, so the ceiling, not ownership, is what holds.
+/// A second login shows the approver decides: deploy was asked, read granted.
+struct ScopedDeviceLogin;
+
+impl ScopedDeviceLogin {
+    fn deploy(
+        b: &dyn Backend,
+        project: &str,
+        environment: &str,
+        app: &SampleApp,
+        auth: Option<CliAuth<'_>>,
+    ) -> Result<CliOutput> {
+        b.rise_cli(
+            &[
+                "deploy",
+                "--project",
+                project,
+                "--environment",
+                environment,
+                "--image",
+                app.image,
+                "--http-port",
+                app.http_port,
+                "--replicas",
+                "1",
+            ],
+            auth,
+        )
+    }
+
+    /// `(deployment_id, environment)` of every deployment `bearer` may list.
+    fn deployments(api: &str, project: &str, bearer: &str) -> Result<Vec<(String, String)>> {
+        let resp = http::get_auth(
+            &format!("{api}/api/v1/projects/{project}/deployments"),
+            bearer,
+        )?;
+        anyhow::ensure!(
+            resp.status == 200,
+            "listing deployments returned {}:\n{}",
+            resp.status,
+            resp.body
+        );
+        let list: Vec<serde_json::Value> = serde_json::from_str(&resp.body)?;
+        Ok(list
+            .iter()
+            .map(|d| {
+                (
+                    d["deployment_id"].as_str().unwrap_or_default().to_string(),
+                    d["environment"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect())
+    }
+
+    fn names(body: &str) -> Result<Vec<String>> {
+        let list: Vec<serde_json::Value> = serde_json::from_str(body)?;
+        Ok(list
+            .iter()
+            .filter_map(|item| item["name"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// Log in with `rise login --device` asking for `requested`, approved as
+    /// `granted`; returns the session.
+    fn device_session(
+        api: &str,
+        approver: &str,
+        requested: &serde_json::Value,
+        granted: &serde_json::Value,
+    ) -> Result<String> {
+        use crate::device_login;
+        let started = device_login::start_with(api, Some(requested))?;
+        let shown = device_login::lookup(api, approver, &started.user_code)?;
+        anyhow::ensure!(
+            &shown["requested_access"] == requested,
+            "the approval page shows {} instead of the request {requested}",
+            shown["requested_access"]
+        );
+        device_login::approve_with(api, approver, &started.user_code, granted)?;
+        device_login::poll(api, &started.device_code)?
+            .map_err(|error| anyhow::anyhow!("expected a token after approval, got {error}"))
+    }
+}
+
+impl Scenario for ScopedDeviceLogin {
+    fn id(&self) -> &'static str {
+        "scoped-device-login"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            BackendKind::Docker | BackendKind::Minikube => Applicability::Run,
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack's Dex serves only the password grant, not a browser sign-in",
+            ),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let api = b.api_base();
+        let app = b.sample_app();
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let approver = crate::login::browser_login(api, dexep, "admin@example.com", "password")
+            .context("sign the approver in through the web UI's Dex sign-in")?;
+
+        // With full access: a project with a staging environment and a
+        // production deployment, and a second project.
+        let project = unique("e2e-scope");
+        let other = unique("e2e-scope-other");
+        create_public_project(b, &project)?;
+        create_public_project(b, &other)?;
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "environment",
+                    "create",
+                    "staging",
+                    "-p",
+                    &project,
+                    "--group",
+                    "staging",
+                ],
+                None,
+            )?,
+            "environment create",
+        )?;
+        expect_ok(
+            Self::deploy(b, &project, "production", &app, None)?,
+            "production deploy",
+        )?;
+
+        // The agent asks to deploy to staging; the approver grants just that.
+        let requested = serde_json::json!({
+            "kind": "restricted",
+            "grants": [{"project": project, "environment": "staging", "preset": "deploy"}],
+        });
+        let token = Self::device_session(api, &approver, &requested, &requested)?;
+        let claims = crate::device_login::claims(&token)?;
+        anyhow::ensure!(
+            claims["authorization_details"].is_array(),
+            "the scoped session carries no ceiling:\n{claims}"
+        );
+        let me = http::get_auth(&format!("{api}/api/v1/users/me"), &token)?;
+        let me: serde_json::Value = serde_json::from_str(&me.body)
+            .with_context(|| format!("parse /users/me ({}): {}", me.status, me.body))?;
+        anyhow::ensure!(
+            me["access"] == requested,
+            "/users/me reports {} instead of the granted {requested}",
+            me["access"]
+        );
+
+        // It deploys to staging through the real CLI, and not to production.
+        let scoped = || CliAuth {
+            token: &token,
+            identity: None,
+        };
+        expect_ok(
+            Self::deploy(b, &project, "staging", &app, Some(scoped()))?,
+            "scoped staging deploy",
+        )?;
+        let refused = Self::deploy(b, &project, "production", &app, Some(scoped()))?;
+        anyhow::ensure!(
+            !refused.success() && refused.combined().contains("does not cover"),
+            "a staging-scoped session deployed to production:\n{}",
+            refused.combined()
+        );
+
+        // It sees its project, its environment, and staging's deployments.
+        let all = Self::deployments(api, &project, b.ci_bearer())?;
+        let in_env = |env: &str| {
+            all.iter()
+                .find(|(_, e)| e == env)
+                .map(|(id, _)| id.clone())
+                .with_context(|| format!("no {env} deployment in {all:?}"))
+        };
+        let (staging_id, production_id) = (in_env("staging")?, in_env("production")?);
+        let visible = Self::deployments(api, &project, &token)?;
+        anyhow::ensure!(
+            !visible.is_empty() && visible.iter().all(|(_, env)| env == "staging"),
+            "the scoped session lists {visible:?}, expected only staging deployments"
+        );
+        let projects = http::get_auth(&format!("{api}/api/v1/projects"), &token)?;
+        anyhow::ensure!(
+            Self::names(&projects.body)? == vec![project.clone()],
+            "the scoped session lists projects {}",
+            projects.body
+        );
+        let environments = http::get_auth(
+            &format!("{api}/api/v1/projects/{project}/environments"),
+            &token,
+        )?;
+        anyhow::ensure!(
+            Self::names(&environments.body)? == vec!["staging".to_string()],
+            "the scoped session lists environments {}",
+            environments.body
+        );
+        for path in [
+            format!("/projects/{project}"),
+            format!("/projects/{project}/environments/staging"),
+            format!("/projects/{project}/deployments/{staging_id}"),
+            format!("/projects/{project}/deployments/{staging_id}/logs?follow=false"),
+        ] {
+            let resp = http::get_auth(&format!("{api}/api/v1{path}"), &token)?;
+            anyhow::ensure!(
+                resp.status == 200,
+                "GET {path} as the scoped session returned {}:\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
+        // Nothing else: production, the other project, anything project- or
+        // install-wide, and the resource API.
+        let get = |path: String| http::get_auth(&format!("{api}/api/v1{path}"), &token);
+        let send = |method: reqwest::Method, path: String, body: serde_json::Value| {
+            http::send_json(method, &format!("{api}/api/v1{path}"), &token, &body)
+        };
+        let denied = [
+            ("GET other project", get(format!("/projects/{other}"))?),
+            (
+                "GET production",
+                get(format!("/projects/{project}/environments/production"))?,
+            ),
+            (
+                "GET production deployment",
+                get(format!("/projects/{project}/deployments/{production_id}"))?,
+            ),
+            (
+                "GET production logs",
+                get(format!(
+                    "/projects/{project}/deployments/{production_id}/logs?follow=false"
+                ))?,
+            ),
+            (
+                "stop production deployment",
+                send(
+                    reqwest::Method::POST,
+                    format!("/projects/{project}/deployments/{production_id}/stop"),
+                    serde_json::json!({}),
+                )?,
+            ),
+            (
+                "retarget staging",
+                send(
+                    reqwest::Method::PATCH,
+                    format!("/projects/{project}/environments/staging"),
+                    serde_json::json!({"primary_deployment_group": "default"}),
+                )?,
+            ),
+            (
+                "set a project-wide env var",
+                send(
+                    reqwest::Method::PUT,
+                    format!("/projects/{project}/env/E2E_SCOPE"),
+                    serde_json::json!({"value": "x", "is_secret": false}),
+                )?,
+            ),
+            (
+                "update the project",
+                send(
+                    reqwest::Method::PUT,
+                    format!("/projects/{project}"),
+                    serde_json::json!({"access_class": "private"}),
+                )?,
+            ),
+            (
+                "create a project",
+                send(
+                    reqwest::Method::POST,
+                    "/projects".to_string(),
+                    serde_json::json!({"name": unique("e2e-scope-new"), "access_class": "public"}),
+                )?,
+            ),
+            ("list teams", get("/teams".to_string())?),
+            (
+                "the resource API",
+                get("/resources/rise.dev/v1alpha1/ServiceAccount".to_string())?,
+            ),
+        ];
+        for (what, resp) in denied {
+            anyhow::ensure!(
+                resp.status == 403,
+                "{what} as the scoped session returned {} (expected 403):\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
+        // The approver decides: the agent asks to deploy, the approver grants
+        // read. The session reads staging and can't deploy there.
+        let read = serde_json::json!({
+            "kind": "restricted",
+            "grants": [{"project": project, "environment": "staging", "preset": "read"}],
+        });
+        let read_token = Self::device_session(api, &approver, &requested, &read)?;
+        let read_only = Self::deployments(api, &project, &read_token)?;
+        anyhow::ensure!(
+            read_only.iter().all(|(_, env)| env == "staging"),
+            "the read session lists {read_only:?}"
+        );
+        let refused = Self::deploy(
+            b,
+            &project,
+            "staging",
+            &app,
+            Some(CliAuth {
+                token: &read_token,
+                identity: None,
+            }),
+        )?;
+        anyhow::ensure!(
+            !refused.success() && refused.combined().contains("does not cover"),
+            "a session granted read deployed anyway:\n{}",
+            refused.combined()
         );
         Ok(())
     }

@@ -55,6 +55,9 @@ pub struct SessionUser {
     pub identity_uid: uuid::Uuid,
     /// The kind of client the session is issued to.
     pub client: crate::SessionClient,
+    /// The session's ceiling (ADR-0006), already compiled and validated by
+    /// the caller. Only a CLI session may carry one.
+    pub authorization_details: Option<Vec<serde_json::Value>>,
 }
 
 /// What an identity token is minted for.
@@ -336,6 +339,7 @@ impl RiseTokenSigner {
             rise_uid: None,
             rise_identity_uid: None,
             rise_client: None,
+            authorization_details: None,
         })
     }
 
@@ -369,6 +373,12 @@ impl RiseTokenSigner {
         claims.rise_uid = Some(user.rise_uid);
         claims.rise_identity_uid = Some(user.identity_uid);
         claims.rise_client = Some(user.client);
+        if user.authorization_details.is_some() && user.client != crate::SessionClient::Cli {
+            return Err(JwtSignerError::InvalidClaims(
+                "only a CLI session may carry authorization_details".to_string(),
+            ));
+        }
+        claims.authorization_details = user.authorization_details.clone();
 
         let mut header = Header::new(Algorithm::HS256);
         header.typ = Some(RISE_SESSION_TYP.to_string());

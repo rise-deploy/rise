@@ -15,11 +15,16 @@ use super::models::{self, *};
 use super::state_machine;
 use super::utils::{create_deployment_with_hooks, generate_deployment_id};
 use crate::db::models::DeploymentStatus as DbDeploymentStatus;
-use crate::db::{deployments as db_deployments, projects, service_accounts, users};
+use crate::db::{
+    deployments as db_deployments, environments as db_environments, projects, service_accounts,
+    users,
+};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::registry::ImageTagType;
 use crate::server::state::AppState;
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 use rise_backend_core::events::EventSeverity;
 
 /// Validate group name format: must be 'default' or match [a-z0-9][a-z0-9/-]*[a-z0-9]
@@ -1092,6 +1097,7 @@ fn validate_resource_constraints(
 pub async fn create_deployment(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Json(payload): Json<CreateDeploymentRequest>,
 ) -> Result<Json<CreateDeploymentResponse>, ServerError> {
     info!("Creating deployment for project '{}'", payload.project);
@@ -1253,6 +1259,16 @@ pub async fn create_deployment(
             .map_err(|_| {
                 ServerError::not_found(format!("Project '{}' not found", payload.project))
             })?;
+    }
+
+    // A scoped session deploys only into the environments it covers; a
+    // deployment without an environment needs a project-wide grant.
+    if let Some(scope) = &scope {
+        scope.require(
+            Operation::new(Verb::Create, Kind::Deployment),
+            &project.name,
+            resolved_environment.as_ref().map(|e| e.name.as_str()),
+        )?;
     }
 
     // Enforce service account environment restrictions.
@@ -2348,6 +2364,7 @@ pub struct ListDeploymentsQuery {
 pub async fn list_deployments(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_name): Path<String>,
     Query(query): Query<ListDeploymentsQuery>,
 ) -> Result<Json<Vec<Deployment>>, ServerError> {
@@ -2381,8 +2398,13 @@ pub async fn list_deployments(
             .map_err(|_| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
     }
 
+    let list_deployments = Operation::new(Verb::List, Kind::Deployment);
+    if let Some(scope) = &scope {
+        scope.require_reach(list_deployments, &project.name)?;
+    }
+
     // Get deployments from database (optionally filtered, with pagination)
-    let db_deployments = db_deployments::list_for_project_filtered(
+    let mut db_deployments = db_deployments::list_for_project_filtered(
         &state.db_pool,
         project.id,
         query.deployment_group.as_deref(),
@@ -2392,6 +2414,25 @@ pub async fn list_deployments(
     )
     .await
     .internal_err("Failed to list deployments")?;
+
+    // A scoped session sees the deployments of the environments it covers. The
+    // filter runs on the requested page, so a page may come back short.
+    if let Some(scope) = &scope {
+        let environment_names: std::collections::HashMap<uuid::Uuid, String> =
+            db_environments::list_for_project(&state.db_pool, project.id)
+                .await
+                .internal_err("Failed to list environments")?
+                .into_iter()
+                .map(|environment| (environment.id, environment.name))
+                .collect();
+        db_deployments.retain(|deployment| {
+            let environment = deployment
+                .environment_id
+                .and_then(|id| environment_names.get(&id))
+                .map(String::as_str);
+            scope.allows(list_deployments, &project.name, environment)
+        });
+    }
 
     // Convert to API models (fetch creator emails and calculate URLs)
     let mut deployments = Vec::with_capacity(db_deployments.len());

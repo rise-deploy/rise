@@ -11,6 +11,9 @@ struct AuthorizeRequest {
     /// Shown on Rise's confirmation page, so the user can recognize the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_name: Option<String>,
+    /// What the login asks for; the approver may change it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,8 +60,10 @@ pub async fn handle_device_flow(
     http_client: &Client,
     backend_url: &str,
     config: &mut Config,
+    access: Option<serde_json::Value>,
 ) -> Result<()> {
     let backend_url = normalize_backend_url(backend_url);
+    super::access::warn_if_narrowing(&backend_url, access.as_ref());
 
     // Step 1: Initialize device flow via backend
     println!("Initializing device authorization flow...");
@@ -67,6 +72,7 @@ pub async fn handle_device_flow(
     let authorize_request = AuthorizeRequest {
         flow: "device".to_string(),
         client_name: client_name(),
+        access,
     };
 
     let response = http_client
@@ -192,6 +198,8 @@ pub async fn handle_device_flow(
                         tracing::debug!("Failed to parse token expiration: {}", e);
                     }
                 }
+                // The approver may have changed what was asked for.
+                super::access::print_granted_access(http_client, &backend_url, &token).await;
 
                 return Ok(());
             } else if let Some(error) = exchange_response.error {

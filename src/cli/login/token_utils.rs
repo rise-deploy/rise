@@ -38,7 +38,7 @@ fn decode_jwt_debug_parts(token: &str) -> Result<JwtDebugParts> {
     Ok(JwtDebugParts { header, claims })
 }
 
-fn decode_jwt_claims(token: &str) -> Result<Value> {
+pub(crate) fn decode_jwt_claims(token: &str) -> Result<Value> {
     let mut parts = token.split('.');
     let _header = parts
         .next()

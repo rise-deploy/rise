@@ -4,12 +4,13 @@ title: "ADR-0006: Scoped CLI Sessions"
 
 ## Status
 
-**Proposed**. Date: 2026-10-03.
+**Implemented** for the typed API (§1–§7, §9–§10). Date: 2026-10-03.
 
-Not implemented. The agent-facing half that works with today's CLI has
-shipped: the Rise App Builder skill tells coding agents to log in with
-`rise login --device` and hand the verification URL to the user. Everything
-below, including the request flags the skill will gain, is design.
+§8 happens kind by kind as the typed tables migrate. The pure model (permissions,
+presets, compilation, ceiling evaluation) lives in
+`rise-backend-auth::session_scope`; enforcement is the route guard in
+`src/server/auth/session_scope.rs`. The e2e scenario `scoped-device-login` covers
+the device flow end to end.
 
 Scope: enforcement on the **typed API** only. The generic resource API, the
 `rise-authz` engine and the kind registry are left unchanged. Scoped sessions
@@ -188,15 +189,16 @@ never by a writer:
 - It is reserved on every other kind and on direct label writes, so it can't
   be inherited from a Project or set to retarget a resource.
 - A write that changes which environment a resource is bound to must be covered
-  both before and after. Moving an env var from `staging` to `production` needs
-  both environments, as ADR-0001 §6.6 requires of any label write that retargets
-  access.
+  both before and after, as ADR-0001 §6.6 requires of any label write that
+  retargets access. On the typed API, moving an env var between environments
+  needs a project-wide grant, which covers both.
 
 An environment grant compiles to three entries:
 
-1. Scope `rise.dev/Project/<org>/<p>`, permission `get` on `Project` only, so
-   the CLI can resolve the project by name.
-2. Scope `rise.dev/Environment/<org>/<p>/<e>`, permission `get` on
+1. Scope `rise.dev/Project/<org>/<p>`, permissions `get` and `list` on
+   `Project` only, so the CLI can resolve the project by name and find it in
+   the project list.
+2. Scope `rise.dev/Environment/<org>/<p>/<e>`, permissions `get` and `list` on
    `Environment`.
 3. Scope `rise.dev/Project/<org>/<p>` with the `rise.dev/environment = <e>`
    selector, carrying the granted permissions' statements on the
@@ -218,8 +220,8 @@ environment. Each ❌ in §3 closes such a path:
   writing one changes production.
 - **Domains, extensions, app users and the project itself** are project-wide by
   construction.
-- **Stopping a deployment group** (`POST …/deployments/stop`) is covered only
-  when every deployment it would stop is bound to a covered environment.
+- **Stopping a deployment group** (`POST …/deployments/stop`) and listing
+  deployment groups need a project-wide grant: a group may span environments.
 
 The general rule for new permissions: an operation may join an environment
 grant only if its effects stay inside that environment.
@@ -251,11 +253,12 @@ The other form is `{ "kind": "full" }`. A grant gives `preset`, `permissions`,
 or both (union). Repeated grants on one target union.
 
 **Regular login (`rise login`, browser/PKCE).** No `--scope`: full access, as
-today. With `--scope`, the CLI sends `access` on
-`POST /auth/authorize {flow: "code"}`. The server validates it syntactically,
-keeps it with the transient PKCE state, compiles it at code exchange (the user
-is authenticated then), and mints it into the session. The user typed the
-flags, so no extra consent page is shown. A target the user can't access fails
+today. With `--scope`, the CLI sends `access` with the code exchange
+(`POST /auth/code/exchange`). The authorize step keeps no server-side state, and
+the code and verifier already authorize a full session, so a request that only
+narrows needs no earlier binding. The server checks its shape before spending
+the code, compiles it once the user is resolved, and mints it into the session.
+The user typed the flags, so no extra consent page is shown. A target the user can't access fails
 the login with a clear error, rather than minting a session that covers
 nothing.
 
@@ -271,8 +274,9 @@ approval page, which:
   access** option;
 - marks a full-access request prominently, with a warning that the CLI can do
   everything the user can, admin rights included;
-- flags targets that don't exist or that the approver can't access, and blocks
-  approval while any remain;
+- blocks approval while a row lacks a project or a permission. The server
+  refuses an approval naming a project or environment that doesn't exist or
+  that the approver can't access, and the page shows its message;
 - shows the §3 note on `deploy` and `secrets` when both appear.
 
 `POST /auth/device/approve` requires `access`. There is no default on approval:
@@ -316,24 +320,33 @@ Rules:
 
 - **The ceiling applies to admins.** The admin bypass skips step 1, never step
   2. A scoped session of an admin user is as narrow as anyone's.
-- **Collections are filtered, not refused.** `GET /projects`, deployment lists
-  and env var lists return only items the ceiling covers, without a 403. This
-  is the same masking ADR-0001 §4 applies to `list`.
-- **Every route is classified.** Each typed route is either
-  *resource-targeted* (it goes through the choke point) or *ambient*. Ambient
-  routes are reachable by any session: `GET /users/me`, platform capabilities,
-  extension types, quickstart templates, access classes, the device endpoints.
-  A test walks the router and fails on any unclassified route. A new endpoint
-  is denied to scoped sessions until someone classifies it.
-- Install-wide writes (project create, teams, `/encrypt`) are classified as
-  needing an unrestricted session.
+- **Collections are filtered.** `GET /projects` returns only covered projects.
+  Environment and deployment lists in a project return only covered items, as
+  ADR-0001 §4 masks `list`. A project where the session holds nothing of that
+  kind answers 403 instead of an empty list, which tells an agent its login is
+  the problem. The deployment filter runs on the requested page, so a page can
+  come back short.
+- **Every route is classified, and unknown means refused.** A guard behind the
+  auth middleware classifies each typed route by method and matched path. It
+  is *ambient* (`GET /users/me`, platform capabilities, extension types,
+  quickstart templates, access classes) or *resource-targeted*. The guard
+  decides a resource-targeted route from its path, its `?environment=` query,
+  or, for a deployment, that deployment's environment. A *handler* route needs
+  the request body or a list to filter, so the handler consults the session's
+  scope itself. The guard turns a successful answer from a handler that never
+  did into a 500. Any other route, a new one included, needs an unrestricted
+  session until someone classifies it.
+- Install-wide operations (project create, teams, `/encrypt`, user lookup,
+  device approval, the deprecated project-less deployment status route) need
+  an unrestricted session.
 
 **Scoped sessions are refused on the generic resource API.** Today the
 resource API builds every session's principal as unrestricted. Rather than
 teach it to read session ceilings before its engine knows these kinds, the
 session authentication adapter rejects any session carrying
 `authorization_details` on `/api/v1/resources` with a 403 that names the
-reason. That's a single guard in `src/server/auth`, outside the resource API.
+reason. That's a single layer on the resource routes, ahead of the resource
+API's own handling, which stays unchanged.
 It fails closed: a scoped session can never reach the resource API with full
 access. The agent workflows this ADR targets (projects, environments,
 deployments, env vars) don't use that API.

@@ -6,7 +6,7 @@ Complete inventory of `rise` CLI commands. Verified against `src/main.rs` clap d
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `rise login` | `--url <url>`, `--browser` (default), `--device` | Authenticate with the Rise backend. Default: OAuth2 authorization-code flow with PKCE via browser. `--device`: confirm a code on the Rise web UI instead (SSH sessions, headless machines). **AI agents always use `--device`** and hand the printed URL and code to the user to approve (see SKILL.md, invariant 0). |
+| `rise login` | `--url <url>`, `--browser` (default), `--device`, `--scope <project>[/<env>]=<preset\|perms>` (repeatable), `--full-access` | Authenticate with the Rise backend. Default: OAuth2 authorization-code flow with PKCE via browser. `--device`: confirm a code on the Rise web UI instead (SSH sessions, headless machines). `--scope`: restrict the session to a project or environment; presets `read`, `deploy`, `develop`, `admin` (project only). **AI agents always use `--device` with the narrowest `--scope`** and hand the printed URL and code to the user to approve (see SKILL.md, invariant 0). |
 
 ## Projects (`rise project` / `rise p`)
 

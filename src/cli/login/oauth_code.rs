@@ -150,6 +150,8 @@ struct CodeExchangeRequest {
     code: String,
     code_verifier: String,
     redirect_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,8 +202,10 @@ pub async fn handle_authorization_code_flow(
     http_client: &Client,
     backend_url: &str,
     config: &mut Config,
+    access: Option<serde_json::Value>,
 ) -> Result<()> {
     let backend_url = normalize_backend_url(backend_url);
+    super::access::warn_if_narrowing(&backend_url, access.as_ref());
 
     // Step 1: Discover OpenID endpoints
     tracing::debug!("Discovering authentication endpoints...");
@@ -284,6 +288,7 @@ pub async fn handle_authorization_code_flow(
         code,
         code_verifier,
         redirect_uri,
+        access,
     };
 
     let response = http_client
@@ -343,6 +348,7 @@ pub async fn handle_authorization_code_flow(
             tracing::debug!("Failed to parse token expiration: {}", e);
         }
     }
+    super::access::print_granted_access(http_client, &backend_url, &exchange_response.token).await;
 
     Ok(())
 }
