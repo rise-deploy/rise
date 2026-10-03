@@ -11,6 +11,11 @@ shipped: the Rise App Builder skill tells coding agents to log in with
 `rise login --device` and hand the verification URL to the user. Everything
 below, including the request flags the skill will gain, is design.
 
+Scope: enforcement on the **typed API** only. The generic resource API, the
+`rise-authz` engine and the kind registry are left unchanged. Scoped sessions
+are refused there until Project, Environment and Deployment become generic
+kinds (§8).
+
 ## Context
 
 A coding agent working on a user's app needs a Rise CLI session. The device
@@ -41,14 +46,17 @@ this case:
 
 This ADR designs per-session permissions at project and environment
 granularity, how a login requests them, and how the user who approves can
-change them.
+change them. Projects, environments and deployments have no generic resource
+kinds yet, so the design is enforced on the typed API now. It is shaped to
+carry over to the generic resource API unchanged once those kinds exist (§8).
 
 ## Decision
 
 ### 1. One ceiling grammar: sessions carry `authorization_details`
 
-A CLI session token may carry ADR-0001 §7's `authorization_details` claim,
-with the same parser (`AuthorizationCap::from_details`) and the same semantics:
+A CLI session token may carry an `authorization_details` claim in ADR-0001
+§7's wire format (`type: rise.dev/rbac` entries, each with one Scope and its
+permission statements), with the same semantics:
 
 - **Omitted** means the user's full live access. This is what every session
   minted today has, and it stays the default.
@@ -64,10 +72,10 @@ user's own authority.
 
 There is deliberately **no second scope vocabulary** (no `project:read`-style
 OAuth scope strings). The user-facing permission names in §3 compile to
-`rise.dev/rbac` entries. The same token then means the same thing on today's
-typed handlers and on the generic resource API once Project and Environment
-migrate (`ROADMAP.md` §4). The migration changes where a decision is evaluated,
-not what a token permits.
+`rise.dev/rbac` entries, the format the resource API's engine already
+evaluates. Today only the typed API reads them (§7). After the migration the
+engine reads the same claim, so a session means the same thing before and
+after (§8).
 
 ### 2. Targets: a project or one of its environments
 
@@ -91,7 +99,7 @@ live access does.
 Install-wide operations have no target and are outside any scoped session:
 creating projects, managing teams, and the admin surface. A scoped session
 can't do them; the user does them, or the agent asks for a full-access login.
-An organization-level target is deferred (§10).
+An organization-level target is deferred (§11).
 
 ### 3. Permissions and presets
 
@@ -112,13 +120,11 @@ fixed `(verb, ResourceKind, subresource?)` statements:
 Kinds are `rise.dev/`-qualified. `Project`, `Environment`, `Deployment` and
 `ServiceAccount` are the names `ROADMAP.md` §4 already uses. This ADR fixes
 `EnvironmentVariable`, `CustomDomain`, `AppUser` and `Extension` (the family
-name under ADR-0003) as the names those tables migrate to. They are registered
-in the built-in kind registry ahead of their storage migration so the shared
-Scope and ResourceKind parsers accept them. Registration fixes their identity
-for policy data. The resource API serves no routes for them until each one
-migrates. `logs`, `value` and `registry-credentials` join `status`,
-`finalizers` and `token` in the subresource registry, as ADR-0001 §2 and
-ADR-0002 anticipate.
+name under ADR-0003) as the names those tables migrate to. The same goes for
+the subresources `logs`, `value` and `registry-credentials`. None of them is
+added to the resource API's kind or subresource registry. The typed check
+keeps them in its own closed list (§7). Each name is registered in the generic
+registry when its table migrates, under the name fixed here (§8).
 
 Presets name common bundles. The CLI and the approval page offer presets first
 and individual permissions second:
@@ -129,6 +135,10 @@ and individual permissions second:
 | `deploy` | `view`, `logs`, `deploy` | project, environment |
 | `develop` | `view`, `logs`, `deploy`, `env-vars` | project, environment |
 | `admin` | all eight | project |
+
+Presets are fixed in code for now. The token always carries the expanded
+statements, never a preset name. So changing a preset's definition changes
+what future logins request, never what an existing session may do.
 
 `deploy` reaches secrets in practice. A deployment can run code that prints its
 own environment, including protected values that the API never returns. So
@@ -143,9 +153,10 @@ covers the Environment resource itself but none of the deployments into it.
 The typed service account's `allowed_environment_ids` is a one-off fix for
 exactly this gap.
 
-**ADR-0001 §7 is amended:** a `rise.dev/rbac` entry may carry an optional
+A session's `rise.dev/rbac` entry may therefore carry an optional
 `labelSelector`, with ADR-0001 §4's grammar restricted to the static form (a
-`value` is required):
+`value` is required). Today only the typed check evaluates it. ADR-0001 §7
+adopts it when the engine starts reading session ceilings (§8):
 
 ```json
 {
@@ -294,9 +305,12 @@ optional environment):
 1. **Live access**, unchanged: today's ownership/membership check and the
    admin bypass.
 2. **Session ceiling**: the operation must be covered by the session's
-   `AuthorizationCap`. The typed adapter builds the target's `ResourceTree`,
-   with effective labels including the synthesized `rise.dev/environment`, and
-   calls the same `ceiling_for` the engine uses.
+   `authorization_details`. The typed check evaluates the ceiling itself. It
+   needs no resource store or registry. It knows the closed set of typed kinds
+   and subresources from §3. It knows the two Scope shapes in §2. It reads the
+   target's `rise.dev/environment` label from `environment_id`. It applies the
+   same coverage rule as ADR-0001 §7 plus the §4 selector. A claim naming any
+   other kind, Scope shape or selector key is an invalid credential.
 
 Rules:
 
@@ -314,12 +328,40 @@ Rules:
 - Install-wide writes (project create, teams, `/encrypt`) are classified as
   needing an unrestricted session.
 
-The resource API needs no new enforcement: it already intersects every
-decision with the principal's cap. The work there is building the
-`AuthenticatedPrincipal` for a session from the session's claim rather than
-`Unrestricted`.
+**Scoped sessions are refused on the generic resource API.** Today the
+resource API builds every session's principal as unrestricted. Rather than
+teach it to read session ceilings before its engine knows these kinds, the
+session authentication adapter rejects any session carrying
+`authorization_details` on `/api/v1/resources` with a 403 that names the
+reason. That's a single guard in `src/server/auth`, outside the resource API.
+It fails closed: a scoped session can never reach the resource API with full
+access. The agent workflows this ADR targets (projects, environments,
+deployments, env vars) don't use that API.
 
-### 8. CLI surface
+### 8. Path to the generic resource API
+
+When a typed table migrates (`ROADMAP.md` §4), its scoping moves with it:
+
+1. Register the kind, and its subresources from §3, under the names fixed
+   there.
+2. Amend ADR-0001 §7 with the §4 `labelSelector` on ceiling entries. Teach the
+   engine's `ceiling_for` and `statements_covering` to apply it. In the grant
+   gate's domain comparison, a selector entry never covers a whole domain, just
+   as a partial Scope doesn't today. Set `rise.dev/environment` as a governed
+   label from the resource's environment reference. This happens once, with
+   the first environment-bound kind (Deployment or env vars).
+3. Build session principals from the session's claim
+   (`AuthorizationCap::from_details`) instead of as unrestricted. Drop the §7 refusal once every kind a session can
+   name has migrated, or narrow it to the kinds still typed.
+4. Delete the migrated kind's arm of the typed check.
+
+No session changes meaning along the way: the claim's format, its Scopes and
+its statements are already the engine's. Presets may then become data: the
+CLI and approval page could offer operator-defined `PlatformRole`s (say
+`agent-deploy`) next to the built-in presets. The token still carries expanded
+statements, so editing such a role never widens a session already issued.
+
+### 9. CLI surface
 
 ```bash
 rise login --device --scope my-app=read --scope my-app/staging=develop
@@ -337,10 +379,10 @@ machine." Credentials stay one per backend URL, shared by every profile for
 that URL. A scoped login replacing a full one is usually what the user wants
 when an agent shares their machine.
 
-### 9. Agent guidance
+### 10. Agent guidance
 
-Once §6–§8 ship, the Rise App Builder skill's login invariant gains a request
-step:
+Once §6, §7 and §9 ship, the Rise App Builder skill's login invariant gains a
+request step:
 
 - Read the target from the task: the project from `rise.toml`, the environment
   from what the user asked for.
@@ -355,11 +397,11 @@ step:
 **Scoping protects only what the agent can't read.** An agent with shell access
 on the user's machine can read any credential file on that machine. A narrow
 session for the agent means little if the user's full session sits beside it.
-That's why the scoped login replaces the stored session (§8). The guarantee is
+That's why the scoped login replaces the stored session (§9). The guarantee is
 strongest where the agent runs in its own sandbox and only ever holds the
 session it requested.
 
-### 10. Explicitly out of scope
+### 11. Explicitly out of scope
 
 - **Organization- or install-level targets** (creating projects, managing
   teams). Deferred until projects are resource-API Organization children, where
@@ -377,21 +419,24 @@ session it requested.
 
 ## Consequences
 
-- One ceiling model covers identity tokens, CLI sessions and, after migration,
-  every typed resource. The typed adapter is a stand-in for engine evaluation.
-  The migration deletes it without changing any token's meaning.
+- One ceiling format covers identity tokens, CLI sessions and, after
+  migration, every typed resource. The typed check is a stand-in for engine
+  evaluation. The migration deletes it without changing any token's meaning.
+- The ceiling is evaluated twice for a while: by the typed check for typed
+  kinds and by the engine for generic ones. Both must apply the same coverage
+  rule. A shared test-vector suite (claim, target, operation → verdict) run
+  against both keeps them in step, and the engine side takes it over at
+  migration.
+- Scoped sessions can't use the generic resource API until §8 lands. Anything
+  an agent needs from that API in the meantime needs a full-access login.
 - Every typed handler moves onto the choke point, a sweeping but mechanical
   change. The route-classification test is what keeps it complete.
-- Four kinds are registered before their storage exists, and three subresource
-  names before their routes do. That fixes their policy identity early,
-  including in RoleBindings someone could write against them now.
+- The names in §3 are fixed now but registered only at migration. A migration
+  that wants a different name must also translate outstanding session claims.
+  Sessions are short-lived, so in practice it waits one session TTL.
 - `rise.dev/environment` becomes a platform-governed label, the first one set
   from a typed column. The resource-API migration of Deployment and env vars
   must preserve it.
-- ADR-0001 §7 gains `labelSelector` on ceiling entries. The engine's
-  `ceiling_for` and `statements_covering` must apply it. In the grant gate's
-  domain comparison, a selector entry never covers a whole domain, just as a
-  partial Scope doesn't today.
 - Sessions get larger by the size of their ceiling. A typical agent grant
   compiles to three or four entries.
 - Device approval gains a decision the user must actually read. The page has to
