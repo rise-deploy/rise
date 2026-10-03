@@ -23,6 +23,31 @@ impl fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+/// Prefix reserved for Rise-injected workload env vars (`RISE_APP_URL`,
+/// `RISE_CONTAINER_HOST__*`, …). User-supplied keys in this namespace are
+/// rejected so they cannot collide with or shadow a Rise-injected value.
+pub const RESERVED_ENV_VAR_PREFIX: &str = "RISE_";
+
+/// True if `key` falls in the reserved `RISE_*` namespace. Case-sensitive:
+/// env names are case-sensitive and the injected vars are uppercase.
+pub fn is_reserved_env_var_key(key: &str) -> bool {
+    key.starts_with(RESERVED_ENV_VAR_PREFIX)
+}
+
+/// Reject reserved `RISE_*` keys in a rise.toml env table. `table` names the
+/// table in the error (e.g. `project.env`).
+fn reject_reserved_env_keys<'a>(
+    table: &str,
+    keys: impl IntoIterator<Item = &'a String>,
+) -> Result<(), ValidationError> {
+    if let Some(key) = keys.into_iter().find(|k| is_reserved_env_var_key(k)) {
+        return Err(ValidationError::new(format!(
+            "[{table}] key '{key}' uses the '{RESERVED_ENV_VAR_PREFIX}' prefix, which is reserved for Rise-injected variables"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate `^[a-z][a-z0-9-]{0,14}$` (max 15 chars, starts with lowercase
 /// letter, lowercase alphanumeric + dash, no trailing dash).
 pub fn is_valid_container_name(name: &str) -> bool {
@@ -177,6 +202,16 @@ pub fn validate_containers_and_routes(
 pub fn validate_project_config(
     config: &crate::project_config::ProjectBuildConfig,
 ) -> Result<(), ValidationError> {
+    if let Some(project) = &config.project {
+        reject_reserved_env_keys("project.env", project.env.keys())?;
+    }
+    for (name, env) in &config.environments {
+        reject_reserved_env_keys(&format!("environments.{name}.env"), env.env.keys())?;
+    }
+    for (name, container) in &config.containers {
+        reject_reserved_env_keys(&format!("containers.{name}.env"), container.env.keys())?;
+    }
+
     if config.containers.is_empty() {
         if !config.routes.is_empty() {
             return Err(ValidationError::new(
@@ -424,5 +459,35 @@ mod tests {
 
         let err = validate_project_config(&config).unwrap_err();
         assert!(err.message.contains("equivalent"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn project_config_rejects_reserved_env_keys() {
+        for (toml_src, table) in [
+            (
+                "[project]\nname = \"app\"\n[project.env]\nRISE_APP_URL = \"x\"\n",
+                "[project.env] key 'RISE_APP_URL'",
+            ),
+            (
+                "[environments.staging.env]\nRISE_FOO = \"x\"\n",
+                "[environments.staging.env] key 'RISE_FOO'",
+            ),
+            (
+                "[containers.api]\nimage = \"nginx\"\n[containers.api.env]\nRISE_ = \"x\"\n",
+                "[containers.api.env] key 'RISE_'",
+            ),
+        ] {
+            let config: crate::project_config::ProjectBuildConfig =
+                toml::from_str(toml_src).unwrap();
+            let err = validate_project_config(&config).unwrap_err();
+            assert!(err.message.starts_with(table), "got: {}", err.message);
+            assert!(err.message.contains("reserved"), "got: {}", err.message);
+        }
+
+        let config: crate::project_config::ProjectBuildConfig = toml::from_str(
+            "[project]\nname = \"app\"\n[project.env]\nrise_lower = \"x\"\nMY_RISE_VAR = \"y\"\n",
+        )
+        .unwrap();
+        validate_project_config(&config).unwrap();
     }
 }
