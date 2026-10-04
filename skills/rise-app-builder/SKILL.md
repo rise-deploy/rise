@@ -68,6 +68,38 @@ User intent
 
 These are the non-obvious rules you MUST follow. Violating them causes silent failures or rejected commands.
 
+### 0. Get access with `rise login --device`; the user approves it
+
+You act on Rise as the user, and only after they grant it on Rise's own web UI. Before the first command that talks to the backend, check whether the CLI is logged in (e.g. `rise project list`). If it reports no login or an expired token, log in with the device flow, asking for only the access the task needs. Do not use plain `rise login` (it waits for a browser callback on this machine):
+
+```bash
+rise login --device --scope my-app/staging=deploy   # add --url https://<rise-host> if no profile or rise.toml target names one
+```
+
+Pick the scope from the task: the project from `rise.toml`, the environment from what the user asked for. Use the narrowest preset that does the job:
+
+| Task | `--scope` |
+|------|-----------|
+| Inspect deployments, logs, env vars | `<project>=read` or `<project>/<env>=read` (`read` is view only; add `,logs` for logs) |
+| Ship a build to one environment | `<project>/<env>=deploy` |
+| …and change that environment's env vars | `<project>/<env>=develop` |
+| Manage the project itself (environments, domains, service accounts) | `<project>=admin`, only when asked |
+| Create a project or team | `--full-access`, and tell the user why |
+
+Repeat `--scope` for several targets.
+
+The command prints a verification URL and a code such as `BCDF-GHJK`, then keeps polling for up to 10 minutes. Run it in the background or with a long timeout so you can read its output while it waits, then relay both values to the user verbatim:
+
+> To give me access to Rise, open **<verification URL>**, sign in, check that the page shows the code **<code>**, and click **Approve**.
+
+Wait for the command to print `✓ Login successful!` before continuing. It then prints `Access:`, the access the user actually granted. They may have changed your request, so work within what it says.
+
+- Never approve the page yourself, drive a browser to it, or ask the user for their password, session cookie, or token. Approval must come from the user.
+- `RISE_TOKEN`, `RISE_TOKEN_COMMAND` and `RISE_IDENTITY` are for CI. Don't set them to work around a missing login.
+- If it fails with "Login was denied", stop and ask the user how to proceed. If it fails with "expired or was already used", ask the user whether to start a new login.
+- If a later command fails with "This login's access does not cover …", ask the user before requesting more. Don't loop on new logins.
+- The login replaces the stored token for that Rise URL, so the user's own CLI session on this machine becomes the one they approved.
+
 ### 1. Always use names, never UUIDs
 
 Project names, environment names, deployment timestamps (e.g. `20240101-120000`), and service account identifiers are what you pass on the CLI. UUIDs are internal only — never reference them in commands or configs.

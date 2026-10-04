@@ -1,4 +1,5 @@
 use crate::db::{projects, users};
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::auth::{
     cookie_helpers,
     token_storage::{
@@ -16,6 +17,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use rise_backend_auth::session_scope::AccessRequest;
 use rise_backend_auth::{SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -494,6 +496,7 @@ async fn issue_session(
     claims: &serde_json::Value,
     login: &ResolvedLogin,
     client: SessionClient,
+    authorization_details: Option<Vec<serde_json::Value>>,
 ) -> Result<String, LoginFailure> {
     // Resolve the user's team memberships for the groups claim; on a DB error,
     // fall back to no groups rather than failing the login.
@@ -505,6 +508,7 @@ async fn issue_session(
         rise_uid: login.identity.principal.uid,
         identity_uid: login.identity.identity_uid,
         client,
+        authorization_details,
     };
     state
         .jwt_signer
@@ -520,6 +524,10 @@ pub struct CodeExchangeRequest {
     pub code: String,
     pub code_verifier: String,
     pub redirect_uri: String,
+    /// The access the session is restricted to (ADR-0006). Omitted means
+    /// full access.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -544,6 +552,10 @@ pub struct AuthorizeRequest {
     pub client_name: Option<String>,
     /// Flow type: "code" for authorization code flow, "device" for device flow
     pub flow: String,
+    /// For device flow: the access the login asks for (ADR-0006). Omitted
+    /// means full access. The approver may change it.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -586,6 +598,12 @@ pub async fn authorize(
 ) -> Result<Json<AuthorizeResponse>, (StatusCode, String)> {
     match payload.flow.as_str() {
         "code" => {
+            if payload.access.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "For the code flow, send `access` with the code exchange".to_string(),
+                ));
+            }
             // Authorization code flow with PKCE
             let redirect_uri = payload.redirect_uri.ok_or_else(|| {
                 (
@@ -643,8 +661,22 @@ pub async fn authorize(
                     )
                 })?;
             let client_ip = (client_ip != "unknown").then_some(client_ip);
+            // Only the shape is checked here: the endpoint is unauthenticated,
+            // so whether the named projects exist is the approver's to see.
+            if let Some(access) = &payload.access {
+                access.validate().map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid access request: {e}"),
+                    )
+                })?;
+            }
             let started = super::device::DeviceFlow::new(&state)
-                .start(payload.client_name.as_deref(), client_ip.as_deref())
+                .start(
+                    payload.client_name.as_deref(),
+                    client_ip.as_deref(),
+                    payload.access.as_ref(),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to start device flow: {:?}", e);
@@ -681,6 +713,16 @@ pub async fn code_exchange(
         "Code exchange request: redirect_uri={}",
         payload.redirect_uri
     );
+
+    // A malformed access request fails before the single-use code is spent.
+    if let Some(access) = &payload.access {
+        access.validate().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid access request: {e}"),
+            )
+        })?;
+    }
 
     // Exchange authorization code for tokens using PKCE
     let token_info = state
@@ -742,9 +784,21 @@ pub async fn code_exchange(
     let login = resolve_login(&state, &claims)
         .await
         .map_err(|failure| failure.response())?;
-    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Cli)
-        .await
-        .map_err(|failure| failure.response())?;
+    let authorization_details = match &payload.access {
+        Some(access) => super::session_scope::compile_grant(&state, &login.user, access)
+            .await
+            .map_err(|e| (e.status, e.message))?,
+        None => None,
+    };
+    let rise_jwt = issue_session(
+        &state,
+        &claims,
+        &login,
+        SessionClient::Cli,
+        authorization_details,
+    )
+    .await
+    .map_err(|failure| failure.response())?;
     let user = login.user;
 
     tracing::info!(
@@ -762,6 +816,9 @@ pub struct MeResponse {
     pub is_admin: bool,
     pub is_operator: bool,
     pub can_create_teams: bool,
+    /// What this session may do: `{"kind": "full"}`, or the grants of a
+    /// scoped CLI session (ADR-0006).
+    pub access: AccessRequest,
 }
 
 /// Get current user info from auth middleware
@@ -769,6 +826,7 @@ pub struct MeResponse {
 pub async fn me(
     State(state): State<AppState>,
     auth: crate::server::auth::context::AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
 ) -> Result<Json<MeResponse>, (StatusCode, String)> {
     let user = auth.user().map_err(|e| (e.status, e.message))?;
     // User is injected by auth middleware
@@ -782,6 +840,7 @@ pub async fn me(
         is_admin,
         is_operator,
         can_create_teams,
+        access: scope.map_or(AccessRequest::Full, |scope| scope.access()),
     }))
 }
 
@@ -1290,7 +1349,7 @@ pub async fn oauth_callback(
     let login = resolve_login(&state, &claims)
         .await
         .map_err(|failure| failure.response())?;
-    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Browser)
+    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Browser, None)
         .await
         .map_err(|failure| failure.response())?;
 
@@ -1942,6 +2001,9 @@ pub async fn oauth_logout(
 pub struct CliAuthSuccessQuery {
     pub success: Option<bool>,
     pub error: Option<String>,
+    /// The session's access as the CLI read it back: `full`, or one
+    /// `<target>: <access>` line per grant.
+    pub access: Option<String>,
 }
 
 /// Handler for CLI authentication success/failure page
@@ -1971,6 +2033,11 @@ pub async fn cli_auth_success(
     context.insert("success", &success);
     if let Some(error) = params.error {
         context.insert("error_message", &error);
+    }
+    match params.access.as_deref() {
+        Some("full") => context.insert("access_full", &true),
+        Some(grants) => context.insert("access_grants", &grants.lines().collect::<Vec<_>>()),
+        None => {}
     }
 
     let html = tera

@@ -65,7 +65,8 @@ cargo test --manifest-path tests/e2e/Cargo.toml
 ```
 
 Backend scenarios run in-order as one suite (they share the single backend
-bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
+bring-up). Set `RISE_E2E_SCENARIOS` to a comma-separated list of scenario ids to
+run only those, e.g. `RISE_E2E_SCENARIOS=device-login,scoped-device-login`. Standalone suites run separately via `RISE_E2E_SUITE`.
 
 ## ECS Backend
 
@@ -271,6 +272,8 @@ container behind the install starts. That is the ECS suite's job.
 |---------------------|--------|----------|------|---------|
 | `public-deploy`     | Run    | Run      | Run  | deploy a sample app → Healthy; HTTP 200 (+ body marker) |
 | `sa-token-exchange` | Run    | Run      | Run  | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
+| `device-login` | Run | Run | Skip³ | `rise login --device` approved from a real browser session yields a session for the approver's `User`/`UserIdentity`; CLI and device sessions can't approve; a code redeems once; denial reaches the CLI |
+| `scoped-device-login` | Run | Run | Skip³ | a device login asking for, and granted, `deploy` on one environment (approved by an admin): the session deploys there through the CLI and lists only that project, environment and its deployments; production, the other project, project- and install-wide writes, and the resource API answer 403; granting `read` for a `deploy` request yields a session that can't deploy |
 | `resource-token-exchange` | Run | Run    | Skip² | resource `ServiceAccount` + `ServiceAccountTrustPolicy` (Dex); credential-less `POST …/token` with the Dex id_token mints an identity token; that token reaches the resource API only once a `PlatformRoleBinding` grants it; wrong claims and an unknown target are the same 401; operator delegation mints too |
 | `persistent-log-retention` | Skip | Run | Run | stop deployment, workload gone, `/logs/volume` total>0 + `rise deployment logs` returns retained backlog |
 | `helm-idempotency`  | Skip   | Run      | Skip | re-run `helm upgrade` applies cleanly |
@@ -279,6 +282,8 @@ container behind the install starts. That is the ECS suite's job.
 ¹ minikube only in `jfrog-vault` registry mode (source build needs a cluster-pullable registry); otherwise `Skip`.
 
 ² the ECS stack grants no operator, and the generic resource API needs one to author the resources the scenario exercises.
+
+³ the ECS stack's Dex serves only the password grant, not the browser sign-in that approves a device login.
 
 ## Standalone Suites
 

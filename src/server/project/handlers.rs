@@ -8,6 +8,7 @@ use super::models::{
 use crate::db::models::User;
 use crate::db::{projects, teams as db_teams, users as db_users};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
 use axum::{
@@ -15,6 +16,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 use rise_backend_auth::PrincipalClaims;
 use uuid::Uuid;
 
@@ -322,6 +324,7 @@ pub async fn create_project(
 pub async fn list_projects(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
 ) -> Result<Json<Vec<ApiProject>>, ServerError> {
     // A service-account access token is bound to a single project and carries the
     // principal, so it needs no user context: return just that project (or an
@@ -340,7 +343,7 @@ pub async fn list_projects(
 
     let user = auth.user()?;
     // Admins can see all projects, others only see projects they have access to
-    let projects = if state.is_admin(user).await {
+    let mut projects = if state.is_admin(user).await {
         projects::list(&state.db_pool, None)
             .await
             .internal_err("Failed to list projects")?
@@ -350,6 +353,11 @@ pub async fn list_projects(
             .internal_err("Failed to list projects")
             .map_err(|e| e.with_context("user_id", user.id.to_string()))?
     };
+    // A scoped session sees the projects it covers, an admin's included.
+    if let Some(scope) = &scope {
+        let list = Operation::new(Verb::List, Kind::Project);
+        scope.retain(&mut projects, list, |project| (project.name.clone(), None));
+    }
 
     let api_projects = projects_to_api(&state, projects).await?;
     Ok(Json(api_projects))

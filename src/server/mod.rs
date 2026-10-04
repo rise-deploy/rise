@@ -296,6 +296,11 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let auth_only_routes = Router::new()
         .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .merge(auth::routes::auth_only_routes())
+        // Scoped sessions (ADR-0006) are checked after authentication.
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
         // Apply auth middleware only
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -318,6 +323,11 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(quickstart::routes::routes());
 
     let platform_routes = platform_routes
+        // Scoped sessions (ADR-0006) are checked last, before the handler
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
         // Apply platform access middleware (runs second, after auth)
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),

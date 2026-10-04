@@ -12,8 +12,10 @@ use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::{SessionDetails, VerifiedExternalToken};
 use crate::server::auth::cookie_helpers;
 use crate::server::auth::identity::{resolve_identity, ResourcePrincipal};
+use crate::server::auth::session_scope::SessionScope;
 use crate::server::auth::user_identity::TokenStanding;
 use crate::server::state::AppState;
+use rise_backend_auth::session_scope::SessionCeiling;
 use rise_backend_auth::{is_rise_issued_jwt, AccessClaims, PrincipalClaims, RiseToken};
 
 /// Extract Bearer token from Authorization header
@@ -180,6 +182,20 @@ pub async fn auth_middleware(
                             "Database error".to_string(),
                         ));
                     }
+                }
+
+                // A scoped session (ADR-0006) carries its ceiling; one that
+                // doesn't parse is an invalid credential, never full access.
+                if let Some(details) = &claims.authorization_details {
+                    let ceiling = SessionCeiling::parse(details).map_err(|e| {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            "Auth middleware: session ceiling rejected: {e}"
+                        );
+                        (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
+                    })?;
+                    req.extensions_mut()
+                        .insert(SessionScope::new(ceiling, &state.default_organization_name));
                 }
 
                 let email = &claims.email;
