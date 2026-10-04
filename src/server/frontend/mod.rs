@@ -52,6 +52,9 @@ pub async fn load_auth_template(
     }
 
     let mut tera = Tera::default();
+    // Tera only escapes names ending in `.html`; these templates render
+    // request-supplied values (project names, error messages), so escape them.
+    tera.autoescape_on(vec![".html.tera"]);
     for partial in AUTH_TEMPLATE_PARTIALS {
         let body = load_text(static_dir, partial).await?;
         tera.add_raw_template(partial, &body).map_err(|e| {
@@ -71,4 +74,58 @@ pub async fn load_auth_template(
         )
     })?;
     Ok(tera)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STATIC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
+    const HOSTILE: &str = "<script>alert(1)</script>";
+
+    async fn render(template: &str, values: &[(&str, &str)]) -> String {
+        let tera = load_auth_template(STATIC_DIR, template).await.unwrap();
+        let mut context = tera::Context::new();
+        context.insert("success", &false);
+        for (key, value) in values {
+            context.insert(*key, value);
+        }
+        tera.render(template, &context).unwrap()
+    }
+
+    #[tokio::test]
+    async fn auth_templates_escape_request_values() {
+        for template in [
+            "cli-auth-success.html.tera",
+            "auth-success.html.tera",
+            "auth-signin.html.tera",
+        ] {
+            let html = render(
+                template,
+                &[
+                    ("error_message", HOSTILE),
+                    ("project_name", HOSTILE),
+                    ("redirect_url", HOSTILE),
+                    ("continue_url", HOSTILE),
+                ],
+            )
+            .await;
+            assert!(!html.contains(HOSTILE), "{template} renders raw HTML");
+            assert!(
+                html.contains("&lt;script&gt;"),
+                "{template} renders no value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redirect_script_keeps_a_json_string() {
+        let tera = load_auth_template(STATIC_DIR, "auth-ui-success.html.tera")
+            .await
+            .unwrap();
+        let mut context = tera::Context::new();
+        context.insert("redirect_url", "https://app.example.com/a?b=1&c=2");
+        let html = tera.render("auth-ui-success.html.tera", &context).unwrap();
+        assert!(html.contains(r#"const redirectUrl = "https://app.example.com/a?b=1&c=2";"#));
+    }
 }
