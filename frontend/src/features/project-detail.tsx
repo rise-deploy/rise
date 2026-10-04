@@ -4,7 +4,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useToast } from '../components/toast';
-import { Alert, Button, ConfirmDialog, Empty, EnvPill, GroupPill, KV, KVRow, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tabs, Tooltip } from '../components/r-ui';
+import { Alert, Button, ConfirmDialog, Empty, EnvPill, GroupPill, KV, KVRow, OwnerLabel, Panel, PanelBody, PanelHead, Pill, SourceLinkGroup, Status, Tooltip } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState, EmptyState } from '../components/states';
 
@@ -13,86 +13,116 @@ import { ProjectStatusPill } from '../components/project-table';
 import { DomainsList, EnvironmentsList, EnvVarsList, ExtensionsList } from './resources';
 import { AppUsersList } from './projects';
 import { useQuickstartTemplates } from './quickstart-templates';
+import { useCurrentProject, type Project } from '../lib/project-context';
+import { PROJECT_SECTIONS, type ProjectSection } from '../lib/routes';
 
-const TAB_LABELS: Record<string, string> = {
-    overview: 'Overview',
-    environments: 'Environments',
-    deployments: 'Deployments',
-    'env-vars': 'Env vars',
-    domains: 'Domains',
-    extensions: 'Extensions',
-    access: 'Access',
-};
-
-const TAB_IDS = ['overview', 'environments', 'deployments', 'env-vars', 'domains', 'extensions', 'access'];
-
-function normalizeTab(tab?: string): string {
-    if (tab === 'service-accounts') return 'access';
-    return tab && TAB_IDS.includes(tab) ? tab : 'overview';
-}
-
-export function ProjectDetail({ projectName, initialTab }: { projectName: string; initialTab?: string }) {
-    const [project, setProject] = useState<any>(null);
-    const [error, setError] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState(normalizeTab(initialTab));
-    const [confirmOpen, setConfirmOpen] = useState(false);
-    const [deleting, setDeleting] = useState(false);
+export function ProjectDetail({ section }: { section: ProjectSection }) {
+    const current = useCurrentProject()!;
+    const { projectName, project, environments, error, reload } = current;
     const [accessClasses, setAccessClasses] = useState<any[]>([]);
     const [currentUserEmail, setCurrentUserEmail] = useState<string>('');
-    const [environments, setEnvironments] = useState<any[]>([]);
-    const [tabCounts, setTabCounts] = useState<Record<string, number>>({});
-    const { showToast } = useToast();
 
-    useEffect(() => { setActiveTab(normalizeTab(initialTab)); }, [initialTab]);
-
-    const loadProject = useCallback(async () => {
-        try {
-            const data = await api.getProject(projectName);
-            setProject(data);
-        } catch (err: any) {
-            setError(err.message);
-        }
-    }, [projectName]);
-
-    useEffect(() => { loadProject(); }, [loadProject]);
     useEffect(() => {
         api.getAccessClasses().then(d => setAccessClasses(d?.access_classes || [])).catch(() => {});
         api.getMe().then(u => setCurrentUserEmail(u?.email || '')).catch(() => {});
     }, []);
 
-    // Fetch environments + per-tab count badges. Each count is recorded only
-    // once its source request resolves, so badges appear progressively.
-    useEffect(() => {
-        let cancelled = false;
-        const record = (key: string, n: number) => {
-            if (!cancelled) setTabCounts(c => ({ ...c, [key]: n }));
-        };
-        api.getProjectEnvironments(projectName)
-            .then((d: any[]) => {
-                const list = Array.isArray(d) ? d : [];
-                if (!cancelled) setEnvironments(list);
-                record('environments', list.length);
-            })
-            .catch(() => {});
-        api.getProjectDeployments(projectName, { limit: 100 })
-            .then((d: any[]) => record('deployments', Array.isArray(d) ? d.length : 0))
-            .catch(() => {});
-        api.getProjectDomains(projectName)
-            .then((d: any) => record('domains', Array.isArray(d) ? d.length : (d?.domains?.length ?? 0)))
-            .catch(() => {});
-        api.getProjectExtensions(projectName)
-            .then((d: any) => record('extensions', Array.isArray(d) ? d.length : (d?.extensions?.length ?? 0)))
-            .catch(() => {});
-        return () => { cancelled = true; };
-    }, [projectName]);
+    if (error) return <ErrorState message={`Failed to load project: ${error}`} onRetry={reload} />;
+    if (!project) return <LoadingState label="Loading project…" />;
 
-    const changeTab = (tab: string) => {
-        setActiveTab(tab);
-        navigate(`/project/${projectName}/${tab}`);
-    };
+    const accessClass = accessClasses.find(a => a.id === project.access_class);
+    const accessLabel = accessClass?.display_name || project.access_class || '—';
+    const info = PROJECT_SECTIONS.find(s => s.id === section)!;
+
+    return (
+        <section>
+            {section === 'overview' ? (
+                <ProjectHeader project={project} accessLabel={accessLabel} accessDescription={accessClass?.description || ''} />
+            ) : (
+                <div className="r-page-head">
+                    <div className="title-stack">
+                        <h1 className="r-page-title">{info.label}</h1>
+                        {info.sub && <div className="r-page-sub">{info.sub}</div>}
+                    </div>
+                </div>
+            )}
+
+            {section === 'overview' && (
+                <ProjectOverview project={project} projectName={projectName} accessLabel={accessLabel} environments={environments} onUpdated={reload} />
+            )}
+            {section === 'deployments' && <DeploymentsList projectName={projectName} />}
+            {section === 'environments' && (
+                <EnvironmentsList projectName={projectName} platformConstraints={project?.platform_constraints} />
+            )}
+            {section === 'variables' && <EnvVarsList projectName={projectName} />}
+            {section === 'domains' && <DomainsList projectName={projectName} defaultUrl={project.default_url} />}
+            {section === 'extensions' && <ExtensionsList projectName={projectName} />}
+            {section === 'access' && (
+                <div className="r-stack">
+                    <AppUsersList
+                        projectName={projectName}
+                        project={project}
+                        accessClasses={accessClasses}
+                        currentUserEmail={currentUserEmail}
+                        onProjectUpdated={reload}
+                    />
+                    <DangerZone project={project} />
+                </div>
+            )}
+        </section>
+    );
+}
+
+function ProjectHeader({ project, accessLabel, accessDescription }: { project: Project; accessLabel: string; accessDescription: string }) {
+    // The source repository is either explicitly configured on the project, or
+    // resolved by the backend from the active/most recent deployment metadata.
+    const sourceUrl: string | null = project.source_url || project.resolved_source_url || null;
+    const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
+
+    return (
+        <div className="r-page-head">
+            <div className="title-stack">
+                <div className="r-title-row">
+                    <h1 className="r-page-title">{project.name}</h1>
+                    <ProjectStatusPill project={project} tooltip={`Lifecycle status: ${project.status || 'Unknown'}`} />
+                </div>
+                <div className="r-meta-bar r-meta-wrap">
+                    {project.primary_url && isSafeUrl(project.primary_url) && (
+                        <a className="r-link mono" href={project.primary_url} target="_blank" rel="noopener noreferrer">
+                            {stripUrlScheme(project.primary_url)}
+                        </a>
+                    )}
+                    {sourceUrl && isSafeUrl(sourceUrl) && (
+                        <a
+                            className="r-meta-link"
+                            href={sourceUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={sourceUrlInherited ? 'Source URL resolved from deployment metadata' : undefined}
+                        >
+                            <Icon name="git" size={13} />
+                            {stripUrlScheme(sourceUrl).replace(/^(github\.com|gitlab\.com)\//, '')}
+                        </a>
+                    )}
+                    <OwnerLabel owner={project.owner} link />
+                    <Tooltip content={accessDescription ? <><div><strong>{accessLabel}</strong></div><div>{accessDescription}</div></> : `Access class: ${accessLabel}`}>
+                        <span className="r-meta-link"><Icon name="lock" size={13} />{accessLabel}</span>
+                    </Tooltip>
+                    {project.created && (
+                        <span title={formatISO8601(project.created)}>created {formatRelativeTimeRounded(project.created)}</span>
+                    )}
+                </div>
+            </div>
+        </div>
+    );
+}
+
+function DangerZone({ project }: { project: Project }) {
+    const [confirmOpen, setConfirmOpen] = useState(false);
+    const [deleting, setDeleting] = useState(false);
+    const { showToast } = useToast();
 
     const handleDelete = async () => {
-        if (!project) return;
         setDeleting(true);
         try {
             await api.deleteProject(project.name);
@@ -106,149 +136,29 @@ export function ProjectDetail({ projectName, initialTab }: { projectName: string
         }
     };
 
-    if (error) return <ErrorState message={`Failed to load project: ${error}`} onRetry={loadProject} />;
-    if (!project) return <LoadingState label="Loading project…" />;
-
-    const ownerType: 'user' | 'team' | null = project.owner?.email ? 'user' : project.owner?.name ? 'team' : null;
-    const ownerLabel = project.owner?.email || project.owner?.name || '—';
-    const accessClass = accessClasses.find(a => a.id === project.access_class);
-    const accessLabel = accessClass?.display_name || project.access_class || '—';
-    const accessDescription = accessClass?.description || '';
-
-    // The source repository is either explicitly configured on the project, or
-    // resolved by the backend from the active/most recent deployment metadata.
-    const sourceUrl: string | null = project.source_url || project.resolved_source_url || null;
-    const sourceUrlInherited = !project.source_url && !!project.resolved_source_url;
-
-    const tabs = TAB_IDS.map(id => ({ id, label: TAB_LABELS[id], count: tabCounts[id] }));
-
     return (
-        <section>
-            <div className="r-page-head">
-                <div className="title-stack">
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, flexWrap: 'wrap' }}>
-                        <h1 className="r-page-title">{project.name}</h1>
-                        <ProjectStatusPill
-                            project={project}
-                            tooltip={`Lifecycle status: ${project.status || 'Unknown'}`}
-                        />
-                        <Pill
-                            kind="accent"
-                            tooltip={
-                                accessDescription
-                                    ? <><div><strong>{accessLabel}</strong></div><div>{accessDescription}</div></>
-                                    : `Access class: ${accessLabel}`
-                            }
-                        >
-                            {accessLabel}
-                        </Pill>
-                    </div>
-                    <div className="r-meta-bar" style={{ marginTop: 8 }}>
-                        {ownerType && (
-                            <>
-                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                                    <Icon name={ownerType === 'team' ? 'users' : 'user'} size={13} />
-                                    {ownerType === 'team' ? (
-                                        <a
-                                            className="r-link"
-                                            href={`/team/${ownerLabel}`}
-                                            onClick={(e) => {
-                                                // Allow modifier-click and middle-click to open in a new tab / window.
-                                                if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
-                                                e.preventDefault();
-                                                navigate(`/team/${ownerLabel}`);
-                                            }}
-                                        >
-                                            {ownerLabel}
-                                        </a>
-                                    ) : ownerLabel}
-                                </span>
-                                <span className="dot-sep" />
-                            </>
-                        )}
-                        {project.primary_url && isSafeUrl(project.primary_url) ? (
-                            <>
-                                <a className="r-link mono" style={{ fontSize: 12.5 }} href={project.primary_url} target="_blank" rel="noopener noreferrer">
-                                    {stripUrlScheme(project.primary_url)}
-                                </a>
-                                <span className="dot-sep" />
-                            </>
-                        ) : null}
-                        {project.created && (
-                            <span title={formatISO8601(project.created)}>created {formatRelativeTimeRounded(project.created)}</span>
-                        )}
-                        {project.deployment_groups?.length > 0 && (
-                            <>
-                                <span className="dot-sep" />
-                                <span>
-                                    {project.deployment_groups.length} group{project.deployment_groups.length === 1 ? '' : 's'}
-                                    {tabCounts.deployments != null && (
-                                        ` · ${tabCounts.deployments} deployment${tabCounts.deployments === 1 ? '' : 's'}`
-                                    )}
-                                </span>
-                            </>
-                        )}
-                    </div>
-                </div>
-                {project.primary_url && isSafeUrl(project.primary_url) && (
-                    <Button icon="ext" onClick={() => window.open(project.primary_url, '_blank', 'noopener,noreferrer')}>Open URL</Button>
-                )}
-                {sourceUrl && isSafeUrl(sourceUrl) && (
-                    <Button
-                        icon="git"
-                        onClick={() => window.open(sourceUrl, '_blank', 'noopener,noreferrer')}
-                        title={sourceUrlInherited ? 'Source URL resolved from deployment metadata' : undefined}
-                    >
-                        Repo
-                    </Button>
-                )}
-                <Button variant="danger" icon="trash" onClick={() => setConfirmOpen(true)}>Delete</Button>
-            </div>
-
-            <div style={{ marginBottom: 24 }}>
-                <Tabs tabs={tabs} active={activeTab} onChange={changeTab} />
-            </div>
-
-            <div>
-                {activeTab === 'overview' && (
-                    <ProjectOverview project={project} projectName={projectName} accessLabel={accessLabel} environments={environments} onUpdated={loadProject} />
-                )}
-                {activeTab === 'deployments' && <DeploymentsList projectName={projectName} />}
-                {activeTab === 'environments' && (
-                    <EnvironmentsList projectName={projectName} platformConstraints={project?.platform_constraints} />
-                )}
-                {activeTab === 'env-vars' && <EnvVarsList projectName={projectName} />}
-                {activeTab === 'domains' && <DomainsList projectName={projectName} defaultUrl={project.default_url} />}
-                {activeTab === 'extensions' && <ExtensionsList projectName={projectName} />}
-                {activeTab === 'access' && (
-                    <AppUsersList
-                        projectName={projectName}
-                        project={project}
-                        accessClasses={accessClasses}
-                        currentUserEmail={currentUserEmail}
-                        onProjectUpdated={loadProject}
-                    />
-                )}
-            </div>
-
+        <Panel className="r-danger-zone">
+            <PanelHead
+                title="Delete project"
+                sub="Removes the project, its deployments, environment variables, service accounts and extensions."
+                right={<Button variant="danger" icon="trash" onClick={() => setConfirmOpen(true)}>Delete project</Button>}
+            />
             <ConfirmDialog
                 isOpen={confirmOpen}
                 onClose={() => setConfirmOpen(false)}
                 onConfirm={handleDelete}
                 title={`Delete project ${project.name}?`}
                 message={
-                    <>
-                        <p style={{ marginTop: 0 }}>
-                            This removes the project, its deployments, environment variables, service accounts and extensions.
-                            This cannot be undone.
-                        </p>
-                    </>
+                    <p style={{ marginTop: 0 }}>
+                        This removes the project, its deployments, environment variables, service accounts and extensions.
+                        This cannot be undone.
+                    </p>
                 }
                 confirmText="Delete project"
                 requireText={project.name}
                 loading={deleting}
             />
-        </section>
+        </Panel>
     );
 }
 

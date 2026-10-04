@@ -1,14 +1,11 @@
-// @ts-nocheck
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { logout, login } from './lib/auth';
 import { api } from './lib/api';
-import { CONFIG } from './lib/config';
 import { maybeMigrateLegacyHashRoute, navigate, usePathLocation } from './lib/navigation';
 import { useToast } from './components/toast';
-import { PlatformAccessDenied, LoadingState } from './components/states';
-import { CommandPalette } from './components/command-palette';
-import { Shell } from './components/shell';
-import { Button } from './components/r-ui';
+import { PlatformAccessDenied } from './components/states';
+import { CommandPalette, type CommandItem } from './components/command-palette';
+import { Shell, type Crumb } from './components/shell';
 import { Icon } from './components/icon';
 import { Home } from './features/home';
 import { Profile } from './features/profile';
@@ -19,84 +16,121 @@ import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployme
 import { DeploymentLogsPage } from './features/logs/logs-page';
 import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
-import { usePrefs } from './lib/prefs';
+import { resolveTheme, usePrefs } from './lib/prefs';
 import { ErrorBoundary } from './components/error-boundary';
+import { ProjectProvider, type Project } from './lib/project-context';
+import { rememberProject } from './lib/recent';
+import { PROJECT_SECTIONS, parseRoute, projectPath, routeProject, type Route } from './lib/routes';
 
-const TAB_LABELS = {
-    deployments: 'Deployments',
-    environments: 'Environments',
-    'env-vars': 'Env Vars',
-    domains: 'Domains',
-    extensions: 'Extensions',
-    access: 'Access',
-};
-
-function normalizeProjectTab(tab?: string) {
-    return tab === 'service-accounts' ? 'access' : (tab || 'overview');
+export interface CurrentUser {
+    id: string;
+    email: string;
+    is_admin?: boolean;
+    is_operator?: boolean;
+    can_create_teams?: boolean;
 }
+
+interface TeamSummary { id: string; name: string; members?: unknown[] }
 
 function LoginPage() {
     const [status, setStatus] = useState('');
     const [loading, setLoading] = useState(false);
+    const signIn = async () => {
+        setStatus('Redirecting to sign-in…');
+        setLoading(true);
+        try {
+            await login();
+        } catch (e) {
+            setStatus(`Error: ${(e as Error).message}`);
+            setLoading(false);
+        }
+    };
     return (
         <div className="r-login-wrap">
-            <div className="r-login-card">
-                <div className="r-login-logo">R</div>
+            <div className="r-signin">
+                <div className="r-signin-brand">
+                    <div className="r-brand-mark">R</div>
+                    <div className="r-brand-name">Rise</div>
+                </div>
                 <div>
-                    <div style={{ fontSize: 20, fontWeight: 600, letterSpacing: '-0.02em' }}>Welcome to Rise</div>
-                    <div style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: 6 }}>
-                        Sign in to deploy and manage your apps.
-                    </div>
+                    <h1 className="r-page-title">Sign in</h1>
+                    <div className="r-page-sub">Deploy and operate your projects.</div>
                 </div>
                 {loading ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, padding: '12px 0' }}>
-                        <span className="r-spinner lg" />
-                        <p style={{ color: 'var(--text-muted)', fontSize: 13, margin: 0 }}>{status}</p>
+                    <div className="r-signin-pending">
+                        <span className="r-spinner" />
+                        <span>{status}</span>
                     </div>
                 ) : (
                     <>
-                        <Button
-                            variant="primary"
-                            icon="lock"
-                            style={{ width: '100%', justifyContent: 'center', padding: '10px 14px' }}
-                            onClick={async () => {
-                                setStatus('Redirecting to login…');
-                                setLoading(true);
-                                try { await login(); } catch (e) { setStatus(`Error: ${e.message}`); setLoading(false); }
-                            }}
-                        >
+                        <button type="button" className="r-btn primary r-btn-block" onClick={signIn}>
+                            <Icon name="lock" size={14} />
                             Continue with SSO
-                        </Button>
-                        {status && <p style={{ color: 'var(--err)', fontSize: 12, margin: 0 }}>{status}</p>}
+                        </button>
+                        {status && <p className="r-signin-error">{status}</p>}
                     </>
                 )}
-                <div style={{ color: 'var(--text-soft)', fontSize: 11.5 }}>
-                    By continuing you agree to your organization's terms of use.
-                </div>
+                <div className="r-signin-foot">By continuing you agree to your organization's terms of use.</div>
             </div>
         </div>
     );
 }
 
+function sectionLabel(id: string): string {
+    return PROJECT_SECTIONS.find(s => s.id === id)?.label ?? id;
+}
+
+function breadcrumbsFor(route: Route): Crumb[] {
+    const projects: Crumb = { label: 'Projects', href: '/projects' };
+    const project = (name: string): Crumb => ({ label: name, href: projectPath(name) });
+    const section = (name: string, id: Parameters<typeof projectPath>[1]): Crumb => ({ label: sectionLabel(id!), href: projectPath(name, id) });
+    switch (route.view) {
+        case 'home': return [{ label: 'Home' }];
+        case 'profile': return [{ label: 'Profile' }];
+        case 'device': return [{ label: 'Device login' }];
+        case 'projects': return [{ label: 'Projects' }];
+        case 'teams': return [{ label: 'Teams' }];
+        case 'team-detail': return [{ label: 'Teams', href: '/teams' }, { label: route.teamName }];
+        case 'project':
+            return route.section === 'overview'
+                ? [projects, { label: route.projectName }]
+                : [projects, project(route.projectName), { label: sectionLabel(route.section) }];
+        case 'environment-deployment':
+            return [projects, project(route.projectName), section(route.projectName, 'environments'),
+                { label: route.environmentName + (route.groupName ? ` / ${route.groupName}` : '') }];
+        case 'extension-detail':
+            return [projects, project(route.projectName), section(route.projectName, 'extensions'),
+                { label: route.extensionInstance || route.extensionType }];
+        case 'deployment-detail':
+            return [projects, project(route.projectName), section(route.projectName, 'deployments'),
+                { label: route.deploymentId, mono: true }];
+        case 'deployment-logs':
+            return [projects, project(route.projectName), section(route.projectName, 'deployments'),
+                { label: route.deploymentId, href: `/deployment/${route.projectName}/${route.deploymentId}`, mono: true },
+                { label: 'Logs' }];
+    }
+}
+
 export function App() {
     // Initialize prefs hook so it applies defaults to the DOM on first render.
-    usePrefs();
+    const [prefs, setPrefs] = usePrefs();
 
-    const [user, setUser] = useState(null);
+    const [user, setUser] = useState<CurrentUser | null>(null);
     const [authChecked, setAuthChecked] = useState(false);
     const [platformAccessDenied, setPlatformAccessDenied] = useState(false);
-    const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
-    const [paletteProjects, setPaletteProjects] = useState([]);
-    const [paletteTeams, setPaletteTeams] = useState([]);
+    const [palette, setPalette] = useState<{ open: boolean; scope?: 'projects' }>({ open: false });
+    const [paletteProjects, setPaletteProjects] = useState<Project[]>([]);
+    const [paletteTeams, setPaletteTeams] = useState<TeamSummary[]>([]);
     const pathname = usePathLocation();
     const { showToast } = useToast();
 
     useEffect(() => {
         maybeMigrateLegacyHashRoute();
 
+        // The OAuth extension's "Test OAuth Flow" returns here with the result
+        // in the URL fragment.
         if (window.location.hash && (window.location.hash.includes('access_token=') || window.location.hash.includes('error='))) {
-            const fragment = window.location.hash.substring(1);
-            const params = new URLSearchParams(fragment);
+            const params = new URLSearchParams(window.location.hash.substring(1));
             const returnPath = sessionStorage.getItem('oauth_return_path');
             const error = params.get('error');
             const errorDescription = params.get('error_description');
@@ -106,43 +140,41 @@ export function App() {
             } else if (accessToken) {
                 const expiresIn = params.get('expires_in');
                 const expiresAt = params.get('expires_at');
-                let expiresAtDate;
+                let expiresAtDate: Date | undefined;
                 if (expiresAt) expiresAtDate = new Date(expiresAt);
-                else if (expiresIn) expiresAtDate = new Date(Date.now() + parseInt(expiresIn) * 1000);
+                else if (expiresIn) expiresAtDate = new Date(Date.now() + parseInt(expiresIn, 10) * 1000);
                 showToast(`OAuth flow successful! Token expires ${expiresAtDate ? expiresAtDate.toLocaleString() : 'soon'}`, 'success');
             }
             sessionStorage.removeItem('oauth_return_path');
-            if (returnPath) navigate(returnPath);
-            else navigate('/home');
+            navigate(returnPath || '/home');
         }
 
-        async function loadUser() {
-            try {
-                const userData = await api.getMe();
-                setUser(userData);
-            } catch (err) {
+        api.getMe()
+            .then((me: CurrentUser) => setUser(me))
+            .catch((err: unknown) => {
                 console.error('Failed to load user:', err);
                 setUser(null);
-            } finally {
-                setAuthChecked(true);
-            }
-        }
-        loadUser();
+            })
+            .finally(() => setAuthChecked(true));
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once on boot
     }, []);
 
+    const openPalette = useCallback((scope?: 'projects') => setPalette({ open: true, scope }), []);
+    const closePalette = useCallback(() => setPalette({ open: false }), []);
+
     useEffect(() => {
-        const handler = (e) => {
+        const handler = (e: KeyboardEvent) => {
             const isModifierK = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k';
             if (!isModifierK) return;
             const target = e.target;
             const isTypingTarget =
                 target instanceof HTMLInputElement ||
                 target instanceof HTMLTextAreaElement ||
-                target?.isContentEditable;
+                (target instanceof HTMLElement && target.isContentEditable);
             const modalOpen = Boolean(document.querySelector('.r-modal-mask, .modal-backdrop, .r-cmdp-mask'));
             if (isTypingTarget && !modalOpen) return;
             e.preventDefault();
-            setCommandPaletteOpen(true);
+            setPalette(p => p.open ? { open: false } : { open: true });
         };
         window.addEventListener('keydown', handler);
         return () => window.removeEventListener('keydown', handler);
@@ -162,7 +194,7 @@ export function App() {
                 setPaletteProjects(projects || []);
                 setPaletteTeams(teams || []);
             } catch (err) {
-                if (err.isPlatformAccessDenied) { setPlatformAccessDenied(true); return; }
+                if ((err as { isPlatformAccessDenied?: boolean }).isPlatformAccessDenied) { setPlatformAccessDenied(true); return; }
                 console.error('Failed to load command palette targets:', err);
             }
         }
@@ -174,6 +206,13 @@ export function App() {
         };
     }, [user?.id]);
 
+    const route = parseRoute(pathname);
+    const currentProject = routeProject(route);
+
+    useEffect(() => {
+        if (currentProject) rememberProject(currentProject);
+    }, [currentProject]);
+
     if (!authChecked) {
         return (
             <div className="r-login-wrap">
@@ -184,149 +223,83 @@ export function App() {
     if (!user) return <LoginPage />;
     if (platformAccessDenied) return <PlatformAccessDenied userEmail={user.email} onLogout={logout} />;
 
-    // ----- Route parsing -----
-    let view = 'home';
-    const params: any = {};
-    const route = pathname.replace(/^\//, '');
-
-    if (route === '' || route === 'home') {
-        view = 'home';
-    } else if (route === 'profile') {
-        view = 'profile';
-    } else if (route === 'device') {
-        view = 'device';
-    } else if (route === 'projects') {
-        view = 'projects';
-    } else if (route === 'teams') {
-        view = 'teams';
-    } else if (route.startsWith('project/')) {
-        const parts = route.split('/');
-        if (parts[2] === 'environment' && parts[3]) {
-            view = 'environment-deployment';
-            params.projectName = parts[1];
-            params.environmentName = parts[3];
-            if (parts[4] === 'group' && parts[5]) params.groupName = parts[5];
-        } else if (parts[2] === 'extensions') {
-            if (parts.length === 3) { view = 'project-detail'; params.projectName = parts[1]; params.tab = 'extensions'; }
-            else if (parts.length === 5 && parts[3]) {
-                if (parts[4] === '@new') { view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = null; }
-                else { view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = parts[4]; }
-            } else if (parts.length === 4 && parts[3]) {
-                view = 'extension-detail'; params.projectName = parts[1]; params.extensionType = parts[3]; params.extensionInstance = null;
-            }
-        } else {
-            view = 'project-detail';
-            params.projectName = parts[1];
-            params.tab = normalizeProjectTab(parts[2]);
-        }
-    } else if (route.startsWith('team/')) {
-        view = 'team-detail';
-        params.teamName = route.split('/')[1];
-    } else if (route.startsWith('deployment/')) {
-        const parts = route.split('/');
-        // `/deployment/:project/:id/logs` is the full-screen log console; the
-        // bare form is the deployment detail page.
-        view = parts[3] === 'logs' ? 'deployment-logs' : 'deployment-detail';
-        params.projectName = parts[1];
-        params.deploymentId = parts[2];
-    } else {
-        view = 'home';
+    const theme = resolveTheme(prefs.theme);
+    const commandItems: CommandItem[] = [];
+    if (currentProject) {
+        PROJECT_SECTIONS.filter(s => s.id !== 'overview').forEach(s => commandItems.push({
+            id: `section-${s.id}`,
+            kind: 'Go to',
+            icon: s.icon,
+            label: `${currentProject} · ${s.label.toLowerCase()}`,
+            keywords: [s.id],
+            run: () => navigate(projectPath(currentProject, s.id)),
+        }));
     }
-
-    // ----- Breadcrumbs -----
-    let breadcrumbs: { label: string; href?: string }[];
-    switch (view) {
-        case 'home':              breadcrumbs = [{ label: 'Home' }]; break;
-        case 'profile':           breadcrumbs = [{ label: 'Profile' }]; break;
-        case 'device':            breadcrumbs = [{ label: 'Device login' }]; break;
-        case 'projects':          breadcrumbs = [{ label: 'Projects' }]; break;
-        case 'teams':             breadcrumbs = [{ label: 'Teams' }]; break;
-        case 'project-detail':    breadcrumbs = [
-            { label: 'Projects', href: '/projects' },
-            { label: params.projectName, href: `/project/${params.projectName}` },
-            ...(params.tab && params.tab !== 'overview' ? [{ label: TAB_LABELS[params.tab] || params.tab }] : []),
-        ]; break;
-        case 'team-detail':       breadcrumbs = [
-            { label: 'Teams', href: '/teams' },
-            { label: params.teamName },
-        ]; break;
-        case 'environment-deployment': breadcrumbs = [
-            { label: 'Projects', href: '/projects' },
-            { label: params.projectName, href: `/project/${params.projectName}` },
-            { label: 'Environments', href: `/project/${params.projectName}/environments` },
-            { label: params.environmentName + (params.groupName ? ` / ${params.groupName}` : '') },
-        ]; break;
-        case 'deployment-logs': breadcrumbs = [
-            { label: 'Projects', href: '/projects' },
-            { label: params.projectName, href: `/project/${params.projectName}` },
-            { label: params.deploymentId, href: `/deployment/${params.projectName}/${params.deploymentId}` },
-            { label: 'Logs' },
-        ]; break;
-        case 'deployment-detail': breadcrumbs = [
-            { label: 'Projects', href: '/projects' },
-            { label: params.projectName, href: `/project/${params.projectName}` },
-            { label: params.deploymentId },
-        ]; break;
-        case 'extension-detail':  breadcrumbs = [
-            { label: 'Projects', href: '/projects' },
-            { label: params.projectName, href: `/project/${params.projectName}` },
-            { label: 'Extensions', href: `/project/${params.projectName}/extensions` },
-            { label: params.extensionInstance || params.extensionType || 'Extension' },
-        ]; break;
-        default:                  breadcrumbs = [{ label: 'Home' }]; break;
-    }
-
-    // ----- Command palette items -----
-    const commandItems = [
-        { id: 'go-home', group: 'Navigate', label: 'Home', keywords: ['home', 'overview'], run: () => navigate('/home') },
-        { id: 'go-projects', group: 'Navigate', label: 'Projects', keywords: ['projects'], run: () => navigate('/projects') },
-        { id: 'go-teams', group: 'Navigate', label: 'Teams', keywords: ['teams'], run: () => navigate('/teams') },
-        { id: 'go-profile', group: 'Navigate', label: 'Profile', keywords: ['profile', 'preferences', 'theme', 'density'], run: () => navigate('/profile') },
-        { id: 'create-project', group: 'Action', label: 'Create project', hint: 'new', keywords: ['project', 'create', 'new'], run: () => navigate('/projects?create=project') },
-        { id: 'create-team', group: 'Action', label: 'Create team', hint: 'new', keywords: ['team', 'create', 'new'], run: () => navigate('/teams?create=team') },
-        { id: 'open-docs', group: 'Open', label: 'Documentation', hint: 'docs', keywords: ['help', 'docs'], run: () => { window.location.href = '/docs/'; } },
-    ];
     paletteProjects.forEach(p => commandItems.push({
         id: `project-${p.id || p.name}`,
-        group: 'Projects',
+        kind: 'Project',
+        icon: 'cube',
         label: p.name,
-        hint: p.owner?.email || p.owner?.name || '',
-        keywords: ['project', p.name, p.owner?.email, p.owner?.name].filter(Boolean) as string[],
-        run: () => navigate(`/project/${p.name}`),
+        sub: p.owner?.name || p.owner?.email || '',
+        run: () => navigate(projectPath(p.name)),
     }));
+    commandItems.push(
+        { id: 'create-project', kind: 'Action', icon: 'plus', label: 'New project', keywords: ['create'], run: () => navigate('/projects?create=project') },
+        { id: 'create-team', kind: 'Action', icon: 'plus', label: 'New team', keywords: ['create'], run: () => navigate('/teams?create=team') },
+    );
     paletteTeams.forEach(t => commandItems.push({
         id: `team-${t.id || t.name}`,
-        group: 'Teams',
+        kind: 'Team',
+        icon: 'users',
         label: t.name,
-        hint: `${t.members?.length || 0} members`,
-        keywords: ['team', t.name],
+        sub: `${t.members?.length || 0} members`,
         run: () => navigate(`/team/${t.name}`),
     }));
+    commandItems.push(
+        { id: 'go-home', kind: 'Go to', icon: 'home', label: 'Go to Home', run: () => navigate('/home') },
+        { id: 'go-projects', kind: 'Go to', icon: 'cube', label: 'Go to Projects', run: () => navigate('/projects') },
+        { id: 'go-teams', kind: 'Go to', icon: 'users', label: 'Go to Teams', run: () => navigate('/teams') },
+        { id: 'go-profile', kind: 'Go to', icon: 'user', label: 'Profile & preferences', keywords: ['theme', 'density', 'palette'], run: () => navigate('/profile') },
+        { id: 'toggle-theme', kind: 'Action', icon: theme === 'dark' ? 'sun' : 'moon', label: theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode', keywords: ['theme', 'dark', 'light'], run: () => setPrefs({ theme: theme === 'dark' ? 'light' : 'dark' }) },
+        { id: 'open-docs', kind: 'Go to', icon: 'info', label: 'Documentation', keywords: ['help', 'docs'], run: () => { window.location.href = '/docs/'; } },
+    );
 
     const createIntent = new URLSearchParams(window.location.search).get('create');
 
+    const page = (
+        <ErrorBoundary key={pathname}>
+            {route.view === 'home' && <Home user={user} />}
+            {route.view === 'profile' && <Profile user={user} onLogout={logout} />}
+            {route.view === 'device' && <DeviceLogin />}
+            {route.view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
+            {route.view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
+            {route.view === 'team-detail' && <TeamDetail teamName={route.teamName} currentUser={user} />}
+            {route.view === 'project' && <ProjectDetail section={route.section} />}
+            {route.view === 'environment-deployment' && <EnvironmentDeploymentView projectName={route.projectName} environmentName={route.environmentName} groupName={route.groupName} />}
+            {route.view === 'deployment-detail' && <DeploymentDetail projectName={route.projectName} deploymentId={route.deploymentId} />}
+            {route.view === 'deployment-logs' && <DeploymentLogsPage projectName={route.projectName} deploymentId={route.deploymentId} />}
+            {route.view === 'extension-detail' && <ExtensionDetailPage projectName={route.projectName} extensionType={route.extensionType} extensionInstance={route.extensionInstance} />}
+        </ErrorBoundary>
+    );
+
+    const shell = (
+        <Shell
+            route={route}
+            pathname={pathname}
+            breadcrumbs={breadcrumbsFor(route)}
+            user={user}
+            onLogout={logout}
+            fullBleed={route.view === 'deployment-logs'}
+            onOpenPalette={openPalette}
+        >
+            {page}
+        </Shell>
+    );
+
     return (
         <>
-            <Shell route={pathname} breadcrumbs={breadcrumbs} user={user} onLogout={logout} fullBleed={view === 'deployment-logs'} onOpenPalette={() => setCommandPaletteOpen(true)}>
-                <ErrorBoundary key={pathname}>
-                    {view === 'home' && <Home user={user} />}
-                    {view === 'profile' && <Profile user={user} />}
-                    {view === 'device' && <DeviceLogin />}
-                    {view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
-                    {view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
-                    {view === 'project-detail' && <ProjectDetail projectName={params.projectName} initialTab={params.tab} />}
-                    {view === 'team-detail' && <TeamDetail teamName={params.teamName} currentUser={user} />}
-                    {view === 'environment-deployment' && <EnvironmentDeploymentView projectName={params.projectName} environmentName={params.environmentName} groupName={params.groupName} />}
-                    {view === 'deployment-detail' && <DeploymentDetail projectName={params.projectName} deploymentId={params.deploymentId} />}
-                    {view === 'deployment-logs' && <DeploymentLogsPage projectName={params.projectName} deploymentId={params.deploymentId} />}
-                    {view === 'extension-detail' && <ExtensionDetailPage projectName={params.projectName} extensionType={params.extensionType} extensionInstance={params.extensionInstance} />}
-                </ErrorBoundary>
-            </Shell>
-            <CommandPalette
-                isOpen={commandPaletteOpen}
-                onClose={() => setCommandPaletteOpen(false)}
-                items={commandItems}
-            />
+            {currentProject ? <ProjectProvider projectName={currentProject}>{shell}</ProjectProvider> : shell}
+            <CommandPalette isOpen={palette.open} scope={palette.scope} onClose={closePalette} items={commandItems} />
         </>
     );
 }

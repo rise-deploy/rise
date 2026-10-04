@@ -1,28 +1,41 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Icon } from './icon';
+import { cx } from './r-ui';
+import { useIsMobile } from '../lib/use-media';
+
+export type CommandKind = 'Action' | 'Project' | 'Team' | 'Go to';
 
 export type CommandItem = {
     id: string;
     label: string;
-    group?: string;
-    hint?: string;
+    kind: CommandKind;
+    icon: string;
+    /** Secondary text after the label, e.g. a project's owner. */
+    sub?: string;
     keywords?: string[];
     run: () => void;
 };
+
+const MAX_RESULTS = 12;
 
 export function CommandPalette({
     isOpen,
     onClose,
     items,
+    scope,
 }: {
     isOpen: boolean;
     onClose: () => void;
     items: CommandItem[];
+    /** Restrict the palette to one kind, e.g. the sidebar's project switcher. */
+    scope?: 'projects';
 }) {
     const [query, setQuery] = useState('');
     const [activeIndex, setActiveIndex] = useState(0);
     const inputRef = useRef<HTMLInputElement>(null);
+    const listRef = useRef<HTMLDivElement>(null);
+    const isMobile = useIsMobile();
 
     useEffect(() => {
         if (isOpen) {
@@ -32,100 +45,86 @@ export function CommandPalette({
         }
     }, [isOpen]);
 
-    const filteredItems = useMemo(() => {
+    const results = useMemo(() => {
+        const pool = scope === 'projects' ? items.filter(i => i.kind === 'Project') : items;
         const q = query.trim().toLowerCase();
-        if (!q) return items;
-        return items.filter((item) => {
-            const haystack = [item.label, item.group, item.hint, ...(item.keywords || [])].filter(Boolean).join(' ').toLowerCase();
-            return haystack.includes(q);
-        });
-    }, [items, query]);
+        const matched = q
+            ? pool.filter(item => [item.label, item.sub, item.kind, ...(item.keywords || [])].filter(Boolean).join(' ').toLowerCase().includes(q))
+            : pool;
+        return matched.slice(0, scope === 'projects' ? matched.length : MAX_RESULTS);
+    }, [items, query, scope]);
 
     useEffect(() => {
         if (!isOpen) return;
-
         const onKey = (e: KeyboardEvent) => {
             if (e.key === 'Escape') { onClose(); return; }
             if (e.key === 'ArrowDown') {
                 e.preventDefault();
-                setActiveIndex((prev) => Math.min(prev + 1, Math.max(0, filteredItems.length - 1)));
+                setActiveIndex(prev => Math.min(prev + 1, Math.max(0, results.length - 1)));
                 return;
             }
             if (e.key === 'ArrowUp') {
                 e.preventDefault();
-                setActiveIndex((prev) => Math.max(prev - 1, 0));
+                setActiveIndex(prev => Math.max(prev - 1, 0));
                 return;
             }
-            if (e.key === 'Enter' && filteredItems[activeIndex]) {
+            if (e.key === 'Enter' && results[activeIndex]) {
                 e.preventDefault();
-                filteredItems[activeIndex].run();
                 onClose();
+                results[activeIndex].run();
             }
         };
-
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [isOpen, activeIndex, filteredItems, onClose]);
+    }, [isOpen, activeIndex, results, onClose]);
+
+    useEffect(() => {
+        listRef.current?.querySelector<HTMLElement>('.r-cmdp-item.sel')?.scrollIntoView({ block: 'nearest' });
+    }, [activeIndex]);
 
     if (!isOpen) return null;
 
-    // Group items into ordered groups.
-    const groups: { name: string; items: { item: CommandItem; globalIndex: number }[] }[] = [];
-    const seen = new Map<string, { item: CommandItem; globalIndex: number }[]>();
-    filteredItems.forEach((item, idx) => {
-        const groupName = item.group || 'Other';
-        let bucket = seen.get(groupName);
-        if (!bucket) {
-            bucket = [];
-            seen.set(groupName, bucket);
-            groups.push({ name: groupName, items: bucket });
-        }
-        bucket.push({ item, globalIndex: idx });
-    });
-
     const node = (
-        <div className="r-cmdp-mask" onClick={onClose}>
-            <div className="r-cmdp" onClick={(e) => e.stopPropagation()}>
+        <div className={cx('r-cmdp-mask', isMobile && 'is-mobile')} onClick={onClose}>
+            <div className="r-cmdp" role="dialog" aria-modal="true" aria-label="Command palette" onClick={e => e.stopPropagation()}>
                 <div className="r-cmdp-input">
-                    <Icon name="search" size={16} />
+                    <Icon name="search" size={17} />
                     <input
                         ref={inputRef}
-                        aria-label="Command palette"
+                        aria-label="Search or run a command"
                         value={query}
-                        onChange={(e) => { setQuery(e.target.value); setActiveIndex(0); }}
-                        placeholder="Search projects, teams, actions…"
+                        onChange={e => { setQuery(e.target.value); setActiveIndex(0); }}
+                        placeholder={scope === 'projects' ? 'Switch to project…' : 'Search or run a command…'}
                     />
-                    <span style={{ fontSize: 11, color: 'var(--text-soft)' }}>
-                        {filteredItems.length} result{filteredItems.length === 1 ? '' : 's'}
-                    </span>
+                    {isMobile
+                        ? <button type="button" className="r-cmdp-cancel" onClick={onClose}>Cancel</button>
+                        : <kbd>Esc</kbd>}
                 </div>
-                <div className="r-cmdp-list">
-                    {filteredItems.length === 0 ? (
-                        <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>No matches.</div>
-                    ) : (
-                        groups.map(g => (
-                            <div key={g.name}>
-                                <div className="r-cmdp-group">{g.name}</div>
-                                {g.items.map(({ item, globalIndex }) => (
-                                    <div
-                                        key={item.id}
-                                        className={`r-cmdp-item ${globalIndex === activeIndex ? 'sel' : ''}`}
-                                        onMouseEnter={() => setActiveIndex(globalIndex)}
-                                        onClick={() => { item.run(); onClose(); }}
-                                    >
-                                        <div className="grow">{item.label}</div>
-                                        {item.hint && <div style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>{item.hint}</div>}
-                                    </div>
-                                ))}
-                            </div>
-                        ))
-                    )}
+                <div className="r-cmdp-list" ref={listRef}>
+                    {results.length === 0 ? (
+                        <div className="r-cmdp-empty">No matches.</div>
+                    ) : results.map((item, idx) => (
+                        <button
+                            type="button"
+                            key={item.id}
+                            className={cx('r-cmdp-item', idx === activeIndex && 'sel')}
+                            onMouseEnter={() => setActiveIndex(idx)}
+                            onClick={() => { onClose(); item.run(); }}
+                        >
+                            <Icon name={item.icon} size={15} />
+                            <span className="label">{item.label}</span>
+                            {item.sub && <span className="sub">{item.sub}</span>}
+                            <span className="kind">{item.kind}</span>
+                        </button>
+                    ))}
                 </div>
-                <div className="r-cmdp-foot">
-                    <span><kbd>↑↓</kbd> navigate</span>
-                    <span><kbd>↵</kbd> select</span>
-                    <span><kbd>Esc</kbd> close</span>
-                </div>
+                {!isMobile && (
+                    <div className="r-cmdp-foot">
+                        <span><kbd>↑↓</kbd> navigate</span>
+                        <span><kbd>↵</kbd> select</span>
+                        <span><kbd>Esc</kbd> close</span>
+                    </div>
+                )}
             </div>
         </div>
     );

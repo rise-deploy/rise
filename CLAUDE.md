@@ -351,6 +351,9 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 | **`EnvPill`** (from `r-ui`) | Color dot + env name | Environment chip; pairs with `EnvironmentColorDot` |
 | **`GroupPill`** (from `r-ui`) | Layer glyph + group name | Group chip |
 | **`EnvironmentColorDot`** (from `r-ui`) | Tinted layer glyph | Placed next to environment names to indicate color |
+| **`OwnerLabel`** (from `r-ui`) | People/person icon + name | Every project owner — teams always carry the people icon |
+
+Statuses are coloured by `statusTone` (healthy / failing / in progress / inactive); use it for bare status dots so they agree with `Status` badges.
 
 ### Before Commit & Push
 
