@@ -18,9 +18,12 @@ import { ExtensionDetailPage } from './features/resources';
 import { TeamDetail, TeamsList } from './features/teams';
 import { resolveTheme, usePrefs } from './lib/prefs';
 import { ErrorBoundary } from './components/error-boundary';
-import { ProjectProvider, type Project } from './lib/project-context';
+import { ProjectProvider, useCurrentProject, type Project } from './lib/project-context';
+import { DeployActionsProvider, useDeployActions } from './components/deploy-actions';
+import { envState, productionEnv } from './lib/env-state';
+import { ProjectLogsPage } from './features/logs/project-logs';
 import { rememberProject } from './lib/recent';
-import { PROJECT_SECTIONS, parseRoute, projectPath, routeProject, type Route } from './lib/routes';
+import { PROJECT_SECTIONS, logsPath, parseRoute, projectPath, routeProject, type Route } from './lib/routes';
 
 export interface CurrentUser {
     id: string;
@@ -74,6 +77,33 @@ function LoginPage() {
             </div>
         </div>
     );
+}
+
+/**
+ * The command palette with the current project's deploy actions on top: what
+ * production serves can be redeployed or rolled back without leaving the
+ * keyboard.
+ */
+function ProjectPalette(props: React.ComponentProps<typeof CommandPalette>) {
+    const current = useCurrentProject();
+    const { request } = useDeployActions();
+    const items: CommandItem[] = [];
+    const prod = current ? productionEnv(current.environments) : null;
+    if (current && prod) {
+        const state = envState(prod, current.deployments);
+        const p = current.projectName;
+        if (state.live) {
+            const live = state.live;
+            items.push({ id: 'act-redeploy', kind: 'Action', icon: 'refresh', label: `Redeploy ${p} · ${prod.name}`, run: () => request({ kind: 'redeploy', source: live }) });
+        }
+        if (state.previous) {
+            const previous = state.previous;
+            items.push({ id: 'act-rollback', kind: 'Action', icon: 'rollback', label: `Roll back ${p} · ${prod.name}`, sub: `to ${previous.deployment_id}`, run: () => request({ kind: 'rollback', source: previous }) });
+        }
+        const logTarget = state.live ?? state.latest;
+        items.push({ id: 'act-logs', kind: 'Go to', icon: 'terminal', label: `${p} · ${prod.name} logs`, run: () => navigate(logsPath(p, logTarget?.deployment_id)) });
+    }
+    return <CommandPalette {...props} items={[...items, ...props.items]} />;
 }
 
 function sectionLabel(id: string): string {
@@ -226,7 +256,7 @@ export function App() {
     const theme = resolveTheme(prefs.theme);
     const commandItems: CommandItem[] = [];
     if (currentProject) {
-        PROJECT_SECTIONS.filter(s => s.id !== 'overview').forEach(s => commandItems.push({
+        PROJECT_SECTIONS.filter(s => s.id !== 'overview' && s.id !== 'logs').forEach(s => commandItems.push({
             id: `section-${s.id}`,
             kind: 'Go to',
             icon: s.icon,
@@ -274,7 +304,8 @@ export function App() {
             {route.view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
             {route.view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
             {route.view === 'team-detail' && <TeamDetail teamName={route.teamName} currentUser={user} />}
-            {route.view === 'project' && <ProjectDetail section={route.section} />}
+            {route.view === 'project' && route.section === 'logs' && <ProjectLogsPage />}
+            {route.view === 'project' && route.section !== 'logs' && <ProjectDetail section={route.section} />}
             {route.view === 'environment-deployment' && <EnvironmentDeploymentView projectName={route.projectName} environmentName={route.environmentName} groupName={route.groupName} />}
             {route.view === 'deployment-detail' && <DeploymentDetail projectName={route.projectName} deploymentId={route.deploymentId} />}
             {route.view === 'deployment-logs' && <DeploymentLogsPage projectName={route.projectName} deploymentId={route.deploymentId} />}
@@ -289,17 +320,28 @@ export function App() {
             breadcrumbs={breadcrumbsFor(route)}
             user={user}
             onLogout={logout}
-            fullBleed={route.view === 'deployment-logs'}
+            fullBleed={route.view === 'deployment-logs' || (route.view === 'project' && route.section === 'logs')}
             onOpenPalette={openPalette}
         >
             {page}
         </Shell>
     );
 
+    const paletteProps = { isOpen: palette.open, scope: palette.scope, onClose: closePalette, items: commandItems };
+    if (!currentProject) {
+        return (
+            <>
+                {shell}
+                <CommandPalette {...paletteProps} />
+            </>
+        );
+    }
     return (
-        <>
-            {currentProject ? <ProjectProvider projectName={currentProject}>{shell}</ProjectProvider> : shell}
-            <CommandPalette isOpen={palette.open} scope={palette.scope} onClose={closePalette} items={commandItems} />
-        </>
+        <ProjectProvider projectName={currentProject}>
+            <DeployActionsProvider>
+                {shell}
+                <ProjectPalette {...paletteProps} />
+            </DeployActionsProvider>
+        </ProjectProvider>
     );
 }

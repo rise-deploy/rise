@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { Fragment, lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { navigate, useQueryParam } from '../lib/navigation';
@@ -6,7 +6,7 @@ import { copyToClipboard, formatDate, formatISO8601, formatRelativeTimeRounded, 
 import { usePolling } from '../lib/polling';
 import { useToast } from '../components/toast';
 import { MonoSortButton, MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
-import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs } from '../components/r-ui';
+import { Button as RButton, Combobox, ConfirmDialog, ENV_COLOR_STYLES, Empty, EnvPill, EnvTag, EnvironmentColorDot, GroupPill, KV, KVRow, Modal, Panel, PanelBody, PanelHead, Pill, SearchInput, Segmented, SourceLinkGroup, SourceLinkGroupAction, Status, Tabs } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { EnvVarsList } from './resources';
 import { EmptyState, ErrorState, LoadingState } from '../components/states';
@@ -14,27 +14,11 @@ import { LogConsole } from './logs/log-console';
 import { ContainerStatusPanel } from './logs/container-status';
 import { EventTimeline } from './logs/event-timeline';
 import { fetchDeploymentEvents, type DeploymentEvent } from './logs/api';
-
-const STATUS_TONES = {
-    Healthy: 'ok',
-    Running: 'ok',
-    Deploying: 'warn',
-    Pending: 'warn',
-    Building: 'warn',
-    Pushing: 'warn',
-    Pushed: 'warn',
-    Unhealthy: 'bad',
-    Failed: 'bad',
-    Stopped: 'muted',
-    Cancelled: 'muted',
-    Superseded: 'muted',
-    Expired: 'muted',
-    Terminating: 'muted',
-};
-
-function getStatusTone(status) {
-    return STATUS_TONES[status] || 'muted';
-}
+import { useCurrentProject, type Deployment } from '../lib/project-context';
+import { useDeployActions } from '../components/deploy-actions';
+import { byNewest, deploymentSource, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
+import { DeploymentMetaStrip, FailurePanel, RolloutPanel, rolloutEnd, rolloutSteps, useDeploymentEvents } from './deployment-diagnosis';
+import { useIsMobile } from '../lib/use-media';
 
 // ── CPU / memory parsing helpers for the multi-container resource breakdown ──
 // CPU is stored as the same string K8s accepts (`"500m"`, `"1"`, `"1.5"`).
@@ -150,261 +134,19 @@ function aggregateContainerResources(
 }
 
 
-export function ActiveDeploymentsSummary({ projectName }) {
-    const [activeDeployments, setActiveDeployments] = useState({});
+export function DeploymentsList({ projectName }: { projectName: string }) {
+    const [deployments, setDeployments] = useState<Deployment[]>([]);
     const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
-    const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
-    const [deploymentToStop, setDeploymentToStop] = useState(null);
-    const [stopping, setStopping] = useState(false);
-    const [environments, setEnvironments] = useState([]);
-    const { showToast } = useToast();
-
-    const isTerminal = (status) => {
-        return ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(status);
-    };
-
-    const loadSummary = useCallback(async () => {
-        try {
-            const deployments = await api.getProjectDeployments(projectName, { limit: 100 });
-
-            // Group deployments by deployment group
-            const grouped = deployments.reduce((acc, d) => {
-                const group = d.deployment_group || 'default';
-                if (!acc[group]) {
-                    acc[group] = {
-                        active: null,
-                        progressing: []
-                    };
-                }
-
-                // Track the active deployment (is_active === true)
-                if (d.is_active) {
-                    acc[group].active = d;
-                }
-
-                // Track progressing (non-terminal) deployments
-                if (!isTerminal(d.status)) {
-                    acc[group].progressing.push(d);
-                }
-
-                return acc;
-            }, {});
-
-            // Filter to only include groups that have an active deployment or progressing deployments
-            const filtered = {};
-            Object.keys(grouped).forEach(group => {
-                const groupData = grouped[group];
-                // Always include default group if it has an active deployment
-                // Include other groups if they have active OR progressing deployments
-                if (groupData.active || (group !== 'default' && groupData.progressing.length > 0)) {
-                    filtered[group] = groupData;
-                }
-            });
-
-            setActiveDeployments(filtered);
-            setLoading(false);
-        } catch (err) {
-            setError(err.message);
-            setLoading(false);
-        }
-    }, [projectName]);
-
-    // Auto-refresh every 5 seconds, paused when the tab is hidden.
-    usePolling(loadSummary, 5000);
-
-    useEffect(() => {
-        api.getProjectEnvironments(projectName)
-            .then(data => setEnvironments(data || []))
-            .catch(() => {});
-    }, [projectName]);
-
-    if (loading) return <LoadingState label="Loading active deployments..." />;
-    if (error) return <ErrorState message={`Error loading active deployments: ${error}`} onRetry={loadSummary} />;
-
-    const handleStopClick = (deployment) => {
-        setDeploymentToStop(deployment);
-        setConfirmDialogOpen(true);
-    };
-
-    const handleStopConfirm = async () => {
-        if (!deploymentToStop) return;
-
-        setStopping(true);
-        try {
-            await api.stopDeployment(projectName, deploymentToStop.deployment_id);
-            showToast(`Deployment ${deploymentToStop.deployment_id} stopped successfully`, 'success');
-            setConfirmDialogOpen(false);
-            setDeploymentToStop(null);
-            loadSummary(); // Refresh the list
-        } catch (err) {
-            showToast(`Failed to stop deployment: ${err.message}`, 'error');
-        } finally {
-            setStopping(false);
-        }
-    };
-
-    const groups = Object.keys(activeDeployments);
-    if (groups.length === 0) return <EmptyState message="No active deployments." />;
-
-    // Build environment lookup by name
-    const envMap = {};
-    for (const env of environments) {
-        envMap[env.name] = env;
-    }
-
-    // Sort groups: production primary first, then production other, then other env primary, then rest
-    const sortedGroups = groups.sort((a, b) => {
-        const dA = activeDeployments[a].active;
-        const dB = activeDeployments[b].active;
-        const envA = dA?.environment ? envMap[dA.environment] : null;
-        const envB = dB?.environment ? envMap[dB.environment] : null;
-        const prodA = envA?.is_production || false;
-        const prodB = envB?.is_production || false;
-        const primaryA = envA?.primary_deployment_group === a;
-        const primaryB = envB?.primary_deployment_group === b;
-
-        // Production before non-production
-        if (prodA !== prodB) return prodA ? -1 : 1;
-        // Primary before non-primary
-        if (primaryA !== primaryB) return primaryA ? -1 : 1;
-        // Both same tier: alphabetical by group name
-        return a.localeCompare(b);
-    });
-
-    return (
-        <>
-            <div className="mono-active-deployments-grid grid gap-4 md:grid-cols-2">
-                {sortedGroups.map(group => {
-                    const groupData = activeDeployments[group];
-                    const deployment = groupData.active;
-
-                    // Skip if no active deployment (shouldn't happen due to filtering, but be safe)
-                    if (!deployment) {
-                        return null;
-                    }
-
-                    const canStop = !isTerminal(deployment.status);
-                    // Count other progressing deployments (exclude the active one)
-                    const otherProgressing = groupData.progressing.filter(d => d.deployment_id !== deployment.deployment_id).length;
-
-                    const envColor = deployment.environment_color
-                        ? (ENV_COLOR_STYLES[deployment.environment_color] || ENV_COLOR_STYLES.gray).color
-                        : null;
-
-                    return (
-                        <div
-                            key={group}
-                            className={`mono-active-deployment-card mono-status-card mono-status-card-${getStatusTone(deployment.status)} border border-gray-200 dark:border-gray-800 p-6`}
-                            style={envColor ? { borderTop: `3px solid ${envColor}` } : undefined}
-                            onClick={() => navigate(`/deployment/${projectName}/${deployment.deployment_id}`)}
-                            onKeyDown={(e) => {
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                    e.preventDefault();
-                                    navigate(`/deployment/${projectName}/${deployment.deployment_id}`);
-                                }
-                            }}
-                            role="link"
-                            tabIndex={0}
-                            aria-label={`View deployment ${deployment.deployment_id}`}
-                        >
-                            <div className="flex justify-between items-center mb-4">
-                                <h5 className="text-lg font-semibold">{group}</h5>
-                                <div className="flex items-center gap-3">
-                                    <Status status={deployment.status} />
-                                    <SourceLinkGroup jobUrl={deployment.job_url} prUrl={deployment.pull_request_url} onClick={(e) => e.stopPropagation()}>
-                                        {canStop && (
-                                            <SourceLinkGroupAction
-                                                variant="danger"
-                                                onClick={(e) => { e.stopPropagation(); handleStopClick(deployment); }}
-                                            >
-                                                Stop
-                                            </SourceLinkGroupAction>
-                                        )}
-                                    </SourceLinkGroup>
-                                </div>
-                            </div>
-                        <dl className="grid grid-cols-2 gap-4 text-sm">
-                            <div>
-                                <dt className="text-gray-600 dark:text-gray-400">Deployment ID</dt>
-                                <dd className="font-mono text-gray-900 dark:text-gray-200">{deployment.deployment_id}</dd>
-                            </div>
-                            <div>
-                                <dt className="text-gray-600 dark:text-gray-400">Image</dt>
-                                <dd className="font-mono text-gray-900 dark:text-gray-200 text-xs">{deployment.image ? deployment.image.split('/').pop() : '-'}</dd>
-                            </div>
-                            <div>
-                                <dt className="text-gray-600 dark:text-gray-400">URL</dt>
-                                <dd>{deployment.primary_url
-                                    ? (isSafeUrl(deployment.primary_url)
-                                        ? <a href={deployment.primary_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300">{deployment.primary_url}</a>
-                                        : <span className="text-gray-900 dark:text-gray-200">{deployment.primary_url}</span>)
-                                    : '-'}</dd>
-                            </div>
-                            <div>
-                                <dt className="text-gray-600 dark:text-gray-400">Created</dt>
-                                <dd className="text-gray-900 dark:text-gray-200" title={formatISO8601(deployment.created)}>
-                                    {formatRelativeTimeRounded(deployment.created)}
-                                </dd>
-                            </div>
-                            {deployment.environment && (
-                                <div>
-                                    <dt className="text-gray-600 dark:text-gray-400">Environment</dt>
-                                    <dd><EnvPill projectName={projectName} env={deployment.environment} color={deployment.environment_color} /></dd>
-                                </div>
-                            )}
-                            {deployment.expires_at && (
-                                <div>
-                                    <dt className="text-gray-600 dark:text-gray-400">Expires</dt>
-                                    <dd className="text-gray-900 dark:text-gray-200">
-                                        {formatTimeRemaining(deployment.expires_at)}
-                                        <span className="text-gray-600 dark:text-gray-500 text-xs ml-2">({formatDate(deployment.expires_at)})</span>
-                                    </dd>
-                                </div>
-                            )}
-                        </dl>
-                        <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-800 flex items-center justify-end">
-                            {otherProgressing > 0 && (
-                                <span className="text-sm text-gray-600 dark:text-gray-500">
-                                    +{otherProgressing} other{otherProgressing === 1 ? '' : 's'} progressing
-                                </span>
-                            )}
-                        </div>
-                    </div>
-                );
-            })}
-            </div>
-
-            <ConfirmDialog
-                isOpen={confirmDialogOpen}
-                onClose={() => {
-                    setConfirmDialogOpen(false);
-                    setDeploymentToStop(null);
-                }}
-                onConfirm={handleStopConfirm}
-                title="Stop Deployment"
-                message={`Are you sure you want to stop deployment ${deploymentToStop?.deployment_id}? Impact: traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop Deployment"
-                confirmTone="danger"
-                loading={stopping}
-            />
-        </>
-    );
-}
-
-// Deployments List Component (with pagination)
-export function DeploymentsList({ projectName }) {
-    const [deployments, setDeployments] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
+    const [error, setError] = useState<string | null>(null);
     const [pageParam, setPageParam] = useQueryParam('page');
     const page = Math.max(0, Number.parseInt(pageParam || '0', 10) || 0);
     const setPage = (value: number) => setPageParam(value > 0 ? String(value) : null);
     const [hasMore, setHasMore] = useState(true);
     const [groupParam, setGroupFilter] = useQueryParam('group');
     const groupFilter = groupParam || '';
-    const [deploymentGroups, setDeploymentGroups] = useState([]);
-    const [environments, setEnvironments] = useState([]);
+    const [deploymentGroups, setDeploymentGroups] = useState<string[]>([]);
+    const project = useCurrentProject();
+    const environments = useMemo(() => sortEnvironments(project?.environments ?? []), [project?.environments]);
     const [envParam, setEnvFilter] = useQueryParam('env');
     const envFilter = envParam || '';
     const [statusParam, setStatusParam] = useQueryParam('status');
@@ -412,42 +154,17 @@ export function DeploymentsList({ projectName }) {
     const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
     const [searchParam, setSearch] = useQueryParam('search');
     const search = searchParam || '';
-    const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
-    const [deploymentToStop, setDeploymentToStop] = useState(null);
+    const [deploymentToStop, setDeploymentToStop] = useState<Deployment | null>(null);
     const [stopping, setStopping] = useState(false);
-    const [rollbackDialogOpen, setRollbackDialogOpen] = useState(false);
-    const [deploymentToRollback, setDeploymentToRollback] = useState(null);
-    const [rollingBack, setRollingBack] = useState(false);
-    const [actionStatus, setActionStatus] = useState('');
+    const { request } = useDeployActions();
     const { showToast } = useToast();
-    const pageSize = 10;
-    // Sort deployments by created desc — the new r-table doesn't expose
-    // sort headers, so we keep the default ordering only.
-    const sortedDeployments = useMemo(() => {
-        return [...deployments].sort((a, b) => {
-            const av = a?.created;
-            const bv = b?.created;
-            if (av == null && bv == null) return 0;
-            if (av == null) return 1;
-            if (bv == null) return -1;
-            return String(bv).localeCompare(String(av), undefined, { numeric: true, sensitivity: 'base' });
-        });
-    }, [deployments]);
+    const isMobile = useIsMobile();
+    const pageSize = 20;
 
-    // Load deployment groups and environments
     useEffect(() => {
-        async function loadGroups() {
-            try {
-                const groups = await api.getDeploymentGroups(projectName);
-                setDeploymentGroups(groups);
-            } catch (err) {
-                console.error('Failed to load deployment groups:', err);
-            }
-        }
-        loadGroups();
-        api.getProjectEnvironments(projectName)
-            .then(data => setEnvironments(data || []))
-            .catch(() => {});
+        api.getDeploymentGroups(projectName)
+            .then((groups: string[]) => setDeploymentGroups(groups || []))
+            .catch((err: unknown) => console.error('Failed to load deployment groups:', err));
     }, [projectName]);
 
     const loadDeployments = useCallback(async () => {
@@ -457,94 +174,56 @@ export function DeploymentsList({ projectName }) {
                 offset: page * pageSize,
             };
             if (groupFilter) params.group = groupFilter;
-
-            const data = await api.getProjectDeployments(projectName, params);
+            const data: Deployment[] = await api.getProjectDeployments(projectName, params);
             setDeployments(data);
             setHasMore(data.length >= pageSize);
-            setLoading(false);
+            setError(null);
         } catch (err) {
-            setError(err.message);
+            setError((err as Error).message);
+        } finally {
             setLoading(false);
         }
     }, [projectName, page, groupFilter]);
 
     useEffect(() => { loadDeployments(); }, [loadDeployments]);
+    useEffect(() => {
+        window.addEventListener('rise:mutation', loadDeployments);
+        return () => window.removeEventListener('rise:mutation', loadDeployments);
+    }, [loadDeployments]);
 
     // Auto-refresh every 5 seconds, paused when the tab is hidden.
     usePolling(loadDeployments, 5000);
 
-    const isTerminal = (status) => {
-        return ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(status);
-    };
+    const sorted = useMemo(() => [...deployments].sort(byNewest), [deployments]);
 
-    const isRollbackable = (deployment) => {
-        return Boolean(deployment?.can_rollback);
-    };
-
-    const handleStopClick = (deployment) => {
-        setDeploymentToStop(deployment);
-        setConfirmDialogOpen(true);
-    };
+    // Per environment+group: is something live there? A superseded deployment
+    // can only be rolled back to when its group still has a live deployment.
+    const liveIn = useMemo(() => {
+        const set = new Set<string>();
+        for (const d of project?.deployments ?? []) if (d.is_active) set.add(`${d.environment}/${d.deployment_group}`);
+        for (const d of deployments) if (d.is_active) set.add(`${d.environment}/${d.deployment_group}`);
+        return set;
+    }, [project?.deployments, deployments]);
 
     const handleStopConfirm = async () => {
         if (!deploymentToStop) return;
-
         setStopping(true);
-        setActionStatus(`Stopping deployment ${deploymentToStop.deployment_id}...`);
         try {
             await api.stopDeployment(projectName, deploymentToStop.deployment_id);
-            showToast(`Deployment ${deploymentToStop.deployment_id} stopped successfully`, 'success');
-            setActionStatus(`Stopped deployment ${deploymentToStop.deployment_id}.`);
-            setConfirmDialogOpen(false);
+            showToast(`Stopping ${deploymentToStop.deployment_id}`, 'success');
             setDeploymentToStop(null);
-            loadDeployments();
+            window.dispatchEvent(new Event('rise:mutation'));
         } catch (err) {
-            showToast(`Failed to stop deployment: ${err.message}`, 'error');
-            setActionStatus(`Failed to stop deployment ${deploymentToStop.deployment_id}.`);
+            showToast(`Failed to stop deployment: ${(err as Error).message}`, 'error');
         } finally {
             setStopping(false);
         }
     };
 
-    const handleRollbackClick = (deployment) => {
-        setDeploymentToRollback(deployment);
-        setRollbackDialogOpen(true);
-    };
-
-    const [useSourceEnvVars, setUseSourceEnvVars] = useState(false);
-
-    const handleRollbackConfirm = async () => {
-        if (!deploymentToRollback) return;
-
-        setRollingBack(true);
-        setActionStatus(`${deploymentToRollback.is_active ? 'Redeploying' : 'Rolling back'} deployment ${deploymentToRollback.deployment_id}...`);
-        try {
-            const response = await api.createDeploymentFrom(projectName, deploymentToRollback.deployment_id, useSourceEnvVars);
-            showToast(`${deploymentToRollback.is_active ? 'Redeploy' : 'Rollback'} successful! New deployment: ${response.deployment_id}`, 'success');
-            setActionStatus(`${deploymentToRollback.is_active ? 'Redeployed' : 'Rolled back'} to new deployment ${response.deployment_id}.`);
-            setRollbackDialogOpen(false);
-            setDeploymentToRollback(null);
-            setUseSourceEnvVars(false); // Reset checkbox
-            loadDeployments();
-        } catch (err) {
-            showToast(`Failed to ${deploymentToRollback.is_active ? 'redeploy' : 'rollback'} deployment: ${err.message}`, 'error');
-            setActionStatus(`Failed to ${deploymentToRollback.is_active ? 'redeploy' : 'rollback'} deployment ${deploymentToRollback.deployment_id}.`);
-        } finally {
-            setRollingBack(false);
-        }
-    };
-
     if (loading && deployments.length === 0) return <LoadingState label="Loading deployments..." />;
-    if (error) return <ErrorState message={`Error loading deployments: ${error}`} onRetry={loadDeployments} />;
+    if (error && deployments.length === 0) return <ErrorState message={`Error loading deployments: ${error}`} onRetry={loadDeployments} />;
 
-    // Client-side environment filter
-    const envFilteredDeployments = envFilter
-        ? sortedDeployments.filter(d => d.environment === envFilter)
-        : sortedDeployments;
-
-    // Status filter — "Active" = not in a terminal state; the rest match a
-    // specific status; "All" shows everything.
-    const matchesStatus = (d) => {
+    const matchesStatus = (d: Deployment) => {
         switch (statusFilter) {
             case 'active': return !isTerminal(d.status);
             case 'healthy': return d.status === 'Healthy';
@@ -553,256 +232,164 @@ export function DeploymentsList({ projectName }) {
             default: return true;
         }
     };
-    const statusFilteredDeployments = envFilteredDeployments.filter(matchesStatus);
-
-    // Client-side text search over the loaded page (deployment id / image / author)
     const q = search.trim().toLowerCase();
-    const filteredDeployments = q
-        ? statusFilteredDeployments.filter(d => {
-            const haystack = `${d.deployment_id || ''} ${d.image || ''} ${d.created_by_email || ''}`.toLowerCase();
-            return haystack.includes(q);
-        })
-        : statusFilteredDeployments;
+    const filtered = sorted
+        .filter(d => !envFilter || d.environment === envFilter)
+        .filter(matchesStatus)
+        .filter(d => !q || `${d.deployment_id} ${d.image || ''} ${d.created_by_email || ''} ${d.deployment_group}`.toLowerCase().includes(q));
 
-    const envOptions = [
-        { value: '', label: 'All envs' },
-        ...environments.map(env => ({ value: env.name, label: env.name })),
-    ];
+    const actionFor = (d: Deployment): React.ReactNode => {
+        if (!d.can_rollback) return null;
+        if (d.is_active) {
+            return (
+                <button type="button" className="r-row-action" onClick={(e) => { e.stopPropagation(); request({ kind: 'redeploy', source: d }); }}>
+                    Redeploy
+                </button>
+            );
+        }
+        if (d.status === 'Superseded' && liveIn.has(`${d.environment}/${d.deployment_group}`)) {
+            return (
+                <button type="button" className="r-row-action" onClick={(e) => { e.stopPropagation(); request({ kind: 'rollback', source: d }); }}>
+                    Roll back here
+                </button>
+            );
+        }
+        return null;
+    };
+
+    const stopFor = (d: Deployment): React.ReactNode => isTerminal(d.status) ? null : (
+        <button type="button" className="r-icon-btn r-row-stop" title="Stop deployment" aria-label={`Stop ${d.deployment_id}`}
+            onClick={(e) => { e.stopPropagation(); setDeploymentToStop(d); }}>
+            <Icon name="stop" size={12} />
+        </button>
+    );
+
+    const groupFor = (d: Deployment): React.ReactNode => {
+        const env = environments.find(e => e.name === d.environment);
+        const primary = !!env && (env.primary_deployment_group || 'default') === d.deployment_group;
+        return primary ? null : <GroupPill projectName={projectName} group={d.deployment_group} />;
+    };
+
+    const open = (d: Deployment) => navigate(`/deployment/${projectName}/${d.deployment_id}`);
 
     return (
         <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
-                <SearchInput
-                    value={search}
-                    onChange={setSearch}
-                    placeholder="Filter deployments…"
-                    style={{ flex: 1, maxWidth: 280 }}
-                />
+            <div className="r-toolbar">
+                <SearchInput value={search} onChange={setSearch} placeholder="Filter by id, image or author" style={{ flex: '1 1 220px', maxWidth: 320 }} />
                 <Segmented<string>
                     value={statusFilter}
                     options={[
+                        { value: 'all', label: 'All' },
                         { value: 'active', label: 'Active' },
                         { value: 'healthy', label: 'Healthy' },
                         { value: 'unhealthy', label: 'Unhealthy' },
                         { value: 'failed', label: 'Failed' },
-                        { value: 'all', label: 'All' },
                     ]}
                     onChange={setStatusFilter}
                 />
-                {environments.length > 0 && (
+                {environments.length > 1 && (
                     <Segmented<string>
                         value={envFilter}
-                        options={envOptions}
-                        onChange={(v) => { setEnvFilter(v); setPage(0); }}
-                        capitalize
+                        options={[{ value: '', label: 'All envs' }, ...environments.map(env => ({ value: env.name, label: env.name }))]}
+                        onChange={(v) => { setEnvFilter(v || null); setPage(0); }}
                     />
                 )}
-                {deploymentGroups.length > 0 && (
-                    <div style={{ width: 200 }}>
+                {deploymentGroups.length > 1 && (
+                    <div style={{ width: 180 }}>
                         <Combobox
                             value={groupFilter}
-                            onChange={(v) => { setGroupFilter(v); setPage(0); }}
-                            options={[
-                                { value: '', label: 'All groups' },
-                                ...deploymentGroups.map(group => ({ value: group, label: group })),
-                            ]}
+                            onChange={(v) => { setGroupFilter(v || null); setPage(0); }}
+                            options={[{ value: '', label: 'All groups' }, ...deploymentGroups.map(group => ({ value: group, label: group }))]}
                             placeholder="All groups"
                         />
                     </div>
                 )}
-                <div style={{ marginLeft: 'auto', fontSize: 12.5, color: 'var(--text-soft)' }}>
-                    {filteredDeployments.length} of {deployments.length}
-                </div>
             </div>
-            {actionStatus && (
-                <div className="r-alert info" style={{ marginBottom: 14, fontSize: 12.5 }}>
-                    <Icon name="info" size={14} />
-                    <div style={{ flex: 1 }}>{actionStatus}</div>
-                </div>
-            )}
 
-            <Panel>
-                {filteredDeployments.length === 0 ? (
-                    <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
-                        No deployments found.
-                    </div>
-                ) : (
-                    <table className="r-table">
+            {filtered.length === 0 ? (
+                <Panel><div className="r-list-empty">No deployments match these filters.</div></Panel>
+            ) : isMobile ? (
+                <div className="r-cards">
+                    {filtered.map(d => (
+                        <div key={d.deployment_id} className="r-card" role="link" tabIndex={0} onClick={() => open(d)}
+                            onKeyDown={e => { if (e.key === 'Enter') open(d); }}>
+                            <div className="r-card-row">
+                                <Status status={d.status} />
+                                {d.environment && <EnvTag env={d.environment} />}
+                                {groupFor(d)}
+                                <span className="age">{formatRelativeTimeRounded(d.created)}</span>
+                            </div>
+                            <div className="r-card-title">{deploymentSource(d)}</div>
+                            <div className="r-card-meta"><span className="mono">{d.deployment_id}</span> · {d.created_by_email}</div>
+                            {(actionFor(d) || stopFor(d)) && <div className="r-card-actions">{actionFor(d)}{stopFor(d)}</div>}
+                        </div>
+                    ))}
+                </div>
+            ) : (
+                <Panel>
+                    <table className="r-table r-dep-table">
                         <thead>
                             <tr>
-                                <th>ID</th>
-                                <th>Status</th>
-                                <th>Env</th>
-                                <th>Group</th>
-                                <th>Image</th>
-                                <th>Created by</th>
-                                <th>Duration</th>
-                                <th>Expires in</th>
-                                <th style={{ textAlign: 'right' }}>Actions</th>
+                                <th style={{ width: 116 }}>Status</th>
+                                <th style={{ width: 160 }}>ID</th>
+                                <th>Source</th>
+                                <th style={{ width: 150 }}>Environment</th>
+                                <th style={{ width: 170 }}>Author</th>
+                                <th style={{ width: 110 }}>Age</th>
+                                <th style={{ width: 150 }} />
                             </tr>
                         </thead>
                         <tbody>
-                            {filteredDeployments.map(d => (
-                                <tr
-                                    key={d.id}
-                                    className="click"
-                                    onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
-                                >
-                                    <td className="mono" style={{ fontSize: 12.25 }}>{d.deployment_id}</td>
+                            {filtered.map(d => (
+                                <tr key={d.deployment_id} className="click" onClick={() => open(d)}>
                                     <td><Status status={d.status} /></td>
+                                    <td className="mono r-nowrap" style={{ fontSize: 12 }}>{d.deployment_id}</td>
                                     <td>
-                                        {d.environment ? (
-                                            <EnvPill projectName={projectName} env={d.environment} color={d.environment_color} />
-                                        ) : <span style={{ color: 'var(--text-soft)' }}>—</span>}
-                                    </td>
-                                    <td>{d.deployment_group ? (() => {
-                                        const env = environments.find((e) => e.name === d.environment);
-                                        return <GroupPill projectName={projectName} group={d.deployment_group} primary={!!env && env.primary_deployment_group === d.deployment_group} />;
-                                    })() : null}</td>
-                                    <td className="mono" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                        {d.image ? d.image.split('/').pop() : '—'}
-                                    </td>
-                                    <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
-                                    <td className="mono" style={{ fontSize: 12.25, color: 'var(--text-muted)' }}>
-                                        {formatDurationDelta(d.created, d.completed_at || new Date().toISOString())}
-                                    </td>
-                                    <td style={{ color: 'var(--text-muted)' }} title={d.expires_at ? formatISO8601(d.expires_at) : undefined}>
-                                        {d.expires_at ? formatTimeRemaining(d.expires_at) : '—'}
-                                    </td>
-                                    <td style={{ textAlign: 'right' }}>
-                                        <div className="row-actions" style={{ display: 'inline-flex', gap: 6, justifyContent: 'flex-end' }}>
-                                            {isRollbackable(d) && (
-                                                <RButton
-                                                    size="sm"
-                                                    onClick={(e) => {
-                                                        e.stopPropagation();
-                                                        handleRollbackClick(d);
-                                                    }}
-                                                >
-                                                    {d.is_active ? 'Redeploy' : 'Rollback'}
-                                                </RButton>
-                                            )}
-                                            {!isTerminal(d.status) && (
-                                                <RButton
-                                                    size="sm"
-                                                    variant="danger"
-                                                    onClick={(e) => {
-                                                        e.stopPropagation();
-                                                        handleStopClick(d);
-                                                    }}
-                                                >
-                                                    Stop
-                                                </RButton>
-                                            )}
+                                        <div className="r-cell-main">{deploymentSource(d)}</div>
+                                        <div className="r-cell-sub">
+                                            {formatDurationDelta(d.created, d.completed_at || new Date().toISOString())}
+                                            {d.expires_at && <span title={formatISO8601(d.expires_at)}> · expires in {formatTimeRemaining(d.expires_at)}</span>}
                                         </div>
+                                    </td>
+                                    <td>
+                                        <span className="r-cell-tags">
+                                            {d.environment ? <EnvTag env={d.environment} /> : <span className="muted">—</span>}
+                                            {groupFor(d)}
+                                        </span>
+                                    </td>
+                                    <td className="r-cell-ellipsis">{d.created_by_email || <span className="muted">—</span>}</td>
+                                    <td className="muted r-nowrap" title={formatISO8601(d.created)}>{formatRelativeTimeRounded(d.created)}</td>
+                                    <td style={{ textAlign: 'right' }}>
+                                        <span className="r-row-actions">{actionFor(d)}{stopFor(d)}</span>
                                     </td>
                                 </tr>
                             ))}
                         </tbody>
                     </table>
-                )}
-            </Panel>
+                </Panel>
+            )}
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 14 }}>
-                <RButton
-                    size="sm"
-                    onClick={() => setPage(page - 1)}
-                    disabled={page === 0}
-                    icon="chevl"
-                >
-                    Previous
-                </RButton>
-                <span style={{ fontSize: 12.5, color: 'var(--text-muted)' }}>
-                    Page {page + 1} · showing{' '}
-                    {filteredDeployments.length === deployments.length
-                        ? `${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`
-                        : `${filteredDeployments.length} of ${deployments.length} deployment${deployments.length === 1 ? '' : 's'}`}
-                </span>
-                <RButton
-                    size="sm"
-                    onClick={() => setPage(page + 1)}
-                    disabled={!hasMore}
-                >
-                    Next
-                </RButton>
-            </div>
+            {(page > 0 || hasMore) && (
+                <div className="r-pager">
+                    <RButton size="sm" onClick={() => setPage(page - 1)} disabled={page === 0} icon="chevl">Newer</RButton>
+                    <span>Page {page + 1}</span>
+                    <RButton size="sm" onClick={() => setPage(page + 1)} disabled={!hasMore}>Older</RButton>
+                </div>
+            )}
 
             <ConfirmDialog
-                isOpen={confirmDialogOpen}
-                onClose={() => {
-                    setConfirmDialogOpen(false);
-                    setDeploymentToStop(null);
-                }}
+                isOpen={!!deploymentToStop}
+                onClose={() => setDeploymentToStop(null)}
                 onConfirm={handleStopConfirm}
-                title="Stop Deployment"
-                message={`Are you sure you want to stop deployment ${deploymentToStop?.deployment_id}? Impact: traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop Deployment"
+                title={`Stop ${deploymentToStop?.deployment_id ?? 'deployment'}?`}
+                message={`Traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
+                confirmText="Stop deployment"
                 confirmTone="danger"
                 loading={stopping}
             />
-
-            <Modal
-                isOpen={rollbackDialogOpen}
-                onClose={() => {
-                    setRollbackDialogOpen(false);
-                    setDeploymentToRollback(null);
-                    setUseSourceEnvVars(false);
-                }}
-                title={deploymentToRollback?.is_active ? 'Redeploy' : 'Rollback to Deployment'}
-                footer={
-                    <>
-                        <RButton
-                            onClick={() => {
-                                setRollbackDialogOpen(false);
-                                setDeploymentToRollback(null);
-                                setUseSourceEnvVars(false);
-                            }}
-                            disabled={rollingBack}
-                        >
-                            Cancel
-                        </RButton>
-                        <RButton
-                            variant="primary"
-                            onClick={handleRollbackConfirm}
-                            loading={rollingBack}
-                            disabled={rollingBack}
-                        >
-                            {deploymentToRollback?.is_active ? 'Redeploy' : 'Rollback'}
-                        </RButton>
-                    </>
-                }
-            >
-                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 }}>
-                    {deploymentToRollback?.is_active
-                        ? `Are you sure you want to redeploy ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`
-                        : `Are you sure you want to rollback to deployment ${deploymentToRollback?.deployment_id}? This will create a new deployment with the same image.`}
-                </p>
-
-                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)', padding: 14 }}>
-                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
-                        <input
-                            type="checkbox"
-                            checked={useSourceEnvVars}
-                            onChange={(e) => setUseSourceEnvVars(e.target.checked)}
-                            style={{ marginTop: 2 }}
-                        />
-                        <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
-                                Use source deployment's environment variables
-                            </div>
-                            <div style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
-                                {useSourceEnvVars
-                                    ? 'Will copy environment variables from the source deployment'
-                                    : "Will use the current project's environment variables (default)"}
-                            </div>
-                        </div>
-                    </label>
-                </div>
-            </Modal>
         </div>
     );
 }
-
 
 /**
  * Shows the latest backend resource representation for each container.
@@ -981,12 +568,10 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const [environments, setEnvironments] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
-    const [rollbackDialogOpen, setRollbackDialogOpen] = useState(false);
-    const [rolling, setRolling] = useState(false);
-    const [useSourceEnvVars, setUseSourceEnvVars] = useState(false);
     const [stopDialogOpen, setStopDialogOpen] = useState(false);
     const [stopping, setStopping] = useState(false);
-    const [detailActionStatus, setDetailActionStatus] = useState('');
+    const project = useCurrentProject();
+    const { request } = useDeployActions();
     // Pushed, not replaced: switching tabs is a move the Back button undoes.
     const [tabParam, setTabParam] = useQueryParam('tab', { history: 'push' });
     const [breakdownOpen, setBreakdownOpen] = useState(false);
@@ -1002,10 +587,6 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         }
     }, [showToast]);
 
-    const isTerminal = (status) => {
-        return ['Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired'].includes(status);
-    };
-
     const loadDeployment = useCallback(async () => {
         try {
             const data = await api.getDeployment(projectName, deploymentId);
@@ -1017,49 +598,28 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         }
     }, [projectName, deploymentId]);
 
-    const handleRollbackClick = () => {
-        setRollbackDialogOpen(true);
-    };
-
     const handleStopConfirm = async () => {
         setStopping(true);
-        setDetailActionStatus(`Stopping deployment ${deploymentId}...`);
         try {
             await api.stopDeployment(projectName, deploymentId);
-            showToast(`Deployment ${deploymentId} stopped successfully`, 'success');
-            setDetailActionStatus(`Stopped deployment ${deploymentId}.`);
+            showToast(`Stopping ${deploymentId}`, 'success');
             setStopDialogOpen(false);
             loadDeployment();
+            window.dispatchEvent(new Event('rise:mutation'));
         } catch (err) {
             showToast(`Failed to stop deployment: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to stop deployment ${deploymentId}.`);
         } finally {
             setStopping(false);
         }
     };
 
-    const handleRollback = async () => {
-        setRolling(true);
-        setDetailActionStatus(`${deployment.is_active ? 'Redeploying' : 'Rolling back'} deployment ${deploymentId}...`);
-        try {
-            const response = await api.createDeploymentFrom(projectName, deploymentId, useSourceEnvVars);
-            showToast(`${deployment.is_active ? 'Redeploy' : 'Rollback'} successful! New deployment: ${response.deployment_id}`, 'success');
-            setDetailActionStatus(`${deployment.is_active ? 'Redeployed' : 'Rolled back'} to deployment ${response.deployment_id}.`);
-            setRollbackDialogOpen(false);
-            setUseSourceEnvVars(false); // Reset checkbox
-            // Redirect to project page to see the new deployment
-            navigate(`/project/${projectName}`);
-        } catch (err) {
-            showToast(`Failed to ${deployment.is_active ? 'redeploy' : 'rollback'} deployment: ${err.message}`, 'error');
-            setDetailActionStatus(`Failed to ${deployment.is_active ? 'redeploy' : 'rollback'} deployment ${deploymentId}.`);
-        } finally {
-            setRolling(false);
-        }
-    };
-
     useEffect(() => {
         loadDeployment();
+        window.addEventListener('rise:mutation', loadDeployment);
+        return () => window.removeEventListener('rise:mutation', loadDeployment);
     }, [loadDeployment]);
+
+    const events = useDeploymentEvents(projectName, deploymentId, deployment?.status ?? '');
 
     // Best-effort fetch of environments so we can flag the group pill as
     // primary when the deployment's group matches the env's primary group.
@@ -1117,6 +677,33 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     // an empty page. Writing `null` for the default keeps a plain link clean.
     const activeTab = tabs.some((t) => t.id === tabParam) ? (tabParam as string) : 'overview';
     const setActiveTab = (id: string) => setTabParam(id === 'overview' ? null : id);
+
+    // What can be done from here depends on where the deployment is in its life.
+    const groupLive = (project?.deployments ?? []).find(d =>
+        d.is_active && d.environment === deployment.environment && d.deployment_group === deployment.deployment_group) ?? null;
+    const promoteTo = deployment.is_active && deployment.environment
+        ? promoteTargets(deployment.environment, project?.environments ?? []).find(e => e.is_production)
+            ?? promoteTargets(deployment.environment, project?.environments ?? [])[0]
+        : null;
+    const currentEnv = (project?.environments ?? []).find(e => e.name === deployment.environment);
+    let primaryAction: React.ReactNode = null;
+    const secondaryActions: React.ReactNode[] = [];
+    if (deployment.can_rollback) {
+        if (deployment.status === 'Failed' || deployment.status === 'Unhealthy') {
+            primaryAction = <RButton variant="primary" icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Retry deploy</RButton>;
+        } else if (deployment.is_active) {
+            if (promoteTo && !currentEnv?.is_production) {
+                primaryAction = <RButton variant="primary" icon="promote" onClick={() => request({ kind: 'promote', source: deployment, targetEnv: promoteTo.name })}>Promote to {promoteTo.name}</RButton>;
+            }
+            secondaryActions.push(<RButton key="redeploy" icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Redeploy</RButton>);
+        } else if (deployment.status === 'Superseded' && groupLive) {
+            primaryAction = <RButton variant="primary" icon="rollback" onClick={() => request({ kind: 'rollback', source: deployment })}>Roll back to this</RButton>;
+        } else if (isTerminal(deployment.status)) {
+            secondaryActions.push(<RButton key="redeploy" icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Deploy again</RButton>);
+        }
+    }
+    const rollout = events ? rolloutSteps(deployment, events) : null;
+    const showFailure = deployment.status === 'Failed' || deployment.status === 'Unhealthy';
 
     const deploymentPanel = (
         <Panel>
@@ -1286,25 +873,10 @@ export function DeploymentDetail({ projectName, deploymentId }) {
         <section>
             <div className="r-page-head">
                 <div className="title-stack">
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-                        <h1 className="r-page-title mono" style={{ fontSize: 20 }}>{deployment.deployment_id}</h1>
+                    <div className="r-title-row">
+                        <h1 className="r-page-title mono r-dep-title">{deployment.deployment_id}</h1>
                         <Status status={deployment.status} tooltip={`Deployment status: ${deployment.status}`} />
-                        {deployment.environment ? (
-                            <EnvPill
-                                projectName={projectName}
-                                env={deployment.environment}
-                                color={deployment.environment_color}
-                                tooltip={
-                                    <>
-                                        <div>Environment: <span className="mono">{deployment.environment}</span></div>
-                                        <div>
-                                            Deployment Group: <span className="mono">{deployment.deployment_group}</span>
-                                            {deployment.deployment_group === 'default' && ' (primary group)'}
-                                        </div>
-                                    </>
-                                }
-                            />
-                        ) : null}
+                        {deployment.environment && <EnvTag env={deployment.environment} color={deployment.environment_color} />}
                         {deployment.deployment_group && (() => {
                             const env = environments.find((e) => e.name === deployment.environment);
                             const isPrimaryGroup = !!env && env.primary_deployment_group === deployment.deployment_group;
@@ -1323,50 +895,39 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             );
                         })()}
                     </div>
-                    <div className="r-meta-bar" style={{ marginTop: 8 }}>
-                        <span>{projectName}</span>
-                        <span className="dot-sep" />
-                        <span>by {deployment.created_by_email || 'unknown'}</span>
-                        <span className="dot-sep" />
-                        <span title={formatISO8601(deployment.created)}>{formatRelativeTimeRounded(deployment.created)}</span>
-                        {deployment.completed_at && (
-                            <>
-                                <span className="dot-sep" />
-                                <span>completed {formatDate(deployment.completed_at)}</span>
-                            </>
-                        )}
-                    </div>
+                    <div className="r-dep-subtitle">{deploymentSource(deployment)}</div>
                 </div>
-                <RButton icon="copy" onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
-                    Copy ID
-                </RButton>
-                {deployment.can_rollback && (
-                    <RButton icon="refresh" onClick={handleRollbackClick}>
-                        {deployment.is_active ? 'Redeploy' : 'Rollback'}
-                    </RButton>
-                )}
-                {!isTerminal(deployment.status) && (
-                    <RButton variant="danger" icon="stop" onClick={() => setStopDialogOpen(true)}>
-                        Stop
-                    </RButton>
-                )}
+                <div className="r-page-actions">
+                    {primaryAction}
+                    {secondaryActions}
+                    <RButton icon="terminal" onClick={() => setActiveTab('logs')}>Logs</RButton>
+                    {!isTerminal(deployment.status) && (
+                        <RButton variant="danger" icon="stop" onClick={() => setStopDialogOpen(true)}>Stop</RButton>
+                    )}
+                    <button type="button" className="r-icon-btn" title="Copy ID" aria-label="Copy deployment ID"
+                        onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
+                        <Icon name="copy" size={14} />
+                    </button>
+                </div>
             </div>
 
-            {detailActionStatus && (
-                <div className="r-alert info" style={{ marginBottom: 18, fontSize: 12.5 }}>
-                    <Icon name="info" size={14} />
-                    <div style={{ flex: 1 }}>{detailActionStatus}</div>
-                </div>
-            )}
-
-            {deployment.error_message && (
-                <div className="r-alert err" style={{ marginBottom: 18, fontSize: 12.5 }}>
-                    <Icon name="info" size={14} />
-                    <div style={{ flex: 1 }}>Error: {deployment.error_message}</div>
-                </div>
-            )}
-
             <Tabs tabs={tabs} active={activeTab} onChange={setActiveTab} />
+
+            {activeTab === 'overview' && (
+                <div className="r-stack r-dep-diagnosis">
+                    <DeploymentMetaStrip deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
+                    {showFailure && (
+                        <FailurePanel
+                            projectName={projectName}
+                            deployment={deployment}
+                            failedAt={rollout?.failedAt ?? null}
+                            stillServing={groupLive && groupLive.deployment_id !== deployment.deployment_id ? groupLive : null}
+                            onOpenLogs={() => setActiveTab('logs')}
+                        />
+                    )}
+                    {rollout && <RolloutPanel steps={rollout.steps} />}
+                </div>
+            )}
 
             {activeTab === 'overview' && (
                 <div className="r-grid-2-1 r-deployment-overview">
@@ -1448,70 +1009,13 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 </Panel>
             )}
 
-            <Modal
-                isOpen={rollbackDialogOpen}
-                onClose={() => {
-                    setRollbackDialogOpen(false);
-                    setUseSourceEnvVars(false);
-                }}
-                title={deployment?.is_active ? 'Redeploy' : 'Rollback to Deployment'}
-                footer={
-                    <>
-                        <RButton
-                            onClick={() => {
-                                setRollbackDialogOpen(false);
-                                setUseSourceEnvVars(false);
-                            }}
-                            disabled={rolling}
-                        >
-                            Cancel
-                        </RButton>
-                        <RButton
-                            variant="primary"
-                            onClick={handleRollback}
-                            loading={rolling}
-                            disabled={rolling}
-                        >
-                            {deployment?.is_active ? 'Redeploy' : 'Rollback'}
-                        </RButton>
-                    </>
-                }
-            >
-                <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 }}>
-                    {deployment?.is_active
-                        ? `Are you sure you want to redeploy ${deploymentId}? This will create a new deployment with the same image.`
-                        : `Are you sure you want to rollback to deployment ${deploymentId}? This will create a new deployment with the same image.`}
-                </p>
-
-                <div style={{ background: 'var(--surface-2)', border: '1px solid var(--border-faint)', borderRadius: 'var(--radius-sm)', padding: 14 }}>
-                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, cursor: 'pointer' }}>
-                        <input
-                            type="checkbox"
-                            checked={useSourceEnvVars}
-                            onChange={(e) => setUseSourceEnvVars(e.target.checked)}
-                            style={{ marginTop: 2 }}
-                        />
-                        <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>
-                                Use source deployment's environment variables
-                            </div>
-                            <div style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 4 }}>
-                                {useSourceEnvVars
-                                    ? 'Will copy environment variables from the source deployment'
-                                    : "Will use the current project's environment variables (default)"}
-                            </div>
-                        </div>
-                    </label>
-                </div>
-            </Modal>
-
             <ConfirmDialog
                 isOpen={stopDialogOpen}
                 onClose={() => setStopDialogOpen(false)}
                 onConfirm={handleStopConfirm}
-                title="Stop Deployment"
-                message={`Are you sure you want to stop deployment ${deploymentId}? Impact: traffic for group "${deployment?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop Deployment"
+                title={`Stop ${deploymentId}?`}
+                message={`Traffic for group "${deployment?.deployment_group || 'default'}" may terminate.`}
+                confirmText="Stop deployment"
                 confirmTone="danger"
                 loading={stopping}
             />

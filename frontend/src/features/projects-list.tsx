@@ -1,9 +1,9 @@
 // @ts-nocheck
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
-import { navigate } from '../lib/navigation';
+import { navigate, useQueryParam } from '../lib/navigation';
 import { useToast } from '../components/toast';
-import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented, Stat, StatGrid } from '../components/r-ui';
+import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented } from '../components/r-ui';
 import { Icon } from '../components/icon';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
@@ -24,8 +24,12 @@ interface Project {
 export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     const [projects, setProjects] = useState<Project[] | null>(null);
     const [error, setError] = useState<string | null>(null);
-    const [search, setSearch] = useState('');
-    const [statusFilter, setStatusFilter] = useState('all');
+    const [searchParam, setSearchParam] = useQueryParam('q');
+    const search = searchParam || '';
+    const setSearch = (v: string) => setSearchParam(v || null);
+    const [statusParam, setStatusParam] = useQueryParam('status');
+    const statusFilter = statusParam || 'all';
+    const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
     const [accessFilter, setAccessFilter] = useState('all');
     const [modalOpen, setModalOpen] = useState(false);
     const [accessClasses, setAccessClasses] = useState<any[]>([]);
@@ -82,8 +86,8 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 statusFilter === 'all' ||
                 (statusFilter === 'healthy' && s === 'running') ||
                 (statusFilter === 'deploying' && s === 'deploying') ||
-                (statusFilter === 'unhealthy' && (s === 'failed' || s === 'deleting')) ||
-                (statusFilter === 'inactive' && (s === 'stopped' || s === 'terminated'));
+                (statusFilter === 'failed' && (s === 'failed' || s === 'deleting')) ||
+                (statusFilter === 'stopped' && (s === 'stopped' || s === 'terminated'));
             if (!matchesStatus) return false;
             if (accessFilter !== 'all' && p.access_class !== accessFilter) return false;
             if (search) {
@@ -120,6 +124,8 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
         }
     };
 
+    const owners = new Set(projects.map(p => p.owner?.name ? `team:${p.owner.name}` : null).filter(Boolean));
+    const teamCount = owners.size;
     const counts = {
         healthy: projects.filter(p => (p.status || '').toLowerCase() === 'running').length,
         // Failed rollouts and deletes that may be stalled need attention.
@@ -141,50 +147,29 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 <div className="title-stack">
                     <h1 className="r-page-title">Projects</h1>
                     <div className="r-page-sub">
-                        {projects.length} project{projects.length === 1 ? '' : 's'} · {counts.healthy} healthy
-                        {counts.unhealthy ? `, ${counts.unhealthy} need attention` : ''}
-                        {counts.deploying ? `, ${counts.deploying} deploying` : ''}
-                        {counts.inactive ? `, ${counts.inactive} inactive` : ''}
+                        {projects.length} project{projects.length === 1 ? '' : 's'} across {teamCount} team{teamCount === 1 ? '' : 's'}
                     </div>
                 </div>
-                <Button onClick={loadProjects} icon="refresh">Refresh</Button>
                 <Button variant="primary" icon="plus" onClick={() => { setFormData({ name: '', access_class: 'public', owner: 'self' }); setModalOpen(true); }}>
                     New project
                 </Button>
             </div>
 
-            <StatGrid cols={3}>
-                <Stat
-                    label="Healthy"
-                    value={counts.healthy}
-                    unit={` / ${projects.length}`}
-                    delta={
-                        counts.unhealthy
-                            ? `${counts.unhealthy} need attention`
-                            : counts.inactive
-                                ? `${counts.inactive} stopped or terminated`
-                                : 'all probes passing'
-                    }
-                    deltaTone={counts.unhealthy ? 'down' : undefined}
-                />
-                <Stat label="Deploying" value={counts.deploying} delta={counts.deploying ? 'builds or rollouts in progress' : 'no active deploys'} />
-            </StatGrid>
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
-                <SearchInput value={search} onChange={setSearch} placeholder="Filter projects…" style={{ flex: 1, maxWidth: 360 }} />
+            <div className="r-toolbar">
+                <SearchInput value={search} onChange={setSearch} placeholder="Filter by name or owner" style={{ flex: '1 1 220px', maxWidth: 360 }} />
                 <Segmented<string>
                     value={statusFilter}
                     options={[
-                        { value: 'all', label: 'All' },
-                        { value: 'healthy', label: 'Healthy' },
-                        { value: 'deploying', label: 'Deploying' },
-                        { value: 'unhealthy', label: 'Unhealthy' },
-                        { value: 'inactive', label: 'Inactive' },
+                        { value: 'all', label: `All ${projects.length}` },
+                        { value: 'healthy', label: `Healthy ${counts.healthy}` },
+                        { value: 'deploying', label: `Deploying ${counts.deploying}` },
+                        { value: 'failed', label: `Failed ${counts.unhealthy}` },
+                        { value: 'stopped', label: `Stopped ${counts.inactive}` },
                     ]}
                     onChange={setStatusFilter}
                 />
                 {accessClasses.length > 0 && (
-                    <div style={{ width: 220 }}>
+                    <div style={{ width: 200 }}>
                         <Combobox
                             value={accessFilter}
                             onChange={setAccessFilter}
@@ -202,8 +187,13 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 projects={filtered}
                 accessClasses={accessClasses}
                 onRowClick={(p) => navigate(`/project/${p.name}`)}
-                emptyText="No projects match your filters."
+                emptyText="No projects match these filters."
             />
+            {filtered.length === 0 && (search || statusFilter !== 'all' || accessFilter !== 'all') && (
+                <div style={{ marginTop: 10 }}>
+                    <button type="button" className="r-link-btn" onClick={() => { setSearch(''); setStatusFilter('all'); setAccessFilter('all'); }}>Clear filters</button>
+                </div>
+            )}
 
             <Modal
                 isOpen={modalOpen}

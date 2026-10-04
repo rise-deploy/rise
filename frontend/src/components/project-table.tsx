@@ -1,6 +1,6 @@
 import { navigate } from '../lib/navigation';
-import { Icon } from './icon';
-import { Panel, Status } from './r-ui';
+import { OwnerLabel, Panel, Status } from './r-ui';
+import { useIsMobile } from '../lib/use-media';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
 
 export interface ProjectOwner {
@@ -48,23 +48,6 @@ export interface AccessClassOption {
     description?: string;
 }
 
-interface OwnerCellProps {
-    owner?: ProjectOwner;
-}
-
-function OwnerCell({ owner }: OwnerCellProps) {
-    if (!owner || (!owner.email && !owner.name)) {
-        return <span style={{ color: 'var(--text-soft)' }}>—</span>;
-    }
-    const isTeam = !owner.email && !!owner.name;
-    return (
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-            <Icon name={isTeam ? 'users' : 'user'} size={13} />
-            <span>{owner.email || owner.name}</span>
-        </span>
-    );
-}
-
 export interface ProjectTableProps {
     projects: ProjectRow[];
     accessClasses?: AccessClassOption[];
@@ -84,74 +67,87 @@ export function ProjectTable({
     emptyText = 'No projects found.',
     isOwnRow,
 }: ProjectTableProps) {
+    const isMobile = useIsMobile();
+    const accessLabel = (p: ProjectRow) => accessClasses.find(a => a.id === p.access_class)?.display_name || p.access_class || '—';
+    // When isOwnRow is provided, mark every row: an accent bar for owned
+    // projects, a gray bar for shared ones.
+    const ownClass = (p: ProjectRow) => isOwnRow ? (isOwnRow(p) ? 'r-row-own' : 'r-row-shared') : '';
+
+    if (projects.length === 0) {
+        return <Panel><div className="r-list-empty r-empty-dashed">{emptyText}</div></Panel>;
+    }
+
+    if (isMobile) {
+        return (
+            <div className="r-cards">
+                {projects.map(project => {
+                    const updated = project.updated || project.updated_at || project.created;
+                    return (
+                        <div key={project.id || project.name} className={`r-card ${ownClass(project)}`} role="link" tabIndex={0}
+                            onClick={() => onRowClick(project)} onKeyDown={e => { if (e.key === 'Enter') onRowClick(project); }}>
+                            <div className="r-card-row">
+                                <span className="r-card-title">{project.name}</span>
+                                <span style={{ marginLeft: 'auto' }}><ProjectStatusPill project={project} /></span>
+                            </div>
+                            {project.primary_url && <div className="r-card-meta mono">{stripUrlScheme(project.primary_url)}</div>}
+                            <div className="r-card-meta r-card-row">
+                                <OwnerLabel owner={project.owner} />
+                                <span>· {accessLabel(project)}</span>
+                                {updated && <span>· {formatRelativeTimeRounded(updated)}</span>}
+                            </div>
+                        </div>
+                    );
+                })}
+            </div>
+        );
+    }
+
     return (
         <Panel>
-            {projects.length === 0 ? (
-                <div style={{ padding: 36, textAlign: 'center', color: 'var(--text-muted)' }}>
-                    {emptyText}
-                </div>
-            ) : (
-                <table className="r-table">
-                    <thead>
-                        <tr>
-                            <th>Project</th>
-                            <th>Status</th>
-                            <th>Primary URL</th>
-                            <th>Owner</th>
-                            <th>Access</th>
-                            <th style={{ textAlign: 'right' }}>Updated</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {projects.map(project => {
-                            const updated = project.updated || project.updated_at || project.created;
-                            // When isOwnRow is provided, mark every row: an accent
-                            // bar for owned projects, a gray bar for shared ones.
-                            const ownClass = isOwnRow
-                                ? (isOwnRow(project) ? ' r-row-own' : ' r-row-shared')
-                                : '';
-                            return (
-                                <tr
-                                    key={project.id || project.name}
-                                    className={`click${ownClass}`}
-                                    onClick={() => onRowClick(project)}
-                                >
-                                    <td style={{ maxWidth: 280 }}>
-                                        <div style={{ fontWeight: 500, fontSize: 13.5 }}>{project.name}</div>
-                                    </td>
-                                    <td><ProjectStatusPill project={project} /></td>
-                                    <td style={{ maxWidth: 300 }}>
-                                        {project.primary_url ? (
-                                            <a
-                                                className="r-link mono"
-                                                style={{ fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'inline-block', maxWidth: '100%' }}
-                                                href={project.primary_url}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                onClick={(e) => e.stopPropagation()}
-                                            >
-                                                {stripUrlScheme(project.primary_url)}
-                                            </a>
-                                        ) : (
-                                            <span style={{ color: 'var(--text-soft)' }}>—</span>
-                                        )}
-                                    </td>
-                                    <td><OwnerCell owner={project.owner} /></td>
-                                    <td>
-                                        <span className="r-pill">
-                                            {accessClasses.find(a => a.id === project.access_class)?.display_name
-                                                || project.access_class || '—'}
-                                        </span>
-                                    </td>
-                                    <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
-                                        {updated ? formatRelativeTimeRounded(updated) : '—'}
-                                    </td>
-                                </tr>
-                            );
-                        })}
-                    </tbody>
-                </table>
-            )}
+            <table className="r-table r-project-table">
+                <thead>
+                    <tr>
+                        <th>Project</th>
+                        <th style={{ width: 130 }}>Status</th>
+                        <th style={{ width: 170 }}>Active deployment</th>
+                        <th style={{ width: 200 }}>Owner</th>
+                        <th style={{ width: 120 }}>Access</th>
+                        <th style={{ width: 110, textAlign: 'right' }}>Updated</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {projects.map(project => {
+                        const updated = project.updated || project.updated_at || project.created;
+                        return (
+                            <tr key={project.id || project.name} className={`click ${ownClass(project)}`} onClick={() => onRowClick(project)}>
+                                <td>
+                                    <div className="r-cell-main" style={{ fontWeight: 600 }}>{project.name}</div>
+                                    {project.primary_url && (
+                                        <a
+                                            className="r-link mono r-cell-sub r-url-sub"
+                                            href={project.primary_url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            onClick={(e) => e.stopPropagation()}
+                                        >
+                                            {stripUrlScheme(project.primary_url)}
+                                        </a>
+                                    )}
+                                </td>
+                                <td><ProjectStatusPill project={project} /></td>
+                                <td className="mono r-nowrap" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                    {project.active_deployment_id || <span className="muted">—</span>}
+                                </td>
+                                <td className="r-cell-ellipsis"><OwnerLabel owner={project.owner} /></td>
+                                <td style={{ color: 'var(--text-muted)' }}>{accessLabel(project)}</td>
+                                <td className="r-nowrap" style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
+                                    {updated ? formatRelativeTimeRounded(updated) : '—'}
+                                </td>
+                            </tr>
+                        );
+                    })}
+                </tbody>
+            </table>
         </Panel>
     );
 }
