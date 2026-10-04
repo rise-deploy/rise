@@ -176,10 +176,23 @@ class RiseAPI {
         });
     }
 
-    // Create a new deployment from an existing deployment (redeploy/rollback)
-    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false) {
-        // Get the source deployment to extract its configuration
-        const sourceDeployment = await this.request(`/projects/${projectName}/deployments/${sourceDeploymentId}`);
+    // Create a new deployment from an existing deployment's image, without a
+    // rebuild. With no target it lands in the source's own group (redeploy /
+    // rollback). With `target.environment` it lands in that environment's
+    // primary group instead (promote); the backend resolves the group.
+    // `useSourceEnvVars` copies the source's variable snapshot; otherwise the
+    // target's current project variables are used.
+    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false, target = null) {
+        let placement;
+        if (target?.environment) {
+            placement = { environment: target.environment };
+        } else {
+            const sourceDeployment = await this.request(`/projects/${projectName}/deployments/${sourceDeploymentId}`);
+            placement = {
+                group: sourceDeployment.deployment_group || 'default',
+                ...(sourceDeployment.environment ? { environment: sourceDeployment.environment } : {}),
+            };
+        }
 
         return this.request(`/deployments`, {
             method: 'POST',
@@ -187,7 +200,7 @@ class RiseAPI {
                 project: projectName,
                 from_deployment: sourceDeploymentId,
                 use_source_env_vars: useSourceEnvVars,
-                group: sourceDeployment.deployment_group || 'default',
+                ...placement,
             })
         });
     }

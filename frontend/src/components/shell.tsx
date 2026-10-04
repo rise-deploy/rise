@@ -230,7 +230,7 @@ function ProjectNav({ route, onOpenPalette }: { route: Route; onOpenPalette: She
             <nav className="r-nav">
                 {PROJECT_SECTIONS.map(s => {
                     const href = projectPath(projectName, s.id);
-                    const count = s.id === 'overview' || s.id === 'access' ? undefined : counts[s.id];
+                    const count = s.id === 'overview' || s.id === 'access' || s.id === 'logs' ? undefined : counts[s.id];
                     return (
                         <a key={s.id} href={href} className={cx(active === s.id && 'active')} onClick={linkClick(href)}>
                             <Icon name={s.icon} className="ico" />

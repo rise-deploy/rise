@@ -8,7 +8,8 @@ export type ProjectSection =
     | 'variables'
     | 'domains'
     | 'extensions'
-    | 'access';
+    | 'access'
+    | 'logs';
 
 export interface ProjectSectionInfo {
     id: ProjectSection;
@@ -27,6 +28,7 @@ export const PROJECT_SECTIONS: ProjectSectionInfo[] = [
     { id: 'variables', label: 'Variables', short: 'Vars', icon: 'key', sub: 'Environment variables, applied on the next deployment' },
     { id: 'domains', label: 'Domains', short: 'Domains', icon: 'globe', sub: 'Custom domains per environment' },
     { id: 'extensions', label: 'Extensions', short: 'Extensions', icon: 'puzzle', sub: 'Managed resources and integrations attached to this project' },
+    { id: 'logs', label: 'Logs', short: 'Logs', icon: 'terminal', sub: 'Logs of one deployment at a time' },
     { id: 'access', label: 'Access', short: 'Access', icon: 'lock', sub: 'Who can reach the deployed app, ownership and service accounts' },
 ];
 
@@ -110,6 +112,10 @@ export function routeSection(route: Route): ProjectSection | null {
 
 export function projectPath(projectName: string, section: ProjectSection = 'overview'): string {
     return section === 'overview' ? `/project/${projectName}` : `/project/${projectName}/${section}`;
+}
+
+export function logsPath(projectName: string, deploymentId?: string | null): string {
+    return `/project/${projectName}/logs${deploymentId ? `?deployment=${encodeURIComponent(deploymentId)}` : ''}`;
 }
 
 export function deploymentPath(projectName: string, deploymentId: string): string {

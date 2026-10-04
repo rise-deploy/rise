@@ -359,25 +359,8 @@
 }
 .mono-status-strip strong { font-size: 13.5px; font-weight: 500; color: var(--text); display: inline-flex; align-items: center; gap: 6px; }
 .mono-status-strip-normalcase strong { text-transform: none; }
-.mono-status-card { border-left: 3px solid transparent; padding-left: 10px; }
-.mono-status-card-ok    { border-left-color: var(--ok); }
-.mono-status-card-warn  { border-left-color: var(--warn); }
-.mono-status-card-bad   { border-left-color: var(--err); }
-.mono-status-card-muted { border-left-color: var(--text-soft); }
 
-.mono-active-deployment-card {
-    background: var(--surface);
-    border: 1px solid var(--border-faint) !important;
-    border-radius: 6px;
-    padding: 18px !important;
-    cursor: pointer;
-    transition: background 0.14s, border-color 0.14s;
-}
-.mono-active-deployment-card:hover { background: var(--surface-2); border-color: var(--border) !important; }
-.mono-active-deployments-grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
-@media (min-width: 768px) { .mono-active-deployments-grid { grid-template-columns: 1fr 1fr; } }
 
-.mono-active-deployment-card h5 { color: var(--text); font-size: 14px; font-weight: 600; margin: 0; }
 
 /* Inline copy buttons */
 .mono-copyable-value { display: inline-flex; align-items: center; gap: 6px; }

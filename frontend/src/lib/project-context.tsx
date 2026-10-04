@@ -81,7 +81,10 @@ interface ProjectContextValue {
     projectName: string;
     project: Project | null;
     environments: Environment[];
-    /** The most recent deployments (newest first, capped by the API page). */
+    /**
+     * Newest first: the most recent page, plus every active deployment and the
+     * recent history of each environment's primary group.
+     */
     deployments: Deployment[];
     counts: ProjectCounts;
     error: string | null;
@@ -91,6 +94,8 @@ interface ProjectContextValue {
 const ProjectContext = createContext<ProjectContextValue | null>(null);
 
 const DEPLOYMENT_PAGE = 100;
+/** History read per primary group: enough for what it serves and what it replaced. */
+const GROUP_PAGE = 20;
 
 /**
  * Loads the data every project-scoped screen and the project sidebar share,
@@ -122,18 +127,42 @@ export function ProjectProvider({ projectName, children }: { projectName: string
         api.getProject(projectName)
             .then((p: Project) => { if (!cancelled) { setProject(p); setError(null); } })
             .catch((err: Error) => { if (!cancelled) setError(err.message); });
-        api.getProjectEnvironments(projectName)
+        const envsReq: Promise<Environment[]> = api.getProjectEnvironments(projectName)
             .then((d: unknown) => {
                 const list = Array.isArray(d) ? d as Environment[] : [];
                 if (!cancelled) setEnvironments(list);
                 record('environments', list.length);
+                return list;
             })
-            .catch((err: unknown) => console.error('Failed to load environments:', err));
-        api.getProjectDeployments(projectName, { limit: DEPLOYMENT_PAGE })
+            .catch((err: unknown) => {
+                console.error('Failed to load environments:', err);
+                return [] as Environment[];
+            });
+        // The recent page alone can miss what an environment serves: enough
+        // newer preview deployments push production's live one off it. So the
+        // active deployments and each environment's primary-group history are
+        // read as well, and merged in.
+        const recentReq = api.getProjectDeployments(projectName, { limit: DEPLOYMENT_PAGE })
             .then((d: unknown) => {
                 const list = Array.isArray(d) ? d as Deployment[] : [];
-                if (!cancelled) setDeployments(list);
                 record('deployments', list.length);
+                return list;
+            });
+        const activeReq = api.getProjectDeployments(projectName, { active: true, limit: DEPLOYMENT_PAGE })
+            .then((d: unknown) => Array.isArray(d) ? d as Deployment[] : [])
+            .catch(() => [] as Deployment[]);
+        const groupsReq = envsReq.then(envs => Promise.all(
+            Array.from(new Set(envs.map(e => e.primary_deployment_group).filter((g): g is string => !!g))).map(group =>
+                api.getProjectDeployments(projectName, { group, limit: GROUP_PAGE })
+                    .then((d: unknown) => Array.isArray(d) ? d as Deployment[] : [])
+                    .catch(() => [] as Deployment[])),
+        ));
+        Promise.all([recentReq, activeReq, groupsReq])
+            .then(([recent, active, groups]) => {
+                if (cancelled) return;
+                const byId = new Map<string, Deployment>();
+                for (const d of [...recent, ...active, ...groups.flat()]) byId.set(d.deployment_id, d);
+                setDeployments([...byId.values()].sort((a, b) => (b.created || '').localeCompare(a.created || '')));
             })
             .catch((err: unknown) => console.error('Failed to load deployments:', err));
         api.getProjectEnvVars(projectName, null)

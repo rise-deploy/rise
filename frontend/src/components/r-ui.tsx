@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { isSafeUrl } from '../lib/utils';
 import { navigate } from '../lib/navigation';
 import { Icon } from './icon';
+import { useCurrentProject } from '../lib/project-context';
 
 export function cx(...parts: Array<string | false | null | undefined>) {
     return parts.filter(Boolean).join(' ');
@@ -192,6 +193,24 @@ export const ENV_COLOR_STYLES: Record<string, { color: string; borderColor: stri
 };
 
 const ENV_COLORS = Object.keys(ENV_COLOR_STYLES);
+
+/**
+ * Compact environment chip for dense rows (deployment lists, pickers): the
+ * environment's colour as a layer glyph, accent-tinted for production. Colour
+ * and production flag come from the current project unless passed in.
+ */
+export function EnvTag({ env, color, production }: { env: string; color?: string; production?: boolean }) {
+    const project = useCurrentProject();
+    const known = project?.environments.find(e => e.name === env);
+    const isProd = production ?? known?.is_production ?? env === 'production';
+    const tint = color ?? known?.color;
+    return (
+        <span className={cx('r-env-tag', isProd && 'prod')}>
+            {tint && <EnvironmentIcon color={tint} size={10} />}
+            {env}
+        </span>
+    );
+}
 
 // Visually represents an environment with a layer-stack glyph tinted with the
 // environment's color. Ported from legacy `ui.tsx`; accepts the same loose size
