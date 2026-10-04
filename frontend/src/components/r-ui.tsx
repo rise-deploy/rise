@@ -20,6 +20,61 @@ export function Status({ status, bare = false, tooltip, title }: { status: strin
     return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
 }
 
+const OK_STATUSES = new Set(['healthy', 'running', 'ok', 'available', 'active']);
+const ERR_STATUSES = new Set(['unhealthy', 'failed', 'error', 'bad']);
+const PROGRESS_STATUSES = new Set([
+    'pending', 'building', 'pushing', 'pushed', 'deploying', 'queued',
+    'creating', 'provisioning', 'updating', 'cancelling',
+]);
+
+export type StatusTone = 'tone-ok' | 'tone-err' | 'tone-progress' | 'tone-muted';
+
+/**
+ * Collapse a project, deployment or extension status onto the four tones the
+ * UI colours by: healthy, failing, in progress, and inactive.
+ */
+export function statusTone(status?: string | null): StatusTone {
+    const key = (status || '').toLowerCase();
+    if (OK_STATUSES.has(key)) return 'tone-ok';
+    if (ERR_STATUSES.has(key)) return 'tone-err';
+    if (PROGRESS_STATUSES.has(key)) return 'tone-progress';
+    return 'tone-muted';
+}
+
+/**
+ * A project owner: a team (people icon + team name) or a user (person icon +
+ * email). Every place an owner is shown uses this so the two read the same.
+ */
+export function OwnerLabel({ owner, size = 12, link = false }: { owner?: { email?: string; name?: string } | null; size?: number; link?: boolean }) {
+    if (!owner || (!owner.email && !owner.name)) return <span style={{ color: 'var(--text-soft)' }}>—</span>;
+    const isTeam = !owner.email && !!owner.name;
+    const label = owner.email || owner.name;
+    const content = (
+        <>
+            <Icon name={isTeam ? 'users' : 'user'} size={size} />
+            <span className="r-owner-name">{label}</span>
+        </>
+    );
+    if (isTeam && link) {
+        const href = `/team/${owner.name}`;
+        return (
+            <a
+                className="r-owner r-link"
+                href={href}
+                onClick={(e) => {
+                    e.stopPropagation();
+                    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                    e.preventDefault();
+                    navigate(href);
+                }}
+            >
+                {content}
+            </a>
+        );
+    }
+    return <span className="r-owner">{content}</span>;
+}
+
 // ---------- Pill ----------
 export function Pill({ children, kind, className, tooltip, title }: { children: React.ReactNode; kind?: 'env-prod' | 'env-staging' | 'env-global' | 'accent'; className?: string; tooltip?: React.ReactNode; title?: string }) {
     const node = <span className={cx('r-pill', kind, className)} title={tooltip ? undefined : title}>{children}</span>;

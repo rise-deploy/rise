@@ -1,80 +1,53 @@
-import { createContext, useCallback, useContext, useState } from 'react';
+import React, { createContext, useCallback, useContext, useState } from 'react';
+import { Icon } from './icon';
 
-const ToastContext = createContext(null);
+export type ToastType = 'success' | 'error' | 'info';
 
-export function ToastProvider({ children }) {
-    const [toasts, setToasts] = useState([]);
+interface ToastItem { id: number; message: React.ReactNode; type: ToastType }
 
-    const showToast = useCallback((message, type = 'info') => {
-        const id = Date.now() + Math.random();
-        const toast = { id, message, type };
+interface ToastContextValue {
+    showToast: (message: React.ReactNode, type?: ToastType) => void;
+}
 
-        setToasts(prev => [...prev, toast]);
+const ToastContext = createContext<ToastContextValue | null>(null);
 
-        // Auto-dismiss after 4 seconds
-        setTimeout(() => {
-            setToasts(prev => prev.filter(t => t.id !== id));
-        }, 4000);
-    }, []);
+// Errors stay up longer: they usually need reading, not just noticing.
+const DISMISS_MS: Record<ToastType, number> = { success: 2800, info: 2800, error: 6000 };
+const ICONS: Record<ToastType, string> = { success: 'check', info: 'info', error: 'alert' };
 
-    const removeToast = useCallback((id) => {
+export function ToastProvider({ children }: { children: React.ReactNode }) {
+    const [toasts, setToasts] = useState<ToastItem[]>([]);
+
+    const removeToast = useCallback((id: number) => {
         setToasts(prev => prev.filter(t => t.id !== id));
     }, []);
+
+    const showToast = useCallback((message: React.ReactNode, type: ToastType = 'info') => {
+        const id = Date.now() + Math.random();
+        setToasts(prev => [...prev, { id, message, type }]);
+        setTimeout(() => removeToast(id), DISMISS_MS[type] ?? DISMISS_MS.info);
+    }, [removeToast]);
 
     return (
         <ToastContext.Provider value={{ showToast }}>
             {children}
-            <div className="toast-container">
+            <div className="r-toasts" role="status" aria-live="polite">
                 {toasts.map(toast => (
-                    <Toast key={toast.id} toast={toast} onClose={() => removeToast(toast.id)} />
+                    <div key={toast.id} className={`r-toast ${toast.type}`}>
+                        <Icon name={ICONS[toast.type]} size={15} className="r-toast-icon" />
+                        <span className="r-toast-msg">{toast.message}</span>
+                        <button type="button" className="r-toast-close" onClick={() => removeToast(toast.id)} aria-label="Dismiss">
+                            <Icon name="close" size={13} />
+                        </button>
+                    </div>
                 ))}
             </div>
         </ToastContext.Provider>
     );
 }
 
-function Toast({ toast, onClose }) {
-    const typeClasses = {
-        success: 'toast-success',
-        error: 'toast-error',
-        info: 'toast-info',
-    };
-
-    return (
-        <div className={`toast ${typeClasses[toast.type] || 'toast-info'}`}>
-            <div className="toast-content">
-                {toast.type === 'success' && (
-                    <div className="toast-icon svg-mask" style={{
-                        maskImage: 'url(/assets/check.svg)',
-                        WebkitMaskImage: 'url(/assets/check.svg)'
-                    }}></div>
-                )}
-                {toast.type === 'error' && (
-                    <div className="toast-icon svg-mask" style={{
-                        maskImage: 'url(/assets/close-x.svg)',
-                        WebkitMaskImage: 'url(/assets/close-x.svg)'
-                    }}></div>
-                )}
-                {toast.type === 'info' && (
-                    <div className="toast-icon svg-mask" style={{
-                        maskImage: 'url(/assets/info.svg)',
-                        WebkitMaskImage: 'url(/assets/info.svg)'
-                    }}></div>
-                )}
-                <span className="toast-message">{toast.message}</span>
-            </div>
-            <button onClick={onClose} className="toast-close">
-                <div className="w-4 h-4 svg-mask" style={{
-                    maskImage: 'url(/assets/close-x.svg)',
-                    WebkitMaskImage: 'url(/assets/close-x.svg)'
-                }}></div>
-            </button>
-        </div>
-    );
-}
-
 // Hook to use toast from any component
-export function useToast() {
+export function useToast(): ToastContextValue {
     const context = useContext(ToastContext);
     if (!context) {
         throw new Error('useToast must be used within ToastProvider');
