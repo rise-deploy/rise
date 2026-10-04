@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
+import { useQueryParam } from '../lib/navigation';
 import { useCurrentProject, type Environment } from '../lib/project-context';
 import { sortEnvironments } from '../lib/env-state';
 import { useIsMobile } from '../lib/use-media';
@@ -91,12 +92,12 @@ export function VariablesSection() {
 
     useEffect(() => { load(); }, [load]);
 
-    // `#env-<name>` (from an environment card) scrolls to that table.
+    // `?env=<name>` (from an environment card) scrolls to that table.
+    const [envParam] = useQueryParam('env');
     useEffect(() => {
-        if (!vars) return;
-        const id = decodeURIComponent(window.location.hash.slice(1));
-        if (id) document.getElementById(id)?.scrollIntoView({ block: 'start' });
-    }, [vars]);
+        if (!vars || !envParam) return;
+        document.getElementById(`env-${envParam}`)?.scrollIntoView({ block: 'start' });
+    }, [vars, envParam]);
 
     const changed = (key: string) => {
         setEdited(s => new Set(s).add(key));

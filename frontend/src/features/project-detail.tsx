@@ -183,6 +183,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: Pr
     const { templates } = useQuickstartTemplates();
     const { showToast } = useToast();
     const [updating, setUpdating] = useState(false);
+    const prodEnvName = productionEnv(useCurrentProject()?.environments ?? [])?.name ?? null;
     if (!project.template) return null;
 
     const stored = project.template;
@@ -193,7 +194,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: Pr
         if (!catalog) return;
         setUpdating(true);
         try {
-            await api.createDeploymentFromImage(projectName, catalog.image, catalog.http_port);
+            await api.createDeploymentFromImage(projectName, catalog.image, catalog.http_port, prodEnvName);
             await api.updateProjectTemplateImage(projectName, catalog.image);
             showToast(`Redeploying ${catalog.display_name} with ${catalog.image}…`, 'success');
             window.dispatchEvent(new Event('rise:mutation'));

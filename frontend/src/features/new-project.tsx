@@ -112,7 +112,8 @@ export function NewProjectPage() {
                 });
             }
             if (deploysNow) {
-                await api.createDeploymentFromImage(name, image.trim(), portNum);
+                // `production` is the environment every project is created with.
+                await api.createDeploymentFromImage(name, image.trim(), portNum, 'production');
                 showToast(`${name} created · first deploy started`, 'success');
                 navigate(projectPath(name));
             } else {

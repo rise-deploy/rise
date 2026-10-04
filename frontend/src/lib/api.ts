@@ -208,7 +208,9 @@ class RiseAPI {
     // Create a new deployment directly from a pre-built public image reference
     // (e.g. "nginx:latest", "ghcr.io/owner/repo:tag"). The server resolves the
     // digest via the OCI client and skips the build pipeline entirely.
-    async createDeploymentFromImage(projectName, image, httpPort) {
+    // `environment` is required once a project has more than one environment;
+    // the backend then deploys into that environment's primary group.
+    async createDeploymentFromImage(projectName, image, httpPort, environment = null) {
         return this.request(`/deployments`, {
             method: 'POST',
             body: JSON.stringify({
@@ -216,6 +218,7 @@ class RiseAPI {
                 image,
                 push_image: false,
                 http_port: httpPort,
+                ...(environment ? { environment } : {}),
             })
         });
     }
