@@ -93,6 +93,15 @@ export function NewProjectPage() {
         try {
             const ownerRef = owner === 'self' ? { user: me.id } : { team: owner };
             await api.createProject(name, access, ownerRef, kind === 'template' && template ? { id: template.id, image: template.image } : null);
+        } catch (e) {
+            showToast(`Failed to create project: ${(e as Error).message}`, 'error');
+            setCreating(false);
+            return;
+        }
+        window.dispatchEvent(new Event('rise:mutation'));
+        // The project exists from here on: a later failure must not leave the
+        // wizard offering to create it again, so it lands on the project.
+        try {
             if (staging) {
                 await api.createEnvironment(name, {
                     name: 'staging',
@@ -102,7 +111,6 @@ export function NewProjectPage() {
                     max_deployment_expiration: previews ? '7d' : null,
                 });
             }
-            window.dispatchEvent(new Event('rise:mutation'));
             if (deploysNow) {
                 await api.createDeploymentFromImage(name, image.trim(), portNum);
                 showToast(`${name} created · first deploy started`, 'success');
@@ -112,7 +120,8 @@ export function NewProjectPage() {
                 setCreated(name);
             }
         } catch (e) {
-            showToast(`Failed to create project: ${(e as Error).message}`, 'error');
+            showToast(`${name} was created, but setting it up failed: ${(e as Error).message}`, 'error');
+            navigate(projectPath(name));
         } finally {
             setCreating(false);
         }
