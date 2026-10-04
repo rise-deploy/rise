@@ -1018,19 +1018,6 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 .r-panel-clickable { cursor: pointer; transition: border-color 0.14s; }
 .r-panel-clickable:hover { border-color: var(--text-soft); }
 .r-panel-clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-/* Accent left border, e.g. cards for teams the current user owns. Drawn as an
-   overlay so it stays continuous over the panel head's bottom divider. */
-.r-panel-own { position: relative; }
-.r-panel-own::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: 3px;
-    background: var(--accent);
-    z-index: 1;
-}
 
 /* ---------- Tables ---------- */
 .r-table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -1656,20 +1643,6 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 .r-kv dt { color: var(--text-soft); font-size: 11.25px; align-self: center; }
 .r-kv dd { margin: 0; color: var(--text); }
 
-/* ---------- Avatar / member stack ---------- */
-.r-member-stack { display: inline-flex; }
-.r-member-stack > * { margin-left: -6px; }
-.r-member-stack > *:first-child { margin-left: 0; }
-.r-member-stack .r-ava-sm { border: 2px solid var(--surface); }
-.r-ava-sm {
-    width: 24px; height: 24px;
-    border-radius: 4px;
-    display: grid; place-items: center;
-    font-weight: 600;
-    color: white;
-    font-size: 11px;
-}
-
 /* ---------- Profile / preferences ---------- */
 .r-prefs-grid {
     display: grid;
@@ -2027,7 +2000,7 @@ a.r-meta-link:hover { color: var(--text); }
     font-weight: 600; text-transform: capitalize;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.r-env-row-v2 .env-status { flex: 0 0 96px; }
+.r-env-row-v2 .env-status { flex: 0 0 120px; }
 
 /* Failure banner on the project overview. */
 .r-issue {
@@ -2547,3 +2520,27 @@ a.r-meta-link:hover { color: var(--text); }
 .r-template-summary .r-link { white-space: nowrap; display: inline-flex; align-items: center; gap: 3px; }
 .r-dep-picker-trigger { overflow: hidden; }
 .r-dep-picker-trigger .r-env-tag { flex-shrink: 1; min-width: 0; overflow: hidden; }
+
+/* ---------- Browser surfaces ---------- */
+::selection { background: color-mix(in oklch, var(--accent) 24%, transparent); color: var(--text); }
+html { scrollbar-color: color-mix(in oklch, var(--text-soft) 45%, transparent) transparent; }
+input, textarea { caret-color: var(--accent); }
+a.r-link:hover, .r-link-btn:hover { text-underline-offset: 3px; }
+/* Ages, durations, counts and ids line up in columns. */
+.age, .dur, .r-nav .badge, .r-cell-sub, .r-table td, .r-meta-strip .v, .r-pager, .r-tab-count, .r-vars-scope-head .sub {
+    font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 767px) {
+    /* Tab strips and filter segments scroll sideways instead of wrapping. */
+    .r-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+    .r-tabs::-webkit-scrollbar { display: none; }
+    .r-tab { white-space: nowrap; flex: 0 0 auto; }
+    .r-toolbar .r-seg { max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+    .r-toolbar .r-seg::-webkit-scrollbar { display: none; }
+    .r-toolbar .r-seg button { white-space: nowrap; flex: 0 0 auto; }
+    /* The failure banner stacks: message, then its action. */
+    .r-issue { flex-wrap: wrap; align-items: flex-start; }
+    .r-issue .text { flex: 1 1 calc(100% - 30px); }
+    .r-issue .r-btn { margin-left: 28px; }
+}

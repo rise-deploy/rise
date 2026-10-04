@@ -16,7 +16,7 @@ import { EventTimeline } from './logs/event-timeline';
 import { fetchDeploymentEvents, type DeploymentEvent } from './logs/api';
 import { useCurrentProject, type Deployment } from '../lib/project-context';
 import { useDeployActions } from '../components/deploy-actions';
-import { byNewest, deploymentSource, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
+import { byNewest, deploymentSource, isInProgress, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
 import { DeploymentMetaStrip, FailurePanel, RolloutPanel, rolloutEnd, rolloutSteps, useDeploymentEvents } from './deployment-diagnosis';
 import { useIsMobile } from '../lib/use-media';
 
@@ -331,10 +331,9 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                         <thead>
                             <tr>
                                 <th style={{ width: 116 }}>Status</th>
-                                <th style={{ width: 160 }}>ID</th>
+                                <th style={{ width: 150 }}>ID</th>
                                 <th>Source</th>
-                                <th style={{ width: 150 }}>Environment</th>
-                                <th style={{ width: 170 }}>Author</th>
+                                <th style={{ width: 140 }}>Environment</th>
                                 <th style={{ width: 110 }}>Age</th>
                                 <th style={{ width: 150 }} />
                             </tr>
@@ -347,7 +346,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                                     <td>
                                         <div className="r-cell-main">{deploymentSource(d)}</div>
                                         <div className="r-cell-sub">
-                                            {formatDurationDelta(d.created, d.completed_at || new Date().toISOString())}
+                                            {[d.created_by_email, durationNote(d)].filter(Boolean).join(' · ')}
                                             {d.expires_at && <span title={formatISO8601(d.expires_at)}> · expires in {formatTimeRemaining(d.expires_at)}</span>}
                                         </div>
                                     </td>
@@ -357,7 +356,6 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                                             {groupFor(d)}
                                         </span>
                                     </td>
-                                    <td className="r-cell-ellipsis">{d.created_by_email || <span className="muted">—</span>}</td>
                                     <td className="muted r-nowrap" title={formatISO8601(d.created)}>{formatRelativeTimeRounded(d.created)}</td>
                                     <td style={{ textAlign: 'right' }}>
                                         <span className="r-row-actions">{actionFor(d)}{stopFor(d)}</span>
@@ -464,6 +462,17 @@ function ResourceAdjustmentNotice({
 function attributeText(event: DeploymentEvent, key: string): string {
     const value = event.attributes?.[key];
     return value === undefined || value === null ? '-' : String(value);
+}
+
+/**
+ * How long a deployment took, or has been going: a finished rollout's
+ * duration, the elapsed time of one in progress, and nothing for one that is
+ * simply live (time since start isn't a duration).
+ */
+function durationNote(d: Deployment): string {
+    if (d.completed_at) return formatDurationDelta(d.created, d.completed_at);
+    if (isInProgress(d.status)) return `${formatDurationDelta(d.created, new Date().toISOString())} so far`;
+    return '';
 }
 
 function formatDurationDelta(fromTs?: string | null, toTs?: string | null) {

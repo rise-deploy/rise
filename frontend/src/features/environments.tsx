@@ -3,7 +3,7 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useCurrentProject, type Deployment, type Environment } from '../lib/project-context';
-import { deploymentSource, envState, promoteTargets, sortEnvironments, HEALTH_LABEL, type EnvState } from '../lib/env-state';
+import { deploymentSource, envState, healthBadge, promoteTargets, sortEnvironments, type EnvState } from '../lib/env-state';
 import { deploymentPath, logsPath, projectPath } from '../lib/routes';
 import { fetchDeploymentContainers } from './logs/api';
 import { useToast } from '../components/toast';
@@ -76,7 +76,7 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
                 <EnvironmentIcon color={env.color} size={13} />
                 <span className="name">{env.name}</span>
                 {env.is_production && env.name !== 'production' && <span className="r-env-tag prod">production</span>}
-                <Status status={HEALTH_LABEL[health]} />
+                <Status {...healthBadge(state)} />
                 <span className="right">{replicas ?? (live ? `${live.replicas} replica${live.replicas === 1 ? '' : 's'}` : '')}</span>
             </div>
             <div className="r-env-card-body">
@@ -435,7 +435,7 @@ export function EnvironmentRows({ states, projectName }: { states: EnvState[]; p
                         onKeyDown={e => { if (e.key === 'Enter') navigate(d ? deploymentPath(projectName, d.deployment_id) : projectPath(projectName, 'environments')); }}
                     >
                         <span className="env-name"><EnvironmentIcon color={state.env.color} size={12} />{state.env.name}</span>
-                        <span className="env-status"><Status status={HEALTH_LABEL[state.health]} /></span>
+                        <span className="env-status"><Status {...healthBadge(state)} /></span>
                         <span className="mono id">{state.live?.deployment_id ?? '—'}</span>
                         <span className="msg">{state.live ? deploymentSource(state.live) : 'Not deployed'}</span>
                         {url && (

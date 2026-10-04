@@ -10,12 +10,12 @@ export function cx(...parts: Array<string | false | null | undefined>) {
 }
 
 // ---------- Status ----------
-export function Status({ status, bare = false, tooltip, title }: { status: string; bare?: boolean; tooltip?: React.ReactNode; title?: string }) {
+export function Status({ status, label, bare = false, tooltip, title }: { status: string; label?: string; bare?: boolean; tooltip?: React.ReactNode; title?: string }) {
     const key = (status || '').toLowerCase();
     const node = (
         <span className={cx('r-status', key, bare && 'bare')} title={tooltip ? undefined : title}>
             <span className="dot" />
-            <span>{status}</span>
+            <span>{label ?? status}</span>
         </span>
     );
     return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
