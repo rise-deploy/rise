@@ -848,7 +848,26 @@ impl Scenario for ScopedDeviceLogin {
             "a session granted read deployed anyway:\n{}",
             refused.combined()
         );
-        Ok(())
+
+        // Free the node for later scenarios: minikube's CPU is tight enough
+        // that two idle app pods keep the next deploy from scheduling.
+        for group in ["default", "staging"] {
+            expect_ok(
+                b.rise_cli(
+                    &[
+                        "deployment",
+                        "stop",
+                        "--project",
+                        &project,
+                        "--group",
+                        group,
+                    ],
+                    None,
+                )?,
+                "deployment stop",
+            )?;
+        }
+        b.wait_workload_removed(&project)
     }
 }
 
