@@ -43,8 +43,14 @@ export function rolloutSteps(deployment: Deployment, events: DeploymentEvent[]):
     const moves = [{ status: 'Pending', at: deployment.created }, ...transitions(events)];
     const entered = new Map<string, string>();
     for (const m of moves) if (!entered.has(m.status)) entered.set(m.status, m.at);
-    const failure = moves.find(m => FAILURE_STATUSES.has(m.status));
-    const reusedImage = !entered.has('Building') && !entered.has('Pushing') && (entered.has('Pushed') || entered.has('Deploying') || entered.has('Healthy') || !!failure);
+    // Only the status the deployment is in now decides whether the rollout
+    // failed: one that went unhealthy and recovered has a failure in its
+    // history but is healthy.
+    const failure = FAILURE_STATUSES.has(deployment.status)
+        ? [...moves].reverse().find(m => m.status === deployment.status) ?? { status: deployment.status, at: deployment.updated }
+        : null;
+    const reusedImage = !entered.has('Building') && !entered.has('Pushing')
+        && (entered.has('Pushed') || entered.has('Deploying') || entered.has('Healthy') || !!failure);
 
     const steps: RolloutStep[] = STEP_DEFS.map(def => {
         const startedAt = def.statuses.map(s => entered.get(s)).find(Boolean);
