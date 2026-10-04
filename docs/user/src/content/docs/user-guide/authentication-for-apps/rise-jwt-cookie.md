@@ -51,7 +51,7 @@ JWT expiration is controlled by the Rise platform. The default is 24 hours, but 
 
 - The cookie is `HttpOnly`, so browser JavaScript cannot read it.
 - The cookie is marked `Secure` in production.
-- The JWT is application-scoped. The `aud` claim is set to the application URL, making the token unusable for Rise API access.
+- The JWT is application-scoped. The `aud` claim is set to the application URL, making the token unusable for Rise API access, and Rise's ingress refuses it for any other application: an app that receives its visitors' tokens can't use them to open another app.
 - Rise signs app tokens with RS256. Applications verify authenticity with public keys discovered from Rise.
 - When cookies share a parent domain, an HS256 Rise API session cookie may also be present. Validating `alg` and `aud` prevents an app from accepting the wrong token type.
 
