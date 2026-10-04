@@ -374,6 +374,11 @@ When a typed table migrates (`ROADMAP.md` §4), its scoping moves with it:
    name has migrated, or narrow it to the kinds still typed.
 4. Delete the migrated kind's arm of the typed check.
 
+Every step keeps the shared session-ceiling cases passing on both evaluators.
+Step 2 removes `engine` from the environment grants' `refusedBy` there, and a
+kind placed anywhere but directly under its Project changes the engine runner's
+resource tree to match.
+
 No session changes meaning along the way: the claim's format, its Scopes and
 its statements are already the engine's. Presets may then become data: the
 CLI and approval page could offer operator-defined `PlatformRole`s (say
@@ -443,9 +448,9 @@ session it requested.
   evaluation. The migration deletes it without changing any token's meaning.
 - The ceiling is evaluated twice for a while: by the typed check for typed
   kinds and by the engine for generic ones. Both must apply the same coverage
-  rule. A shared test-vector suite (claim, target, operation → verdict) run
-  against both keeps them in step, and the engine side takes it over at
-  migration.
+  rule. Shared cases (claim, target, operation → verdict) in
+  `crates/rise-backend-auth/testdata/session-ceilings.json` run against both
+  and keep them in step; the engine side takes them over at migration.
 - Scoped sessions can't use the generic resource API until §8 lands. Anything
   an agent needs from that API in the meantime needs a full-access login.
 - Every typed handler moves onto the choke point, a sweeping but mechanical
