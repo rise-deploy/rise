@@ -74,8 +74,14 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
             Applicability::Run => {
                 report::note(&format!("RUN  {}", s.id()));
                 let start = std::time::Instant::now();
+                let before = project_names(b);
                 let result = s.run(b);
                 let took = report::human(start.elapsed());
+                // Pass or fail, the scenario's apps must not hold capacity the
+                // next one needs.
+                if let Err(e) = before.and_then(|before| reclaim(b, &before)) {
+                    report::note(&format!("     cleanup after {} failed: {e:#}", s.id()));
+                }
                 match result {
                     Ok(()) => {
                         passed += 1;
@@ -97,6 +103,60 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
         report::human(suite_start.elapsed())
     ));
     anyhow::ensure!(failed.is_empty(), "scenarios failed: {failed:?}");
+    Ok(())
+}
+
+/// Every project the admin CI bearer can see (an admin sees all of them).
+fn project_names(b: &dyn Backend) -> Result<std::collections::BTreeSet<String>> {
+    let resp = b.api_get("/api/v1/projects")?;
+    anyhow::ensure!(
+        resp.status == 200,
+        "list projects returned {}:\n{}",
+        resp.status,
+        resp.body
+    );
+    let projects: Vec<serde_json::Value> =
+        serde_json::from_str(&resp.body).context("parse project list")?;
+    Ok(projects
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Stop every deployment group of the projects created since `before`, and
+/// wait for their workloads to go. Minikube runs the whole suite on one small
+/// node, where a few idle app pods left behind keep a later deploy from
+/// scheduling. On ECS, Fargate has no shared node to free, so the stop is not
+/// waited on.
+fn reclaim(b: &dyn Backend, before: &std::collections::BTreeSet<String>) -> Result<()> {
+    for project in project_names(b)?.difference(before) {
+        let groups = b.api_get(&format!("/api/v1/projects/{project}/deployment-groups"))?;
+        anyhow::ensure!(
+            groups.status == 200,
+            "list deployment groups of {project} returned {}:\n{}",
+            groups.status,
+            groups.body
+        );
+        let groups: Vec<String> =
+            serde_json::from_str(&groups.body).context("parse deployment groups")?;
+        for group in groups {
+            // Group names are `[a-z0-9/-]`: `/` is the one character to escape.
+            let query = group.replace('/', "%2F");
+            let resp = b.api_post(
+                &format!("/api/v1/projects/{project}/deployments/stop?group={query}"),
+                &serde_json::json!({}),
+            )?;
+            anyhow::ensure!(
+                resp.status == 200,
+                "stop {project} group {group} returned {}:\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+        if b.kind() != BackendKind::Ecs {
+            b.wait_workload_removed(project)?;
+        }
+    }
     Ok(())
 }
 
@@ -849,25 +909,7 @@ impl Scenario for ScopedDeviceLogin {
             refused.combined()
         );
 
-        // Free the node for later scenarios: minikube's CPU is tight enough
-        // that two idle app pods keep the next deploy from scheduling.
-        for group in ["default", "staging"] {
-            expect_ok(
-                b.rise_cli(
-                    &[
-                        "deployment",
-                        "stop",
-                        "--project",
-                        &project,
-                        "--group",
-                        group,
-                    ],
-                    None,
-                )?,
-                "deployment stop",
-            )?;
-        }
-        b.wait_workload_removed(&project)
+        Ok(())
     }
 }
 
