@@ -1,3 +1,4 @@
+pub mod access;
 pub mod device_flow;
 pub mod oauth_code;
 pub(crate) mod token_utils;

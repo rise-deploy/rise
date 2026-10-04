@@ -1,4 +1,5 @@
 use crate::db::{projects, users};
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::auth::{
     cookie_helpers,
     token_storage::{
@@ -16,6 +17,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use rise_backend_auth::session_scope::AccessRequest;
 use rise_backend_auth::{SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -60,48 +62,83 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// best-effort: the canonical host is always included, so the common deep-link
 /// keeps working even if the deployment lookups fail.
 async fn project_redirect_hosts(state: &AppState, project_name: &str) -> Vec<String> {
-    fn host_of(url: &str) -> Option<String> {
-        url::Url::parse(url)
-            .ok()?
-            .host_str()
-            .map(|h| h.to_lowercase())
-    }
-    fn add(hosts: &mut Vec<String>, host: Option<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    for url in project_app_urls(state, project_name).await {
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_lowercase));
         if let Some(host) = host {
             if !hosts.contains(&host) {
                 hosts.push(host);
             }
         }
     }
-    let mut hosts: Vec<String> = Vec::new();
-    // Canonical ingress host from the template (no DB needed).
-    add(
-        &mut hosts,
-        build_project_url(state, project_name)
-            .as_deref()
-            .and_then(host_of),
-    );
-    // Active deployment URLs (default host + custom domains), across groups.
+    hosts
+}
+
+/// Whether a token's `aud` names the app at `candidate`: same host, explicit
+/// port and path prefix (sub-path layouts put several apps on one host). The
+/// scheme is ignored, as one app may be reached over either.
+fn audience_names_app(aud: &str, candidate: &str) -> bool {
+    fn key(url: &str) -> Option<(String, Option<u16>, String)> {
+        let url = url::Url::parse(url).ok()?;
+        Some((
+            url.host_str()?.to_lowercase(),
+            url.port(),
+            url.path().trim_end_matches('/').to_string(),
+        ))
+    }
+    match (key(aud), key(candidate)) {
+        (Some(aud), Some(candidate)) => aud == candidate,
+        _ => false,
+    }
+}
+
+/// Whether a token whose audience is `aud` may open `project_name`'s app.
+///
+/// Sign-in mints an app token for the URL the visitor came through (the
+/// project's template URL, a custom domain, or another deployment group's
+/// host) and the app receives that cookie. Without this check, the owner of one
+/// app could replay a visitor's token against another app the visitor can
+/// reach. A token for Rise's own URL is a web UI session, or an app token from
+/// an install without per-project URLs, where every app shares Rise's host and
+/// cookie anyway.
+async fn audience_admits_project(state: &AppState, project_name: &str, aud: &str) -> bool {
+    // The cheap candidates cover the common case on every app request.
+    if audience_names_app(aud, &state.public_url)
+        || build_project_url(state, project_name).is_some_and(|url| audience_names_app(aud, &url))
+    {
+        return true;
+    }
+    project_app_urls(state, project_name)
+        .await
+        .iter()
+        .any(|url| audience_names_app(aud, url))
+}
+
+/// The base URLs `project_name`'s app answers on: its template URL plus every
+/// active deployment's URL (default host + custom domains), across groups.
+/// Lookups are best-effort; a failed one leaves its URLs out.
+async fn project_app_urls(state: &AppState, project_name: &str) -> Vec<String> {
+    let mut urls: Vec<String> = build_project_url(state, project_name).into_iter().collect();
     if let Ok(Some(project)) = projects::find_by_name(&state.db_pool, project_name).await {
         if let Ok(deployments) =
             crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
                 .await
         {
             for deployment in &deployments {
-                if let Ok(urls) = state
+                if let Ok(deployment_urls) = state
                     .deployment_backend
                     .get_deployment_urls(deployment, &project)
                     .await
                 {
-                    add(&mut hosts, host_of(&urls.default_url));
-                    for custom in &urls.custom_domain_urls {
-                        add(&mut hosts, host_of(custom));
-                    }
+                    urls.push(deployment_urls.default_url);
+                    urls.extend(deployment_urls.custom_domain_urls);
                 }
             }
         }
     }
-    hosts
+    urls
 }
 
 /// Validate and sanitize a redirect URL to prevent open redirect vulnerabilities
@@ -459,6 +496,7 @@ async fn issue_session(
     claims: &serde_json::Value,
     login: &ResolvedLogin,
     client: SessionClient,
+    authorization_details: Option<Vec<serde_json::Value>>,
 ) -> Result<String, LoginFailure> {
     // Resolve the user's team memberships for the groups claim; on a DB error,
     // fall back to no groups rather than failing the login.
@@ -470,6 +508,7 @@ async fn issue_session(
         rise_uid: login.identity.principal.uid,
         identity_uid: login.identity.identity_uid,
         client,
+        authorization_details,
     };
     state
         .jwt_signer
@@ -485,6 +524,10 @@ pub struct CodeExchangeRequest {
     pub code: String,
     pub code_verifier: String,
     pub redirect_uri: String,
+    /// The access the session is restricted to (ADR-0006). Omitted means
+    /// full access.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -509,6 +552,10 @@ pub struct AuthorizeRequest {
     pub client_name: Option<String>,
     /// Flow type: "code" for authorization code flow, "device" for device flow
     pub flow: String,
+    /// For device flow: the access the login asks for (ADR-0006). Omitted
+    /// means full access. The approver may change it.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -551,6 +598,12 @@ pub async fn authorize(
 ) -> Result<Json<AuthorizeResponse>, (StatusCode, String)> {
     match payload.flow.as_str() {
         "code" => {
+            if payload.access.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "For the code flow, send `access` with the code exchange".to_string(),
+                ));
+            }
             // Authorization code flow with PKCE
             let redirect_uri = payload.redirect_uri.ok_or_else(|| {
                 (
@@ -608,8 +661,22 @@ pub async fn authorize(
                     )
                 })?;
             let client_ip = (client_ip != "unknown").then_some(client_ip);
+            // Only the shape is checked here: the endpoint is unauthenticated,
+            // so whether the named projects exist is the approver's to see.
+            if let Some(access) = &payload.access {
+                access.validate().map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid access request: {e}"),
+                    )
+                })?;
+            }
             let started = super::device::DeviceFlow::new(&state)
-                .start(payload.client_name.as_deref(), client_ip.as_deref())
+                .start(
+                    payload.client_name.as_deref(),
+                    client_ip.as_deref(),
+                    payload.access.as_ref(),
+                )
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to start device flow: {:?}", e);
@@ -646,6 +713,16 @@ pub async fn code_exchange(
         "Code exchange request: redirect_uri={}",
         payload.redirect_uri
     );
+
+    // A malformed access request fails before the single-use code is spent.
+    if let Some(access) = &payload.access {
+        access.validate().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid access request: {e}"),
+            )
+        })?;
+    }
 
     // Exchange authorization code for tokens using PKCE
     let token_info = state
@@ -707,9 +784,21 @@ pub async fn code_exchange(
     let login = resolve_login(&state, &claims)
         .await
         .map_err(|failure| failure.response())?;
-    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Cli)
-        .await
-        .map_err(|failure| failure.response())?;
+    let authorization_details = match &payload.access {
+        Some(access) => super::session_scope::compile_grant(&state, &login.user, access)
+            .await
+            .map_err(|e| (e.status, e.message))?,
+        None => None,
+    };
+    let rise_jwt = issue_session(
+        &state,
+        &claims,
+        &login,
+        SessionClient::Cli,
+        authorization_details,
+    )
+    .await
+    .map_err(|failure| failure.response())?;
     let user = login.user;
 
     tracing::info!(
@@ -727,6 +816,9 @@ pub struct MeResponse {
     pub is_admin: bool,
     pub is_operator: bool,
     pub can_create_teams: bool,
+    /// What this session may do: `{"kind": "full"}`, or the grants of a
+    /// scoped CLI session (ADR-0006).
+    pub access: AccessRequest,
 }
 
 /// Get current user info from auth middleware
@@ -734,6 +826,7 @@ pub struct MeResponse {
 pub async fn me(
     State(state): State<AppState>,
     auth: crate::server::auth::context::AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
 ) -> Result<Json<MeResponse>, (StatusCode, String)> {
     let user = auth.user().map_err(|e| (e.status, e.message))?;
     // User is injected by auth middleware
@@ -747,6 +840,7 @@ pub async fn me(
         is_admin,
         is_operator,
         can_create_teams,
+        access: scope.map_or(AccessRequest::Full, |scope| scope.access()),
     }))
 }
 
@@ -1255,7 +1349,7 @@ pub async fn oauth_callback(
     let login = resolve_login(&state, &claims)
         .await
         .map_err(|failure| failure.response())?;
-    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Browser)
+    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Browser, None)
         .await
         .map_err(|failure| failure.response())?;
 
@@ -1636,6 +1730,17 @@ pub async fn ingress_auth(
         }
     };
 
+    // A token minted for another app (which received it as its own cookie)
+    // never opens this one.
+    if !audience_admits_project(&state, &params.project, &ingress_claims.aud).await {
+        tracing::warn!(
+            project = %params.project,
+            aud = %ingress_claims.aud,
+            "Ingress token was minted for another app"
+        );
+        return Ok(unauthenticated("Session is for another app"));
+    }
+
     // A disabled User or identity loses app access with every other token: a
     // session re-resolves its User and minting identity, and an ingress token
     // — which keeps the IdP's `sub` — is checked against that identity's
@@ -1896,6 +2001,9 @@ pub async fn oauth_logout(
 pub struct CliAuthSuccessQuery {
     pub success: Option<bool>,
     pub error: Option<String>,
+    /// The session's access as the CLI read it back: `full`, or one
+    /// `<target>: <access>` line per grant.
+    pub access: Option<String>,
 }
 
 /// Handler for CLI authentication success/failure page
@@ -1925,6 +2033,11 @@ pub async fn cli_auth_success(
     context.insert("success", &success);
     if let Some(error) = params.error {
         context.insert("error_message", &error);
+    }
+    match params.access.as_deref() {
+        Some("full") => context.insert("access_full", &true),
+        Some(grants) => context.insert("access_grants", &grants.lines().collect::<Vec<_>>()),
+        None => {}
     }
 
     let html = tera
@@ -2036,6 +2149,27 @@ mod tests {
             url,
             "http://rise.localhost:3000/api/v1/auth/signin?project=app"
         );
+    }
+
+    #[test]
+    fn audience_names_only_its_own_app() {
+        let app = "https://shop.apps.example.com";
+        assert!(audience_names_app(app, "https://shop.apps.example.com/"));
+        // Either scheme reaches the same app.
+        assert!(audience_names_app(app, "http://shop.apps.example.com"));
+        assert!(!audience_names_app(app, "https://other.apps.example.com"));
+        assert!(!audience_names_app(
+            app,
+            "https://shop.apps.example.com:8443"
+        ));
+
+        // Sub-path layouts share a host: the path tells the apps apart.
+        let shop = "https://apps.example.com/shop";
+        assert!(audience_names_app(shop, "https://apps.example.com/shop/"));
+        assert!(!audience_names_app(shop, "https://apps.example.com/other"));
+        assert!(!audience_names_app(shop, "https://apps.example.com"));
+
+        assert!(!audience_names_app("not a url", app));
     }
 
     #[test]

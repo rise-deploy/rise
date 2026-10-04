@@ -54,10 +54,10 @@ class RiseAPI {
         return this.request(`/auth/device?user_code=${encodeURIComponent(userCode)}`);
     }
 
-    async approveDevice(userCode) {
+    async approveDevice(userCode, access) {
         return this.request('/auth/device/approve', {
             method: 'POST',
-            body: JSON.stringify({ user_code: userCode })
+            body: JSON.stringify({ user_code: userCode, access })
         });
     }
 

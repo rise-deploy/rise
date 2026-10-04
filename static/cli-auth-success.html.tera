@@ -56,6 +56,13 @@
         .steps p { margin: 0 0 6px; color: var(--text); font-weight: 500; }
         .steps ul { margin: 0; padding-left: 18px; }
         .steps li { margin: 4px 0; }
+        .access {
+            text-align: left; border: 1px solid var(--border-faint); border-radius: 8px;
+            padding: 12px 14px; margin-top: 18px; font-size: 13px; color: var(--muted);
+        }
+        .access p { margin: 0 0 6px; color: var(--text); font-weight: 500; }
+        .access ul { margin: 0; padding: 0; list-style: none; }
+        .access li { margin: 4px 0; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; }
         .errbox {
             background: var(--err-bg); color: var(--err);
             border: 1px solid color-mix(in oklch, var(--err) 30%, transparent);
@@ -71,6 +78,19 @@
         <div class="badge ok" aria-hidden="true">&check;</div>
         <h1>CLI authentication successful</h1>
         <p>You're signed in to the Rise CLI. You can close this window and return to your terminal.</p>
+        {% if access_full %}
+        <div class="access">
+            <p>Access: full</p>
+            This session can do everything your account can.
+        </div>
+        {% elif access_grants %}
+        <div class="access">
+            <p>Access: restricted to</p>
+            <ul>
+                {% for grant in access_grants %}<li>{{ grant }}</li>{% endfor %}
+            </ul>
+        </div>
+        {% endif %}
         <div class="steps">
             <p>Next steps</p>
             <ul>
