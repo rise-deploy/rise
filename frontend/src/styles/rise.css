@@ -545,7 +545,6 @@ a { color: inherit; }
 .r-split-btn-main.active { color: var(--ok); background: var(--ok-bg); }
 .r-split-btn-main.active .dot {
     background: var(--ok);
-    box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 30%, transparent);
     animation: r-pulse-soft 2.4s infinite;
 }
 .r-split-btn-side.active { color: var(--accent); background: var(--accent-soft); }
@@ -729,7 +728,7 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     text-overflow: ellipsis;
 }
 .r-cbox-item:hover, .r-cbox-item.sel { background: var(--surface-2); }
-.r-cbox-item.sel { box-shadow: inset 2px 0 0 var(--accent); }
+.r-cbox-item.sel { background: var(--accent-soft); }
 .r-cbox-item .check {
     width: 14px;
     height: 14px;
@@ -811,9 +810,6 @@ textarea.r-field { resize: vertical; min-height: 80px; font-family: 'JetBrains M
     border-radius: 4px;
     color: var(--text-muted);
 }
-.r-pill.env-prod { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
-.r-pill.env-staging { color: var(--info); background: var(--info-bg); border-color: transparent; }
-.r-pill.env-global { color: var(--text-muted); background: var(--surface-2); border-color: transparent; }
 .r-pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
 
 .r-project-status-link { display: inline-flex; border-radius: 999px; text-decoration: none; }
@@ -900,9 +896,7 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 }
 .r-status.healthy .dot, .r-status.running .dot, .r-status.ok .dot, .r-status.available .dot, .r-status.active .dot {
     background: var(--ok);
-    box-shadow: 0 0 0 3px color-mix(in oklch, var(--ok) 30%, transparent);
 }
-.r-status.healthy .dot, .r-status.running .dot { animation: r-pulse-soft 2.4s infinite; }
 
 .r-status.unhealthy, .r-status.failed, .r-status.error, .r-status.bad {
     color: var(--err);
@@ -910,9 +904,7 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 }
 .r-status.unhealthy .dot, .r-status.failed .dot, .r-status.error .dot, .r-status.bad .dot {
     background: var(--err);
-    box-shadow: 0 0 0 3px color-mix(in oklch, var(--err) 30%, transparent);
 }
-.r-status.unhealthy .dot { animation: r-pulse-soft 1.6s infinite; }
 
 /* In progress: accent, pulsing while work is underway. */
 .r-status.building, .r-status.deploying, .r-status.queued, .r-status.pending,
@@ -1398,17 +1390,6 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 .r-group-name { display: flex; align-items: center; gap: 9px; }
 .r-group-name strong { color: var(--text); font-weight: 600; font-size: 13px; }
 
-.r-branch-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 1px 8px;
-    border-radius: 999px;
-    background: var(--surface);
-    border: 1px solid var(--border-faint);
-    font-size: 11px;
-    color: var(--text-muted);
-}
 
 /* ---------- Deployment overview and variable snapshots ---------- */
 .r-deployment-overview { align-items: start; }
@@ -1586,7 +1567,6 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
     border: 1px solid var(--border-faint);
     background: var(--surface);
     border-radius: 8px;
-    box-shadow: var(--shadow-md);
     display: flex;
     flex-direction: column;
     gap: 18px;
@@ -1600,7 +1580,6 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
     color: var(--accent-fg);
     display: grid; place-items: center;
     font-weight: 700; font-size: 22px;
-    box-shadow: var(--shadow-sm);
 }
 
 /* ---------- Alerts ---------- */
@@ -1628,11 +1607,11 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 }
 .dark .r-alert.err { color: var(--err); }
 .r-alert.info {
-    background: var(--info-bg);
-    border-color: color-mix(in oklch, var(--info) 30%, transparent);
-    color: oklch(0.36 0.12 250);
+    background: var(--accent-soft);
+    border-color: color-mix(in oklch, var(--accent) 25%, transparent);
+    color: var(--text);
 }
-.dark .r-alert.info { color: var(--info); }
+.r-alert.info > svg { color: var(--accent); }
 
 /* ---------- Key/value list ---------- */
 .r-kv { display: grid; grid-template-columns: max-content 1fr; gap: 10px 22px; font-size: 13px; }
@@ -1659,10 +1638,9 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
     overflow: hidden;
     cursor: pointer;
     background: var(--surface);
-    box-shadow: var(--shadow-sm);
-    transition: transform 0.12s, border-color 0.12s, box-shadow 0.12s;
+    transition: border-color 0.14s, box-shadow 0.14s;
 }
-.r-palette-btn:hover { transform: translateY(-1px); border-color: var(--border-strong); }
+.r-palette-btn:hover { border-color: var(--border-strong); }
 .r-palette-btn[aria-checked="true"] {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px color-mix(in oklch, var(--accent) 35%, transparent);

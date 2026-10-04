@@ -685,12 +685,10 @@ export function EnvVarsList({ projectName, deploymentId }) {
 
     const TypeTag = ({ envVar }) => {
         if (envVar.is_protected) {
-            return <span className="r-pill" style={{ color: 'var(--info)', background: 'var(--info-bg)', borderColor: 'transparent' }}>protected</span>;
+            return <span className="r-var-badge protected" title="Write-only: can't be revealed or read back"><Icon name="lock" size={10} />Protected</span>;
         }
-        if (envVar.is_secret) {
-            return <span className="r-pill" style={{ color: 'var(--warn)', background: 'var(--warn-bg)', borderColor: 'transparent' }}>secret</span>;
-        }
-        return <span className="r-pill">plain</span>;
+        if (envVar.is_secret) return <span className="r-var-badge secret">Secret</span>;
+        return <span className="muted">Plain</span>;
     };
 
     // Renders the masked/revealed value cell with a reveal eye for readable secrets.

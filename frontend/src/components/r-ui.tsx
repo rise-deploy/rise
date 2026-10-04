@@ -77,7 +77,7 @@ export function OwnerLabel({ owner, size = 12, link = false }: { owner?: { email
 }
 
 // ---------- Pill ----------
-export function Pill({ children, kind, className, tooltip, title }: { children: React.ReactNode; kind?: 'env-prod' | 'env-staging' | 'env-global' | 'accent'; className?: string; tooltip?: React.ReactNode; title?: string }) {
+export function Pill({ children, kind, className, tooltip, title }: { children: React.ReactNode; kind?: 'accent'; className?: string; tooltip?: React.ReactNode; title?: string }) {
     const node = <span className={cx('r-pill', kind, className)} title={tooltip ? undefined : title}>{children}</span>;
     return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
 }

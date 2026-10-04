@@ -270,7 +270,7 @@ Crisp and compact.
 - **Focus:** 2px indigo outline, 2px offset.
 
 ### Status badges and dots
-- **Badge:** dot (6px) and label, 2px 9px padding, 4px corners, 11.75px/500, coloured by tone. In-progress dots pulse at 1.2s. A badge can carry a more precise label than its status, e.g. "Deploy failed" for an environment still served by its previous deployment.
+- **Badge:** dot (6px) and label, 2px 9px padding, 4px corners, 11.75px/500, coloured by tone. In-progress dots pulse at 1.2s; the only other moving dot is the green Live indicator of a streaming log console. Healthy and failing dots are still. A badge can carry a more precise label than its status, e.g. "Deploy failed" for an environment still served by its previous deployment.
 - **Dot:** 7px circle in sidebar, list rows and pickers, same tones.
 
 ### Chips
