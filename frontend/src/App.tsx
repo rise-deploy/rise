@@ -238,11 +238,15 @@ export function App() {
         };
     }, [user?.id]);
 
-    // `/projects?create=project` predates the new-project page.
-    if (pathname === '/projects' && new URLSearchParams(window.location.search).get('create') === 'project') {
+    // `/projects?create=project` predates the new-project page. Render the
+    // page straight away, and move the router there so later renders agree.
+    const legacyCreate = pathname === '/projects' && new URLSearchParams(window.location.search).get('create') === 'project';
+    if (legacyCreate) pathname = '/projects/new';
+    useEffect(() => {
+        if (!legacyCreate) return;
         window.history.replaceState({}, '', '/projects/new');
-        pathname = '/projects/new';
-    }
+        window.dispatchEvent(new Event('rise:navigate'));
+    }, [legacyCreate]);
     const route = parseRoute(pathname);
     const currentProject = routeProject(route);
 

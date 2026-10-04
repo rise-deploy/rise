@@ -193,18 +193,21 @@ function TeamDetail({ teamName, currentUser }: { teamName: string; currentUser: 
     const ownerIds = (team.owners || []).map(o => o.id);
     const memberIds = (team.members || []).map(m => m.id);
 
-    const update = async (owners: string[], members: string[], message: string) => {
+    /** Saves the roster; resolves to whether it was saved. */
+    const update = async (owners: string[], members: string[], message: string): Promise<boolean> => {
         if (owners.length === 0) {
             showToast('A team needs at least one owner', 'error');
-            return;
+            return false;
         }
         try {
             await api.updateTeam(team.id, { owners, members });
             showToast(message, 'success');
             await load();
             window.dispatchEvent(new Event('rise:mutation'));
+            return true;
         } catch (err) {
             showToast(`Failed to update team: ${(err as Error).message}`, 'error');
+            return false;
         }
     };
 
@@ -337,7 +340,7 @@ function AddPersonModal({ open, onClose, team, knownEmails, onAdd }: {
     onClose: () => void;
     team: Team;
     knownEmails: string[];
-    onAdd: (id: string, email: string, role: Role) => Promise<void>;
+    onAdd: (id: string, email: string, role: Role) => Promise<boolean>;
 }) {
     const [email, setEmail] = useState('');
     const [role, setRole] = useState<Role>('member');
@@ -356,8 +359,7 @@ function AddPersonModal({ open, onClose, team, knownEmails, onAdd }: {
                 showToast(`No Rise account for ${value} — they need to sign in to Rise once first`, 'error');
                 return;
             }
-            await onAdd(user.id, user.email, role);
-            onClose();
+            if (await onAdd(user.id, user.email, role)) onClose();
         } catch (err) {
             const msg = (err as Error).message;
             showToast(msg.includes('404') ? `No Rise account for ${value} — they need to sign in to Rise once first` : `Failed to add ${value}: ${msg}`, 'error');
