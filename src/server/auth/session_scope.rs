@@ -89,6 +89,22 @@ impl SessionScope {
         }
     }
 
+    /// Keep the `items` the ceiling allows `op` on, each in the project and
+    /// environment `target` names. Counts as consulting the ceiling even when
+    /// there is nothing to filter.
+    pub fn retain<T>(
+        &self,
+        items: &mut Vec<T>,
+        op: Operation,
+        target: impl Fn(&T) -> (String, Option<String>),
+    ) {
+        self.consulted.store(true, Ordering::Relaxed);
+        items.retain(|item| {
+            let (project, environment) = target(item);
+            self.allows(op, &project, environment.as_deref())
+        });
+    }
+
     /// The grants the session holds, for display.
     pub fn access(&self) -> AccessRequest {
         self.ceiling.to_access()
@@ -219,10 +235,11 @@ fn classify(method: &Method, path: &str) -> Rule {
             OnDeployment(sub(Get, EnvironmentVariable, Subresource::Value))
         }
 
+        // `?environment=` lists that environment's variables together with
+        // the project-wide ones, and may decrypt secrets: the handler filters
+        // per variable.
         ("GET", "/projects/{project_id_or_name}/env")
-        | ("GET", "/projects/{project_id_or_name}/env/preview") => {
-            OnEnvVar(op(List, EnvironmentVariable))
-        }
+        | ("GET", "/projects/{project_id_or_name}/env/preview") => Handler,
         ("PUT", "/projects/{project_id_or_name}/env/{key}") => {
             OnEnvVar(op(Update, EnvironmentVariable))
         }
@@ -368,6 +385,15 @@ async fn decide(
             scope.require(op, &project, environment.as_deref())?;
         }
         Rule::OnDeployment(op) => {
+            // Listing a deployment's variables with their values decrypts the
+            // unprotected secrets among them.
+            let op = if op == Operation::new(Verb::List, Kind::EnvironmentVariable)
+                && query_param(&parts.uri, "include_unprotected_values").as_deref() == Some("true")
+            {
+                Operation::sub(Verb::Get, Kind::EnvironmentVariable, Subresource::Value)
+            } else {
+                op
+            };
             let project = project_name(state, project_param).await?;
             let environment = match param("deployment_id") {
                 Some(deployment_id) => {
@@ -508,8 +534,40 @@ pub async fn refuse_on_resource_api(req: Request, next: Next) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A scoped session granting `access` (an [`AccessRequest`] as JSON).
+    pub(crate) fn scope(access: serde_json::Value) -> SessionScope {
+        let request: AccessRequest = serde_json::from_value(access).unwrap();
+        let details = rise_backend_auth::session_scope::compile("default", &request).unwrap();
+        SessionScope::new(SessionCeiling::parse(&details).unwrap(), "default")
+    }
+
+    #[test]
+    fn env_var_listings_filter_in_the_handler() {
+        // `?environment=` mixes in project-wide variables and may decrypt
+        // secrets: the path alone can't decide.
+        for path in [
+            "/projects/{project_id_or_name}/env",
+            "/projects/{project_id_or_name}/env/preview",
+        ] {
+            assert_eq!(classify(&Method::GET, path), Rule::Handler);
+        }
+    }
+
+    #[test]
+    fn retain_counts_as_consulting_on_an_empty_list() {
+        let scope = scope(serde_json::json!({
+            "kind": "restricted",
+            "grants": [{"project": "app", "preset": "read"}],
+        }));
+        let mut none: Vec<&str> = Vec::new();
+        scope.retain(&mut none, Operation::new(Verb::List, Kind::Project), |p| {
+            (p.to_string(), None)
+        });
+        assert!(scope.consulted.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn unknown_routes_need_full_access() {

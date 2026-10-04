@@ -356,7 +356,7 @@ pub async fn list_projects(
     // A scoped session sees the projects it covers, an admin's included.
     if let Some(scope) = &scope {
         let list = Operation::new(Verb::List, Kind::Project);
-        projects.retain(|project| scope.allows(list, &project.name, None));
+        scope.retain(&mut projects, list, |project| (project.name.clone(), None));
     }
 
     let api_projects = projects_to_api(&state, projects).await?;

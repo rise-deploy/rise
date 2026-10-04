@@ -719,6 +719,17 @@ impl Scenario for ScopedDeviceLogin {
             )?,
             "environment create",
         )?;
+        // A project-wide secret and a staging one, both retrievable.
+        for (key, value, environment) in [
+            ("E2E_GLOBAL_SECRET", "global-value", None),
+            ("E2E_STAGING_SECRET", "staging-value", Some("staging")),
+        ] {
+            let mut args = vec!["env", "set", "-p", &project, "--secret", key, value];
+            if let Some(environment) = environment {
+                args.extend(["-E", environment]);
+            }
+            expect_ok(b.rise_cli(&args, None)?, "env set")?;
+        }
         expect_ok(
             Self::deploy(b, &project, "production", &app, None)?,
             "production deploy",
@@ -810,8 +821,36 @@ impl Scenario for ScopedDeviceLogin {
         let send = |method: reqwest::Method, path: String, body: serde_json::Value| {
             http::send_json(method, &format!("{api}/api/v1{path}"), &token, &body)
         };
+
+        // Staging's variables come back without the project-wide ones mixed
+        // in, and without secret values: `deploy` doesn't include `secrets`.
+        for path in [
+            format!("/projects/{project}/env?environment=staging&include_unprotected_values=true"),
+            format!("/projects/{project}/env/preview?environment=staging"),
+        ] {
+            let resp = get(path.clone())?;
+            anyhow::ensure!(
+                resp.status == 200,
+                "GET {path}: {}\n{}",
+                resp.status,
+                resp.body
+            );
+            anyhow::ensure!(
+                resp.body.contains("E2E_STAGING_SECRET")
+                    && !resp.body.contains("E2E_GLOBAL_SECRET")
+                    && !resp.body.contains("-value"),
+                "GET {path} leaked beyond staging's masked variables:\n{}",
+                resp.body
+            );
+        }
         let denied = [
             ("GET other project", get(format!("/projects/{other}"))?),
+            (
+                "decrypt a staging deployment's env",
+                get(format!(
+                    "/projects/{project}/deployments/{staging_id}/env?include_unprotected_values=true"
+                ))?,
+            ),
             (
                 "GET production",
                 get(format!("/projects/{project}/environments/production"))?,
