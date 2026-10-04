@@ -147,7 +147,7 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
                         <Icon name="terminal" size={15} />
                     </button>
                     <button type="button" className="r-icon-btn" title="Variables" aria-label={`${env.name} variables`}
-                        onClick={() => navigate(`${projectPath(projectName, 'variables')}#env-${encodeURIComponent(env.name)}`)}>
+                        onClick={() => navigate(`${projectPath(projectName, 'variables')}?env=${encodeURIComponent(env.name)}`)}>
                         <Icon name="key" size={15} />
                     </button>
                     {live && (
