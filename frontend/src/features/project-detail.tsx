@@ -8,7 +8,8 @@ import { Icon } from '../components/icon';
 import { LoadingState, ErrorState } from '../components/states';
 import { DeploymentsList } from './deployments';
 import { ProjectStatusPill } from '../components/project-table';
-import { DomainsList, EnvVarsList, ExtensionsList } from './resources';
+import { DomainsList, ExtensionsList } from './resources';
+import { VariablesSection } from './variables';
 import { EnvironmentRows, EnvironmentsSection } from './environments';
 import { AppUsersList } from './projects';
 import { useQuickstartTemplates } from './quickstart-templates';
@@ -19,7 +20,7 @@ import { deploymentPath, projectPath, type ProjectSection } from '../lib/routes'
 import { SectionHead } from '../components/section-head';
 
 // Sections that render their own head because it carries actions.
-const SELF_HEADED = new Set<ProjectSection>(['environments']);
+const SELF_HEADED = new Set<ProjectSection>(['environments', 'variables', 'domains', 'extensions']);
 
 interface AccessClass { id: string; display_name?: string; description?: string }
 
@@ -50,7 +51,7 @@ export function ProjectDetail({ section }: { section: ProjectSection }) {
             {section === 'overview' && <ProjectOverview project={project} onUpdated={reload} />}
             {section === 'deployments' && <DeploymentsList projectName={projectName} />}
             {section === 'environments' && <EnvironmentsSection />}
-            {section === 'variables' && <EnvVarsList projectName={projectName} deploymentId={undefined} />}
+            {section === 'variables' && <VariablesSection />}
             {section === 'domains' && <DomainsList projectName={projectName} defaultUrl={project.default_url} />}
             {section === 'extensions' && <ExtensionsList projectName={projectName} />}
             {section === 'access' && (
@@ -182,6 +183,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: Pr
     const { templates } = useQuickstartTemplates();
     const { showToast } = useToast();
     const [updating, setUpdating] = useState(false);
+    const prodEnvName = productionEnv(useCurrentProject()?.environments ?? [])?.name ?? null;
     if (!project.template) return null;
 
     const stored = project.template;
@@ -192,7 +194,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: Pr
         if (!catalog) return;
         setUpdating(true);
         try {
-            await api.createDeploymentFromImage(projectName, catalog.image, catalog.http_port);
+            await api.createDeploymentFromImage(projectName, catalog.image, catalog.http_port, prodEnvName);
             await api.updateProjectTemplateImage(projectName, catalog.image);
             showToast(`Redeploying ${catalog.display_name} with ${catalog.image}…`, 'success');
             window.dispatchEvent(new Event('rise:mutation'));

@@ -405,52 +405,6 @@
 .mono-state-error { color: var(--err); border-color: color-mix(in oklch, var(--err) 30%, var(--border)); background: var(--err-bg); }
 
 /* Legacy login wrap — still used as fallback */
-.mono-login-wrap {
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 40px;
-    background: var(--bg);
-}
-.mono-login-card {
-    width: 380px;
-    max-width: 100%;
-    padding: 32px;
-    border: 1px solid var(--border-faint);
-    background: var(--surface);
-    border-radius: 8px;
-    box-shadow: var(--shadow-md);
-    color: var(--text);
-}
-.mono-login-logo {
-    width: 48px;
-    height: 48px;
-    border-radius: 6px;
-    background: var(--accent);
-    color: var(--accent-fg);
-    display: grid;
-    place-items: center;
-    font-weight: 700;
-    font-size: 22px;
-    box-shadow: var(--shadow-sm);
-}
-.mono-login-title { font-size: 20px; font-weight: 600; color: var(--text); margin: 8px 0 4px; }
-.mono-login-subtitle { font-size: 13.5px; color: var(--text-muted); margin: 0; }
-.mono-login-button {
-    width: 100%;
-    padding: 10px 14px;
-    margin-top: 14px;
-    background: var(--accent);
-    color: var(--accent-fg);
-    border: none;
-    border-radius: 4px;
-    font-weight: 500;
-    font-size: 13.5px;
-    cursor: pointer;
-    transition: filter 0.14s;
-}
-.mono-login-button:hover { filter: brightness(1.06); }
 
 /* Shortcut hint */
 .mono-shortcut-hint {

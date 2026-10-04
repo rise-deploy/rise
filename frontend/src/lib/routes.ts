@@ -26,8 +26,8 @@ export const PROJECT_SECTIONS: ProjectSectionInfo[] = [
     { id: 'deployments', label: 'Deployments', short: 'Deploys', icon: 'commit', sub: 'Every deployment of this project, newest first' },
     { id: 'environments', label: 'Environments', short: 'Envs', icon: 'layer', sub: 'Promote, roll back and redeploy each environment' },
     { id: 'variables', label: 'Variables', short: 'Vars', icon: 'key', sub: 'Environment variables, applied on the next deployment' },
-    { id: 'domains', label: 'Domains', short: 'Domains', icon: 'globe', sub: 'Custom domains per environment' },
-    { id: 'extensions', label: 'Extensions', short: 'Extensions', icon: 'puzzle', sub: 'Managed resources and integrations attached to this project' },
+    { id: 'domains', label: 'Domains', short: 'Domains', icon: 'globe', sub: 'Point your own domains at an environment. Each environment has its own primary domain.' },
+    { id: 'extensions', label: 'Extensions', short: 'Extensions', icon: 'puzzle', sub: 'Datastores, managed services and integrations connected to this project' },
     { id: 'logs', label: 'Logs', short: 'Logs', icon: 'terminal', sub: 'Logs of one deployment at a time' },
     { id: 'access', label: 'Access', short: 'Access', icon: 'lock', sub: 'Who can reach the deployed app, ownership and service accounts' },
 ];
@@ -46,6 +46,7 @@ export type Route =
     | { view: 'profile' }
     | { view: 'device' }
     | { view: 'projects' }
+    | { view: 'new-project' }
     | { view: 'teams' }
     | { view: 'team-detail'; teamName: string }
     | { view: 'project'; projectName: string; section: ProjectSection }
@@ -67,7 +68,7 @@ export function parseRoute(pathname: string): Route {
         case 'device':
             return { view: 'device' };
         case 'projects':
-            return { view: 'projects' };
+            return a === 'new' ? { view: 'new-project' } : { view: 'projects' };
         case 'teams':
             return { view: 'teams' };
         case 'team':

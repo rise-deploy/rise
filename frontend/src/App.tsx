@@ -11,11 +11,12 @@ import { Home } from './features/home';
 import { Profile } from './features/profile';
 import { DeviceLogin } from './features/device-login';
 import { ProjectsList } from './features/projects-list';
+import { NewProjectPage } from './features/new-project';
 import { ProjectDetail } from './features/project-detail';
 import { DeploymentDetail, EnvironmentDeploymentView } from './features/deployments';
 import { DeploymentLogsPage } from './features/logs/logs-page';
 import { ExtensionDetailPage } from './features/resources';
-import { TeamDetail, TeamsList } from './features/teams';
+import { TeamsPage } from './features/teams';
 import { resolveTheme, usePrefs } from './lib/prefs';
 import { ErrorBoundary } from './components/error-boundary';
 import { ProjectProvider, useCurrentProject, type Project } from './lib/project-context';
@@ -119,6 +120,7 @@ function breadcrumbsFor(route: Route): Crumb[] {
         case 'profile': return [{ label: 'Profile' }];
         case 'device': return [{ label: 'Device login' }];
         case 'projects': return [{ label: 'Projects' }];
+        case 'new-project': return [{ label: 'Projects', href: '/projects' }, { label: 'New project' }];
         case 'teams': return [{ label: 'Teams' }];
         case 'team-detail': return [{ label: 'Teams', href: '/teams' }, { label: route.teamName }];
         case 'project':
@@ -151,7 +153,7 @@ export function App() {
     const [palette, setPalette] = useState<{ open: boolean; scope?: 'projects' }>({ open: false });
     const [paletteProjects, setPaletteProjects] = useState<Project[]>([]);
     const [paletteTeams, setPaletteTeams] = useState<TeamSummary[]>([]);
-    const pathname = usePathLocation();
+    let pathname = usePathLocation();
     const { showToast } = useToast();
 
     useEffect(() => {
@@ -236,6 +238,15 @@ export function App() {
         };
     }, [user?.id]);
 
+    // `/projects?create=project` predates the new-project page. Render the
+    // page straight away, and move the router there so later renders agree.
+    const legacyCreate = pathname === '/projects' && new URLSearchParams(window.location.search).get('create') === 'project';
+    if (legacyCreate) pathname = '/projects/new';
+    useEffect(() => {
+        if (!legacyCreate) return;
+        window.history.replaceState({}, '', '/projects/new');
+        window.dispatchEvent(new Event('rise:navigate'));
+    }, [legacyCreate]);
     const route = parseRoute(pathname);
     const currentProject = routeProject(route);
 
@@ -274,7 +285,7 @@ export function App() {
         run: () => navigate(projectPath(p.name)),
     }));
     commandItems.push(
-        { id: 'create-project', kind: 'Action', icon: 'plus', label: 'New project', keywords: ['create'], run: () => navigate('/projects?create=project') },
+        { id: 'create-project', kind: 'Action', icon: 'plus', label: 'New project', keywords: ['create'], run: () => navigate('/projects/new') },
         { id: 'create-team', kind: 'Action', icon: 'plus', label: 'New team', keywords: ['create'], run: () => navigate('/teams?create=team') },
     );
     paletteTeams.forEach(t => commandItems.push({
@@ -301,9 +312,10 @@ export function App() {
             {route.view === 'home' && <Home user={user} />}
             {route.view === 'profile' && <Profile user={user} onLogout={logout} />}
             {route.view === 'device' && <DeviceLogin />}
-            {route.view === 'projects' && <ProjectsList openCreate={createIntent === 'project'} />}
-            {route.view === 'teams' && <TeamsList currentUser={user} openCreate={createIntent === 'team'} />}
-            {route.view === 'team-detail' && <TeamDetail teamName={route.teamName} currentUser={user} />}
+            {route.view === 'projects' && <ProjectsList />}
+            {route.view === 'new-project' && <NewProjectPage />}
+            {route.view === 'teams' && <TeamsPage currentUser={user} openCreate={createIntent === 'team'} />}
+            {route.view === 'team-detail' && <TeamsPage currentUser={user} teamName={route.teamName} />}
             {route.view === 'project' && route.section === 'logs' && <ProjectLogsPage />}
             {route.view === 'project' && route.section !== 'logs' && <ProjectDetail section={route.section} />}
             {route.view === 'environment-deployment' && <EnvironmentDeploymentView projectName={route.projectName} environmentName={route.environmentName} groupName={route.groupName} />}

@@ -1,659 +1,458 @@
-// @ts-nocheck
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
-import { formatDate } from '../lib/utils';
+import { formatRelativeTimeRounded } from '../lib/utils';
+import { useIsMobile } from '../lib/use-media';
+import type { Project } from '../lib/project-context';
+import { projectPath } from '../lib/routes';
 import { useToast } from '../components/toast';
-import { AutocompleteInput } from '../components/r-ui';
-import { ProjectTable } from '../components/project-table';
-import { EmptyState, ErrorState, LoadingState } from '../components/states';
-import { Alert, ConfirmDialog as RConfirmDialog, Panel, PanelBody, PanelHead, Button as RButton, Empty, Field as RField, Input as RInput, Modal as RModal, Pill, Tooltip, colorFor } from '../components/r-ui';
-import { AddMenu, Menu, RosterTable } from '../components/roster-table';
+import { Menu } from '../components/roster-table';
 import { Icon } from '../components/icon';
+import { ErrorState, LoadingState } from '../components/states';
+import {
+    Alert,
+    AutocompleteInput,
+    Button,
+    ConfirmDialog,
+    Empty,
+    Field,
+    Input,
+    Modal,
+    Panel,
+    Segmented,
+    colorFor,
+    cx,
+    statusTone,
+} from '../components/r-ui';
 
+interface TeamUser { id: string; email: string }
 
-// Teams List Component
-export function TeamsList({ currentUser, openCreate = false }) {
-    const [teams, setTeams] = useState([]);
-    const [projects, setProjects] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
-    const [isModalOpen, setIsModalOpen] = useState(false);
-    const [formData, setFormData] = useState({ name: '', members: '', owners: '' });
-    const [saving, setSaving] = useState(false);
-    const [actionStatus, setActionStatus] = useState('');
-    const { showToast } = useToast();
-    // Sort by team name (case-insensitive, numeric-aware) — matches the
-    // previous useSortableData default behaviour.
-    const sortedTeams = useMemo(
-        () => [...teams].sort((a, b) =>
-            String(a.name ?? '').localeCompare(String(b.name ?? ''), undefined, { numeric: true, sensitivity: 'base' })
-        ),
-        [teams]
-    );
+interface Team {
+    id: string;
+    name: string;
+    members: TeamUser[];
+    owners: TeamUser[];
+    idp_managed: boolean;
+    updated: string;
+}
 
-    const loadTeams = useCallback(async () => {
+interface CurrentUser { id: string; email: string; is_admin?: boolean; can_create_teams?: boolean }
+
+interface Person extends TeamUser { isOwner: boolean; isMember: boolean }
+
+type Role = 'member' | 'owner';
+
+function teamProjectCount(projects: Project[], team: Team): number {
+    return projects.filter(p => p.owner && (p.owner.id === team.id || (!p.owner.email && p.owner.name === team.name))).length;
+}
+
+/** Everyone on a team once, with the roles they hold — a person can hold both. */
+function people(team: Team): Person[] {
+    const map = new Map<string, Person>();
+    for (const o of team.owners || []) map.set(o.id, { ...o, isOwner: true, isMember: false });
+    for (const m of team.members || []) {
+        const p = map.get(m.id);
+        if (p) p.isMember = true;
+        else map.set(m.id, { ...m, isOwner: false, isMember: true });
+    }
+    return [...map.values()].sort((a, b) => Number(b.isOwner) - Number(a.isOwner) || a.email.localeCompare(b.email));
+}
+
+function initials(email: string): string {
+    const local = email.split('@')[0] || email;
+    const parts = local.split(/[._-]/).filter(Boolean);
+    return ((parts[0]?.[0] || '') + (parts[1]?.[0] || '')).toUpperCase() || local.slice(0, 2).toUpperCase();
+}
+
+/**
+ * Teams own projects. Desktop shows the list and the selected team side by
+ * side; on mobile the list and a team are separate screens.
+ */
+export function TeamsPage({ currentUser, teamName, openCreate = false }: { currentUser: CurrentUser; teamName?: string; openCreate?: boolean }) {
+    const [teams, setTeams] = useState<Team[] | null>(null);
+    const [projects, setProjects] = useState<Project[]>([]);
+    const [error, setError] = useState<string | null>(null);
+    const [createOpen, setCreateOpen] = useState(false);
+    const isMobile = useIsMobile();
+
+    const load = useCallback(async () => {
         try {
-            const data = await api.getTeams();
-            setTeams(data);
+            const data: Team[] = await api.getTeams();
+            setTeams([...data].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })));
+            setError(null);
         } catch (err) {
-            setError(err.message);
-        } finally {
-            setLoading(false);
+            setError((err as Error).message);
         }
+        api.getProjects().then((p: Project[]) => setProjects(p || [])).catch(() => {});
     }, []);
 
     useEffect(() => {
-        loadTeams();
-        api.getProjects().then(setProjects).catch(() => {});
-    }, [loadTeams]);
-
-    const handleCreateClick = () => {
-        setFormData({ name: '', members: '', owners: currentUser?.email || '' });
-        setIsModalOpen(true);
-    };
+        load();
+        window.addEventListener('rise:mutation', load);
+        return () => window.removeEventListener('rise:mutation', load);
+    }, [load]);
 
     useEffect(() => {
         if (!openCreate) return;
-        handleCreateClick();
+        setCreateOpen(true);
         window.history.replaceState({}, '', window.location.pathname);
-    }, [openCreate, currentUser?.email]);
+    }, [openCreate]);
 
-    const handleCreate = async () => {
-        if (!formData.name) {
-            showToast('Team name is required', 'error');
-            return;
-        }
+    if (error && !teams) return <ErrorState message={`Error loading teams: ${error}`} onRetry={load} />;
+    if (!teams) return <LoadingState label="Loading teams…" />;
 
-        // Parse comma-separated email lists
-        const memberEmails = formData.members
-            .split(',')
-            .map(e => e.trim())
-            .filter(e => e.length > 0);
+    const showList = !isMobile || !teamName;
+    const showDetail = !!teamName;
 
-        const ownerEmails = formData.owners
-            .split(',')
-            .map(e => e.trim())
-            .filter(e => e.length > 0);
+    return (
+        <section>
+            {showList && (
+                <div className="r-page-head">
+                    <div className="title-stack">
+                        <h1 className="r-page-title">Teams</h1>
+                        <div className="r-page-sub">Teams own projects. Owners manage the team and its members.</div>
+                    </div>
+                    {currentUser.can_create_teams && (
+                        <Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>New team</Button>
+                    )}
+                </div>
+            )}
 
-        if (ownerEmails.length === 0) {
-            showToast('At least one owner is required', 'error');
-            return;
-        }
+            <div className={cx(!isMobile && 'r-teams-layout')}>
+                {showList && (
+                    teams.length === 0 ? (
+                        <Panel><Empty title="No teams yet">Create a team to share project ownership across people.</Empty></Panel>
+                    ) : (
+                        <Panel className="r-list r-team-list">
+                            {teams.map(t => {
+                                const mine = t.owners?.some(o => o.email === currentUser.email);
+                                const count = teamProjectCount(projects, t);
+                                return (
+                                    <div
+                                        key={t.id}
+                                        role="link"
+                                        tabIndex={0}
+                                        aria-current={t.name === teamName ? 'page' : undefined}
+                                        className={cx('r-list-row r-team-row', t.name === teamName && 'sel')}
+                                        onClick={() => navigate(`/team/${t.name}`)}
+                                        onKeyDown={e => { if (e.key === 'Enter') navigate(`/team/${t.name}`); }}
+                                    >
+                                        <span className="r-team-tile">{t.name.slice(0, 1).toUpperCase()}</span>
+                                        <span className="body">
+                                            <span className="name">{t.name}{t.idp_managed && <span className="r-env-tag">IdP</span>}{mine && <span className="r-env-tag prod">owner</span>}</span>
+                                            <span className="sub">{people(t).length} {people(t).length === 1 ? 'person' : 'people'} · {count} project{count === 1 ? '' : 's'}</span>
+                                        </span>
+                                        <Icon name="chev" size={14} />
+                                    </div>
+                                );
+                            })}
+                        </Panel>
+                    )
+                )}
+                {showDetail ? (
+                    <TeamDetail key={teamName} teamName={teamName!} currentUser={currentUser} />
+                ) : !isMobile && teams.length > 0 ? (
+                    <Panel><Empty title="Select a team">Pick a team to see its people and projects.</Empty></Panel>
+                ) : null}
+            </div>
 
-        setSaving(true);
-        setActionStatus(`Creating team ${formData.name}...`);
+            <CreateTeamModal open={createOpen} onClose={() => setCreateOpen(false)} currentUser={currentUser} />
+        </section>
+    );
+}
+
+function TeamDetail({ teamName, currentUser }: { teamName: string; currentUser: CurrentUser }) {
+    const [team, setTeam] = useState<Team | null>(null);
+    const [teamProjects, setTeamProjects] = useState<Project[]>([]);
+    const [error, setError] = useState<string | null>(null);
+    const [addOpen, setAddOpen] = useState(false);
+    const [deleteOpen, setDeleteOpen] = useState(false);
+    const [deleting, setDeleting] = useState(false);
+    const { showToast } = useToast();
+
+    const load = useCallback(async () => {
         try {
-            // Look up user IDs for owners and members
+            const [data, projects] = await Promise.all([api.getTeam(teamName), api.getTeamProjects(teamName)]);
+            setTeam(data);
+            setTeamProjects(projects || []);
+            setError(null);
+        } catch (err) {
+            setError((err as Error).message);
+        }
+    }, [teamName]);
+
+    useEffect(() => { load(); }, [load]);
+
+    if (error && !team) return <ErrorState message={`Error loading team: ${error}`} onRetry={load} />;
+    if (!team) return <LoadingState label="Loading team…" />;
+
+    const canManage = !!currentUser.is_admin || team.owners?.some(o => o.email === currentUser.email);
+    // IdP-managed teams can only be changed by admins.
+    const canEdit = canManage && (!team.idp_managed || !!currentUser.is_admin);
+    const roster = people(team);
+    const ownerIds = (team.owners || []).map(o => o.id);
+    const memberIds = (team.members || []).map(m => m.id);
+
+    /** Saves the roster; resolves to whether it was saved. */
+    const update = async (owners: string[], members: string[], message: string): Promise<boolean> => {
+        if (owners.length === 0) {
+            showToast('A team needs at least one owner', 'error');
+            return false;
+        }
+        try {
+            await api.updateTeam(team.id, { owners, members });
+            showToast(message, 'success');
+            await load();
+            window.dispatchEvent(new Event('rise:mutation'));
+            return true;
+        } catch (err) {
+            showToast(`Failed to update team: ${(err as Error).message}`, 'error');
+            return false;
+        }
+    };
+
+    const actionsFor = (p: Person) => {
+        const items: { label: string; icon?: string; onClick: () => void }[] = [];
+        if (!p.isOwner) items.push({ label: 'Make owner', icon: 'user', onClick: () => update([...ownerIds, p.id], memberIds, `${p.email} is now an owner`) });
+        if (p.isOwner && ownerIds.length > 1) items.push({ label: 'Remove owner role', icon: 'user', onClick: () => update(ownerIds.filter(id => id !== p.id), p.isMember ? memberIds : [...memberIds, p.id], `${p.email} is now a member`) });
+        if (p.isOwner && !p.isMember) items.push({ label: 'Also make member', icon: 'user', onClick: () => update(ownerIds, [...memberIds, p.id], `${p.email} is now also a member`) });
+        if (p.isMember && p.isOwner) items.push({ label: 'Remove member role', icon: 'user', onClick: () => update(ownerIds, memberIds.filter(id => id !== p.id), `${p.email} is no longer a member`) });
+        if (!(p.isOwner && ownerIds.length === 1)) {
+            items.push({ label: 'Remove from team', icon: 'trash', onClick: () => update(ownerIds.filter(id => id !== p.id), memberIds.filter(id => id !== p.id), `Removed ${p.email}`) });
+        }
+        return items;
+    };
+
+    const handleDelete = async () => {
+        setDeleting(true);
+        try {
+            await api.deleteTeam(team.id);
+            showToast(`Team ${team.name} deleted`, 'success');
+            window.dispatchEvent(new Event('rise:mutation'));
+            navigate('/teams');
+        } catch (err) {
+            showToast(`Failed to delete team: ${(err as Error).message}`, 'error');
+            setDeleting(false);
+        }
+    };
+
+    const owned = (p: Project) => !!p.owner && (p.owner.id === team.id || (!p.owner.email && p.owner.name === team.name));
+
+    return (
+        <div className="r-team-detail">
+            <div className="r-team-head">
+                <div className="title-stack">
+                    <h2 className="r-team-title"><Icon name="users" size={18} />{team.name}{team.idp_managed && <span className="r-env-tag">IdP</span>}</h2>
+                    <div className="r-page-sub">{roster.length} {roster.length === 1 ? 'person' : 'people'} · updated {formatRelativeTimeRounded(team.updated)}</div>
+                </div>
+                {canEdit && (
+                    <div className="r-page-actions">
+                        <Button variant="primary" icon="plus" onClick={() => setAddOpen(true)}>Add member</Button>
+                        <button type="button" className="r-icon-btn" title="Delete team" aria-label="Delete team" onClick={() => setDeleteOpen(true)}>
+                            <Icon name="trash" size={14} />
+                        </button>
+                    </div>
+                )}
+            </div>
+
+            {team.idp_managed && !currentUser.is_admin && (
+                <Alert tone="info" icon="info">
+                    This team is managed by your identity provider and can only be modified by administrators.
+                </Alert>
+            )}
+
+            <div>
+                <div className="r-label-row"><span className="r-section-label">People</span></div>
+                <Panel className="r-list">
+                    {roster.length === 0 && <div className="r-list-empty">No people in this team.</div>}
+                    {roster.map(p => (
+                        <div key={p.id} className="r-person">
+                            <span className="r-person-ava" style={{ background: colorFor(p.email) }}>{initials(p.email)}</span>
+                            <span className="body">
+                                <span className="name">{p.email.split('@')[0]}{p.email === currentUser.email && <span className="muted"> (you)</span>}</span>
+                                <span className="sub">{p.email}</span>
+                            </span>
+                            <span className="r-roles">
+                                {p.isOwner && <span className="r-role owner">Owner</span>}
+                                {p.isMember && <span className="r-role">Member</span>}
+                            </span>
+                            {canEdit && actionsFor(p).length > 0 ? (
+                                <Menu
+                                    items={actionsFor(p)}
+                                    trigger={({ toggle }) => (
+                                        <button type="button" className="r-icon-btn r-var-act" aria-label={`Change ${p.email}`} onClick={toggle}>
+                                            <Icon name="more" size={16} />
+                                        </button>
+                                    )}
+                                />
+                            ) : canEdit ? <span className="r-person-spacer" title="The last owner can't be removed" /> : null}
+                        </div>
+                    ))}
+                </Panel>
+            </div>
+
+            <div>
+                <div className="r-label-row"><span className="r-section-label">Projects</span></div>
+                {teamProjects.length === 0 ? (
+                    <Panel><div className="r-list-empty">No projects owned by or shared with this team.</div></Panel>
+                ) : (
+                    <div className="r-team-projects">
+                        {[...teamProjects].sort((a, b) => a.name.localeCompare(b.name)).map(p => (
+                            <button type="button" key={p.name} className="r-team-project" onClick={() => navigate(projectPath(p.name))}>
+                                <span className={cx('r-dot', statusTone(p.status))} />
+                                <span className="name">{p.name}</span>
+                                <span className="status">{owned(p) ? p.status : 'shared'}</span>
+                            </button>
+                        ))}
+                    </div>
+                )}
+            </div>
+
+            <AddPersonModal open={addOpen} onClose={() => setAddOpen(false)} team={team}
+                knownEmails={currentUser.email ? [currentUser.email] : []}
+                onAdd={(id, email, role) => update(
+                    role === 'owner' ? Array.from(new Set([...ownerIds, id])) : ownerIds,
+                    role === 'member' ? Array.from(new Set([...memberIds, id])) : memberIds,
+                    `Added ${email} as ${role}`,
+                )} />
+
+            <ConfirmDialog
+                isOpen={deleteOpen}
+                onClose={() => setDeleteOpen(false)}
+                onConfirm={handleDelete}
+                title={`Delete team ${team.name}?`}
+                message="Projects owned by this team lose their owning team. This cannot be undone."
+                confirmText="Delete team"
+                confirmTone="danger"
+                requireText={team.name}
+                loading={deleting}
+            />
+        </div>
+    );
+}
+
+/**
+ * Rise has no invitations: a person is added by email once they have signed in
+ * to Rise at least once (that's when their account exists).
+ */
+function AddPersonModal({ open, onClose, team, knownEmails, onAdd }: {
+    open: boolean;
+    onClose: () => void;
+    team: Team;
+    knownEmails: string[];
+    onAdd: (id: string, email: string, role: Role) => Promise<boolean>;
+}) {
+    const [email, setEmail] = useState('');
+    const [role, setRole] = useState<Role>('member');
+    const [busy, setBusy] = useState(false);
+    const { showToast } = useToast();
+    useEffect(() => { if (open) { setEmail(''); setRole('member'); } }, [open]);
+
+    const submit = async () => {
+        const value = email.trim();
+        if (!value.includes('@')) { showToast('Enter an email address', 'error'); return; }
+        setBusy(true);
+        try {
+            const res: { users?: TeamUser[] } = await api.lookupUsers([value]);
+            const user = res.users?.[0];
+            if (!user) {
+                showToast(`No Rise account for ${value} — they need to sign in to Rise once first`, 'error');
+                return;
+            }
+            if (await onAdd(user.id, user.email, role)) onClose();
+        } catch (err) {
+            const msg = (err as Error).message;
+            showToast(msg.includes('404') ? `No Rise account for ${value} — they need to sign in to Rise once first` : `Failed to add ${value}: ${msg}`, 'error');
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    return (
+        <Modal
+            isOpen={open}
+            onClose={onClose}
+            title={`Add to ${team.name}`}
+            sub="People are added by the email they sign in to Rise with."
+            footer={
+                <>
+                    <Button onClick={onClose} disabled={busy}>Cancel</Button>
+                    <Button variant="primary" onClick={submit} loading={busy}>Add {role}</Button>
+                </>
+            }
+        >
+            <Field label="Email">
+                <AutocompleteInput type="email" value={email} onChange={setEmail} options={knownEmails} placeholder="name@example.com" onEnter={submit} />
+            </Field>
+            <Field label="Role" hint={role === 'owner' ? 'Owners manage the team and its members.' : 'Members can own projects through the team.'}>
+                <Segmented<Role> value={role} options={[{ value: 'member', label: 'Member' }, { value: 'owner', label: 'Owner' }]} onChange={setRole} />
+            </Field>
+        </Modal>
+    );
+}
+
+function CreateTeamModal({ open, onClose, currentUser }: { open: boolean; onClose: () => void; currentUser: CurrentUser }) {
+    const [name, setName] = useState('');
+    const [owners, setOwners] = useState('');
+    const [members, setMembers] = useState('');
+    const [saving, setSaving] = useState(false);
+    const { showToast } = useToast();
+    useEffect(() => {
+        if (open) { setName(''); setOwners(currentUser.email || ''); setMembers(''); }
+    }, [open, currentUser.email]);
+
+    const emails = useMemo(() => (s: string) => s.split(',').map(e => e.trim()).filter(Boolean), []);
+
+    const create = async () => {
+        if (!name) { showToast('Team name is required', 'error'); return; }
+        const ownerEmails = emails(owners);
+        const memberEmails = emails(members);
+        if (ownerEmails.length === 0) { showToast('At least one owner is required', 'error'); return; }
+        setSaving(true);
+        try {
             const ownerLookup = await api.lookupUsers(ownerEmails);
             const memberLookup = memberEmails.length > 0 ? await api.lookupUsers(memberEmails) : { users: [] };
-
             if (!ownerLookup.users || ownerLookup.users.length !== ownerEmails.length) {
-                showToast('One or more owner email addresses not found', 'error');
-                setSaving(false);
+                showToast('One or more owner email addresses have no Rise account', 'error');
                 return;
             }
-
             if (memberEmails.length > 0 && (!memberLookup.users || memberLookup.users.length !== memberEmails.length)) {
-                showToast('One or more member email addresses not found', 'error');
-                setSaving(false);
+                showToast('One or more member email addresses have no Rise account', 'error');
                 return;
             }
-
-            const ownerIds = ownerLookup.users.map(u => u.id);
-            const memberIds = memberLookup.users.map(u => u.id);
-
-            await api.createTeam(formData.name, memberIds, ownerIds);
-            showToast(`Team ${formData.name} created successfully`, 'success');
-            setActionStatus(`Created team ${formData.name}.`);
-            setIsModalOpen(false);
-            loadTeams();
+            await api.createTeam(name, memberLookup.users.map((u: TeamUser) => u.id), ownerLookup.users.map((u: TeamUser) => u.id));
+            showToast(`Team ${name} created`, 'success');
+            onClose();
             window.dispatchEvent(new Event('rise:mutation'));
+            navigate(`/team/${name}`);
         } catch (err) {
-            showToast(`Failed to create team: ${err.message}`, 'error');
-            setActionStatus(`Failed to create team ${formData.name}.`);
+            showToast(`Failed to create team: ${(err as Error).message}`, 'error');
         } finally {
             setSaving(false);
         }
     };
 
-    if (loading) return <LoadingState label="Loading teams..." />;
-    if (error) return <ErrorState message={`Error loading teams: ${error}`} onRetry={loadTeams} />;
-
     return (
-        <section>
-            <div className="r-page-head">
-                <div className="title-stack">
-                    <h1 className="r-page-title">Teams</h1>
-                    <div className="r-page-sub">
-                        {sortedTeams.length} team{sortedTeams.length === 1 ? '' : 's'} ·{' '}
-                        {sortedTeams.reduce((n, t) => n + (t.members?.length || 0), 0)} members total
-                    </div>
-                </div>
-                {currentUser?.can_create_teams && (
-                    <RButton variant="primary" icon="plus" onClick={handleCreateClick}>
-                        New team
-                    </RButton>
-                )}
-            </div>
-            {actionStatus && <p className="mono-inline-status mb-3">{actionStatus}</p>}
-            {sortedTeams.length === 0 ? (
-                <Empty title="No teams yet">Create a team to share project ownership across people.</Empty>
-            ) : (
-                <div className="r-grid-2">
-                    {sortedTeams.map(t => (
-                        <TeamCard
-                            key={t.id}
-                            team={t}
-                            projectCount={countProjectsForTeam(projects, t)}
-                            isOwner={!!currentUser && (t.owners || []).some(o => o.email === currentUser.email)}
-                            onOpen={() => navigate(`/team/${t.name}`)}
-                        />
-                    ))}
-                </div>
-            )}
-
-            <RModal
-                isOpen={isModalOpen}
-                onClose={() => setIsModalOpen(false)}
-                title="Create Team"
-                footer={
-                    <>
-                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>
-                            Cancel
-                        </RButton>
-                        <RButton variant="primary" onClick={handleCreate} loading={saving}>
-                            Create
-                        </RButton>
-                    </>
-                }
-            >
-                <RField label="Team Name">
-                    <RInput
-                        id="team-name"
-                        value={formData.name}
-                        onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                        placeholder="engineering"
-                        autoFocus
-                    />
-                </RField>
-
-                <RField
-                    label="Owners (emails, comma-separated)"
-                    hint="Owners can manage the team. At least one owner is required."
-                >
-                    <AutocompleteInput
-                        id="team-owners"
-                        type="email"
-                        value={formData.owners}
-                        onChange={(next) => setFormData({ ...formData, owners: next })}
-                        options={currentUser?.email ? [currentUser.email] : []}
-                        placeholder="alice@example.com, bob@example.com"
-                        multiValue
-                    />
-                </RField>
-
-                <RField
-                    label="Members (emails, comma-separated)"
-                    hint="Members can use the team for project ownership."
-                >
-                    <AutocompleteInput
-                        id="team-members"
-                        type="email"
-                        value={formData.members}
-                        onChange={(next) => setFormData({ ...formData, members: next })}
-                        options={currentUser?.email ? [currentUser.email] : []}
-                        placeholder="charlie@example.com, dana@example.com"
-                        multiValue
-                    />
-                </RField>
-            </RModal>
-        </section>
-    );
-}
-
-// Counts projects owned by a given team across the project list. We match by
-// id when available (preferred), then fall back to comparing names so that
-// callers with a partially populated project list (no owner.id) still work.
-function countProjectsForTeam(projects, team) {
-    if (!Array.isArray(projects) || projects.length === 0) return 0;
-    return projects.filter(p => {
-        const owner = p.owner;
-        if (!owner) return false;
-        if (owner.id && team.id) return owner.id === team.id;
-        if (owner.name && team.name) return owner.name === team.name;
-        return false;
-    }).length;
-}
-
-// A labelled, overlapping stack of user avatars; each avatar shows the user's
-// email on hover.
-function AvatarGroup({ label, users }) {
-    const visible = users.slice(0, 8);
-    const overflow = Math.max(0, users.length - visible.length);
-    return (
-        <div className="r-meta-bar" style={{ marginBottom: 0 }}>
-            <span style={{ color: 'var(--text-soft)' }}>{label}</span>
-            <span className="dot-sep" />
-            {users.length === 0 ? (
-                <span style={{ color: 'var(--text-soft)' }}>None</span>
-            ) : (
-                <div className="r-member-stack">
-                    {visible.map(u => {
-                        const email = u.email || u.name || '?';
-                        return (
-                            <Tooltip key={u.id || email} content={email}>
-                                <span
-                                    className="r-ava-sm"
-                                    style={{ background: colorFor(email), width: 22, height: 22, fontSize: 10 }}
-                                >
-                                    {email.trim()[0]?.toUpperCase() || '?'}
-                                </span>
-                            </Tooltip>
-                        );
-                    })}
-                    {overflow > 0 && (
-                        <span
-                            className="r-ava-sm"
-                            style={{ background: 'var(--surface-2)', color: 'var(--text-muted)', width: 22, height: 22, fontSize: 10 }}
-                        >
-                            +{overflow}
-                        </span>
-                    )}
-                </div>
-            )}
-        </div>
-    );
-}
-
-function TeamCard({ team, projectCount, onOpen, isOwner }) {
-    const members = team.members || [];
-    const owners = team.owners || [];
-
-    return (
-        <Panel onClick={onOpen} className={isOwner ? 'r-panel-own' : undefined}>
-            <PanelHead>
-                <div style={{ minWidth: 0 }}>
-                    <div className="r-panel-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                        <span>{team.name}</span>
-                        {team.idp_managed && (
-                            <span className="r-pill accent" style={{ fontSize: 10.5, padding: '1px 6px' }}>IDP</span>
-                        )}
-                    </div>
-                    <div className="r-panel-sub">
-                        {members.length} member{members.length === 1 ? '' : 's'}
-                        {' · '}{projectCount} project{projectCount === 1 ? '' : 's'}
-                    </div>
-                </div>
-            </PanelHead>
-            <PanelBody>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                    <AvatarGroup label="Owners" users={owners} />
-                    <AvatarGroup label="Members" users={members} />
-                </div>
-            </PanelBody>
-        </Panel>
-    );
-}
-
-// Team Detail Component
-export function TeamDetail({ teamName, currentUser }) {
-    const [team, setTeam] = useState(null);
-    const [teamProjects, setTeamProjects] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
-    const [newOwnerEmail, setNewOwnerEmail] = useState('');
-    const [newMemberEmail, setNewMemberEmail] = useState('');
-    const [addOwnerOpen, setAddOwnerOpen] = useState(false);
-    const [addMemberOpen, setAddMemberOpen] = useState(false);
-    const [addingOwner, setAddingOwner] = useState(false);
-    const [addingMember, setAddingMember] = useState(false);
-    const [roleFilter, setRoleFilter] = useState('all');
-    const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-    const [deleting, setDeleting] = useState(false);
-    const { showToast } = useToast();
-
-    const loadTeam = useCallback(async () => {
-        try {
-            const [data, projects] = await Promise.all([
-                api.getTeam(teamName),
-                api.getTeamProjects(teamName),
-            ]);
-            setTeam(data);
-            setTeamProjects(projects || []);
-        } catch (err) {
-            setError(err.message);
-        } finally {
-            setLoading(false);
-        }
-    }, [teamName]);
-
-    useEffect(() => {
-        loadTeam();
-    }, [loadTeam]);
-
-    // Check if user can manage this team
-    const canManage = currentUser && team && (
-        currentUser.is_admin ||
-        (team.owners && team.owners.some(o => o.email === currentUser.email))
-    );
-
-    // IDP-managed teams can only be managed by admins
-    const canEdit = canManage && (!team?.idp_managed || currentUser?.is_admin);
-
-    const handleAddOwner = async () => {
-        if (!newOwnerEmail.trim()) {
-            showToast('Please enter an email address', 'error');
-            return;
-        }
-
-        setAddingOwner(true);
-        try {
-            // Look up user ID by email
-            const lookupResult = await api.lookupUsers([newOwnerEmail.trim()]);
-            if (!lookupResult.users || lookupResult.users.length === 0) {
-                showToast(`User with email ${newOwnerEmail} not found`, 'error');
-                return;
+        <Modal
+            isOpen={open}
+            onClose={onClose}
+            title="New team"
+            footer={
+                <>
+                    <Button onClick={onClose} disabled={saving}>Cancel</Button>
+                    <Button variant="primary" onClick={create} loading={saving}>Create team</Button>
+                </>
             }
-
-            const currentOwnerIds = team.owners?.map(o => o.id) || [];
-            const newOwnerId = lookupResult.users[0].id;
-
-            await api.updateTeam(team.id, {
-                owners: [...currentOwnerIds, newOwnerId]
-            });
-            showToast(`Added ${newOwnerEmail} as owner`, 'success');
-            setNewOwnerEmail('');
-            setAddOwnerOpen(false);
-            await loadTeam();
-        } catch (err) {
-            showToast(`Failed to add owner: ${err.message}`, 'error');
-        } finally {
-            setAddingOwner(false);
-        }
-    };
-
-    const handleRemoveOwner = async (ownerId, email) => {
-        try {
-            const currentOwnerIds = team.owners?.map(o => o.id) || [];
-            const updatedOwnerIds = currentOwnerIds.filter(id => id !== ownerId);
-
-            if (updatedOwnerIds.length === 0) {
-                showToast('Cannot remove last owner', 'error');
-                return;
-            }
-
-            await api.updateTeam(team.id, { owners: updatedOwnerIds });
-            showToast(`Removed ${email} from owners`, 'success');
-            await loadTeam();
-        } catch (err) {
-            showToast(`Failed to remove owner: ${err.message}`, 'error');
-        }
-    };
-
-    const handleAddMember = async () => {
-        if (!newMemberEmail.trim()) {
-            showToast('Please enter an email address', 'error');
-            return;
-        }
-
-        setAddingMember(true);
-        try {
-            // Look up user ID by email
-            const lookupResult = await api.lookupUsers([newMemberEmail.trim()]);
-            if (!lookupResult.users || lookupResult.users.length === 0) {
-                showToast(`User with email ${newMemberEmail} not found`, 'error');
-                return;
-            }
-
-            const currentMemberIds = team.members?.map(m => m.id) || [];
-            const newMemberId = lookupResult.users[0].id;
-
-            await api.updateTeam(team.id, {
-                members: [...currentMemberIds, newMemberId]
-            });
-            showToast(`Added ${newMemberEmail} as member`, 'success');
-            setNewMemberEmail('');
-            setAddMemberOpen(false);
-            await loadTeam();
-        } catch (err) {
-            showToast(`Failed to add member: ${err.message}`, 'error');
-        } finally {
-            setAddingMember(false);
-        }
-    };
-
-    const handleRemoveMember = async (memberId, email) => {
-        try {
-            const currentMemberIds = team.members?.map(m => m.id) || [];
-            const updatedMemberIds = currentMemberIds.filter(id => id !== memberId);
-            await api.updateTeam(team.id, { members: updatedMemberIds });
-            showToast(`Removed ${email} from members`, 'success');
-            await loadTeam();
-        } catch (err) {
-            showToast(`Failed to remove member: ${err.message}`, 'error');
-        }
-    };
-
-    const handleDeleteTeam = async () => {
-        setDeleting(true);
-        try {
-            await api.deleteTeam(team.id);
-            showToast(`Team ${team.name} deleted successfully`, 'success');
-            window.dispatchEvent(new Event('rise:mutation'));
-            navigate('/teams');
-        } catch (err) {
-            showToast(`Failed to delete team: ${err.message}`, 'error');
-            setDeleting(false);
-        }
-    };
-
-    if (loading) return <LoadingState label="Loading team..." />;
-    if (error) return <ErrorState message={`Error loading team: ${error}`} onRetry={loadTeam} />;
-    if (!team) return <EmptyState message="Team not found." />;
-
-    // --- Unified members roster ---
-    // A user can be both an owner and a member; collapse those into one row.
-    const owners = team.owners || [];
-    const members = team.members || [];
-    const peopleMap = new Map();
-    const keyOf = (u) => u.id || u.email;
-    for (const o of owners) {
-        const k = keyOf(o);
-        if (!peopleMap.has(k)) peopleMap.set(k, { ...o, isOwner: false, isMember: false });
-        peopleMap.get(k).isOwner = true;
-    }
-    for (const m of members) {
-        const k = keyOf(m);
-        if (!peopleMap.has(k)) peopleMap.set(k, { ...m, isOwner: false, isMember: false });
-        peopleMap.get(k).isMember = true;
-    }
-    const visiblePeople = [...peopleMap.values()].filter(p => {
-        if (roleFilter === 'owners') return p.isOwner;
-        if (roleFilter === 'members') return p.isMember;
-        return true;
-    });
-    const rosterRows = visiblePeople.map(p => {
-        const kinds = [];
-        if (p.isOwner) kinds.push('Owner');
-        if (p.isMember) kinds.push('Member');
-        let actions = null;
-        if (canEdit) {
-            if (p.isOwner && p.isMember) {
-                actions = (
-                    <Menu
-                        items={[
-                            { label: 'Remove as owner', icon: 'trash', onClick: () => handleRemoveOwner(p.id, p.email) },
-                            { label: 'Remove as member', icon: 'trash', onClick: () => handleRemoveMember(p.id, p.email) },
-                        ]}
-                        trigger={({ toggle }) => (
-                            <RButton variant="danger" size="sm" icon="trash" onClick={toggle}>
-                                Remove<Icon name="chevd" size={12} />
-                            </RButton>
-                        )}
-                    />
-                );
-            } else {
-                const removeRole = p.isOwner ? 'owner' : 'member';
-                actions = (
-                    <RButton
-                        variant="danger"
-                        size="sm"
-                        icon="trash"
-                        onClick={() => removeRole === 'owner'
-                            ? handleRemoveOwner(p.id, p.email)
-                            : handleRemoveMember(p.id, p.email)}
-                    >
-                        Remove
-                    </RButton>
-                );
-            }
-        }
-        return {
-            key: `person-${keyOf(p)}`,
-            icon: 'user',
-            name: <span style={{ fontWeight: 500 }}>{p.email}</span>,
-            kindLabel: kinds,
-            actions,
-        };
-    });
-
-    const isTeamOwnedProject = (project) => {
-        const owner = project.owner;
-        if (!owner) return false;
-        if (team.id && owner.id) return owner.id === team.id;
-        return !owner.email && owner.name === team.name;
-    };
-
-    return (
-        <section>
-            <div className="r-page-head">
-                <div className="title-stack">
-                    <h1 className="r-page-title" style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                        <span>{team.name}</span>
-                        {team.idp_managed && <Pill kind="accent">IDP</Pill>}
-                    </h1>
-                    <div className="r-page-sub">Updated {formatDate(team.updated)}</div>
-                </div>
-                {canEdit && (
-                    <RButton variant="danger" onClick={() => setDeleteDialogOpen(true)}>
-                        Delete
-                    </RButton>
-                )}
-            </div>
-
-            {team.idp_managed && !currentUser?.is_admin && (
-                <div style={{ marginBottom: 20 }}>
-                    <Alert tone="info" icon="info">
-                        This team is managed by your identity provider and can only be modified by administrators.
-                    </Alert>
-                </div>
-            )}
-
-            <div className="r-stack">
-                <RosterTable
-                    title="People"
-                    sub="Owners can manage the team. Members can use it for project ownership."
-                    addControl={canEdit ? (
-                        <AddMenu
-                            items={[
-                                { label: 'Add owner', icon: 'user', onClick: () => { setNewOwnerEmail(''); setAddOwnerOpen(true); } },
-                                { label: 'Add member', icon: 'user', onClick: () => { setNewMemberEmail(''); setAddMemberOpen(true); } },
-                            ]}
-                        />
-                    ) : undefined}
-                    filter={{
-                        value: roleFilter,
-                        options: [
-                            { value: 'all', label: 'All' },
-                            { value: 'owners', label: 'Owners' },
-                            { value: 'members', label: 'Members' },
-                        ],
-                        onChange: setRoleFilter,
-                    }}
-                    rows={rosterRows}
-                    emptyText="No people in this team"
-                />
-
-                <div>
-                    <div style={{ marginBottom: 14 }}>
-                        <div className="r-section-title">Projects ({teamProjects.length})</div>
-                        {teamProjects.length > 0 && (
-                            <div className="r-section-sub">
-                                Highlighted rows are owned by this team. The rest are shared with it via project access.
-                            </div>
-                        )}
-                    </div>
-                    <ProjectTable
-                        projects={teamProjects.slice().sort((a, b) => a.name.localeCompare(b.name))}
-                        onRowClick={(project) => navigate(`/project/${project.name}`)}
-                        emptyText="No projects owned by or shared with this team"
-                        isOwnRow={isTeamOwnedProject}
-                    />
-                </div>
-            </div>
-
-            <RModal
-                isOpen={addOwnerOpen}
-                onClose={() => setAddOwnerOpen(false)}
-                title="Add owner"
-                sub="Owners can manage this team."
-                footer={
-                    <>
-                        <RButton onClick={() => setAddOwnerOpen(false)} disabled={addingOwner}>Cancel</RButton>
-                        <RButton variant="primary" onClick={handleAddOwner} loading={addingOwner}>Add owner</RButton>
-                    </>
-                }
-            >
-                <RField label="Owner email">
-                    <AutocompleteInput
-                        type="email"
-                        id="add-owner-email"
-                        value={newOwnerEmail}
-                        onChange={setNewOwnerEmail}
-                        options={currentUser?.email ? [currentUser.email] : []}
-                        placeholder="owner@example.com"
-                        onEnter={handleAddOwner}
-                    />
-                </RField>
-            </RModal>
-
-            <RModal
-                isOpen={addMemberOpen}
-                onClose={() => setAddMemberOpen(false)}
-                title="Add member"
-                sub="Members can use this team for project ownership."
-                footer={
-                    <>
-                        <RButton onClick={() => setAddMemberOpen(false)} disabled={addingMember}>Cancel</RButton>
-                        <RButton variant="primary" onClick={handleAddMember} loading={addingMember}>Add member</RButton>
-                    </>
-                }
-            >
-                <RField label="Member email">
-                    <AutocompleteInput
-                        type="email"
-                        id="add-member-email"
-                        value={newMemberEmail}
-                        onChange={setNewMemberEmail}
-                        options={currentUser?.email ? [currentUser.email] : []}
-                        placeholder="member@example.com"
-                        onEnter={handleAddMember}
-                    />
-                </RField>
-            </RModal>
-
-            <RConfirmDialog
-                isOpen={deleteDialogOpen}
-                onClose={() => setDeleteDialogOpen(false)}
-                onConfirm={handleDeleteTeam}
-                title="Delete Team"
-                message={`Delete team "${team.name}"? Impact: projects owned by this team may lose expected ownership workflows.`}
-                confirmText="Delete Team"
-                confirmTone="danger"
-                requireText={team.name}
-                loading={deleting}
-            />
-        </section>
+        >
+            <Field label="Team name">
+                <Input value={name} onChange={e => setName(e.target.value)} placeholder="engineering" autoFocus />
+            </Field>
+            <Field label="Owners (emails, comma-separated)" hint="Owners can manage the team. At least one owner is required.">
+                <AutocompleteInput type="email" value={owners} onChange={setOwners} options={currentUser.email ? [currentUser.email] : []} placeholder="alice@example.com, bob@example.com" multiValue />
+            </Field>
+            <Field label="Members (emails, comma-separated)" hint="Members can own projects through the team.">
+                <AutocompleteInput type="email" value={members} onChange={setMembers} options={currentUser.email ? [currentUser.email] : []} placeholder="charlie@example.com" multiValue />
+            </Field>
+        </Modal>
     );
 }

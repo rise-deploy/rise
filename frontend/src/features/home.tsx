@@ -134,7 +134,7 @@ export function Home({ user }: HomeProps) {
                         {projects.length} project{projects.length === 1 ? '' : 's'} · {healthy} healthy · {needAttention} need{needAttention === 1 ? 's' : ''} attention
                     </div>
                 </div>
-                <Button variant="primary" icon="plus" onClick={() => navigate('/projects?create=project')}>New project</Button>
+                <Button variant="primary" icon="plus" onClick={() => navigate('/projects/new')}>New project</Button>
             </div>
 
             {(attention.length > 0 || failedProjects.length > 0) && (

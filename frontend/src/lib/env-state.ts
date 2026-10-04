@@ -87,6 +87,17 @@ export const HEALTH_LABEL: Record<EnvHealth, string> = {
     stopped: 'Stopped',
 };
 
+/**
+ * The badge for an environment: its health, worded so a failed deploy that
+ * left the previous one serving doesn't read like an outage.
+ */
+export function healthBadge(state: EnvState): { status: string; label: string } {
+    if (state.health === 'failed' && state.live && state.live.status === 'Healthy') {
+        return { status: 'Failed', label: 'Deploy failed' };
+    }
+    return { status: HEALTH_LABEL[state.health], label: HEALTH_LABEL[state.health] };
+}
+
 /** The last segment of an image reference, e.g. `api:59a1ac`. */
 export function shortImage(image?: string): string {
     if (!image) return '—';

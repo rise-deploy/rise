@@ -1,13 +1,9 @@
-// @ts-nocheck
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate, useQueryParam } from '../lib/navigation';
-import { useToast } from '../components/toast';
-import { Button, Combobox, Field, Input, Modal, SearchInput, Segmented } from '../components/r-ui';
-import { Icon } from '../components/icon';
+import { Button, Combobox, SearchInput, Segmented } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
-import { QuickstartDeployModal, QuickstartPickerModal, useQuickstartTemplates, type QuickstartTemplate } from './quickstart-templates';
 
 interface Project {
     id?: string;
@@ -21,7 +17,7 @@ interface Project {
     updated?: string;
 }
 
-export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
+export function ProjectsList() {
     const [projects, setProjects] = useState<Project[] | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [searchParam, setSearchParam] = useQueryParam('q');
@@ -31,24 +27,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     const statusFilter = statusParam || 'all';
     const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
     const [accessFilter, setAccessFilter] = useState('all');
-    const [modalOpen, setModalOpen] = useState(false);
     const [accessClasses, setAccessClasses] = useState<any[]>([]);
-    const [teams, setTeams] = useState<any[]>([]);
-    const [currentUser, setCurrentUser] = useState<any>(null);
-    const [formData, setFormData] = useState({ name: '', access_class: 'public', owner: 'self' });
-    const [saving, setSaving] = useState(false);
-    const [selectedTemplate, setSelectedTemplate] = useState<QuickstartTemplate | null>(null);
-    const [pickerOpen, setPickerOpen] = useState(false);
-    const { templates: quickstartTemplates } = useQuickstartTemplates();
-    const hasTemplates = !!quickstartTemplates && quickstartTemplates.length > 0;
-    const { showToast } = useToast();
-
-    const handleTemplateSelect = (template: QuickstartTemplate) => {
-        // Close the blank-create modal and hand off to the quickstart deploy modal,
-        // which has its own form pre-filled with a suggested name + sensible defaults.
-        setModalOpen(false);
-        setSelectedTemplate(template);
-    };
 
     const loadProjects = useCallback(async () => {
         try {
@@ -62,18 +41,8 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     useEffect(() => { loadProjects(); }, [loadProjects]);
 
     useEffect(() => {
-        api.getTeams().then(setTeams).catch(() => {});
-        api.getMe().then(setCurrentUser).catch(() => {});
         api.getAccessClasses().then(d => setAccessClasses(d?.access_classes || [])).catch(() => {});
     }, []);
-
-    useEffect(() => {
-        if (openCreate) {
-            setFormData({ name: '', access_class: 'public', owner: 'self' });
-            setModalOpen(true);
-            window.history.replaceState({}, '', window.location.pathname);
-        }
-    }, [openCreate]);
 
     const filtered = useMemo(() => {
         if (!projects) return [];
@@ -102,28 +71,6 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
     if (error) return <ErrorState message={`Failed to load projects: ${error}`} onRetry={loadProjects} />;
     if (!projects) return <LoadingState label="Loading projects…" />;
 
-    const handleCreate = async () => {
-        if (!formData.name) { showToast('Project name is required', 'error'); return; }
-        if (!/^[a-z0-9-]+$/.test(formData.name)) {
-            showToast('Project name must contain only lowercase letters, numbers, and hyphens', 'error');
-            return;
-        }
-        if (!currentUser) { showToast('Unable to determine current user', 'error'); return; }
-        setSaving(true);
-        try {
-            const owner = formData.owner === 'self' ? { user: currentUser.id } : { team: formData.owner };
-            await api.createProject(formData.name, formData.access_class, owner);
-            showToast(`Project ${formData.name} created`, 'success');
-            setModalOpen(false);
-            loadProjects();
-            window.dispatchEvent(new Event('rise:mutation'));
-        } catch (err: any) {
-            showToast(`Failed to create project: ${err.message}`, 'error');
-        } finally {
-            setSaving(false);
-        }
-    };
-
     const owners = new Set(projects.map(p => p.owner?.name ? `team:${p.owner.name}` : null).filter(Boolean));
     const teamCount = owners.size;
     const counts = {
@@ -150,7 +97,7 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                         {projects.length} project{projects.length === 1 ? '' : 's'} across {teamCount} team{teamCount === 1 ? '' : 's'}
                     </div>
                 </div>
-                <Button variant="primary" icon="plus" onClick={() => { setFormData({ name: '', access_class: 'public', owner: 'self' }); setModalOpen(true); }}>
+                <Button variant="primary" icon="plus" onClick={() => navigate('/projects/new')}>
                     New project
                 </Button>
             </div>
@@ -195,87 +142,6 @@ export function ProjectsList({ openCreate = false }: { openCreate?: boolean }) {
                 </div>
             )}
 
-            <Modal
-                isOpen={modalOpen}
-                onClose={() => setModalOpen(false)}
-                title={
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
-                        <span>Create a new project</span>
-                        {hasTemplates && (
-                            <button
-                                type="button"
-                                className="r-link"
-                                style={{ fontSize: 12.5, fontWeight: 500, background: 'none', border: 0, padding: 0, cursor: 'pointer' }}
-                                onClick={() => { setModalOpen(false); setPickerOpen(true); }}
-                            >
-                                Create from template &rarr;
-                            </button>
-                        )}
-                    </div>
-                }
-                sub="A project bundles deployments, environments, env vars, domains and access."
-                footer={
-                    <>
-                        <Button onClick={() => setModalOpen(false)} disabled={saving}>Cancel</Button>
-                        <Button variant="primary" loading={saving} onClick={handleCreate}>Create project</Button>
-                    </>
-                }
-            >
-                <Field label="Project name" hint="Only lowercase letters, numbers, and hyphens.">
-                    <Input
-                        placeholder="my-service"
-                        value={formData.name}
-                        onChange={e => setFormData({ ...formData, name: e.target.value.toLowerCase() })}
-                        autoFocus
-                    />
-                </Field>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                    <Field
-                        label="Access class"
-                        hint={accessClasses.find(a => a.id === formData.access_class)?.description}
-                    >
-                        <Combobox
-                            value={formData.access_class}
-                            onChange={(v) => setFormData({ ...formData, access_class: v })}
-                            options={accessClasses.map(ac => ({ value: ac.id, label: ac.display_name, hint: ac.description }))}
-                            placeholder="Select access class"
-                        />
-                    </Field>
-                    <Field label="Owner">
-                        <Combobox
-                            value={formData.owner}
-                            onChange={(v) => setFormData({ ...formData, owner: v })}
-                            options={[
-                                {
-                                    value: 'self',
-                                    label: `You (${currentUser?.email || 'me'})`,
-                                    icon: <Icon name="user" size={13} />,
-                                    keywords: 'me self you',
-                                },
-                                ...teams.map(t => ({
-                                    value: t.id,
-                                    label: t.name,
-                                    icon: <Icon name="users" size={13} />,
-                                    keywords: `team ${t.name}`,
-                                })),
-                            ]}
-                            placeholder="Select owner"
-                        />
-                    </Field>
-                </div>
-            </Modal>
-
-            <QuickstartPickerModal
-                open={pickerOpen}
-                onClose={() => setPickerOpen(false)}
-                onSelect={handleTemplateSelect}
-            />
-
-            <QuickstartDeployModal
-                template={selectedTemplate}
-                onClose={() => setSelectedTemplate(null)}
-                onDeployed={() => loadProjects()}
-            />
         </section>
     );
 }
