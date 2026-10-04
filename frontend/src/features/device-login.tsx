@@ -3,6 +3,14 @@ import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
 import { useQueryParam } from '../lib/navigation';
 import { Alert, Button, Field, Input, KV, KVRow, Panel, PanelBody, PanelHead } from '../components/r-ui';
+import {
+    AccessEditor,
+    AccessRequest,
+    GrantRow,
+    requestFromRows,
+    rowsFromRequest,
+    rowsProblem,
+} from './device-access-editor';
 
 /** A pending `rise login --device`, as `GET /auth/device` describes it. */
 interface DeviceAuthorization {
@@ -11,6 +19,8 @@ interface DeviceAuthorization {
     client_ip?: string;
     created_at: string;
     expires_at: string;
+    /** What the login asks for; the approver may change it. */
+    requested_access: AccessRequest;
     /** The current session may not approve: it is not a browser sign-in from the last few minutes. */
     reauth_required: boolean;
 }
@@ -78,6 +88,9 @@ export function DeviceLogin() {
     const [input, setInput] = useState(userCode ?? '');
     const [phase, setPhase] = useState<Phase>(userCode ? { kind: 'loading' } : { kind: 'enter' });
     const [busy, setBusy] = useState(false);
+    // The access an approval grants: the request, as the approver edits it.
+    const [full, setFull] = useState(true);
+    const [rows, setRows] = useState<GrantRow[]>([]);
 
     const lookup = useCallback(async (code: string) => {
         setPhase({ kind: 'loading' });
@@ -91,6 +104,8 @@ export function DeviceLogin() {
             }
             // A fresh session is confirmed: the round-trip, if any, is done.
             clearReauthMarker();
+            setFull(request.requested_access.kind === 'full');
+            setRows(rowsFromRequest(request.requested_access));
             setPhase({ kind: 'confirm', request });
         } catch (err) {
             setPhase({ kind: 'error', message: errorMessage(err) });
@@ -105,7 +120,7 @@ export function DeviceLogin() {
         setBusy(true);
         try {
             if (approve) {
-                await api.approveDevice(request.user_code);
+                await api.approveDevice(request.user_code, requestFromRows(full, rows));
                 setPhase({ kind: 'approved' });
             } else {
                 await api.denyDevice(request.user_code);
@@ -199,12 +214,28 @@ export function DeviceLogin() {
                                     <KVRow k="Requested">{new Date(phase.request.created_at).toLocaleString()}</KVRow>
                                     <KVRow k="Expires">{new Date(phase.request.expires_at).toLocaleString()}</KVRow>
                                 </KV>
+                                <AccessEditor
+                                    requested={phase.request.requested_access}
+                                    full={full}
+                                    rows={rows}
+                                    onChange={(nextFull, nextRows) => {
+                                        setFull(nextFull);
+                                        setRows(nextRows);
+                                    }}
+                                />
+                                {rowsProblem(full, rows) && <Alert tone="err" icon="info">{rowsProblem(full, rows)}</Alert>}
                                 <Alert tone="warn" icon="info">
                                     Only approve if you just ran <code>rise login --device</code> yourself and this code
-                                    matches the one in your terminal. Approving signs that terminal in as you.
+                                    matches the one in your terminal. Approving signs that terminal in as you, with the access above.
                                 </Alert>
                                 <div style={{ display: 'flex', gap: 8 }}>
-                                    <Button variant="primary" icon="check" loading={busy} onClick={() => decide(phase.request, true)}>
+                                    <Button
+                                        variant="primary"
+                                        icon="check"
+                                        loading={busy}
+                                        disabled={rowsProblem(full, rows) !== null}
+                                        onClick={() => decide(phase.request, true)}
+                                    >
                                         Approve
                                     </Button>
                                     <Button icon="close" disabled={busy} onClick={() => decide(phase.request, false)}>

@@ -97,9 +97,20 @@ impl RiseTokenSigner {
                     let claims =
                         decode::<RiseClaims>(token, self.hs256_decoding_key(), &validation)?.claims;
                     let typed = header.typ.as_deref() == Some(RISE_SESSION_TYP);
+                    // A ceiling only ever rides on a CLI session, and is
+                    // never an empty list (which would read as "nothing").
+                    let ceiling_misplaced =
+                        claims
+                            .authorization_details
+                            .as_ref()
+                            .is_some_and(|details| {
+                                details.is_empty()
+                                    || claims.rise_client != Some(crate::SessionClient::Cli)
+                            });
                     if typed != claims.rise_uid.is_some()
                         || typed != claims.rise_identity_uid.is_some()
                         || (!typed && claims.rise_client.is_some())
+                        || ceiling_misplaced
                     {
                         return Err(invalid_shape());
                     }
@@ -126,6 +137,7 @@ impl RiseTokenSigner {
                 if claims.rise_uid.is_some()
                     || claims.rise_identity_uid.is_some()
                     || claims.rise_client.is_some()
+                    || claims.authorization_details.is_some()
                 {
                     return Err(invalid_shape());
                 }
@@ -227,6 +239,7 @@ mod tests {
             rise_uid: None,
             rise_identity_uid: None,
             rise_client: None,
+            authorization_details: None,
         };
         let token = signer
             .sign_ingress_jwt(
@@ -353,6 +366,7 @@ mod tests {
             rise_uid: None,
             rise_identity_uid: None,
             rise_client: None,
+            authorization_details: None,
         };
         let token = signer
             .sign_ingress_jwt(
@@ -407,6 +421,7 @@ mod tests {
             rise_uid: None,
             rise_identity_uid: None,
             rise_client: None,
+            authorization_details: None,
         }
     }
 
@@ -416,6 +431,7 @@ mod tests {
             rise_uid: uuid::Uuid::from_u128(7),
             identity_uid: uuid::Uuid::from_u128(8),
             client: crate::SessionClient::Cli,
+            authorization_details: None,
         }
     }
 
@@ -646,8 +662,7 @@ mod tests {
             }
         }
 
-        // The matching pair is a session, including on the ingress path, which
-        // accepts a user's session cookie as well as an app-scoped token.
+        // The matching pair is a session.
         let typed = encode_hs256(Some(crate::RISE_SESSION_TYP), &with_uid);
         assert!(matches!(
             signer.verify_rise_jwt(&typed).unwrap(),
@@ -656,7 +671,91 @@ mod tests {
                 ..
             })
         ));
-        assert!(signer.verify_jwt_skip_aud(&typed).is_ok());
+
+        // The ingress path takes the web UI's session as an app cookie, and no
+        // other: not a CLI session, nor one that names no client.
+        assert!(signer.verify_jwt_skip_aud(&typed).is_err());
+        for (client, accepted) in [("browser", true), ("cli", false)] {
+            let mut claims = with_uid.clone();
+            claims["rise_client"] = serde_json::json!(client);
+            let session = encode_hs256(Some(crate::RISE_SESSION_TYP), &claims);
+            assert!(signer.verify_rise_jwt(&session).is_ok(), "{client}");
+            assert_eq!(
+                signer.verify_jwt_skip_aud(&session).is_ok(),
+                accepted,
+                "{client}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_authorization_details_ride_only_on_cli_sessions() {
+        let signer = create_test_signer();
+        let details = vec![serde_json::json!({"type": "rise.dev/rbac"})];
+
+        // Minted on a CLI session, the ceiling survives verification as is.
+        let scoped = crate::SessionUser {
+            authorization_details: Some(details.clone()),
+            ..session_user()
+        };
+        let token = signer
+            .sign_user_jwt(
+                &serde_json::json!({"sub": "u", "email": "u@example.com"}),
+                &scoped,
+                None,
+                "https://rise.test",
+                None,
+            )
+            .unwrap();
+        match signer.verify_rise_jwt(&token).unwrap() {
+            RiseToken::Session(claims) => {
+                assert_eq!(claims.authorization_details, Some(details.clone()))
+            }
+            other => panic!("expected a session, got {other:?}"),
+        }
+
+        // A browser session is never scoped.
+        let browser = crate::SessionUser {
+            client: crate::SessionClient::Browser,
+            authorization_details: Some(details.clone()),
+            ..session_user()
+        };
+        assert!(signer
+            .sign_user_jwt(
+                &serde_json::json!({"sub": "u", "email": "u@example.com"}),
+                &browser,
+                None,
+                "https://rise.test",
+                None
+            )
+            .is_err());
+
+        // Hand-crafted shapes Rise never mints are refused: a ceiling on a
+        // browser session, an empty ceiling, or one on a legacy session.
+        let key = hs256_key();
+        let encode_hs256 = |typ: Option<&str>, claims: &serde_json::Value| {
+            let mut header = Header::new(Algorithm::HS256);
+            header.typ = typ.map(str::to_string);
+            encode(&header, claims, &key).unwrap()
+        };
+        let mut typed = serde_json::to_value(session_claims()).unwrap();
+        typed["rise_uid"] = serde_json::json!(uuid::Uuid::new_v4());
+        typed["rise_identity_uid"] = serde_json::json!(uuid::Uuid::new_v4());
+        let mut browser_scoped = typed.clone();
+        browser_scoped["rise_client"] = serde_json::json!("browser");
+        browser_scoped["authorization_details"] = serde_json::json!(details);
+        let mut empty = typed.clone();
+        empty["rise_client"] = serde_json::json!("cli");
+        empty["authorization_details"] = serde_json::json!([]);
+        for claims in [&browser_scoped, &empty] {
+            let token = encode_hs256(Some(crate::RISE_SESSION_TYP), claims);
+            assert!(signer.verify_rise_jwt(&token).is_err(), "{claims}");
+        }
+        let mut legacy = serde_json::to_value(session_claims()).unwrap();
+        legacy["authorization_details"] = serde_json::json!(details);
+        assert!(signer
+            .verify_rise_jwt(&encode_hs256(None, &legacy))
+            .is_err());
     }
 
     #[test]
@@ -894,6 +993,7 @@ mod tests {
             rise_uid: None,
             rise_identity_uid: None,
             rise_client: None,
+            authorization_details: None,
         };
         let header = Header::new(Algorithm::HS384);
         // Sign with the wrong alg using a throwaway secret; verify must fail.

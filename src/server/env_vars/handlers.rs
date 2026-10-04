@@ -3,6 +3,7 @@ use super::models::{
 };
 use crate::db::{env_vars as db_env_vars, environments as db_environments, projects};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::{MaybeSessionScope, SessionScope};
 use crate::server::deployment::models as deployment_models;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::extensions::InjectedEnvVarValue;
@@ -13,6 +14,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use rise_backend_auth::session_scope::{Kind, Operation, Subresource, Verb};
 use std::collections::HashMap;
 
 /// Validate an environment variable key from a URL path segment.
@@ -172,6 +174,7 @@ pub async fn set_project_env_var(
 pub async fn list_project_env_vars(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_id_or_name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<EnvVarsResponse>, ServerError> {
@@ -189,6 +192,12 @@ pub async fn list_project_env_vars(
 
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
+
+    let visibility = VarVisibility {
+        scope: scope.as_ref(),
+        project: &project.name,
+    };
+    visibility.require_any()?;
 
     // Check if we should include unprotected values
     let include_unprotected = params
@@ -214,6 +223,13 @@ pub async fn list_project_env_vars(
     // Convert to API response
     let mut env_vars = Vec::new();
     for var in db_env_vars {
+        let environment = var
+            .environment_id
+            .and_then(|id| env_name_map.get(&id).cloned());
+        if !visibility.lists(environment.as_deref()) {
+            continue;
+        }
+        let include_unprotected = include_unprotected && visibility.reveals(environment.as_deref());
         let value = if include_unprotected && var.is_secret && !var.is_protected {
             // Decrypt unprotected secret
             match &state.encryption_provider {
@@ -230,10 +246,6 @@ pub async fn list_project_env_vars(
         } else {
             var.value.clone()
         };
-
-        let environment = var
-            .environment_id
-            .and_then(|id| env_name_map.get(&id).cloned());
 
         let mut response = if var.is_secret && (!include_unprotected || var.is_protected) {
             // Mask protected secrets
@@ -254,6 +266,38 @@ pub async fn list_project_env_vars(
     }
 
     Ok(Json(EnvVarsResponse { env_vars }))
+}
+
+/// What a scoped session may see of a project's variables (ADR-0006 §3): a
+/// variable bound to an environment needs a grant there, a project-wide one a
+/// project grant, and a secret's value additionally `secrets`.
+struct VarVisibility<'a> {
+    scope: Option<&'a SessionScope>,
+    project: &'a str,
+}
+
+impl VarVisibility<'_> {
+    const LIST: Operation = Operation::new(Verb::List, Kind::EnvironmentVariable);
+    const READ_VALUE: Operation =
+        Operation::sub(Verb::Get, Kind::EnvironmentVariable, Subresource::Value);
+
+    /// Refuse a session that can list no variable in the project at all.
+    fn require_any(&self) -> Result<(), ServerError> {
+        match self.scope {
+            Some(scope) => scope.require_reach(Self::LIST, self.project),
+            None => Ok(()),
+        }
+    }
+
+    fn lists(&self, environment: Option<&str>) -> bool {
+        self.scope
+            .is_none_or(|scope| scope.allows(Self::LIST, self.project, environment))
+    }
+
+    fn reveals(&self, environment: Option<&str>) -> bool {
+        self.scope
+            .is_none_or(|scope| scope.allows(Self::READ_VALUE, self.project, environment))
+    }
 }
 
 /// Delete a project environment variable
@@ -646,6 +690,7 @@ pub async fn get_deployment_env_var_value(
 pub async fn preview_deployment_env_vars(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_id_or_name): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<EnvVarsResponse>, ServerError> {
@@ -663,6 +708,12 @@ pub async fn preview_deployment_env_vars(
 
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
+
+    let visibility = VarVisibility {
+        scope: scope.as_ref(),
+        project: &project.name,
+    };
+    visibility.require_any()?;
 
     let deployment_group = params
         .get("deployment_group")
@@ -690,8 +741,12 @@ pub async fn preview_deployment_env_vars(
         } else {
             "global".to_string()
         });
+        let environment = var.environment_id.and(preview_env_name.as_deref());
+        if !visibility.lists(environment) {
+            continue;
+        }
 
-        if var.is_secret && !var.is_protected {
+        if var.is_secret && !var.is_protected && visibility.reveals(environment) {
             // Unprotected secret — decrypt for preview
             let decrypted = match &state.encryption_provider {
                 Some(provider) => provider
@@ -716,14 +771,14 @@ pub async fn preview_deployment_env_vars(
                 },
             );
         } else if var.is_secret {
-            // Protected secret — mask
+            // Protected secret, or one this session may not read — mask
             env_map.insert(
                 var.key.clone(),
                 EnvVarResponse {
                     key: var.key,
                     value: "••••••••".to_string(),
                     is_secret: true,
-                    is_protected: true,
+                    is_protected: var.is_protected,
                     environment: None,
                     source,
                 },
@@ -869,6 +924,66 @@ pub async fn preview_deployment_env_vars(
     env_vars.sort_by(|a, b| a.key.cmp(&b.key));
 
     Ok(Json(EnvVarsResponse { env_vars }))
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::VarVisibility;
+    use crate::server::auth::session_scope::tests::scope;
+    use serde_json::json;
+
+    #[test]
+    fn an_environment_grant_sees_only_its_own_variables() {
+        let staging = scope(json!({
+            "kind": "restricted",
+            "grants": [{"project": "app", "environment": "staging", "preset": "deploy"}],
+        }));
+        let visibility = VarVisibility {
+            scope: Some(&staging),
+            project: "app",
+        };
+        assert!(visibility.require_any().is_ok());
+        assert!(visibility.lists(Some("staging")));
+        assert!(!visibility.lists(Some("production")));
+        // Project-wide variables apply to every environment.
+        assert!(!visibility.lists(None));
+        // `deploy` doesn't include `secrets`.
+        assert!(!visibility.reveals(Some("staging")));
+    }
+
+    #[test]
+    fn secrets_reveal_values_only_where_granted() {
+        let staging = scope(json!({
+            "kind": "restricted",
+            "grants": [{"project": "app", "environment": "staging", "permissions": ["view", "secrets"]}],
+        }));
+        let visibility = VarVisibility {
+            scope: Some(&staging),
+            project: "app",
+        };
+        assert!(visibility.reveals(Some("staging")));
+        assert!(!visibility.reveals(None));
+
+        let project = scope(json!({
+            "kind": "restricted",
+            "grants": [{"project": "app", "preset": "read"}],
+        }));
+        let visibility = VarVisibility {
+            scope: Some(&project),
+            project: "app",
+        };
+        assert!(visibility.lists(None) && visibility.lists(Some("staging")));
+        assert!(!visibility.reveals(None));
+    }
+
+    #[test]
+    fn an_unrestricted_session_sees_everything() {
+        let visibility = VarVisibility {
+            scope: None,
+            project: "app",
+        };
+        assert!(visibility.lists(None) && visibility.reveals(Some("staging")));
+    }
 }
 
 #[cfg(test)]

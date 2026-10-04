@@ -12,13 +12,18 @@ pub struct Started {
     pub verification_uri_complete: String,
 }
 
-/// `POST /auth/authorize {flow: "device"}`.
+/// `POST /auth/authorize {flow: "device"}`, asking for full access.
 pub fn start(api_base: &str) -> Result<Started> {
-    let resp = crate::http::post_json(
-        &format!("{api_base}/api/v1/auth/authorize"),
-        None,
-        &serde_json::json!({"flow": "device", "client_name": "rise-e2e"}),
-    )?;
+    start_with(api_base, None)
+}
+
+/// [`start`], asking for `access` (ADR-0006) when given.
+pub fn start_with(api_base: &str, access: Option<&serde_json::Value>) -> Result<Started> {
+    let mut body = serde_json::json!({"flow": "device", "client_name": "rise-e2e"});
+    if let Some(access) = access {
+        body["access"] = access.clone();
+    }
+    let resp = crate::http::post_json(&format!("{api_base}/api/v1/auth/authorize"), None, &body)?;
     anyhow::ensure!(
         resp.status == 200,
         "device authorize returned {}:\n{}",
@@ -79,13 +84,50 @@ pub fn lookup(api_base: &str, session: &str, user_code: &str) -> Result<serde_js
     serde_json::from_str(&resp.body).context("parse device lookup response")
 }
 
-/// `POST /auth/device/{approve,deny}` as the signed-in browser.
+/// `POST /auth/device/{approve,deny}` as the signed-in browser; an approval
+/// grants full access.
 pub fn decide(api_base: &str, session: &str, user_code: &str, approve: bool) -> Result<()> {
-    let action = if approve { "approve" } else { "deny" };
+    if approve {
+        return approve_with(
+            api_base,
+            session,
+            user_code,
+            &serde_json::json!({"kind": "full"}),
+        );
+    }
+    post_decision(
+        api_base,
+        session,
+        "deny",
+        &serde_json::json!({"user_code": user_code}),
+    )
+}
+
+/// `POST /auth/device/approve`, granting `access` (ADR-0006).
+pub fn approve_with(
+    api_base: &str,
+    session: &str,
+    user_code: &str,
+    access: &serde_json::Value,
+) -> Result<()> {
+    post_decision(
+        api_base,
+        session,
+        "approve",
+        &serde_json::json!({"user_code": user_code, "access": access}),
+    )
+}
+
+fn post_decision(
+    api_base: &str,
+    session: &str,
+    action: &str,
+    body: &serde_json::Value,
+) -> Result<()> {
     let resp = crate::http::post_json(
         &format!("{api_base}/api/v1/auth/device/{action}"),
         Some(session),
-        &serde_json::json!({"user_code": user_code}),
+        body,
     )?;
     anyhow::ensure!(
         resp.status == 204,

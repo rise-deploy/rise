@@ -1,6 +1,7 @@
 use super::models::{CreateEnvironmentRequest, EnvironmentResponse, UpdateEnvironmentRequest};
 use crate::db::{environments as db_environments, projects};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::project::handlers::ensure_project_access_or_admin;
 use crate::server::state::AppState;
@@ -9,6 +10,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 
 /// Create a new environment for a project
 pub async fn create_environment(
@@ -116,6 +118,7 @@ pub async fn create_environment(
 pub async fn list_environments(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_id_or_name): Path<String>,
 ) -> Result<Json<Vec<EnvironmentResponse>>, ServerError> {
     let project = if let Ok(uuid) = project_id_or_name.parse() {
@@ -132,9 +135,16 @@ pub async fn list_environments(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    let envs = db_environments::list_for_project(&state.db_pool, project.id)
+    let mut envs = db_environments::list_for_project(&state.db_pool, project.id)
         .await
         .internal_err("Failed to list environments")?;
+
+    // A scoped session sees the environments it covers.
+    if let Some(scope) = &scope {
+        let list = Operation::new(Verb::List, Kind::Environment);
+        scope.require_reach(list, &project.name)?;
+        envs.retain(|environment| scope.allows(list, &project.name, Some(&environment.name)));
+    }
 
     Ok(Json(envs.into_iter().map(|e| e.into()).collect()))
 }

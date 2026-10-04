@@ -196,6 +196,7 @@ cargo build --all-features     # Full build with CLI + backend
 
 3. **CLI Implementation** (`--features cli`, default) ✅
    - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
+   - [x] Scoped logins (`rise login --scope <project>[/<env>]=<preset>`): sessions narrowed to projects/environments, enforced on the typed API (ADR-0006)
    - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`
