@@ -92,13 +92,43 @@ pub fn warn_if_narrowing(backend_url: &str, request: Option<&Value>) {
 
 /// Print the access the new session holds, as `/users/me` reports it.
 pub async fn print_granted_access(http_client: &Client, backend_url: &str, token: &str) {
+    if let Some(access) = fetch_granted_access(http_client, backend_url, token).await {
+        print_access(&access);
+    }
+}
+
+/// The access the session holding `token` was granted, or `None` when the
+/// backend cannot say (a failure here never fails the login).
+pub async fn fetch_granted_access(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+) -> Option<Value> {
     match fetch_access(http_client, backend_url, token).await {
-        Ok(access) => {
-            for line in describe_access(&access) {
-                println!("{line}");
-            }
+        Ok(access) => Some(access),
+        Err(e) => {
+            tracing::debug!("Failed to read the session's access: {e:#}");
+            None
         }
-        Err(e) => tracing::debug!("Failed to read the session's access: {e:#}"),
+    }
+}
+
+pub fn print_access(access: &Value) {
+    for line in describe_access(access) {
+        println!("{line}");
+    }
+}
+
+/// `access` as the CLI success page's `access` parameter: `full`, or one
+/// `<target>: <access>` line per grant.
+pub fn access_page_param(access: &Value) -> String {
+    match grant_rows(access) {
+        None => "full".to_string(),
+        Some(rows) => rows
+            .iter()
+            .map(|(target, what)| format!("{target}: {what}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -117,34 +147,53 @@ async fn fetch_access(http_client: &Client, backend_url: &str, token: &str) -> R
         .context("/users/me reports no access (older backend)")
 }
 
-fn describe_access(access: &Value) -> Vec<String> {
+/// One `(target, access)` row per grant, or `None` for full access.
+fn grant_rows(access: &Value) -> Option<Vec<(String, String)>> {
     if access["kind"] != "restricted" {
-        return vec!["  Access: full".to_string()];
+        return None;
     }
     let grants = access["grants"].as_array().cloned().unwrap_or_default();
+    let rows = grants
+        .iter()
+        .map(|grant| {
+            let project = grant["project"].as_str().unwrap_or("?");
+            let target = match grant["environment"].as_str() {
+                Some(environment) => format!("{project}/{environment}"),
+                None => project.to_string(),
+            };
+            let what = match grant["preset"].as_str() {
+                Some(preset) => preset.to_string(),
+                None => grant["permissions"]
+                    .as_array()
+                    .map(|p| {
+                        p.iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default(),
+            };
+            (target, what)
+        })
+        .collect();
+    Some(rows)
+}
+
+fn describe_access(access: &Value) -> Vec<String> {
+    let Some(rows) = grant_rows(access) else {
+        return vec!["  Access: full".to_string()];
+    };
     let mut lines = vec!["  Access: restricted".to_string()];
-    if grants.is_empty() {
+    if rows.is_empty() {
         lines.push("    (nothing)".to_string());
     }
-    let label = |grant: &Value| match grant["environment"].as_str() {
-        Some(environment) => format!("{}/{environment}", grant["project"].as_str().unwrap_or("?")),
-        None => grant["project"].as_str().unwrap_or("?").to_string(),
-    };
-    let width = grants.iter().map(|g| label(g).len()).max().unwrap_or(0);
-    for grant in &grants {
-        let what = match grant["preset"].as_str() {
-            Some(preset) => preset.to_string(),
-            None => grant["permissions"]
-                .as_array()
-                .map(|p| {
-                    p.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default(),
-        };
-        lines.push(format!("    {:width$}  {what}", label(grant)));
+    let width = rows
+        .iter()
+        .map(|(target, _)| target.len())
+        .max()
+        .unwrap_or(0);
+    for (target, what) in &rows {
+        lines.push(format!("    {target:width$}  {what}"));
     }
     lines
 }
@@ -212,5 +261,17 @@ mod tests {
             describe_access(&json!({"kind": "full"})),
             vec!["  Access: full"]
         );
+    }
+
+    #[test]
+    fn access_page_param_lists_grants() {
+        assert_eq!(
+            access_page_param(&json!({"kind": "restricted", "grants": [
+                {"project": "my-app", "permissions": ["view", "logs"]},
+                {"project": "my-app", "environment": "staging", "preset": "deploy"},
+            ]})),
+            "my-app: view, logs\nmy-app/staging: deploy"
+        );
+        assert_eq!(access_page_param(&json!({"kind": "full"})), "full");
     }
 }

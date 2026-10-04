@@ -1955,6 +1955,9 @@ pub async fn oauth_logout(
 pub struct CliAuthSuccessQuery {
     pub success: Option<bool>,
     pub error: Option<String>,
+    /// The session's access as the CLI read it back: `full`, or one
+    /// `<target>: <access>` line per grant.
+    pub access: Option<String>,
 }
 
 /// Handler for CLI authentication success/failure page
@@ -1984,6 +1987,11 @@ pub async fn cli_auth_success(
     context.insert("success", &success);
     if let Some(error) = params.error {
         context.insert("error_message", &error);
+    }
+    match params.access.as_deref() {
+        Some("full") => context.insert("access_full", &true),
+        Some(grants) => context.insert("access_grants", &grants.lines().collect::<Vec<_>>()),
+        None => {}
     }
 
     let html = tera
