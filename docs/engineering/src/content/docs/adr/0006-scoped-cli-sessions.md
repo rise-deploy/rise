@@ -351,6 +351,12 @@ It fails closed: a scoped session can never reach the resource API with full
 access. The agent workflows this ADR targets (projects, environments,
 deployments, env vars) don't use that API.
 
+**No CLI session opens a deployed app.** The ingress check behind private and
+members-only apps takes an app-scoped ingress token, or the web UI's own
+session for an app served under Rise's host, and nothing else. A CLI session,
+scoped or not, sent as the `rise_jwt` cookie is treated as no session, so a
+scoped login can't reach apps outside its ceiling through the app's cookie.
+
 ### 8. Path to the generic resource API
 
 When a typed table migrates (`ROADMAP.md` §4), its scoping moves with it:

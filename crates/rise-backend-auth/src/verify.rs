@@ -662,8 +662,7 @@ mod tests {
             }
         }
 
-        // The matching pair is a session, including on the ingress path, which
-        // accepts a user's session cookie as well as an app-scoped token.
+        // The matching pair is a session.
         let typed = encode_hs256(Some(crate::RISE_SESSION_TYP), &with_uid);
         assert!(matches!(
             signer.verify_rise_jwt(&typed).unwrap(),
@@ -672,7 +671,21 @@ mod tests {
                 ..
             })
         ));
-        assert!(signer.verify_jwt_skip_aud(&typed).is_ok());
+
+        // The ingress path takes the web UI's session as an app cookie, and no
+        // other: not a CLI session, nor one that names no client.
+        assert!(signer.verify_jwt_skip_aud(&typed).is_err());
+        for (client, accepted) in [("browser", true), ("cli", false)] {
+            let mut claims = with_uid.clone();
+            claims["rise_client"] = serde_json::json!(client);
+            let session = encode_hs256(Some(crate::RISE_SESSION_TYP), &claims);
+            assert!(signer.verify_rise_jwt(&session).is_ok(), "{client}");
+            assert_eq!(
+                signer.verify_jwt_skip_aud(&session).is_ok(),
+                accepted,
+                "{client}"
+            );
+        }
     }
 
     #[test]

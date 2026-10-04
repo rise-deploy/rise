@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use crate::claims::{
-    AccessClaims, ActorClaim, IdentityClaims, PrincipalClaims, RiseClaims, WorkloadClaims,
-    WorkloadSubjectInfo,
+    AccessClaims, ActorClaim, IdentityClaims, PrincipalClaims, RiseClaims, SessionClient,
+    WorkloadClaims, WorkloadSubjectInfo,
 };
 use crate::error::JwtSignerError;
 use crate::verify::RiseToken;
@@ -585,15 +585,22 @@ impl RiseTokenSigner {
     /// Verify and decode a Rise JWT without audience validation.
     ///
     /// Adapter over [`Self::verify_rise_jwt`] for the `ingress_auth` handler, which
-    /// accepts both HS256 (user session) and RS256 (app-scoped ingress) tokens and
-    /// does not check `aud`. Project access is validated separately via database
-    /// checks.
+    /// accepts both HS256 (web UI session) and RS256 (app-scoped ingress) tokens
+    /// and does not check `aud`. Project access is validated separately via
+    /// database checks.
     pub fn verify_jwt_skip_aud(&self, token: &str) -> Result<RiseClaims, JwtSignerError> {
         let claims = match self.verify_rise_jwt(token)? {
-            RiseToken::Session(claims) | RiseToken::Ingress(claims) => claims,
+            RiseToken::Ingress(claims) => claims,
+            // The web UI's session doubles as the app cookie for an app served
+            // under Rise's own host. A CLI session is an API credential, never an
+            // app cookie, and one that doesn't say which client it was issued to
+            // is treated the same way.
+            RiseToken::Session(claims) if claims.rise_client == Some(SessionClient::Browser) => {
+                claims
+            }
             // An exchanged access token or a resource identity token must never
             // be honored on the ingress path.
-            RiseToken::Access(_) | RiseToken::Identity(_) => {
+            RiseToken::Session(_) | RiseToken::Access(_) | RiseToken::Identity(_) => {
                 return Err(JwtSignerError::SigningFailed(
                     jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
                 ))

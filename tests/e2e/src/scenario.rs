@@ -160,6 +160,21 @@ fn reclaim(b: &dyn Backend, before: &std::collections::BTreeSet<String>) -> Resu
     Ok(())
 }
 
+/// The cookie a signed-in visitor sends to a private app: the web UI's session,
+/// from a real sign-in through Dex (only a browser session opens an app).
+/// `None` on ECS, whose Dex serves only the password grant; the scenario notes
+/// that it skips the signed-in check there.
+fn visitor_cookie(b: &dyn Backend) -> Result<Option<String>> {
+    if b.kind() == BackendKind::Ecs {
+        report::note("     ECS: signed-in app access not checked (Dex has no browser sign-in)");
+        return Ok(None);
+    }
+    let dexep = b.dex().context("backend exposes no reachable Dex")?;
+    let session = crate::login::browser_login(b.api_base(), dexep, "admin@example.com", "password")
+        .context("sign in through the web UI's Dex sign-in")?;
+    Ok(Some(format!("rise_jwt={session}")))
+}
+
 /// Unique-enough project name per run (DNS-safe), so a stale stack can't collide.
 pub(crate) fn unique(prefix: &str) -> String {
     // Process id + per-process atomic counter: two scenarios in one process can't
@@ -1685,11 +1700,32 @@ impl Scenario for PrivateIngressAuth {
             "redirect not to the project's signin page: {location}"
         );
 
-        // Authenticated (rise_jwt cookie) is allowed straight through to the app.
-        // Do NOT follow redirects: a rejected cookie answers 302 -> signin (which
-        // itself serves 200), so following would let an auth regression pass the
-        // status check. A 200 here therefore means the ingress let us through.
-        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        // Only the web UI's session opens an app. Rise sessions that aren't
+        // one (the CI bearer names no client; a CLI login is an API
+        // credential) are sent to sign in like an anonymous visitor.
+        let mut refused = vec![("the CI bearer", b.ci_bearer().to_string())];
+        if b.kind() != BackendKind::Ecs {
+            let dexep = b.dex().context("backend exposes no reachable Dex")?;
+            let cli = crate::login::login(b.api_base(), dexep, "admin@example.com", "password")
+                .context("log in through the CLI's code flow")?;
+            refused.push(("a CLI session", cli));
+        }
+        for (what, token) in refused {
+            let resp = b.ingress_get(&project, "/", false, Some(&format!("rise_jwt={token}")))?;
+            anyhow::ensure!(
+                resp.status == 302,
+                "{what} opened a private app (status {})",
+                resp.status
+            );
+        }
+
+        // A signed-in visitor is allowed straight through to the app. Do NOT
+        // follow redirects: a rejected cookie answers 302 -> signin (which
+        // itself serves 200), so following would let an auth regression pass
+        // the status check. A 200 here therefore means the ingress let us in.
+        let Some(cookie) = visitor_cookie(b)? else {
+            return Ok(());
+        };
         let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
         anyhow::ensure!(
             authed.status == 200,
@@ -1820,7 +1856,9 @@ impl Scenario for RouteAccessOverride {
 
         // An authenticated request to the inherited root route passes the gate
         // and reaches the sample app's known-good `/` path.
-        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        let Some(cookie) = visitor_cookie(b)? else {
+            return Ok(());
+        };
         let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
         anyhow::ensure!(
             authed.status == 200,
