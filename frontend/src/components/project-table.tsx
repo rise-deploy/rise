@@ -53,25 +53,18 @@ export interface ProjectTableProps {
     accessClasses?: AccessClassOption[];
     onRowClick: (project: ProjectRow) => void;
     emptyText?: string;
-    isOwnRow?: (project: ProjectRow) => boolean;
 }
 
-// Shared project listing table (r-* design system). Renders inside a Panel and
-// owns its empty state. Used by the Projects page and the team detail page.
-//
-// isOwnRow: optional predicate; matching rows get an accent highlight.
+// Project listing: a table on desktop, stacked cards on phones. Owns its
+// empty state.
 export function ProjectTable({
     projects,
     accessClasses = [],
     onRowClick,
     emptyText = 'No projects found.',
-    isOwnRow,
 }: ProjectTableProps) {
     const isMobile = useIsMobile();
     const accessLabel = (p: ProjectRow) => accessClasses.find(a => a.id === p.access_class)?.display_name || p.access_class || '—';
-    // When isOwnRow is provided, mark every row: an accent bar for owned
-    // projects, a gray bar for shared ones.
-    const ownClass = (p: ProjectRow) => isOwnRow ? (isOwnRow(p) ? 'r-row-own' : 'r-row-shared') : '';
 
     if (projects.length === 0) {
         return <Panel><div className="r-list-empty r-empty-dashed">{emptyText}</div></Panel>;
@@ -83,7 +76,7 @@ export function ProjectTable({
                 {projects.map(project => {
                     const updated = project.updated || project.updated_at || project.created;
                     return (
-                        <div key={project.id || project.name} className={`r-card ${ownClass(project)}`} role="link" tabIndex={0}
+                        <div key={project.id || project.name} className="r-card" role="link" tabIndex={0}
                             onClick={() => onRowClick(project)} onKeyDown={e => { if (e.key === 'Enter') onRowClick(project); }}>
                             <div className="r-card-row">
                                 <span className="r-card-title">{project.name}</span>
@@ -119,7 +112,7 @@ export function ProjectTable({
                     {projects.map(project => {
                         const updated = project.updated || project.updated_at || project.created;
                         return (
-                            <tr key={project.id || project.name} className={`click ${ownClass(project)}`} onClick={() => onRowClick(project)}>
+                            <tr key={project.id || project.name} className="click" onClick={() => onRowClick(project)}>
                                 <td>
                                     <div className="r-cell-main" style={{ fontWeight: 600 }}>{project.name}</div>
                                     {project.primary_url && (
