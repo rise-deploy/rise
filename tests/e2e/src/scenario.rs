@@ -1740,6 +1740,62 @@ impl Scenario for PrivateIngressAuth {
                 authed.body
             );
         }
+
+        // An app's token opens that app and no other: apps receive their
+        // visitors' tokens, so one app could otherwise replay them against
+        // another. The other app needn't be deployed for its sign-in to mint a
+        // token. ECS's Dex serves no browser sign-in.
+        if b.kind() == BackendKind::Ecs {
+            return Ok(());
+        }
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let sign_in = |project: &str| {
+            crate::login::app_login(
+                b.api_base(),
+                dexep,
+                project,
+                "admin@example.com",
+                "password",
+            )
+            .with_context(|| format!("sign a visitor in to {project}"))
+        };
+        let other = unique("e2e-priv-other");
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &other,
+                    "--access-class",
+                    "private",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+        let own = b.ingress_get(
+            &project,
+            "/",
+            false,
+            Some(&format!("rise_jwt={}", sign_in(&project)?)),
+        )?;
+        anyhow::ensure!(
+            own.status == 200,
+            "the app's own token was refused (status {})",
+            own.status
+        );
+        let replayed = b.ingress_get(
+            &project,
+            "/",
+            false,
+            Some(&format!("rise_jwt={}", sign_in(&other)?)),
+        )?;
+        anyhow::ensure!(
+            replayed.status == 302,
+            "another app's token opened this app (status {})",
+            replayed.status
+        );
         Ok(())
     }
 }

@@ -62,48 +62,83 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// best-effort: the canonical host is always included, so the common deep-link
 /// keeps working even if the deployment lookups fail.
 async fn project_redirect_hosts(state: &AppState, project_name: &str) -> Vec<String> {
-    fn host_of(url: &str) -> Option<String> {
-        url::Url::parse(url)
-            .ok()?
-            .host_str()
-            .map(|h| h.to_lowercase())
-    }
-    fn add(hosts: &mut Vec<String>, host: Option<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    for url in project_app_urls(state, project_name).await {
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_lowercase));
         if let Some(host) = host {
             if !hosts.contains(&host) {
                 hosts.push(host);
             }
         }
     }
-    let mut hosts: Vec<String> = Vec::new();
-    // Canonical ingress host from the template (no DB needed).
-    add(
-        &mut hosts,
-        build_project_url(state, project_name)
-            .as_deref()
-            .and_then(host_of),
-    );
-    // Active deployment URLs (default host + custom domains), across groups.
+    hosts
+}
+
+/// Whether a token's `aud` names the app at `candidate`: same host, explicit
+/// port and path prefix (sub-path layouts put several apps on one host). The
+/// scheme is ignored, as one app may be reached over either.
+fn audience_names_app(aud: &str, candidate: &str) -> bool {
+    fn key(url: &str) -> Option<(String, Option<u16>, String)> {
+        let url = url::Url::parse(url).ok()?;
+        Some((
+            url.host_str()?.to_lowercase(),
+            url.port(),
+            url.path().trim_end_matches('/').to_string(),
+        ))
+    }
+    match (key(aud), key(candidate)) {
+        (Some(aud), Some(candidate)) => aud == candidate,
+        _ => false,
+    }
+}
+
+/// Whether a token whose audience is `aud` may open `project_name`'s app.
+///
+/// Sign-in mints an app token for the URL the visitor came through (the
+/// project's template URL, a custom domain, or another deployment group's
+/// host) and the app receives that cookie. Without this check, the owner of one
+/// app could replay a visitor's token against another app the visitor can
+/// reach. A token for Rise's own URL is a web UI session, or an app token from
+/// an install without per-project URLs, where every app shares Rise's host and
+/// cookie anyway.
+async fn audience_admits_project(state: &AppState, project_name: &str, aud: &str) -> bool {
+    // The cheap candidates cover the common case on every app request.
+    if audience_names_app(aud, &state.public_url)
+        || build_project_url(state, project_name).is_some_and(|url| audience_names_app(aud, &url))
+    {
+        return true;
+    }
+    project_app_urls(state, project_name)
+        .await
+        .iter()
+        .any(|url| audience_names_app(aud, url))
+}
+
+/// The base URLs `project_name`'s app answers on: its template URL plus every
+/// active deployment's URL (default host + custom domains), across groups.
+/// Lookups are best-effort; a failed one leaves its URLs out.
+async fn project_app_urls(state: &AppState, project_name: &str) -> Vec<String> {
+    let mut urls: Vec<String> = build_project_url(state, project_name).into_iter().collect();
     if let Ok(Some(project)) = projects::find_by_name(&state.db_pool, project_name).await {
         if let Ok(deployments) =
             crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
                 .await
         {
             for deployment in &deployments {
-                if let Ok(urls) = state
+                if let Ok(deployment_urls) = state
                     .deployment_backend
                     .get_deployment_urls(deployment, &project)
                     .await
                 {
-                    add(&mut hosts, host_of(&urls.default_url));
-                    for custom in &urls.custom_domain_urls {
-                        add(&mut hosts, host_of(custom));
-                    }
+                    urls.push(deployment_urls.default_url);
+                    urls.extend(deployment_urls.custom_domain_urls);
                 }
             }
         }
     }
-    hosts
+    urls
 }
 
 /// Validate and sanitize a redirect URL to prevent open redirect vulnerabilities
@@ -1695,6 +1730,17 @@ pub async fn ingress_auth(
         }
     };
 
+    // A token minted for another app (which received it as its own cookie)
+    // never opens this one.
+    if !audience_admits_project(&state, &params.project, &ingress_claims.aud).await {
+        tracing::warn!(
+            project = %params.project,
+            aud = %ingress_claims.aud,
+            "Ingress token was minted for another app"
+        );
+        return Ok(unauthenticated("Session is for another app"));
+    }
+
     // A disabled User or identity loses app access with every other token: a
     // session re-resolves its User and minting identity, and an ingress token
     // — which keeps the IdP's `sub` — is checked against that identity's
@@ -2103,6 +2149,27 @@ mod tests {
             url,
             "http://rise.localhost:3000/api/v1/auth/signin?project=app"
         );
+    }
+
+    #[test]
+    fn audience_names_only_its_own_app() {
+        let app = "https://shop.apps.example.com";
+        assert!(audience_names_app(app, "https://shop.apps.example.com/"));
+        // Either scheme reaches the same app.
+        assert!(audience_names_app(app, "http://shop.apps.example.com"));
+        assert!(!audience_names_app(app, "https://other.apps.example.com"));
+        assert!(!audience_names_app(
+            app,
+            "https://shop.apps.example.com:8443"
+        ));
+
+        // Sub-path layouts share a host: the path tells the apps apart.
+        let shop = "https://apps.example.com/shop";
+        assert!(audience_names_app(shop, "https://apps.example.com/shop/"));
+        assert!(!audience_names_app(shop, "https://apps.example.com/other"));
+        assert!(!audience_names_app(shop, "https://apps.example.com"));
+
+        assert!(!audience_names_app("not a url", app));
     }
 
     #[test]
