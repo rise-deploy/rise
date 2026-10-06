@@ -1298,10 +1298,7 @@ async fn dispatch_post_inner(
         };
         match outcome {
             Ok(response) => return Ok(response),
-            Err(error) if ResourceAuthorizer::should_retry(&error, attempt) => {
-                ResourceAuthorizer::backoff(attempt).await;
-                attempt += 1;
-            }
+            Err(error) if ResourceAuthorizer::should_retry(&error, attempt) => attempt += 1,
             Err(error) => return Err(error),
         }
     }
@@ -1360,10 +1357,7 @@ async fn dispatch_put_inner(
         };
         match outcome {
             Ok(response) => return Ok(response),
-            Err(error) if ResourceAuthorizer::should_retry(&error, attempt) => {
-                ResourceAuthorizer::backoff(attempt).await;
-                attempt += 1;
-            }
+            Err(error) if ResourceAuthorizer::should_retry(&error, attempt) => attempt += 1,
             Err(error) => return Err(error),
         }
     }
@@ -1467,10 +1461,7 @@ async fn dispatch_delete_inner(
         };
         match outcome {
             Ok(response) => return Ok(response),
-            Err(error) if ResourceAuthorizer::should_retry(&error, attempt) => {
-                ResourceAuthorizer::backoff(attempt).await;
-                attempt += 1;
-            }
+            Err(error) if ResourceAuthorizer::should_retry(&error, attempt) => attempt += 1,
             Err(error) => return Err(error),
         }
     }

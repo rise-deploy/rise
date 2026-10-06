@@ -30,16 +30,17 @@ Rise then keeps a token for it at `/var/run/secrets/rise/identity/tokens/bao`.
 
 ## Log in and read
 
-Log in with the token file and work under your own path. Rise injects
-`RISE_ENVIRONMENT`; the project name is your own:
+Log in with the token file and work under your own path. Replace `my-app`
+with your project's name; Rise injects the environment as `RISE_ENVIRONMENT`:
 
 ```bash
 export BAO_ADDR=https://bao.example.com
 export BAO_TOKEN=$(bao write -field=token auth/rise/login \
   role=app jwt=@/var/run/secrets/rise/identity/tokens/bao)
+APP_PATH="rise/my-app/$RISE_ENVIRONMENT"
 
-bao kv put -mount=secret "rise/my-app/$RISE_ENVIRONMENT/config" api_key=s3cr3t
-bao kv get -mount=secret "rise/my-app/$RISE_ENVIRONMENT/config"
+bao kv put -mount=secret "$APP_PATH/config" api_key=s3cr3t
+bao kv get -mount=secret "$APP_PATH/config"
 ```
 
 With Vault, use `vault` instead of `bao` — the arguments are the same.
@@ -54,7 +55,8 @@ before it expires — and log in again when the Vault token runs out.
 Make [OpenBao Agent](https://openbao.org/docs/agent-and-proxy/agent/) (or
 Vault Agent) your image's entrypoint and let it start your app. The Agent logs
 in with the token file, passes secrets to the app as environment variables, and
-restarts the app when they change:
+restarts the app when they change. This replaces the image's entrypoint, so it
+needs a [Dockerfile build](../../user-guide/builds/docker/):
 
 ```dockerfile
 FROM openbao/openbao:2.4 AS bao
@@ -84,7 +86,8 @@ auto_auth {
   }
 }
 
-# One block per variable; RISE_ENVIRONMENT picks this environment's path.
+# One block per variable. Replace my-app with your project's name;
+# RISE_ENVIRONMENT picks this environment's path.
 env_template "API_KEY" {
   contents             = "{{ with secret (printf \"secret/data/rise/my-app/%s/config\" (env \"RISE_ENVIRONMENT\")) }}{{ .Data.data.api_key }}{{ end }}"
   error_on_missing_key = true

@@ -44,6 +44,7 @@ use uuid::Uuid;
 use crate::server::auth::context::{AnyAuth, AuthContext};
 use crate::server::error::ServerError;
 use crate::server::resources::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
+use crate::server::retry::conflict_retry_delay;
 
 pub use change::{
     change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
@@ -61,13 +62,6 @@ pub use projection::{project_list_item, ReadGranularity};
 /// ordinary case — one concurrent policy write — while a persistently losing
 /// request surfaces as a 503 the caller can see.
 const MAX_SERIALIZATION_ATTEMPTS: u32 = 3;
-
-/// The randomized wait before a replay, in milliseconds, scaled by the number
-/// of attempts already made.
-///
-/// Two writes that abort each other under SSI and replay at once tend to abort
-/// each other again; a random stagger lets one of them commit first.
-const SERIALIZATION_BACKOFF_MS: std::ops::Range<u64> = 5..25;
 
 /// Builds authorization contexts for requests, over the pool or over one
 /// serializable transaction.
@@ -211,11 +205,14 @@ impl ResourceAuthorizer {
     /// commits against. A concurrent revocation either precedes the check or
     /// forces the attempt to be replayed.
     ///
-    /// `attempt` is the 1-based replay counter, carried only so the audit
-    /// record can say which try it is: gate comparisons and refusals are logged
-    /// inline (a comparison happened, whatever the transaction goes on to do),
-    /// so a replayed write emits the line more than once and an unmarked
-    /// duplicate would read as two separate attempts to delegate.
+    /// `attempt` is the 1-based replay counter. A replay first waits a short,
+    /// jittered delay: the previous attempt's transaction is already rolled
+    /// back by then, and two writes that aborted each other would otherwise
+    /// replay in lockstep and lose again. The audit record also carries it:
+    /// gate comparisons and refusals are logged inline (a comparison happened,
+    /// whatever the transaction goes on to do), so a replayed write emits the
+    /// line more than once and an unmarked duplicate would read as two
+    /// separate attempts to delegate.
     pub async fn begin_write(
         &self,
         auth: &AnyAuth,
@@ -225,6 +222,9 @@ impl ResourceAuthorizer {
         // accept should not cost one, and on a retry loop it would cost one per
         // attempt.
         let (principal, user, actor) = Self::principal(auth)?;
+        if attempt > 1 {
+            tokio::time::sleep(conflict_retry_delay(attempt - 1)).await;
+        }
         let transaction = SerializableTransaction::begin(&self.pool)
             .await
             .map_err(store_error_to_server_error)?;
@@ -252,16 +252,6 @@ impl ResourceAuthorizer {
             );
         }
         retry
-    }
-
-    /// Waits a short, random time before replaying a write that lost a
-    /// serialization race, so two contending writes do not replay in lockstep.
-    pub async fn backoff(attempt: u32) {
-        let millis = {
-            use rand::RngExt;
-            rand::rng().random_range(SERIALIZATION_BACKOFF_MS)
-        } * u64::from(attempt);
-        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
     }
 }
 
