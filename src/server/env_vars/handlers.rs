@@ -816,7 +816,7 @@ pub async fn preview_deployment_env_vars(
 
     // System vars from rise_system_env_vars() — requires deployment URLs from the backend.
     // When URLs are unavailable (e.g. no deployment controller configured), fall back to
-    // inserting only the URL-independent vars (RISE_ISSUER, RISE_DEPLOYMENT_GROUP*).
+    // inserting only the URL-independent vars (RISE_ISSUER, RISE_PROJECT, RISE_DEPLOYMENT_GROUP*).
     match state
         .deployment_backend
         .get_project_urls(&project, &deployment_group)
@@ -825,6 +825,7 @@ pub async fn preview_deployment_env_vars(
         Ok(urls) => {
             for (key, value) in deployment_models::rise_system_env_vars(
                 &state.public_url,
+                &project.name,
                 &deployment_group,
                 &urls,
                 params.get("environment").map(|s| s.as_str()),
@@ -850,6 +851,7 @@ pub async fn preview_deployment_env_vars(
             // Insert URL-independent system vars only
             for (key, value) in [
                 ("RISE_ISSUER", state.public_url.clone()),
+                ("RISE_PROJECT", project.name.clone()),
                 ("RISE_DEPLOYMENT_GROUP", deployment_group.clone()),
                 (
                     "RISE_DEPLOYMENT_GROUP_NORMALIZED",

@@ -264,6 +264,7 @@ async fn insert_rise_env_vars(
 
     let vars = models::rise_system_env_vars(
         &state.public_url,
+        &project.name,
         &deployment.deployment_group,
         &deployment_urls,
         environment_name.as_deref(),

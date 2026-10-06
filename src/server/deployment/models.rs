@@ -315,10 +315,11 @@ mod tests {
             all_urls: vec!["https://myapp.rise.dev".to_string()],
         };
 
-        let vars = rise_system_env_vars("https://rise.dev", "default", &urls, None);
+        let vars = rise_system_env_vars("https://rise.dev", "myapp", "default", &urls, None);
 
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
         assert_eq!(map["RISE_ISSUER"], "https://rise.dev");
+        assert_eq!(map["RISE_PROJECT"], "myapp");
         assert_eq!(map["RISE_APP_URL"], "https://myapp.rise.dev");
         assert_eq!(map["RISE_APP_URLS"], r#"["https://myapp.rise.dev"]"#);
         assert_eq!(map["RISE_DEPLOYMENT_GROUP"], "default");
@@ -337,7 +338,7 @@ mod tests {
             ],
         };
 
-        let vars = rise_system_env_vars("https://rise.dev", "mr/42", &urls, None);
+        let vars = rise_system_env_vars("https://rise.dev", "myapp", "mr/42", &urls, None);
 
         let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
         assert_eq!(map["RISE_APP_URL"], "https://custom.example.com");

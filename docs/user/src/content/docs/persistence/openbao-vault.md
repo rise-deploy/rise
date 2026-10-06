@@ -30,14 +30,14 @@ Rise then keeps a token for it at `/var/run/secrets/rise/identity/tokens/bao`.
 
 ## Log in and read
 
-Log in with the token file and work under your own path. Replace `my-app`
-with your project's name; Rise injects the environment as `RISE_ENVIRONMENT`:
+Log in with the token file and work under your own path, built from the
+`RISE_PROJECT` and `RISE_ENVIRONMENT` variables Rise injects:
 
 ```bash
 export BAO_ADDR=https://bao.example.com
 export BAO_TOKEN=$(bao write -field=token auth/rise/login \
   role=app jwt=@/var/run/secrets/rise/identity/tokens/bao)
-APP_PATH="rise/my-app/$RISE_ENVIRONMENT"
+APP_PATH="rise/$RISE_PROJECT/$RISE_ENVIRONMENT"
 
 bao kv put -mount=secret "$APP_PATH/config" api_key=s3cr3t
 bao kv get -mount=secret "$APP_PATH/config"
@@ -86,10 +86,10 @@ auto_auth {
   }
 }
 
-# One block per variable. Replace my-app with your project's name;
-# RISE_ENVIRONMENT picks this environment's path.
+# One block per variable; RISE_PROJECT and RISE_ENVIRONMENT pick this
+# deployment's path.
 env_template "API_KEY" {
-  contents             = "{{ with secret (printf \"secret/data/rise/my-app/%s/config\" (env \"RISE_ENVIRONMENT\")) }}{{ .Data.data.api_key }}{{ end }}"
+  contents             = "{{ with secret (printf \"secret/data/rise/%s/%s/config\" (env \"RISE_PROJECT\") (env \"RISE_ENVIRONMENT\")) }}{{ .Data.data.api_key }}{{ end }}"
   error_on_missing_key = true
 }
 
@@ -105,7 +105,7 @@ template_config {
 }
 ```
 
-The same image works in every environment. Your app reads `API_KEY` like any
+The same image works in every project and environment. Your app reads `API_KEY` like any
 other environment variable and must handle `SIGTERM`, which the Agent sends
 before restarting it with new values.
 
