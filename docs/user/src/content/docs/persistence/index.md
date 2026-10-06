@@ -21,3 +21,6 @@ never another project's — with no long-lived secret to store or rotate.
 | PostgreSQL | [AWS RDS Provisioner](../extensions/aws-rds-provisioner/) | Project extension; injects connection variables |
 | Object storage | [AWS S3 Bucket](../extensions/aws-s3-bucket/) | Project extension |
 | Anything that trusts OIDC (AWS IAM, GCP, …) | [Workload Identity Tokens](../user-guide/workload-identity-tokens/) | Federate the token directly |
+
+Each option needs your Rise operator to set it up first; their side is in the
+[operator docs](/operator-docs/persistence/).

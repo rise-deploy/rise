@@ -1,6 +1,6 @@
 ---
 title: "OpenBao / Vault"
-description: Give every Rise app its own KV v2 path in OpenBao or HashiCorp Vault, authenticated by its workload identity.
+description: Set up OpenBao or HashiCorp Vault so every Rise app gets its own KV v2 path, authenticated by its workload identity.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -8,7 +8,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 [OpenBao](https://openbao.org) and [HashiCorp Vault](https://www.vaultproject.io)
 can trust Rise as a JWT issuer. With **one** auth role and **one** templated
 policy, every Rise app logs in with its
-[workload identity token](../../user-guide/workload-identity-tokens/) and gets
+[workload identity token](/docs/user-guide/workload-identity-tokens/) and gets
 access to exactly one KV v2 path:
 
 ```
@@ -186,53 +186,21 @@ resource "vault_jwt_auth_backend_role" "rise_app" {
 To admit only some projects, add `bound_claims`, e.g.
 `{"project": ["billing", "checkout"]}`.
 
-## 5. Use it from an app
+## 5. Hand it to your users
 
-Request a token for the audience in `rise.toml`:
+Apps need four values, which the
+[user guide](/docs/persistence/openbao-vault/) asks them to get from you:
 
-```toml
-[identity.audiences]
-bao = "https://bao.example.com"
-```
-
-Then log in with the token file and work under your own path. Rise injects
-`RISE_ENVIRONMENT`; the project name is your own:
-
-```bash
-export BAO_ADDR=https://bao.example.com
-export BAO_TOKEN=$(bao write -field=token auth/rise/login \
-  role=app jwt=@/var/run/secrets/rise/identity/tokens/bao)
-
-bao kv put -mount=secret "rise/my-app/$RISE_ENVIRONMENT/config" api_key=s3cr3t
-bao kv get -mount=secret "rise/my-app/$RISE_ENVIRONMENT/config"
-```
-
-Any Vault client library does the same: `POST /v1/auth/rise/login` with
-`{"role": "app", "jwt": "<file contents>"}`, then use the returned
-`auth.client_token`. Re-read the token file on every login — Rise refreshes it
-before it expires — and log in again when the Vault token runs out.
-
-For an app that should not talk to Vault itself, run
-[OpenBao Agent](https://openbao.org/docs/agent-and-proxy/agent/) or Vault Agent
-alongside it with JWT auto-auth pointed at the same file:
-
-```hcl
-auto_auth {
-  method "jwt" {
-    mount_path = "auth/rise"
-    config = {
-      role                     = "app"
-      path                     = "/var/run/secrets/rise/identity/tokens/bao"
-      remove_jwt_after_reading = false # the file is read-only and refreshed by Rise
-    }
-  }
-}
-```
+| Value | In this guide |
+|---|---|
+| Address | `https://bao.example.com` |
+| Audience | `https://bao.example.com` |
+| Auth mount and role | `auth/rise`, role `app` |
+| KV mount and path | `secret`, `rise/<project>/<environment>/` |
 
 ## Notes
 
 - A deployment without an environment carries the environment `<null>`, so its
   path is `rise/<project>/<null>/`.
-- Values are not exposed to the app as environment variables; read them at
-  runtime. Rise's own [environment variables](../../user-guide/environment-variables/)
-  remain the place for configuration Rise should inject at deploy time.
+- This setup lives entirely in OpenBao/Vault; Rise needs no configuration for
+  it and it works the same on every deployment backend.
