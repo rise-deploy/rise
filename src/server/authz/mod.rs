@@ -62,6 +62,13 @@ pub use projection::{project_list_item, ReadGranularity};
 /// request surfaces as a 503 the caller can see.
 const MAX_SERIALIZATION_ATTEMPTS: u32 = 3;
 
+/// The randomized wait before a replay, in milliseconds, scaled by the number
+/// of attempts already made.
+///
+/// Two writes that abort each other under SSI and replay at once tend to abort
+/// each other again; a random stagger lets one of them commit first.
+const SERIALIZATION_BACKOFF_MS: std::ops::Range<u64> = 5..25;
+
 /// Builds authorization contexts for requests, over the pool or over one
 /// serializable transaction.
 #[derive(Clone)]
@@ -245,6 +252,16 @@ impl ResourceAuthorizer {
             );
         }
         retry
+    }
+
+    /// Waits a short, random time before replaying a write that lost a
+    /// serialization race, so two contending writes do not replay in lockstep.
+    pub async fn backoff(attempt: u32) {
+        let millis = {
+            use rand::RngExt;
+            rand::rng().random_range(SERIALIZATION_BACKOFF_MS)
+        } * u64::from(attempt);
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
     }
 }
 
