@@ -51,10 +51,28 @@ before it expires — and log in again when the Vault token runs out.
 
 ## Without Vault code in your app
 
-Run [OpenBao Agent](https://openbao.org/docs/agent-and-proxy/agent/) or Vault
-Agent alongside your app with JWT auto-auth pointed at the same file:
+Make [OpenBao Agent](https://openbao.org/docs/agent-and-proxy/agent/) (or
+Vault Agent) your image's entrypoint and let it start your app. The Agent logs
+in with the token file, passes secrets to the app as environment variables, and
+restarts the app when they change:
+
+```dockerfile
+FROM openbao/openbao:2.4 AS bao
+
+FROM python:3.13-slim
+COPY --from=bao /bin/bao /usr/local/bin/bao
+COPY agent.hcl /etc/bao/agent.hcl
+COPY . /app
+WORKDIR /app
+ENTRYPOINT ["bao", "agent", "-config=/etc/bao/agent.hcl"]
+```
 
 ```hcl
+# agent.hcl
+vault {
+  address = "https://bao.example.com"
+}
+
 auto_auth {
   method "jwt" {
     mount_path = "auth/rise"
@@ -65,10 +83,31 @@ auto_auth {
     }
   }
 }
+
+# One block per variable; RISE_ENVIRONMENT picks this environment's path.
+env_template "API_KEY" {
+  contents             = "{{ with secret (printf \"secret/data/rise/my-app/%s/config\" (env \"RISE_ENVIRONMENT\")) }}{{ .Data.data.api_key }}{{ end }}"
+  error_on_missing_key = true
+}
+
+exec {
+  command                   = ["python", "app.py"]
+  restart_on_secret_changes = "always"
+  restart_stop_signal       = "SIGTERM"
+}
+
+# How often changed values are picked up (default 5m).
+template_config {
+  static_secret_render_interval = "1m"
+}
 ```
+
+The same image works in every environment. Your app reads `API_KEY` like any
+other environment variable and must handle `SIGTERM`, which the Agent sends
+before restarting it with new values.
 
 ## Notes
 
-- Values are not exposed as environment variables; read them at runtime.
-  Rise's own [environment variables](../../user-guide/environment-variables/)
+- Rise itself does not inject Vault values; read them at runtime or through
+  the Agent as above. Rise's own [environment variables](../../user-guide/environment-variables/)
   remain the place for configuration Rise should inject at deploy time.
