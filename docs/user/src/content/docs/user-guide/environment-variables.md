@@ -118,6 +118,7 @@ Rise automatically injects these variables into every deployment:
 |----------|-------------|---------|
 | `PORT` | HTTP port the container should listen on | `8080` |
 | `RISE_ISSUER` | Rise server URL and JWT issuer | `https://rise.example.com` |
+| `RISE_PROJECT` | Project name | `myapp` |
 | `RISE_APP_URL` | Canonical URL (primary custom domain or default URL) | `https://myapp.example.com` |
 | `RISE_APP_URLS` | JSON array of all URLs for the app | `["https://myapp.app.example.com"]` |
 | `RISE_DEPLOYMENT_GROUP` | Deployment group name | `default` |

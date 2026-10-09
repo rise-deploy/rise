@@ -24,6 +24,7 @@ pub mod rate_limit;
 pub mod registry;
 #[cfg(feature = "backend")]
 pub mod resources;
+pub mod retry;
 pub mod service_accounts;
 pub mod settings;
 pub mod ssrf;

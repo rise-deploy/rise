@@ -745,6 +745,7 @@ impl DockerReconciler {
 
         let system_env = rise_system_env_vars(
             &self.config.public_url,
+            &project.name,
             &deployment.deployment_group,
             &urls,
             env_name.as_deref(),
