@@ -580,33 +580,8 @@ async fn build_traefik_dynamic_config(
             continue;
         }
 
-        // Store errors fail the snapshot (Traefik keeps its last good config);
-        // a single project's bad linkage only withholds that project's routes.
-        let Some(org_uid) = state
-            .deployment_store
-            .organization_uid_for_project(project.id)
-            .await?
-        else {
-            tracing::error!(project = %project.name, "Withholding routes: project has no Organization linkage");
-            continue;
-        };
-        let Some(org) =
-            state.resource_store.get(org_uid).await.map_err(|error| {
-                anyhow::anyhow!("failed to load Organization {org_uid}: {error}")
-            })?
-        else {
-            tracing::error!(project = %project.name, %org_uid, "Withholding routes: Organization is missing");
-            continue;
-        };
-        let org_spec: rise_resource_api::OrganizationSpec = match serde_json::from_value(org.spec) {
-            Ok(spec) => spec,
-            Err(error) => {
-                tracing::error!(project = %project.name, %org_uid, "Withholding routes: Organization has malformed spec: {error:?}");
-                continue;
-            }
-        };
         if !provider.controller_class.is_empty()
-            && org_spec.deployment_controller_class.as_deref()
+            && project_controller_class(state, &project).await?.as_deref()
                 != Some(provider.controller_class.as_str())
         {
             continue;
@@ -620,13 +595,16 @@ async fn build_traefik_dynamic_config(
             .deployment_store
             .list_project_custom_domains(project.id)
             .await?;
+        // Any error — store or undecodable data — fails the whole snapshot, so
+        // Traefik keeps serving its last good config instead of dropping a
+        // live router.
         targets.extend(rise_backend_traefik::dynamic::project_route_targets(
             &project,
             &deployments,
             &environments,
             &custom_domains,
             &url_builder,
-        ));
+        )?);
     }
 
     Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
@@ -634,6 +612,30 @@ async fn build_traefik_dynamic_config(
         &render_config,
         provider.native_provider,
     ))
+}
+
+/// The deployment controller class of `project`'s Organization.
+#[cfg(feature = "backend")]
+async fn project_controller_class(
+    state: &state::AppState,
+    project: &rise_backend_core::models::Project,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+
+    let org_uid = state
+        .deployment_store
+        .organization_uid_for_project(project.id)
+        .await?
+        .with_context(|| format!("project '{}' has no Organization linkage", project.name))?;
+    let org = state
+        .resource_store
+        .get(org_uid)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to load Organization {org_uid}: {error}"))?
+        .with_context(|| format!("Organization {org_uid} is missing"))?;
+    let org_spec: rise_resource_api::OrganizationSpec = serde_json::from_value(org.spec)
+        .with_context(|| format!("Organization {org_uid} has malformed spec"))?;
+    Ok(org_spec.deployment_controller_class)
 }
 
 /// Static facts about the configured runtime log backend. Surfaced to the

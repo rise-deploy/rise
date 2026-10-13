@@ -286,11 +286,39 @@ impl DeploymentUrlBuilder {
         hosts
     }
 
+    /// The environment whose `primary_deployment_group` is `deployment_group`.
+    fn environment_for_group<'a>(
+        deployment_group: &str,
+        all_environments: &'a [Environment],
+    ) -> Option<&'a Environment> {
+        all_environments
+            .iter()
+            .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group))
+    }
+
+    /// `environment`'s custom domains that pass [`Self::filter_valid_custom_domains`].
+    fn valid_domains_for_environment(
+        &self,
+        environment: Option<&Environment>,
+        custom_domains: &[CustomDomain],
+    ) -> Vec<CustomDomain> {
+        let Some(environment) = environment else {
+            return Vec::new();
+        };
+        let for_env: Vec<CustomDomain> = custom_domains
+            .iter()
+            .filter(|domain| domain.environment_id == environment.id)
+            .cloned()
+            .collect();
+        self.filter_valid_custom_domains(&for_env)
+    }
+
     /// The public hosts Traefik routes to `deployment_group`'s active
     /// deployment: [`Self::primary_ingress_hosts`] with the environment whose
     /// `primary_deployment_group` is this group, and only that environment's
-    /// valid custom domains. Mirrors the Kubernetes webhook's per-group scoping,
-    /// so a production custom domain never lands on a preview group's router.
+    /// valid custom domains — the same per-group scoping as the Kubernetes
+    /// webhook, so a production custom domain never lands on a preview group's
+    /// router. Unlike Kubernetes, there is no fallback host when none applies.
     pub fn public_hosts_for_group(
         &self,
         project: &Project,
@@ -298,17 +326,8 @@ impl DeploymentUrlBuilder {
         all_environments: &[Environment],
         custom_domains: &[CustomDomain],
     ) -> Vec<String> {
-        let environment = all_environments
-            .iter()
-            .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
-        let domains_for_env: Vec<CustomDomain> = match environment {
-            Some(env) => self
-                .filter_valid_custom_domains(custom_domains)
-                .into_iter()
-                .filter(|domain| domain.environment_id == env.id)
-                .collect(),
-            None => Vec::new(),
-        };
+        let environment = Self::environment_for_group(deployment_group, all_environments);
+        let domains_for_env = self.valid_domains_for_environment(environment, custom_domains);
         self.primary_ingress_hosts(
             project,
             deployment_group,
@@ -388,9 +407,7 @@ impl DeploymentUrlBuilder {
         all_environments: &[Environment],
         custom_domains: &[CustomDomain],
     ) -> DeploymentUrls {
-        let environment = all_environments
-            .iter()
-            .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
+        let environment = Self::environment_for_group(deployment_group, all_environments);
         self.compute_urls_for_group(
             project,
             deployment_group,
@@ -422,12 +439,8 @@ impl DeploymentUrlBuilder {
             })
         });
 
-        let valid_custom_domains = self.filter_valid_custom_domains(custom_domains);
-        let env_id = environment_for_group.map(|e| e.id);
-        let domains_for_env: Vec<&CustomDomain> = valid_custom_domains
-            .iter()
-            .filter(|cd| env_id == Some(cd.environment_id))
-            .collect();
+        let domains_for_env =
+            self.valid_domains_for_environment(environment_for_group, custom_domains);
 
         let starred = domains_for_env.iter().find(|d| d.is_primary);
         let primary_url = if let Some(starred) = starred {

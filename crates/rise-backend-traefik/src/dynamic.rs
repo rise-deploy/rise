@@ -99,30 +99,19 @@ pub fn render_dynamic_config(
 /// group, each routed on its own group's hosts
 /// ([`DeploymentUrlBuilder::public_hosts_for_group`]).
 ///
-/// A deployment whose container/route side-data does not decode is logged and
-/// skipped: one corrupt row must not take every other route out of the
-/// install-wide snapshot.
+/// A deployment whose container/route side-data does not decode fails the
+/// whole call: the HTTP-provider endpoint then errors and Traefik keeps
+/// serving its last good config, rather than dropping a live router.
 pub fn project_route_targets(
     project: &Project,
     active_deployments: &[Deployment],
     all_environments: &[Environment],
     custom_domains: &[CustomDomain],
     url_builder: &DeploymentUrlBuilder,
-) -> Vec<DynamicRouteTarget> {
+) -> anyhow::Result<Vec<DynamicRouteTarget>> {
     let mut targets = Vec::new();
     for deployment in active_deployments {
-        let (containers, routes) = match resolve_runtime_containers(deployment) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                tracing::error!(
-                    project = %project.name,
-                    deployment_group = %deployment.deployment_group,
-                    deployment_id = %deployment.deployment_id,
-                    "Withholding routes for deployment with undecodable side-data: {error:?}"
-                );
-                continue;
-            }
-        };
+        let (containers, routes) = resolve_runtime_containers(deployment)?;
         let hosts = url_builder.public_hosts_for_group(
             project,
             &deployment.deployment_group,
@@ -149,7 +138,7 @@ pub fn project_route_targets(
             }
         }));
     }
-    targets
+    Ok(targets)
 }
 
 pub fn render_dynamic_route_targets(
@@ -349,13 +338,10 @@ mod tests {
         let classes = HashMap::from([("private".to_string(), AccessRequirement::Member)]);
         let project = project("docs-app", "private");
         let production = environment(&project, "production", Some("default"));
-        let mut corrupt = deployment(&project, "d4", "pr/125");
-        corrupt.containers = Some(serde_json::json!("not a container list"));
         let deployments = [
             deployment(&project, "d3", "pr/124"),
             deployment(&project, "d2", "pr/123"),
             deployment(&project, "d1", "default"),
-            corrupt,
         ];
 
         let rendered = render_dynamic_route_targets(
@@ -365,7 +351,8 @@ mod tests {
                 std::slice::from_ref(&production),
                 &[custom_domain(&production, "docs.customer.com")],
                 &url_builder(),
-            ),
+            )
+            .unwrap(),
             &config(&classes),
             "ecs",
         );
@@ -396,5 +383,16 @@ mod tests {
                 .middlewares
                 .contains_key(&format!("{name}-auth")));
         }
+    }
+
+    /// An undecodable active deployment fails the snapshot (Traefik keeps its
+    /// last good config) instead of silently dropping that group's router.
+    #[test]
+    fn undecodable_deployment_fails_the_snapshot() {
+        let project = project("docs-app", "private");
+        let mut corrupt = deployment(&project, "d2", "pr/123");
+        corrupt.containers = Some(serde_json::json!("not a container list"));
+        let deployments = [deployment(&project, "d1", "default"), corrupt];
+        assert!(project_route_targets(&project, &deployments, &[], &[], &url_builder()).is_err());
     }
 }

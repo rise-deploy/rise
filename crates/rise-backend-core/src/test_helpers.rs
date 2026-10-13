@@ -11,10 +11,19 @@
 //! rather than duplicating the fixtures.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use chrono::Utc;
+use uuid::Uuid;
 
 use super::desired::{DesiredContainer, DesiredRoute};
 use super::diff::ActualContainer;
+use super::models::{
+    CustomDomain, Deployment, DeploymentStatus, Environment, Project, ProjectStatus,
+};
 use super::naming;
+use super::providers::{ImageTagType, RegistryCredentials, RegistryProvider};
+use super::url_builder::DeploymentUrlBuilder;
 
 pub fn desired(container: &str, image: &str, hash: &str) -> DesiredContainer {
     DesiredContainer {
@@ -141,17 +150,6 @@ pub fn all_healthy(actual: &[ActualContainer]) -> HashMap<String, bool> {
 }
 
 // ── Model fixtures ─────────────────────────────────────────────────────
-
-use std::sync::Arc;
-
-use chrono::Utc;
-use uuid::Uuid;
-
-use super::models::{
-    CustomDomain, Deployment, DeploymentStatus, Environment, Project, ProjectStatus,
-};
-use super::providers::{ImageTagType, RegistryCredentials, RegistryProvider};
-use super::url_builder::DeploymentUrlBuilder;
 
 /// A project named `name` with the given access class.
 pub fn project(name: &str, access_class: &str) -> Project {

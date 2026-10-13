@@ -1189,10 +1189,11 @@ impl EcsReconciler {
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
-        let urls = self.url_builder.compute_deployment_urls(
+        // Same environment selection as `public_hosts_for_group`, so the
+        // advertised URLs match the hosts Traefik routes.
+        let urls = self.url_builder.compute_project_urls(
             project,
-            deployment,
-            environment.as_ref(),
+            &deployment.deployment_group,
             &all_environments,
             &custom_domains,
         );
