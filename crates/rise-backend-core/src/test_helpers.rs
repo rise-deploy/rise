@@ -1,14 +1,11 @@
 //! Shared test fixtures for the runtime-agnostic reconcile machinery.
 //!
-//! Public (rather than `#[cfg(test)]`) so every backend crate's tests build the
-//! same canonical desired/actual containers instead of drifting copies.
-
-//! Shared `#[cfg(test)]` fixtures for the reconciler's pure-helper unit tests.
-//!
-//! These builders construct the `DesiredContainer` / `ActualContainer` slots and
-//! the protected-id / health maps used across the `diff`, `rolling`, and
-//! `pod_status` test modules so each module's tests can `use super::test_helpers`
-//! rather than duplicating the fixtures.
+//! Compiled for this crate's tests and, through the `test-helpers` feature
+//! (enabled only from `[dev-dependencies]`), for every backend crate's tests,
+//! so they build the same canonical fixtures instead of drifting copies:
+//! `DesiredContainer` / `ActualContainer` slots, protected-id and health maps,
+//! and `Project` / `Deployment` / `Environment` / `CustomDomain` models with a
+//! matching `DeploymentUrlBuilder`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

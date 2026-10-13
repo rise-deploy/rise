@@ -701,11 +701,10 @@ impl DockerReconciler {
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
         // URLs (drives Traefik hosts + RISE_* system env vars).
-        // Same environment selection as `public_hosts_for_group`, so the
-        // advertised URLs match the hosts Traefik routes.
-        let urls = self.url_builder.compute_project_urls(
+        let urls = self.url_builder.compute_deployment_urls(
             project,
-            &deployment.deployment_group,
+            deployment,
+            environment.as_ref(),
             &all_environments,
             &custom_domains,
         );
