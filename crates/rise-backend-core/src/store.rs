@@ -84,7 +84,10 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<Deployment>>;
 
-    /// List a project's active deployments — at most one per deployment group.
+    /// List a project's active deployments — at most one per deployment group
+    /// (unique partial index), and never a terminal one: the
+    /// `ensure_terminal_not_active` trigger clears `is_active` on every
+    /// transition to a terminal status.
     async fn list_active_deployments_for_project(
         &self,
         project_id: Uuid,

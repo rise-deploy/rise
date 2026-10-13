@@ -296,7 +296,7 @@ impl DeploymentUrlBuilder {
             .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group))
     }
 
-    /// `environment`'s custom domains that pass [`Self::filter_valid_custom_domains`].
+    /// `environment`'s custom domains that pass [`Self::is_valid_custom_domain`].
     fn valid_domains_for_environment(
         &self,
         environment: Option<&Environment>,
@@ -305,12 +305,13 @@ impl DeploymentUrlBuilder {
         let Some(environment) = environment else {
             return Vec::new();
         };
-        let for_env: Vec<CustomDomain> = custom_domains
+        custom_domains
             .iter()
-            .filter(|domain| domain.environment_id == environment.id)
+            .filter(|domain| {
+                domain.environment_id == environment.id && self.is_valid_custom_domain(domain)
+            })
             .cloned()
-            .collect();
-        self.filter_valid_custom_domains(&for_env)
+            .collect()
     }
 
     /// The public hosts Traefik routes to `deployment_group`'s active
@@ -347,29 +348,32 @@ impl DeploymentUrlBuilder {
     ) -> Vec<CustomDomain> {
         custom_domains
             .iter()
-            .filter(|domain| {
-                match validate_custom_domain(
-                    &domain.domain,
-                    &self.production_ingress_url_template,
-                    self.staging_ingress_url_template.as_deref(),
-                    self.environment_ingress_url_template.as_deref(),
-                    None,
-                ) {
-                    Ok(()) => true,
-                    Err(reason) => {
-                        warn!(
-                            domain_id = %domain.id,
-                            project_id = %domain.project_id,
-                            domain = %domain.domain,
-                            "Ignoring custom domain that conflicts with project default domain pattern: {}",
-                            reason
-                        );
-                        false
-                    }
-                }
-            })
+            .filter(|domain| self.is_valid_custom_domain(domain))
             .cloned()
             .collect()
+    }
+
+    /// Whether `domain` stays clear of the ingress URL templates; logs why not.
+    fn is_valid_custom_domain(&self, domain: &CustomDomain) -> bool {
+        match validate_custom_domain(
+            &domain.domain,
+            &self.production_ingress_url_template,
+            self.staging_ingress_url_template.as_deref(),
+            self.environment_ingress_url_template.as_deref(),
+            None,
+        ) {
+            Ok(()) => true,
+            Err(reason) => {
+                warn!(
+                    domain_id = %domain.id,
+                    project_id = %domain.project_id,
+                    domain = %domain.domain,
+                    "Ignoring custom domain that conflicts with project default domain pattern: {}",
+                    reason
+                );
+                false
+            }
+        }
     }
 
     // ── Deployment URLs ────────────────────────────────────────────────
