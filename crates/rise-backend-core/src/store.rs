@@ -84,6 +84,12 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<Deployment>>;
 
+    /// List a project's active deployments — at most one per deployment group.
+    async fn list_active_deployments_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Deployment>>;
+
     /// List the non-terminal deployments in a project's deployment group.
     async fn find_non_terminal_deployments_for_project_and_group(
         &self,

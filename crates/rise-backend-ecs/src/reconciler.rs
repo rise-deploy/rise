@@ -1196,17 +1196,12 @@ impl EcsReconciler {
             &all_environments,
             &custom_domains,
         );
-        let primary_hosts = self.url_builder.primary_ingress_hosts(
+        let primary_hosts = self.url_builder.public_hosts_for_group(
             project,
             &deployment.deployment_group,
-            environment.as_ref().filter(|e| {
-                e.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-            }),
-            &custom_domains,
-            true,
             &all_environments,
+            &custom_domains,
         );
-        let primary_hosts: Vec<String> = primary_hosts.into_iter().map(|h| h.host).collect();
 
         // Secrets are kept SEPARATE from plain env — the whole point of D7. They
         // still ride in the merged env, since a container sees one flat
@@ -2301,22 +2296,12 @@ impl EcsReconciler {
 
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
         let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
-        let primary_hosts = self.url_builder.primary_ingress_hosts(
+        let primary_hosts = self.url_builder.public_hosts_for_group(
             project,
             &deployment.deployment_group,
-            environment.as_ref().filter(|e| {
-                e.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-            }),
-            &custom_domains,
-            true,
             &all_environments,
+            &custom_domains,
         );
-        let primary_hosts: Vec<String> = primary_hosts.into_iter().map(|h| h.host).collect();
 
         // An empty spec set is never ready — otherwise a corrupt deployment row
         // would report Healthy while running nothing.

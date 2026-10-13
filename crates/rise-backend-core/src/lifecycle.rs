@@ -536,6 +536,12 @@ mod tests {
         ) -> Result<Vec<Deployment>> {
             unimplemented!()
         }
+        async fn list_active_deployments_for_project(
+            &self,
+            _project_id: Uuid,
+        ) -> Result<Vec<Deployment>> {
+            unimplemented!()
+        }
         async fn find_non_terminal_deployments_for_project_and_group(
             &self,
             project_id: Uuid,

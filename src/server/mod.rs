@@ -536,8 +536,7 @@ async fn build_traefik_dynamic_config(
     state: &state::AppState,
 ) -> anyhow::Result<rise_backend_traefik::dynamic::DynamicConfig> {
     use anyhow::Context;
-    use rise_backend_core::{resolve_runtime_containers, DeploymentUrlBuilder, DesiredRoute};
-    use rise_backend_traefik::dynamic::DynamicRouteTarget;
+    use rise_backend_core::DeploymentUrlBuilder;
 
     let provider = state
         .traefik_http_provider
@@ -573,19 +572,39 @@ async fn build_traefik_dynamic_config(
 
     let mut targets = Vec::new();
     for project in state.deployment_store.list_projects(None).await? {
-        let org_uid = state
+        let deployments = state
+            .deployment_store
+            .list_active_deployments_for_project(project.id)
+            .await?;
+        if deployments.is_empty() {
+            continue;
+        }
+
+        // Store errors fail the snapshot (Traefik keeps its last good config);
+        // a single project's bad linkage only withholds that project's routes.
+        let Some(org_uid) = state
             .deployment_store
             .organization_uid_for_project(project.id)
             .await?
-            .with_context(|| format!("project '{}' has no Organization linkage", project.name))?;
-        let org = state
-            .resource_store
-            .get(org_uid)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to load Organization {org_uid}: {error}"))?
-            .with_context(|| format!("Organization {org_uid} is missing"))?;
-        let org_spec: rise_resource_api::OrganizationSpec = serde_json::from_value(org.spec)
-            .with_context(|| format!("Organization {org_uid} has malformed spec"))?;
+        else {
+            tracing::error!(project = %project.name, "Withholding routes: project has no Organization linkage");
+            continue;
+        };
+        let Some(org) =
+            state.resource_store.get(org_uid).await.map_err(|error| {
+                anyhow::anyhow!("failed to load Organization {org_uid}: {error}")
+            })?
+        else {
+            tracing::error!(project = %project.name, %org_uid, "Withholding routes: Organization is missing");
+            continue;
+        };
+        let org_spec: rise_resource_api::OrganizationSpec = match serde_json::from_value(org.spec) {
+            Ok(spec) => spec,
+            Err(error) => {
+                tracing::error!(project = %project.name, %org_uid, "Withholding routes: Organization has malformed spec: {error:?}");
+                continue;
+            }
+        };
         if !provider.controller_class.is_empty()
             && org_spec.deployment_controller_class.as_deref()
                 != Some(provider.controller_class.as_str())
@@ -593,15 +612,6 @@ async fn build_traefik_dynamic_config(
             continue;
         }
 
-        let deployments = active_deployment_per_group(
-            state
-                .deployment_store
-                .list_non_terminal_deployments_for_project(project.id)
-                .await?,
-        );
-        if deployments.is_empty() {
-            continue;
-        }
         let environments = state
             .deployment_store
             .list_environments_for_project(project.id)
@@ -610,48 +620,13 @@ async fn build_traefik_dynamic_config(
             .deployment_store
             .list_project_custom_domains(project.id)
             .await?;
-
-        for deployment in deployments {
-            let (containers, routes) = resolve_runtime_containers(&deployment)?;
-            let environment = deployment
-                .environment_id
-                .and_then(|id| environments.iter().find(|environment| environment.id == id));
-            let hosts: Vec<String> = url_builder
-                .primary_ingress_hosts(
-                    &project,
-                    &deployment.deployment_group,
-                    environment.filter(|environment| {
-                        environment.primary_deployment_group.as_deref()
-                            == Some(&deployment.deployment_group)
-                    }),
-                    &custom_domains,
-                    true,
-                    &environments,
-                )
-                .into_iter()
-                .map(|host| host.host)
-                .collect();
-
-            targets.extend(containers.into_iter().map(|container| {
-                DynamicRouteTarget {
-                    project: project.name.clone(),
-                    access_class: project.access_class.clone(),
-                    deployment_group: deployment.deployment_group.clone(),
-                    deployment_id: deployment.deployment_id.clone(),
-                    port: container.port,
-                    routes: routes
-                        .iter()
-                        .filter(|route| route.container == container.name)
-                        .map(|route| DesiredRoute {
-                            hosts: hosts.clone(),
-                            path_prefix: Some(route.path.clone()),
-                            access: route.access.clone(),
-                        })
-                        .collect(),
-                    container: container.name,
-                }
-            }));
-        }
+        targets.extend(rise_backend_traefik::dynamic::project_route_targets(
+            &project,
+            &deployments,
+            &environments,
+            &custom_domains,
+            &url_builder,
+        ));
     }
 
     Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
@@ -659,25 +634,6 @@ async fn build_traefik_dynamic_config(
         &render_config,
         provider.native_provider,
     ))
-}
-
-/// The active deployment of every deployment group, in input order.
-///
-/// `is_active` is scoped to `(project, deployment_group)`, so a project
-/// carries one active deployment per group and every one of them is publicly
-/// routed. Should a group momentarily report two (mid-handover), the first in
-/// input order wins — callers pass the store's newest-first listing.
-#[cfg(feature = "backend")]
-fn active_deployment_per_group(
-    deployments: Vec<rise_backend_core::models::Deployment>,
-) -> Vec<rise_backend_core::models::Deployment> {
-    let mut seen = std::collections::HashSet::new();
-    deployments
-        .into_iter()
-        .filter(|deployment| {
-            deployment.is_active && seen.insert(deployment.deployment_group.clone())
-        })
-        .collect()
 }
 
 /// Static facts about the configured runtime log backend. Surfaced to the
@@ -727,75 +683,5 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!("Received SIGTERM, shutting down gracefully");
         },
-    }
-}
-
-#[cfg(all(test, feature = "backend"))]
-mod tests {
-    use super::active_deployment_per_group;
-    use rise_backend_core::models::{Deployment, DeploymentStatus};
-
-    fn deployment(id: &str, group: &str, is_active: bool) -> Deployment {
-        let now = chrono::Utc::now();
-        Deployment {
-            id: uuid::Uuid::new_v4(),
-            deployment_id: id.to_string(),
-            project_id: uuid::Uuid::nil(),
-            created_by_id: uuid::Uuid::nil(),
-            status: DeploymentStatus::Healthy,
-            deployment_group: group.to_string(),
-            environment_id: None,
-            expires_at: None,
-            termination_reason: None,
-            completed_at: None,
-            error_message: None,
-            build_logs: None,
-            controller_metadata: serde_json::Value::Null,
-            image: None,
-            image_digest: None,
-            rolled_back_from_deployment_id: None,
-            http_port: 8080,
-            needs_reconcile: false,
-            is_active,
-            deploying_started_at: None,
-            first_healthy_at: None,
-            job_url: None,
-            pull_request_url: None,
-            git_repository_url: None,
-            replicas: 1,
-            cpu: "500m".to_string(),
-            memory: "256Mi".to_string(),
-            identity_credential_hash: None,
-            identity_audiences: serde_json::json!({}),
-            containers: None,
-            routes: None,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
-    /// Regression for rise-deploy/rise#548: a newer active preview group must
-    /// not hide production or older preview groups from the Traefik snapshot.
-    #[test]
-    fn every_active_group_is_routed() {
-        // Newest first, as `list_non_terminal_deployments_for_project` returns.
-        let selected = active_deployment_per_group(vec![
-            deployment("pr-124-new", "pr/124", true),
-            deployment("default-next", "default", false),
-            deployment("pr-123", "pr/123", true),
-            deployment("default", "default", true),
-        ]);
-        let ids: Vec<_> = selected.iter().map(|d| d.deployment_id.as_str()).collect();
-        assert_eq!(ids, vec!["pr-124-new", "pr-123", "default"]);
-    }
-
-    #[test]
-    fn newest_active_wins_within_a_group() {
-        let selected = active_deployment_per_group(vec![
-            deployment("newer", "default", true),
-            deployment("older", "default", true),
-        ]);
-        let ids: Vec<_> = selected.iter().map(|d| d.deployment_id.as_str()).collect();
-        assert_eq!(ids, vec!["newer"]);
     }
 }
