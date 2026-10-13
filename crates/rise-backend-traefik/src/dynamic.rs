@@ -280,4 +280,79 @@ mod tests {
             "http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1"
         );
     }
+
+    /// Regression for rise-deploy/rise#548: every active deployment group of
+    /// a project keeps its own routers and auth middleware, and a new
+    /// deployment in one group leaves the other groups' routes untouched.
+    #[test]
+    fn every_group_keeps_its_routes_and_auth() {
+        let classes = HashMap::from([("private".to_string(), AccessRequirement::Member)]);
+        let target = |group: &str, deployment_id: &str, host: &str| DynamicRouteTarget {
+            project: "docs-app".to_string(),
+            access_class: "private".to_string(),
+            deployment_group: group.to_string(),
+            deployment_id: deployment_id.to_string(),
+            container: "web".to_string(),
+            port: Some(8080),
+            routes: vec![DesiredRoute {
+                hosts: vec![host.to_string()],
+                path_prefix: Some("/".to_string()),
+                access: None,
+            }],
+        };
+        let groups = [
+            ("default", "docs-app.example.com"),
+            ("pr/123", "docs-app-pr-123.example.com"),
+            ("pr/124", "docs-app-pr-124.example.com"),
+        ];
+        let render = |preview_deployment: &str| {
+            render_dynamic_route_targets(
+                groups.iter().map(|(group, host)| {
+                    let id = if *group == "pr/124" {
+                        preview_deployment
+                    } else {
+                        "d1"
+                    };
+                    target(group, id, host)
+                }),
+                &config(&classes),
+                "ecs",
+            )
+        };
+
+        let before = render("d1");
+        assert_eq!(before.http.routers.len(), 3);
+        for (_, host) in groups {
+            let (name, router) = before
+                .http
+                .routers
+                .iter()
+                .find(|(_, router)| router.rule.contains(host))
+                .unwrap_or_else(|| panic!("no router for {host}"));
+            assert_eq!(router.middlewares, vec![format!("{name}-auth")]);
+            assert!(before
+                .http
+                .middlewares
+                .contains_key(&format!("{name}-auth")));
+        }
+
+        let after = render("d2");
+        assert_eq!(
+            before.http.routers.keys().collect::<Vec<_>>(),
+            after.http.routers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            before.http.middlewares.keys().collect::<Vec<_>>(),
+            after.http.middlewares.keys().collect::<Vec<_>>()
+        );
+        let changed: Vec<_> = before
+            .http
+            .routers
+            .iter()
+            .filter(|(name, router)| after.http.routers[*name].service != router.service)
+            .map(|(_, router)| router.rule.clone())
+            .collect();
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].contains("docs-app-pr-124.example.com"));
+    }
 }
