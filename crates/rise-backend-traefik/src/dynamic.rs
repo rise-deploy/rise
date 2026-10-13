@@ -95,9 +95,9 @@ pub fn render_dynamic_config(
     )
 }
 
-/// Route targets for `project`'s active deployments — one per deployment
-/// group, each routed on its own group's hosts
-/// ([`DeploymentUrlBuilder::public_hosts_for_group`]).
+/// Route targets for `project`'s active deployments — one per container of
+/// each deployment group's active deployment, every group routed on its own
+/// hosts ([`DeploymentUrlBuilder::public_hosts_for_group`]).
 ///
 /// A deployment whose container/route side-data does not decode fails the
 /// whole call: the HTTP-provider endpoint then errors and Traefik keeps
