@@ -224,6 +224,16 @@ run "alb_uses_https_and_group_restricted_auth" {
     ])
     error_message = "digest and group-based authorization settings must reach the control-plane task"
   }
+
+  # The ALB terminates TLS; without trusting it, Traefik rewrites
+  # X-Forwarded-Proto to http and private-project sign-in redirects lose https.
+  assert {
+    condition = contains(
+      module.runtime.traefik_command,
+      "--entrypoints.web.forwardedHeaders.trustedIPs=10.42.0.0/24,10.42.1.0/24",
+    )
+    error_message = "in ALB mode Traefik must trust X-Forwarded-* from the public subnets"
+  }
 }
 
 run "traefik_discovery_is_unconstrained_by_default" {
@@ -232,6 +242,12 @@ run "traefik_discovery_is_unconstrained_by_default" {
   assert {
     condition     = length([for c in module.runtime.traefik_command : c if strcontains(c, "constraints")]) == 0
     error_message = "an unset traefik_constraints must add no constraint flag"
+  }
+
+  # Traefik terminates TLS itself in NLB mode, so no upstream is trusted.
+  assert {
+    condition     = length([for c in module.runtime.traefik_command : c if strcontains(c, "forwardedHeaders")]) == 0
+    error_message = "in NLB mode Traefik must not trust X-Forwarded-* headers"
   }
 }
 

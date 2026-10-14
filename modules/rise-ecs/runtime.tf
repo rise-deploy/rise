@@ -46,6 +46,10 @@ module "runtime" {
     image           = var.traefik_image
     refresh_seconds = var.traefik_refresh_seconds
     constraints     = var.traefik_constraints
+    # In ALB mode the ALB terminates TLS and sets X-Forwarded-Proto. Only the
+    # edge security group reaches Traefik's port 80, and it sits in the public
+    # subnets.
+    forwarded_headers_trusted_ips = local.acme_enabled ? [] : module.network.vpc.public_subnet_cidrs
   }
   acme = {
     enabled         = local.acme_enabled

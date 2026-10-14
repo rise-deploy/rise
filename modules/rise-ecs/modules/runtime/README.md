@@ -39,5 +39,10 @@ The caller's security groups must permit Traefik to reach Rise on TCP
 Traefik's API on TCP 8080. The API and Rise's internal listener must remain
 restricted to their intended callers. Port 8082 serves Traefik's ping check.
 
+When a load balancer terminates TLS in front of Traefik, set
+`traefik.forwarded_headers_trusted_ips` to its source ranges. Otherwise
+Traefik overwrites `X-Forwarded-Proto` with `http`, and Rise's sign-in
+redirects for private projects point at `http://`.
+
 `rise` and `traefik` outputs expose service and discovery identifiers;
 `traefik_command` exposes the effective routing configuration for inspection.
