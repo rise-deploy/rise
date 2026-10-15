@@ -24,6 +24,9 @@ pub enum InjectedEnvVarValue {
     Plain(String),
     /// Secret but not protected. Carries (decrypted, encrypted) so the caller can write
     /// the pre-encrypted value to DB without re-encrypting.
+    // Only reached from `main` (through the extension registry), which is not a
+    // dead-code root when the binary is built for tests.
+    #[cfg_attr(test, allow(dead_code))]
     Secret {
         decrypted: String,
         encrypted: String,
