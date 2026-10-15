@@ -146,9 +146,7 @@ step.
 WAF. It costs custom domains their automatic certificates: ACM has no HTTP-01,
 so each one gains a DNS-validated certificate an operator has to create, against
 a default limit of 25 per listener. Port 80 redirects permanently to HTTPS;
-Traefik still routes and still enforces access classes in both modes, and
-trusts the `X-Forwarded-*` headers arriving from the public subnets so that
-sign-in redirects keep the `https` scheme the ALB received.
+Traefik still routes and still enforces access classes in both modes.
 
 **Traefik runs one replica, and that is not configurable.** Its ACME file store
 is not multi-writer safe. In ACME mode the deployment configuration also stops

@@ -156,36 +156,3 @@ run "rejects_incomplete_acme" {
   }
   expect_failures = [var.acme]
 }
-
-run "forwarded_headers_untrusted_by_default" {
-  command = plan
-
-  assert {
-    condition = length([
-      for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command :
-      flag if startswith(flag, "--entrypoints.web.forwardedHeaders.")
-    ]) == 0
-    error_message = "Traefik must not trust X-Forwarded-* headers unless a load balancer range is given."
-  }
-}
-
-run "forwarded_headers_trusted_from_load_balancer" {
-  command = plan
-
-  variables {
-    traefik = {
-      name                          = "rise-traefik"
-      discovery_name                = "rise-traefik"
-      image                         = "traefik:v3.7.10"
-      forwarded_headers_trusted_ips = ["10.42.0.0/24", "10.42.1.0/24"]
-    }
-  }
-
-  assert {
-    condition = contains(
-      jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command,
-      "--entrypoints.web.forwardedHeaders.trustedIPs=10.42.0.0/24,10.42.1.0/24",
-    )
-    error_message = "Traefik must keep X-Forwarded-Proto from a TLS-terminating load balancer."
-  }
-}

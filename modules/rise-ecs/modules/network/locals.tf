@@ -5,10 +5,7 @@ locals {
   create_vpc = var.vpc == null
   vpc_id     = local.create_vpc ? aws_vpc.this[0].id : var.vpc.id
 
-  public_subnet_ids = local.create_vpc ? [for s in aws_subnet.public : s.id] : var.vpc.public_subnet_ids
-  public_subnet_cidrs = local.create_vpc ? [for s in aws_subnet.public : s.cidr_block] : [
-    for id in var.vpc.public_subnet_ids : data.aws_subnet.brought[id].cidr_block
-  ]
+  public_subnet_ids  = local.create_vpc ? [for s in aws_subnet.public : s.id] : var.vpc.public_subnet_ids
   private_subnet_ids = local.create_vpc ? [for s in aws_subnet.private : s.id] : var.vpc.private_subnet_ids
   database_subnet_ids = local.create_vpc ? [for s in aws_subnet.database : s.id] : (
     length(var.vpc.database_subnet_ids) > 0 ? var.vpc.database_subnet_ids : var.vpc.private_subnet_ids

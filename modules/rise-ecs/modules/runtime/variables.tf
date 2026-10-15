@@ -97,9 +97,6 @@ variable "traefik" {
     refresh_seconds   = optional(number, 15)
     constraints       = optional(string, "")
     log_stream_prefix = optional(string, "traefik")
-    # Sources whose X-Forwarded-* headers the `web` entrypoint keeps. Set it to
-    # the load balancer's subnets when one terminates TLS in front of Traefik.
-    forwarded_headers_trusted_ips = optional(list(string), [])
   })
 }
 

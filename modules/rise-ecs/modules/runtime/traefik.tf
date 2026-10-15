@@ -35,15 +35,6 @@ locals {
       "--entrypoints.web.address=:80",
       "--entrypoints.websecure.address=:443",
       "--entrypoints.rise-catalog.address=127.0.0.1:8083",
-    ],
-    # Traefik replaces X-Forwarded-* from any source it does not trust. Behind a
-    # TLS-terminating load balancer that turns X-Forwarded-Proto into `http`,
-    # and forwardAuth's same-host sign-in redirect and the OAuth callback URL
-    # are both built from it.
-    length(var.traefik.forwarded_headers_trusted_ips) == 0 ? [] : [
-      "--entrypoints.web.forwardedHeaders.trustedIPs=${join(",", var.traefik.forwarded_headers_trusted_ips)}",
-    ],
-    [
       # A dedicated entrypoint for the load balancer's health check, so it does
       # not depend on a router existing.
       "--entrypoints.ping.address=:8082",

@@ -3,7 +3,6 @@ output "vpc" {
   value = {
     id                     = local.vpc_id
     public_subnet_ids      = local.public_subnet_ids
-    public_subnet_cidrs    = local.public_subnet_cidrs
     private_subnet_ids     = local.private_subnet_ids
     database_subnet_ids    = local.database_subnet_ids
     private_subnets_by_key = local.private_subnets_by_key
