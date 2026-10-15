@@ -466,7 +466,8 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `production_ingress_url_template` — host template for production deployments.
 - `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
   templates for staging / per-environment deployments.
-- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_schema` — `http` or `https` (default `https`). The scheme browsers use to
+  reach apps; also used for sign-in redirects and `/.rise` callback URLs on app hosts.
 - `ingress_port?` — external port apps are served on (e.g. `80` locally).
 - `controller_class_name` — controller ownership class (default `default`).
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
