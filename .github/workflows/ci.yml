@@ -26,7 +26,7 @@ env:
   CHART_REGISTRY: ghcr.io/rise-deploy
   NODE_VERSION: "24"
   # renovate: datasource=github-tags depName=rust packageName=rust-lang/rust extractVersion=^(?<version>\d+\.\d+\.\d+)$
-  RUST_VERSION: "1.95.0"
+  RUST_VERSION: "1.97.1"
 
 jobs:
 
