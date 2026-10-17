@@ -59,6 +59,13 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Persistence',
+          items: [
+            { label: 'Overview', slug: 'persistence' },
+            { label: 'OpenBao / Vault', slug: 'persistence/openbao-vault' },
+          ],
+        },
+        {
           label: 'Access',
           items: [
             { label: 'Authentication', slug: 'user-guide/authentication' },

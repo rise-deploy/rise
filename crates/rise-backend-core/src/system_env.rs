@@ -7,6 +7,7 @@ use crate::group::normalize_deployment_group;
 ///
 /// Returns `(key, value)` pairs for:
 /// - `RISE_ISSUER` — Rise server URL (base URL for all Rise endpoints and JWT issuer)
+/// - `RISE_PROJECT` — The project name
 /// - `RISE_APP_URL` — Canonical URL where the app is accessible
 /// - `RISE_APP_URLS` — JSON array of all URLs where the app can be accessed
 /// - `RISE_DEPLOYMENT_GROUP` — The deployment group name (e.g. "default", "mr/123")
@@ -14,6 +15,7 @@ use crate::group::normalize_deployment_group;
 /// - `RISE_ENVIRONMENT` — The environment name (e.g. "production", "staging"), if set
 pub fn rise_system_env_vars(
     public_url: &str,
+    project_name: &str,
     deployment_group: &str,
     deployment_urls: &DeploymentUrls,
     environment_name: Option<&str>,
@@ -29,6 +31,7 @@ pub fn rise_system_env_vars(
 
     let mut vars = vec![
         ("RISE_ISSUER".to_string(), public_url.to_string()),
+        ("RISE_PROJECT".to_string(), project_name.to_string()),
         (
             "RISE_APP_URL".to_string(),
             deployment_urls.primary_url.clone(),

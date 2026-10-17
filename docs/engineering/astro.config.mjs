@@ -81,6 +81,13 @@ export default defineConfig({
                 { label: 'Loki Backend', slug: 'persistent-logs/loki' },
               ],
             },
+            {
+              label: 'Persistence',
+              items: [
+                { label: 'Overview', slug: 'persistence' },
+                { label: 'OpenBao / Vault', slug: 'persistence/openbao-vault' },
+              ],
+            },
             { label: 'Production Deployment', slug: 'production' },
             { label: 'Database', slug: 'database' },
             { label: 'PostgreSQL Upgrades', slug: 'upgrading-postgresql' },
