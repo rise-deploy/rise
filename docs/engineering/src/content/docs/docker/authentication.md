@@ -41,10 +41,12 @@ proxying each request:
   (`build_signin_redirect_url` in `auth/handlers.rs`). This mirrors the
   Kubernetes nginx `auth-signin` flow.
 
-The redirect target host is reconstructed from the `X-Forwarded-Proto` /
-`X-Forwarded-Host` / `X-Forwarded-Uri` headers, so the user is sent to the login
-page on **the app's own host** and returned to where they started after signing
-in. The configured `auth_signin_url` is only a degraded fallback used when
+The redirect target is reconstructed from the configured `ingress_schema` and
+the `X-Forwarded-Host` / `X-Forwarded-Uri` headers, so the user is sent to the
+login page on **the app's own host** and returned to where they started after
+signing in. The scheme comes from configuration rather than `X-Forwarded-Proto`
+because forwardAuth derives that header from Traefik's own connection, which is
+plain HTTP when a load balancer terminates TLS in front of it. The configured `auth_signin_url` is only a degraded fallback used when
 `X-Forwarded-Host` is absent.
 
 ### Fail-closed
