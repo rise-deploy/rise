@@ -410,7 +410,7 @@ export function EnvironmentsSection() {
                 onClose={() => setEnvToDelete(null)}
                 onConfirm={handleDeleteConfirm}
                 title={`Delete environment ${envToDelete?.name ?? ''}?`}
-                message={`Deletes the environment "${envToDelete?.name}". This cannot be undone.`}
+                message={`Deletes the environment "${envToDelete?.name}" with its variables and deployment history. Stop its deployments first. This cannot be undone.`}
                 confirmText="Delete environment"
                 confirmTone="danger"
                 loading={deleting}

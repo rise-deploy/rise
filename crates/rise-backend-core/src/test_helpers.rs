@@ -177,7 +177,7 @@ pub fn deployment(project: &Project, deployment_id: &str, group: &str) -> Deploy
         created_by_id: Uuid::nil(),
         status: DeploymentStatus::Healthy,
         deployment_group: group.to_string(),
-        environment_id: None,
+        environment_id: Uuid::nil(),
         expires_at: None,
         termination_reason: None,
         completed_at: None,

@@ -102,7 +102,7 @@ Once a deployment enters a running state it stays there indefinitely — Rise do
 
 A deployment group is a label that identifies a set of related deployments. Only one deployment per group can be active at a time — when a new deployment in a group reaches `Healthy`, the previous one is `Superseded`.
 
-**Group names are just labels — they carry no intrinsic meaning on their own.** A group name only acquires routing, URL, and variable-scoping semantics when it is set as the primary group of an [Environment](../environments). Without a matching environment, deployments in a custom group still run but receive the generic staging URL pattern and no environment-scoped variables.
+**Group names are just labels — they carry no intrinsic meaning on their own.** A group name only acquires routing, URL, and variable-scoping semantics when it is set as the primary group of an [Environment](../environments). Every deployment still belongs to an environment: a deployment to a custom group takes the one you name with `-E` (or the project's only one) and gets that environment's variables, but the group's own staging URL rather than the environment's.
 
 ```bash
 # Deploy to the default group

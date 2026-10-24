@@ -1155,20 +1155,17 @@ pub async fn diff_deployment_env_vars(
             .await
             .internal_err("Failed to get deployment")?
             .ok_or_else(|| ServerError::not_found("Deployment not found"))?;
-    let deployment_env = match deployment.environment_id {
-        Some(id) => db_environments::find_by_id(&state.db_pool, id)
-            .await
-            .internal_err("Failed to get environment")?
-            .map(|e| e.name),
-        None => None,
-    };
+    let deployment_env = db_environments::find_by_id(&state.db_pool, deployment.environment_id)
+        .await
+        .internal_err("Failed to get environment")?
+        .map(|e| e.name);
 
     // The environment compared against: the one asked for, else the
     // deployment's own.
     let (target_id, target_env) =
         match resolve_environment_id(&state.db_pool, project.id, &params).await? {
             Some(id) => (Some(id), params.get("environment").cloned()),
-            None => (deployment.environment_id, deployment_env.clone()),
+            None => (Some(deployment.environment_id), deployment_env.clone()),
         };
 
     // Before: the snapshot's project and configuration variables.

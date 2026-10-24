@@ -28,7 +28,7 @@ pub struct CreateDeploymentParams<'a> {
     pub image_digest: Option<&'a str>,
     pub rolled_back_from_deployment_id: Option<Uuid>,
     pub deployment_group: &'a str,
-    pub environment_id: Option<Uuid>,
+    pub environment_id: Uuid,
     pub expires_at: Option<DateTime<Utc>>,
     pub http_port: i32,
     pub is_active: bool,
@@ -1502,9 +1502,8 @@ pub struct DeploymentListFilter<'a> {
     /// Case-insensitive substring of the deployment ID, the image, the
     /// deployment group, or the creator's email.
     pub search: Option<&'a str>,
-    /// Restricts the list to these environments (a scoped session); the flag
-    /// also admits deployments that belong to no environment.
-    pub allowed_environments: Option<(Vec<Uuid>, bool)>,
+    /// Restricts the list to these environments (a scoped session).
+    pub allowed_environments: Option<Vec<Uuid>>,
 }
 
 /// Largest page [`list_for_project_filtered`] returns.
@@ -1519,10 +1518,7 @@ pub async fn list_for_project_filtered(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<(Vec<Deployment>, i64)> {
-    let (allowed_ids, allow_no_environment) = match &filter.allowed_environments {
-        Some((ids, no_env)) => (Some(ids.as_slice()), *no_env),
-        None => (None, true),
-    };
+    let allowed_ids = filter.allowed_environments.as_deref();
     let statuses = filter.statuses.as_deref();
     let limit = limit.unwrap_or(10).clamp(1, MAX_LIST_LIMIT);
     let offset = offset.unwrap_or(0).max(0);
@@ -1559,11 +1555,9 @@ pub async fn list_for_project_filtered(
                OR EXISTS (SELECT 1 FROM users u
                           WHERE u.id = d.created_by_id
                             AND strpos(lower(u.email), lower($6)) > 0))
-          AND ($7::uuid[] IS NULL
-               OR d.environment_id = ANY($7)
-               OR ($8 AND d.environment_id IS NULL))
+          AND ($7::uuid[] IS NULL OR d.environment_id = ANY($7))
         ORDER BY d.created_at DESC
-        LIMIT $9 OFFSET $10
+        LIMIT $8 OFFSET $9
         "#,
         project_id,
         filter.group,
@@ -1572,7 +1566,6 @@ pub async fn list_for_project_filtered(
         statuses,
         filter.search,
         allowed_ids,
-        allow_no_environment,
         limit,
         offset
     )
@@ -1595,9 +1588,7 @@ pub async fn list_for_project_filtered(
                OR EXISTS (SELECT 1 FROM users u
                           WHERE u.id = d.created_by_id
                             AND strpos(lower(u.email), lower($6)) > 0))
-          AND ($7::uuid[] IS NULL
-               OR d.environment_id = ANY($7)
-               OR ($8 AND d.environment_id IS NULL))
+          AND ($7::uuid[] IS NULL OR d.environment_id = ANY($7))
         "#,
         project_id,
         filter.group,
@@ -1605,13 +1596,32 @@ pub async fn list_for_project_filtered(
         filter.environment_id,
         statuses,
         filter.search,
-        allowed_ids,
-        allow_no_environment
+        allowed_ids
     )
     .fetch_one(pool)
     .await?;
 
     Ok((deployments, total))
+}
+
+/// How many of an environment's deployments are not yet in a terminal state.
+/// Deleting an environment deletes its deployments, so it waits until none
+/// are still running.
+pub async fn count_live_for_environment(pool: &PgPool, environment_id: Uuid) -> Result<i64> {
+    let count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!"
+        FROM deployments
+        WHERE environment_id = $1
+          AND status NOT IN ('Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired')
+        "#,
+        environment_id
+    )
+    .fetch_one(pool)
+    .await
+    .context("Failed to count the environment's live deployments")?;
+
+    Ok(count)
 }
 
 /// Get all active deployment groups for a project
@@ -1971,13 +1981,15 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let env = crate::db::environments::test_environment_id(pool, project).await;
         sqlx::query_scalar(
-            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status)
-             VALUES ('20260830-000001', $1, $2, $3) RETURNING id",
+            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status, environment_id)
+             VALUES ('20260830-000001', $1, $2, $3, $4) RETURNING id",
         )
         .bind(project)
         .bind(user)
         .bind(status)
+        .bind(env)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -2010,7 +2022,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -2109,7 +2122,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "mr/123",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: Some(capped_expires_at),
                 http_port: 8080,
                 is_active: false,
@@ -2150,7 +2164,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: Some(requested_expires_at),
                 http_port: 8080,
                 is_active: false,
@@ -2217,7 +2232,8 @@ mod tests {
                     image_digest: None,
                     rolled_back_from_deployment_id: None,
                     deployment_group: "default",
-                    environment_id: None,
+                    environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                        .await,
                     expires_at: None,
                     http_port: 8080,
                     is_active: false,
@@ -2403,16 +2419,19 @@ mod tests {
             ("20260930-000003", "preview", true),
             ("20260930-000004", "preview", false),
         ] {
+            let environment = crate::db::environments::test_environment_id(&pool, project_id).await;
             sqlx::query(
                 "INSERT INTO deployments
-                     (deployment_id, project_id, created_by_id, status, deployment_group, is_active)
-                 VALUES ($1, $2, $3, 'Healthy', $4, $5)",
+                     (deployment_id, project_id, created_by_id, status, deployment_group,
+                      is_active, environment_id)
+                 VALUES ($1, $2, $3, 'Healthy', $4, $5, $6)",
             )
             .bind(deployment_id)
             .bind(project_id)
             .bind(user_id)
             .bind(group)
             .bind(is_active)
+            .bind(environment)
             .execute(&pool)
             .await
             .unwrap();
@@ -2494,7 +2513,12 @@ mod tests {
                 "Failed",
                 "registry/app:abc999",
             ),
-            ("20261001-000004", None, "Stopped", "registry/other:zzz"),
+            (
+                "20261001-000004",
+                Some(production),
+                "Stopped",
+                "registry/other:zzz",
+            ),
         ] {
             sqlx::query(
                 "INSERT INTO deployments
@@ -2532,8 +2556,11 @@ mod tests {
             100,
         )
         .await;
-        assert_eq!(ids, ["20261001-000001", "20261001-000002"]);
-        assert_eq!(total, 2);
+        assert_eq!(
+            ids,
+            ["20261001-000001", "20261001-000002", "20261001-000004"]
+        );
+        assert_eq!(total, 3);
 
         let (ids, _) = list(
             DeploymentListFilter {
@@ -2565,7 +2592,7 @@ mod tests {
         // total agrees with what it can see.
         let (ids, total) = list(
             DeploymentListFilter {
-                allowed_environments: Some((vec![staging], false)),
+                allowed_environments: Some(vec![staging]),
                 ..Default::default()
             },
             100,
@@ -2573,6 +2600,42 @@ mod tests {
         .await;
         assert_eq!(ids, ["20261001-000003"]);
         assert_eq!(total, 1);
+    }
+
+    /// Deleting an environment takes its deployments with it, so the handler
+    /// waits until none are running; the count is what it checks.
+    #[sqlx::test]
+    async fn an_environment_deletes_with_its_deployments_once_none_are_live(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let staging = seed_environment(&pool, project_id, "staging", "staging", false).await;
+        let deployment = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261025-000001",
+            "staging",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        sqlx::query("UPDATE deployments SET environment_id = $1 WHERE id = $2")
+            .bind(staging)
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_live_for_environment(&pool, staging).await.unwrap(), 1);
+
+        sqlx::query("UPDATE deployments SET status = 'Stopped' WHERE id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_live_for_environment(&pool, staging).await.unwrap(), 0);
+
+        assert!(crate::db::environments::delete(&pool, staging)
+            .await
+            .unwrap());
+        assert!(find_by_id(&pool, deployment.id).await.unwrap().is_none());
     }
 
     #[sqlx::test]
@@ -2608,13 +2671,14 @@ mod tests {
             let id = sqlx::query_scalar::<_, Uuid>(
                 "INSERT INTO deployments
                      (deployment_id, project_id, created_by_id, status, deployment_group,
-                      rolled_back_from_deployment_id)
-                 VALUES ($1, $2, $3, 'Healthy', 'default', $4) RETURNING id",
+                      rolled_back_from_deployment_id, environment_id)
+                 VALUES ($1, $2, $3, 'Healthy', 'default', $4, $5) RETURNING id",
             )
             .bind(deployment_id)
             .bind(project_id)
             .bind(user_id)
             .bind(parent)
+            .bind(built.environment_id)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -3114,7 +3178,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -3205,7 +3270,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -3282,7 +3348,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -3388,7 +3455,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: group,
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
