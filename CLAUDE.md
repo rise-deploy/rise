@@ -104,7 +104,7 @@ The codebase is organized into functional modules:
    - **Environment Variables** (`env_vars/`): Plain and encrypted per-project variables
    - **Custom Domains** (`custom_domains/`): Custom domain registration, verification, TLS wiring
    - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
-   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
+   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps — also used by the ECS identity sidecar (`rise identity agent`) to write a deployment's `[identity]` token files
    - **Generic Resources** (`resources/`): The generic resource API (`/api/v1/resources`) and its garbage collector, authorized through `authz/`
    - **Platform** (`platform/`): Platform/organization-level concerns
    - **Quickstart** (`quickstart/`): Catalog of ready-to-deploy templates (see `config/default.yaml`)
@@ -195,7 +195,8 @@ cargo build --all-features     # Full build with CLI + backend
      - [x] Snowflake OAuth provisioner for Snowflake security integrations
 
 3. **CLI Implementation** (`--features cli`, default) ✅
-   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and device flow
+   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
+   - [x] Scoped logins (`rise login --scope <project>[/<env>]=<preset>`): sessions narrowed to projects/environments, enforced on the typed API (ADR-0006)
    - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`
@@ -310,6 +311,9 @@ Keep it current as work merges:
   multi-org routing, codebase decomposition). The Project owns *live status*.
   Don't duplicate rationale into the board, and don't create new
   `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files.
+  `ROADMAP.md` §2's *Authentication entry points* table lists every way a
+  credential enters Rise and whether it stays or retires; update it with any
+  new credential path, and never build permanent behavior on a retiring one.
   Architectural decisions are recorded as ADRs under
   `docs/engineering/src/content/docs/adr/` — an ADR records the decision, its
   rationale, and (via its Status field) implementation progress. Prefer an
@@ -342,11 +346,14 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 | Component | Style | Purpose |
 |---|---|---|
 | **`Status`** (from `r-ui`) | Dot + label | Deployment/project lifecycle status (Running, Failed, Stopped, …) |
-| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels via `kind="accent"`, env labels via `kind="env-*"` |
+| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels (`kind="accent"`); environments use `EnvPill` |
 | **`BasePill`** (from `r-ui`) | Icon + name pill | Generic two-cell pill — building block for `EnvPill` / `GroupPill` |
 | **`EnvPill`** (from `r-ui`) | Color dot + env name | Environment chip; pairs with `EnvironmentColorDot` |
 | **`GroupPill`** (from `r-ui`) | Layer glyph + group name | Group chip |
 | **`EnvironmentColorDot`** (from `r-ui`) | Tinted layer glyph | Placed next to environment names to indicate color |
+| **`OwnerLabel`** (from `r-ui`) | People/person icon + name | Every project owner — teams always carry the people icon |
+
+Statuses are coloured by `statusTone` (healthy / failing / in progress / inactive); use it for bare status dots so they agree with `Status` badges.
 
 ### Before Commit & Push
 

@@ -1,14 +1,9 @@
 ---
-import config from 'virtual:starlight/user-config';
-
 import LanguageSelect from '@astrojs/starlight/components/LanguageSelect.astro';
 import Search from '@astrojs/starlight/components/Search.astro';
 import SiteTitle from '@astrojs/starlight/components/SiteTitle.astro';
 import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
 import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
-
-const shouldRenderSearch =
-	config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
 
 const selectorUrl = process.env.RISE_DOCS_SELECTOR_URL;
 const switchUrl = process.env.RISE_DOCS_SWITCH_URL;
@@ -24,7 +19,7 @@ const platformUrl =
 		<SiteTitle />
 	</div>
 	<div class="sl-flex print:hidden">
-		{shouldRenderSearch && <Search />}
+		<Search />
 	</div>
 	<div class="sl-hidden md:sl-flex print:hidden right-group">
 		{

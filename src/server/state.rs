@@ -87,6 +87,10 @@ pub struct AppState {
     /// `SERIALIZABLE` transaction.
     #[cfg(feature = "backend")]
     pub resource_authorizer: crate::server::authz::ResourceAuthorizer,
+    /// Resolves interactive logins and User sessions to live `User` resources
+    /// (ADR-0001 §1, §7), provisioning a User on a first login.
+    #[cfg(feature = "backend")]
+    pub user_logins: crate::server::auth::user_identity::UserLogins,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
@@ -141,6 +145,8 @@ pub struct AppState {
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
     /// Rate limiter for OAuth endpoints (token, authorize, callback)
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
+    /// Rate limiter for the workload identity token-exchange endpoint.
+    pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
     /// Project-name labels reserved for control-plane hosts. Normalized to
@@ -440,6 +446,9 @@ async fn init_ecs_backend(
         controller_class_name,
         reconcile_interval_secs,
         health_probes,
+        identity_agent_image,
+        identity_exchange_url,
+        identity_token_ttl_seconds,
         ..
     } = settings
     else {
@@ -520,6 +529,8 @@ async fn init_ecs_backend(
         );
     }
 
+    tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
+
     let reconciler = EcsReconciler::new(
         ecs,
         ssm,
@@ -555,6 +566,11 @@ async fn init_ecs_backend(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
+            identity_agent_image: identity_agent_image.trim().to_string(),
+            identity_exchange_url: identity_exchange_url
+                .clone()
+                .unwrap_or_else(|| public_url.to_string()),
+            identity_token_ttl_seconds: *identity_token_ttl_seconds,
         },
     );
     let reconciler_handle = reconciler.spawn(shutdown);
@@ -919,6 +935,7 @@ impl AppState {
                     auto_remove,
                     access_key_id,
                     secret_access_key,
+                    registry_host,
                 } => {
                     let ecr_config = EcrConfig {
                         region: region.clone(),
@@ -928,6 +945,7 @@ impl AppState {
                         auto_remove: *auto_remove,
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
+                        registry_host: registry_host.clone(),
                     };
                     let provider = EcrProvider::new(ecr_config)
                         .await
@@ -1163,6 +1181,13 @@ impl AppState {
                 idp_groups: operator_idp_groups.clone(),
             },
         );
+
+        #[cfg(feature = "backend")]
+        let user_logins = crate::server::auth::user_identity::UserLogins::new(
+            pg_resource_store.clone(),
+            db_pool.clone(),
+            &settings.auth.issuer,
+        )?;
 
         // Store auth settings for issuer comparison
         let auth_settings = Arc::new(settings.auth.clone());
@@ -1881,6 +1906,11 @@ impl AppState {
                 .build(),
         );
 
+        let workload_token_rate_limiter =
+            Arc::new(crate::server::rate_limit::WorkloadTokenRateLimiter::new(
+                &settings.server.workload_token_rate_limit,
+            ));
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -2022,6 +2052,8 @@ impl AppState {
             #[cfg(feature = "backend")]
             resource_authorizer,
             #[cfg(feature = "backend")]
+            user_logins,
+            #[cfg(feature = "backend")]
             default_organization_uid,
             #[cfg(feature = "backend")]
             default_organization_name,
@@ -2045,6 +2077,7 @@ impl AppState {
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,
+            workload_token_rate_limiter,
             access_classes,
             reserved_project_names,
             signin_base_url,

@@ -84,7 +84,7 @@
         <div class="progress"><div id="progress-bar"></div></div>
         <p><small>You'll be redirected shortly. <a href="{{ redirect_url }}" class="subtle-link">Continue now</a> if nothing happens.</small></p>
         <script>
-            const redirectUrl = {{ redirect_url | json_encode() }};
+            const redirectUrl = {{ redirect_url | json_encode() | safe }};
             const progressBar = document.getElementById('progress-bar');
             setTimeout(() => progressBar.style.width = '100%', 100);
             setTimeout(() => { window.location.href = redirectUrl; }, 1000);

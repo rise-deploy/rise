@@ -439,7 +439,7 @@ mod tests {
             created_by_id: Uuid::nil(),
             status,
             deployment_group: "default".to_string(),
-            environment_id: None,
+            environment_id: Uuid::nil(),
             expires_at: None,
             termination_reason: None,
             completed_at: None,
@@ -531,6 +531,12 @@ mod tests {
             unimplemented!()
         }
         async fn list_non_terminal_deployments_for_project(
+            &self,
+            _project_id: Uuid,
+        ) -> Result<Vec<Deployment>> {
+            unimplemented!()
+        }
+        async fn list_active_deployments_for_project(
             &self,
             _project_id: Uuid,
         ) -> Result<Vec<Deployment>> {

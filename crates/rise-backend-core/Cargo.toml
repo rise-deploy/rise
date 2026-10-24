@@ -12,6 +12,9 @@ default = []
 # Enables `schemars::JsonSchema` derives on the shared settings types so
 # `rise-deploy` can include them in the generated backend-config schema.
 schema = ["dep:schemars", "rise-deployment-spec/schema"]
+# Exposes `test_helpers` to other crates' tests; enable it only from
+# `[dev-dependencies]` so the fixtures never reach a production build.
+test-helpers = []
 
 [dependencies]
 anyhow = { workspace = true }

@@ -13,7 +13,9 @@ use uuid::Uuid;
 /// leaks via `{:?}` (e.g. in logs or panic messages).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RiseClaims {
-    /// User ID from IdP
+    /// The subject. On a session token ([`crate::RISE_SESSION_TYP`]) this is
+    /// the canonical `user:<name>` of the Rise `User` resource; on an ingress
+    /// token and a legacy session it is the upstream IdP's `sub`.
     pub sub: String,
     /// User email
     pub email: String,
@@ -32,6 +34,40 @@ pub struct RiseClaims {
     pub iss: String,
     /// Audience (Rise UI URL or project URL)
     pub aud: String,
+    /// The UID of the `User` resource `sub` names (ADR-0001 §7). Present
+    /// exactly on a session token carrying [`crate::RISE_SESSION_TYP`]; the
+    /// verifier rejects it on any other shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_uid: Option<uuid::Uuid>,
+    /// The UID of the `UserIdentity` whose login minted this session. Present
+    /// exactly when `rise_uid` is: deactivating or deleting that identity ends
+    /// the sessions it minted, and only those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_identity_uid: Option<uuid::Uuid>,
+    /// Which kind of client the session was issued to. Only ever on a session
+    /// token carrying [`crate::RISE_SESSION_TYP`]; absent on sessions minted
+    /// before the claim existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_client: Option<SessionClient>,
+    /// The session's Allow ceiling (ADR-0006): `rise.dev/rbac` entries in
+    /// ADR-0001 §7's wire format. Only ever on a CLI session; absent means the
+    /// user's full live access. The verifier checks only where it may appear;
+    /// the server parses and enforces the entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<Vec<serde_json::Value>>,
+}
+
+/// The kind of client a Rise session was issued to.
+///
+/// Signed into the session so it cannot be changed by presenting the token
+/// differently (a CLI token sent as a `Cookie` is still a CLI session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionClient {
+    /// The web UI, signed in through the browser login.
+    Browser,
+    /// The CLI, signed in through the PKCE code flow or the device flow.
+    Cli,
 }
 
 impl std::fmt::Debug for RiseClaims {
@@ -45,6 +81,10 @@ impl std::fmt::Debug for RiseClaims {
             .field("exp", &self.exp)
             .field("iss", &self.iss)
             .field("aud", &self.aud)
+            .field("rise_uid", &self.rise_uid)
+            .field("rise_identity_uid", &self.rise_identity_uid)
+            .field("rise_client", &self.rise_client)
+            .field("authorization_details", &self.authorization_details)
             .finish()
     }
 }

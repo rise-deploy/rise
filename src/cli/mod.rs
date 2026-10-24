@@ -1,3 +1,4 @@
+pub mod auth_hint;
 #[cfg(feature = "backend")]
 pub mod backend;
 pub mod compose;

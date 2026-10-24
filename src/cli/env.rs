@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{Context, Result};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
@@ -81,7 +82,7 @@ async fn fetch_env_vars_response(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch environment variables")?;
 
@@ -130,7 +131,7 @@ pub async fn fetch_preview_env_vars(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch preview environment variables")?;
 
@@ -191,7 +192,7 @@ pub async fn set_env(
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to set environment variable")?;
 
@@ -351,7 +352,7 @@ pub async fn get_env(
         let response = http_client
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .send()
+            .send_with_auth_hint(backend_url)
             .await
             .context("Failed to get environment variable value")?;
 
@@ -402,7 +403,7 @@ pub async fn unset_env(
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to delete environment variable")?;
 
@@ -586,7 +587,7 @@ pub async fn list_deployment_env(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to list deployment environment variables")?;
 

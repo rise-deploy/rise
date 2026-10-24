@@ -304,7 +304,15 @@ account_id = "123456789012"
 repo_prefix = "rise/"
 push_role_arn = "arn:aws:iam::..."
 auto_remove = true
+# Optional: the registry host images are pushed to and deployed from, as
+# host[:port]. Defaults to <account_id>.dkr.ecr.<region>.amazonaws.com; set it
+# for another ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+# The ECR API endpoint itself follows the AWS SDK (`AWS_ENDPOINT_URL`).
+# registry_host = "123456789012.dkr.ecr.us-east-1.localhost:4566"
 ```
+
+On ECS (`config/ecs.yaml`) this is `RISE_ECR_REGISTRY_HOST`, which the
+`rise-ecs` module sets from `ecr_registry_host`.
 
 #### OCI Registry (Docker, Harbor, Quay)
 
@@ -458,7 +466,8 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `production_ingress_url_template` — host template for production deployments.
 - `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
   templates for staging / per-environment deployments.
-- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_schema` — `http` or `https` (default `https`). The scheme browsers use to
+  reach apps; also used for sign-in redirects and `/.rise` callback URLs on app hosts.
 - `ingress_port?` — external port apps are served on (e.g. `80` locally).
 - `controller_class_name` — controller ownership class (default `default`).
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).

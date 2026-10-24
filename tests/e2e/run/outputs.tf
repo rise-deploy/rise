@@ -17,6 +17,11 @@ output "controller_class" {
   value       = local.controller_class
 }
 
+output "rise_internal_url" {
+  description = "Rise's in-VPC address. Workloads use it to reach the API, since the edge admits only the harness."
+  value       = local.auth_backend_url
+}
+
 output "dex_issuer" {
   description = "In-VPC Cloud Map address; only Rise resolves it."
   value       = local.dex_issuer

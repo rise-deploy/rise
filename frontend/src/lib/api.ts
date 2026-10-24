@@ -1,5 +1,6 @@
 // @ts-nocheck
 // API client for Rise backend
+import { ApiError, apiErrorFromResponse } from './api-error';
 
 class RiseAPI {
     constructor(baseUrl) {
@@ -20,20 +21,11 @@ class RiseAPI {
 
         if (response.status === 401) {
             // Authentication required - let the app handle showing login page
-            throw new Error('Authentication required');
-        }
-
-        if (response.status === 403) {
-            // Platform access denied - user is authenticated but lacks platform access
-            const errorText = await response.text();
-            const error = new Error(errorText || 'You do not have access to Rise platform features. Your account is configured for application access only. Please contact your administrator if you need platform access.');
-            error.isPlatformAccessDenied = true;
-            throw error;
+            throw new ApiError(401, 'Authentication required');
         }
 
         if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error: ${response.status} ${errorText}`);
+            throw await apiErrorFromResponse(response);
         }
 
         // Handle responses with no body (204 No Content, 202 Accepted)
@@ -47,6 +39,25 @@ class RiseAPI {
     // User endpoints
     async getMe() {
         return this.request('/users/me');
+    }
+
+    // Device login (`rise login --device`) confirmation
+    async getDeviceAuthorization(userCode) {
+        return this.request(`/auth/device?user_code=${encodeURIComponent(userCode)}`);
+    }
+
+    async approveDevice(userCode, access) {
+        return this.request('/auth/device/approve', {
+            method: 'POST',
+            body: JSON.stringify({ user_code: userCode, access })
+        });
+    }
+
+    async denyDevice(userCode) {
+        return this.request('/auth/device/deny', {
+            method: 'POST',
+            body: JSON.stringify({ user_code: userCode })
+        });
     }
 
     async lookupUsers(emails) {
@@ -137,10 +148,28 @@ class RiseAPI {
 
     // Deployment endpoints
     async getProjectDeployments(projectName, params = {}) {
+        return (await this.getProjectDeploymentsPage(projectName, params)).items;
+    }
+
+    /**
+     * One page of a project's deployments plus the number matching the filter
+     * across all pages. Filters: group, active, environment, status
+     * (comma-separated), q (ID, image or creator email), limit, offset.
+     */
+    async getProjectDeploymentsPage(projectName, params = {}) {
         const queryString = new URLSearchParams(
             Object.entries(params).filter(([_, v]) => v !== null && v !== undefined && v !== '')
         ).toString();
-        return this.request(`/projects/${projectName}/deployments${queryString ? '?' + queryString : ''}`);
+        const response = await fetch(
+            `${this.baseUrl}/api/v1/projects/${projectName}/deployments${queryString ? '?' + queryString : ''}`,
+            { headers: { 'Content-Type': 'application/json' }, credentials: 'include' },
+        );
+        if (response.status === 401) throw new ApiError(401, 'Authentication required');
+        if (!response.ok) throw await apiErrorFromResponse(response);
+        const items = await response.json();
+        const header = response.headers.get('X-Total-Count');
+        const total = header !== null && header !== '' ? Number(header) : null;
+        return { items, total: Number.isFinite(total) ? total : null };
     }
 
     async getDeployment(projectName, deploymentId) {
@@ -157,10 +186,23 @@ class RiseAPI {
         });
     }
 
-    // Create a new deployment from an existing deployment (redeploy/rollback)
-    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false) {
-        // Get the source deployment to extract its configuration
-        const sourceDeployment = await this.request(`/projects/${projectName}/deployments/${sourceDeploymentId}`);
+    // Create a new deployment from an existing deployment's image, without a
+    // rebuild. With no target it lands in the source's own group (redeploy /
+    // rollback). With `target.environment` it lands in that environment's
+    // primary group instead (promote); the backend resolves the group.
+    // `useSourceEnvVars` copies the source's variable snapshot; otherwise the
+    // target's current project variables are used.
+    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false, target = null) {
+        let placement;
+        if (target?.environment) {
+            placement = { environment: target.environment };
+        } else {
+            const sourceDeployment = await this.request(`/projects/${projectName}/deployments/${sourceDeploymentId}`);
+            placement = {
+                group: sourceDeployment.deployment_group || 'default',
+                ...(sourceDeployment.environment ? { environment: sourceDeployment.environment } : {}),
+            };
+        }
 
         return this.request(`/deployments`, {
             method: 'POST',
@@ -168,7 +210,7 @@ class RiseAPI {
                 project: projectName,
                 from_deployment: sourceDeploymentId,
                 use_source_env_vars: useSourceEnvVars,
-                group: sourceDeployment.deployment_group || 'default',
+                ...placement,
             })
         });
     }
@@ -176,7 +218,9 @@ class RiseAPI {
     // Create a new deployment directly from a pre-built public image reference
     // (e.g. "nginx:latest", "ghcr.io/owner/repo:tag"). The server resolves the
     // digest via the OCI client and skips the build pipeline entirely.
-    async createDeploymentFromImage(projectName, image, httpPort) {
+    // `environment` is required once a project has more than one environment;
+    // the backend then deploys into that environment's primary group.
+    async createDeploymentFromImage(projectName, image, httpPort, environment = null) {
         return this.request(`/deployments`, {
             method: 'POST',
             body: JSON.stringify({
@@ -184,6 +228,7 @@ class RiseAPI {
                 image,
                 push_image: false,
                 http_port: httpPort,
+                ...(environment ? { environment } : {}),
             })
         });
     }
@@ -286,6 +331,16 @@ class RiseAPI {
 
     async getDeploymentEnvVars(projectName, deploymentId) {
         return this.request(`/projects/${projectName}/deployments/${deploymentId}/env`);
+    }
+
+    /**
+     * Compare a deployment's variable snapshot with what a new deployment into
+     * `environment` (default: the deployment's own) would get now. Secrets are
+     * compared on the server; only whether they changed comes back.
+     */
+    async diffDeploymentEnvVars(projectName, deploymentId, environment = null) {
+        const qs = environment ? `?environment=${encodeURIComponent(environment)}` : '';
+        return this.request(`/projects/${projectName}/deployments/${deploymentId}/env/diff${qs}`);
     }
 
     async setEnvVar(projectName, key, value, isSecret, isProtected = true, environment = null) {

@@ -28,6 +28,12 @@ An agent does not need the skill installed locally. Point it to the hosted files
 
 The user documentation `llms.txt` also lists these files under **AI Skills**, so an agent starting from the documentation root can discover them automatically.
 
+## Granting the agent access
+
+The skill tells the agent to log in with `rise login --device`. The agent then hands you a link on your Rise instance and a code. Open the link, check that the page shows the same code, and click **Approve**. Only approve a code your agent just showed you: approving signs that CLI in as you.
+
+The CLI keeps one token per Rise URL, so the session you approve replaces any login already stored on that machine.
+
 ## Recommended prompt
 
 This prompt automatically uses the documentation URL of the page you are viewing, including PR previews:

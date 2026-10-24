@@ -31,6 +31,76 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Every deployment belongs to an environment.** *Action required.* A
+  migration makes `deployments.environment_id` required. Deployments without
+  one (from before environments existed, or left behind by a deleted
+  environment) are assigned to the environment whose primary group they ran
+  in, else to `production`, else to the project's oldest environment; a project
+  with no environments gets `production` first. Deleting an environment now
+  deletes its deployments and their history, and the API refuses with `409`
+  while any of them is not stopped. Before upgrading, stop the deployments of
+  environments you plan to delete if you want that history gone, and expect
+  environment-less deployments to show up under an environment afterwards.
+  The workload identity `sub` no longer carries `env:<null>`.
+
+- **Docker/ECS route every active deployment group, each on its own hosts.**
+  *Action required.* The Traefik HTTP-provider snapshot used to route only the
+  newest active deployment group of each project, so production and older
+  previews returned Traefik's `404 page not found` (#548). Every group is now
+  routed. A custom domain is attached only to the router of its environment's
+  primary deployment group, never to preview groups, and domains that match an
+  ingress URL template are no longer routed. Kubernetes already behaved this
+  way. Before upgrading, look for `Ignoring custom domain that conflicts with
+  project default domain pattern` warnings: those domains stop being served on
+  Docker/ECS. A deployment whose stored container/route data does not decode
+  now fails the whole snapshot, and Traefik keeps its last good config until the
+  row is fixed.
+
+- **CLI browser login requires numeric IPv4 loopback callbacks.** *Breaking.*
+  The CLI listens and redirects on `127.0.0.1`, trying ports 8765, 8766, then
+  8767. Before upgrading the CLI, register these exact URLs on the identity
+  provider's Rise client (Keycloak: **Valid redirect URIs**):
+  `http://127.0.0.1:8765/callback`, `http://127.0.0.1:8766/callback`, and
+  `http://127.0.0.1:8767/callback`.
+  The bundled development, Helm, CI, and ECS Dex configurations allow only
+  these numeric CLI callbacks. CLIs that redirect to `localhost` cannot use
+  browser login with those configurations; upgrade the CLI alongside the
+  configuration, or use `rise login --device`.
+
+- **`rise login --device` is served by Rise, not the IdP.** *Config change.*
+  The device code is now confirmed on Rise's own `/device` page, after a fresh
+  browser sign-in. The IdP no longer needs to support, or enable, the OAuth
+  device grant, and a device-grant setting on Rise's IdP client can be removed.
+  The bundled Dex config drops `urn:ietf:params:oauth:grant-type:device_code`.
+  Existing CLIs keep working: the endpoints and responses are unchanged. Migration
+  `20260924000001` adds the `device_authorizations` table.
+
+- **User logins resolve to `User` resources; sessions carry `rise_uid`.**
+  *Action required.* Every interactive login (browser, CLI code and device
+  flows, app ingress sign-in) now resolves the ID token's exact `(iss, sub)`
+  to a `rise.dev/User` through a `UserIdentity`, creating both on a first
+  login. New session tokens carry `typ: rise-session+jwt`, `sub =
+  user:<name>` and the User's `rise_uid`, and are re-resolved on every request.
+  The generic resource API authorizes that User — `user:<name>` in a binding
+  names it.
+  - **Log in again to use the resource API.** A session issued before the
+    upgrade keeps working on the typed APIs (projects, teams, deployments)
+    until it expires, but `/api/v1/resources` answers it with `401`.
+  - **`auth.issuer` must be spelled exactly as your IdP stamps `iss`**
+    (trailing slash included if the IdP uses one) and otherwise canonical, or
+    the server refuses to start. The same rule now admits trailing-slash
+    issuers in `ServiceAccountTrustPolicy` / `ControllerTrustPolicy`.
+  - **Disable a user with `spec.active: false`** on their `User` (every login
+    and session ends) or on one `UserIdentity` (that login and the sessions
+    it minted). Deleting a `UserIdentity` ends its sessions too but merely
+    unlinks it: the next login through it provisions a new User. A session
+    from before the upgrade ends early too, once a login has mapped its IdP
+    `sub`.
+  - Migration `20260922000001` adds `users.resource_user_uid`, linking each
+    typed user to the `User` resource it last logged in as.
+  - Operator standing is unchanged: still `auth.operator_users` /
+    `auth.operator_idp_groups`, matched against the login's typed user.
+
 - **Controllers are RBAC principals; `auth.controllers` and the status/finalizer
   allowlist are removed.** *Breaking.* A controller now authenticates by
   matching a live `ControllerTrustPolicy` resource beneath a live root
@@ -87,6 +157,53 @@ Merged to `develop`:
   tokens. The typed-table exchange at `POST /api/v1/auth/token` and the CLI
   are unchanged. See [Authentication & Tokens](/operator-docs/authentication/#identity-rs256--the-token-subresource).
 
+- **ECS: workload identity.** *Breaking.* ECS deployments now get the
+  workload identity files every other backend delivers — the bootstrap
+  credential for `rise identity token`, and the `[identity].audiences` token
+  files — so a deployment declaring `[identity]` is no longer rejected. Every
+  new ECS task runs an identity sidecar (`rise identity agent`, from the new
+  `ghcr.io/rise-deploy/rise-cli` image) next to the app; see
+  [ECS › Workload identity](/operator-docs/ecs/#workload-identity).
+
+  - **Action required: set the sidecar image.** The server refuses to start
+    without `deployment_controller.identity_agent_image`
+    (`RISE_ECS_IDENTITY_AGENT_IMAGE`), normally
+    `ghcr.io/rise-deploy/rise-cli:<the same version>`. The `rise-ecs` module
+    requires `rise_cli_image_tag` (or `rise_cli_image_ref`), exactly like
+    `rise_image_tag`. The workload execution role must be able to pull it.
+
+  - **Upgrading rolls every running ECS service once.** The first reconcile
+    tick provisions each running deployment's credential and adds the sidecar,
+    which registers a new task-definition revision; ECS replaces the tasks as a
+    rolling update, without a routing gap. Expect a burst of
+    `RegisterTaskDefinition` calls (throttled to 1/s) on large installs.
+  - Tasks must reach the token endpoint, the public URL by default. Set
+    `identity_exchange_url` (`RISE_ECS_IDENTITY_EXCHANGE_URL`) if they cannot.
+  - `identity_token_ttl_seconds` is now env-driven on ECS
+    (`RISE_IDENTITY_TOKEN_TTL_SECONDS`), and `rise-ecs` exposes it along with
+    `identity_exchange_url`.
+
+- **The workload identity token-exchange endpoint has its own rate limiter.**
+  *Config change.* `POST /api/v1/identity/token` no longer shares the OAuth
+  limiter. A request with a valid bootstrap credential counts against that
+  deployment's budget only; the per-IP budget applies only to credentials that
+  match no deployment. Configure it under `server.workload_token_rate_limit`
+  (`per_deployment_max`/`per_deployment_window_secs`, default 500 per 60 s;
+  `rejected_per_ip_max`/`rejected_per_ip_window_secs`, default 50 per 60 s).
+  `server.oauth_rate_limit` no longer applies to this endpoint.
+
+- **One lifetime cap for workload identity tokens; `server.workload_token_max_ttl_seconds`
+  is removed.** *Breaking.* Tokens from the token-exchange endpoint
+  (`POST /api/v1/identity/token`, `rise identity token`) are now capped by
+  `deployment_controller.identity_token_ttl_seconds` — the lifetime of the
+  auto-minted `[identity]` token files — on every backend. **The default
+  lifetime of an exchanged token rises from 900 s to 3600 s**, matching the
+  token files a workload could already read; a request's `ttl_seconds` still
+  lowers it. The server **refuses to start** while
+  `server.workload_token_max_ttl_seconds` is set, rather than silently
+  lengthening tokens you had capped: remove the key and set
+  `identity_token_ttl_seconds` to the lifetime you want.
+
 - **ECS: a `capacity` setting, and service network configuration now converges.**
   *Config change.* `deployment_controller.capacity` selects where workload tasks
   run — `fargate` (the default, and what every existing install keeps doing) or
@@ -129,6 +246,25 @@ Merged to `develop`:
   refreshes the readable attributes; use `terraform plan -refresh=false` when
   the plan identity intentionally cannot call `secretsmanager:GetSecretValue`.
   After the first apply, normal refresh uses `ListSecretVersionIds`.
+
+- **Config change — `registry.registry_host` for ECR.** Overrides the host
+  images are pushed to and deployed from (default
+  `<account_id>.dkr.ecr.<region>.amazonaws.com`), for FIPS or dual-stack ECR
+  endpoints and ECR-compatible emulators. `RISE_ECR_REGISTRY_HOST` on ECS;
+  `ecr_registry_host` in `rise-ecs`. Unset keeps the current behavior.
+
+- **Breaking (release candidates) — `rise-ecs` takes `route53_zone`, not
+  `route53_zone_id`.** It takes the zone as an object, so a zone created in the
+  same configuration works in one apply instead of failing the plan with
+  "Invalid count argument". Replace `route53_zone_id = "Z..."` with
+  `route53_zone = { zone_id = "Z..." }`, or pass the zone resource or data
+  source itself. The records keep their addresses; nothing is recreated.
+
+- **`rise-ecs` secret versions stop changing on every plan.** Each secret
+  version's `secret_string_wo_version` was a hash too large for the AWS provider
+  to store exactly, so every `terraform plan` replaced all four secret versions.
+  The next apply updates each one a final time, with the same value; after that
+  they stay put. Nothing to do.
 
 - **ECS runtime log access names the exact log group.** `rise-aws` requires
   `ecs_log_group_name` whenever `enable_ecs = true`, and grants

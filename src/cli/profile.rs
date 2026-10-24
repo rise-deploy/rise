@@ -1,6 +1,6 @@
 //! `rise profile` — inspect and manage the login profiles selected via the
-//! global `--profile` flag, `RISE_PROFILE` environment variable, or persisted
-//! default selection.
+//! global `--profile` flag, `RISE_PROFILE` environment variable, project target,
+//! or persisted default selection. Profiles alias URLs and share their credentials.
 //!
 //! A profile is "registered" simply by having a saved config file: `rise
 //! login --profile <name>` creates one on first use, so there is nothing to
@@ -12,7 +12,8 @@ use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, 
 
 /// List all registered profiles, marking which one is currently active.
 pub fn list_profiles() -> Result<()> {
-    let active = Config::active_profile_label()?;
+    let target = Config::resolve_target(None, None, false)?;
+    let active = target.profile.as_deref().unwrap_or("default");
 
     let mut names = vec!["default".to_string()];
     names.extend(Config::list_profiles()?);
@@ -39,11 +40,15 @@ pub fn list_profiles() -> Result<()> {
         let path = Config::path_for(key)?;
 
         table.add_row(vec![
-            Cell::new(if *name == active { "*" } else { "" }),
+            Cell::new(if name == active { "*" } else { "" }),
             Cell::new(name),
             Cell::new(cfg.backend_url.as_deref().unwrap_or("-")),
-            Cell::new(if cfg.stored_token().is_some() {
-                "yes"
+            Cell::new(if let Some(url) = cfg.backend_url.as_deref() {
+                if Config::token_for_url(url)?.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
             } else {
                 "no"
             }),
@@ -53,6 +58,7 @@ pub fn list_profiles() -> Result<()> {
 
     println!("{}", table);
     println!("\nActive profile: {}", active);
+    println!("Backend URL: {}", target.url);
 
     Ok(())
 }
@@ -64,7 +70,7 @@ pub fn use_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove a profile's saved config file.
+/// Remove a profile alias without deleting the URL credential.
 pub fn remove_profile(name: &str) -> Result<()> {
     Config::remove_profile(name)?;
     println!("✓ Removed profile '{}'", name);
