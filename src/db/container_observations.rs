@@ -191,12 +191,14 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let env = crate::db::environments::test_environment_id(pool, project).await;
         sqlx::query_scalar(
-            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status)
-             VALUES ('20260831-000001', $1, $2, 'Healthy') RETURNING id",
+            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status, environment_id)
+             VALUES ('20260831-000001', $1, $2, 'Healthy', $3) RETURNING id",
         )
         .bind(project)
         .bind(user)
+        .bind(env)
         .fetch_one(pool)
         .await
         .unwrap()

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"count!\"\n        FROM deployments d\n        WHERE d.project_id = $1\n          AND ($2::text IS NULL OR d.deployment_group = $2)\n          AND ($3::bool IS NULL OR d.is_active = $3)\n          AND ($4::uuid IS NULL OR d.environment_id = $4)\n          AND ($5::text[] IS NULL OR d.status = ANY($5))\n          AND ($6::text IS NULL\n               OR strpos(lower(d.deployment_id), lower($6)) > 0\n               OR strpos(lower(COALESCE(d.image, '')), lower($6)) > 0\n               OR strpos(lower(d.deployment_group), lower($6)) > 0\n               OR EXISTS (SELECT 1 FROM users u\n                          WHERE u.id = d.created_by_id\n                            AND strpos(lower(u.email), lower($6)) > 0))\n          AND ($7::uuid[] IS NULL OR d.environment_id = ANY($7))\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "Uuid",
+        "TextArray",
+        "Text",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "54b6c3429c6a324969b8dc81bff864b4fbee429357d4e9be8023ca89adac9daa"
+}

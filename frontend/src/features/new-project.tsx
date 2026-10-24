@@ -6,6 +6,7 @@ import { useToast } from '../components/toast';
 import { Icon } from '../components/icon';
 import { Alert, Button, Panel, cx } from '../components/r-ui';
 import { suggestProjectName, usePlatformCapabilities, useQuickstartTemplates, type QuickstartTemplate } from './quickstart-templates';
+import { mostRestrictive, sortByRestrictiveness, type AccessClass } from '../lib/access';
 
 // A project is created in three steps: what it runs (empty, an existing image,
 // or a catalog template), what it's called and who owns it, and which
@@ -14,9 +15,9 @@ import { suggestProjectName, usePlatformCapabilities, useQuickstartTemplates, ty
 
 type SourceKind = 'empty' | 'image' | 'template';
 
-interface AccessClass { id: string; display_name: string; description?: string }
-interface TeamSummary { id: string; name: string }
-interface CurrentUser { id: string; email: string }
+interface TeamMember { id: string }
+interface TeamSummary { id: string; name: string; owners?: TeamMember[]; members?: TeamMember[] }
+interface CurrentUser { id: string; email: string; is_admin?: boolean }
 
 // DNS-1123 label, as the backend validates (`validate_project_name`).
 const NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -54,9 +55,10 @@ export function NewProjectPage() {
 
     useEffect(() => {
         api.getAccessClasses().then((d: { access_classes?: AccessClass[] }) => {
-            const list = d?.access_classes || [];
+            const list = sortByRestrictiveness(d?.access_classes || []);
             setAccessClasses(list);
-            setAccess(a => a || list[0]?.id || '');
+            // Default to the narrowest audience; widening is a deliberate choice.
+            setAccess(a => a || mostRestrictive(list)?.id || '');
         }).catch(() => {});
         api.getTeams().then((t: TeamSummary[]) => setTeams(t || [])).catch(() => {});
         api.getMe().then(setMe).catch(() => {});
@@ -130,6 +132,9 @@ export function NewProjectPage() {
 
     if (created) return <NextSteps name={created} staging={staging} previews={previews} />;
 
+    // A project can be owned by a team its creator belongs to; admins may pick any team.
+    const ownableTeams = teams.filter(t => !!me?.is_admin
+        || [...(t.owners || []), ...(t.members || [])].some(m => m.id === me?.id));
     const ownerName = owner === 'self' ? me?.email : teams.find(t => t.id === owner)?.name;
     const accessName = accessClasses.find(a => a.id === access)?.display_name;
 
@@ -209,7 +214,7 @@ export function NewProjectPage() {
                             <button type="button" className={cx('r-chip-btn', owner === 'self' && 'on')} onClick={() => setOwner('self')}>
                                 <Icon name="user" size={12} />You
                             </button>
-                            {teams.map(t => (
+                            {ownableTeams.map(t => (
                                 <button type="button" key={t.id} className={cx('r-chip-btn', owner === t.id && 'on')} onClick={() => setOwner(t.id)}>
                                     <Icon name="users" size={12} />{t.name}
                                 </button>
