@@ -25,6 +25,12 @@
       "groupName": "npm dependencies"
     },
     {
+      "description": "astro check rejects TypeScript 7. Remove once @astrojs/check's typescript peer range includes 7.",
+      "matchFileNames": ["docs/**"],
+      "matchDepNames": ["typescript"],
+      "allowedVersions": "<7"
+    },
+    {
       "description": "Group non-major Python dependency updates",
       "matchCategories": ["python"],
       "matchUpdateTypes": ["minor", "patch"],
