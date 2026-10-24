@@ -482,7 +482,7 @@ Merged to `develop`:
     `effectiveLabels`, and `deletionTimestamp` — no `spec`, `status`, `uid`,
     `revision`, or `discriminator`. Operators always hold `get`, so their list
     responses are unchanged apart from `effectiveLabels`.
-  - A write that loses a serialization race after three attempts returns `503`
+  - A write that loses a serialization race after five attempts returns `503`
     with a retryable message instead of committing on stale facts.
 
   **A restriction must name a subject that resolves today.** A principal's own
