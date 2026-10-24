@@ -123,7 +123,7 @@ services:
   # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   vault:
     profiles: ["jfrog-vault"]
-    image: hashicorp/vault:1.21
+    image: hashicorp/vault:2.1
     container_name: rise-vault
     restart: unless-stopped
     ports:

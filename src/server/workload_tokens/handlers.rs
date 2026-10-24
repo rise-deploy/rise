@@ -78,24 +78,17 @@ async fn authenticate_credential(
         .internal_err("Failed to load project")?
         .ok_or_else(|| ServerError::internal("Project not found for deployment"))?;
 
-    // Resolve the environment name. A deployment with `environment_id = Some(..)`
-    // MUST have a matching environment row — if the lookup yields `None`, fail
-    // closed rather than minting a token with the `NO_ENVIRONMENT` sentinel,
-    // which would be a wrong, potentially cross-environment identity.
-    let environment = match deployment.environment_id {
-        Some(env_id) => {
-            let env = db_environments::find_by_id(&state.db_pool, env_id)
-                .await
-                .internal_err("Failed to load environment")?
-                .ok_or_else(|| {
-                    ServerError::internal(
-                        "Deployment references an environment that no longer exists",
-                    )
-                })?;
-            Some(env.name)
-        }
-        None => None,
-    };
+    // Resolve the environment name. Every deployment has an environment row;
+    // if the lookup yields `None`, fail closed rather than minting a token with
+    // the `NO_ENVIRONMENT` sentinel, which would be a wrong, potentially
+    // cross-environment identity.
+    let environment = db_environments::find_by_id(&state.db_pool, deployment.environment_id)
+        .await
+        .internal_err("Failed to load environment")?
+        .ok_or_else(|| {
+            ServerError::internal("Deployment references an environment that no longer exists")
+        })?;
+    let environment = Some(environment.name);
 
     Ok(Ok(CredentialSubject {
         deployment,
@@ -271,7 +264,10 @@ mod tests {
                             image_digest: None,
                             rolled_back_from_deployment_id: None,
                             deployment_group: "default",
-                            environment_id: None,
+                            environment_id: crate::db::environments::test_environment_id(
+                                &pool, project_id,
+                            )
+                            .await,
                             expires_at: None,
                             http_port: 8080,
                             is_active: false,

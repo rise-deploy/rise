@@ -82,6 +82,7 @@ pub async fn list_access_classes(
             id: id.clone(),
             display_name: class.display_name.clone(),
             description: class.description.clone(),
+            access_requirement: class.access_requirement.clone(),
         })
         .collect();
 
@@ -190,7 +191,8 @@ pub async fn create_project(
                         .with_context("user_id", user.id.to_string())
                 })?;
 
-            if !is_member {
+            // Admins bypass the membership requirement, as on the other typed APIs.
+            if !is_member && !state.is_admin(user).await {
                 return Err(ServerError::forbidden("You are not a member of this team"));
             }
 
@@ -376,10 +378,12 @@ async fn projects_to_api(
             .await
             .internal_err("Failed to get active deployment info")?;
 
-    // Batch fetch the public identifiers for active deployment links
+    // Batch fetch the public identifiers for active and latest deployment links
     let deployment_ids: Vec<Uuid> = active_deployment_info
         .values()
-        .filter_map(|info| info.as_ref().map(|i| i.id))
+        .flat_map(|info| [info.active.as_ref(), info.latest.as_ref()])
+        .flatten()
+        .map(|i| i.id)
         .collect();
 
     let deployments_map = if !deployment_ids.is_empty() {
@@ -413,13 +417,17 @@ async fn projects_to_api(
     // Project URLs depend on configuration, not deployment lifecycle state.
     let mut api_projects = Vec::new();
     for project in projects {
-        let active_info = active_deployment_info
-            .get(&project.id)
-            .and_then(Option::as_ref);
-        let active_deployment = active_info.and_then(|info| deployments_map.get(&info.id));
+        let production = active_deployment_info.get(&project.id);
+        let active_info = production.and_then(|info| info.active.as_ref());
+        let latest_info = production.and_then(|info| info.latest.as_ref());
         let active_deployment_status = active_info.map(|info| info.status.to_string());
-        let active_deployment_id =
-            active_deployment.map(|deployment| deployment.deployment_id.clone());
+        let active_deployment_id = active_info
+            .and_then(|info| deployments_map.get(&info.id))
+            .map(|deployment| deployment.deployment_id.clone());
+        let latest_deployment_status = latest_info.map(|info| info.status.to_string());
+        let latest_deployment_id = latest_info
+            .and_then(|info| deployments_map.get(&info.id))
+            .map(|deployment| deployment.deployment_id.clone());
         let urls = state
             .deployment_backend
             .get_project_urls(
@@ -457,6 +465,8 @@ async fn projects_to_api(
             owner,
             active_deployment_status,
             active_deployment_id,
+            latest_deployment_status,
+            latest_deployment_id,
             default_url: Some(urls.default_url),
             primary_url: Some(urls.primary_url),
             custom_domain_urls: urls.custom_domain_urls,
@@ -542,13 +552,23 @@ pub async fn get_project(
         )
         .await
         .internal_err("Failed to calculate project URLs")?;
+    let production_group = projects::production_deployment_group(&state.db_pool, project.id)
+        .await
+        .internal_err("Failed to get the production deployment group")?;
     let active_deployment = crate::db::deployments::find_active_deployment_for_group(
         &state.db_pool,
         project.id,
-        crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
+        &production_group,
     )
     .await
     .internal_err("Failed to get active deployment")?;
+    let latest_deployment = crate::db::deployments::find_last_for_project_and_group(
+        &state.db_pool,
+        project.id,
+        &production_group,
+    )
+    .await
+    .internal_err("Failed to get latest deployment")?;
 
     // Resolve owner info
     let owner_info = resolve_owner_info(&state, &project)
@@ -562,6 +582,10 @@ pub async fn get_project(
     if let Some(deployment) = active_deployment {
         api_project.active_deployment_id = Some(deployment.deployment_id);
         api_project.active_deployment_status = Some(deployment.status.to_string());
+    }
+    if let Some(deployment) = latest_deployment {
+        api_project.latest_deployment_id = Some(deployment.deployment_id);
+        api_project.latest_deployment_status = Some(deployment.status.to_string());
     }
 
     // When no source URL is explicitly configured, resolve one from deployment
@@ -672,7 +696,7 @@ pub async fn update_project(
                     .await
                     .internal_err("Failed to check team membership")?;
 
-                if !is_member {
+                if !is_member && !state.is_admin(user).await {
                     return Err(ServerError::forbidden(format!(
                         "You must be a member of team '{}' to transfer projects to it",
                         team.name
@@ -1168,6 +1192,8 @@ fn convert_project(
         access_class: project.access_class,
         owner,
         active_deployment_status: None, // Will be populated by caller if needed
+        latest_deployment_status: None,
+        latest_deployment_id: None,
         active_deployment_id: None,
         default_url: None,          // Will be populated by caller
         primary_url: None,          // Will be populated by caller
