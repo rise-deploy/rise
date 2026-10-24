@@ -223,49 +223,30 @@ pub async fn copy_project_env_vars_to_deployment(
     pool: &PgPool,
     project_id: Uuid,
     deployment_id: Uuid,
-    environment_id: Option<Uuid>,
-    environment_name: Option<&str>,
+    environment_id: Uuid,
+    environment_name: &str,
 ) -> Result<u64> {
-    let result = if let Some(env_id) = environment_id {
-        let env_source = environment_name
-            .map(|name| format!("env:{}", name))
-            .unwrap_or_else(|| "global".to_string());
-        sqlx::query!(
-            r#"
-            WITH resolved AS (
-                SELECT DISTINCT ON (key) key, value, is_secret, is_protected,
-                    CASE WHEN environment_id IS NOT NULL THEN $4 ELSE 'global' END as source
-                FROM project_env_vars
-                WHERE project_id = $2 AND (environment_id IS NULL OR environment_id = $3)
-                ORDER BY key, CASE WHEN environment_id IS NOT NULL THEN 0 ELSE 1 END
-            )
-            INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)
-            SELECT $1, key, value, is_secret, is_protected, source FROM resolved
-            "#,
-            deployment_id,
-            project_id,
-            env_id,
-            env_source
-        )
-        .execute(pool)
-        .await
-        .context("Failed to copy project environment variables to deployment")?
-    } else {
-        // No environment context: only copy global vars (environment_id IS NULL)
-        sqlx::query!(
-            r#"
-            INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)
-            SELECT $1, key, value, is_secret, is_protected, 'global'
+    let env_source = format!("env:{}", environment_name);
+    let result = sqlx::query!(
+        r#"
+        WITH resolved AS (
+            SELECT DISTINCT ON (key) key, value, is_secret, is_protected,
+                CASE WHEN environment_id IS NOT NULL THEN $4 ELSE 'global' END as source
             FROM project_env_vars
-            WHERE project_id = $2 AND environment_id IS NULL
-            "#,
-            deployment_id,
-            project_id
+            WHERE project_id = $2 AND (environment_id IS NULL OR environment_id = $3)
+            ORDER BY key, CASE WHEN environment_id IS NOT NULL THEN 0 ELSE 1 END
         )
-        .execute(pool)
-        .await
-        .context("Failed to copy project environment variables to deployment")?
-    };
+        INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)
+        SELECT $1, key, value, is_secret, is_protected, source FROM resolved
+        "#,
+        deployment_id,
+        project_id,
+        environment_id,
+        env_source
+    )
+    .execute(pool)
+    .await
+    .context("Failed to copy project environment variables to deployment")?;
 
     Ok(result.rows_affected())
 }
@@ -458,7 +439,8 @@ mod tests {
                     image_digest: None,
                     rolled_back_from_deployment_id: None,
                     deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                    environment_id: None,
+                    environment_id: crate::db::environments::test_environment_id(&pool, project.id)
+                        .await,
                     expires_at: None,
                     http_port: 8080,
                     is_active: false,
@@ -551,7 +533,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project.id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -659,7 +642,7 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "staging",
-                environment_id: Some(env.id),
+                environment_id: env.id,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -678,15 +661,9 @@ mod tests {
         .await
         .unwrap();
 
-        copy_project_env_vars_to_deployment(
-            &pool,
-            project.id,
-            deployment.id,
-            Some(env.id),
-            Some("staging"),
-        )
-        .await
-        .unwrap();
+        copy_project_env_vars_to_deployment(&pool, project.id, deployment.id, env.id, "staging")
+            .await
+            .unwrap();
 
         let dep_vars = list_deployment_env_vars(&pool, deployment.id)
             .await

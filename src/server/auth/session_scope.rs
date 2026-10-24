@@ -429,8 +429,7 @@ async fn project_name(state: &AppState, param: Option<String>) -> Result<String,
 }
 
 /// The environment a deployment is bound to, by name. A deployment that
-/// doesn't exist, or has no environment, has none: only a project-wide grant
-/// covers it.
+/// doesn't exist has none: only a project-wide grant covers it.
 async fn deployment_environment(
     state: &AppState,
     project: &str,
@@ -450,7 +449,7 @@ async fn deployment_environment(
         deployments::find_by_project_and_deployment_id(&state.db_pool, project.id, deployment_id)
             .await
             .map_err(lookup_failed)?
-            .and_then(|deployment| deployment.environment_id)
+            .map(|deployment| deployment.environment_id)
     else {
         return Ok(None);
     };

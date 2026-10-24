@@ -396,6 +396,22 @@ pub async fn delete_environment(
         ));
     }
 
+    // Deleting an environment deletes its deployments; running ones are
+    // stopped first, so their workloads are torn down by the controller.
+    let live = crate::db::deployments::count_live_for_environment(&state.db_pool, env.id)
+        .await
+        .internal_err("Failed to count the environment's deployments")?;
+    if live > 0 {
+        return Err(ServerError::conflict(format!(
+            "Environment '{}' has {} deployment{} that {} not stopped. Stop {} first; deleting the environment deletes its deployment history.",
+            env_name,
+            live,
+            if live == 1 { "" } else { "s" },
+            if live == 1 { "is" } else { "are" },
+            if live == 1 { "it" } else { "them" },
+        )));
+    }
+
     let deleted = db_environments::delete(&state.db_pool, env.id)
         .await
         .internal_err("Failed to delete environment")?;
