@@ -56,8 +56,9 @@ through any resource API.
 Schema ownership is real, not aspirational:
 
 - `resource_store` belongs to `rise-resource-store-postgres`, which owns its
-  migrations and SQLX offline cache. `runtime_sync` belongs to
-  `rise-runtime-sync` on the same terms.
+  migrations; its queries are runtime-checked, so it has no SQLX offline cache.
+  `runtime_sync` belongs to `rise-runtime-sync`, which owns its migrations and
+  SQLX offline cache.
 - No `rise-deploy` production query reaches into `resource_store`; `grep -rn
   resource_store src/db/*.rs` is empty. One test fixture writes it directly
   (`src/server/resources/gc.rs:741`, under `#[cfg(test)]`).
