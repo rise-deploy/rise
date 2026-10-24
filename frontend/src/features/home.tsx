@@ -5,12 +5,13 @@ import { Button, EnvTag, OwnerLabel, Panel, Status, cx, statusTone } from '../co
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState } from '../components/states';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
-import { byNewest, deploymentSource, isInProgress } from '../lib/env-state';
+import { byNewest, isInProgress } from '../lib/env-state';
 import type { Deployment, Project } from '../lib/project-context';
 import { useRecentProjects } from '../lib/recent';
 import { deploymentPath, projectPath } from '../lib/routes';
 import { QuickstartPanel } from './quickstart-templates';
 import { effectiveStatus, hasFailedDeploy, statusLabel } from '../lib/project-status';
+import { DeploymentSource } from '../components/deployment-source';
 
 interface HomeProps {
     user: { email?: string; id?: string } | null;
@@ -189,7 +190,7 @@ export function Home({ user }: HomeProps) {
                                 <span className={cx('r-dot', statusTone(d.status))} title={d.status} />
                                 <span className="proj">{project}</span>
                                 {d.environment && <EnvTag env={d.environment} color={d.environment_color} />}
-                                <span className="msg">{deploymentSource(d)}</span>
+                                <span className="msg"><DeploymentSource d={d} projectName={project} /></span>
                                 <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                             </div>
                         ))}

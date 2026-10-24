@@ -15,10 +15,11 @@ import { AppUsersList } from './projects';
 import { useQuickstartTemplates } from './quickstart-templates';
 import { useCurrentProject, type Project } from '../lib/project-context';
 import { useDeployActions } from '../components/deploy-actions';
-import { byNewest, deploymentSource, envState, productionEnv, sortEnvironments } from '../lib/env-state';
-import { deploymentPath, projectPath, type ProjectSection } from '../lib/routes';
+import { byNewest, envState, productionEnv, sortEnvironments, type EnvState } from '../lib/env-state';
+import { deploymentPath, logsPath, projectPath, type ProjectSection } from '../lib/routes';
 import type { AccessClass } from '../lib/access';
 import { SectionHead } from '../components/section-head';
+import { DeploymentSource } from '../components/deployment-source';
 
 // Sections that render their own head because it carries actions.
 const SELF_HEADED = new Set<ProjectSection>(['environments', 'variables', 'domains', 'extensions']);
@@ -121,10 +122,14 @@ function RedeployProductionButton() {
     const current = useCurrentProject()!;
     const { request } = useDeployActions();
     const prod = productionEnv(current.environments);
-    const live = prod ? envState(prod, current.deployments).live : null;
+    const state = prod ? envState(prod, current.deployments) : null;
+    const live = state?.live ?? null;
     if (!prod || !live) return null;
+    // Redeploying what already serves is never the fix for a failed deploy:
+    // while one is open, the failure banner carries the primary action.
+    const failing = current.environments.some(env => !!envState(env, current.deployments).failedAttempt);
     return (
-        <Button variant="primary" icon="refresh" onClick={() => request({ kind: 'redeploy', source: live })}>
+        <Button variant={failing ? undefined : 'primary'} icon="refresh" onClick={() => request({ kind: 'redeploy', source: live })}>
             Redeploy {prod.name}
         </Button>
     );
@@ -280,12 +285,58 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: Pr
 function SectionLabelRow({ label, href, link }: { label: string; href?: string; link?: string }) {
     return (
         <div className="r-label-row">
-            <span className="r-section-label">{label}</span>
+            <h2 className="r-section-label">{label}</h2>
             {href && link && (
                 <a className="r-link" href={href} onClick={(e) => { if (e.metaKey || e.ctrlKey) return; e.preventDefault(); navigate(href); }}>
                     {link}
                 </a>
             )}
+        </div>
+    );
+}
+
+/**
+ * A failed deploy in an environment: what failed, why, and whether anything
+ * is down, with the way forward. When the previous deployment still serves,
+ * nothing is down and diagnosing comes first; when nothing healthy serves,
+ * rolling back is offered beside it.
+ */
+function FailureBanner({ state, projectName }: { state: EnvState; projectName: string }) {
+    const { request } = useDeployActions();
+    const failed = state.failedAttempt!;
+    const serving = state.live && state.live.status === 'Healthy' ? state.live : null;
+    const rollbackTo = !serving ? state.previous : null;
+    const open = (e: React.MouseEvent, href: string) => {
+        if (e.button !== 0 || e.metaKey || e.ctrlKey) return;
+        e.preventDefault();
+        navigate(href);
+    };
+    const diagnoseHref = deploymentPath(projectName, failed.deployment_id);
+    const logsHref = logsPath(projectName, failed.deployment_id);
+    return (
+        <div className="r-issue">
+            <Icon name="alert" size={16} />
+            <div className="text">
+                <div className="r-issue-title">
+                    The last {state.env.name} deploy {failed.status === 'Unhealthy' ? 'is unhealthy' : 'failed'}
+                    <span className="mono"> · {failed.deployment_id}</span>
+                </div>
+                {failed.error_message && <div className="r-issue-reason">{failed.error_message}</div>}
+                <div className="r-issue-serving">
+                    {serving
+                        ? <><span className="mono">{serving.deployment_id}</span> is still serving {state.env.name}; nothing is down.</>
+                        : <>Nothing healthy is serving {state.env.name}.</>}
+                </div>
+            </div>
+            <div className="r-issue-actions">
+                <a className="r-btn primary" href={diagnoseHref} onClick={e => open(e, diagnoseHref)}>Diagnose</a>
+                <a className="r-btn" href={logsHref} onClick={e => open(e, logsHref)}><Icon name="terminal" size={13} />Logs</a>
+                {rollbackTo && (
+                    <Button icon="rollback" onClick={() => request({ kind: 'rollback', source: rollbackTo })}>
+                        Roll back to {rollbackTo.deployment_id.split('-').pop()}
+                    </Button>
+                )}
+            </div>
         </div>
     );
 }
@@ -301,20 +352,7 @@ function ProjectOverview({ project, onUpdated }: { project: Project; onUpdated: 
 
     return (
         <div className="r-stack">
-            {issues.map(s => {
-                const failed = s.failedAttempt!;
-                return (
-                    <div key={s.env.name} className="r-issue">
-                        <Icon name="alert" size={16} />
-                        <div className="text">
-                            The last {s.env.name} deploy (<span className="mono">{failed.deployment_id}</span>) {failed.status === 'Unhealthy' ? 'is unhealthy' : 'failed'}
-                            {failed.error_message ? <>: {failed.error_message}</> : '.'}
-                            {s.live && <> <span className="mono">{s.live.deployment_id}</span> is still serving traffic.</>}
-                        </div>
-                        <Button onClick={() => navigate(deploymentPath(projectName, failed.deployment_id))}>Diagnose →</Button>
-                    </div>
-                );
-            })}
+            {issues.map(s => <FailureBanner key={s.env.name} state={s} projectName={projectName} />)}
 
             <div>
                 <SectionLabelRow label="Environments" href={projectPath(projectName, 'environments')} link="Manage →" />
@@ -340,7 +378,7 @@ function ProjectOverview({ project, onUpdated }: { project: Project; onUpdated: 
                             <span className={cx('r-dot', statusTone(d.status))} title={d.status} />
                             <span className="mono id">{d.deployment_id}</span>
                             {d.environment && <EnvTag env={d.environment} />}
-                            <span className="msg">{deploymentSource(d)}</span>
+                            <span className="msg"><DeploymentSource d={d} projectName={projectName} /></span>
                             <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                         </div>
                     ))}

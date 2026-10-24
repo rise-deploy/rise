@@ -110,14 +110,24 @@ export function shortRevision(revision?: string): string {
     return revision ? revision.slice(0, 7) : '';
 }
 
-/** A one-line description of where a deployment came from. */
+/** `#31` (GitHub) or `!31` (GitLab) for a pull/merge request URL. */
+export function pullRequestLabel(url?: string): string | null {
+    const m = url?.match(/\/(?:pull|pulls|merge_requests)\/(\d+)/);
+    if (!m) return null;
+    return `${url!.includes('merge_requests') ? '!' : '#'}${m[1]}`;
+}
+
+/**
+ * Where a deployment came from, as one fact: its pull request, else the
+ * deployment it was created from, else branch@commit, else its image.
+ * `DeploymentSource` renders the same fact with the rest in a card.
+ */
 export function deploymentSource(d: Deployment): string {
-    const parts: string[] = [];
-    const pr = d.pull_request_url?.match(/\/(?:pull|merge_requests)\/(\d+)/);
-    if (pr) parts.push(`${d.pull_request_url!.includes('merge_requests') ? '!' : '#'}${pr[1]}`);
-    if (d.git_revision) parts.push(shortRevision(d.git_revision));
-    parts.push(shortImage(d.image));
-    return parts.join(' · ');
+    const pr = pullRequestLabel(d.pull_request_url);
+    if (pr) return d.git_branch ? `${pr} · ${d.git_branch}` : pr;
+    if (d.source_deployment_id) return `Redeploy of ${d.source_deployment_id.split('-').pop()}`;
+    if (d.git_revision) return `${d.git_branch ? `${d.git_branch}@` : ''}${shortRevision(d.git_revision)}`;
+    return shortImage(d.image);
 }
 
 /** A link to the commit on its forge, when the forge's URL layout is known. */
