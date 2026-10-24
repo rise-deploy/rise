@@ -3,4 +3,8 @@
 # Rise uses RSA for JWT signing/verification and key generation, and the remaining
 # transitive uses are either signature-oriented or build-time only. There is no
 # stable fixed release of the rsa crate yet.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0387 is timing variability in crypto-bigint 0.5, reached only through
+# aws-sigv4's `sigv4a` feature, which pins crypto-bigint 0.5 in every release
+# (latest checked: 1.6.3). Remove it once aws-sigv4 depends on crypto-bigint >=0.7.6.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
