@@ -1,6 +1,6 @@
 use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -260,9 +260,7 @@ pub async fn list_env(
             .any(|v| v.environment.is_some());
 
     let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS);
+    table.load_style(UTF8_FULL.with_rounded_corners());
 
     if show_env_col {
         table.set_header(vec![
@@ -619,8 +617,7 @@ pub async fn list_deployment_env(
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("KEY").add_attribute(Attribute::Bold),
             Cell::new("VALUE").add_attribute(Attribute::Bold),
