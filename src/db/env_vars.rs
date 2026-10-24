@@ -294,6 +294,40 @@ pub async fn copy_deployment_env_vars_to_deployment(
     Ok(result.rows_affected())
 }
 
+/// Copy the variables a deployment got from its `rise.toml` and from CLI
+/// flags onto another deployment, replacing same-named variables there.
+///
+/// A deployment created from another one reuses its image and the rest of its
+/// configuration; these variables belong to that configuration too, while
+/// project variables are read fresh.
+pub async fn copy_config_env_vars_to_deployment(
+    pool: &PgPool,
+    source_deployment_id: Uuid,
+    target_deployment_id: Uuid,
+) -> Result<u64> {
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)
+        SELECT $1, key, value, is_secret, is_protected, source
+        FROM deployment_env_vars
+        WHERE deployment_id = $2 AND source IN ('toml', 'cli')
+        ON CONFLICT (deployment_id, key) DO UPDATE
+        SET value = EXCLUDED.value,
+            is_secret = EXCLUDED.is_secret,
+            is_protected = EXCLUDED.is_protected,
+            source = EXCLUDED.source,
+            updated_at = NOW()
+        "#,
+        target_deployment_id,
+        source_deployment_id
+    )
+    .execute(pool)
+    .await
+    .context("Failed to copy rise.toml and CLI variables to deployment")?;
+
+    Ok(result.rows_affected())
+}
+
 /// List all environment variables for a deployment
 /// This is used by the controller to get env vars for container injection
 pub async fn list_deployment_env_vars(
@@ -392,6 +426,101 @@ mod tests {
     use crate::db::deployments::{self, CreateDeploymentParams};
     use crate::db::models::{DeploymentStatus, ProjectStatus};
     use crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP;
+
+    /// A deployment created from another keeps the source's rise.toml and CLI
+    /// variables over the project's, and takes nothing else from it.
+    #[sqlx::test]
+    async fn config_variables_follow_a_redeploy(pool: PgPool) {
+        let user = crate::db::users::create(&pool, "config-vars@example.com")
+            .await
+            .unwrap();
+        let project = crate::db::projects::create(
+            &pool,
+            "config-vars-project",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for deployment_id in ["20261024-000001", "20261024-000002"] {
+            let d = deployments::create(
+                &pool,
+                CreateDeploymentParams {
+                    deployment_id,
+                    project_id: project.id,
+                    created_by_id: user.id,
+                    status: DeploymentStatus::Healthy,
+                    image: Some("test:v1"),
+                    image_digest: None,
+                    rolled_back_from_deployment_id: None,
+                    deployment_group: DEFAULT_DEPLOYMENT_GROUP,
+                    environment_id: None,
+                    expires_at: None,
+                    http_port: 8080,
+                    is_active: false,
+                    job_url: None,
+                    pull_request_url: None,
+                    git_repository_url: None,
+                    replicas: 1,
+                    cpu: "500m",
+                    memory: "256Mi",
+                    identity_audiences: serde_json::json!({}),
+                    containers: None,
+                    routes: None,
+                    expiration_cap: None,
+                },
+            )
+            .await
+            .unwrap();
+            ids.push(d.id);
+        }
+        let (source, target) = (ids[0], ids[1]);
+        for (key, value, origin) in [
+            ("LOG_LEVEL", "debug", "toml"),
+            ("FEATURE_X", "on", "cli"),
+            ("DATABASE_URL", "from-source", "global"),
+            ("PORT", "8080", "system"),
+        ] {
+            upsert_deployment_env_var(&pool, source, key, value, false, false, origin)
+                .await
+                .unwrap();
+        }
+        // The new deployment already has the project's current values.
+        upsert_deployment_env_var(&pool, target, "LOG_LEVEL", "info", false, false, "global")
+            .await
+            .unwrap();
+        upsert_deployment_env_var(
+            &pool,
+            target,
+            "DATABASE_URL",
+            "current",
+            false,
+            false,
+            "global",
+        )
+        .await
+        .unwrap();
+
+        copy_config_env_vars_to_deployment(&pool, source, target)
+            .await
+            .unwrap();
+
+        let vars: std::collections::HashMap<String, (String, String)> =
+            list_deployment_env_vars(&pool, target)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|v| (v.key, (v.value, v.source)))
+                .collect();
+        assert_eq!(vars["LOG_LEVEL"], ("debug".into(), "toml".into()));
+        assert_eq!(vars["FEATURE_X"], ("on".into(), "cli".into()));
+        assert_eq!(vars["DATABASE_URL"], ("current".into(), "global".into()));
+        assert!(!vars.contains_key("PORT"));
+    }
 
     #[sqlx::test]
     async fn get_deployment_env_var_returns_matching_variable(pool: PgPool) {

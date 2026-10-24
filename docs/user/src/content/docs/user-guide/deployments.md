@@ -47,7 +47,7 @@ Reuse the image from a previous deployment:
 rise deploy --from 20241205-1234
 ```
 
-By default, the new deployment uses the project's current environment variables. To copy environment variables from the source deployment instead:
+By default, the new deployment uses the project's current environment variables, with the source deployment's `rise.toml` and CLI-flag variables on top: like its port, resources and routes, they travel with the source. Variables passed with this command (`--env`, the local `rise.toml`) still take precedence. To copy all environment variables from the source deployment instead:
 
 ```bash
 rise deploy --from 20241205-1234 --use-source-env-vars

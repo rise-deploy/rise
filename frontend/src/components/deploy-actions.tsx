@@ -85,7 +85,6 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
     // Redeploying a deployment that failed retries an image that already
     // failed once; say so, and what keeps serving meanwhile.
     const retrying = kind === 'redeploy' && (source.status === 'Failed' || source.status === 'Unhealthy');
-    const targetGroup = kind === 'promote' ? (env?.primary_deployment_group ?? null) : source.deployment_group;
 
     let title: string;
     let body: React.ReactNode;
@@ -177,12 +176,14 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
                 <span className="r-diff-arrow" aria-hidden>→</span>
                 <DeploymentSummary d={source} label="After" tone="after" />
             </div>
+            {useSourceEnvVars && (
+                <p className="r-var-changes-note">Uses the variables of <span className="mono">{source.deployment_id}</span> unchanged.</p>
+            )}
             {!useSourceEnvVars && (kind !== 'promote' || target) && (
                 <VarChanges
                     projectName={project.projectName}
                     sourceId={source.deployment_id}
                     environment={envName || null}
-                    group={targetGroup}
                 />
             )}
             {kind !== 'promote' && (
