@@ -691,11 +691,10 @@ impl DockerReconciler {
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Environment context.
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let env_name = environment.as_ref().map(|e| e.name.clone());
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
@@ -708,21 +707,12 @@ impl DockerReconciler {
             &all_environments,
             &custom_domains,
         );
-        let primary_hosts: Vec<String> = self
-            .url_builder
-            .primary_ingress_hosts(
-                project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|env| {
-                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &all_environments,
-            )
-            .into_iter()
-            .map(|h| h.host)
-            .collect();
+        let primary_hosts = self.url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            &all_environments,
+            &custom_domains,
+        );
 
         // Env vars: plain + decrypted secret (merged into plain — Docker has no
         // secret concept) + system env vars.
@@ -1708,10 +1698,11 @@ impl DockerReconciler {
     /// Resolve a deployment's environment name (`None` for the no-environment
     /// case), shared by identity preparation and refresh.
     async fn resolve_environment_name(&self, deployment: &Deployment) -> Result<Option<String>> {
-        match deployment.environment_id {
-            Some(env_id) => Ok(self.store.find_environment(env_id).await?.map(|e| e.name)),
-            None => Ok(None),
-        }
+        Ok(self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?
+            .map(|e| e.name))
     }
 
     async fn pull_image(&self, image: &str) -> Result<()> {
@@ -1804,28 +1795,14 @@ impl DockerReconciler {
         project: &Project,
         deployment: &Deployment,
     ) -> Result<Vec<String>> {
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-        Ok(self
-            .url_builder
-            .primary_ingress_hosts(
-                project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|env| {
-                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &all_environments,
-            )
-            .into_iter()
-            .map(|h| h.host)
-            .collect())
+        Ok(self.url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            &all_environments,
+            &custom_domains,
+        ))
     }
 
     async fn reconcile_health(

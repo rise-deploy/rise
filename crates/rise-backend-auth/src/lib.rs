@@ -13,6 +13,7 @@
 mod claims;
 mod error;
 mod matchers;
+pub mod session_scope;
 mod signer;
 mod verify;
 mod workload;

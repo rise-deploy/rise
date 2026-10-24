@@ -837,7 +837,7 @@ export function SnowflakeOAuthDetailView({ extension, projectName }) {
                                     </tr>
                                     <tr>
                                         <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET</span></td>
-                                        <td><Pill>protected</Pill></td>
+                                        <td><span className="r-var-badge protected"><Icon name="lock" size={10} />Protected</span></td>
                                     </tr>
                                     <tr>
                                         <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{status.oauth_extension_name.toUpperCase().replace(/-/g, '_')}_ISSUER</span></td>
@@ -989,7 +989,7 @@ export function AwsS3DetailView({ extension, projectName }) {
                             </tr>
                             <tr>
                                 <td><span className="mono">AWS_SECRET_ACCESS_KEY</span></td>
-                                <td><Pill>protected</Pill></td>
+                                <td><span className="r-var-badge protected"><Icon name="lock" size={10} />Protected</span></td>
                             </tr>
                             <tr>
                                 <td><span className="mono">AWS_REGION</span></td>
@@ -1133,7 +1133,7 @@ export function AwsRdsDetailView({ extension, projectName }) {
                                     </tr>
                                     <tr>
                                         <td><span className="mono">PGPASSWORD</span></td>
-                                        <td><Pill>protected</Pill></td>
+                                        <td><span className="r-var-badge protected"><Icon name="lock" size={10} />Protected</span></td>
                                     </tr>
                                     <tr>
                                         <td><span className="mono">PGDATABASE</span></td>

@@ -234,6 +234,15 @@ enum Commands {
         /// (for SSH sessions and other machines without a local browser)
         #[arg(long, conflicts_with = "browser")]
         device: bool,
+        /// Restrict the session to a project or environment:
+        /// `<project>[/<environment>]=<preset|permission>[,...]`. Presets: read,
+        /// deploy, develop, admin. Repeatable. With --device this is a request
+        /// the approver may change.
+        #[arg(long = "scope", value_name = "TARGET=ACCESS")]
+        scopes: Vec<String>,
+        /// Ask for full access explicitly (the default without --scope)
+        #[arg(long, conflicts_with = "scopes")]
+        full_access: bool,
     },
     /// Manage CLI login profiles (see the global --profile flag / RISE_PROFILE)
     #[command(subcommand)]
@@ -1291,12 +1300,23 @@ async fn main() -> Result<()> {
     }
 
     match &cli_command {
-        Commands::Login { device, .. } => {
+        Commands::Login {
+            device,
+            scopes,
+            full_access,
+            ..
+        } => {
+            let access = login::access::request_from_scopes(scopes, *full_access)?;
             if *device {
-                login::handle_device_flow(&http_client, &backend_url, &mut config).await?;
+                login::handle_device_flow(&http_client, &backend_url, &mut config, access).await?;
             } else {
-                login::handle_authorization_code_flow(&http_client, &backend_url, &mut config)
-                    .await?;
+                login::handle_authorization_code_flow(
+                    &http_client,
+                    &backend_url,
+                    &mut config,
+                    access,
+                )
+                .await?;
             }
         }
         #[cfg(feature = "backend")]

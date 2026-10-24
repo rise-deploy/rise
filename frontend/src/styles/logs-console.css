@@ -325,7 +325,7 @@
 
 .r-logc-query-menu-item:hover { background: var(--hover); }
 .r-logc-query-menu-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.r-logc-query-menu-item.on { box-shadow: inset 2px 0 0 var(--accent); font-weight: 500; }
+.r-logc-query-menu-item.on { background: var(--accent-soft); font-weight: 500; }
 
 .r-logc-level-dot {
     width: 7px;

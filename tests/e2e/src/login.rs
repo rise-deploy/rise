@@ -89,8 +89,65 @@ pub fn browser_login(
     username: &str,
     password: &str,
 ) -> Result<String> {
+    let response = sign_in(api_base, dex, None, username, password)?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "sign-in callback answered {}",
+        response.status()
+    );
+    session_cookie(response.headers()).context("sign-in callback set no rise_jwt cookie")
+}
+
+/// Sign `username` in to `project`'s app, as a visitor's browser does, and
+/// return the app token Rise sets as the app's `rise_jwt` cookie. The app's
+/// `/.rise/auth/complete` step is reached through `api_base`: Rise serves it
+/// whatever the host.
+pub fn app_login(
+    api_base: &str,
+    dex: &DexEndpoint,
+    project: &str,
+    username: &str,
+    password: &str,
+) -> Result<String> {
+    let response = sign_in(api_base, dex, Some(project), username, password)?;
+    // The callback hands the browser to the app's completion step, by
+    // redirect or from a page that links to it.
+    let complete = if response.status().is_redirection() {
+        location(&response)?
+    } else {
+        let body = response.text().unwrap_or_default();
+        let start = body
+            .find("/.rise/auth/complete?token=")
+            .with_context(|| format!("sign-in callback names no completion step:\n{body}"))?;
+        let end = body[start..]
+            .find(|c: char| c == '"' || c == '\'' || c.is_whitespace())
+            .map_or(body.len(), |len| start + len);
+        body[start..end].replace("&amp;", "&")
+    };
+    let token = query_param(Url::parse("http://app")?.join(&complete)?.as_ref(), "token")?
+        .context("completion step carries no token")?;
+    let complete = format!("{api_base}/.rise/auth/complete?token={token}");
+    let response = no_redirect_client()?
+        .get(&complete)
+        .send()
+        .with_context(|| format!("GET {complete}"))?;
+    session_cookie(response.headers()).context("completion step set no rise_jwt cookie")
+}
+
+/// Walk Rise's browser sign-in through Dex and return Rise's answer to the
+/// callback: for the web UI when `project` is `None`, for that app otherwise.
+fn sign_in(
+    api_base: &str,
+    dex: &DexEndpoint,
+    project: Option<&str>,
+    username: &str,
+    password: &str,
+) -> Result<reqwest::blocking::Response> {
     let client = no_redirect_client()?;
-    let start = format!("{api_base}/api/v1/auth/signin/start");
+    let start = match project {
+        Some(project) => format!("{api_base}/api/v1/auth/signin/start?project={project}"),
+        None => format!("{api_base}/api/v1/auth/signin/start"),
+    };
     let response = client
         .get(&start)
         .send()
@@ -112,16 +169,10 @@ pub fn browser_login(
     }
     let api = Url::parse(api_base).context("parse API base")?;
     let callback = reroute(&Url::parse(&callback)?, &Url::parse(&redirect_uri)?, &api);
-    let response = client
+    client
         .get(callback.clone())
         .send()
-        .with_context(|| format!("GET {callback}"))?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "sign-in callback answered {}",
-        response.status()
-    );
-    session_cookie(response.headers()).context("sign-in callback set no rise_jwt cookie")
+        .with_context(|| format!("GET {callback}"))
 }
 
 /// The non-empty `rise_jwt` among a response's cookies. A cleared legacy

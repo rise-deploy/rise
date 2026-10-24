@@ -8,7 +8,7 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 
 | Command | Alias | Subcommands | Details |
 |---------|-------|-------------|---------|
-| `rise login` | | | [Authentication](../authentication) |
+| `rise login` | | `--device`, `--scope`, `--full-access` | [Authentication](../authentication), [Restricting a Login](../authentication#restricting-a-login) |
 | `rise profile` | | `list` (`ls`), `use`, `remove` (`rm`) | [Login Profiles](../configuration#login-profiles) |
 | `rise deploy` | | | [Deployments](../deployments) |
 | `rise build` | | | [Building Images](../builds) |

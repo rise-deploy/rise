@@ -37,6 +37,8 @@ pub struct DeviceAuthorization {
     pub approved_session: Option<serde_json::Value>,
     pub client_name: Option<String>,
     pub client_ip: Option<String>,
+    /// What the login asks for (ADR-0006); `None` on rows that predate it.
+    pub requested_access: Option<serde_json::Value>,
     pub interval_seconds: i32,
     pub last_polled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -52,6 +54,7 @@ struct Row {
     approved_session: Option<serde_json::Value>,
     client_name: Option<String>,
     client_ip: Option<String>,
+    requested_access: Option<serde_json::Value>,
     interval_seconds: i32,
     last_polled_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
@@ -70,6 +73,7 @@ impl TryFrom<Row> for DeviceAuthorization {
             approved_session: row.approved_session,
             client_name: row.client_name,
             client_ip: row.client_ip,
+            requested_access: row.requested_access,
             interval_seconds: row.interval_seconds,
             last_polled_at: row.last_polled_at,
             created_at: row.created_at,
@@ -84,6 +88,7 @@ pub struct NewDeviceAuthorization<'a> {
     pub user_code: &'a str,
     pub client_name: Option<&'a str>,
     pub client_ip: Option<&'a str>,
+    pub requested_access: Option<&'a serde_json::Value>,
     pub interval_seconds: i32,
     pub expires_at: DateTime<Utc>,
 }
@@ -96,14 +101,16 @@ pub async fn create(pool: &PgPool, new: &NewDeviceAuthorization<'_>) -> Result<b
     let result = sqlx::query!(
         r#"
         INSERT INTO device_authorizations
-            (device_code_hash, user_code, client_name, client_ip, interval_seconds, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (device_code_hash, user_code, client_name, client_ip, requested_access,
+             interval_seconds, expires_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (user_code) DO NOTHING
         "#,
         new.device_code_hash,
         new.user_code,
         new.client_name,
         new.client_ip,
+        new.requested_access,
         new.interval_seconds,
         new.expires_at,
     )
@@ -121,7 +128,8 @@ pub async fn find_pending_by_user_code(
         Row,
         r#"
         SELECT id, user_code, status, approved_user_id, approved_session, client_name,
-               client_ip, interval_seconds, last_polled_at, created_at, expires_at
+               client_ip, requested_access, interval_seconds, last_polled_at, created_at,
+               expires_at
         FROM device_authorizations
         WHERE user_code = $1 AND status = 'pending' AND expires_at > NOW()
         "#,
@@ -141,7 +149,8 @@ pub async fn find_by_device_code_hash(
         Row,
         r#"
         SELECT id, user_code, status, approved_user_id, approved_session, client_name,
-               client_ip, interval_seconds, last_polled_at, created_at, expires_at
+               client_ip, requested_access, interval_seconds, last_polled_at, created_at,
+               expires_at
         FROM device_authorizations
         WHERE device_code_hash = $1
         "#,

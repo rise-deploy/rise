@@ -15,5 +15,6 @@ pub(crate) mod redirect;
 pub mod roles;
 pub mod routes;
 pub mod sa_match;
+pub mod session_scope;
 pub mod token_storage;
 pub mod user_identity;

@@ -2,7 +2,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, Method, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose, Engine as _};
 use jsonwebtoken::decode_header;
@@ -12,8 +12,11 @@ use crate::db::{service_accounts, users, User};
 use crate::server::auth::context::{SessionDetails, VerifiedExternalToken};
 use crate::server::auth::cookie_helpers;
 use crate::server::auth::identity::{resolve_identity, ResourcePrincipal};
+use crate::server::auth::session_scope::SessionScope;
 use crate::server::auth::user_identity::TokenStanding;
+use crate::server::error::ServerError;
 use crate::server::state::AppState;
+use rise_backend_auth::session_scope::SessionCeiling;
 use rise_backend_auth::{is_rise_issued_jwt, AccessClaims, PrincipalClaims, RiseToken};
 
 /// Extract Bearer token from Authorization header
@@ -180,6 +183,20 @@ pub async fn auth_middleware(
                             "Database error".to_string(),
                         ));
                     }
+                }
+
+                // A scoped session (ADR-0006) carries its ceiling; one that
+                // doesn't parse is an invalid credential, never full access.
+                if let Some(details) = &claims.authorization_details {
+                    let ceiling = SessionCeiling::parse(details).map_err(|e| {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            "Auth middleware: session ceiling rejected: {e}"
+                        );
+                        (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
+                    })?;
+                    req.extensions_mut()
+                        .insert(SessionScope::new(ceiling, &state.default_organization_name));
                 }
 
                 let email = &claims.email;
@@ -435,6 +452,9 @@ pub async fn optional_auth_middleware(
     next.run(req).await
 }
 
+/// `error_code` of the 403 a user without platform access receives.
+pub const PLATFORM_ACCESS_DENIED: &str = "platform_access_denied";
+
 /// Platform access middleware - blocks non-platform users from API endpoints
 ///
 /// Applied AFTER auth_middleware (which validates JWT and injects User or VerifiedExternalToken).
@@ -525,13 +545,17 @@ pub async fn platform_access_middleware(
             path = %req.uri().path(),
             "Platform access denied for non-platform user"
         );
-        return Err((
-            StatusCode::FORBIDDEN,
+        // A JSON body with a stable code, so clients can tell "no platform
+        // access at all" apart from an ordinary permission error on one
+        // resource (both are 403).
+        return Ok(ServerError::forbidden(
             "You do not have access to Rise platform features. \
              Your account is configured for application access only. \
-             Please contact your administrator if you need platform access."
-                .to_string(),
-        ));
+             Please contact your administrator if you need platform access.",
+        )
+        .with_error_code(PLATFORM_ACCESS_DENIED)
+        .expected()
+        .into_response());
     }
 
     Ok(next.run(req).await)

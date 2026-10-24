@@ -49,6 +49,12 @@ pub struct RiseClaims {
     /// before the claim existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rise_client: Option<SessionClient>,
+    /// The session's Allow ceiling (ADR-0006): `rise.dev/rbac` entries in
+    /// ADR-0001 §7's wire format. Only ever on a CLI session; absent means the
+    /// user's full live access. The verifier checks only where it may appear;
+    /// the server parses and enforces the entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<Vec<serde_json::Value>>,
 }
 
 /// The kind of client a Rise session was issued to.
@@ -78,6 +84,7 @@ impl std::fmt::Debug for RiseClaims {
             .field("rise_uid", &self.rise_uid)
             .field("rise_identity_uid", &self.rise_identity_uid)
             .field("rise_client", &self.rise_client)
+            .field("authorization_details", &self.authorization_details)
             .finish()
     }
 }

@@ -286,35 +286,94 @@ impl DeploymentUrlBuilder {
         hosts
     }
 
+    /// The environment whose `primary_deployment_group` is `deployment_group`.
+    fn environment_for_group<'a>(
+        deployment_group: &str,
+        all_environments: &'a [Environment],
+    ) -> Option<&'a Environment> {
+        all_environments
+            .iter()
+            .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group))
+    }
+
+    /// `environment`'s custom domains that pass [`Self::is_valid_custom_domain`].
+    fn valid_domains_for_environment(
+        &self,
+        environment: Option<&Environment>,
+        custom_domains: &[CustomDomain],
+    ) -> Vec<CustomDomain> {
+        let Some(environment) = environment else {
+            return Vec::new();
+        };
+        custom_domains
+            .iter()
+            .filter(|domain| {
+                domain.environment_id == environment.id && self.is_valid_custom_domain(domain)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The public hosts Traefik routes to `deployment_group`'s active
+    /// deployment: [`Self::primary_ingress_hosts`] with the environment whose
+    /// `primary_deployment_group` is this group, and only that environment's
+    /// valid custom domains — the same per-group scoping as the Kubernetes
+    /// webhook, so a production custom domain never lands on a preview group's
+    /// router. Unlike Kubernetes, there is no fallback host when none applies.
+    pub fn public_hosts_for_group(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+        all_environments: &[Environment],
+        custom_domains: &[CustomDomain],
+    ) -> Vec<String> {
+        let environment = Self::environment_for_group(deployment_group, all_environments);
+        let domains_for_env = self.valid_domains_for_environment(environment, custom_domains);
+        self.primary_ingress_hosts(
+            project,
+            deployment_group,
+            environment,
+            &domains_for_env,
+            true,
+            all_environments,
+        )
+        .into_iter()
+        .map(|host| host.host)
+        .collect()
+    }
+
     pub fn filter_valid_custom_domains(
         &self,
         custom_domains: &[CustomDomain],
     ) -> Vec<CustomDomain> {
         custom_domains
             .iter()
-            .filter(|domain| {
-                match validate_custom_domain(
-                    &domain.domain,
-                    &self.production_ingress_url_template,
-                    self.staging_ingress_url_template.as_deref(),
-                    self.environment_ingress_url_template.as_deref(),
-                    None,
-                ) {
-                    Ok(()) => true,
-                    Err(reason) => {
-                        warn!(
-                            domain_id = %domain.id,
-                            project_id = %domain.project_id,
-                            domain = %domain.domain,
-                            "Ignoring custom domain that conflicts with project default domain pattern: {}",
-                            reason
-                        );
-                        false
-                    }
-                }
-            })
+            .filter(|domain| self.is_valid_custom_domain(domain))
             .cloned()
             .collect()
+    }
+
+    /// Whether `domain` stays clear of the ingress URL templates; logs why not.
+    fn is_valid_custom_domain(&self, domain: &CustomDomain) -> bool {
+        match validate_custom_domain(
+            &domain.domain,
+            &self.production_ingress_url_template,
+            self.staging_ingress_url_template.as_deref(),
+            self.environment_ingress_url_template.as_deref(),
+            None,
+        ) {
+            Ok(()) => true,
+            Err(reason) => {
+                warn!(
+                    domain_id = %domain.id,
+                    project_id = %domain.project_id,
+                    domain = %domain.domain,
+                    "Ignoring custom domain that conflicts with project default domain pattern: {}",
+                    reason
+                );
+                false
+            }
+        }
     }
 
     // ── Deployment URLs ────────────────────────────────────────────────
@@ -352,9 +411,7 @@ impl DeploymentUrlBuilder {
         all_environments: &[Environment],
         custom_domains: &[CustomDomain],
     ) -> DeploymentUrls {
-        let environment = all_environments
-            .iter()
-            .find(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
+        let environment = Self::environment_for_group(deployment_group, all_environments);
         self.compute_urls_for_group(
             project,
             deployment_group,
@@ -386,12 +443,8 @@ impl DeploymentUrlBuilder {
             })
         });
 
-        let valid_custom_domains = self.filter_valid_custom_domains(custom_domains);
-        let env_id = environment_for_group.map(|e| e.id);
-        let domains_for_env: Vec<&CustomDomain> = valid_custom_domains
-            .iter()
-            .filter(|cd| env_id == Some(cd.environment_id))
-            .collect();
+        let domains_for_env =
+            self.valid_domains_for_environment(environment_for_group, custom_domains);
 
         let starred = domains_for_env.iter().find(|d| d.is_primary);
         let primary_url = if let Some(starred) = starred {
@@ -457,5 +510,46 @@ impl DeploymentUrlBuilder {
                 ImageTagType::Internal,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_helpers::{custom_domain, environment, project, url_builder};
+
+    #[test]
+    fn public_hosts_scope_custom_domains_to_the_groups_environment() {
+        let builder = url_builder();
+        let project = project("docs-app", "private");
+        let production = environment(&project, "production", Some("default"));
+        let staging = environment(&project, "staging", Some("main"));
+        let environments = vec![production.clone(), staging.clone()];
+        let domains = vec![
+            custom_domain(&production, "docs.customer.com"),
+            // Matches the production template: stale, never routed.
+            custom_domain(&production, "other-app.example.test"),
+            custom_domain(&staging, "staging.customer.com"),
+        ];
+
+        assert_eq!(
+            builder.public_hosts_for_group(&project, "default", &environments, &domains),
+            vec![
+                "docs-app-default.preview.example.test",
+                "docs-app.example.test",
+                "docs.customer.com",
+            ]
+        );
+        assert_eq!(
+            builder.public_hosts_for_group(&project, "main", &environments, &domains),
+            vec![
+                "docs-app-main.preview.example.test",
+                "docs-app-staging.example.test",
+                "staging.customer.com",
+            ]
+        );
+        assert_eq!(
+            builder.public_hosts_for_group(&project, "pr/123", &environments, &domains),
+            vec!["docs-app-pr--123.preview.example.test"]
+        );
     }
 }

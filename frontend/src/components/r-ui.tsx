@@ -3,25 +3,81 @@ import { createPortal } from 'react-dom';
 import { isSafeUrl } from '../lib/utils';
 import { navigate } from '../lib/navigation';
 import { Icon } from './icon';
+import { useCurrentProject } from '../lib/project-context';
 
 export function cx(...parts: Array<string | false | null | undefined>) {
     return parts.filter(Boolean).join(' ');
 }
 
 // ---------- Status ----------
-export function Status({ status, bare = false, tooltip, title }: { status: string; bare?: boolean; tooltip?: React.ReactNode; title?: string }) {
+export function Status({ status, label, bare = false, tooltip, title }: { status: string; label?: string; bare?: boolean; tooltip?: React.ReactNode; title?: string }) {
     const key = (status || '').toLowerCase();
     const node = (
         <span className={cx('r-status', key, bare && 'bare')} title={tooltip ? undefined : title}>
             <span className="dot" />
-            <span>{status}</span>
+            <span>{label ?? status}</span>
         </span>
     );
     return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
 }
 
+const OK_STATUSES = new Set(['healthy', 'running', 'ok', 'available', 'active']);
+const ERR_STATUSES = new Set(['unhealthy', 'failed', 'error', 'bad']);
+const PROGRESS_STATUSES = new Set([
+    'pending', 'building', 'pushing', 'pushed', 'deploying', 'queued',
+    'creating', 'provisioning', 'updating', 'cancelling',
+]);
+
+export type StatusTone = 'tone-ok' | 'tone-err' | 'tone-progress' | 'tone-muted';
+
+/**
+ * Collapse a project, deployment or extension status onto the four tones the
+ * UI colours by: healthy, failing, in progress, and inactive.
+ */
+export function statusTone(status?: string | null): StatusTone {
+    const key = (status || '').toLowerCase();
+    if (OK_STATUSES.has(key)) return 'tone-ok';
+    if (ERR_STATUSES.has(key)) return 'tone-err';
+    if (PROGRESS_STATUSES.has(key)) return 'tone-progress';
+    return 'tone-muted';
+}
+
+/**
+ * A project owner: a team (people icon + team name) or a user (person icon +
+ * email). Every place an owner is shown uses this so the two read the same.
+ */
+export function OwnerLabel({ owner, size = 12, link = false }: { owner?: { email?: string; name?: string } | null; size?: number; link?: boolean }) {
+    if (!owner || (!owner.email && !owner.name)) return <span style={{ color: 'var(--text-soft)' }}>—</span>;
+    const isTeam = !owner.email && !!owner.name;
+    const label = owner.email || owner.name;
+    const content = (
+        <>
+            <Icon name={isTeam ? 'users' : 'user'} size={size} />
+            <span className="r-owner-name">{label}</span>
+        </>
+    );
+    if (isTeam && link) {
+        const href = `/team/${owner.name}`;
+        return (
+            <a
+                className="r-owner r-link"
+                href={href}
+                onClick={(e) => {
+                    e.stopPropagation();
+                    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+                    e.preventDefault();
+                    navigate(href);
+                }}
+            >
+                {content}
+            </a>
+        );
+    }
+    return <span className="r-owner">{content}</span>;
+}
+
 // ---------- Pill ----------
-export function Pill({ children, kind, className, tooltip, title }: { children: React.ReactNode; kind?: 'env-prod' | 'env-staging' | 'env-global' | 'accent'; className?: string; tooltip?: React.ReactNode; title?: string }) {
+export function Pill({ children, kind, className, tooltip, title }: { children: React.ReactNode; kind?: 'accent'; className?: string; tooltip?: React.ReactNode; title?: string }) {
     const node = <span className={cx('r-pill', kind, className)} title={tooltip ? undefined : title}>{children}</span>;
     return tooltip ? <Tooltip content={tooltip}>{node}</Tooltip> : node;
 }
@@ -137,6 +193,24 @@ export const ENV_COLOR_STYLES: Record<string, { color: string; borderColor: stri
 };
 
 const ENV_COLORS = Object.keys(ENV_COLOR_STYLES);
+
+/**
+ * Compact environment chip for dense rows (deployment lists, pickers): the
+ * environment's colour as a layer glyph, accent-tinted for production. Colour
+ * and production flag come from the current project unless passed in.
+ */
+export function EnvTag({ env, color, production }: { env: string; color?: string; production?: boolean }) {
+    const project = useCurrentProject();
+    const known = project?.environments.find(e => e.name === env);
+    const isProd = production ?? known?.is_production ?? env === 'production';
+    const tint = color ?? known?.color;
+    return (
+        <span className={cx('r-env-tag', isProd && 'prod')}>
+            {tint && <EnvironmentIcon color={tint} size={10} />}
+            {env}
+        </span>
+    );
+}
 
 // Visually represents an environment with a layer-stack glyph tinted with the
 // environment's color. Ported from legacy `ui.tsx`; accepts the same loose size
@@ -843,11 +917,11 @@ export function Select(props: {
 }
 
 // ---------- SearchInput ----------
-export function SearchInput({ value, onChange, placeholder, style }: { value: string; onChange: (v: string) => void; placeholder?: string; style?: React.CSSProperties }) {
+export function SearchInput({ value, onChange, placeholder, style, label }: { value: string; onChange: (v: string) => void; placeholder?: string; style?: React.CSSProperties; label?: string }) {
     return (
         <div className="r-input" style={style}>
             <Icon name="search" size={13} />
-            <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} />
+            <input type="search" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} aria-label={label ?? placeholder ?? 'Search'} />
         </div>
     );
 }

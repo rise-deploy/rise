@@ -21,6 +21,7 @@ use crate::db::device_authorizations::{
 };
 use crate::db::User;
 use crate::server::auth::context::{AuthContext, SessionDetails};
+use crate::server::auth::session_scope::compile_grant;
 use crate::server::auth::user_identity::{SessionRejection, UserLogins, UserPrincipal};
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
@@ -32,6 +33,7 @@ use axum::{
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use rand::{Rng, RngExt};
+use rise_backend_auth::session_scope::AccessRequest;
 use rise_backend_auth::{RiseTokenSigner, SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -120,6 +122,9 @@ struct ApprovedSession {
     email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    /// The ceiling the approver granted (ADR-0006); `None` is full access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_details: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +176,8 @@ pub struct DeviceLookupResponse {
     pub client_ip: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// What the login asks for. The approver may change it.
+    pub requested_access: AccessRequest,
     /// The caller's session may not approve: it is too old, or predates
     /// identity-bound sessions. Sign in again, then approve.
     pub reauth_required: bool,
@@ -195,12 +202,15 @@ impl<'a> DeviceFlow<'a> {
     }
 
     /// Start a device login. `client_name` and `client_ip` are only displayed
-    /// on the confirmation page.
+    /// on the confirmation page; `access` is the requester's proposal, already
+    /// validated.
     pub async fn start(
         &self,
         client_name: Option<&str>,
         client_ip: Option<&str>,
+        access: Option<&AccessRequest>,
     ) -> anyhow::Result<StartedDeviceLogin> {
+        let requested_access = access.map(serde_json::to_value).transpose()?;
         let device_code = generate_device_code();
         let device_code_hash = hash_device_code(&device_code);
         let expires_at = Utc::now() + DEVICE_CODE_TTL;
@@ -216,6 +226,7 @@ impl<'a> DeviceFlow<'a> {
                     user_code: &user_code,
                     client_name: client_name.as_deref(),
                     client_ip,
+                    requested_access: requested_access.as_ref(),
                     interval_seconds: POLL_INTERVAL.as_secs() as i32,
                     expires_at,
                 },
@@ -369,6 +380,7 @@ impl<'a> DeviceFlow<'a> {
             rise_uid: approved.rise_uid,
             identity_uid: approved.identity_uid,
             client: SessionClient::Cli,
+            authorization_details: approved.authorization_details.clone(),
         };
         match self
             .signer
@@ -418,17 +430,27 @@ impl<'a> DeviceFlow<'a> {
             client_ip: row.client_ip,
             created_at: row.created_at,
             expires_at: row.expires_at,
+            // A row without a request predates them and asked for everything;
+            // an unreadable one is shown as such, never silently widened.
+            requested_access: match row.requested_access {
+                None => AccessRequest::Full,
+                Some(value) => serde_json::from_value(value)
+                    .internal_err("Device login carries an unreadable access request")?,
+            },
             reauth_required: principal.is_none() || approving_session(details).is_none(),
         })
     }
 
-    /// Approve a pending device login for the caller's session.
+    /// Approve a pending device login for the caller's session, granting the
+    /// ceiling `authorization_details` (`None` for full access), which the
+    /// caller compiled against the approver's own access.
     pub async fn approve(
         &self,
         user: &User,
         principal: Option<&UserPrincipal>,
         details: Option<&SessionDetails>,
         user_code: &str,
+        authorization_details: Option<Vec<serde_json::Value>>,
     ) -> Result<(), ServerError> {
         let user_code = parse_user_code(user_code)?;
         let (Some(principal), Some(details)) = (principal, approving_session(details)) else {
@@ -444,6 +466,7 @@ impl<'a> DeviceFlow<'a> {
             identity_uid: details.identity_uid,
             email: user.email.clone(),
             name: details.name.clone(),
+            authorization_details,
         })
         .internal_err("Failed to record device login approval")?;
         let approved = device_authorizations::approve(self.pool, &user_code, user.id, &session)
@@ -522,6 +545,10 @@ pub async fn lookup(
 #[derive(Debug, Deserialize)]
 pub struct DeviceDecisionRequest {
     pub user_code: String,
+    /// What an approval grants. Required to approve: the page sends exactly
+    /// what it displayed, so a missing field never means full access.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 /// Approve a device login for the caller (`POST /auth/device/approve`).
@@ -534,8 +561,27 @@ pub async fn approve(
 ) -> Result<StatusCode, ServerError> {
     let user = auth.user()?;
     let details = details.as_ref().map(|Extension(details)| details);
+    // Whether this session may approve at all comes first: a CLI session is
+    // told so, not asked to fix its request.
+    if auth.user_principal().is_none() || approving_session(details).is_none() {
+        return Err(ServerError::unauthorized(
+            "Sign in again to approve this device login",
+        ));
+    }
+    let access = payload.access.as_ref().ok_or_else(|| {
+        ServerError::bad_request(
+            "An approval must state the access it grants: `{\"kind\": \"full\"}` or the grants",
+        )
+    })?;
+    let authorization_details = compile_grant(&state, user, access).await?;
     DeviceFlow::new(&state)
-        .approve(user, auth.user_principal(), details, &payload.user_code)
+        .approve(
+            user,
+            auth.user_principal(),
+            details,
+            &payload.user_code,
+            authorization_details,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -752,13 +798,67 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn the_request_is_shown_and_the_approved_ceiling_is_minted(pool: PgPool) {
+        let fx = Fixture::new(pool).await;
+        let flow = fx.flow();
+        let (user, identity) = fx.sign_in("subject-1", "ada@example.com").await;
+        let details = session_details(&identity, now());
+
+        // Without a request, the login asks for full access.
+        let full = flow.start(None, None, None).await.unwrap();
+        let shown = flow
+            .lookup(Some(&identity.principal), Some(&details), &full.user_code)
+            .await
+            .unwrap();
+        assert_eq!(shown.requested_access, AccessRequest::Full);
+
+        let requested: AccessRequest = serde_json::from_value(serde_json::json!({
+            "kind": "restricted",
+            "grants": [{"project": "app", "environment": "staging", "preset": "deploy"}],
+        }))
+        .unwrap();
+        let started = flow.start(None, None, Some(&requested)).await.unwrap();
+        let shown = flow
+            .lookup(
+                Some(&identity.principal),
+                Some(&details),
+                &started.user_code,
+            )
+            .await
+            .unwrap();
+        assert_eq!(shown.requested_access, requested);
+
+        // The approver decides; what they grant is what the session carries.
+        let granted = vec![serde_json::json!({"type": "rise.dev/rbac", "scope": "x"})];
+        flow.approve(
+            &user,
+            Some(&identity.principal),
+            Some(&details),
+            &started.user_code,
+            Some(granted.clone()),
+        )
+        .await
+        .unwrap();
+        let token = flow
+            .exchange(&started.device_code)
+            .await
+            .token
+            .expect("a session after approval");
+        let claims = fx.signer.verify_user_jwt(&token, RISE_URL).unwrap();
+        assert_eq!(claims.authorization_details, Some(granted));
+    }
+
+    #[sqlx::test]
     async fn an_approved_login_yields_one_session_for_the_approvers_identity(pool: PgPool) {
         let fx = Fixture::new(pool).await;
         let flow = fx.flow();
         let (user, identity) = fx.sign_in("subject-1", "ada@example.com").await;
         let details = session_details(&identity, now());
 
-        let started = flow.start(Some("laptop"), Some("10.0.0.1")).await.unwrap();
+        let started = flow
+            .start(Some("laptop"), Some("10.0.0.1"), None)
+            .await
+            .unwrap();
         assert_eq!(
             started.verification_uri_complete,
             format!("{RISE_URL}/device?user_code={}", started.user_code)
@@ -777,9 +877,15 @@ mod tests {
         assert_eq!(request.client_ip.as_deref(), Some("10.0.0.1"));
         assert!(!request.reauth_required);
 
-        flow.approve(&user, Some(&identity.principal), Some(&details), &typed)
-            .await
-            .unwrap();
+        flow.approve(
+            &user,
+            Some(&identity.principal),
+            Some(&details),
+            &typed,
+            None,
+        )
+        .await
+        .unwrap();
         let redeemed = flow.exchange(&started.device_code).await;
         let token = redeemed.token.expect("a session after approval");
         let claims = fx.signer.verify_user_jwt(&token, RISE_URL).unwrap();
@@ -789,6 +895,7 @@ mod tests {
         assert_eq!(claims.email, "ada@example.com");
         assert_eq!(claims.name.as_deref(), Some("Ada"));
         assert_eq!(claims.rise_client, Some(SessionClient::Cli));
+        assert_eq!(claims.authorization_details, None);
 
         let again = flow.exchange(&started.device_code).await;
         assert_eq!(error_of(&again), Some("expired_token"));
@@ -796,7 +903,7 @@ mod tests {
 
         // The brand-new device session cannot approve its own successor: it
         // is a CLI session, however fresh.
-        let next = flow.start(None, None).await.unwrap();
+        let next = flow.start(None, None, None).await.unwrap();
         let device_session = SessionDetails {
             identity_uid: claims.rise_identity_uid.unwrap(),
             name: claims.name.clone(),
@@ -818,6 +925,7 @@ mod tests {
                 Some(&identity.principal),
                 Some(&device_session),
                 &next.user_code,
+                None,
             )
             .await
             .unwrap_err();
@@ -832,7 +940,7 @@ mod tests {
         let flow = fx.flow();
         let (user, _) = fx.sign_in("subject-1", "ada@example.com").await;
 
-        let started = flow.start(None, None).await.unwrap();
+        let started = flow.start(None, None, None).await.unwrap();
         flow.deny(&user, &started.user_code).await.unwrap();
         let denied = flow.exchange(&started.device_code).await;
         assert_eq!(error_of(&denied), Some("access_denied"));
@@ -848,7 +956,7 @@ mod tests {
         let fx = Fixture::new(pool).await;
         let flow = fx.flow();
         let (user, identity) = fx.sign_in("subject-1", "ada@example.com").await;
-        let started = flow.start(None, None).await.unwrap();
+        let started = flow.start(None, None, None).await.unwrap();
         let code = &started.user_code;
 
         let stale = session_details(&identity, now() - APPROVAL_MAX_SESSION_AGE.as_secs() - 60);
@@ -858,7 +966,7 @@ mod tests {
             .unwrap();
         assert!(request.reauth_required);
         let err = flow
-            .approve(&user, Some(&identity.principal), Some(&stale), code)
+            .approve(&user, Some(&identity.principal), Some(&stale), code, None)
             .await
             .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
@@ -874,7 +982,7 @@ mod tests {
             .unwrap();
         assert!(request.reauth_required);
         let err = flow
-            .approve(&user, Some(&identity.principal), Some(&cli), code)
+            .approve(&user, Some(&identity.principal), Some(&cli), code, None)
             .await
             .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
@@ -882,7 +990,10 @@ mod tests {
         // A legacy session names no User or identity.
         let request = flow.lookup(None, None, code).await.unwrap();
         assert!(request.reauth_required);
-        let err = flow.approve(&user, None, None, code).await.unwrap_err();
+        let err = flow
+            .approve(&user, None, None, code, None)
+            .await
+            .unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
 
         // Neither refusal consumed the code.
@@ -896,12 +1007,13 @@ mod tests {
         let flow = fx.flow();
         let (user, identity) = fx.sign_in("subject-1", "ada@example.com").await;
         let details = session_details(&identity, now());
-        let started = flow.start(None, None).await.unwrap();
+        let started = flow.start(None, None, None).await.unwrap();
         flow.approve(
             &user,
             Some(&identity.principal),
             Some(&details),
             &started.user_code,
+            None,
         )
         .await
         .unwrap();
@@ -916,7 +1028,7 @@ mod tests {
     async fn polling_faster_than_the_interval_slows_the_client_down(pool: PgPool) {
         let fx = Fixture::new(pool).await;
         let flow = fx.flow();
-        let started = flow.start(None, None).await.unwrap();
+        let started = flow.start(None, None, None).await.unwrap();
 
         let first = flow.exchange(&started.device_code).await;
         assert_eq!(error_of(&first), Some("authorization_pending"));
@@ -944,7 +1056,7 @@ mod tests {
         let flow = fx.flow();
         let (user, identity) = fx.sign_in("subject-1", "ada@example.com").await;
         let details = session_details(&identity, now());
-        let started = flow.start(None, None).await.unwrap();
+        let started = flow.start(None, None, None).await.unwrap();
         sqlx::query(
             "UPDATE device_authorizations SET expires_at = NOW() - INTERVAL '1 second' \
              WHERE user_code = $1",
@@ -960,6 +1072,7 @@ mod tests {
                 Some(&identity.principal),
                 Some(&details),
                 &started.user_code,
+                None,
             )
             .await
             .unwrap_err();

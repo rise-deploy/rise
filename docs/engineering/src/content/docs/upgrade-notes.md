@@ -31,6 +31,31 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Every deployment belongs to an environment.** *Action required.* A
+  migration makes `deployments.environment_id` required. Deployments without
+  one (from before environments existed, or left behind by a deleted
+  environment) are assigned to the environment whose primary group they ran
+  in, else to `production`, else to the project's oldest environment; a project
+  with no environments gets `production` first. Deleting an environment now
+  deletes its deployments and their history, and the API refuses with `409`
+  while any of them is not stopped. Before upgrading, stop the deployments of
+  environments you plan to delete if you want that history gone, and expect
+  environment-less deployments to show up under an environment afterwards.
+  The workload identity `sub` no longer carries `env:<null>`.
+
+- **Docker/ECS route every active deployment group, each on its own hosts.**
+  *Action required.* The Traefik HTTP-provider snapshot used to route only the
+  newest active deployment group of each project, so production and older
+  previews returned Traefik's `404 page not found` (#548). Every group is now
+  routed. A custom domain is attached only to the router of its environment's
+  primary deployment group, never to preview groups, and domains that match an
+  ingress URL template are no longer routed. Kubernetes already behaved this
+  way. Before upgrading, look for `Ignoring custom domain that conflicts with
+  project default domain pattern` warnings: those domains stop being served on
+  Docker/ECS. A deployment whose stored container/route data does not decode
+  now fails the whole snapshot, and Traefik keeps its last good config until the
+  row is fixed.
+
 - **CLI browser login requires numeric IPv4 loopback callbacks.** *Breaking.*
   The CLI listens and redirects on `127.0.0.1`, trying ports 8765, 8766, then
   8767. Before upgrading the CLI, register these exact URLs on the identity

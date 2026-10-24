@@ -196,6 +196,7 @@ cargo build --all-features     # Full build with CLI + backend
 
 3. **CLI Implementation** (`--features cli`, default) ✅
    - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
+   - [x] Scoped logins (`rise login --scope <project>[/<env>]=<preset>`): sessions narrowed to projects/environments, enforced on the typed API (ADR-0006)
    - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`
@@ -345,11 +346,14 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 | Component | Style | Purpose |
 |---|---|---|
 | **`Status`** (from `r-ui`) | Dot + label | Deployment/project lifecycle status (Running, Failed, Stopped, …) |
-| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels via `kind="accent"`, env labels via `kind="env-*"` |
+| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels (`kind="accent"`); environments use `EnvPill` |
 | **`BasePill`** (from `r-ui`) | Icon + name pill | Generic two-cell pill — building block for `EnvPill` / `GroupPill` |
 | **`EnvPill`** (from `r-ui`) | Color dot + env name | Environment chip; pairs with `EnvironmentColorDot` |
 | **`GroupPill`** (from `r-ui`) | Layer glyph + group name | Group chip |
 | **`EnvironmentColorDot`** (from `r-ui`) | Tinted layer glyph | Placed next to environment names to indicate color |
+| **`OwnerLabel`** (from `r-ui`) | People/person icon + name | Every project owner — teams always carry the people icon |
+
+Statuses are coloured by `statusTone` (healthy / failing / in progress / inactive); use it for bare status dots so they agree with `Status` badges.
 
 ### Before Commit & Push
 

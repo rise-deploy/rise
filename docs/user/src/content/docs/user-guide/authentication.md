@@ -49,6 +49,46 @@ poll.
 - Codes expire after 10 minutes and work once. Only approve a code you requested
   yourself — approving signs that terminal in as you.
 
+### Restricting a Login
+
+A login has your full access by default. Add `--scope` to restrict it to a
+project or one of its environments, for example before handing the CLI to a
+coding agent:
+
+```bash
+rise login --device --scope my-app/staging=deploy
+rise login --scope my-app=read --scope my-app/staging=develop
+```
+
+Each `--scope` is `<project>[/<environment>]=<access>`, where access is a preset
+or a comma-separated list of permissions:
+
+| Preset | Permissions | On |
+|---|---|---|
+| `read` | `view` | project, environment |
+| `deploy` | `view`, `logs`, `deploy` | project, environment |
+| `develop` | `view`, `logs`, `deploy`, `env-vars` | project, environment |
+| `admin` | all of them | project |
+
+The permissions are `view`, `logs`, `deploy`, `env-vars`, `secrets` (read
+retrievable secret values), and the project-only `configure` (environments,
+domains, extensions, app users), `service-accounts` and `project-admin` (rename,
+re-own, change access class, delete). An environment grant reaches that
+environment, its deployments and its own env vars. It never reaches the
+project's other environments, project-wide env vars, or settings that would let
+it redirect another environment's deployments.
+
+- With `--device`, the scope is a request: the approval page shows it, and the
+  person approving can narrow it, widen it, or grant full access. The CLI prints
+  the access it was actually granted.
+- A restricted login can't create projects, manage teams, or use the resource
+  API. Admins' restricted logins are restricted too.
+- `--full-access` asks for full access explicitly; it's the same as no `--scope`.
+- A restricted login replaces the stored token for that Rise URL, including a
+  full-access one. The CLI says so first.
+- A `deploy` grant can reach secrets in practice: a deployment can print its own
+  environment.
+
 ### Token Storage
 
 Tokens are stored as private JSON files under `~/.config/rise/credentials/`, with
