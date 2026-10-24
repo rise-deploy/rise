@@ -33,7 +33,8 @@ export const PROJECT_SECTIONS: ProjectSectionInfo[] = [
 ];
 
 /** Sections shown directly in the mobile tab bar; the rest live under "More". */
-export const MOBILE_PRIMARY_SECTIONS: ProjectSection[] = ['overview', 'deployments', 'environments', 'variables'];
+// Logs is where a failed deploy is diagnosed, so it gets a tab; Variables moves to More.
+export const MOBILE_PRIMARY_SECTIONS: ProjectSection[] = ['overview', 'deployments', 'environments', 'logs'];
 
 // Paths that predate the current section names keep working.
 const SECTION_ALIASES: Record<string, ProjectSection> = {

@@ -70,3 +70,46 @@ pub struct EnvVarsResponse {
 pub struct EnvVarValueResponse {
     pub value: String,
 }
+
+/// How a variable differs between a deployment's snapshot and what a new
+/// deployment would get now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvVarChange {
+    Added,
+    Removed,
+    Changed,
+    Unchanged,
+    /// Present on both sides but not comparable for this caller: a secret it
+    /// may not read, or one that could not be decrypted.
+    Unknown,
+}
+
+/// One variable in a snapshot-versus-now comparison. Values are included only
+/// for plain variables; a secret's entry says whether it changed, never what
+/// it is.
+#[derive(Debug, Serialize)]
+pub struct EnvVarDiffEntry {
+    pub key: String,
+    pub change: EnvVarChange,
+    pub is_secret: bool,
+    pub is_protected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Where the value comes from on each side: `global`, `env:<name>`,
+    /// `toml` or `cli`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_source: Option<String>,
+}
+
+/// Response for comparing a deployment's variables with the current ones
+#[derive(Debug, Serialize)]
+pub struct EnvVarDiffResponse {
+    /// The environment the comparison was made against (`None` = Global only).
+    pub environment: Option<String>,
+    pub changes: Vec<EnvVarDiffEntry>,
+}

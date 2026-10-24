@@ -14,11 +14,13 @@ import { LogConsole } from './logs/log-console';
 import { ContainerStatusPanel } from './logs/container-status';
 import { EventTimeline } from './logs/event-timeline';
 import { fetchDeploymentEvents, type DeploymentEvent } from './logs/api';
-import { useCurrentProject, type Deployment } from '../lib/project-context';
+import { useCurrentProject, type Deployment, type Environment } from '../lib/project-context';
+import { deploymentPath } from '../lib/routes';
 import { useDeployActions } from '../components/deploy-actions';
 import { byNewest, deploymentSource, isInProgress, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
 import { DeploymentMetaStrip, FailurePanel, RolloutPanel, rolloutEnd, rolloutSteps, useDeploymentEvents } from './deployment-diagnosis';
 import { useIsMobile } from '../lib/use-media';
+import { DeploymentSource } from '../components/deployment-source';
 
 // ── CPU / memory parsing helpers for the multi-container resource breakdown ──
 // CPU is stored as the same string K8s accepts (`"500m"`, `"1"`, `"1.5"`).
@@ -134,6 +136,60 @@ function aggregateContainerResources(
 }
 
 
+/**
+ * What stopping a deployment does, in words: cancel a rollout, take an
+ * environment's URL down, or end a preview.
+ */
+function stopConsequence(d: Deployment | null | undefined, environments: Environment[]): { title: string; message: string; confirm: string } {
+    if (!d) return { title: 'Stop deployment?', message: '', confirm: 'Stop deployment' };
+    const id = d.deployment_id;
+    const env = environments.find(e => e.name === d.environment);
+    const url = d.primary_url ? d.primary_url.replace(/^https?:\/\//, '') : null;
+    if (isInProgress(d.status)) {
+        return {
+            title: `Cancel ${id}?`,
+            message: `Cancels this rollout. Whatever ${d.environment || 'the group'} serves now keeps serving.`,
+            confirm: 'Cancel rollout',
+        };
+    }
+    if (d.is_active && env && (env.primary_deployment_group || 'default') === d.deployment_group) {
+        return {
+            title: `Stop ${env.name}?`,
+            message: `${id} is what ${env.name} serves. Stopping it takes ${url ?? `the ${env.name} URL`} offline until you deploy again.`,
+            confirm: `Stop ${env.name}`,
+        };
+    }
+    if (d.is_active) {
+        return {
+            title: `Stop ${d.deployment_group}?`,
+            message: `${id} serves the ${d.deployment_group} group${url ? ` at ${url}` : ''}. Stopping it takes that address offline.`,
+            confirm: 'Stop deployment',
+        };
+    }
+    return { title: `Stop ${id}?`, message: `Stops ${id}.`, confirm: 'Stop deployment' };
+}
+
+/**
+ * A row's primary cell links to what the row opens, so keyboards and
+ * middle-clicks reach it; a plain click navigates in place like the row.
+ */
+export function rowLinkClick(go: () => void) {
+    return (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        e.preventDefault();
+        go();
+    };
+}
+
+/** Status names each status filter asks the server for; absent = no filter. */
+const STATUS_FILTERS: Record<string, string[] | undefined> = {
+    active: ['Pending', 'Building', 'Pushing', 'Pushed', 'Deploying', 'Healthy', 'Unhealthy', 'Cancelling', 'Terminating'],
+    healthy: ['Healthy'],
+    unhealthy: ['Unhealthy'],
+    failed: ['Failed'],
+};
+
 export function DeploymentsList({ projectName }: { projectName: string }) {
     const [deployments, setDeployments] = useState<Deployment[]>([]);
     const [loading, setLoading] = useState(true);
@@ -142,6 +198,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     const page = Math.max(0, Number.parseInt(pageParam || '0', 10) || 0);
     const setPage = (value: number) => setPageParam(value > 0 ? String(value) : null);
     const [hasMore, setHasMore] = useState(true);
+    const [total, setTotal] = useState<number | null>(null);
     const [groupParam, setGroupFilter] = useQueryParam('group');
     const groupFilter = groupParam || '';
     const [deploymentGroups, setDeploymentGroups] = useState<string[]>([]);
@@ -151,9 +208,16 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     const envFilter = envParam || '';
     const [statusParam, setStatusParam] = useQueryParam('status');
     const statusFilter = statusParam || 'all';
-    const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
-    const [searchParam, setSearch] = useQueryParam('search');
+    const setStatusFilter = (v: string) => { setStatusParam(v === 'all' ? null : v); setPage(0); };
+    const [searchParam, setSearchParam] = useQueryParam('search');
     const search = searchParam || '';
+    const setSearch = (v: string) => { setSearchParam(v || null); setPage(0); };
+    // The server does the filtering; wait for a pause in typing before asking.
+    const [query, setQuery] = useState(search);
+    useEffect(() => {
+        const t = window.setTimeout(() => setQuery(search.trim()), 300);
+        return () => window.clearTimeout(t);
+    }, [search]);
     const [deploymentToStop, setDeploymentToStop] = useState<Deployment | null>(null);
     const [stopping, setStopping] = useState(false);
     const { request } = useDeployActions();
@@ -169,21 +233,27 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
 
     const loadDeployments = useCallback(async () => {
         try {
-            const params: { limit: number; offset: number; group?: string } = {
+            const params: Record<string, string | number> = {
                 limit: pageSize,
                 offset: page * pageSize,
             };
             if (groupFilter) params.group = groupFilter;
-            const data: Deployment[] = await api.getProjectDeployments(projectName, params);
-            setDeployments(data);
-            setHasMore(data.length >= pageSize);
+            if (envFilter) params.environment = envFilter;
+            const statuses = STATUS_FILTERS[statusFilter];
+            if (statuses) params.status = statuses.join(',');
+            if (query) params.q = query;
+            const { items, total }: { items: Deployment[]; total: number | null } =
+                await api.getProjectDeploymentsPage(projectName, params);
+            setDeployments(items);
+            setTotal(total);
+            setHasMore(total !== null ? (page + 1) * pageSize < total : items.length >= pageSize);
             setError(null);
         } catch (err) {
             setError((err as Error).message);
         } finally {
             setLoading(false);
         }
-    }, [projectName, page, groupFilter]);
+    }, [projectName, page, groupFilter, envFilter, statusFilter, query]);
 
     useEffect(() => { loadDeployments(); }, [loadDeployments]);
     useEffect(() => {
@@ -223,20 +293,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     if (loading && deployments.length === 0) return <LoadingState label="Loading deployments..." />;
     if (error && deployments.length === 0) return <ErrorState message={`Error loading deployments: ${error}`} onRetry={loadDeployments} />;
 
-    const matchesStatus = (d: Deployment) => {
-        switch (statusFilter) {
-            case 'active': return !isTerminal(d.status);
-            case 'healthy': return d.status === 'Healthy';
-            case 'unhealthy': return d.status === 'Unhealthy';
-            case 'failed': return d.status === 'Failed';
-            default: return true;
-        }
-    };
-    const q = search.trim().toLowerCase();
-    const filtered = sorted
-        .filter(d => !envFilter || d.environment === envFilter)
-        .filter(matchesStatus)
-        .filter(d => !q || `${d.deployment_id} ${d.image || ''} ${d.created_by_email || ''} ${d.deployment_group}`.toLowerCase().includes(q));
+    const filtered = sorted;
 
     const actionFor = (d: Deployment): React.ReactNode => {
         if (!d.can_rollback) return null;
@@ -258,9 +315,9 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     };
 
     const stopFor = (d: Deployment): React.ReactNode => isTerminal(d.status) ? null : (
-        <button type="button" className="r-icon-btn r-row-stop" title="Stop deployment" aria-label={`Stop ${d.deployment_id}`}
+        <button type="button" className="r-row-action r-row-stop" aria-label={`${isInProgress(d.status) ? 'Cancel' : 'Stop'} ${d.deployment_id}`}
             onClick={(e) => { e.stopPropagation(); setDeploymentToStop(d); }}>
-            <Icon name="stop" size={12} />
+            {isInProgress(d.status) ? 'Cancel' : 'Stop'}
         </button>
     );
 
@@ -319,7 +376,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                                 {groupFor(d)}
                                 <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                             </div>
-                            <div className="r-card-title">{deploymentSource(d)}</div>
+                            <div className="r-card-title"><DeploymentSource d={d} projectName={projectName} /></div>
                             <div className="r-card-meta"><span className="mono">{d.deployment_id}</span> · {d.created_by_email}</div>
                             {(actionFor(d) || stopFor(d)) && <div className="r-card-actions">{actionFor(d)}{stopFor(d)}</div>}
                         </div>
@@ -342,12 +399,14 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                             {filtered.map(d => (
                                 <tr key={d.deployment_id} className="click" onClick={() => open(d)}>
                                     <td><Status status={d.status} /></td>
-                                    <td className="mono r-nowrap" style={{ fontSize: 12 }}>{d.deployment_id}</td>
+                                    <td className="mono r-nowrap" style={{ fontSize: 12 }}>
+                                        <a className="r-row-link" href={deploymentPath(projectName, d.deployment_id)} onClick={rowLinkClick(() => open(d))}>{d.deployment_id}</a>
+                                    </td>
                                     <td>
-                                        <div className="r-cell-main">{deploymentSource(d)}</div>
+                                        <div className="r-cell-main"><DeploymentSource d={d} projectName={projectName} /></div>
                                         <div className="r-cell-sub">
                                             {[d.created_by_email, durationNote(d)].filter(Boolean).join(' · ')}
-                                            {d.expires_at && <span title={formatISO8601(d.expires_at)}> · expires in {formatTimeRemaining(d.expires_at)}</span>}
+                                            {d.expires_at && <span title={formatISO8601(d.expires_at)}> · expires {formatTimeRemaining(d.expires_at)}</span>}
                                         </div>
                                     </td>
                                     <td>
@@ -370,7 +429,11 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
             {(page > 0 || hasMore) && (
                 <div className="r-pager">
                     <RButton size="sm" onClick={() => setPage(page - 1)} disabled={page === 0} icon="chevl">Newer</RButton>
-                    <span>Page {page + 1}</span>
+                    <span>
+                        {total !== null && filtered.length > 0
+                            ? `${page * pageSize + 1}–${page * pageSize + filtered.length} of ${total}`
+                            : `Page ${page + 1}`}
+                    </span>
                     <RButton size="sm" onClick={() => setPage(page + 1)} disabled={!hasMore}>Older</RButton>
                 </div>
             )}
@@ -379,9 +442,9 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                 isOpen={!!deploymentToStop}
                 onClose={() => setDeploymentToStop(null)}
                 onConfirm={handleStopConfirm}
-                title={`Stop ${deploymentToStop?.deployment_id ?? 'deployment'}?`}
-                message={`Traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop deployment"
+                title={stopConsequence(deploymentToStop, environments).title}
+                message={stopConsequence(deploymentToStop, environments).message}
+                confirmText={stopConsequence(deploymentToStop, environments).confirm}
                 confirmTone="danger"
                 loading={stopping}
             />
@@ -533,7 +596,11 @@ export function EnvironmentDeploymentView({ projectName, environmentName, groupN
                     const envs = await api.getProjectEnvironments(projectName);
                     group = (envs || []).find((e) => e.name === environmentName)?.primary_deployment_group || null;
                 }
-                const deployments = await api.getProjectDeployments(projectName, { limit: 100 });
+                // Ask for the environment's active deployments directly: the
+                // live one can be older than any recent page.
+                const deployments = await api.getProjectDeployments(projectName, {
+                    environment: environmentName, active: true, limit: 50, ...(group ? { group } : {}),
+                });
                 const active = deployments.find(
                     (d) => d.environment === environmentName
                         && d.is_active
@@ -699,7 +766,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const secondaryActions: React.ReactNode[] = [];
     if (deployment.can_rollback) {
         if (deployment.status === 'Failed' || deployment.status === 'Unhealthy') {
-            primaryAction = <RButton variant="primary" icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Retry deploy</RButton>;
+            primaryAction = <RButton icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Retry</RButton>;
         } else if (deployment.is_active) {
             if (promoteTo && !currentEnv?.is_production) {
                 primaryAction = <RButton variant="primary" icon="promote" onClick={() => request({ kind: 'promote', source: deployment, targetEnv: promoteTo.name })}>Promote to {promoteTo.name}</RButton>;
@@ -911,7 +978,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     {secondaryActions}
                     <RButton icon="terminal" onClick={() => setActiveTab('logs')}>Logs</RButton>
                     {!isTerminal(deployment.status) && (
-                        <RButton variant="danger" icon="stop" onClick={() => setStopDialogOpen(true)}>Stop</RButton>
+                        <RButton icon="stop" onClick={() => setStopDialogOpen(true)}>{isInProgress(deployment.status) ? 'Cancel' : 'Stop'}</RButton>
                     )}
                     <button type="button" className="r-icon-btn" title="Copy ID" aria-label="Copy deployment ID"
                         onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
@@ -924,7 +991,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
             {activeTab === 'overview' && (
                 <div className="r-stack r-dep-diagnosis">
-                    <DeploymentMetaStrip deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
+                    {/* A failed deployment leads with why it failed; the facts follow. */}
                     {showFailure && (
                         <FailurePanel
                             projectName={projectName}
@@ -934,6 +1001,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             onOpenLogs={() => setActiveTab('logs')}
                         />
                     )}
+                    <DeploymentMetaStrip projectName={projectName} deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
                     {rollout && <RolloutPanel steps={rollout.steps} />}
                 </div>
             )}
@@ -1022,9 +1090,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 isOpen={stopDialogOpen}
                 onClose={() => setStopDialogOpen(false)}
                 onConfirm={handleStopConfirm}
-                title={`Stop ${deploymentId}?`}
-                message={`Traffic for group "${deployment?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop deployment"
+                title={stopConsequence(deployment, project?.environments ?? []).title}
+                message={stopConsequence(deployment, project?.environments ?? []).message}
+                confirmText={stopConsequence(deployment, project?.environments ?? []).confirm}
                 confirmTone="danger"
                 loading={stopping}
             />

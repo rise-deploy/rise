@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)\n        SELECT $1, key, value, is_secret, is_protected, source\n        FROM deployment_env_vars\n        WHERE deployment_id = $2 AND source IN ('toml', 'cli')\n        ON CONFLICT (deployment_id, key) DO UPDATE\n        SET value = EXCLUDED.value,\n            is_secret = EXCLUDED.is_secret,\n            is_protected = EXCLUDED.is_protected,\n            source = EXCLUDED.source,\n            updated_at = NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "537107872a313dfb88c5f9430e7f44920d91ee8b62363e8df28b2dad22afcd7c"
+}

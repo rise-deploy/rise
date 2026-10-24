@@ -4,6 +4,7 @@ import { navigate, useQueryParam } from '../lib/navigation';
 import { Button, Combobox, SearchInput, Segmented } from '../components/r-ui';
 import { ProjectTable } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
+import { effectiveStatus } from '../lib/project-status';
 
 interface Project {
     id?: string;
@@ -47,7 +48,7 @@ export function ProjectsList() {
     const filtered = useMemo(() => {
         if (!projects) return [];
         return projects.filter(p => {
-            const s = (p.status || '').toLowerCase();
+            const s = effectiveStatus(p).toLowerCase();
             // Filter buckets cover every ProjectStatus the backend can emit
             // (Running, Stopped, Deploying, Failed, Deleting, Terminated) so
             // no project is silently hidden by a non-"all" selection.
@@ -74,16 +75,17 @@ export function ProjectsList() {
     const owners = new Set(projects.map(p => p.owner?.name ? `team:${p.owner.name}` : null).filter(Boolean));
     const teamCount = owners.size;
     const counts = {
-        healthy: projects.filter(p => (p.status || '').toLowerCase() === 'running').length,
-        // Failed rollouts and deletes that may be stalled need attention.
+        healthy: projects.filter(p => effectiveStatus(p) === 'Running').length,
+        // Failed rollouts (including a failed deploy the previous deployment
+        // outlived) and deletes that may be stalled need attention.
         unhealthy: projects.filter(p => {
-            const s = (p.status || '').toLowerCase();
+            const s = effectiveStatus(p).toLowerCase();
             return s === 'failed' || s === 'deleting';
         }).length,
-        deploying: projects.filter(p => (p.status || '').toLowerCase() === 'deploying').length,
+        deploying: projects.filter(p => effectiveStatus(p) === 'Deploying').length,
         // Stopped or fully terminated projects — present but not running.
         inactive: projects.filter(p => {
-            const s = (p.status || '').toLowerCase();
+            const s = effectiveStatus(p).toLowerCase();
             return s === 'stopped' || s === 'terminated';
         }).length,
     };

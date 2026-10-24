@@ -79,11 +79,10 @@ impl DeploymentBackend for DockerBackend {
         deployment: &Deployment,
         project: &Project,
     ) -> Result<DeploymentUrls> {
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
