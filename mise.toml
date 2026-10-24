@@ -77,7 +77,14 @@ mise run backend:run "$backend"
 
 [tasks."sqlx:prepare"]
 description = "Prepare the SQLX query cache that needs to be committed for building with SQLX_OFFLINE=true."
-run = "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets"
+# Build the dependencies first: `sqlx prepare` collects the queries of every
+# crate it compiles, so the workspace crates that own their own query caches
+# (rise-runtime-sync, rise-resource-store-postgres) would otherwise land in
+# rise-deploy's when they aren't already built, e.g. on a cold CI cache.
+run = [
+    "cargo check --package rise-deploy --features cli,backend --all-targets",
+    "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets",
+]
 
 [tasks.deny]
 description = "Check dependency licenses and sources against deny.toml."
@@ -85,7 +92,14 @@ run = "cargo deny check licenses sources"
 
 [tasks."sqlx:check"]
 description = "Check that all SQLX queries are valid."
-run = "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets"
+# Build the dependencies first: `sqlx prepare` collects the queries of every
+# crate it compiles, so the workspace crates that own their own query caches
+# (rise-runtime-sync, rise-resource-store-postgres) would otherwise land in
+# rise-deploy's when they aren't already built, e.g. on a cold CI cache.
+run = [
+    "cargo check --package rise-deploy --features cli,backend --all-targets",
+    "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets",
+]
 
 [tasks."resource-store-postgres:sqlx:prepare"]
 description = "Prepare the SQLX query cache for rise-resource-store-postgres (requires running DB)."
