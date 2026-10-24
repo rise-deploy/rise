@@ -15,11 +15,16 @@ use super::models::{self, *};
 use super::state_machine;
 use super::utils::{create_deployment_with_hooks, generate_deployment_id};
 use crate::db::models::DeploymentStatus as DbDeploymentStatus;
-use crate::db::{deployments as db_deployments, projects, service_accounts, users};
+use crate::db::{
+    deployments as db_deployments, environments as db_environments, projects, service_accounts,
+    users,
+};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::registry::ImageTagType;
 use crate::server::state::AppState;
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 use rise_backend_core::events::EventSeverity;
 
 /// Validate group name format: must be 'default' or match [a-z0-9][a-z0-9/-]*[a-z0-9]
@@ -247,15 +252,12 @@ async fn insert_rise_env_vars(
         .internal_err("Failed to get deployment URLs")?;
 
     // Resolve environment name for RISE_ENVIRONMENT
-    let environment_name = if let Some(env_id) = deployment.environment_id {
-        crate::db::environments::find_by_id(&state.db_pool, env_id)
+    let environment_name =
+        crate::db::environments::find_by_id(&state.db_pool, deployment.environment_id)
             .await
             .ok()
             .flatten()
-            .map(|e| e.name)
-    } else {
-        None
-    };
+            .map(|e| e.name);
 
     let vars = models::rise_system_env_vars(
         &state.public_url,
@@ -640,6 +642,65 @@ async fn convert_deployment(
     custom_domain_urls: Vec<String>,
     all_urls: Vec<String>,
 ) -> Deployment {
+    let environment =
+        crate::db::environments::find_by_id(&state.db_pool, deployment.environment_id)
+            .await
+            .ok()
+            .flatten();
+    let provenance = match crate::db::deployment_events::provenance_batch(
+        &state.db_pool,
+        &[deployment.id],
+    )
+    .await
+    {
+        Ok(mut map) => map.remove(&deployment.id).unwrap_or_default(),
+        Err(e) => {
+            error!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to read deployment provenance: {:?}", e
+            );
+            Default::default()
+        }
+    };
+    convert_deployment_with(
+        state,
+        deployment,
+        project,
+        created_by_email,
+        DeploymentUrls {
+            primary_url,
+            custom_domain_urls,
+            all_urls,
+        },
+        environment.as_ref(),
+        provenance,
+    )
+    .await
+}
+
+/// URLs a deployment is reachable at, as returned to clients.
+struct DeploymentUrls {
+    primary_url: Option<String>,
+    custom_domain_urls: Vec<String>,
+    all_urls: Vec<String>,
+}
+
+/// [`convert_deployment`] with the environment and provenance already looked
+/// up, so a list can fetch them for every row at once.
+async fn convert_deployment_with(
+    state: &AppState,
+    deployment: crate::db::models::Deployment,
+    project: &crate::db::models::Project,
+    created_by_email: String,
+    urls: DeploymentUrls,
+    environment: Option<&crate::db::models::Environment>,
+    provenance: crate::db::deployment_events::Provenance,
+) -> Deployment {
+    let DeploymentUrls {
+        primary_url,
+        custom_domain_urls,
+        all_urls,
+    } = urls;
     // Multi-container side-data, folded onto the row. `None` is a legacy
     // single-container deployment — the frontend reads the flat replicas/cpu/
     // memory fields in that case. A present-but-unparseable column is corrupt:
@@ -680,16 +741,8 @@ async fn convert_deployment(
     };
     let can_rollback = state_machine::can_create_from(&deployment);
 
-    // Resolve environment name and color
-    let (environment, environment_color) = if let Some(env_id) = deployment.environment_id {
-        let env = crate::db::environments::find_by_id(&state.db_pool, env_id)
-            .await
-            .ok()
-            .flatten();
-        (env.as_ref().map(|e| e.name.clone()), env.map(|e| e.color))
-    } else {
-        (None, None)
-    };
+    let environment_color = environment.map(|e| e.color.clone());
+    let environment = environment.map(|e| e.name.clone());
 
     Deployment {
         id: deployment.id.to_string(),
@@ -721,6 +774,10 @@ async fn convert_deployment(
         job_url: deployment.job_url,
         pull_request_url: deployment.pull_request_url,
         git_repository_url: deployment.git_repository_url,
+        git_revision: provenance.git_revision,
+        git_branch: provenance.git_branch,
+        git_dirty: provenance.git_dirty,
+        source_deployment_id: provenance.source_deployment_id,
         created: deployment.created_at.to_rfc3339(),
         updated: deployment.updated_at.to_rfc3339(),
     }
@@ -733,15 +790,23 @@ async fn convert_deployment(
 ///   deployment group of a *different* environment.
 /// - If environment specified, no group: use environment's primary deployment group.
 /// - If group specified, no environment: look up environment whose primary group matches;
-///   then auto-resolve (0 envs → none, 1 env → use it, 2+ → error).
+///   then auto-resolve (1 env → use it, 2+ → error).
 /// - If neither specified: if the project has exactly one environment, use it.
-///   If zero, use the default group with no environment. If more than one, error.
+///   If more than one, error.
+///
+/// Every deployment belongs to an environment. A project always has one
+/// (`production` is created with it and cannot be deleted), so finding none
+/// is an internal error.
+fn no_environments() -> ServerError {
+    ServerError::internal("Project has no environments; every project needs at least one")
+}
+
 async fn resolve_deployment_target(
     pool: &sqlx::PgPool,
     project_id: uuid::Uuid,
     requested_environment: Option<&str>,
     requested_group: Option<&str>,
-) -> Result<(String, Option<crate::db::models::Environment>), ServerError> {
+) -> Result<(String, crate::db::models::Environment), ServerError> {
     use crate::db::environments;
 
     match (requested_environment, requested_group) {
@@ -765,7 +830,7 @@ async fn resolve_deployment_target(
                     )));
                 }
             }
-            Ok((group.to_string(), Some(env)))
+            Ok((group.to_string(), env))
         }
         // Environment only, no group
         (Some(env_name), None) => {
@@ -781,7 +846,7 @@ async fn resolve_deployment_target(
                     env_name
                 ))
             })?;
-            Ok((group, Some(env)))
+            Ok((group, env))
         }
         // Group only, no environment
         (None, Some(group)) => {
@@ -789,7 +854,7 @@ async fn resolve_deployment_target(
             let env = environments::find_by_primary_group(pool, project_id, group)
                 .await
                 .internal_err("Failed to look up environment by group")?;
-            if env.is_some() {
+            if let Some(env) = env {
                 Ok((group.to_string(), env))
             } else {
                 // No primary group match. Auto-resolve from available environments.
@@ -797,11 +862,8 @@ async fn resolve_deployment_target(
                     .await
                     .internal_err("Failed to list environments")?;
                 match all_envs.len() {
-                    0 => Ok((group.to_string(), None)),
-                    1 => Ok((
-                        group.to_string(),
-                        Some(all_envs.into_iter().next().unwrap()),
-                    )),
+                    0 => Err(no_environments()),
+                    1 => Ok((group.to_string(), all_envs.into_iter().next().unwrap())),
                     _ => Err(ServerError::bad_request(
                         "Multiple environments configured. Specify an environment to select one.",
                     )),
@@ -814,14 +876,14 @@ async fn resolve_deployment_target(
                 .await
                 .internal_err("Failed to list environments")?;
             match all_envs.len() {
-                0 => Ok((models::DEFAULT_DEPLOYMENT_GROUP.to_string(), None)),
+                0 => Err(no_environments()),
                 1 => {
                     let env = all_envs.into_iter().next().unwrap();
                     let group = env
                         .primary_deployment_group
                         .clone()
                         .unwrap_or_else(|| models::DEFAULT_DEPLOYMENT_GROUP.to_string());
-                    Ok((group, Some(env)))
+                    Ok((group, env))
                 }
                 _ => Err(ServerError::bad_request(
                     "Multiple environments configured. Specify an environment to select one.",
@@ -999,7 +1061,7 @@ fn validate_container_resource_names(
 #[cfg(feature = "backend")]
 fn validate_resource_constraints(
     state: &AppState,
-    resolved_environment: &Option<crate::db::models::Environment>,
+    resolved_environment: Option<&crate::db::models::Environment>,
     // Total replicas across the deployment. For single-container this is the
     // container's `replicas`; for multi-container it MUST be the sum across
     // all containers — the limit applies to the deployment as a whole.
@@ -1017,29 +1079,23 @@ fn validate_resource_constraints(
         .unwrap_or_default();
 
     let eff_min_replicas = resolved_environment
-        .as_ref()
         .and_then(|e| e.min_replicas)
         .map(|v| v as u32)
         .unwrap_or(platform_constraints.min_replicas);
     let eff_max_replicas = resolved_environment
-        .as_ref()
         .and_then(|e| e.max_replicas)
         .map(|v| v as u32)
         .unwrap_or(platform_constraints.max_replicas);
     let eff_min_cpu = resolved_environment
-        .as_ref()
         .and_then(|e| e.min_cpu.as_deref())
         .unwrap_or(&platform_constraints.min_cpu);
     let eff_max_cpu = resolved_environment
-        .as_ref()
         .and_then(|e| e.max_cpu.as_deref())
         .unwrap_or(&platform_constraints.max_cpu);
     let eff_min_memory = resolved_environment
-        .as_ref()
         .and_then(|e| e.min_memory.as_deref())
         .unwrap_or(&platform_constraints.min_memory);
     let eff_max_memory = resolved_environment
-        .as_ref()
         .and_then(|e| e.max_memory.as_deref())
         .unwrap_or(&platform_constraints.max_memory);
 
@@ -1092,6 +1148,7 @@ fn validate_resource_constraints(
 pub async fn create_deployment(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Json(payload): Json<CreateDeploymentRequest>,
 ) -> Result<Json<CreateDeploymentResponse>, ServerError> {
     info!("Creating deployment for project '{}'", payload.project);
@@ -1215,7 +1272,7 @@ pub async fn create_deployment(
     let (expires_at, expiration_cap) = rise_backend_core::expiration::effective_expiration(
         requested_expires_at,
         Utc::now(),
-        resolved_environment.as_ref(),
+        Some(&resolved_environment),
         &resolved_group,
     )
     .map_err(|e| {
@@ -1255,6 +1312,15 @@ pub async fn create_deployment(
             })?;
     }
 
+    // A scoped session deploys only into the environments it covers.
+    if let Some(scope) = &scope {
+        scope.require(
+            Operation::new(Verb::Create, Kind::Deployment),
+            &project.name,
+            Some(resolved_environment.name.as_str()),
+        )?;
+    }
+
     // Enforce service account environment restrictions.
     if is_sa {
         // The restriction snapshot: an exchanged access token carries it inline
@@ -1275,21 +1341,10 @@ pub async fn create_deployment(
         };
 
         if let Some(ref allowed_env_ids) = allowed_env_ids {
-            let target_env_id = resolved_environment.as_ref().map(|e| e.id);
-            match target_env_id {
-                Some(env_id) if !allowed_env_ids.contains(&env_id) => {
-                    return Err(ServerError::forbidden(
-                        "This service account is not allowed to deploy to the requested environment",
-                    ));
-                }
-                None => {
-                    // SA has environment restrictions but no environment was specified;
-                    // block the deployment since we can't verify the target is allowed.
-                    return Err(ServerError::forbidden(
-                        "This service account requires an explicit environment target",
-                    ));
-                }
-                _ => {} // target environment is in the allowed list
+            if !allowed_env_ids.contains(&resolved_environment.id) {
+                return Err(ServerError::forbidden(
+                    "This service account is not allowed to deploy to the requested environment",
+                ));
             }
         }
     }
@@ -1328,7 +1383,7 @@ pub async fn create_deployment(
     let port_from_env_override: Option<u16> = {
         let filtered = filter_env_overrides_by_environment(
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         );
         if let Some(port_override) = filtered.iter().rfind(|o| o.key == "PORT") {
             match port_override.value.parse::<u16>() {
@@ -1525,7 +1580,7 @@ pub async fn create_deployment(
             );
             validate_resource_constraints(
                 &state,
-                &resolved_environment,
+                Some(&resolved_environment),
                 total_replicas,
                 &per_container,
                 payload.from_deployment.is_some(),
@@ -1567,7 +1622,7 @@ pub async fn create_deployment(
                 image_digest: source_deployment.image_digest.as_deref(), // Copy digest from source if present
                 rolled_back_from_deployment_id: Some(original_source_id), // Track original source for image tag calculation
                 deployment_group: &resolved_group, // Use requested group (may be different from source)
-                environment_id: resolved_environment.as_ref().map(|e| e.id),
+                environment_id: resolved_environment.id,
                 expires_at,                        // expires_at
                 http_port: final_http_port as i32, // Use determined http_port
                 is_active: false,                  // Deployments start as inactive
@@ -1608,10 +1663,19 @@ pub async fn create_deployment(
                 project.id,
                 new_deployment.id,
                 new_deployment.environment_id,
-                resolved_environment.as_ref().map(|e| e.name.as_str()),
+                &resolved_environment.name,
             )
             .await
             .internal_err("Failed to copy environment variables")?;
+            // rise.toml and CLI variables travel with the source's
+            // configuration, like its port, resources and routes do.
+            crate::db::env_vars::copy_config_env_vars_to_deployment(
+                &state.db_pool,
+                source_deployment.id,
+                new_deployment.id,
+            )
+            .await
+            .internal_err("Failed to copy rise.toml and CLI variables")?;
         }
 
         // Apply env overrides from the request
@@ -1619,7 +1683,7 @@ pub async fn create_deployment(
             &state,
             new_deployment.id,
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         )
         .await?;
 
@@ -1699,7 +1763,7 @@ pub async fn create_deployment(
         );
         validate_resource_constraints(
             &state,
-            &resolved_environment,
+            Some(&resolved_environment),
             total_replicas,
             &per_container,
             false,
@@ -1756,7 +1820,7 @@ pub async fn create_deployment(
                     image_digest: None, // No digest — controller will use internal registry tag
                     rolled_back_from_deployment_id: None,
                     deployment_group: &resolved_group,
-                    environment_id: resolved_environment.as_ref().map(|e| e.id),
+                    environment_id: resolved_environment.id,
                     expires_at,
                     http_port: effective_http_port as i32,
                     is_active: false,
@@ -1786,7 +1850,7 @@ pub async fn create_deployment(
                 project.id,
                 deployment.id,
                 deployment.environment_id,
-                resolved_environment.as_ref().map(|e| e.name.as_str()),
+                &resolved_environment.name,
             )
             .await
             .internal_err("Failed to copy environment variables")?;
@@ -1796,7 +1860,7 @@ pub async fn create_deployment(
                 &state,
                 deployment.id,
                 &payload.env_overrides,
-                resolved_environment.as_ref().map(|e| e.name.as_str()),
+                Some(resolved_environment.name.as_str()),
             )
             .await?;
 
@@ -1855,7 +1919,7 @@ pub async fn create_deployment(
                 image_digest: Some(&image_digest),
                 rolled_back_from_deployment_id: None,
                 deployment_group: &resolved_group,
-                environment_id: resolved_environment.as_ref().map(|e| e.id),
+                environment_id: resolved_environment.id,
                 expires_at,
                 http_port: effective_http_port as i32,
                 is_active: false,
@@ -1885,7 +1949,7 @@ pub async fn create_deployment(
             project.id,
             deployment.id,
             deployment.environment_id,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            &resolved_environment.name,
         )
         .await
         .internal_err("Failed to copy environment variables")?;
@@ -1895,7 +1959,7 @@ pub async fn create_deployment(
             &state,
             deployment.id,
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         )
         .await?;
 
@@ -1986,7 +2050,7 @@ pub async fn create_deployment(
                 image_digest: None, // image_digest - NULL for build-from-source
                 rolled_back_from_deployment_id: None, // Not a rollback
                 deployment_group: &resolved_group, // deployment_group
-                environment_id: resolved_environment.as_ref().map(|e| e.id),
+                environment_id: resolved_environment.id,
                 expires_at,                            // expires_at
                 http_port: effective_http_port as i32, // http_port
                 is_active: false,                      // Deployments start as inactive
@@ -2016,7 +2080,7 @@ pub async fn create_deployment(
             project.id,
             deployment.id,
             deployment.environment_id,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            &resolved_environment.name,
         )
         .await
         .internal_err("Failed to copy environment variables")?;
@@ -2026,7 +2090,7 @@ pub async fn create_deployment(
             &state,
             deployment.id,
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         )
         .await?;
 
@@ -2337,20 +2401,49 @@ pub async fn update_deployment_status(
 pub struct ListDeploymentsQuery {
     #[serde(rename = "group")]
     pub deployment_group: Option<String>,
+    /// `true` lists only the deployments currently serving their group,
+    /// `false` only the rest.
+    pub active: Option<bool>,
+    /// Environment name.
+    pub environment: Option<String>,
+    /// Comma-separated status names (e.g. `Failed,Unhealthy`).
+    pub status: Option<String>,
+    /// Case-insensitive substring of the deployment ID, image, group or creator email.
+    pub q: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+/// Header carrying the number of deployments that match a list's filter
+/// across all pages.
+pub const TOTAL_COUNT_HEADER: &str = "x-total-count";
+
+/// Parse a comma-separated status filter, rejecting unknown names.
+fn parse_status_filter(raw: &str) -> Result<Vec<String>, ServerError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            serde_json::from_value::<DbDeploymentStatus>(serde_json::Value::String(
+                name.to_string(),
+            ))
+            .map(|status| status.to_string())
+            .map_err(|_| ServerError::bad_request(format!("Unknown deployment status '{name}'")))
+        })
+        .collect()
 }
 
 /// List deployments for a project
 pub async fn list_deployments(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_name): Path<String>,
     Query(query): Query<ListDeploymentsQuery>,
-) -> Result<Json<Vec<Deployment>>, ServerError> {
+) -> Result<(axum::http::HeaderMap, Json<Vec<Deployment>>), ServerError> {
     debug!(
-        "Listing deployments for project: {} (group: {:?})",
-        project_name, query.deployment_group
+        "Listing deployments for project: {} (group: {:?}, active: {:?})",
+        project_name, query.deployment_group, query.active
     );
 
     // Find the project by name
@@ -2378,64 +2471,139 @@ pub async fn list_deployments(
             .map_err(|_| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
     }
 
-    // Get deployments from database (optionally filtered by group, with pagination)
-    let db_deployments = db_deployments::list_for_project_and_group(
+    let list_deployments = Operation::new(Verb::List, Kind::Deployment);
+    if let Some(scope) = &scope {
+        scope.require_reach(list_deployments, &project.name)?;
+    }
+
+    let environments = db_environments::list_for_project(&state.db_pool, project.id)
+        .await
+        .internal_err("Failed to list environments")?;
+
+    let environment_id = match query.environment.as_deref().filter(|e| !e.is_empty()) {
+        Some(name) => Some(
+            environments
+                .iter()
+                .find(|environment| environment.name == name)
+                .map(|environment| environment.id)
+                .ok_or_else(|| ServerError::not_found(format!("Environment '{name}' not found")))?,
+        ),
+        None => None,
+    };
+    let statuses = match query.status.as_deref().filter(|s| !s.is_empty()) {
+        Some(raw) => Some(parse_status_filter(raw)?),
+        None => None,
+    };
+
+    // A scoped session sees the deployments of the environments it covers.
+    // Filtering in the query keeps pages full and the total accurate.
+    let allowed_environments = scope.as_ref().map(|scope| {
+        environments
+            .iter()
+            .filter(|environment| {
+                scope.allows(list_deployments, &project.name, Some(&environment.name))
+            })
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>()
+    });
+
+    let filter = db_deployments::DeploymentListFilter {
+        group: query.deployment_group.as_deref(),
+        active: query.active,
+        environment_id,
+        statuses,
+        search: query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+        allowed_environments,
+    };
+    let (db_deployments, total) = db_deployments::list_for_project_filtered(
         &state.db_pool,
         project.id,
-        query.deployment_group.as_deref(),
+        &filter,
         query.limit,
         query.offset,
     )
     .await
     .internal_err("Failed to list deployments")?;
 
-    // Convert to API models (fetch creator emails and calculate URLs)
+    // Look up what every row needs at once rather than per row.
+    let creator_ids: Vec<uuid::Uuid> = db_deployments.iter().map(|d| d.created_by_id).collect();
+    let creator_emails = users::get_emails_batch(&state.db_pool, &creator_ids)
+        .await
+        .internal_err("Failed to get creator emails")?;
+    let deployment_ids: Vec<uuid::Uuid> = db_deployments.iter().map(|d| d.id).collect();
+    let mut provenance =
+        crate::db::deployment_events::provenance_batch(&state.db_pool, &deployment_ids)
+            .await
+            .internal_err("Failed to get deployment provenance")?;
+    let environments_by_id: std::collections::HashMap<uuid::Uuid, &crate::db::models::Environment> =
+        environments
+            .iter()
+            .map(|environment| (environment.id, environment))
+            .collect();
+
     let mut deployments = Vec::with_capacity(db_deployments.len());
     for db_deployment in db_deployments {
-        let created_by_email = get_creator_email(&state.db_pool, db_deployment.created_by_id).await;
+        let created_by_email = creator_emails
+            .get(&db_deployment.created_by_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Only calculate URLs for non-terminal deployments that could receive traffic
-        let (primary_url, custom_domain_urls, all_urls) =
-            if state_machine::is_terminal(&db_deployment.status) {
-                // Terminal deployments (Failed, Stopped, Cancelled, Superseded, Expired) cannot receive traffic
-                (None, vec![], vec![])
-            } else {
-                // Calculate deployment URLs dynamically for active deployments
-                match state
-                    .deployment_backend
-                    .get_deployment_urls(&db_deployment, &project)
-                    .await
-                {
-                    Ok(urls) => (
-                        Some(urls.primary_url),
-                        urls.custom_domain_urls,
-                        urls.all_urls,
-                    ),
-                    Err(e) => {
-                        error!(
-                            "Failed to calculate URLs for deployment {}: {}",
-                            db_deployment.deployment_id, e
-                        );
-                        (None, vec![], vec![])
+        let urls = if state_machine::is_terminal(&db_deployment.status) {
+            DeploymentUrls {
+                primary_url: None,
+                custom_domain_urls: vec![],
+                all_urls: vec![],
+            }
+        } else {
+            match state
+                .deployment_backend
+                .get_deployment_urls(&db_deployment, &project)
+                .await
+            {
+                Ok(urls) => DeploymentUrls {
+                    primary_url: Some(urls.primary_url),
+                    custom_domain_urls: urls.custom_domain_urls,
+                    all_urls: urls.all_urls,
+                },
+                Err(e) => {
+                    error!(
+                        "Failed to calculate URLs for deployment {}: {}",
+                        db_deployment.deployment_id, e
+                    );
+                    DeploymentUrls {
+                        primary_url: None,
+                        custom_domain_urls: vec![],
+                        all_urls: vec![],
                     }
                 }
-            };
+            }
+        };
 
+        let environment = environments_by_id
+            .get(&db_deployment.environment_id)
+            .copied();
+        let deployment_provenance = provenance.remove(&db_deployment.id).unwrap_or_default();
         deployments.push(
-            convert_deployment(
+            convert_deployment_with(
                 &state,
                 db_deployment,
                 &project,
                 created_by_email,
-                primary_url,
-                custom_domain_urls,
-                all_urls,
+                urls,
+                environment,
+                deployment_provenance,
             )
             .await,
         );
     }
 
-    Ok(Json(deployments))
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        TOTAL_COUNT_HEADER,
+        axum::http::HeaderValue::from(total.max(0) as u64),
+    );
+    Ok((headers, Json(deployments)))
 }
 
 /// Query parameters for stopping deployments
@@ -4008,7 +4176,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(group, "staging");
-        assert_eq!(env.unwrap().name, "staging");
+        assert_eq!(env.name, "staging");
     }
 
     #[sqlx::test]
@@ -4272,7 +4440,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(group, "default");
-        assert_eq!(env.unwrap().name, "production");
+        assert_eq!(env.name, "production");
     }
 
     #[sqlx::test]
@@ -4312,7 +4480,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(group, "mr/123");
-        assert_eq!(env.unwrap().name, "staging");
+        assert_eq!(env.name, "staging");
     }
 
     /// Absence, an explicit null and an empty object all mean the same thing:

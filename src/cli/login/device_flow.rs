@@ -8,6 +8,12 @@ use std::time::Duration;
 #[derive(Debug, Serialize)]
 struct AuthorizeRequest {
     flow: String,
+    /// Shown on Rise's confirmation page, so the user can recognize the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+    /// What the login asks for; the approver may change it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,22 +40,30 @@ fn default_interval() -> u64 {
     5 // 5 seconds
 }
 
+/// How much a `slow_down` answer adds to the polling interval (RFC 8628 §3.5).
+const SLOW_DOWN_STEP: Duration = Duration::from_secs(5);
+
+/// This machine's hostname, if it can be determined.
+fn client_name() -> Option<String> {
+    let output = std::process::Command::new("hostname").output().ok()?;
+    let name = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (output.status.success() && !name.is_empty()).then_some(name)
+}
+
 /// Handle device authorization flow via backend
 ///
-/// NOTE: Device flow support depends on the OIDC provider. Some providers (like certain
-/// configurations) may not support device flow. Use the browser flow (default) as the
-/// recommended option: `rise login`
+/// Rise is the device authorization server: the user confirms the code on the
+/// Rise web UI (signing in there if needed), and this poll then receives a
+/// Rise session. Useful where the CLI cannot open a browser or receive the
+/// browser flow's localhost callback (SSH sessions, containers).
 pub async fn handle_device_flow(
     http_client: &Client,
     backend_url: &str,
     config: &mut Config,
-    backend_url_to_save: Option<&str>,
+    access: Option<serde_json::Value>,
 ) -> Result<()> {
     let backend_url = normalize_backend_url(backend_url);
-
-    eprintln!("⚠️  Warning: Device flow may not be supported by all identity providers.");
-    eprintln!("   For best results, use the browser flow: rise login");
-    eprintln!();
+    super::access::warn_if_narrowing(&backend_url, access.as_ref());
 
     // Step 1: Initialize device flow via backend
     println!("Initializing device authorization flow...");
@@ -57,6 +71,8 @@ pub async fn handle_device_flow(
     let authorize_url = format!("{}/api/v1/auth/authorize", backend_url);
     let authorize_request = AuthorizeRequest {
         flow: "device".to_string(),
+        client_name: client_name(),
+        access,
     };
 
     let response = http_client
@@ -102,9 +118,10 @@ pub async fn handle_device_flow(
         .as_ref()
         .unwrap_or(&verification_uri);
 
-    println!("\nOpening browser to authenticate...");
-    println!("If the browser doesn't open, visit: {}", verification_url);
-    println!("Enter code: {}", user_code);
+    println!("\nTo log in, open this URL and confirm the code:");
+    println!("  {}", verification_url);
+    println!("\n  Code: {}\n", user_code);
+    println!("Only approve if the page shows this same code.");
 
     if let Err(e) = webbrowser::open(verification_url) {
         println!("Failed to open browser automatically: {}", e);
@@ -128,7 +145,7 @@ pub async fn handle_device_flow(
     }
 
     let exchange_url = format!("{}/api/v1/auth/device/exchange", backend_url);
-    let poll_interval = Duration::from_secs(interval);
+    let mut poll_interval = Duration::from_secs(interval);
     let timeout = Duration::from_secs(expires_in);
     let start_time = std::time::Instant::now();
 
@@ -160,22 +177,18 @@ pub async fn handle_device_flow(
                 .context("Failed to parse device exchange response")?;
 
             if let Some(token) = exchange_response.token {
-                // Store the backend URL if provided
-                if let Some(url) = backend_url_to_save {
-                    config
-                        .set_backend_url(url.to_string())
-                        .context("Failed to save backend URL")?;
-                }
-
                 // Store the token
                 log_token_debug(&token, "device flow response");
                 config
-                    .set_token(token.clone())
+                    .save_login(&backend_url, token.clone())
                     .context("Failed to save authentication token")?;
 
                 println!("\n✓ Login successful!");
                 println!("  Profile: {}", Config::active_profile_label()?);
-                println!("  Token saved to: {}", Config::config_path()?.display());
+                println!(
+                    "  Token saved to: {}",
+                    Config::credential_path(backend_url.as_ref())?.display()
+                );
 
                 // Display token expiration
                 match format_token_expiration(&token) {
@@ -185,20 +198,29 @@ pub async fn handle_device_flow(
                         tracing::debug!("Failed to parse token expiration: {}", e);
                     }
                 }
+                // The approver may have changed what was asked for.
+                super::access::print_granted_access(http_client, &backend_url, &token).await;
 
                 return Ok(());
             } else if let Some(error) = exchange_response.error {
-                if error == "authorization_pending" || error == "slow_down" {
-                    // Continue polling
-                    print!(".");
-                    use std::io::Write;
-                    std::io::stdout().flush()?;
-                } else {
-                    anyhow::bail!(
-                        "Device authorization failed: {} - {}",
-                        error,
-                        exchange_response.error_description.unwrap_or_default()
-                    );
+                let description = exchange_response.error_description.unwrap_or_default();
+                match error.as_str() {
+                    // Keep polling; `server_error` is a transient backend failure.
+                    "authorization_pending" | "slow_down" | "server_error" => {
+                        if error == "slow_down" {
+                            poll_interval += SLOW_DOWN_STEP;
+                        }
+                        print!(".");
+                        use std::io::Write;
+                        std::io::stdout().flush()?;
+                    }
+                    "access_denied" => {
+                        anyhow::bail!("Login was denied: {}", description)
+                    }
+                    "expired_token" => anyhow::bail!(
+                        "The login code expired or was already used. Run `rise login --device` again."
+                    ),
+                    _ => anyhow::bail!("Device authorization failed: {} - {}", error, description),
                 }
             }
         } else {

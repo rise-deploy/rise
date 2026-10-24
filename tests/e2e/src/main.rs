@@ -2,19 +2,23 @@
 //! share one expensive backend `bring_up` (a whole compose stack or minikube
 //! cluster), so they run as one in-order suite under our own reporter rather than
 //! as independent tests that would each re-provision. Standalone suites, such as
-//! local `rise compose`, run without a backend. Gated on `RISE_E2E_BACKEND` or
+//! local `rise compose` and the Terraform install against an AWS emulator, run
+//! without a backend. Gated on `RISE_E2E_BACKEND` or
 //! `RISE_E2E_SUITE`; skips (exit 0) when neither is set.
 
 use std::process::ExitCode;
 use std::time::Instant;
 
-use rise_e2e::{backend, compose, report, scenario, upgrade, BackendKind};
+use rise_e2e::{aws_install, backend, compose, report, scenario, upgrade, BackendKind};
 
 fn main() -> ExitCode {
     match std::env::var("RISE_E2E_SUITE").ok().as_deref() {
-        Some("compose") => return run_standalone_compose(),
+        Some("compose") => return run_standalone(compose::run),
+        Some("aws-install") => return run_standalone(aws_install::run),
         Some(other) if !other.is_empty() => {
-            eprintln!("[e2e] RISE_E2E_SUITE={other:?} is not known (expected: compose)");
+            eprintln!(
+                "[e2e] RISE_E2E_SUITE={other:?} is not known (expected: compose, aws-install)"
+            );
             return ExitCode::FAILURE;
         }
         _ => {}
@@ -23,7 +27,7 @@ fn main() -> ExitCode {
     let Some(kind) = BackendKind::from_env() else {
         eprintln!(
             "[e2e] RISE_E2E_BACKEND and RISE_E2E_SUITE unset — skipping the e2e harness \
-             (set RISE_E2E_BACKEND=docker|minikube|ecs or RISE_E2E_SUITE=compose to run it)"
+             (set RISE_E2E_BACKEND=docker|minikube|ecs or RISE_E2E_SUITE=compose|aws-install to run it)"
         );
         return ExitCode::SUCCESS;
     };
@@ -94,9 +98,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_standalone_compose() -> ExitCode {
+fn run_standalone(suite: fn() -> anyhow::Result<()>) -> ExitCode {
     let total = Instant::now();
-    let outcome = std::panic::catch_unwind(compose::run);
+    let outcome = std::panic::catch_unwind(suite);
     report::note(&format!(
         "total wall-clock {}",
         report::human(total.elapsed())

@@ -125,6 +125,21 @@ variable "ecr_auto_remove" {
   default     = false
 }
 
+variable "ecr_registry_host" {
+  description = <<-EOT
+    Registry host Rise pushes to and deploys from, as host[:port]. Null uses
+    <account>.dkr.ecr.<region>.amazonaws.com; set it for another ECR endpoint
+    (FIPS, dual-stack) or an ECR-compatible emulator.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ecr_registry_host == null || can(regex("^[^/:]+(:[0-9]+)?$", var.ecr_registry_host))
+    error_message = "ecr_registry_host must be a bare host[:port], with no scheme or path."
+  }
+}
+
 variable "oci_registry_url" {
   description = "Registry host for registry_type = \"oci-client-auth\". Must be reachable from the task subnets."
   type        = string
@@ -381,10 +396,20 @@ variable "traefik_refresh_seconds" {
   default     = 15
 }
 
-variable "route53_zone_id" {
-  description = "Route 53 zone to create the apex and wildcard alias records in. Leave null to manage DNS yourself."
-  type        = string
-  default     = null
+variable "route53_zone" {
+  description = <<-EOT
+    Route 53 zone to create the apex and wildcard alias records in. Pass the
+    zone itself -- `aws_route53_zone.this` or `data.aws_route53_zone.this` --
+    or `{ zone_id = "Z..." }`. Leave null to manage DNS yourself.
+
+    An object rather than a bare ID so that a zone created in the same apply
+    works: the module decides how many records to write at plan time, and
+    whether an object is null is known then even while its zone_id is not.
+  EOT
+  type = object({
+    zone_id = string
+  })
+  default = null
 }
 
 # -----------------------------------------------------------------------------
@@ -460,6 +485,34 @@ variable "rise_image_ref" {
   validation {
     condition     = var.rise_image_ref == null || strcontains(var.rise_image_ref, "@sha256:")
     error_message = "rise_image_ref must be an OCI digest reference containing @sha256:."
+  }
+}
+
+variable "rise_cli_image" {
+  description = "Rise CLI image repository: the workload-identity sidecar every workload task runs. The workload execution role pulls it with no registry credentials."
+  type        = string
+  default     = "ghcr.io/rise-deploy/rise-cli"
+}
+
+variable "rise_cli_image_tag" {
+  description = "CLI image tag, normally the same release as the control plane. Set this or rise_cli_image_ref, but not both."
+  type        = string
+  default     = null
+}
+
+variable "rise_cli_image_ref" {
+  description = "Complete immutable CLI image reference, such as ghcr.io/rise-deploy/rise-cli@sha256:…. Set this or rise_cli_image_tag, but not both."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = (var.rise_cli_image_ref == null) != (var.rise_cli_image_tag == null)
+    error_message = "Set exactly one of rise_cli_image_ref or rise_cli_image_tag."
+  }
+
+  validation {
+    condition     = var.rise_cli_image_ref == null || strcontains(var.rise_cli_image_ref, "@sha256:")
+    error_message = "rise_cli_image_ref must be an OCI digest reference containing @sha256:."
   }
 }
 
@@ -738,4 +791,16 @@ variable "traefik_constraints" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "identity_exchange_url" {
+  description = "Base URL at which the identity sidecar reaches the Rise API. Null uses the public URL, which workloads reach through the edge; set an internal address only if the apps security group can reach it."
+  type        = string
+  default     = null
+}
+
+variable "identity_token_ttl_seconds" {
+  description = "Lifetime of the auto-minted [identity] workload tokens. The identity sidecar in each task refreshes them at half this. Null keeps Rise's default (3600)."
+  type        = number
+  default     = null
 }

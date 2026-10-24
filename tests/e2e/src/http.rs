@@ -75,6 +75,25 @@ pub fn post_json(
     Ok(HttpResponse { status, body })
 }
 
+/// Send `body` as JSON with any method and a `Bearer` token — for the Rise API
+/// calls the narrower helpers don't cover (`PUT`, `PATCH`).
+pub fn send_json(
+    method: reqwest::Method,
+    url: &str,
+    bearer: &str,
+    body: &serde_json::Value,
+) -> Result<HttpResponse> {
+    let resp = shared_client()
+        .request(method.clone(), url)
+        .bearer_auth(bearer)
+        .json(body)
+        .send()
+        .with_context(|| format!("{method} {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    Ok(HttpResponse { status, body })
+}
+
 /// DELETE `url` with a `Bearer` token — for authenticated Rise API calls.
 pub fn delete_auth(url: &str, bearer: &str) -> Result<HttpResponse> {
     let resp = shared_client()

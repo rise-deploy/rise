@@ -1,6 +1,7 @@
 pub mod context;
 pub mod controller;
 pub mod cookie_helpers;
+pub mod device;
 pub mod entra_sync;
 pub mod exchange;
 pub mod group_sync;
@@ -14,4 +15,6 @@ pub(crate) mod redirect;
 pub mod roles;
 pub mod routes;
 pub mod sa_match;
+pub mod session_scope;
 pub mod token_storage;
+pub mod user_identity;

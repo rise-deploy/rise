@@ -111,7 +111,7 @@ fn external_identity_fields_are_required_and_canonical() {
     }
 
     assert!(serde_json::from_value::<UserIdentitySpec>(json!({
-        "issuer": "https://issuer.example/",
+        "issuer": "https://ISSUER.example",
         "subject": "subject"
     }))
     .is_err());
@@ -119,10 +119,16 @@ fn external_identity_fields_are_required_and_canonical() {
 
 #[test]
 fn issuers_are_canonical_urls() {
+    // The IdP's own `iss` spelling, with or without one trailing slash, is
+    // canonical: OIDC compares issuers as exact strings, and IdPs differ.
     for canonical in [
         "https://issuer.example",
+        "https://issuer.example/",
         "http://rise-dex:5556/dex",
+        "http://rise-dex:5556/dex/",
+        "https://tenant.auth0.example/",
         "https://127.0.0.1:8443",
+        "https://127.0.0.1:8443/",
     ] {
         let issuer = Issuer::new(canonical).unwrap();
         assert_eq!(issuer.as_str(), canonical);
@@ -135,10 +141,15 @@ fn issuers_are_canonical_urls() {
     for (noncanonical, canonical) in [
         (
             "https://ISSUER.example:443/a/../tenant///",
+            "https://issuer.example/tenant/",
+        ),
+        (
+            "https://ISSUER.example/tenant",
             "https://issuer.example/tenant",
         ),
-        ("http://rise-dex:5556/dex/", "http://rise-dex:5556/dex"),
-        ("https://127.0.0.1:8443/", "https://127.0.0.1:8443"),
+        ("https://issuer.example:443", "https://issuer.example"),
+        ("http://rise-dex:5556/dex//", "http://rise-dex:5556/dex/"),
+        ("https://127.0.0.1:8443//", "https://127.0.0.1:8443/"),
     ] {
         let error = Issuer::new(noncanonical).unwrap_err();
         assert_eq!(

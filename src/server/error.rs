@@ -48,6 +48,9 @@ pub struct ServerError {
     pub context: Vec<(&'static str, String)>,
     /// Optional suggestions for the client (e.g. fuzzy-matched names)
     pub suggestions: Option<Vec<String>>,
+    /// Optional stable, machine-readable code for errors a client branches on
+    /// (e.g. `platform_access_denied`), returned as `error_code`.
+    pub error_code: Option<&'static str>,
     /// If true, skip error-level logging (for expected transient conditions)
     pub expected: bool,
     /// If true, the operation lost a `SERIALIZABLE` race and the caller may
@@ -70,6 +73,7 @@ impl ServerError {
             source: None,
             context: Vec::new(),
             suggestions: None,
+            error_code: None,
             expected: false,
             retryable: false,
         }
@@ -87,6 +91,7 @@ impl ServerError {
             source: Some(source),
             context: Vec::new(),
             suggestions: None,
+            error_code: None,
             expected: false,
             retryable: false,
         }
@@ -101,6 +106,12 @@ impl ServerError {
     /// Add suggestions to the error response (chainable)
     pub fn with_suggestions(mut self, suggestions: Option<Vec<String>>) -> Self {
         self.suggestions = suggestions;
+        self
+    }
+
+    /// Attach a machine-readable error code to the response (chainable)
+    pub fn with_error_code(mut self, code: &'static str) -> Self {
+        self.error_code = Some(code);
         self
     }
 
@@ -208,16 +219,14 @@ impl IntoResponse for ServerError {
         }
 
         // Return clean JSON error response to client
-        let body = if let Some(suggestions) = &self.suggestions {
-            Json(json!({
-                "error": self.message,
-                "suggestions": suggestions,
-            }))
-        } else {
-            Json(json!({
-                "error": self.message,
-            }))
-        };
+        let mut body = json!({ "error": self.message });
+        if let Some(suggestions) = &self.suggestions {
+            body["suggestions"] = json!(suggestions);
+        }
+        if let Some(code) = self.error_code {
+            body["error_code"] = json!(code);
+        }
+        let body = Json(body);
 
         (self.status, body).into_response()
     }
@@ -306,6 +315,23 @@ mod tests {
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
         assert_eq!(body_json["error"], "Invalid input");
+    }
+
+    #[tokio::test]
+    async fn test_server_error_carries_error_code_only_when_set() {
+        let response = ServerError::forbidden("No access")
+            .with_error_code("platform_access_denied")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["error"], "No access");
+        assert_eq!(body_json["error_code"], "platform_access_denied");
+
+        let response = ServerError::forbidden("Not a member").into_response();
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body_json.get("error_code").is_none());
     }
 
     #[tokio::test]

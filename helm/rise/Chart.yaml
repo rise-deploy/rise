@@ -2,8 +2,8 @@ apiVersion: v2
 name: chart
 description: A Helm chart for Rise - a Kubernetes deployment platform
 type: application
-version: 0.23.0-rc15
-appVersion: "0.23.0-rc15"
+version: 0.23.0-rc19
+appVersion: "0.23.0-rc19"
 keywords:
   - kubernetes
   - deployment
@@ -22,6 +22,6 @@ dependencies:
     repository: "https://grafana.github.io/helm-charts"
     condition: logs.loki.enabled
   - name: alloy
-    version: "1.11.1"
+    version: "1.14.3"
     repository: "https://grafana.github.io/helm-charts"
     condition: logs.alloy.enabled

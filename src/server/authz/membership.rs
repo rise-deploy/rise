@@ -12,15 +12,9 @@
 //! with process configuration, which the engine deliberately knows nothing
 //! about.
 //!
-//! **Group policy is dark until identity resources exist.** A *principal's* own
-//! ties resolve through a live, active `User` resource of their name, and no
-//! login path writes one yet, so every principal currently has an empty tie
-//! set. That direction is safe for an Allow — a group binding simply grants
-//! nothing — but it is *not* safe for a Deny: a cap expressed as a
-//! group-targeted Deny is never collected, so it does not bite. Until identity
-//! resolution lands, a restriction has to be expressed against a subject that
-//! resolves today (`system:authenticated`, `org:<name>`, or the principal
-//! itself) to actually be a restriction.
+//! A *principal's* own ties resolve through the live, active `User` resource
+//! its session names — the one login resolved or provisioned for it
+//! (`auth::user_identity`).
 //!
 //! The gate's question is the exception, and deliberately so: `groups_for_user`
 //! resolves by *name* and does not require the row to exist or be active, since
@@ -31,13 +25,13 @@
 //!
 //! **Transitional operator derivation.** ADR-0001 §1 defines an operator as an
 //! active User with a live, active `UserIdentity` matching the restart-loaded
-//! `operatorIdentities` selector set. Those identity resources are not yet
-//! written by any login path, so this resolver derives the same status from the
-//! configuration that governs it today: the `auth.operator_users` email
-//! allowlist and the `auth.operator_idp_groups` IdP groups, resolved through
-//! `auth::roles`. The seam is what matters — the engine asks one question and
-//! gets one live answer — and the derivation moves to `UserIdentity` when
-//! identity resources go live, with no change above this module.
+//! `operatorIdentities` selector set. That selector set is not configurable
+//! yet, so this resolver derives the same status from the configuration that
+//! governs it today: the `auth.operator_users` email allowlist and the
+//! `auth.operator_idp_groups` IdP groups, matched against the typed user the
+//! session also carries, through `auth::roles`. The seam is what matters — the
+//! engine asks one question and gets one live answer — and the derivation
+//! moves to `UserIdentity` selectors with no change above this module.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -50,6 +44,15 @@ use rise_resource_api::{ResourceStore, SubjectId, UserSpec, API_VERSION_V1ALPHA1
 use rise_resource_store_postgres::{MembershipLookup, PgSession};
 
 use crate::db::models::User;
+use crate::server::auth::user_identity::UserPrincipal;
+
+/// The two identities an authenticated session carries: the live `User`
+/// resource it names, and the typed-API user its login found by email.
+#[derive(Clone, Debug)]
+pub struct ResolvedUser {
+    pub typed: User,
+    pub resource: UserPrincipal,
+}
 
 /// The configured operator selectors, as this install expresses them today.
 #[derive(Clone)]
@@ -60,7 +63,7 @@ pub struct OperatorSelectors {
 
 /// Resolves live Group ties and operator standing for one request.
 ///
-/// A Controller principal holds neither: `user` is `None` for it, and
+/// A resource principal holds neither: `user` is `None` for it, and
 /// `resolve` answers empty without consulting the store, matching the engine's
 /// contract that non-User principals hold no Group ties or operator standing.
 pub struct RiseMembershipResolver {
@@ -69,11 +72,11 @@ pub struct RiseMembershipResolver {
     memberships: MembershipLookup,
     operators: OperatorSelectors,
     /// The authenticated User this resolver answers for, or `None` for a
-    /// non-User principal (a Controller). Authentication already resolved the
-    /// credential to this row when present, and the principal carries its UID,
-    /// so the resolver reads the *live* facts — Group ties and IdP groups —
-    /// rather than re-resolving who the caller is.
-    user: Option<User>,
+    /// non-User principal. Authentication already resolved the session to
+    /// this User resource, and the principal carries its UID, so the resolver
+    /// reads the *live* facts — Group ties and IdP groups — rather than
+    /// re-resolving who the caller is.
+    user: Option<ResolvedUser>,
 }
 
 impl RiseMembershipResolver {
@@ -84,7 +87,7 @@ impl RiseMembershipResolver {
         session: PgSession,
         store: Arc<dyn ResourceStore>,
         operators: OperatorSelectors,
-        user: Option<User>,
+        user: Option<ResolvedUser>,
     ) -> Self {
         Self {
             memberships: MembershipLookup::in_session(session.clone()),
@@ -103,11 +106,10 @@ impl RiseMembershipResolver {
     /// confers nothing until a User of that name exists again, which is the
     /// reactivation §1 describes rather than a live tie.
     ///
-    /// The UID is the *resource's*, resolved from the canonical name — never the
-    /// credential's `rise_uid`. Those are the same value only once identity
-    /// resolution assigns a principal its User resource's UID; passing the
-    /// credential's would make a tie resolvable only when two independently
-    /// generated identifiers happened to coincide, which is to say never.
+    /// The UID is the *resource's*, resolved from the canonical name at read
+    /// time rather than taken from the credential: the tie is read through the
+    /// same session as the rest of the snapshot, so it agrees with whatever
+    /// that transaction sees of the User.
     async fn group_ties(
         &self,
         subject: &SubjectId,
@@ -232,16 +234,20 @@ impl MembershipResolver for RiseMembershipResolver {
         })?;
         // The resolver is built for one request's principal; answering for
         // another would attribute one caller's ties to another.
-        if principal.subject_uid() != user.id {
+        if principal.subject_uid() != user.resource.uid
+            || principal.subject() != &user.resource.subject()
+        {
             return Err(AuthorizationError::Membership(format!(
-                "resolver holds user {} but was asked about {}",
-                user.id,
+                "resolver holds user {} ({}) but was asked about {} ({})",
+                user.resource.subject(),
+                user.resource.uid,
+                principal.subject(),
                 principal.subject_uid()
             )));
         }
         Ok(PrincipalMembership {
             groups: self.group_ties(principal.subject()).await?,
-            is_operator: self.is_operator(user).await?,
+            is_operator: self.is_operator(&user.typed).await?,
         })
     }
 

@@ -1,10 +1,12 @@
 use crate::db::{projects, users};
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::auth::{
     cookie_helpers,
     token_storage::{
         generate_code_challenge, generate_code_verifier, generate_state_token,
         CompletedAuthSession, OAuth2State,
     },
+    user_identity::{LoginError, LoginProfile, ResolvedIdentity, TokenStanding},
 };
 use crate::server::frontend::load_auth_template;
 use crate::server::state::AppState;
@@ -15,6 +17,8 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use rise_backend_auth::session_scope::AccessRequest;
+use rise_backend_auth::{SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::instrument;
@@ -58,48 +62,83 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
 /// best-effort: the canonical host is always included, so the common deep-link
 /// keeps working even if the deployment lookups fail.
 async fn project_redirect_hosts(state: &AppState, project_name: &str) -> Vec<String> {
-    fn host_of(url: &str) -> Option<String> {
-        url::Url::parse(url)
-            .ok()?
-            .host_str()
-            .map(|h| h.to_lowercase())
-    }
-    fn add(hosts: &mut Vec<String>, host: Option<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    for url in project_app_urls(state, project_name).await {
+        let host = url::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_lowercase));
         if let Some(host) = host {
             if !hosts.contains(&host) {
                 hosts.push(host);
             }
         }
     }
-    let mut hosts: Vec<String> = Vec::new();
-    // Canonical ingress host from the template (no DB needed).
-    add(
-        &mut hosts,
-        build_project_url(state, project_name)
-            .as_deref()
-            .and_then(host_of),
-    );
-    // Active deployment URLs (default host + custom domains), across groups.
+    hosts
+}
+
+/// Whether a token's `aud` names the app at `candidate`: same host, explicit
+/// port and path prefix (sub-path layouts put several apps on one host). The
+/// scheme is ignored, as one app may be reached over either.
+fn audience_names_app(aud: &str, candidate: &str) -> bool {
+    fn key(url: &str) -> Option<(String, Option<u16>, String)> {
+        let url = url::Url::parse(url).ok()?;
+        Some((
+            url.host_str()?.to_lowercase(),
+            url.port(),
+            url.path().trim_end_matches('/').to_string(),
+        ))
+    }
+    match (key(aud), key(candidate)) {
+        (Some(aud), Some(candidate)) => aud == candidate,
+        _ => false,
+    }
+}
+
+/// Whether a token whose audience is `aud` may open `project_name`'s app.
+///
+/// Sign-in mints an app token for the URL the visitor came through (the
+/// project's template URL, a custom domain, or another deployment group's
+/// host) and the app receives that cookie. Without this check, the owner of one
+/// app could replay a visitor's token against another app the visitor can
+/// reach. A token for Rise's own URL is a web UI session, or an app token from
+/// an install without per-project URLs, where every app shares Rise's host and
+/// cookie anyway.
+async fn audience_admits_project(state: &AppState, project_name: &str, aud: &str) -> bool {
+    // The cheap candidates cover the common case on every app request.
+    if audience_names_app(aud, &state.public_url)
+        || build_project_url(state, project_name).is_some_and(|url| audience_names_app(aud, &url))
+    {
+        return true;
+    }
+    project_app_urls(state, project_name)
+        .await
+        .iter()
+        .any(|url| audience_names_app(aud, url))
+}
+
+/// The base URLs `project_name`'s app answers on: its template URL plus every
+/// active deployment's URL (default host + custom domains), across groups.
+/// Lookups are best-effort; a failed one leaves its URLs out.
+async fn project_app_urls(state: &AppState, project_name: &str) -> Vec<String> {
+    let mut urls: Vec<String> = build_project_url(state, project_name).into_iter().collect();
     if let Ok(Some(project)) = projects::find_by_name(&state.db_pool, project_name).await {
         if let Ok(deployments) =
             crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
                 .await
         {
             for deployment in &deployments {
-                if let Ok(urls) = state
+                if let Ok(deployment_urls) = state
                     .deployment_backend
                     .get_deployment_urls(deployment, &project)
                     .await
                 {
-                    add(&mut hosts, host_of(&urls.default_url));
-                    for custom in &urls.custom_domain_urls {
-                        add(&mut hosts, host_of(custom));
-                    }
+                    urls.push(deployment_urls.default_url);
+                    urls.extend(deployment_urls.custom_domain_urls);
                 }
             }
         }
     }
-    hosts
+    urls
 }
 
 /// Validate and sanitize a redirect URL to prevent open redirect vulnerabilities
@@ -337,26 +376,158 @@ async fn sync_groups_after_login(
     Ok(())
 }
 
+/// Why a validated upstream login did not produce a Rise session.
+#[derive(Debug)]
+enum LoginFailure {
+    /// The ID token has no `email`, which the typed APIs key users on.
+    MissingEmail,
+    /// The exact identity mapping, or its User, is inactive (ADR-0001 §1).
+    Disabled,
+    /// The upstream `sub` cannot be recorded as a `UserIdentity` subject.
+    InvalidSubject(String),
+    /// A database or signing failure; already logged.
+    Internal,
+}
+
+impl LoginFailure {
+    /// The status and message a login endpoint answers with.
+    fn response(&self) -> (StatusCode, String) {
+        match self {
+            Self::MissingEmail => (StatusCode::BAD_REQUEST, "Email claim missing".to_string()),
+            Self::Disabled => (
+                StatusCode::FORBIDDEN,
+                "This account is disabled. Contact your Rise administrator.".to_string(),
+            ),
+            Self::InvalidSubject(reason) => (StatusCode::UNAUTHORIZED, reason.clone()),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to process user".to_string(),
+            ),
+        }
+    }
+}
+
+/// The two identities a validated login resolves to.
+struct ResolvedLogin {
+    /// The typed-API user, found or created by email.
+    user: crate::db::User,
+    /// The live `User` resource and the `UserIdentity` the login came
+    /// through, found by exact `(issuer, subject)` or provisioned on first
+    /// sight (ADR-0001 §1).
+    identity: ResolvedIdentity,
+}
+
+/// Resolve an ID token already validated against `auth.issuer` to its typed
+/// user and its `User` resource.
+///
+/// An inactive mapping or User fails here, before anything is issued — the
+/// ingress flow included, since a disabled User may not log in anywhere.
+async fn resolve_login(
+    state: &AppState,
+    claims: &serde_json::Value,
+) -> Result<ResolvedLogin, LoginFailure> {
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .ok_or(LoginFailure::MissingEmail)?;
+    // `JwtValidator` verified the signature and `iss`; `sub` is required there
+    // too, so an absent one is a malformed token rather than an unknown user.
+    let subject = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| LoginFailure::InvalidSubject("Subject claim missing".to_string()))?;
+
+    let profile = LoginProfile {
+        email: Some(email.to_string()),
+        display_name: claims
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    };
+    let identity = state
+        .user_logins
+        .resolve_or_provision(subject, &profile)
+        .await
+        .map_err(|error| match error {
+            LoginError::Inactive => {
+                tracing::warn!("Login refused: the identity or its User is inactive");
+                LoginFailure::Disabled
+            }
+            LoginError::InvalidSubject(reason) => {
+                tracing::warn!("Login refused: {reason}");
+                LoginFailure::InvalidSubject("Invalid subject claim".to_string())
+            }
+            LoginError::Store(error) => {
+                tracing::error!("Failed to resolve the login's User: {error:?}");
+                LoginFailure::Internal
+            }
+        })?;
+
+    // Paired with a default-Org membership in one transaction.
+    let user = users::find_or_create_with_default_organization(
+        &state.db_pool,
+        email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to find/create user: {:#}", e);
+        LoginFailure::Internal
+    })?;
+
+    // A cross-reference only: nothing authenticates through it, so losing a
+    // race for it must not fail the login.
+    let resource_uid = identity.principal.uid;
+    if let Err(e) = users::link_resource_user(&state.db_pool, user.id, resource_uid).await {
+        tracing::warn!(
+            user_id = %user.id,
+            resource_user_uid = %resource_uid,
+            "Failed to link the typed user to its User resource: {:?}",
+            e
+        );
+    }
+
+    Ok(ResolvedLogin { user, identity })
+}
+
+/// Issue the Rise session token for a resolved login, to `client`.
+async fn issue_session(
+    state: &AppState,
+    claims: &serde_json::Value,
+    login: &ResolvedLogin,
+    client: SessionClient,
+    authorization_details: Option<Vec<serde_json::Value>>,
+) -> Result<String, LoginFailure> {
+    // Resolve the user's team memberships for the groups claim; on a DB error,
+    // fall back to no groups rather than failing the login.
+    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, login.user.id)
+        .await
+        .ok();
+    let session_user = SessionUser {
+        subject: login.identity.principal.subject().to_string(),
+        rise_uid: login.identity.principal.uid,
+        identity_uid: login.identity.identity_uid,
+        client,
+        authorization_details,
+    };
+    state
+        .jwt_signer
+        .sign_user_jwt(claims, &session_user, groups, &state.public_url, None)
+        .map_err(|e| {
+            tracing::error!("Failed to sign Rise JWT: {:#}", e);
+            LoginFailure::Internal
+        })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CodeExchangeRequest {
     pub code: String,
     pub code_verifier: String,
     pub redirect_uri: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DeviceExchangeRequest {
-    pub device_code: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DeviceExchangeResponse {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_description: Option<String>,
+    /// The access the session is restricted to (ADR-0006). Omitted means
+    /// full access.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -375,8 +546,16 @@ pub struct AuthorizeRequest {
     /// For authorization code flow: the PKCE code challenge method
     #[serde(default)]
     pub code_challenge_method: Option<String>,
+    /// For device flow: a name for the requesting machine (e.g. its hostname),
+    /// shown on the confirmation page
+    #[serde(default)]
+    pub client_name: Option<String>,
     /// Flow type: "code" for authorization code flow, "device" for device flow
     pub flow: String,
+    /// For device flow: the access the login asks for (ADR-0006). Omitted
+    /// means full access. The approver may change it.
+    #[serde(default)]
+    pub access: Option<AccessRequest>,
 }
 
 #[derive(Debug, Serialize)]
@@ -404,14 +583,27 @@ pub struct AuthorizeResponse {
     pub interval: Option<u64>,
 }
 
+/// Rate-limit bucket shared by every device-login start.
+const DEVICE_START_RATE_LIMIT_BUCKET: &str = "auth-device-start";
+
 /// Build OAuth2 authorization URL or initiate device flow (for CLI)
-#[instrument(skip(state))]
+///
+/// The device flow is served by Rise itself (see [`super::device`]): the user
+/// confirms the code on Rise's `/device` page, not at the IdP.
+#[instrument(skip(state, headers))]
 pub async fn authorize(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<AuthorizeRequest>,
 ) -> Result<Json<AuthorizeResponse>, (StatusCode, String)> {
     match payload.flow.as_str() {
         "code" => {
+            if payload.access.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "For the code flow, send `access` with the code exchange".to_string(),
+                ));
+            }
             // Authorization code flow with PKCE
             let redirect_uri = payload.redirect_uri.ok_or_else(|| {
                 (
@@ -456,23 +648,52 @@ pub async fn authorize(
             }))
         }
         "device" => {
-            // Device authorization flow
-            let device_response = state.oauth_client.device_flow_start().await.map_err(|e| {
-                tracing::error!("Failed to start device flow: {:#}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to start device flow: {}", e),
+            let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+            // Unauthenticated, and each start stores a row until it expires.
+            state
+                .oauth_rate_limiter
+                .increment_and_check(&client_ip, None, DEVICE_START_RATE_LIMIT_BUCKET)
+                .await
+                .map_err(|retry_after| {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        format!("Too many device logins started; retry in {retry_after}s"),
+                    )
+                })?;
+            let client_ip = (client_ip != "unknown").then_some(client_ip);
+            // Only the shape is checked here: the endpoint is unauthenticated,
+            // so whether the named projects exist is the approver's to see.
+            if let Some(access) = &payload.access {
+                access.validate().map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Invalid access request: {e}"),
+                    )
+                })?;
+            }
+            let started = super::device::DeviceFlow::new(&state)
+                .start(
+                    payload.client_name.as_deref(),
+                    client_ip.as_deref(),
+                    payload.access.as_ref(),
                 )
-            })?;
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to start device flow: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to start device flow".to_string(),
+                    )
+                })?;
 
             Ok(Json(AuthorizeResponse {
                 authorization_url: None,
-                device_code: Some(device_response.device_code),
-                user_code: Some(device_response.user_code),
-                verification_uri: Some(device_response.verification_uri.clone()),
-                verification_uri_complete: Some(device_response.verification_uri_complete),
-                expires_in: Some(device_response.expires_in),
-                interval: Some(device_response.interval),
+                device_code: Some(started.device_code),
+                user_code: Some(started.user_code),
+                verification_uri: Some(started.verification_uri),
+                verification_uri_complete: Some(started.verification_uri_complete),
+                expires_in: Some(started.expires_in),
+                interval: Some(started.interval),
             }))
         }
         _ => Err((
@@ -492,6 +713,16 @@ pub async fn code_exchange(
         "Code exchange request: redirect_uri={}",
         payload.redirect_uri
     );
+
+    // A malformed access request fails before the single-use code is spent.
+    if let Some(access) = &payload.access {
+        access.validate().map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid access request: {e}"),
+            )
+        })?;
+    }
 
     // Exchange authorization code for tokens using PKCE
     let token_info = state
@@ -550,44 +781,25 @@ pub async fn code_exchange(
             (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
         })?;
 
-    // Extract email from claims
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Email claim missing".to_string()))?;
-
-    // Find or create user (paired with default-Org membership in one transaction)
-    let user = users::find_or_create_with_default_organization(
-        &state.db_pool,
-        email,
-        state.default_organization_uid,
+    let login = resolve_login(&state, &claims)
+        .await
+        .map_err(|failure| failure.response())?;
+    let authorization_details = match &payload.access {
+        Some(access) => super::session_scope::compile_grant(&state, &login.user, access)
+            .await
+            .map_err(|e| (e.status, e.message))?,
+        None => None,
+    };
+    let rise_jwt = issue_session(
+        &state,
+        &claims,
+        &login,
+        SessionClient::Cli,
+        authorization_details,
     )
     .await
-    .map_err(|e| {
-        tracing::error!("Failed to find/create user: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to process user".to_string(),
-        )
-    })?;
-
-    // Resolve the user's team memberships for the groups claim; on a DB error,
-    // fall back to no groups rather than failing the login.
-    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
-        .await
-        .ok();
-
-    // Issue Rise JWT for user authentication (consumed by the CLI)
-    let rise_jwt = state
-        .jwt_signer
-        .sign_user_jwt(&claims, groups, &state.public_url, None)
-        .map_err(|e| {
-            tracing::error!("Failed to sign Rise JWT: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create token".to_string(),
-            )
-        })?;
+    .map_err(|failure| failure.response())?;
+    let user = login.user;
 
     tracing::info!(
         "CLI login successful for user {} - issued Rise JWT",
@@ -597,151 +809,6 @@ pub async fn code_exchange(
     Ok(Json(LoginResponse { token: rise_jwt }))
 }
 
-/// Exchange device code for token (Device Flow)
-#[instrument(skip(state, payload))]
-pub async fn device_exchange(
-    State(state): State<AppState>,
-    Json(payload): Json<DeviceExchangeRequest>,
-) -> Json<DeviceExchangeResponse> {
-    tracing::debug!(
-        "Device exchange request: device_code={}...",
-        &payload.device_code[..8.min(payload.device_code.len())]
-    );
-
-    // Poll the identity provider's token endpoint with the device code
-    match state
-        .oauth_client
-        .device_flow_poll(&payload.device_code)
-        .await
-    {
-        Ok(Some(token_info)) => {
-            tracing::info!("Device authorization successful");
-
-            // Sync IdP groups after successful login
-            if let Err(e) = sync_groups_after_login(&state, &token_info.id_token).await {
-                tracing::warn!("Group sync failed during device exchange: {:?}", e);
-                // Don't fail the login if group sync fails
-            }
-
-            // Validate the IdP JWT to extract claims
-            let mut expected_claims = HashMap::new();
-            expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
-
-            let claims = match state
-                .jwt_validator
-                .validate(
-                    &token_info.id_token,
-                    &state.auth_settings.issuer,
-                    &expected_claims,
-                )
-                .await
-            {
-                Ok(claims) => claims,
-                Err(e) => {
-                    tracing::error!("Failed to validate ID token: {:#}", e);
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("invalid_token".to_string()),
-                        error_description: Some("Failed to validate ID token".to_string()),
-                    });
-                }
-            };
-
-            // Extract email from claims
-            let email = match claims.get("email").and_then(|v| v.as_str()) {
-                Some(email) => email,
-                None => {
-                    tracing::error!("Email claim missing from ID token");
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("invalid_token".to_string()),
-                        error_description: Some("Email claim missing".to_string()),
-                    });
-                }
-            };
-
-            // Find or create user (paired with default-Org membership in one transaction)
-            let user = match users::find_or_create_with_default_organization(
-                &state.db_pool,
-                email,
-                state.default_organization_uid,
-            )
-            .await
-            {
-                Ok(user) => user,
-                Err(e) => {
-                    tracing::error!("Failed to find/create user: {:#}", e);
-                    return Json(DeviceExchangeResponse {
-                        token: None,
-                        error: Some("server_error".to_string()),
-                        error_description: Some("Failed to process user".to_string()),
-                    });
-                }
-            };
-
-            // Resolve the user's team memberships for the groups claim; on a DB
-            // error, fall back to no groups rather than failing the login.
-            let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
-                .await
-                .ok();
-
-            // Issue Rise JWT for user authentication (consumed by the CLI)
-            let rise_jwt =
-                match state
-                    .jwt_signer
-                    .sign_user_jwt(&claims, groups, &state.public_url, None)
-                {
-                    Ok(jwt) => jwt,
-                    Err(e) => {
-                        tracing::error!("Failed to sign Rise JWT: {:#}", e);
-                        return Json(DeviceExchangeResponse {
-                            token: None,
-                            error: Some("server_error".to_string()),
-                            error_description: Some("Failed to create token".to_string()),
-                        });
-                    }
-                };
-
-            tracing::info!(
-                "CLI device login successful for user {} - issued Rise JWT",
-                user.email
-            );
-
-            Json(DeviceExchangeResponse {
-                token: Some(rise_jwt),
-                error: None,
-                error_description: None,
-            })
-        }
-        Ok(None) => {
-            // authorization_pending - user hasn't authorized yet
-            tracing::debug!("Device authorization pending");
-            Json(DeviceExchangeResponse {
-                token: None,
-                error: Some("authorization_pending".to_string()),
-                error_description: None,
-            })
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            tracing::warn!("Device authorization error: {}", error_msg);
-
-            // Check for standard OAuth2 device flow errors
-            let (error, description) = if error_msg.contains("slow_down") {
-                ("slow_down".to_string(), None)
-            } else {
-                ("access_denied".to_string(), Some(error_msg))
-            };
-
-            Json(DeviceExchangeResponse {
-                token: None,
-                error: Some(error),
-                error_description: description,
-            })
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     pub id: String,
@@ -749,6 +816,9 @@ pub struct MeResponse {
     pub is_admin: bool,
     pub is_operator: bool,
     pub can_create_teams: bool,
+    /// What this session may do: `{"kind": "full"}`, or the grants of a
+    /// scoped CLI session (ADR-0006).
+    pub access: AccessRequest,
 }
 
 /// Get current user info from auth middleware
@@ -756,6 +826,7 @@ pub struct MeResponse {
 pub async fn me(
     State(state): State<AppState>,
     auth: crate::server::auth::context::AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
 ) -> Result<Json<MeResponse>, (StatusCode, String)> {
     let user = auth.user().map_err(|e| (e.status, e.message))?;
     // User is injected by auth middleware
@@ -769,6 +840,7 @@ pub async fn me(
         is_admin,
         is_operator,
         can_create_teams,
+        access: scope.map_or(AccessRequest::Full, |scope| scope.access()),
     }))
 }
 
@@ -938,18 +1010,15 @@ pub async fn signin_page(
 /// This allows the OAuth flow to use the actual request host (e.g., custom domain)
 /// instead of the configured public_url.
 ///
+/// The scheme is the configured `ingress_schema`, not `X-Forwarded-Proto`: behind
+/// a load balancer that terminates TLS, the proxy in front of Rise only sees
+/// plain HTTP and reports `http` for a request the browser made over `https`.
+///
 /// Falls back to the configured public_url if no valid host header is present.
 fn extract_request_base_url(headers: &HeaderMap, state: &AppState) -> String {
-    // Get Host header
     if let Some(host) = headers.get("host") {
         if let Ok(host_str) = host.to_str() {
-            // Get X-Forwarded-Proto header (set by Nginx ingress)
-            let scheme = headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("http");
-
-            return format!("{}://{}", scheme, host_str);
+            return format!("{}://{}", state.ingress_schema, host_str);
         }
     }
 
@@ -1178,27 +1247,12 @@ pub async fn oauth_callback(
             project
         );
 
-        // Get user email from claims
-        let user_email = claims["email"].as_str().ok_or_else(|| {
-            tracing::error!("No email in JWT claims");
-            (StatusCode::UNAUTHORIZED, "Invalid token claims".to_string())
-        })?;
-
-        // Find or create user to get user_id for team lookup (paired with
-        // default-Org membership in one transaction)
-        let user = users::find_or_create_with_default_organization(
-            &state.db_pool,
-            user_email,
-            state.default_organization_uid,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to find/create user: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Database error".to_string(),
-            )
-        })?;
+        // A disabled User may not log in to an app either. The ingress token
+        // itself keeps its app-facing shape: the IdP's `sub`, no Rise UID.
+        let user = resolve_login(&state, &claims)
+            .await
+            .map_err(|failure| failure.response())?
+            .user;
 
         // Issue Rise JWT with user's team memberships
         // Use custom domain URL as audience when available, otherwise build from ingress template
@@ -1289,72 +1343,12 @@ pub async fn oauth_callback(
     // Regular OAuth flow (not ingress auth) - UI login
     tracing::info!("Using Rise JWT for UI session");
 
-    // Get claims from IdP token (use existing validation from earlier in the function)
-    let mut expected_claims = HashMap::new();
-    expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
-
-    let claims = state
-        .jwt_validator
-        .validate(
-            &token_info.id_token,
-            &state.auth_settings.issuer,
-            &expected_claims,
-        )
+    let login = resolve_login(&state, &claims)
         .await
-        .map_err(|e| {
-            tracing::error!("Failed to validate ID token: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to validate token".to_string(),
-            )
-        })?;
-
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            tracing::error!("Email claim missing from ID token");
-            (
-                StatusCode::BAD_REQUEST,
-                "Email claim missing from token".to_string(),
-            )
-        })?;
-
-    // Find or create user (paired with default-Org membership in one transaction)
-    let user = users::find_or_create_with_default_organization(
-        &state.db_pool,
-        email,
-        state.default_organization_uid,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to find or create user: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to process user".to_string(),
-        )
-    })?;
-
-    // Sync groups after login
-    sync_groups_after_login(&state, &token_info.id_token).await?;
-
-    // Resolve the user's team memberships for the groups claim; on a DB error,
-    // fall back to no groups rather than failing the login.
-    let groups = crate::db::teams::get_team_names_for_user(&state.db_pool, user.id)
+        .map_err(|failure| failure.response())?;
+    let rise_jwt = issue_session(&state, &claims, &login, SessionClient::Browser, None)
         .await
-        .ok();
-
-    // Issue Rise HS256 JWT for user authentication (consumed by the UI)
-    let rise_jwt = state
-        .jwt_signer
-        .sign_user_jwt(&claims, groups, &state.public_url, None)
-        .map_err(|e| {
-            tracing::error!("Failed to sign user JWT: {:#}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to create authentication token".to_string(),
-            )
-        })?;
+        .map_err(|failure| failure.response())?;
 
     let cookie = cookie_helpers::create_rise_jwt_cookie(&rise_jwt, &state.cookie_settings, max_age);
 
@@ -1607,18 +1601,28 @@ fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
 /// plane would set the cookie on the wrong host and loop.
 ///
 /// Traefik routes `PathPrefix('/.rise')` on every host to the Rise backend, so
-/// `{X-Forwarded-Proto}://{X-Forwarded-Host}/.rise/auth/signin` is served by the
-/// backend even though the host is the app's. The original request URL is
-/// reconstructed from `X-Forwarded-Proto` + `X-Forwarded-Host` +
-/// `X-Forwarded-Uri` and embedded as `redirect` so the user returns to where
-/// they started after signing in.
+/// `{scheme}://{X-Forwarded-Host}/.rise/auth/signin` is served by the backend
+/// even though the host is the app's. The original request URL is
+/// reconstructed from `scheme` + `X-Forwarded-Host` + `X-Forwarded-Uri` and
+/// embedded as `redirect` so the user returns to where they started after
+/// signing in.
+///
+/// `scheme` is the configured `ingress_schema`. `X-Forwarded-Proto` is not
+/// usable: forwardAuth derives it from Traefik's own connection, which is plain
+/// HTTP behind a TLS-terminating load balancer. Trusting the incoming header
+/// instead (`trustForwardHeader`) is not an option either — it would also trust
+/// a client-supplied `X-Forwarded-Uri`, which `allowlist_path` relies on.
 ///
 /// Falls back to the control-plane `signin_base` URL only when
 /// `X-Forwarded-Host` is absent (degraded path — the same-host redirect cannot
 /// be constructed without the forwarded host).
-fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderMap) -> String {
+fn build_signin_redirect_url(
+    signin_base: &str,
+    scheme: &str,
+    project: &str,
+    headers: &HeaderMap,
+) -> String {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let proto = header("x-forwarded-proto").unwrap_or("http");
     let host = header("x-forwarded-host");
     let uri = header("x-forwarded-uri").unwrap_or("/");
 
@@ -1626,9 +1630,9 @@ fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderM
 
     if let Some(host) = host {
         // Same-host signin page (served by the backend via the /.rise router).
-        let original = format!("{proto}://{host}{uri}");
+        let original = format!("{scheme}://{host}{uri}");
         format!(
-            "{proto}://{host}/.rise/auth/signin?project={enc_project}&redirect={}",
+            "{scheme}://{host}/.rise/auth/signin?project={enc_project}&redirect={}",
             urlencoding::encode(&original)
         )
     } else {
@@ -1703,8 +1707,12 @@ pub async fn ingress_auth(
     // the browser); otherwise keep the bare 401 nginx expects.
     let unauthenticated = |reason: &str| -> Response {
         if params.signin_redirect {
-            let location =
-                build_signin_redirect_url(&state.signin_base_url, &params.project, &headers);
+            let location = build_signin_redirect_url(
+                &state.signin_base_url,
+                &state.ingress_schema,
+                &params.project,
+                &headers,
+            );
             tracing::debug!(
                 project = %params.project,
                 location = %location,
@@ -1732,6 +1740,43 @@ pub async fn ingress_auth(
             return Ok(unauthenticated("Invalid or expired session"));
         }
     };
+
+    // A token minted for another app (which received it as its own cookie)
+    // never opens this one.
+    if !audience_admits_project(&state, &params.project, &ingress_claims.aud).await {
+        tracing::warn!(
+            project = %params.project,
+            aud = %ingress_claims.aud,
+            "Ingress token was minted for another app"
+        );
+        return Ok(unauthenticated("Session is for another app"));
+    }
+
+    // A disabled User or identity loses app access with every other token: a
+    // session re-resolves its User and minting identity, and an ingress token
+    // — which keeps the IdP's `sub` — is checked against that identity's
+    // mapping.
+    let uids = ingress_claims
+        .rise_uid
+        .zip(ingress_claims.rise_identity_uid);
+    match state
+        .user_logins
+        .check_token(&ingress_claims.sub, uids)
+        .await
+    {
+        Ok(TokenStanding::Active(_)) => {}
+        Ok(TokenStanding::Rejected(rejection)) => {
+            tracing::warn!("Ingress token rejected: {rejection}");
+            return Ok(unauthenticated("Invalid or expired session"));
+        }
+        Err(error) => {
+            tracing::error!("Failed to re-resolve the ingress token's User: {error:?}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error".to_string(),
+            ));
+        }
+    }
 
     let email = ingress_claims.email;
 
@@ -1967,6 +2012,9 @@ pub async fn oauth_logout(
 pub struct CliAuthSuccessQuery {
     pub success: Option<bool>,
     pub error: Option<String>,
+    /// The session's access as the CLI read it back: `full`, or one
+    /// `<target>: <access>` line per grant.
+    pub access: Option<String>,
 }
 
 /// Handler for CLI authentication success/failure page
@@ -1996,6 +2044,11 @@ pub async fn cli_auth_success(
     context.insert("success", &success);
     if let Some(error) = params.error {
         context.insert("error_message", &error);
+    }
+    match params.access.as_deref() {
+        Some("full") => context.insert("access_full", &true),
+        Some(grants) => context.insert("access_grants", &grants.lines().collect::<Vec<_>>()),
+        None => {}
     }
 
     let html = tera
@@ -2069,10 +2122,10 @@ mod tests {
     #[test]
     fn signin_redirect_url_reconstructs_from_forwarded_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "secret.rise.localhost".parse().unwrap());
         headers.insert("x-forwarded-uri", "/dashboard?tab=1".parse().unwrap());
-        let url = build_signin_redirect_url("http://localhost:3000", "secret app", &headers);
+        let url =
+            build_signin_redirect_url("http://localhost:3000", "https", "secret app", &headers);
         // Same-host signin page served by the /.rise router on the app host,
         // project (URL-encoded), and redirect (full original URL, encoded).
         assert!(
@@ -2087,10 +2140,9 @@ mod tests {
         // cookie lands on the host forwardAuth reads — never on the control
         // plane host from signin_base.
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
         headers.insert("x-forwarded-uri", "/".parse().unwrap());
-        let url = build_signin_redirect_url("http://rise.localhost:3000", "app", &headers);
+        let url = build_signin_redirect_url("http://rise.localhost:3000", "https", "app", &headers);
         let signin_host = url_host(&url);
         assert_eq!(signin_host, "app.rise.localhost");
         assert_ne!(signin_host, "rise.localhost:3000");
@@ -2098,15 +2150,51 @@ mod tests {
     }
 
     #[test]
+    fn signin_redirect_url_uses_configured_scheme_over_forwarded_proto() {
+        // Behind a TLS-terminating load balancer forwardAuth reports `http`; the
+        // browser is on https, and so must the sign-in page and return URL be.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/docs".parse().unwrap());
+        let url = build_signin_redirect_url("http://rise.localhost:3000", "https", "app", &headers);
+        assert!(url.starts_with("https://app.rise.localhost/.rise/auth/signin?project=app"));
+        assert!(url.contains("&redirect=https%3A%2F%2Fapp.rise.localhost%2Fdocs"));
+        assert!(!url.contains("http%3A"));
+    }
+
+    #[test]
     fn signin_redirect_url_falls_back_without_forwarded_host() {
         let headers = HeaderMap::new();
-        let url = build_signin_redirect_url("http://rise.localhost:3000/", "app", &headers);
+        let url =
+            build_signin_redirect_url("http://rise.localhost:3000/", "https", "app", &headers);
         // No forwarded host → degraded fallback to the control-plane signin page.
         // Trailing slash on base is trimmed; no redirect param when host absent.
         assert_eq!(
             url,
             "http://rise.localhost:3000/api/v1/auth/signin?project=app"
         );
+    }
+
+    #[test]
+    fn audience_names_only_its_own_app() {
+        let app = "https://shop.apps.example.com";
+        assert!(audience_names_app(app, "https://shop.apps.example.com/"));
+        // Either scheme reaches the same app.
+        assert!(audience_names_app(app, "http://shop.apps.example.com"));
+        assert!(!audience_names_app(app, "https://other.apps.example.com"));
+        assert!(!audience_names_app(
+            app,
+            "https://shop.apps.example.com:8443"
+        ));
+
+        // Sub-path layouts share a host: the path tells the apps apart.
+        let shop = "https://apps.example.com/shop";
+        assert!(audience_names_app(shop, "https://apps.example.com/shop/"));
+        assert!(!audience_names_app(shop, "https://apps.example.com/other"));
+        assert!(!audience_names_app(shop, "https://apps.example.com"));
+
+        assert!(!audience_names_app("not a url", app));
     }
 
     #[test]

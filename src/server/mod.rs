@@ -296,6 +296,11 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let auth_only_routes = Router::new()
         .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .merge(auth::routes::auth_only_routes())
+        // Scoped sessions (ADR-0006) are checked after authentication.
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
         // Apply auth middleware only
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -318,6 +323,11 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(quickstart::routes::routes());
 
     let platform_routes = platform_routes
+        // Scoped sessions (ADR-0006) are checked last, before the handler
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
         // Apply platform access middleware (runs second, after auth)
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -476,6 +486,7 @@ async fn run_ecr_controller_loop(
             auto_remove,
             access_key_id,
             secret_access_key,
+            registry_host,
         }) => EcrConfig {
             region: region.clone(),
             account_id: account_id.clone(),
@@ -484,6 +495,7 @@ async fn run_ecr_controller_loop(
             auto_remove: *auto_remove,
             access_key_id: access_key_id.clone(),
             secret_access_key: secret_access_key.clone(),
+            registry_host: registry_host.clone(),
         },
         _ => {
             anyhow::bail!("ECR controller requires ECR registry configuration");
@@ -524,8 +536,7 @@ async fn build_traefik_dynamic_config(
     state: &state::AppState,
 ) -> anyhow::Result<rise_backend_traefik::dynamic::DynamicConfig> {
     use anyhow::Context;
-    use rise_backend_core::{resolve_runtime_containers, DeploymentUrlBuilder, DesiredRoute};
-    use rise_backend_traefik::dynamic::DynamicRouteTarget;
+    use rise_backend_core::DeploymentUrlBuilder;
 
     let provider = state
         .traefik_http_provider
@@ -561,40 +572,21 @@ async fn build_traefik_dynamic_config(
 
     let mut targets = Vec::new();
     for project in state.deployment_store.list_projects(None).await? {
-        let org_uid = state
+        let deployments = state
             .deployment_store
-            .organization_uid_for_project(project.id)
-            .await?
-            .with_context(|| format!("project '{}' has no Organization linkage", project.name))?;
-        let org = state
-            .resource_store
-            .get(org_uid)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to load Organization {org_uid}: {error}"))?
-            .with_context(|| format!("Organization {org_uid} is missing"))?;
-        let org_spec: rise_resource_api::OrganizationSpec = serde_json::from_value(org.spec)
-            .with_context(|| format!("Organization {org_uid} has malformed spec"))?;
+            .list_active_deployments_for_project(project.id)
+            .await?;
+        if deployments.is_empty() {
+            continue;
+        }
+
         if !provider.controller_class.is_empty()
-            && org_spec.deployment_controller_class.as_deref()
+            && project_controller_class(state, &project).await?.as_deref()
                 != Some(provider.controller_class.as_str())
         {
             continue;
         }
 
-        let Some(deployment) = state
-            .deployment_store
-            .list_non_terminal_deployments_for_project(project.id)
-            .await?
-            .into_iter()
-            .find(|deployment| deployment.is_active)
-        else {
-            continue;
-        };
-        let (containers, routes) = resolve_runtime_containers(&deployment)?;
-        let environment = match deployment.environment_id {
-            Some(id) => state.deployment_store.find_environment(id).await?,
-            None => None,
-        };
         let environments = state
             .deployment_store
             .list_environments_for_project(project.id)
@@ -603,41 +595,16 @@ async fn build_traefik_dynamic_config(
             .deployment_store
             .list_project_custom_domains(project.id)
             .await?;
-        let hosts: Vec<String> = url_builder
-            .primary_ingress_hosts(
-                &project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|environment| {
-                    environment.primary_deployment_group.as_deref()
-                        == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &environments,
-            )
-            .into_iter()
-            .map(|host| host.host)
-            .collect();
-
-        targets.extend(containers.into_iter().map(|container| {
-            DynamicRouteTarget {
-                project: project.name.clone(),
-                access_class: project.access_class.clone(),
-                deployment_group: deployment.deployment_group.clone(),
-                deployment_id: deployment.deployment_id.clone(),
-                port: container.port,
-                routes: routes
-                    .iter()
-                    .filter(|route| route.container == container.name)
-                    .map(|route| DesiredRoute {
-                        hosts: hosts.clone(),
-                        path_prefix: Some(route.path.clone()),
-                        access: route.access.clone(),
-                    })
-                    .collect(),
-                container: container.name,
-            }
-        }));
+        // Any error — store or undecodable data — fails the whole snapshot, so
+        // Traefik keeps serving its last good config instead of dropping a
+        // live router.
+        targets.extend(rise_backend_traefik::dynamic::project_route_targets(
+            &project,
+            &deployments,
+            &environments,
+            &custom_domains,
+            &url_builder,
+        )?);
     }
 
     Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
@@ -645,6 +612,30 @@ async fn build_traefik_dynamic_config(
         &render_config,
         provider.native_provider,
     ))
+}
+
+/// The deployment controller class of `project`'s Organization.
+#[cfg(feature = "backend")]
+async fn project_controller_class(
+    state: &state::AppState,
+    project: &rise_backend_core::models::Project,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+
+    let org_uid = state
+        .deployment_store
+        .organization_uid_for_project(project.id)
+        .await?
+        .with_context(|| format!("project '{}' has no Organization linkage", project.name))?;
+    let org = state
+        .resource_store
+        .get(org_uid)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to load Organization {org_uid}: {error}"))?
+        .with_context(|| format!("Organization {org_uid} is missing"))?;
+    let org_spec: rise_resource_api::OrganizationSpec = serde_json::from_value(org.spec)
+        .with_context(|| format!("Organization {org_uid} has malformed spec"))?;
+    Ok(org_spec.deployment_controller_class)
 }
 
 /// Static facts about the configured runtime log backend. Surfaced to the

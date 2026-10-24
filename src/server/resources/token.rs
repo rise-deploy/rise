@@ -641,11 +641,15 @@ pub(super) async fn delegated_issuance(
             None,
         ),
         AnyAuth::User(other) => {
-            let user = other.user()?;
+            // The choke point already refused a session naming no User
+            // resource, so this is the principal the grant was checked for.
+            let user = other.user_principal().ok_or_else(|| {
+                ServerError::unauthorized("This session does not name a Rise User")
+            })?;
             (
                 ActorClaim {
-                    sub: format!("user:{}", user.id),
-                    rise_uid: user.id,
+                    sub: user.subject().to_string(),
+                    rise_uid: user.uid,
                     act: None,
                 },
                 None,

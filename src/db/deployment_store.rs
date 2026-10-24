@@ -81,6 +81,13 @@ impl DeploymentStore for PgDeploymentStore {
         crate::db::deployments::list_non_terminal_for_project(&self.pool, project_id).await
     }
 
+    async fn list_active_deployments_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<Deployment>> {
+        crate::db::deployments::get_active_deployments_for_project(&self.pool, project_id).await
+    }
+
     async fn find_non_terminal_deployments_for_project_and_group(
         &self,
         project_id: Uuid,

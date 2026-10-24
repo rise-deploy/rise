@@ -50,6 +50,7 @@ locals {
   oidc_issuer = var.deploy_dex ? "https://dex.${var.ingress_domain}/dex" : var.oidc_issuer
 
   workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
+  create_dns_records     = var.route53_zone != null
   create_traefik_task_role = coalesce(
     var.create_traefik_task_role,
     var.traefik_task_role_arn == null,
@@ -59,6 +60,9 @@ locals {
   log_group_name = coalesce(var.log_group_name, "/${local.name}")
   rise_image_ref = var.rise_image_ref != null ? var.rise_image_ref : (
     var.rise_image_tag != null ? "${var.rise_image}:${var.rise_image_tag}" : ""
+  )
+  rise_cli_image_ref = var.rise_cli_image_ref != null ? var.rise_cli_image_ref : (
+    var.rise_cli_image_tag != null ? "${var.rise_cli_image}:${var.rise_cli_image_tag}" : ""
   )
 
   # --- Control-plane environment -------------------------------------------
@@ -140,6 +144,7 @@ module "control_plane_env" {
     push_role_arn = var.ecr_push_role_arn
     repo_prefix   = var.ecr_repo_prefix
     auto_remove   = var.ecr_auto_remove
+    registry_host = var.ecr_registry_host
     } : {
     type         = "oci-client-auth"
     registry_url = var.oci_registry_url
@@ -147,4 +152,8 @@ module "control_plane_env" {
   }
 
   repository_credentials_secret_arn = var.repository_credentials_secret_arn
+
+  identity_agent_image       = local.rise_cli_image_ref
+  identity_exchange_url      = var.identity_exchange_url
+  identity_token_ttl_seconds = var.identity_token_ttl_seconds
 }

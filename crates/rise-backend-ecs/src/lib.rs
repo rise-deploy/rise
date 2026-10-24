@@ -168,11 +168,10 @@ impl DeploymentBackend for EcsBackend {
         deployment: &Deployment,
         project: &Project,
     ) -> Result<DeploymentUrls> {
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
@@ -190,10 +189,14 @@ impl DeploymentBackend for EcsBackend {
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
+        let environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-        Ok(self
-            .url_builder
-            .compute_project_urls(project, deployment_group, &custom_domains))
+        Ok(self.url_builder.compute_project_urls(
+            project,
+            deployment_group,
+            &environments,
+            &custom_domains,
+        ))
     }
 
     async fn cleanup_environment(&self, project: &Project, environment_name: &str) -> Result<()> {

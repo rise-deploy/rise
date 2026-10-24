@@ -1,7 +1,7 @@
 use crate::db::env_vars as db_env_vars;
 use crate::server::encryption::EncryptionProvider;
 use crate::server::extensions::providers::oauth::models::{
-    OAuthExtensionSpec, OAuthExtensionStatus, TokenResponse,
+    OAuthExtensionSpec, OAuthExtensionStatus, TokenEndpointAuthMethod, TokenResponse,
 };
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
@@ -39,6 +39,48 @@ impl Clone for OAuthProvider {
             api_domain: self.api_domain.clone(),
         }
     }
+}
+
+/// Build a POST to the upstream token endpoint with `params` as the form body,
+/// authenticating as the extension's client per `spec.token_endpoint_auth_method`.
+pub(super) fn upstream_token_request(
+    http_client: &reqwest::Client,
+    token_endpoint: &str,
+    spec: &OAuthExtensionSpec,
+    client_secret: &str,
+    params: &[(&str, &str)],
+) -> reqwest::RequestBuilder {
+    let request = http_client
+        .post(token_endpoint)
+        .header(reqwest::header::ACCEPT, "application/json");
+    match spec.token_endpoint_auth_method {
+        TokenEndpointAuthMethod::ClientSecretPost => {
+            let mut form = params.to_vec();
+            form.push(("client_id", &spec.client_id));
+            form.push(("client_secret", client_secret));
+            request.form(&form)
+        }
+        TokenEndpointAuthMethod::ClientSecretBasic => request
+            .header(
+                reqwest::header::AUTHORIZATION,
+                basic_client_credentials(&spec.client_id, client_secret),
+            )
+            .form(params),
+    }
+}
+
+/// `Basic` credentials per RFC 6749 §2.3.1: both halves are form-urlencoded
+/// before joining, so a `:` in the client ID cannot shift the split.
+fn basic_client_credentials(client_id: &str, client_secret: &str) -> String {
+    use base64::Engine;
+
+    let encode =
+        |value: &str| url::form_urlencoded::byte_serialize(value.as_bytes()).collect::<String>();
+    let credentials = format!("{}:{}", encode(client_id), encode(client_secret));
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(credentials)
+    )
 }
 
 /// Generate a secure random token for Rise client secret (32 bytes, base64url encoded)
@@ -190,20 +232,20 @@ impl OAuthProvider {
             token_endpoint
         );
 
-        let response = self
-            .http_client
-            .post(&token_endpoint)
-            .header("Accept", "application/json")
-            .form(&[
+        let response = upstream_token_request(
+            &self.http_client,
+            &token_endpoint,
+            spec,
+            client_secret,
+            &[
                 ("grant_type", "authorization_code"),
                 ("code", authorization_code),
-                ("client_id", &spec.client_id),
-                ("client_secret", client_secret),
                 ("redirect_uri", redirect_uri),
-            ])
-            .send()
-            .await
-            .context("Failed to send token exchange request")?;
+            ],
+        )
+        .send()
+        .await
+        .context("Failed to send token exchange request")?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -243,19 +285,19 @@ impl OAuthProvider {
 
         debug!("Refreshing token with endpoint: {}", token_endpoint);
 
-        let response = self
-            .http_client
-            .post(&token_endpoint)
-            .header("Accept", "application/json")
-            .form(&[
+        let response = upstream_token_request(
+            &self.http_client,
+            &token_endpoint,
+            spec,
+            client_secret,
+            &[
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
-                ("client_id", &spec.client_id),
-                ("client_secret", client_secret),
-            ])
-            .send()
-            .await
-            .context("Failed to send token refresh request")?;
+            ],
+        )
+        .send()
+        .await
+        .context("Failed to send token refresh request")?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -408,9 +450,6 @@ impl Extension for OAuthProvider {
         if spec.issuer_url.is_empty() {
             return Err(anyhow!("issuer_url is required"));
         }
-        if spec.scopes.is_empty() {
-            return Err(anyhow!("at least one scope is required"));
-        }
 
         // Validate issuer_url
         Url::parse(&spec.issuer_url).context("Invalid issuer_url URL")?;
@@ -491,6 +530,7 @@ impl Extension for OAuthProvider {
             "client_secret_encrypted",
             "authorization_endpoint",
             "token_endpoint",
+            "token_endpoint_auth_method",
             "scopes",
         ];
 
@@ -737,10 +777,19 @@ The OAuth extension requires:
    - `client_secret`: OAuth client secret (stored encrypted via `rise encrypt`)
 
 2. **Provider Endpoints**:
-   - `authorization_endpoint`: OAuth provider's authorization URL
-   - `token_endpoint`: OAuth provider's token URL
+   - `issuer_url`: OIDC issuer; endpoints are discovered from its
+     `.well-known/openid-configuration`
+   - `authorization_endpoint` / `token_endpoint`: set both for providers
+     without OIDC discovery (GitHub, Snowflake, Notion)
 
-3. **Scopes**: OAuth scopes to request (provider-specific)
+3. **Scopes**: OAuth scopes to request (provider-specific; empty for providers
+   without scopes)
+
+4. **Client authentication** (`token_endpoint_auth_method`, optional):
+   `client_secret_post` (default) sends the client credentials in the token
+   request body; `client_secret_basic` sends them as an HTTP Basic
+   `Authorization` header. Use `client_secret_basic` for providers that reject
+   body credentials with `invalid_client`, such as Notion.
 
 ## Setup Steps
 
@@ -760,6 +809,7 @@ rise extension create my-app oauth-provider \
     "description": "OAuth authentication for my app",
     "client_id": "your_client_id",
     "client_secret_encrypted": "'"$ENCRYPTED"'",
+    "issuer_url": "https://provider.com",
     "authorization_endpoint": "https://provider.com/oauth/authorize",
     "token_endpoint": "https://provider.com/oauth/token",
     "scopes": ["openid", "email", "profile"]
@@ -779,6 +829,7 @@ rise extension create my-app oauth-snowflake \
     "description": "Snowflake OAuth for analytics",
     "client_id": "ABC123XYZ...",
     "client_secret_encrypted": "'"$ENCRYPTED"'",
+    "issuer_url": "https://myorg.snowflakecomputing.com",
     "authorization_endpoint": "https://myorg.snowflakecomputing.com/oauth/authorize",
     "token_endpoint": "https://myorg.snowflakecomputing.com/oauth/token-request",
     "scopes": ["refresh_token"]
@@ -796,8 +847,7 @@ rise extension create my-app oauth-google \
     "description": "Sign in with Google",
     "client_id": "123456789.apps.googleusercontent.com",
     "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
-    "token_endpoint": "https://oauth2.googleapis.com/token",
+    "issuer_url": "https://accounts.google.com",
     "scopes": ["openid", "email", "profile"]
   }'
 ```
@@ -813,9 +863,34 @@ rise extension create my-app oauth-github \
     "description": "Sign in with GitHub",
     "client_id": "Iv1.abc123...",
     "client_secret_encrypted": "'"$ENCRYPTED"'",
+    "issuer_url": "https://github.com",
     "authorization_endpoint": "https://github.com/login/oauth/authorize",
     "token_endpoint": "https://github.com/login/oauth/access_token",
     "scopes": ["read:user", "user:email"]
+  }'
+```
+
+### Notion OAuth
+
+Create a public integration at https://www.notion.so/profile/integrations.
+Notion has no scopes (access is chosen by the user on the consent screen), needs
+`owner=user` on the authorization URL, and only accepts HTTP Basic client
+authentication.
+
+```bash
+ENCRYPTED=$(rise encrypt "your_notion_client_secret")
+rise extension create my-app oauth-notion \
+  --type oauth \
+  --spec '{
+    "provider_name": "Notion",
+    "description": "Connect a Notion workspace",
+    "client_id": "your-notion-client-id",
+    "client_secret_encrypted": "'"$ENCRYPTED"'",
+    "issuer_url": "https://api.notion.com",
+    "authorization_endpoint": "https://api.notion.com/v1/oauth/authorize?owner=user",
+    "token_endpoint": "https://api.notion.com/v1/oauth/token",
+    "token_endpoint_auth_method": "client_secret_basic",
+    "scopes": []
   }'
 ```
 
@@ -937,8 +1012,7 @@ const authUrl = 'https://api.rise.dev/oidc/my-app/oauth-provider/authorize?redir
             "required": [
                 "provider_name",
                 "client_id",
-                "issuer_url",
-                "scopes"
+                "issuer_url"
             ],
             "properties": {
                 "provider_name": {
@@ -979,15 +1053,103 @@ const authUrl = 'https://api.rise.dev/oidc/my-app/oauth-provider/authorize?redir
                     "description": "OAuth token URL (optional). If not provided, fetched from OIDC discovery.",
                     "example": "https://github.com/login/oauth/access_token"
                 },
+                "token_endpoint_auth_method": {
+                    "type": "string",
+                    "enum": ["client_secret_post", "client_secret_basic"],
+                    "default": "client_secret_post",
+                    "description": "How Rise authenticates to the token endpoint: client_secret_post sends client_id and client_secret in the form body; client_secret_basic sends them as an HTTP Basic Authorization header (required by e.g. Notion).",
+                    "example": "client_secret_basic"
+                },
                 "scopes": {
                     "type": "array",
                     "items": {
                         "type": "string"
                     },
-                    "description": "OAuth scopes to request",
+                    "description": "OAuth scopes to request. Leave empty for providers without scopes (e.g. Notion).",
                     "example": ["openid", "email", "profile"]
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(method: TokenEndpointAuthMethod) -> OAuthExtensionSpec {
+        serde_json::from_value(json!({
+            "provider_name": "Test",
+            "client_id": "id:with space",
+            "issuer_url": "https://idp.example.com",
+            "token_endpoint_auth_method": method,
+        }))
+        .unwrap()
+    }
+
+    fn build(method: TokenEndpointAuthMethod) -> reqwest::Request {
+        upstream_token_request(
+            &reqwest::Client::new(),
+            "https://idp.example.com/token",
+            &spec(method),
+            "s3cr&t",
+            &[("grant_type", "refresh_token"), ("refresh_token", "rt")],
+        )
+        .build()
+        .unwrap()
+    }
+
+    fn body(request: &reqwest::Request) -> String {
+        String::from_utf8(request.body().unwrap().as_bytes().unwrap().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn client_secret_post_sends_credentials_in_the_form_body() {
+        let request = build(TokenEndpointAuthMethod::ClientSecretPost);
+
+        assert!(request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none());
+        assert_eq!(
+            body(&request),
+            "grant_type=refresh_token&refresh_token=rt&client_id=id%3Awith+space&client_secret=s3cr%26t"
+        );
+    }
+
+    #[test]
+    fn client_secret_basic_sends_urlencoded_credentials_in_the_header_only() {
+        use base64::Engine;
+
+        let request = build(TokenEndpointAuthMethod::ClientSecretBasic);
+
+        let header = request.headers()[reqwest::header::AUTHORIZATION]
+            .to_str()
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(header.strip_prefix("Basic ").unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"id%3Awith+space:s3cr%26t");
+        assert_eq!(body(&request), "grant_type=refresh_token&refresh_token=rt");
+    }
+
+    #[test]
+    fn auth_method_defaults_to_client_secret_post_and_is_omitted_when_default() {
+        let spec: OAuthExtensionSpec = serde_json::from_value(json!({
+            "provider_name": "Test",
+            "client_id": "id",
+            "issuer_url": "https://idp.example.com",
+        }))
+        .unwrap();
+
+        assert_eq!(
+            spec.token_endpoint_auth_method,
+            TokenEndpointAuthMethod::ClientSecretPost
+        );
+        assert!(spec.scopes.is_empty());
+        assert!(serde_json::to_value(&spec)
+            .unwrap()
+            .get("token_endpoint_auth_method")
+            .is_none());
     }
 }

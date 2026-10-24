@@ -184,12 +184,25 @@ impl Issuer {
 
         // Reject aliases instead of silently changing an authentication
         // identifier. `url::Url` normalizes host case, default ports, and dot
-        // segments; Rise additionally chooses the spelling without a trailing
-        // slash as canonical.
-        let canonical = parsed.as_str().trim_end_matches('/').to_owned();
-        if canonical != value {
+        // segments; what remains is the spelling the IdP itself stamps in
+        // `iss`, compared byte-for-byte. OIDC issuer identifiers are exact
+        // strings, and IdPs differ on the trailing slash (Dex omits it, Auth0
+        // includes it), so either one trailing slash or none is canonical —
+        // an IdP stamps exactly one of them, and a mapping written in the
+        // other spelling simply never matches a token. More than one trailing
+        // slash is not a spelling any IdP uses.
+        let normalized = parsed.as_str();
+        let trimmed = normalized.trim_end_matches('/');
+        let spelled_as_normalized = value == normalized && !value.ends_with("//");
+        let spelled_without_slash = value == trimmed;
+        if !(spelled_as_normalized || spelled_without_slash) {
+            let with_one_slash = if value.ends_with('/') {
+                format!("{trimmed}/")
+            } else {
+                trimmed.to_owned()
+            };
             return Err(ValidationError::new(format!(
-                "issuer URL must be in its canonical form \"{canonical}\""
+                "issuer URL must be in its canonical form \"{with_one_slash}\""
             )));
         }
         Ok(Self(value.to_owned()))

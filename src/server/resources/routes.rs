@@ -37,6 +37,10 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route(RESOURCE_PATH_ROUTE, post(handlers::dispatch_post))
         .route(RESOURCE_PATH_ROUTE, put(handlers::dispatch_put))
         .route(RESOURCE_PATH_ROUTE, delete(handlers::dispatch_delete))
+        // Scoped CLI sessions are refused third (ADR-0006 §7).
+        .route_layer(axum::middleware::from_fn(
+            crate::server::auth::session_scope::refuse_on_resource_api,
+        ))
         // Platform access runs second, after authentication.
         .route_layer(from_fn_with_state(
             state.clone(),

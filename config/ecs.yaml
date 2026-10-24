@@ -76,6 +76,8 @@ registry:
   push_role_arn: "${RISE_ECR_PUSH_ROLE_ARN:-}"
   repo_prefix: "${RISE_ECR_REPO_PREFIX:-rise/}"
   auto_remove: "${RISE_ECR_AUTO_REMOVE:-false}"
+  # Empty uses <account_id>.dkr.ecr.<region>.amazonaws.com.
+  registry_host: "${RISE_ECR_REGISTRY_HOST:-}"
 
 deployment_controller:
   type: "ecs"
@@ -147,6 +149,15 @@ deployment_controller:
   # the authoritative readiness signal with no fallback, so without a reachable
   # API such a deployment never becomes Healthy.
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-}"
+
+  # Workload identity. Every task runs a small sidecar (`rise identity agent`
+  # from the rise-cli image) that writes the credential and [identity] token
+  # files to /var/run/secrets/rise/identity. The image is required, normally the
+  # same release as this server; the sidecar fetches tokens from the public URL
+  # unless an internal one is set.
+  identity_agent_image: "${RISE_ECS_IDENTITY_AGENT_IMAGE:-}"
+  identity_exchange_url: "${RISE_ECS_IDENTITY_EXCHANGE_URL:-}"
+  identity_token_ttl_seconds: "${RISE_IDENTITY_TOKEN_TTL_SECONDS:-3600}"
 
   access_classes:
     public:

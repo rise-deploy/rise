@@ -80,8 +80,6 @@ export interface LogConsoleProps {
     deploymentCreated?: string | null;
     /** Container names declared by the deployment, for the container filter. */
     containers?: string[];
-    /** Deployment metadata panels, shown in the slide-over details drawer. */
-    details?: React.ReactNode;
     /** `page` fills the viewport; `embedded` sits inside the deployment tab. */
     variant?: 'page' | 'embedded';
     /** Rendered at the far left of the status bar (breadcrumb, back link). */
@@ -95,7 +93,6 @@ export function LogConsole({
     deploymentCompletedAt,
     deploymentCreated,
     containers = [],
-    details,
     variant = 'embedded',
     lead,
 }: LogConsoleProps) {
@@ -119,7 +116,6 @@ export function LogConsole({
     const [wrap, setWrap] = useState(true);
     const [following, setFollowing] = useState(true);
     const [railOpen, setRailOpen] = useState(true);
-    const [detailsOpen, setDetailsOpen] = useState(false);
     const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
     const [matchCursor, setMatchCursor] = useState(0);
     // Written by the stream on scroll/hover, read by the volume rail's cursor
@@ -371,11 +367,6 @@ export function LogConsole({
                             <Icon name="download" size={13} />
                         </button>
                     </Tooltip>
-                    {details && (
-                        <RButton size="sm" onClick={() => setDetailsOpen((v) => !v)}>
-                            Details
-                        </RButton>
-                    )}
                 </div>
             </div>
 
@@ -514,21 +505,6 @@ export function LogConsole({
                 empty={emptyMessage}
                 timelineCursor={timelineCursor}
             />
-
-            {details && detailsOpen && (
-                <>
-                    <div className="r-logc-scrim" onClick={() => setDetailsOpen(false)} />
-                    <aside className="r-logc-details" aria-label="Deployment details">
-                        <div className="r-logc-details-head">
-                            <span>Details</span>
-                            <button type="button" onClick={() => setDetailsOpen(false)} aria-label="Close details">
-                                <Icon name="close" size={13} />
-                            </button>
-                        </div>
-                        <div className="r-logc-details-body">{details}</div>
-                    </aside>
-                </>
-            )}
         </div>
     );
 }

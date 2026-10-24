@@ -27,6 +27,7 @@ use bollard::Docker;
 use futures::StreamExt;
 use tracing::warn;
 
+pub use rise_backend_core::identity::is_safe_token_filename;
 use rise_backend_core::identity::{
     IDENTITY_CREDENTIAL_KEY, IDENTITY_MOUNT_PATH, IDENTITY_TOKENS_SUBDIR,
 };
@@ -37,19 +38,6 @@ use rise_backend_core::identity::{
 /// `/var/run` → `/run` symlink) when extracting, so we emit file entries only.
 fn mount_base_relative() -> &'static str {
     IDENTITY_MOUNT_PATH.trim_start_matches('/')
-}
-
-/// Whether a `[identity].audiences` map key is safe to use as a single in-pod
-/// token filename. Rejects empty, `.`/`..`, and any name containing a path
-/// separator so a crafted filename can never escape the tokens directory when we
-/// build the tar (path-traversal defense).
-pub fn is_safe_token_filename(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
 }
 
 /// Build a tar archive (for the archive PUT) carrying the identity files.

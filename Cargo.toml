@@ -23,7 +23,7 @@ anyhow = "1.0.100"
 async-trait = "0.1"
 base64 = "0.22"
 chrono = { version = "0.4.38", features = ["serde"] }
-jsonwebtoken = { version = "10.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 rand = "0.10.0"
 rsa = "0.9"
 schemars = { version = "1", features = ["chrono04", "uuid1"] }
@@ -41,7 +41,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [package]
 name = "rise-deploy"
-version = "0.23.0-rc15"
+version = "0.23.0-rc19"
 publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -178,7 +178,7 @@ urlencoding = "2.1"
 # CLI-only dependencies
 clap = { version = "4.5.53", features = ["derive"], optional = true }
 comfy-table = { version = "7.1", optional = true }
-dirs = { version = "6.0", optional = true }
+dirs = { version = "7.0", optional = true }
 rpassword = { version = "7.4", optional = true }
 tempfile = { version = "3.0", optional = true }
 toml = { version = "1", optional = true }
