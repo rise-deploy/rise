@@ -239,7 +239,12 @@ fn classify(method: &Method, path: &str) -> Rule {
         // the project-wide ones, and may decrypt secrets: the handler filters
         // per variable.
         ("GET", "/projects/{project_id_or_name}/env")
-        | ("GET", "/projects/{project_id_or_name}/env/preview") => Handler,
+        | ("GET", "/projects/{project_id_or_name}/env/preview")
+        // Compares a deployment's snapshot with another environment's current
+        // variables: both sides are filtered per variable in the handler.
+        | ("GET", "/projects/{project_id_or_name}/deployments/{deployment_id}/env/diff") => {
+            Handler
+        }
         ("PUT", "/projects/{project_id_or_name}/env/{key}") => {
             OnEnvVar(op(Update, EnvironmentVariable))
         }
@@ -551,6 +556,7 @@ pub(crate) mod tests {
         for path in [
             "/projects/{project_id_or_name}/env",
             "/projects/{project_id_or_name}/env/preview",
+            "/projects/{project_id_or_name}/deployments/{deployment_id}/env/diff",
         ] {
             assert_eq!(classify(&Method::GET, path), Rule::Handler);
         }

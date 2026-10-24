@@ -23,9 +23,11 @@ Every value requires exactly one type: `--plain`, `--secret`, or `--protected`.
 Secret values are encrypted at rest; protected secrets cannot be retrieved
 through the API. Rise can still tell you whether one changed: the web UI's
 redeploy, rollback and promote dialogs compare the source deployment's
-variables with the current ones (`GET /api/v1/projects/{project}/deployments/{id}/env/diff`)
-and report a protected value as changed or unchanged without revealing it.
-Omit the value to enter it interactively; input for both
+variables with the ones the new deployment would get
+(`GET /api/v1/projects/{project}/deployments/{id}/env/diff`). A protected
+value is reported as changed or unchanged, never shown, and only when both
+sides are set at the same place (Global, the same environment, `rise.toml` or
+a CLI flag); a value that moved is reported as moved. Omit the value to enter it interactively; input for both
 secret forms is hidden:
 
 ```bash

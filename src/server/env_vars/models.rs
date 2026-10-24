@@ -80,6 +80,9 @@ pub enum EnvVarChange {
     Removed,
     Changed,
     Unchanged,
+    /// Present on both sides but not comparable for this caller: a secret it
+    /// may not read, or one that could not be decrypted.
+    Unknown,
 }
 
 /// One variable in a snapshot-versus-now comparison. Values are included only
@@ -95,6 +98,12 @@ pub struct EnvVarDiffEntry {
     pub from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// Where the value comes from on each side: `global`, `env:<name>`,
+    /// `toml` or `cli`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_source: Option<String>,
 }
 
 /// Response for comparing a deployment's variables with the current ones

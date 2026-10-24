@@ -343,7 +343,6 @@ class RiseAPI {
         return this.request(`/projects/${projectName}/deployments/${deploymentId}/env/diff${qs}`);
     }
 
-
     async setEnvVar(projectName, key, value, isSecret, isProtected = true, environment = null) {
         const params = new URLSearchParams();
         if (environment) params.set('environment', environment);

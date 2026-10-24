@@ -1685,6 +1685,15 @@ pub async fn create_deployment(
             )
             .await
             .internal_err("Failed to copy environment variables")?;
+            // rise.toml and CLI variables travel with the source's
+            // configuration, like its port, resources and routes do.
+            crate::db::env_vars::copy_config_env_vars_to_deployment(
+                &state.db_pool,
+                source_deployment.id,
+                new_deployment.id,
+            )
+            .await
+            .internal_err("Failed to copy rise.toml and CLI variables")?;
         }
 
         // Apply env overrides from the request

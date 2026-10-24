@@ -176,6 +176,9 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
                 <span className="r-diff-arrow" aria-hidden>→</span>
                 <DeploymentSummary d={source} label="After" tone="after" />
             </div>
+            {useSourceEnvVars && (
+                <p className="r-var-changes-note">Uses the variables of <span className="mono">{source.deployment_id}</span> unchanged.</p>
+            )}
             {!useSourceEnvVars && (kind !== 'promote' || target) && (
                 <VarChanges
                     projectName={project.projectName}

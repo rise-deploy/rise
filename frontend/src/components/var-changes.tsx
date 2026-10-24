@@ -9,14 +9,23 @@ import { cx } from './r-ui';
 
 interface DiffEntry {
     key: string;
-    change: 'added' | 'removed' | 'changed' | 'unchanged';
+    change: 'added' | 'removed' | 'changed' | 'unchanged' | 'unknown';
     is_secret: boolean;
     is_protected: boolean;
     from?: string;
     to?: string;
+    from_source?: string;
+    to_source?: string;
 }
 
-const ORDER = { changed: 0, added: 1, removed: 2, unchanged: 3 };
+/** `global` → Global, `env:staging` → staging, `toml` → rise.toml, `cli` → a CLI flag. */
+function sourceLabel(source?: string): string {
+    if (!source || source === 'global') return 'Global';
+    if (source.startsWith('env:')) return source.slice(4);
+    return source === 'toml' ? 'rise.toml' : source === 'cli' ? 'a CLI flag' : source;
+}
+
+const ORDER = { changed: 0, added: 1, removed: 2, unknown: 3, unchanged: 4 };
 
 /** The variable changes a deployment made from `sourceId` into `environment` would bring. */
 export function VarChanges({ projectName, sourceId, environment }: {
@@ -51,14 +60,17 @@ export function VarChanges({ projectName, sourceId, environment }: {
             <ul>
                 {changes.map(c => (
                     <li key={c.key} className={cx('r-var-change', c.change)}>
-                        <span className="mark" aria-hidden>{c.change === 'added' ? '+' : c.change === 'removed' ? '−' : '~'}</span>
+                        <span className="mark" aria-hidden>{c.change === 'added' ? '+' : c.change === 'removed' ? '−' : c.change === 'unknown' ? '?' : '~'}</span>
                         <span className="mono key">{c.key}</span>
                         <span className="what">
                             {c.change === 'added' && <>added{c.to !== undefined && <> · <span className="mono">{c.to}</span></>}</>}
                             {c.change === 'removed' && <>removed</>}
                             {c.change === 'changed' && (c.from !== undefined && c.to !== undefined
                                 ? <><span className="mono">{c.from}</span> → <span className="mono">{c.to}</span></>
-                                : <>{c.is_protected ? 'protected' : 'secret'} value changed</>)}
+                                : c.from_source !== c.to_source
+                                    ? <>now set in {sourceLabel(c.to_source)} (was {sourceLabel(c.from_source)})</>
+                                    : <>{c.is_protected ? 'protected' : 'secret'} value changed</>)}
+                            {c.change === 'unknown' && <>{c.is_protected ? 'protected' : 'secret'}; you can't read it, so it isn't compared</>}
                         </span>
                     </li>
                 ))}
