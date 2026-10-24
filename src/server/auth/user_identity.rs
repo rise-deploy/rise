@@ -18,7 +18,7 @@
 //! An inactive mapping, or an active one under an inactive User, is found and
 //! refused — never treated as unknown.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc};
 
 use rise_resource_api::{
     CreateResourceParams, ExternalSubject, Issuer, ResourceApi, ResourceRow, StoreError, SubjectId,
@@ -28,10 +28,10 @@ use rise_resource_store_postgres::{IdentityLookup, PgResourceStore, Serializable
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::server::retry::conflict_retry_delay;
+
 /// Bound contention retries to eight transactions and at most 900 ms of backoff.
 const MAX_PROVISION_ATTEMPTS: u32 = 8;
-const PROVISION_RETRY_INITIAL_MS: u64 = 20;
-const PROVISION_RETRY_MAX_MS: u64 = 200;
 
 /// Retry whole provisioning transactions after giving competing logins time to
 /// commit. Only retryable store conflicts incur a delay; other errors fail fast.
@@ -46,22 +46,12 @@ where
                 StoreError::Conflict(_) | StoreError::NameConflict | StoreError::Serialization,
             )) if attempt < MAX_PROVISION_ATTEMPTS => {
                 // The failed transaction is dropped before sleeping and retrying.
-                tokio::time::sleep(provision_retry_delay(attempt)).await;
+                tokio::time::sleep(conflict_retry_delay(attempt)).await;
             }
             result => return result,
         }
     }
     unreachable!("the final provisioning attempt returns its result")
-}
-
-fn provision_retry_delay(attempt: u32) -> Duration {
-    use rand::RngExt;
-
-    let ceiling_ms = PROVISION_RETRY_INITIAL_MS
-        .saturating_mul(2u64.saturating_pow(attempt - 1))
-        .min(PROVISION_RETRY_MAX_MS);
-    // Equal jitter ensures a pause while spreading concurrent callers out.
-    Duration::from_millis(rand::rng().random_range(ceiling_ms / 2..=ceiling_ms))
 }
 
 /// The `User` resource an authenticated session belongs to.
@@ -426,6 +416,8 @@ fn ulid(at: std::time::SystemTime, random: u128) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[tokio::test(start_paused = true)]
@@ -507,19 +499,6 @@ mod tests {
             .unwrap_err();
             assert_eq!(actual.to_string(), expected);
             assert_eq!(started.elapsed(), Duration::ZERO);
-        }
-    }
-
-    #[test]
-    fn provisioning_jitter_stays_within_the_exponential_cap() {
-        for (attempt, ceiling) in [20, 40, 80, 160, 200, 200, 200].into_iter().enumerate() {
-            for _ in 0..32 {
-                let delay = provision_retry_delay(attempt as u32 + 1);
-                assert!(
-                    (Duration::from_millis(ceiling / 2)..=Duration::from_millis(ceiling))
-                        .contains(&delay)
-                );
-            }
         }
     }
 

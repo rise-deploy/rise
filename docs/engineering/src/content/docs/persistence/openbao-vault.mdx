@@ -1,0 +1,204 @@
+---
+title: "OpenBao / Vault"
+description: Set up OpenBao or HashiCorp Vault so every Rise app gets its own KV v2 path, authenticated by its workload identity.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+[OpenBao](https://openbao.org) and [HashiCorp Vault](https://www.vaultproject.io)
+can trust Rise as a JWT issuer. With **one** auth role and **one** templated
+policy, every Rise app logs in with its
+[workload identity token](/docs/user-guide/workload-identity-tokens/) and gets
+access to exactly one KV v2 path:
+
+```
+secret/rise/<project>/<environment>/*
+```
+
+Nothing is set up per project: a new project or environment can use its path as
+soon as it is deployed, and can never reach another one's.
+
+The commands below use the OpenBao CLI (`bao`); with Vault, use `vault` — the
+arguments are the same. The Terraform examples use the
+[`hashicorp/vault`](https://registry.terraform.io/providers/hashicorp/vault/latest)
+provider, which works against both.
+
+## Prerequisites
+
+- OpenBao or Vault can reach your Rise backend over HTTPS — it fetches
+  `https://<your-rise>/.well-known/openid-configuration` and the JWKS behind it.
+- Pick an audience for the tokens apps present. This guide uses
+  `https://bao.example.com`.
+
+## 1. Enable a KV v2 mount
+
+Skip this if you already have one; the examples assume it is mounted at `secret/`.
+
+<Tabs syncKey="iac">
+<TabItem label="CLI">
+
+```bash
+bao secrets enable -path=secret -version=2 kv
+```
+
+</TabItem>
+<TabItem label="Terraform">
+
+```hcl
+resource "vault_mount" "secret" {
+  path    = "secret"
+  type    = "kv"
+  options = { version = "2" }
+}
+```
+
+</TabItem>
+</Tabs>
+
+## 2. Trust Rise as a JWT issuer
+
+`oidc_discovery_url` and `bound_issuer` are your Rise backend URL, exactly as it
+appears in the token's `iss` claim (no trailing slash).
+
+<Tabs syncKey="iac">
+<TabItem label="CLI">
+
+```bash
+bao auth enable -path=rise jwt
+
+bao write auth/rise/config \
+  oidc_discovery_url="https://rise.example.com" \
+  bound_issuer="https://rise.example.com"
+```
+
+</TabItem>
+<TabItem label="Terraform">
+
+```hcl
+resource "vault_jwt_auth_backend" "rise" {
+  path               = "rise"
+  type               = "jwt"
+  oidc_discovery_url = "https://rise.example.com"
+  bound_issuer       = "https://rise.example.com"
+}
+```
+
+</TabItem>
+</Tabs>
+
+## 3. Create the templated policy
+
+The policy reads the `project` and `environment` claims from the entity alias
+metadata of the `rise` auth mount, so it needs that mount's **accessor**.
+
+<Tabs syncKey="iac">
+<TabItem label="CLI">
+
+```bash
+ACCESSOR=$(bao auth list -format=json | jq -r '."rise/".accessor')
+META="identity.entity.aliases.${ACCESSOR}.metadata"
+APP_PATH="rise/{{${META}.project}}/{{${META}.environment}}"
+
+bao policy write rise-app - <<POLICY
+path "secret/data/${APP_PATH}/*" {
+  capabilities = ["create", "read", "update", "patch", "delete"]
+}
+path "secret/metadata/${APP_PATH}/*" {
+  capabilities = ["read", "list", "delete"]
+}
+POLICY
+```
+
+</TabItem>
+<TabItem label="Terraform">
+
+```hcl
+locals {
+  rise_meta = "identity.entity.aliases.${vault_jwt_auth_backend.rise.accessor}.metadata"
+  app_path  = "rise/{{${local.rise_meta}.project}}/{{${local.rise_meta}.environment}}"
+}
+
+resource "vault_policy" "rise_app" {
+  name   = "rise-app"
+  policy = <<-EOT
+    path "${vault_mount.secret.path}/data/${local.app_path}/*" {
+      capabilities = ["create", "read", "update", "patch", "delete"]
+    }
+    path "${vault_mount.secret.path}/metadata/${local.app_path}/*" {
+      capabilities = ["read", "list", "delete"]
+    }
+  EOT
+}
+```
+
+</TabItem>
+</Tabs>
+
+Keep only `read` (and `list`) if apps should consume values that operators
+write rather than write their own.
+
+## 4. Create the role
+
+`user_claim = "sub"` gives each project/environment pair its own entity
+(`rise:proj:<project>:env:<environment>`); `claim_mappings` copies the claims
+the policy reads into that entity's alias metadata.
+
+<Tabs syncKey="iac">
+<TabItem label="CLI">
+
+```bash
+bao write auth/rise/role/app - <<'ROLE'
+{
+  "role_type": "jwt",
+  "user_claim": "sub",
+  "bound_audiences": ["https://bao.example.com"],
+  "claim_mappings": { "project": "project", "environment": "environment" },
+  "token_policies": ["rise-app"],
+  "token_ttl": "1h",
+  "token_max_ttl": "4h"
+}
+ROLE
+```
+
+</TabItem>
+<TabItem label="Terraform">
+
+```hcl
+resource "vault_jwt_auth_backend_role" "rise_app" {
+  backend         = vault_jwt_auth_backend.rise.path
+  role_name       = "app"
+  role_type       = "jwt"
+  user_claim      = "sub"
+  bound_audiences = ["https://bao.example.com"]
+  claim_mappings = {
+    project     = "project"
+    environment = "environment"
+  }
+  token_policies = [vault_policy.rise_app.name]
+  token_ttl      = 3600
+  token_max_ttl  = 14400
+}
+```
+
+</TabItem>
+</Tabs>
+
+To admit only some projects, add `bound_claims`, e.g.
+`{"project": ["billing", "checkout"]}`.
+
+## 5. Hand it to your users
+
+Apps need four values, which the
+[user guide](/docs/persistence/openbao-vault/) asks them to get from you:
+
+| Value | In this guide |
+|---|---|
+| Address | `https://bao.example.com` |
+| Audience | `https://bao.example.com` |
+| Auth mount and role | `auth/rise`, role `app` |
+| KV mount and path | `secret`, `rise/<project>/<environment>/` |
+
+## Notes
+
+- This setup lives entirely in OpenBao/Vault; Rise needs no configuration for
+  it and it works the same on every deployment backend.
