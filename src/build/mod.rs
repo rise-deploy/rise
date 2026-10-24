@@ -202,9 +202,7 @@ use railpack::build_image_with_railpacks;
 /// handled the same as unset variables, avoiding errors when code attempts to use
 /// empty paths or values.
 pub(crate) fn env_var_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| if v.is_empty() { None } else { Some(v) })
+    std::env::var(key).ok().filter(|v| !v.is_empty())
 }
 
 /// Resolve the `SSL_CERT_FILE` environment variable, returning `Some(path)` if
