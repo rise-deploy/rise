@@ -2,6 +2,7 @@ import { navigate } from '../lib/navigation';
 import { OwnerLabel, Panel, Status } from './r-ui';
 import { useIsMobile } from '../lib/use-media';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
+import { effectiveStatus, hasFailedDeploy, statusLabel } from '../lib/project-status';
 
 export interface ProjectOwner {
     id?: string;
@@ -14,6 +15,8 @@ export interface ProjectRow {
     name: string;
     status?: string;
     active_deployment_id?: string;
+    latest_deployment_id?: string;
+    latest_deployment_status?: string;
     primary_url?: string;
     access_class?: string;
     owner?: ProjectOwner;
@@ -23,15 +26,19 @@ export interface ProjectRow {
 }
 
 export function ProjectStatusPill({ project, tooltip }: { project: ProjectRow; tooltip?: string }) {
-    const status = <Status status={project.status || 'Unknown'} tooltip={tooltip} />;
-    if (!project.active_deployment_id) return status;
+    const failed = hasFailedDeploy(project);
+    const label = statusLabel(project);
+    const status = <Status status={effectiveStatus(project)} label={label} tooltip={tooltip} />;
+    // A failed deploy links to that deployment, where its failure is explained.
+    const target = failed ? project.latest_deployment_id : project.active_deployment_id;
+    if (!target) return status;
 
-    const href = `/deployment/${project.name}/${project.active_deployment_id}`;
+    const href = `/deployment/${project.name}/${target}`;
     return (
         <a
             className="r-project-status-link"
             href={href}
-            aria-label={`Open active deployment for ${project.name}: ${project.status || 'Unknown'}`}
+            aria-label={`${failed ? 'Open failed deployment' : 'Open active deployment'} for ${project.name}: ${label}`}
             onClick={(e) => {
                 e.stopPropagation();
                 if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -114,7 +121,12 @@ export function ProjectTable({
                         return (
                             <tr key={project.id || project.name} className="click" onClick={() => onRowClick(project)}>
                                 <td>
-                                    <div className="r-cell-main" style={{ fontWeight: 600 }}>{project.name}</div>
+                                    <div className="r-cell-main" style={{ fontWeight: 600 }}>
+                                        <a className="r-row-link" href={`/project/${project.name}`}
+                                            onClick={(e) => { e.stopPropagation(); if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; e.preventDefault(); onRowClick(project); }}>
+                                            {project.name}
+                                        </a>
+                                    </div>
                                     {project.primary_url && (
                                         <a
                                             className="r-link mono r-cell-sub r-url-sub"

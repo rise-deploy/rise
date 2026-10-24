@@ -1,5 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { api } from './api';
+import { usePolling } from './polling';
+import { isInProgress } from './env-state';
 
 // Shapes of the API responses the shell and the project sections share. Only
 // the fields the UI reads are listed; the backend models in `src/server` are
@@ -14,6 +16,9 @@ export interface Project {
     owner?: ProjectOwner;
     active_deployment_status?: string;
     active_deployment_id?: string;
+    /** Newest deployment of the production group; differs from the active one after a failed or in-flight deploy. */
+    latest_deployment_status?: string;
+    latest_deployment_id?: string;
     default_url?: string;
     primary_url?: string;
     custom_domain_urls?: string[];
@@ -64,6 +69,13 @@ export interface Deployment {
     job_url?: string;
     pull_request_url?: string;
     git_repository_url?: string;
+    /** Commit the image was built from (inherited by redeploys, rollbacks and promotions). */
+    git_revision?: string;
+    git_branch?: string;
+    /** Built from a working tree with uncommitted changes. */
+    git_dirty?: boolean;
+    /** The deployment this one was created from, if any. */
+    source_deployment_id?: string;
     created: string;
     updated: string;
     [key: string]: unknown;
@@ -110,6 +122,10 @@ export function ProjectProvider({ projectName, children }: { projectName: string
     const [generation, setGeneration] = useState(0);
 
     const reload = useCallback(() => setGeneration(g => g + 1), []);
+    // CLI and CI deploys change what environments serve without telling this
+    // page: refresh quickly while a rollout is in flight, slowly otherwise.
+    const busy = project?.status === 'Deploying' || deployments.some(d => isInProgress(d.status));
+    usePolling(reload, busy ? 5000 : 20000);
 
     useEffect(() => {
         setProject(null);
@@ -142,10 +158,10 @@ export function ProjectProvider({ projectName, children }: { projectName: string
         // newer preview deployments push production's live one off it. So the
         // active deployments and each environment's primary-group history are
         // read as well, and merged in.
-        const recentReq = api.getProjectDeployments(projectName, { limit: DEPLOYMENT_PAGE })
-            .then((d: unknown) => {
-                const list = Array.isArray(d) ? d as Deployment[] : [];
-                record('deployments', list.length);
+        const recentReq = api.getProjectDeploymentsPage(projectName, { limit: DEPLOYMENT_PAGE })
+            .then(({ items, total }: { items: unknown; total: number | null }) => {
+                const list = Array.isArray(items) ? items as Deployment[] : [];
+                record('deployments', total ?? list.length);
                 return list;
             });
         const activeReq = api.getProjectDeployments(projectName, { active: true, limit: DEPLOYMENT_PAGE })

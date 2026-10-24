@@ -8,6 +8,7 @@ import { api } from '../lib/api';
 import { useCurrentProject, type Project } from '../lib/project-context';
 import { useRecentProjects } from '../lib/recent';
 import { useIsMobile } from '../lib/use-media';
+import { effectiveStatus, statusLabel } from '../lib/project-status';
 import {
     MOBILE_PRIMARY_SECTIONS,
     PROJECT_SECTIONS,
@@ -192,7 +193,7 @@ function GlobalNav({ route, summary }: { route: Route; summary: SidebarProps['su
                         const p = byName.get(name);
                         return (
                             <a key={name} href={projectPath(name)} onClick={linkClick(projectPath(name))}>
-                                <span className={cx('r-dot', statusTone(p?.status))} />
+                                <span className={cx('r-dot', statusTone(p ? effectiveStatus(p) : undefined))} />
                                 <span className="r-nav-label">{name}</span>
                             </a>
                         );
@@ -216,12 +217,12 @@ function ProjectNav({ route, onOpenPalette }: { route: Route; onOpenPalette: She
                     All projects
                 </a>
                 <button type="button" className="r-proj-switch" onClick={() => onOpenPalette('projects')} aria-label="Switch project">
-                    <span className={cx('r-dot', statusTone(project?.status))} />
+                    <span className={cx('r-dot', statusTone(project ? effectiveStatus(project) : undefined))} />
                     <span className="r-proj-switch-text">
                         <span className="name">{projectName}</span>
                         <span className="sub">
                             {project?.owner && <OwnerLabel owner={project.owner} size={11} />}
-                            {project?.status && <span>· {project.status}</span>}
+                            {project?.status && <span>· {statusLabel(project)}</span>}
                         </span>
                     </span>
                     <Icon name="updown" size={14} />
@@ -291,7 +292,7 @@ function MobileShell({ route, pathname, breadcrumbs, onOpenPalette, fullBleed, c
     if (current) {
         title = (
             <span className="r-mhead-proj">
-                <span className={cx('r-dot', statusTone(current.project?.status))} />
+                <span className={cx('r-dot', statusTone(current.project ? effectiveStatus(current.project) : undefined))} />
                 {current.projectName}
             </span>
         );

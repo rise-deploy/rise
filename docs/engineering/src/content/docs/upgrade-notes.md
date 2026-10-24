@@ -31,6 +31,18 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Every deployment belongs to an environment.** *Action required.* A
+  migration makes `deployments.environment_id` required. Deployments without
+  one (from before environments existed, or left behind by a deleted
+  environment) are assigned to the environment whose primary group they ran
+  in, else to `production`, else to the project's oldest environment; a project
+  with no environments gets `production` first. Deleting an environment now
+  deletes its deployments and their history, and the API refuses with `409`
+  while any of them is not stopped. Before upgrading, stop the deployments of
+  environments you plan to delete if you want that history gone, and expect
+  environment-less deployments to show up under an environment afterwards.
+  The workload identity `sub` no longer carries `env:<null>`.
+
 - **Docker/ECS route every active deployment group, each on its own hosts.**
   *Action required.* The Traefik HTTP-provider snapshot used to route only the
   newest active deployment group of each project, so production and older

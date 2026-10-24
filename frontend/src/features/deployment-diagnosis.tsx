@@ -1,10 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import type { Deployment } from '../lib/project-context';
-import { shortImage } from '../lib/env-state';
+import { commitUrl, shortImage, shortRevision } from '../lib/env-state';
+import { navigate } from '../lib/navigation';
 import { Icon } from '../components/icon';
 import { SourceLinkGroup, cx } from '../components/r-ui';
-import { fetchDeploymentEvents, streamLogs, type DeploymentEvent } from './logs/api';
+import { fetchDeploymentEvents, getLogsCapabilities, streamLogs, type DeploymentEvent } from './logs/api';
+import type { LogStatus } from './logs/types';
 
 // The rollout as the status-change log records it. The CLI reports the build
 // and push (it builds locally); the controller reports the rest. A deployment
@@ -130,33 +132,64 @@ interface ExcerptLine { at: string; level: string; text: string }
 
 const ISO_PREFIX = /^(\d{4}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:?\d{2}))\s?/;
 
-/** The last warning and error lines of a deployment, for the failure panel. */
-function useErrorExcerpt(projectName: string, deployment: Deployment): ExcerptLine[] | null {
-    const [lines, setLines] = useState<ExcerptLine[] | null>(null);
+/** Levels at or above warning, as log backends spell them. */
+const SEVERE = ['warn', 'warning', 'error', 'err', 'critical', 'crit', 'fatal', 'alert', 'emerg', 'emergency', 'panic'];
+
+interface Excerpt {
+    lines: ExcerptLine[];
+    /** Why no lines could be read, when the backend said so. */
+    unavailable: string | null;
+}
+
+/** The last warning-or-worse lines of a deployment, for the failure panel. */
+function useErrorExcerpt(projectName: string, deployment: Deployment): Excerpt | null {
+    const [excerpt, setExcerpt] = useState<Excerpt | null>(null);
     useEffect(() => {
         const controller = new AbortController();
         const collected: ExcerptLine[] = [];
-        streamLogs({
-            projectName,
-            deploymentId: deployment.deployment_id,
-            tail: 8,
-            levels: ['warn', 'error'],
-            start: deployment.created,
-            end: deployment.completed_at || new Date().toISOString(),
-            signal: controller.signal,
-        }, {
-            onLine: payload => {
-                const m = payload.line.match(ISO_PREFIX);
-                const at = m ? new Date(m[1]).toLocaleTimeString([], { hour12: false }) : '';
-                collected.push({ at, level: payload.level, text: m ? payload.line.slice(m[0].length) : payload.line });
-            },
-        })
-            .then(() => setLines(collected))
-            .catch(() => { if (!controller.signal.aborted) setLines([]); });
+        let unavailable: string | null = null;
+        (async () => {
+            // Ask for every severe level this backend knows, so crash lines
+            // logged as critical or fatal are not dropped.
+            const caps = await getLogsCapabilities();
+            const known = caps.levels.map(l => l.toLowerCase()).filter(l => SEVERE.includes(l));
+            await streamLogs({
+                projectName,
+                deploymentId: deployment.deployment_id,
+                tail: 8,
+                levels: known.length ? known : ['warn', 'error'],
+                start: deployment.created,
+                end: deployment.completed_at || new Date().toISOString(),
+                signal: controller.signal,
+            }, {
+                onLine: payload => {
+                    const m = payload.line.match(ISO_PREFIX);
+                    const at = m ? new Date(m[1]).toLocaleTimeString([], { hour12: false }) : '';
+                    collected.push({ at, level: payload.level, text: m ? payload.line.slice(m[0].length) : payload.line });
+                },
+                onStatus: payload => {
+                    try {
+                        const status = JSON.parse(payload) as LogStatus;
+                        if (status.reason !== 'no_logs_found') unavailable = status.message || UNAVAILABLE[status.reason] || 'Logs are unavailable.';
+                    } catch {
+                        unavailable = 'Logs are unavailable.';
+                    }
+                },
+            });
+        })()
+            .then(() => setExcerpt({ lines: collected, unavailable }))
+            .catch(() => { if (!controller.signal.aborted) setExcerpt({ lines: [], unavailable: 'Could not read logs.' }); });
         return () => controller.abort();
     }, [projectName, deployment.deployment_id, deployment.created, deployment.completed_at]);
-    return lines;
+    return excerpt;
 }
+
+const UNAVAILABLE: Partial<Record<LogStatus['reason'], string>> = {
+    historical_backend_not_configured: 'Logs for stopped containers are not kept on this install, so there are none to show.',
+    retention_expired_possible: 'These logs may be past the log retention period.',
+    backend_unavailable: 'The log backend did not answer.',
+    deployment_not_ready: 'The deployment has not produced logs yet.',
+};
 
 export function FailurePanel({ projectName, deployment, failedAt, stillServing, onOpenLogs }: {
     projectName: string;
@@ -184,9 +217,9 @@ export function FailurePanel({ projectName, deployment, failedAt, stillServing, 
                             : <>Nothing in group <span className="mono">{deployment.deployment_group}</span> is serving traffic.</>}
                 </div>
             </div>
-            {excerpt && excerpt.length > 0 && (
+            {excerpt && excerpt.lines.length > 0 && (
                 <div className="r-failure-log">
-                    {excerpt.map((l, i) => (
+                    {excerpt.lines.map((l, i) => (
                         <div key={i} className={cx('line', `lvl-${l.level}`)}>
                             <span className="t">{l.at}</span>
                             <span className="l">{l.level.toUpperCase()}</span>
@@ -198,8 +231,8 @@ export function FailurePanel({ projectName, deployment, failedAt, stillServing, 
             <div className="r-failure-foot">
                 <span>
                     {excerpt === null ? 'Loading recent warnings and errors…'
-                        : excerpt.length === 0 ? 'No warning or error lines were logged.'
-                            : 'Last warning and error lines.'}
+                        : excerpt.lines.length > 0 ? 'Last warning and error lines.'
+                            : excerpt.unavailable ?? 'No warning or error lines were logged.'}
                     {' '}Variables are snapshotted per deployment; compare them on the Variables tab.
                 </span>
                 <button type="button" className="r-link r-link-btn" onClick={onOpenLogs}>Open logs →</button>
@@ -214,7 +247,7 @@ export function rolloutEnd(deployment: Deployment, steps: RolloutStep[] | null):
     return healthy ?? deployment.completed_at ?? null;
 }
 
-export function DeploymentMetaStrip({ deployment, endedAt }: { deployment: Deployment; endedAt: string | null }) {
+export function DeploymentMetaStrip({ projectName, deployment, endedAt }: { projectName: string; deployment: Deployment; endedAt: string | null }) {
     const hasLinks = !!(deployment.pull_request_url || deployment.job_url);
     const repo = deployment.git_repository_url && isSafeUrl(deployment.git_repository_url) ? deployment.git_repository_url : null;
     const cells: { k: string; v: React.ReactNode }[] = [
@@ -229,6 +262,26 @@ export function DeploymentMetaStrip({ deployment, endedAt }: { deployment: Deplo
         { k: 'Duration', v: <span className="mono">{formatDuration(deployment.created, endedAt)}</span> },
         { k: 'Image', v: <span className="mono" title={deployment.image}>{shortImage(deployment.image)}</span> },
     ];
+    if (deployment.git_revision) {
+        const href = commitUrl(repo ?? undefined, deployment.git_revision);
+        const sha = shortRevision(deployment.git_revision);
+        cells.splice(1, 0, {
+            k: 'Commit',
+            v: <>
+                {href ? <a className="r-link mono" href={href} target="_blank" rel="noopener noreferrer" title={deployment.git_revision}>{sha}</a>
+                    : <span className="mono" title={deployment.git_revision}>{sha}</span>}
+                {deployment.git_branch && <span className="muted"> on <span className="mono">{deployment.git_branch}</span></span>}
+                {deployment.git_dirty && <span className="r-dirty" title="Built from a working tree with uncommitted changes; the commit alone does not reproduce this image">+ uncommitted</span>}
+            </>,
+        });
+    }
+    if (deployment.source_deployment_id) {
+        const href = `/deployment/${projectName}/${deployment.source_deployment_id}`;
+        cells.push({
+            k: 'Created from',
+            v: <a className="r-link mono" href={href} onClick={e => { if (e.button !== 0 || e.metaKey || e.ctrlKey) return; e.preventDefault(); navigate(href); }}>{deployment.source_deployment_id}</a>,
+        });
+    }
     return (
         <div className="r-meta-strip">
             {cells.map(c => (

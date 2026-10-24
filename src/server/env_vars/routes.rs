@@ -36,6 +36,10 @@ pub fn routes() -> Router<AppState> {
             get(handlers::list_deployment_env_vars),
         )
         .route(
+            "/projects/{project_id_or_name}/deployments/{deployment_id}/env/diff",
+            get(handlers::diff_deployment_env_vars),
+        )
+        .route(
             "/projects/{project_id_or_name}/deployments/{deployment_id}/env/{key}/value",
             get(handlers::get_deployment_env_var_value),
         )

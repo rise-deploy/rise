@@ -239,7 +239,12 @@ fn classify(method: &Method, path: &str) -> Rule {
         // the project-wide ones, and may decrypt secrets: the handler filters
         // per variable.
         ("GET", "/projects/{project_id_or_name}/env")
-        | ("GET", "/projects/{project_id_or_name}/env/preview") => Handler,
+        | ("GET", "/projects/{project_id_or_name}/env/preview")
+        // Compares a deployment's snapshot with another environment's current
+        // variables: both sides are filtered per variable in the handler.
+        | ("GET", "/projects/{project_id_or_name}/deployments/{deployment_id}/env/diff") => {
+            Handler
+        }
         ("PUT", "/projects/{project_id_or_name}/env/{key}") => {
             OnEnvVar(op(Update, EnvironmentVariable))
         }
@@ -424,8 +429,7 @@ async fn project_name(state: &AppState, param: Option<String>) -> Result<String,
 }
 
 /// The environment a deployment is bound to, by name. A deployment that
-/// doesn't exist, or has no environment, has none: only a project-wide grant
-/// covers it.
+/// doesn't exist has none: only a project-wide grant covers it.
 async fn deployment_environment(
     state: &AppState,
     project: &str,
@@ -445,7 +449,7 @@ async fn deployment_environment(
         deployments::find_by_project_and_deployment_id(&state.db_pool, project.id, deployment_id)
             .await
             .map_err(lookup_failed)?
-            .and_then(|deployment| deployment.environment_id)
+            .map(|deployment| deployment.environment_id)
     else {
         return Ok(None);
     };
@@ -551,6 +555,7 @@ pub(crate) mod tests {
         for path in [
             "/projects/{project_id_or_name}/env",
             "/projects/{project_id_or_name}/env/preview",
+            "/projects/{project_id_or_name}/deployments/{deployment_id}/env/diff",
         ] {
             assert_eq!(classify(&Method::GET, path), Rule::Handler);
         }

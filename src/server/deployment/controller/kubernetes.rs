@@ -58,11 +58,10 @@ impl DeploymentBackend for KubernetesBackend {
         project: &Project,
     ) -> Result<DeploymentUrls> {
         // Load environment info if the deployment has one
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
 
         // All envs are needed so `compute_deployment_urls` can suppress a DG URL
         // whose host would collide with another env's URL (see

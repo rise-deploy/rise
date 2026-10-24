@@ -105,6 +105,12 @@ pub async fn create_environment(
         }
     })?;
 
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
+    }
+
     tracing::info!(
         "Created environment '{}' for project '{}'",
         env.name,
@@ -344,6 +350,12 @@ pub async fn update_environment(
         .internal_err("Failed to update deployment constraints")?;
     }
 
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
+    }
+
     tracing::info!(
         "Updated environment '{}' in project '{}'",
         updated.name,
@@ -384,6 +396,22 @@ pub async fn delete_environment(
         ));
     }
 
+    // Deleting an environment deletes its deployments; running ones are
+    // stopped first, so their workloads are torn down by the controller.
+    let live = crate::db::deployments::count_live_for_environment(&state.db_pool, env.id)
+        .await
+        .internal_err("Failed to count the environment's deployments")?;
+    if live > 0 {
+        return Err(ServerError::conflict(format!(
+            "Environment '{}' has {} deployment{} that {} not stopped. Stop {} first; deleting the environment deletes its deployment history.",
+            env_name,
+            live,
+            if live == 1 { "" } else { "s" },
+            if live == 1 { "is" } else { "are" },
+            if live == 1 { "it" } else { "them" },
+        )));
+    }
+
     let deleted = db_environments::delete(&state.db_pool, env.id)
         .await
         .internal_err("Failed to delete environment")?;
@@ -393,6 +421,12 @@ pub async fn delete_environment(
             "Environment '{}' not found",
             env_name
         )));
+    }
+
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
     }
 
     tracing::info!(
