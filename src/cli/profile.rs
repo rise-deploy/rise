@@ -8,7 +8,7 @@
 
 use crate::config::Config;
 use anyhow::Result;
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 
 /// List all registered profiles, marking which one is currently active.
 pub fn list_profiles() -> Result<()> {
@@ -20,8 +20,7 @@ pub fn list_profiles() -> Result<()> {
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("").add_attribute(Attribute::Bold),
             Cell::new("NAME").add_attribute(Attribute::Bold),

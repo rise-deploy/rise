@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH resolved AS (\n            SELECT DISTINCT ON (key) key, value, is_secret, is_protected,\n                CASE WHEN environment_id IS NOT NULL THEN $4 ELSE 'global' END as source\n            FROM project_env_vars\n            WHERE project_id = $2 AND (environment_id IS NULL OR environment_id = $3)\n            ORDER BY key, CASE WHEN environment_id IS NOT NULL THEN 0 ELSE 1 END\n        )\n        INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)\n        SELECT $1, key, value, is_secret, is_protected, source FROM resolved\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fc4b070a90e6a9311c45a3ceb9e900522d61b4301e6aad9f596074157d4db527"
+}

@@ -105,7 +105,6 @@ When `-E` is omitted, Rise resolves the target environment in order:
 
 1. **`rise.toml` default** — if a `rise.toml` is present and one of its `[environments.<name>]` sections has `default = true`, that environment name is sent to the server.
 2. **Server auto-resolve** — if no environment is specified by the client, the server picks one based on how many environments the project has:
-   - **0 environments**: deploys to the `default` group with no environment association.
    - **1 environment**: uses that environment and its primary group.
    - **2 or more environments**: returns an error — you must pass `-E` explicitly.
 
@@ -147,7 +146,7 @@ Each deployment gets a URL based on how it is associated with environments and g
 |----------------|-------------|---------|
 | Production environment | Project's main URL (and any custom domain) | `my-app.apps.rise.example.com` |
 | Non-production environment | Environment-specific URL | `staging--my-app.preview.rise.example.com` |
-| No environment (group only) | Group-specific staging URL | `mr--123--my-app.preview.rise.example.com` |
+| Any other group (e.g. previews) | Group-specific staging URL | `mr--123--my-app.preview.rise.example.com` |
 
 The exact URL patterns depend on how your Rise platform is configured — contact your operator if the URLs don't match what you expect. Custom domains only apply to deployments in the production environment.
 

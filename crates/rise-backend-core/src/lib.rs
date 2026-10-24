@@ -42,6 +42,7 @@ pub mod system_env;
 pub mod token_ttl;
 pub mod url_builder;
 
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 
 pub use backend::{DeploymentBackend, DeploymentUrls};

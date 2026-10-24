@@ -1961,7 +1961,7 @@ mod tests {
             created_by_id: uuid::Uuid::nil(),
             status: crate::db::models::DeploymentStatus::Healthy,
             deployment_group: "default".to_string(),
-            environment_id: None,
+            environment_id: uuid::Uuid::nil(),
             expires_at: None,
             termination_reason: None,
             completed_at: None,
@@ -2556,7 +2556,7 @@ mod tests {
         let environments = vec![environment.clone()];
         let mut deployment = test_deployment();
         deployment.deployment_group = "staging".to_string();
-        deployment.environment_id = Some(environment.id);
+        deployment.environment_id = environment.id;
         let before = builder.compute_deployment_urls(
             &project,
             &deployment,

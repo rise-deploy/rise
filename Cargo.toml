@@ -41,7 +41,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [package]
 name = "rise-deploy"
-version = "0.23.0-rc18"
+version = "0.23.0-rc19"
 publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -177,7 +177,7 @@ urlencoding = "2.1"
 
 # CLI-only dependencies
 clap = { version = "4.5.53", features = ["derive"], optional = true }
-comfy-table = { version = "7.1", optional = true }
+comfy-table = { version = "8.0", optional = true }
 dirs = { version = "7.0", optional = true }
 rpassword = { version = "7.4", optional = true }
 tempfile = { version = "3.0", optional = true }
@@ -225,7 +225,7 @@ aws-sdk-sts = { version = "1.80", default-features = false, features = ["default
 
 # Kubernetes feature dependencies
 kube = { version = "4", features = ["client", "derive"], optional = true }
-k8s-openapi = { version = "0.27", features = ["v1_31", "schemars"], optional = true }
+k8s-openapi = { version = "0.28", features = ["v1_32", "schemars"], optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 
 # Docker runtime feature dependency (Traefik routing)

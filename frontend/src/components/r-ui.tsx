@@ -917,11 +917,11 @@ export function Select(props: {
 }
 
 // ---------- SearchInput ----------
-export function SearchInput({ value, onChange, placeholder, style }: { value: string; onChange: (v: string) => void; placeholder?: string; style?: React.CSSProperties }) {
+export function SearchInput({ value, onChange, placeholder, style, label }: { value: string; onChange: (v: string) => void; placeholder?: string; style?: React.CSSProperties; label?: string }) {
     return (
         <div className="r-input" style={style}>
             <Icon name="search" size={13} />
-            <input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} />
+            <input type="search" value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} aria-label={label ?? placeholder ?? 'Search'} />
         </div>
     );
 }

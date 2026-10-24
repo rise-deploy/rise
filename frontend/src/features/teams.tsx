@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
+import { errorText, isApiError } from '../lib/api-error';
 import { navigate } from '../lib/navigation';
 import { formatRelativeTimeRounded } from '../lib/utils';
 import { useIsMobile } from '../lib/use-media';
@@ -361,8 +362,7 @@ function AddPersonModal({ open, onClose, team, knownEmails, onAdd }: {
             }
             if (await onAdd(user.id, user.email, role)) onClose();
         } catch (err) {
-            const msg = (err as Error).message;
-            showToast(msg.includes('404') ? `No Rise account for ${value} — they need to sign in to Rise once first` : `Failed to add ${value}: ${msg}`, 'error');
+            showToast(isApiError(err, 404) ? `No Rise account for ${value} — they need to sign in to Rise once first` : `Failed to add ${value}: ${errorText(err)}`, 'error');
         } finally {
             setBusy(false);
         }

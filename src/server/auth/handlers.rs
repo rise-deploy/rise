@@ -1010,18 +1010,15 @@ pub async fn signin_page(
 /// This allows the OAuth flow to use the actual request host (e.g., custom domain)
 /// instead of the configured public_url.
 ///
+/// The scheme is the configured `ingress_schema`, not `X-Forwarded-Proto`: behind
+/// a load balancer that terminates TLS, the proxy in front of Rise only sees
+/// plain HTTP and reports `http` for a request the browser made over `https`.
+///
 /// Falls back to the configured public_url if no valid host header is present.
 fn extract_request_base_url(headers: &HeaderMap, state: &AppState) -> String {
-    // Get Host header
     if let Some(host) = headers.get("host") {
         if let Ok(host_str) = host.to_str() {
-            // Get X-Forwarded-Proto header (set by Nginx ingress)
-            let scheme = headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("http");
-
-            return format!("{}://{}", scheme, host_str);
+            return format!("{}://{}", state.ingress_schema, host_str);
         }
     }
 
@@ -1604,18 +1601,28 @@ fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
 /// plane would set the cookie on the wrong host and loop.
 ///
 /// Traefik routes `PathPrefix('/.rise')` on every host to the Rise backend, so
-/// `{X-Forwarded-Proto}://{X-Forwarded-Host}/.rise/auth/signin` is served by the
-/// backend even though the host is the app's. The original request URL is
-/// reconstructed from `X-Forwarded-Proto` + `X-Forwarded-Host` +
-/// `X-Forwarded-Uri` and embedded as `redirect` so the user returns to where
-/// they started after signing in.
+/// `{scheme}://{X-Forwarded-Host}/.rise/auth/signin` is served by the backend
+/// even though the host is the app's. The original request URL is
+/// reconstructed from `scheme` + `X-Forwarded-Host` + `X-Forwarded-Uri` and
+/// embedded as `redirect` so the user returns to where they started after
+/// signing in.
+///
+/// `scheme` is the configured `ingress_schema`. `X-Forwarded-Proto` is not
+/// usable: forwardAuth derives it from Traefik's own connection, which is plain
+/// HTTP behind a TLS-terminating load balancer. Trusting the incoming header
+/// instead (`trustForwardHeader`) is not an option either — it would also trust
+/// a client-supplied `X-Forwarded-Uri`, which `allowlist_path` relies on.
 ///
 /// Falls back to the control-plane `signin_base` URL only when
 /// `X-Forwarded-Host` is absent (degraded path — the same-host redirect cannot
 /// be constructed without the forwarded host).
-fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderMap) -> String {
+fn build_signin_redirect_url(
+    signin_base: &str,
+    scheme: &str,
+    project: &str,
+    headers: &HeaderMap,
+) -> String {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    let proto = header("x-forwarded-proto").unwrap_or("http");
     let host = header("x-forwarded-host");
     let uri = header("x-forwarded-uri").unwrap_or("/");
 
@@ -1623,9 +1630,9 @@ fn build_signin_redirect_url(signin_base: &str, project: &str, headers: &HeaderM
 
     if let Some(host) = host {
         // Same-host signin page (served by the backend via the /.rise router).
-        let original = format!("{proto}://{host}{uri}");
+        let original = format!("{scheme}://{host}{uri}");
         format!(
-            "{proto}://{host}/.rise/auth/signin?project={enc_project}&redirect={}",
+            "{scheme}://{host}/.rise/auth/signin?project={enc_project}&redirect={}",
             urlencoding::encode(&original)
         )
     } else {
@@ -1700,8 +1707,12 @@ pub async fn ingress_auth(
     // the browser); otherwise keep the bare 401 nginx expects.
     let unauthenticated = |reason: &str| -> Response {
         if params.signin_redirect {
-            let location =
-                build_signin_redirect_url(&state.signin_base_url, &params.project, &headers);
+            let location = build_signin_redirect_url(
+                &state.signin_base_url,
+                &state.ingress_schema,
+                &params.project,
+                &headers,
+            );
             tracing::debug!(
                 project = %params.project,
                 location = %location,
@@ -2111,10 +2122,10 @@ mod tests {
     #[test]
     fn signin_redirect_url_reconstructs_from_forwarded_headers() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "secret.rise.localhost".parse().unwrap());
         headers.insert("x-forwarded-uri", "/dashboard?tab=1".parse().unwrap());
-        let url = build_signin_redirect_url("http://localhost:3000", "secret app", &headers);
+        let url =
+            build_signin_redirect_url("http://localhost:3000", "https", "secret app", &headers);
         // Same-host signin page served by the /.rise router on the app host,
         // project (URL-encoded), and redirect (full original URL, encoded).
         assert!(
@@ -2129,10 +2140,9 @@ mod tests {
         // cookie lands on the host forwardAuth reads — never on the control
         // plane host from signin_base.
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
         headers.insert("x-forwarded-uri", "/".parse().unwrap());
-        let url = build_signin_redirect_url("http://rise.localhost:3000", "app", &headers);
+        let url = build_signin_redirect_url("http://rise.localhost:3000", "https", "app", &headers);
         let signin_host = url_host(&url);
         assert_eq!(signin_host, "app.rise.localhost");
         assert_ne!(signin_host, "rise.localhost:3000");
@@ -2140,9 +2150,24 @@ mod tests {
     }
 
     #[test]
+    fn signin_redirect_url_uses_configured_scheme_over_forwarded_proto() {
+        // Behind a TLS-terminating load balancer forwardAuth reports `http`; the
+        // browser is on https, and so must the sign-in page and return URL be.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "http".parse().unwrap());
+        headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
+        headers.insert("x-forwarded-uri", "/docs".parse().unwrap());
+        let url = build_signin_redirect_url("http://rise.localhost:3000", "https", "app", &headers);
+        assert!(url.starts_with("https://app.rise.localhost/.rise/auth/signin?project=app"));
+        assert!(url.contains("&redirect=https%3A%2F%2Fapp.rise.localhost%2Fdocs"));
+        assert!(!url.contains("http%3A"));
+    }
+
+    #[test]
     fn signin_redirect_url_falls_back_without_forwarded_host() {
         let headers = HeaderMap::new();
-        let url = build_signin_redirect_url("http://rise.localhost:3000/", "app", &headers);
+        let url =
+            build_signin_redirect_url("http://rise.localhost:3000/", "https", "app", &headers);
         // No forwarded host → degraded fallback to the control-plane signin page.
         // Trailing slash on base is trimmed; no redirect param when host absent.
         assert_eq!(

@@ -123,6 +123,20 @@ pub struct Deployment {
     pub pull_request_url: Option<String>, // URL to the PR/MR associated with this deployment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_repository_url: Option<String>, // HTTPS URL of the Git repository this deployment was created from
+    /// Commit the image was built from, as the CLI reported it. Inherited from
+    /// the source deployment for redeploys, rollbacks and promotions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// The build ran on a working tree with uncommitted changes, so the image
+    /// cannot be reproduced from `git_revision` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
+    /// `deployment_id` of the deployment this one was created from (redeploy,
+    /// rollback, promote), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deployment_id: Option<String>,
     #[serde(default)]
     pub created: String,
     #[serde(default)]

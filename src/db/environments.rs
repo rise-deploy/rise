@@ -352,6 +352,21 @@ where
     .await
 }
 
+/// The project's `production` environment, created on first use, for tests
+/// that need a deployment's required environment without caring which.
+#[cfg(test)]
+pub async fn test_environment_id(pool: &PgPool, project_id: Uuid) -> Uuid {
+    match find_by_name(pool, project_id, "production").await.unwrap() {
+        Some(env) => env.id,
+        None => {
+            create_default_for_project(pool, project_id)
+                .await
+                .unwrap()
+                .id
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { api } from '../lib/api';
+import { audience, sortByRestrictiveness, widensAccess } from '../lib/access';
 import { CONFIG } from '../lib/config';
 import { navigate } from '../lib/navigation';
 import { useToast } from '../components/toast';
@@ -33,8 +34,11 @@ const KIND_META = {
 };
 
 // Access tab component - manages access class and unified user/team/service-account access
-export function AppUsersList({ projectName, project, accessClasses, currentUserEmail, onProjectUpdated }) {
+export function AppUsersList({ projectName, project, accessClasses: unsortedAccessClasses, currentUserEmail, currentUserId, currentUserIsAdmin, onProjectUpdated }) {
+    const accessClasses = sortByRestrictiveness(unsortedAccessClasses || []);
     const [teams, setTeams] = useState([]);
+    const [pendingAccess, setPendingAccess] = useState(null);
+    const [changingAccess, setChangingAccess] = useState(false);
     const [serviceAccounts, setServiceAccounts] = useState([]);
     const [environments, setEnvironments] = useState([]);
     const [typeFilter, setTypeFilter] = useState('all');
@@ -113,17 +117,37 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
         api.getProjectEnvironments(projectName).then(d => setEnvironments(d || [])).catch(() => {});
     }, [projectName]);
 
-    const handleChangeAccessClass = async (newAccessClass) => {
-        if (!project || !newAccessClass || newAccessClass === project.access_class) return;
+    const applyAccessClass = async (newAccessClass) => {
+        setChangingAccess(true);
         try {
             await api.updateProject(projectName, { access_class: newAccessClass });
             const ac = accessClasses.find(a => a.id === newAccessClass);
             showToast(`Access class updated to ${ac ? ac.display_name : newAccessClass}`, 'success');
+            setPendingAccess(null);
             onProjectUpdated();
         } catch (err) {
             showToast(`Failed to update access class: ${err.message}`, 'error');
+        } finally {
+            setChangingAccess(false);
         }
     };
+
+    // Every change is confirmed: operators configure access classes freely
+    // (ingress class, annotations such as IP allowlists), so only the sign-in
+    // requirement can be compared, and a class with the same requirement can
+    // still be reachable from a wider network.
+    const handleChangeAccessClass = (newAccessClass) => {
+        if (!project || !newAccessClass || newAccessClass === project.access_class) return;
+        const to = accessClasses.find(a => a.id === newAccessClass);
+        setPendingAccess(to || { id: newAccessClass, display_name: newAccessClass });
+    };
+    const pendingWidens = pendingAccess
+        ? widensAccess(accessClasses.find(a => a.id === project?.access_class), pendingAccess)
+        : false;
+
+    // A project can move to a team its owner belongs to; admins may pick any team.
+    const ownableTeams = currentUserIsAdmin ? teams : teams.filter(t =>
+        [...(t.owners || []), ...(t.members || [])].some(m => (currentUserId && m.id === currentUserId) || m.email === currentUserEmail));
 
     const handleEditOwner = () => {
         if (owner?.email) {
@@ -482,7 +506,7 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
                         <RCombobox
                             value={newOwnerTeamId}
                             onChange={setNewOwnerTeamId}
-                            options={teams.map(t => ({ value: t.id, label: t.name }))}
+                            options={ownableTeams.map(t => ({ value: t.id, label: t.name }))}
                             placeholder="Select a team"
                             searchPlaceholder="Search teams…"
                         />
@@ -594,6 +618,19 @@ export function AppUsersList({ projectName, project, accessClasses, currentUserE
                     </Suspense>
                 </RField>
             </RModal>
+
+            <RConfirmDialog
+                isOpen={!!pendingAccess}
+                onClose={() => setPendingAccess(null)}
+                onConfirm={() => pendingAccess && applyAccessClass(pendingAccess.id)}
+                title={`Change access to ${pendingAccess?.display_name || ''}?`}
+                message={pendingAccess
+                    ? `${pendingAccess.description ? `${pendingAccess.display_name}: ${pendingAccess.description}. ` : ''}${pendingWidens ? `Sign-in: ${audience(pendingAccess)} will be able to reach ${project?.primary_url || project?.default_url || projectName}. ` : ''}This applies to every environment of ${projectName}.`
+                    : ''}
+                confirmText="Change access"
+                confirmTone={pendingWidens ? 'danger' : 'primary'}
+                loading={changingAccess}
+            />
 
             <RConfirmDialog
                 isOpen={!!confirmRemove}
