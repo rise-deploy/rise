@@ -7,7 +7,7 @@
       "rise-indigo": {
         "role": "primary",
         "displayName": "Rise Indigo",
-        "canonical": "oklch(0.55 0.17 270)",
+        "canonical": "oklch(0.52 0.17 270)",
         "tonalRamp": [
           "oklch(0.15 0.17 270)",
           "oklch(0.26 0.17 270)",
@@ -157,7 +157,7 @@
       "ink-muted": {
         "role": "neutral",
         "displayName": "Ink Muted",
-        "canonical": "oklch(0.50 0.006 80)",
+        "canonical": "oklch(0.47 0.006 80)",
         "tonalRamp": [
           "oklch(0.15 0.006 80)",
           "oklch(0.26 0.006 80)",
@@ -172,7 +172,7 @@
       "ink-soft": {
         "role": "neutral",
         "displayName": "Ink Soft",
-        "canonical": "oklch(0.62 0.006 80)",
+        "canonical": "oklch(0.53 0.006 80)",
         "tonalRamp": [
           "oklch(0.15 0.006 80)",
           "oklch(0.26 0.006 80)",
@@ -187,7 +187,7 @@
       "healthy": {
         "role": "status",
         "displayName": "Healthy",
-        "canonical": "oklch(0.62 0.13 150)",
+        "canonical": "oklch(0.50 0.13 150)",
         "tonalRamp": [
           "oklch(0.15 0.13 150)",
           "oklch(0.26 0.13 150)",
@@ -217,7 +217,7 @@
       "caution": {
         "role": "status",
         "displayName": "Caution",
-        "canonical": "oklch(0.62 0.12 70)",
+        "canonical": "oklch(0.52 0.12 70)",
         "tonalRamp": [
           "oklch(0.15 0.12 70)",
           "oklch(0.26 0.12 70)",
@@ -247,7 +247,7 @@
       "failing": {
         "role": "status",
         "displayName": "Failing",
-        "canonical": "oklch(0.58 0.18 25)",
+        "canonical": "oklch(0.52 0.18 25)",
         "tonalRamp": [
           "oklch(0.15 0.18 25)",
           "oklch(0.26 0.18 25)",
@@ -464,7 +464,7 @@
       "refersTo": "button-primary",
       "description": "The one main action in a region: Redeploy, Promote, Save.",
       "html": "<button class=\"ds-btn-primary\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15\"/></svg>Redeploy production</button>",
-      "css": ".ds-btn-primary { display:inline-flex; align-items:center; gap:7px; padding:7px 12px; border-radius:4px; border:1px solid transparent; background:var(--accent, oklch(0.55 0.17 270)); color:var(--accent-fg, #fff); font:500 12.75px/1.2 Inter, system-ui, sans-serif; white-space:nowrap; cursor:pointer; transition:filter .14s; } .ds-btn-primary:hover { filter:brightness(1.06); } .ds-btn-primary:focus-visible { outline:2px solid var(--accent, oklch(0.55 0.17 270)); outline-offset:2px; }"
+      "css": ".ds-btn-primary { display:inline-flex; align-items:center; gap:7px; padding:7px 12px; border-radius:4px; border:1px solid transparent; background:var(--accent, oklch(0.52 0.17 270)); color:var(--accent-fg, #fff); font:500 12.75px/1.2 Inter, system-ui, sans-serif; white-space:nowrap; cursor:pointer; transition:filter .14s; } .ds-btn-primary:hover { filter:brightness(1.06); } .ds-btn-primary:focus-visible { outline:2px solid var(--accent, oklch(0.52 0.17 270)); outline-offset:2px; }"
     },
     {
       "name": "Secondary Button",
@@ -472,7 +472,7 @@
       "refersTo": "button-secondary",
       "description": "Every other action: Roll back, Logs, Cancel.",
       "html": "<button class=\"ds-btn\">Roll back</button>",
-      "css": ".ds-btn { display:inline-flex; align-items:center; gap:7px; padding:7px 12px; border-radius:4px; border:1px solid var(--border, oklch(0.84 0.005 80)); background:var(--surface, #fff); color:var(--text, oklch(0.20 0.006 80)); font:500 12.75px/1.2 Inter, system-ui, sans-serif; white-space:nowrap; cursor:pointer; transition:background .14s; } .ds-btn:hover { background:var(--hover, oklch(0.945 0.013 270)); } .ds-btn:focus-visible { outline:2px solid var(--accent, oklch(0.55 0.17 270)); outline-offset:2px; }"
+      "css": ".ds-btn { display:inline-flex; align-items:center; gap:7px; padding:7px 12px; border-radius:4px; border:1px solid var(--border, oklch(0.84 0.005 80)); background:var(--surface, #fff); color:var(--text, oklch(0.20 0.006 80)); font:500 12.75px/1.2 Inter, system-ui, sans-serif; white-space:nowrap; cursor:pointer; transition:background .14s; } .ds-btn:hover { background:var(--hover, oklch(0.945 0.013 270)); } .ds-btn:focus-visible { outline:2px solid var(--accent, oklch(0.52 0.17 270)); outline-offset:2px; }"
     },
     {
       "name": "Field",
@@ -480,7 +480,7 @@
       "refersTo": "field",
       "description": "Text input; mono for keys, values and image references.",
       "html": "<input class=\"ds-field\" placeholder=\"DATABASE_URL\" />",
-      "css": ".ds-field { width:260px; padding:8px 11px; border-radius:4px; border:1px solid var(--border, oklch(0.84 0.005 80)); background:var(--surface, #fff); color:var(--text, oklch(0.20 0.006 80)); font:12.5px/1.4 'JetBrains Mono', ui-monospace, monospace; transition:border .14s, box-shadow .14s; } .ds-field::placeholder { color:var(--text-soft, oklch(0.62 0.006 80)); } .ds-field:focus { outline:none; border-color:var(--accent, oklch(0.55 0.17 270)); box-shadow:0 0 0 3px color-mix(in oklch, var(--accent, oklch(0.55 0.17 270)) 16%, transparent); }"
+      "css": ".ds-field { width:260px; padding:8px 11px; border-radius:4px; border:1px solid var(--border, oklch(0.84 0.005 80)); background:var(--surface, #fff); color:var(--text, oklch(0.20 0.006 80)); font:12.5px/1.4 'JetBrains Mono', ui-monospace, monospace; transition:border .14s, box-shadow .14s; } .ds-field::placeholder { color:var(--text-soft, oklch(0.53 0.006 80)); } .ds-field:focus { outline:none; border-color:var(--accent, oklch(0.52 0.17 270)); box-shadow:0 0 0 3px color-mix(in oklch, var(--accent, oklch(0.52 0.17 270)) 16%, transparent); }"
     },
     {
       "name": "Status Badges",
@@ -488,7 +488,7 @@
       "refersTo": "status-healthy",
       "description": "The four status tones every badge and dot uses.",
       "html": "<span class=\"ds-status ok\"><i></i>Healthy</span> <span class=\"ds-status run\"><i></i>Deploying</span> <span class=\"ds-status err\"><i></i>Deploy failed</span> <span class=\"ds-status off\"><i></i>Superseded</span>",
-      "css": ".ds-status { display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border-radius:4px; font:500 11.75px/1.45 Inter, system-ui, sans-serif; margin-right:6px; } .ds-status i { width:6px; height:6px; border-radius:50%; background:currentColor; } .ds-status.ok { color:var(--ok, oklch(0.62 0.13 150)); background:var(--ok-bg, oklch(0.96 0.04 150)); } .ds-status.run { color:var(--accent, oklch(0.55 0.17 270)); background:var(--accent-soft, oklch(0.95 0.04 270)); } .ds-status.run i { animation:ds-pulse 1.2s infinite; } .ds-status.err { color:var(--err, oklch(0.58 0.18 25)); background:var(--err-bg, oklch(0.96 0.04 25)); } .ds-status.off { color:var(--text-soft, oklch(0.62 0.006 80)); background:var(--surface-2, oklch(0.96 0.012 270)); border:1px solid var(--border-faint, oklch(0.89 0.01 270)); } @keyframes ds-pulse { 50% { opacity:.45; } }"
+      "css": ".ds-status { display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border-radius:4px; font:500 11.75px/1.45 Inter, system-ui, sans-serif; margin-right:6px; } .ds-status i { width:6px; height:6px; border-radius:50%; background:currentColor; } .ds-status.ok { color:var(--ok, oklch(0.50 0.13 150)); background:var(--ok-bg, oklch(0.96 0.04 150)); } .ds-status.run { color:var(--accent, oklch(0.52 0.17 270)); background:var(--accent-soft, oklch(0.95 0.04 270)); } .ds-status.run i { animation:ds-pulse 1.2s infinite; } .ds-status.err { color:var(--err, oklch(0.52 0.18 25)); background:var(--err-bg, oklch(0.96 0.04 25)); } .ds-status.off { color:var(--text-soft, oklch(0.53 0.006 80)); background:var(--surface-2, oklch(0.96 0.012 270)); border:1px solid var(--border-faint, oklch(0.89 0.01 270)); } @keyframes ds-pulse { 50% { opacity:.45; } }"
     },
     {
       "name": "Environment Tag",
@@ -496,7 +496,7 @@
       "refersTo": "env-tag",
       "description": "Compact environment chip with the environment's colour glyph; production in indigo.",
       "html": "<span class=\"ds-env prod\"><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#34d399\" stroke-width=\"1.7\"><path d=\"M12 2 2 7l10 5 10-5-10-5ZM2 17l10 5 10-5M2 12l10 5 10-5\"/></svg>production</span> <span class=\"ds-env\"><svg width=\"10\" height=\"10\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"#fbbf24\" stroke-width=\"1.7\"><path d=\"M12 2 2 7l10 5 10-5-10-5ZM2 17l10 5 10-5M2 12l10 5 10-5\"/></svg>staging</span>",
-      "css": ".ds-env { display:inline-flex; align-items:center; gap:4px; padding:0 6px; border-radius:3px; font:11px/1.6 Inter, system-ui, sans-serif; color:var(--text-muted, oklch(0.50 0.006 80)); background:var(--surface-2, oklch(0.96 0.012 270)); margin-right:6px; } .ds-env.prod { color:var(--accent, oklch(0.55 0.17 270)); background:var(--accent-soft, oklch(0.95 0.04 270)); }"
+      "css": ".ds-env { display:inline-flex; align-items:center; gap:4px; padding:0 6px; border-radius:3px; font:11px/1.6 Inter, system-ui, sans-serif; color:var(--text-muted, oklch(0.47 0.006 80)); background:var(--surface-2, oklch(0.96 0.012 270)); margin-right:6px; } .ds-env.prod { color:var(--accent, oklch(0.52 0.17 270)); background:var(--accent-soft, oklch(0.95 0.04 270)); }"
     },
     {
       "name": "Sidebar Navigation",
@@ -504,7 +504,7 @@
       "refersTo": "nav-item-active",
       "description": "Project-scoped section nav with counts and the active marker.",
       "html": "<nav class=\"ds-nav\"><a class=\"on\" href=\"#\">Overview</a><a href=\"#\">Deployments<span>8</span></a><a href=\"#\">Environments<span>2</span></a></nav>",
-      "css": ".ds-nav { display:flex; flex-direction:column; gap:1px; width:216px; font:13.5px Inter, system-ui, sans-serif; } .ds-nav a { position:relative; display:flex; align-items:center; padding:7px 10px; border-radius:4px; color:var(--text-muted, oklch(0.50 0.006 80)); text-decoration:none; transition:background .14s, color .14s; } .ds-nav a:hover { background:var(--hover, oklch(0.945 0.013 270)); color:var(--text, oklch(0.20 0.006 80)); } .ds-nav a.on { background:var(--accent-soft, oklch(0.95 0.04 270)); color:var(--accent, oklch(0.55 0.17 270)); font-weight:600; } .ds-nav a.on::before { content:''; position:absolute; left:0; top:50%; transform:translateY(-50%); width:3px; height:14px; border-radius:2px; background:var(--accent, oklch(0.55 0.17 270)); } .ds-nav span { margin-left:auto; font-size:10.5px; padding:1px 6px; border-radius:3px; background:var(--surface-2, oklch(0.96 0.012 270)); color:var(--text-soft, oklch(0.62 0.006 80)); } .ds-nav a:focus-visible { outline:2px solid var(--accent, oklch(0.55 0.17 270)); outline-offset:-2px; }"
+      "css": ".ds-nav { display:flex; flex-direction:column; gap:1px; width:216px; font:13.5px Inter, system-ui, sans-serif; } .ds-nav a { position:relative; display:flex; align-items:center; padding:7px 10px; border-radius:4px; color:var(--text-muted, oklch(0.47 0.006 80)); text-decoration:none; transition:background .14s, color .14s; } .ds-nav a:hover { background:var(--hover, oklch(0.945 0.013 270)); color:var(--text, oklch(0.20 0.006 80)); } .ds-nav a.on { background:var(--accent-soft, oklch(0.95 0.04 270)); color:var(--accent, oklch(0.52 0.17 270)); font-weight:600; } .ds-nav a.on::before { content:''; position:absolute; left:0; top:50%; transform:translateY(-50%); width:3px; height:14px; border-radius:2px; background:var(--accent, oklch(0.52 0.17 270)); } .ds-nav span { margin-left:auto; font-size:10.5px; padding:1px 6px; border-radius:3px; background:var(--surface-2, oklch(0.96 0.012 270)); color:var(--text-soft, oklch(0.53 0.006 80)); } .ds-nav a:focus-visible { outline:2px solid var(--accent, oklch(0.52 0.17 270)); outline-offset:-2px; }"
     },
     {
       "name": "Panel with list rows",
@@ -512,7 +512,7 @@
       "refersTo": "panel",
       "description": "Flat panel; whole-row links separated by hairlines.",
       "html": "<div class=\"ds-panel\"><a class=\"ds-row\" href=\"#\"><i class=\"ok\"></i><code>20261004-1163c6</code><span>checkout-api:c659a33</span><em>52 minutes ago</em></a><a class=\"ds-row\" href=\"#\"><i class=\"err\"></i><code>20261004-1200c5</code><span>checkout-api:c559a1a</span><em>14 minutes ago</em></a></div>",
-      "css": ".ds-panel { width:520px; background:var(--surface, #fff); border:1px solid var(--border-faint, oklch(0.89 0.01 270)); border-radius:6px; overflow:hidden; font:13.5px Inter, system-ui, sans-serif; } .ds-row { display:flex; align-items:center; gap:12px; padding:11px 16px; color:var(--text, oklch(0.20 0.006 80)); text-decoration:none; border-top:1px solid var(--border-faint, oklch(0.89 0.01 270)); transition:background .14s; } .ds-row:first-child { border-top:none; } .ds-row:hover { background:var(--hover, oklch(0.945 0.013 270)); } .ds-row i { width:7px; height:7px; border-radius:50%; } .ds-row i.ok { background:var(--ok, oklch(0.62 0.13 150)); } .ds-row i.err { background:var(--err, oklch(0.58 0.18 25)); } .ds-row code { font:12px 'JetBrains Mono', monospace; color:var(--text-muted, oklch(0.50 0.006 80)); } .ds-row span { flex:1; } .ds-row em { font-style:normal; font-size:12px; color:var(--text-soft, oklch(0.62 0.006 80)); font-variant-numeric:tabular-nums; }"
+      "css": ".ds-panel { width:520px; background:var(--surface, #fff); border:1px solid var(--border-faint, oklch(0.89 0.01 270)); border-radius:6px; overflow:hidden; font:13.5px Inter, system-ui, sans-serif; } .ds-row { display:flex; align-items:center; gap:12px; padding:11px 16px; color:var(--text, oklch(0.20 0.006 80)); text-decoration:none; border-top:1px solid var(--border-faint, oklch(0.89 0.01 270)); transition:background .14s; } .ds-row:first-child { border-top:none; } .ds-row:hover { background:var(--hover, oklch(0.945 0.013 270)); } .ds-row i { width:7px; height:7px; border-radius:50%; } .ds-row i.ok { background:var(--ok, oklch(0.50 0.13 150)); } .ds-row i.err { background:var(--err, oklch(0.52 0.18 25)); } .ds-row code { font:12px 'JetBrains Mono', monospace; color:var(--text-muted, oklch(0.47 0.006 80)); } .ds-row span { flex:1; } .ds-row em { font-style:normal; font-size:12px; color:var(--text-soft, oklch(0.53 0.006 80)); font-variant-numeric:tabular-nums; }"
     }
   ],
   "narrative": {
