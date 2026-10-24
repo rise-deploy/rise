@@ -15,6 +15,9 @@ pub struct OAuthExtensionSpec {
     /// DEPRECATED: Will be auto-migrated to client_secret_encrypted by the reconciler.
     /// Kept for deserialization only (existing DB records may still have this field).
     #[serde(default, skip_serializing)]
+    // Only reached from `main` (through the extension registry), which is not a
+    // dead-code root when the binary is built for tests.
+    #[cfg_attr(test, allow(dead_code))]
     pub client_secret_ref: Option<String>,
     /// Encrypted client secret stored directly in spec (preferred over client_secret_ref)
     #[serde(default, skip_serializing_if = "Option::is_none")]
