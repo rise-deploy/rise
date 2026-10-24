@@ -84,6 +84,9 @@ fn basic_client_credentials(client_id: &str, client_secret: &str) -> String {
 }
 
 /// Generate a secure random token for Rise client secret (32 bytes, base64url encoded)
+// Only reached from `main` (through the extension registry), which is not a
+// dead-code root when the binary is built for tests.
+#[cfg_attr(test, allow(dead_code))]
 fn generate_rise_client_secret() -> String {
     use base64::Engine;
     use rand::RngExt;
@@ -327,6 +330,9 @@ impl OAuthProvider {
     /// Migrate an extension from client_secret_ref to client_secret_encrypted.
     /// If the extension has client_secret_ref set but no client_secret_encrypted,
     /// resolves the env var value, encrypts it, updates the spec, and deletes the env var.
+    // Only reached from `main` (through the extension registry), which is not a
+    // dead-code root when the binary is built for tests.
+    #[cfg_attr(test, allow(dead_code))]
     async fn migrate_client_secret_ref(
         &self,
         ext: &crate::db::models::ProjectExtension,
@@ -403,6 +409,9 @@ impl OAuthProvider {
     }
 
     /// Handle deletion of an OAuth extension
+    // Only reached from `main` (through the extension registry), which is not a
+    // dead-code root when the binary is built for tests.
+    #[cfg_attr(test, allow(dead_code))]
     async fn reconcile_deletion(&self, ext: crate::db::models::ProjectExtension) -> Result<()> {
         use crate::db::extensions as db_extensions;
 

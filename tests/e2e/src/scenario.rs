@@ -1902,12 +1902,22 @@ impl Scenario for RouteAccessOverride {
 
         // The exact public route must bypass the gate. The sample app may return
         // 404 for `/public`; the contract under test is that the ingress forwards
-        // it instead of producing an auth response.
-        let public = b.ingress_get(&project, "/public", false, None)?;
+        // it instead of producing an auth response. On Kubernetes the public
+        // route is a separate Ingress that nginx can load after the private one;
+        // until then `/public` falls through to the gated `/` prefix, so poll.
+        let mut public_status = 0;
+        for _ in 0..45 {
+            if let Ok(r) = b.ingress_get(&project, "/public", false, None) {
+                public_status = r.status;
+                if !matches!(public_status, 302 | 401 | 403) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         anyhow::ensure!(
-            !matches!(public.status, 302 | 401 | 403),
-            "expected the exact `access = \"public\"` route to bypass auth, got {}",
-            public.status
+            !matches!(public_status, 0 | 302 | 401 | 403),
+            "expected the exact `access = \"public\"` route to bypass auth, got {public_status}"
         );
 
         // An authenticated request to the inherited root route passes the gate

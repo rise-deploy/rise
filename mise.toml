@@ -16,7 +16,7 @@ helm = "latest"
 # check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
 # `mise run terraform:check` in the same change.
 terraform = "1.16.5"
-rust = { version = "1.95.0", profile = "default" }
+rust = { version = "1.97.1", profile = "default" }
 kubectl = "latest"
 k9s = "latest"
 vault = "latest"
@@ -78,9 +78,9 @@ mise run backend:run "$backend"
 [tasks."sqlx:prepare"]
 description = "Prepare the SQLX query cache that needs to be committed for building with SQLX_OFFLINE=true."
 # Build the dependencies first: `sqlx prepare` collects the queries of every
-# crate it compiles, so the workspace crates that own their own query caches
-# (rise-runtime-sync, rise-resource-store-postgres) would otherwise land in
-# rise-deploy's when they aren't already built, e.g. on a cold CI cache.
+# crate it compiles, so rise-runtime-sync, which owns its own query cache,
+# would otherwise land in rise-deploy's when it isn't already built, e.g. on a
+# cold CI cache.
 run = [
     "cargo check --package rise-deploy --features cli,backend --all-targets",
     "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets",
@@ -93,21 +93,13 @@ run = "cargo deny check licenses sources"
 [tasks."sqlx:check"]
 description = "Check that all SQLX queries are valid."
 # Build the dependencies first: `sqlx prepare` collects the queries of every
-# crate it compiles, so the workspace crates that own their own query caches
-# (rise-runtime-sync, rise-resource-store-postgres) would otherwise land in
-# rise-deploy's when they aren't already built, e.g. on a cold CI cache.
+# crate it compiles, so rise-runtime-sync, which owns its own query cache,
+# would otherwise land in rise-deploy's when it isn't already built, e.g. on a
+# cold CI cache.
 run = [
     "cargo check --package rise-deploy --features cli,backend --all-targets",
     "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets",
 ]
-
-[tasks."resource-store-postgres:sqlx:prepare"]
-description = "Prepare the SQLX query cache for rise-resource-store-postgres (requires running DB)."
-run = "cargo sqlx prepare -- --package rise-resource-store-postgres --all-targets"
-
-[tasks."resource-store-postgres:sqlx:check"]
-description = "Verify the SQLX query cache for rise-resource-store-postgres is up to date."
-run = "cargo sqlx prepare --check -- --package rise-resource-store-postgres --all-targets"
 
 [tasks."runtime-sync:db:migrate"]
 description = "Create the runtime_sync schema/tables in the dev DB (needed before runtime-sync:sqlx:prepare)."

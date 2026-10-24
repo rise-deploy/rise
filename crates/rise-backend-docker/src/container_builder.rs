@@ -2,13 +2,15 @@
 //!
 //! Everything here is deterministic and daemon-free so it can be unit-tested:
 //! the reconciler resolves the dynamic inputs (env vars, image, URLs) and calls
-//! [`build_container`] to produce the [`bollard::container::Config`] plus the
+//! [`build_container`] to produce the [`ContainerCreateBody`] plus the
 //! container name and labels.
 
 use std::collections::HashMap;
 
-use bollard::container::Config;
-use bollard::secret::{EndpointSettings, HostConfig, RestartPolicy, RestartPolicyNameEnum};
+use bollard::models::{
+    ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, RestartPolicy,
+    RestartPolicyNameEnum,
+};
 
 use super::labels::{self, BookkeepingLabels};
 use rise_backend_core::quantity::{
@@ -98,7 +100,7 @@ pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> St
 /// create config (which already carries the network attachment).
 pub struct BuiltContainer {
     pub name: String,
-    pub config: Config<String>,
+    pub config: ContainerCreateBody,
 }
 
 /// Build the bollard create spec for one desired container.
@@ -256,8 +258,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     let (exposed_ports, port_bindings) = match publish_port {
         Some(port) => {
             let key = format!("{port}/tcp");
-            let mut exposed: HashMap<String, HashMap<(), ()>> = HashMap::new();
-            exposed.insert(key.clone(), HashMap::new());
+            let exposed = vec![key.clone()];
             let mut bindings: bollard::models::PortMap = HashMap::new();
             bindings.insert(
                 key,
@@ -285,14 +286,14 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         ..Default::default()
     };
 
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some(desired.image.clone()),
         env: if env.is_empty() { None } else { Some(env) },
         labels: Some(all_labels),
         exposed_ports,
         host_config: Some(host_config),
-        networking_config: Some(bollard::container::NetworkingConfig {
-            endpoints_config: endpoints,
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(endpoints),
         }),
         ..Default::default()
     };
@@ -538,6 +539,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .endpoints_config
+            .as_ref()
+            .unwrap()
             .get("rise_default")
             .unwrap()
             .aliases
@@ -576,6 +579,8 @@ mod tests {
                 .networking_config
                 .unwrap()
                 .endpoints_config
+                .as_ref()
+                .unwrap()
                 .get("rise_default")
                 .unwrap()
                 .aliases
@@ -607,6 +612,8 @@ mod tests {
                 .networking_config
                 .unwrap()
                 .endpoints_config
+                .as_ref()
+                .unwrap()
                 .get("rise_default")
                 .unwrap()
                 .aliases
@@ -904,7 +911,7 @@ mod tests {
             .exposed_ports
             .as_ref()
             .expect("exposed_ports must be set when publishing");
-        assert!(exposed.contains_key("8080/tcp"));
+        assert!(exposed.iter().any(|p| p == "8080/tcp"));
 
         let bindings = built
             .config

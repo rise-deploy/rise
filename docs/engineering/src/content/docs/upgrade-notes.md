@@ -31,6 +31,13 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Kubernetes 1.32 is the minimum supported version.** *Breaking.* Rise's
+  Kubernetes client now targets the 1.32 API, and the Helm chart declares
+  `kubeVersion: ">=1.32.0-0"`, so `helm install`/`helm upgrade` fails on older
+  clusters. Upgrade the cluster to 1.32 or newer before upgrading Rise. The
+  minimum follows the oldest version Rise's Kubernetes client types support and
+  will keep rising with them.
+
 - **Every deployment belongs to an environment.** *Action required.* A
   migration makes `deployments.environment_id` required. Deployments without
   one (from before environments existed, or left behind by a deleted
