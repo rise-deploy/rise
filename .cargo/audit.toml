@@ -1,12 +1,13 @@
 [advisories]
-# RUSTSEC-2023-0071 affects Marvin-attack timing side channels in RSA decryption.
-# Rise uses RSA for JWT signing/verification and key generation, and the remaining
-# transitive uses are either signature-oriented or build-time only. There is no
-# stable fixed release of the rsa crate yet.
-#
-# RUSTSEC-2026-0387: timing variability in crypto-bigint 0.5, which aws-sigv4
-# pulls in only for SigV4a (ECDSA P-256) signing, enabled by aws-sdk-sts's
-# default features. Rise signs AWS requests with SigV4 (HMAC) only. Even the
-# latest aws-sigv4 still depends on crypto-bigint 0.5; drop this once it moves
-# to >=0.7.6.
-ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]
+ignore = [
+    # Marvin-attack timing side channels in RSA decryption. Rise uses RSA for
+    # JWT signing/verification and key generation, and the remaining transitive
+    # uses are either signature-oriented or build-time only. There is no stable
+    # fixed release of the rsa crate yet.
+    "RUSTSEC-2023-0071",
+    # Timing variability in crypto-bigint 0.5, which aws-sigv4 pulls in only for
+    # SigV4a (ECDSA P-256) signing, enabled by aws-sdk-sts's default features.
+    # Rise signs AWS requests with SigV4 (HMAC) only. Even the latest aws-sigv4
+    # still depends on crypto-bigint 0.5; drop this once it moves to >=0.7.6.
+    "RUSTSEC-2026-0387",
+]
