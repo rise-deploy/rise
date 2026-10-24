@@ -245,7 +245,7 @@ pub async fn create_project(
         if e.to_string().contains("duplicate key") || e.to_string().contains("unique constraint") {
             ServerError::new(
                 StatusCode::CONFLICT,
-                format!("Project '{}' already exists", &payload.name),
+                format!("Project '{}' already exists", payload.name),
             )
         } else {
             ServerError::internal_anyhow(e, "Failed to create project")
