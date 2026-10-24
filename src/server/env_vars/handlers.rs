@@ -1027,3 +1027,278 @@ mod tests {
         assert!(validate_env_var_key("foo$bar").is_err());
     }
 }
+
+/// A variable's plaintext and flags, on one side of a comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComparedVar {
+    pub value: String,
+    pub is_secret: bool,
+    pub is_protected: bool,
+}
+
+/// Compare a deployment's project-set variables with the current ones, key by
+/// key. Values are copied into the result only for variables plain on the
+/// side they come from.
+pub(crate) fn diff_env_vars(
+    before: &std::collections::BTreeMap<String, ComparedVar>,
+    after: &std::collections::BTreeMap<String, ComparedVar>,
+) -> Vec<super::models::EnvVarDiffEntry> {
+    use super::models::{EnvVarChange, EnvVarDiffEntry};
+    let plain = |v: &ComparedVar| (!v.is_secret).then(|| v.value.clone());
+    let mut out = Vec::new();
+    for (key, now) in after {
+        let entry = match before.get(key) {
+            None => EnvVarDiffEntry {
+                key: key.clone(),
+                change: EnvVarChange::Added,
+                is_secret: now.is_secret,
+                is_protected: now.is_protected,
+                from: None,
+                to: plain(now),
+            },
+            Some(old) => EnvVarDiffEntry {
+                key: key.clone(),
+                change: if old.value == now.value {
+                    EnvVarChange::Unchanged
+                } else {
+                    EnvVarChange::Changed
+                },
+                is_secret: now.is_secret || old.is_secret,
+                is_protected: now.is_protected || old.is_protected,
+                from: plain(old).filter(|_| !now.is_secret),
+                to: plain(now).filter(|_| !old.is_secret),
+            },
+        };
+        out.push(entry);
+    }
+    for (key, old) in before {
+        if !after.contains_key(key) {
+            out.push(EnvVarDiffEntry {
+                key: key.clone(),
+                change: EnvVarChange::Removed,
+                is_secret: old.is_secret,
+                is_protected: old.is_protected,
+                from: plain(old),
+                to: None,
+            });
+        }
+    }
+    out
+}
+
+/// Compare a deployment's variable snapshot with what a new deployment into
+/// an environment would get now (`?environment=`, default: the deployment's
+/// own environment).
+///
+/// Only variables set on the project (Global or per environment) are
+/// compared; rise.toml, CLI, extension and system variables come from
+/// elsewhere. Secrets, protected ones included, are decrypted here to compare
+/// them, and only whether they changed is returned.
+pub async fn diff_deployment_env_vars(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
+    Path((project_id_or_name, deployment_id)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<super::models::EnvVarDiffResponse>, ServerError> {
+    use std::collections::BTreeMap;
+
+    let project = if let Ok(uuid) = project_id_or_name.parse() {
+        projects::find_by_id(&state.db_pool, uuid)
+            .await
+            .internal_err("Failed to get project")?
+    } else {
+        projects::find_by_name(&state.db_pool, &project_id_or_name)
+            .await
+            .internal_err("Failed to get project")?
+    }
+    .ok_or_else(|| ServerError::not_found("Project not found"))?;
+
+    let user = auth.user()?;
+    ensure_project_access_or_admin(&state, user, &project).await?;
+
+    let visibility = VarVisibility {
+        scope: scope.as_ref(),
+        project: &project.name,
+    };
+    visibility.require_any()?;
+
+    let deployment =
+        crate::db::deployments::find_by_deployment_id(&state.db_pool, &deployment_id, project.id)
+            .await
+            .internal_err("Failed to get deployment")?
+            .ok_or_else(|| ServerError::not_found("Deployment not found"))?;
+
+    // The environment to compare against: the one asked for, else the
+    // deployment's own.
+    let environment = match params.get("environment").filter(|e| !e.is_empty()) {
+        Some(name) => Some(
+            db_environments::find_by_name(&state.db_pool, project.id, name)
+                .await
+                .internal_err("Failed to get environment")?
+                .ok_or_else(|| ServerError::not_found(format!("Environment '{name}' not found")))?,
+        ),
+        None => match deployment.environment_id {
+            Some(id) => db_environments::find_by_id(&state.db_pool, id)
+                .await
+                .internal_err("Failed to get environment")?,
+            None => None,
+        },
+    };
+    let environment_name = environment.as_ref().map(|e| e.name.clone());
+
+    let decrypt = |value: String, is_secret: bool| {
+        let state = &state;
+        async move {
+            if !is_secret {
+                return Ok::<_, ServerError>(value);
+            }
+            match &state.encryption_provider {
+                Some(provider) => provider
+                    .decrypt(&value)
+                    .await
+                    .internal_err("Failed to decrypt secret"),
+                None => Err(ServerError::internal(
+                    "Cannot decrypt secrets: no encryption provider configured",
+                )),
+            }
+        }
+    };
+
+    // Before: the snapshot's project-set variables.
+    let mut before = BTreeMap::new();
+    let snapshot = db_env_vars::list_deployment_env_vars(&state.db_pool, deployment.id)
+        .await
+        .internal_err("Failed to list deployment environment variables")?;
+    for var in snapshot {
+        let scoped_to = match var.source.as_str() {
+            "global" => None,
+            source => match source.strip_prefix("env:") {
+                Some(env) => Some(env.to_string()),
+                None => continue,
+            },
+        };
+        if !visibility.lists(scoped_to.as_deref()) {
+            continue;
+        }
+        let value = decrypt(var.value, var.is_secret).await?;
+        before.insert(
+            var.key,
+            ComparedVar {
+                value,
+                is_secret: var.is_secret,
+                is_protected: var.is_protected,
+            },
+        );
+    }
+
+    // After: Global, then the environment's own values on top.
+    let current = db_env_vars::list_project_env_vars(
+        &state.db_pool,
+        project.id,
+        environment.as_ref().map(|e| e.id),
+    )
+    .await
+    .internal_err("Failed to list environment variables")?;
+    let (scoped, global): (Vec<_>, Vec<_>) = current
+        .into_iter()
+        .partition(|v| v.environment_id.is_some());
+    let mut after = BTreeMap::new();
+    for var in global.into_iter().chain(scoped) {
+        let scoped_to = var.environment_id.and(environment_name.as_deref());
+        if !visibility.lists(scoped_to) {
+            continue;
+        }
+        let value = decrypt(var.value, var.is_secret).await?;
+        after.insert(
+            var.key,
+            ComparedVar {
+                value,
+                is_secret: var.is_secret,
+                is_protected: var.is_protected,
+            },
+        );
+    }
+
+    Ok(Json(super::models::EnvVarDiffResponse {
+        environment: environment_name,
+        changes: diff_env_vars(&before, &after),
+    }))
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::{diff_env_vars, ComparedVar};
+    use crate::server::env_vars::models::EnvVarChange;
+    use std::collections::BTreeMap;
+
+    fn var(value: &str, is_secret: bool, is_protected: bool) -> ComparedVar {
+        ComparedVar {
+            value: value.into(),
+            is_secret,
+            is_protected,
+        }
+    }
+
+    fn map(vars: &[(&str, ComparedVar)]) -> BTreeMap<String, ComparedVar> {
+        vars.iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn protected_secrets_compare_by_value_without_revealing_it() {
+        let before = map(&[
+            ("DB_PASSWORD", var("old", true, true)),
+            ("API_KEY", var("same", true, true)),
+        ]);
+        let after = map(&[
+            ("DB_PASSWORD", var("new", true, true)),
+            ("API_KEY", var("same", true, true)),
+        ]);
+        let changes = diff_env_vars(&before, &after);
+        let by_key = |k: &str| changes.iter().find(|c| c.key == k).unwrap();
+        assert_eq!(by_key("DB_PASSWORD").change, EnvVarChange::Changed);
+        assert_eq!(by_key("API_KEY").change, EnvVarChange::Unchanged);
+        for c in &changes {
+            assert!(
+                c.from.is_none() && c.to.is_none(),
+                "secret value leaked for {}",
+                c.key
+            );
+        }
+    }
+
+    #[test]
+    fn plain_values_are_shown_and_additions_and_removals_reported() {
+        let before = map(&[
+            ("LOG_LEVEL", var("info", false, false)),
+            ("OLD", var("x", false, false)),
+        ]);
+        let after = map(&[
+            ("LOG_LEVEL", var("warn", false, false)),
+            ("NEW", var("y", false, false)),
+        ]);
+        let changes = diff_env_vars(&before, &after);
+        let by_key = |k: &str| changes.iter().find(|c| c.key == k).unwrap();
+        let level = by_key("LOG_LEVEL");
+        assert_eq!(level.change, EnvVarChange::Changed);
+        assert_eq!(
+            (level.from.as_deref(), level.to.as_deref()),
+            (Some("info"), Some("warn"))
+        );
+        assert_eq!(by_key("NEW").change, EnvVarChange::Added);
+        assert_eq!(by_key("NEW").to.as_deref(), Some("y"));
+        assert_eq!(by_key("OLD").change, EnvVarChange::Removed);
+    }
+
+    #[test]
+    fn a_value_that_turned_secret_is_not_shown_on_either_side() {
+        let before = map(&[("TOKEN", var("plain-before", false, false))]);
+        let after = map(&[("TOKEN", var("secret-now", true, false))]);
+        let changes = diff_env_vars(&before, &after);
+        assert_eq!(changes[0].change, EnvVarChange::Changed);
+        assert!(changes[0].is_secret);
+        assert!(changes[0].from.is_none() && changes[0].to.is_none());
+    }
+}

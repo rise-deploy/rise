@@ -329,19 +329,20 @@ class RiseAPI {
         return this.request(`/projects/${projectName}/env${qs ? '?' + qs : ''}`);
     }
 
-    async getDeploymentEnvVars(projectName, deploymentId, includeUnprotectedValues = false) {
-        const qs = includeUnprotectedValues ? '?include_unprotected_values=true' : '';
-        return this.request(`/projects/${projectName}/deployments/${deploymentId}/env${qs}`);
+    async getDeploymentEnvVars(projectName, deploymentId) {
+        return this.request(`/projects/${projectName}/deployments/${deploymentId}/env`);
     }
 
-    /** The variables a new deployment into this environment and group would get now. */
-    async previewEnvVars(projectName, environment, deploymentGroup) {
-        const params = new URLSearchParams();
-        if (environment) params.set('environment', environment);
-        if (deploymentGroup) params.set('deployment_group', deploymentGroup);
-        const qs = params.toString();
-        return this.request(`/projects/${projectName}/env/preview${qs ? '?' + qs : ''}`);
+    /**
+     * Compare a deployment's variable snapshot with what a new deployment into
+     * `environment` (default: the deployment's own) would get now. Secrets are
+     * compared on the server; only whether they changed comes back.
+     */
+    async diffDeploymentEnvVars(projectName, deploymentId, environment = null) {
+        const qs = environment ? `?environment=${encodeURIComponent(environment)}` : '';
+        return this.request(`/projects/${projectName}/deployments/${deploymentId}/env/diff${qs}`);
     }
+
 
     async setEnvVar(projectName, key, value, isSecret, isProtected = true, environment = null) {
         const params = new URLSearchParams();

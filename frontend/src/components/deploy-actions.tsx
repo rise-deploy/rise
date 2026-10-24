@@ -85,7 +85,6 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
     // Redeploying a deployment that failed retries an image that already
     // failed once; say so, and what keeps serving meanwhile.
     const retrying = kind === 'redeploy' && (source.status === 'Failed' || source.status === 'Unhealthy');
-    const targetGroup = kind === 'promote' ? (env?.primary_deployment_group ?? null) : source.deployment_group;
 
     let title: string;
     let body: React.ReactNode;
@@ -182,7 +181,6 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
                     projectName={project.projectName}
                     sourceId={source.deployment_id}
                     environment={envName || null}
-                    group={targetGroup}
                 />
             )}
             {kind !== 'promote' && (

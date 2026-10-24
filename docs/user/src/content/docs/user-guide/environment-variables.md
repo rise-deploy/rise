@@ -21,7 +21,11 @@ rise env set -p my-app JWT_SECRET supersecret --protected
 
 Every value requires exactly one type: `--plain`, `--secret`, or `--protected`.
 Secret values are encrypted at rest; protected secrets cannot be retrieved
-through the API. Omit the value to enter it interactively; input for both
+through the API. Rise can still tell you whether one changed: the web UI's
+redeploy, rollback and promote dialogs compare the source deployment's
+variables with the current ones (`GET /api/v1/projects/{project}/deployments/{id}/env/diff`)
+and report a protected value as changed or unchanged without revealing it.
+Omit the value to enter it interactively; input for both
 secret forms is hidden:
 
 ```bash
