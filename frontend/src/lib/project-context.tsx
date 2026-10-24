@@ -1,5 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { api } from './api';
+import { usePolling } from './polling';
+import { isInProgress } from './env-state';
 
 // Shapes of the API responses the shell and the project sections share. Only
 // the fields the UI reads are listed; the backend models in `src/server` are
@@ -120,6 +122,10 @@ export function ProjectProvider({ projectName, children }: { projectName: string
     const [generation, setGeneration] = useState(0);
 
     const reload = useCallback(() => setGeneration(g => g + 1), []);
+    // CLI and CI deploys change what environments serve without telling this
+    // page: refresh quickly while a rollout is in flight, slowly otherwise.
+    const busy = project?.status === 'Deploying' || deployments.some(d => isInProgress(d.status));
+    usePolling(reload, busy ? 5000 : 20000);
 
     useEffect(() => {
         setProject(null);

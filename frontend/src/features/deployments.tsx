@@ -14,7 +14,8 @@ import { LogConsole } from './logs/log-console';
 import { ContainerStatusPanel } from './logs/container-status';
 import { EventTimeline } from './logs/event-timeline';
 import { fetchDeploymentEvents, type DeploymentEvent } from './logs/api';
-import { useCurrentProject, type Deployment } from '../lib/project-context';
+import { useCurrentProject, type Deployment, type Environment } from '../lib/project-context';
+import { deploymentPath } from '../lib/routes';
 import { useDeployActions } from '../components/deploy-actions';
 import { byNewest, deploymentSource, isInProgress, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
 import { DeploymentMetaStrip, FailurePanel, RolloutPanel, rolloutEnd, rolloutSteps, useDeploymentEvents } from './deployment-diagnosis';
@@ -134,6 +135,52 @@ function aggregateContainerResources(
     };
 }
 
+
+/**
+ * What stopping a deployment does, in words: cancel a rollout, take an
+ * environment's URL down, or end a preview.
+ */
+function stopConsequence(d: Deployment | null | undefined, environments: Environment[]): { title: string; message: string; confirm: string } {
+    if (!d) return { title: 'Stop deployment?', message: '', confirm: 'Stop deployment' };
+    const id = d.deployment_id;
+    const env = environments.find(e => e.name === d.environment);
+    const url = d.primary_url ? d.primary_url.replace(/^https?:\/\//, '') : null;
+    if (isInProgress(d.status)) {
+        return {
+            title: `Cancel ${id}?`,
+            message: `Cancels this rollout. Whatever ${d.environment || 'the group'} serves now keeps serving.`,
+            confirm: 'Cancel rollout',
+        };
+    }
+    if (d.is_active && env && (env.primary_deployment_group || 'default') === d.deployment_group) {
+        return {
+            title: `Stop ${env.name}?`,
+            message: `${id} is what ${env.name} serves. Stopping it takes ${url ?? `the ${env.name} URL`} offline until you deploy again.`,
+            confirm: `Stop ${env.name}`,
+        };
+    }
+    if (d.is_active) {
+        return {
+            title: `Stop ${d.deployment_group}?`,
+            message: `${id} serves the ${d.deployment_group} group${url ? ` at ${url}` : ''}. Stopping it takes that address offline.`,
+            confirm: 'Stop deployment',
+        };
+    }
+    return { title: `Stop ${id}?`, message: `Stops ${id}.`, confirm: 'Stop deployment' };
+}
+
+/**
+ * A row's primary cell links to what the row opens, so keyboards and
+ * middle-clicks reach it; a plain click navigates in place like the row.
+ */
+export function rowLinkClick(go: () => void) {
+    return (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+        e.preventDefault();
+        go();
+    };
+}
 
 /** Status names each status filter asks the server for; absent = no filter. */
 const STATUS_FILTERS: Record<string, string[] | undefined> = {
@@ -268,9 +315,9 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     };
 
     const stopFor = (d: Deployment): React.ReactNode => isTerminal(d.status) ? null : (
-        <button type="button" className="r-icon-btn r-row-stop" title="Stop deployment" aria-label={`Stop ${d.deployment_id}`}
+        <button type="button" className="r-row-action r-row-stop" aria-label={`${isInProgress(d.status) ? 'Cancel' : 'Stop'} ${d.deployment_id}`}
             onClick={(e) => { e.stopPropagation(); setDeploymentToStop(d); }}>
-            <Icon name="stop" size={12} />
+            {isInProgress(d.status) ? 'Cancel' : 'Stop'}
         </button>
     );
 
@@ -352,7 +399,9 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                             {filtered.map(d => (
                                 <tr key={d.deployment_id} className="click" onClick={() => open(d)}>
                                     <td><Status status={d.status} /></td>
-                                    <td className="mono r-nowrap" style={{ fontSize: 12 }}>{d.deployment_id}</td>
+                                    <td className="mono r-nowrap" style={{ fontSize: 12 }}>
+                                        <a className="r-row-link" href={deploymentPath(projectName, d.deployment_id)} onClick={rowLinkClick(() => open(d))}>{d.deployment_id}</a>
+                                    </td>
                                     <td>
                                         <div className="r-cell-main"><DeploymentSource d={d} projectName={projectName} /></div>
                                         <div className="r-cell-sub">
@@ -393,9 +442,9 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                 isOpen={!!deploymentToStop}
                 onClose={() => setDeploymentToStop(null)}
                 onConfirm={handleStopConfirm}
-                title={`Stop ${deploymentToStop?.deployment_id ?? 'deployment'}?`}
-                message={`Traffic for group "${deploymentToStop?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop deployment"
+                title={stopConsequence(deploymentToStop, environments).title}
+                message={stopConsequence(deploymentToStop, environments).message}
+                confirmText={stopConsequence(deploymentToStop, environments).confirm}
                 confirmTone="danger"
                 loading={stopping}
             />
@@ -717,7 +766,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
     const secondaryActions: React.ReactNode[] = [];
     if (deployment.can_rollback) {
         if (deployment.status === 'Failed' || deployment.status === 'Unhealthy') {
-            primaryAction = <RButton variant="primary" icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Retry deploy</RButton>;
+            primaryAction = <RButton icon="refresh" onClick={() => request({ kind: 'redeploy', source: deployment })}>Retry</RButton>;
         } else if (deployment.is_active) {
             if (promoteTo && !currentEnv?.is_production) {
                 primaryAction = <RButton variant="primary" icon="promote" onClick={() => request({ kind: 'promote', source: deployment, targetEnv: promoteTo.name })}>Promote to {promoteTo.name}</RButton>;
@@ -929,7 +978,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     {secondaryActions}
                     <RButton icon="terminal" onClick={() => setActiveTab('logs')}>Logs</RButton>
                     {!isTerminal(deployment.status) && (
-                        <RButton variant="danger" icon="stop" onClick={() => setStopDialogOpen(true)}>Stop</RButton>
+                        <RButton icon="stop" onClick={() => setStopDialogOpen(true)}>{isInProgress(deployment.status) ? 'Cancel' : 'Stop'}</RButton>
                     )}
                     <button type="button" className="r-icon-btn" title="Copy ID" aria-label="Copy deployment ID"
                         onClick={() => handleCopy(deployment.deployment_id, 'Deployment ID')}>
@@ -942,7 +991,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
             {activeTab === 'overview' && (
                 <div className="r-stack r-dep-diagnosis">
-                    <DeploymentMetaStrip projectName={projectName} deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
+                    {/* A failed deployment leads with why it failed; the facts follow. */}
                     {showFailure && (
                         <FailurePanel
                             projectName={projectName}
@@ -952,6 +1001,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             onOpenLogs={() => setActiveTab('logs')}
                         />
                     )}
+                    <DeploymentMetaStrip projectName={projectName} deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
                     {rollout && <RolloutPanel steps={rollout.steps} />}
                 </div>
             )}
@@ -1040,9 +1090,9 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                 isOpen={stopDialogOpen}
                 onClose={() => setStopDialogOpen(false)}
                 onConfirm={handleStopConfirm}
-                title={`Stop ${deploymentId}?`}
-                message={`Traffic for group "${deployment?.deployment_group || 'default'}" may terminate.`}
-                confirmText="Stop deployment"
+                title={stopConsequence(deployment, project?.environments ?? []).title}
+                message={stopConsequence(deployment, project?.environments ?? []).message}
+                confirmText={stopConsequence(deployment, project?.environments ?? []).confirm}
                 confirmTone="danger"
                 loading={stopping}
             />

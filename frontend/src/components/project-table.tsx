@@ -121,7 +121,12 @@ export function ProjectTable({
                         return (
                             <tr key={project.id || project.name} className="click" onClick={() => onRowClick(project)}>
                                 <td>
-                                    <div className="r-cell-main" style={{ fontWeight: 600 }}>{project.name}</div>
+                                    <div className="r-cell-main" style={{ fontWeight: 600 }}>
+                                        <a className="r-row-link" href={`/project/${project.name}`}
+                                            onClick={(e) => { e.stopPropagation(); if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; e.preventDefault(); onRowClick(project); }}>
+                                            {project.name}
+                                        </a>
+                                    </div>
                                     {project.primary_url && (
                                         <a
                                             className="r-link mono r-cell-sub r-url-sub"

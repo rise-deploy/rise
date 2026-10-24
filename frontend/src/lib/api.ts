@@ -329,8 +329,18 @@ class RiseAPI {
         return this.request(`/projects/${projectName}/env${qs ? '?' + qs : ''}`);
     }
 
-    async getDeploymentEnvVars(projectName, deploymentId) {
-        return this.request(`/projects/${projectName}/deployments/${deploymentId}/env`);
+    async getDeploymentEnvVars(projectName, deploymentId, includeUnprotectedValues = false) {
+        const qs = includeUnprotectedValues ? '?include_unprotected_values=true' : '';
+        return this.request(`/projects/${projectName}/deployments/${deploymentId}/env${qs}`);
+    }
+
+    /** The variables a new deployment into this environment and group would get now. */
+    async previewEnvVars(projectName, environment, deploymentGroup) {
+        const params = new URLSearchParams();
+        if (environment) params.set('environment', environment);
+        if (deploymentGroup) params.set('deployment_group', deploymentGroup);
+        const qs = params.toString();
+        return this.request(`/projects/${projectName}/env/preview${qs ? '?' + qs : ''}`);
     }
 
     async setEnvVar(projectName, key, value, isSecret, isProtected = true, environment = null) {

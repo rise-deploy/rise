@@ -285,7 +285,7 @@ function ProjectTemplatePanel({ project, projectName, onUpdated }: { project: Pr
 function SectionLabelRow({ label, href, link }: { label: string; href?: string; link?: string }) {
     return (
         <div className="r-label-row">
-            <span className="r-section-label">{label}</span>
+            <h2 className="r-section-label">{label}</h2>
             {href && link && (
                 <a className="r-link" href={href} onClick={(e) => { if (e.metaKey || e.ctrlKey) return; e.preventDefault(); navigate(href); }}>
                     {link}

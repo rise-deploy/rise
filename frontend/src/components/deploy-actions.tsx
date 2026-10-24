@@ -6,6 +6,9 @@ import { deploymentSource, envState, promoteTargets } from '../lib/env-state';
 import { formatRelativeTimeRounded } from '../lib/utils';
 import { Button, Modal, Select, cx } from './r-ui';
 import { useToast } from './toast';
+import { VarChanges } from './var-changes';
+
+const shortId = (id: string) => id.split('-').pop() || id;
 
 // Redeploy, roll back and promote all create a new deployment from an existing
 // one's image — no rebuild. They differ only in where the new deployment lands
@@ -79,6 +82,11 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
             d.is_active && d.environment === sourceEnv && d.deployment_group === source.deployment_group) ?? null)
         : null;
 
+    // Redeploying a deployment that failed retries an image that already
+    // failed once; say so, and what keeps serving meanwhile.
+    const retrying = kind === 'redeploy' && (source.status === 'Failed' || source.status === 'Unhealthy');
+    const targetGroup = kind === 'promote' ? (env?.primary_deployment_group ?? null) : source.deployment_group;
+
     let title: string;
     let body: React.ReactNode;
     let confirm: string;
@@ -90,6 +98,10 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
         title = target ? `Promote to ${target}?` : 'Promote';
         body = <>Ships the exact image running in {sourceEnv} to {target || 'another environment'}. Variables from {target || 'the target'} are used.</>;
         confirm = 'Promote';
+    } else if (retrying) {
+        title = `Retry ${shortId(source.deployment_id)} in ${envName || source.deployment_group}?`;
+        body = <>Deploys the image of <span className="mono">{source.deployment_id}</span> again, without a rebuild.</>;
+        confirm = 'Retry';
     } else {
         title = `Redeploy ${envName || source.deployment_group}?`;
         body = <>Starts a new deployment of the same image. Use this to apply variable changes — no rebuild.</>;
@@ -127,7 +139,7 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
                 <>
                     <Button onClick={onClose} disabled={busy}>Cancel</Button>
                     <Button
-                        variant={kind === 'rollback' ? 'danger' : 'primary'}
+                        variant="primary"
                         icon={kind === 'rollback' ? 'rollback' : kind === 'promote' ? 'promote' : 'refresh'}
                         onClick={run}
                         loading={busy}
@@ -139,6 +151,18 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
             }
         >
             <p className="r-modal-text">{body}</p>
+            {retrying && (
+                <div className="r-retry-note" role="note">
+                    <strong>This image failed{source.error_message ? ':' : '.'}</strong>
+                    {source.error_message && <> {source.error_message}</>}
+                    <div>
+                        {current && current.deployment_id !== source.deployment_id
+                            ? <><span className="mono">{current.deployment_id}</span> keeps serving until the new deployment is healthy. </>
+                            : null}
+                        Retry when the cause was outside the image (a dependency, a variable you have since changed); otherwise fix the code and deploy again.
+                    </div>
+                </div>
+            )}
             {kind === 'promote' && targets.length > 1 && (
                 <div>
                     <label className="r-field-label">Target environment</label>
@@ -153,6 +177,14 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
                 <span className="r-diff-arrow" aria-hidden>→</span>
                 <DeploymentSummary d={source} label="After" tone="after" />
             </div>
+            {!useSourceEnvVars && (kind !== 'promote' || target) && (
+                <VarChanges
+                    projectName={project.projectName}
+                    sourceId={source.deployment_id}
+                    environment={envName || null}
+                    group={targetGroup}
+                />
+            )}
             {kind !== 'promote' && (
                 <label className="r-check">
                     <input type="checkbox" checked={useSourceEnvVars} onChange={e => setUseSourceEnvVars(e.target.checked)} />

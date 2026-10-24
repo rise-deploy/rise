@@ -2,7 +2,7 @@
 name: Rise
 description: The web dashboard for Rise, an internal platform for deploying container images.
 colors:
-  rise-indigo: "oklch(0.55 0.17 270)"
+  rise-indigo: "oklch(0.52 0.17 270)"
   rise-indigo-soft: "oklch(0.95 0.04 270)"
   on-indigo: "#ffffff"
   daylight: "oklch(0.985 0.009 270)"
@@ -12,13 +12,13 @@ colors:
   rule: "oklch(0.84 0.005 80)"
   rule-faint: "oklch(0.89 0.01 270)"
   ink: "oklch(0.20 0.006 80)"
-  ink-muted: "oklch(0.50 0.006 80)"
-  ink-soft: "oklch(0.62 0.006 80)"
-  healthy: "oklch(0.62 0.13 150)"
+  ink-muted: "oklch(0.47 0.006 80)"
+  ink-soft: "oklch(0.53 0.006 80)"
+  healthy: "oklch(0.50 0.13 150)"
   healthy-wash: "oklch(0.96 0.04 150)"
-  caution: "oklch(0.62 0.12 70)"
+  caution: "oklch(0.52 0.12 70)"
   caution-wash: "oklch(0.96 0.06 80)"
-  failing: "oklch(0.58 0.18 25)"
+  failing: "oklch(0.52 0.18 25)"
   failing-wash: "oklch(0.96 0.04 25)"
   after-hours: "oklch(0.17 0.008 270)"
   console: "oklch(0.205 0.01 270)"
@@ -262,7 +262,7 @@ Sharp, small corners in a strict ladder: 3px for chips, kbd and environment tags
 ### Buttons
 Crisp and compact.
 - **Shape:** 4px corners, 1px border, 7px 12px padding, 12.75px/500 text, 7px icon gap, never wrapping. 44px minimum height on phones.
-- **Primary:** Rise Indigo fill, white text, no border; hover brightens slightly. One per screen region.
+- **Primary:** Rise Indigo fill, white text in light mode and near-black text in dark mode (white on the lighter dark-mode indigo falls below 4.5:1), no border; hover brightens slightly. One per screen region.
 - **Secondary:** Desk fill, Rule border, Ink text; hover Shelf Hover.
 - **Danger:** Failing fill, white text, for confirming destructive actions only. Delete triggers inside dialogs are ghost buttons with Failing text, placed on the left of the footer.
 - **Ghost / icon:** transparent, 28–32px square icon buttons for row actions (reveal, edit, delete, logs, settings); 40–44px on phones.

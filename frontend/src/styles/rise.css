@@ -13,18 +13,18 @@
     --border-strong: oklch(0.74 0.005 80);
 
     --text: oklch(0.20 0.006 80);
-    --text-muted: oklch(0.50 0.006 80);
-    --text-soft: oklch(0.62 0.006 80);
+    --text-muted: oklch(0.47 0.006 80);
+    --text-soft: oklch(0.53 0.006 80);
 
-    --accent: oklch(0.55 0.17 270);
+    --accent: oklch(0.52 0.17 270);
     --accent-fg: #ffffff;
     --accent-soft: oklch(0.95 0.04 270);
 
-    --ok: oklch(0.62 0.13 150);
+    --ok: oklch(0.50 0.13 150);
     --ok-bg: oklch(0.96 0.04 150);
-    --warn: oklch(0.62 0.12 70);
+    --warn: oklch(0.52 0.12 70);
     --warn-bg: oklch(0.96 0.06 80);
-    --err: oklch(0.58 0.18 25);
+    --err: oklch(0.52 0.18 25);
     --err-bg: oklch(0.96 0.04 25);
     --info: oklch(0.55 0.13 250);
     --info-bg: oklch(0.96 0.03 250);
@@ -73,7 +73,7 @@
     --text-soft: oklch(0.64 0.008 270);
 
     --accent: oklch(0.70 0.15 270);
-    --accent-fg: #ffffff;
+    --accent-fg: oklch(0.18 0.03 270);
     --accent-soft: oklch(0.30 0.07 270);
 
     --ok: oklch(0.76 0.14 150);
@@ -105,7 +105,7 @@
 /* Palette: shifts the accent plus a subtle tint of the light-mode
    surfaces toward the accent hue. Dark mode keeps neutral surfaces. */
 [data-palette="mint"]:not(.dark) {
-    --accent: oklch(0.55 0.10 165);
+    --accent: oklch(0.48 0.10 165);
     --accent-soft: oklch(0.95 0.04 165);
     --bg: oklch(0.985 0.008 165);
     --surface-2: oklch(0.96 0.011 165);
@@ -119,7 +119,7 @@
 }
 
 [data-palette="indigo"]:not(.dark) {
-    --accent: oklch(0.55 0.17 270);
+    --accent: oklch(0.52 0.17 270);
     --accent-soft: oklch(0.95 0.04 270);
     --bg: oklch(0.985 0.009 270);
     --surface-2: oklch(0.96 0.012 270);
@@ -128,12 +128,12 @@
 }
 [data-palette="indigo"].dark, .dark[data-palette="indigo"] {
     --accent: oklch(0.70 0.15 270);
-    --accent-fg: #ffffff;
+    --accent-fg: oklch(0.18 0.03 270);
     --accent-soft: oklch(0.30 0.07 270);
 }
 
 [data-palette="ember"]:not(.dark) {
-    --accent: oklch(0.62 0.16 40);
+    --accent: oklch(0.52 0.16 40);
     --accent-soft: oklch(0.95 0.05 40);
     --bg: oklch(0.987 0.01 55);
     --surface-2: oklch(0.965 0.013 55);
@@ -2171,8 +2171,7 @@ a.r-btn { text-decoration: none; }
 }
 .r-row-action:hover { border-color: var(--accent); color: var(--accent); }
 .r-row-action:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.r-icon-btn.r-row-stop { width: 26px; height: 26px; color: var(--text-soft); }
-.r-icon-btn.r-row-stop:hover { color: var(--err); border-color: var(--err); }
+.r-row-action.r-row-stop:hover { color: var(--err); border-color: color-mix(in oklch, var(--err) 45%, transparent); }
 .r-pager { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; font-size: 12.5px; color: var(--text-muted); }
 
 /* Mobile card lists (tables become stacked cards below 768px). */
@@ -2195,7 +2194,7 @@ a.r-btn { text-decoration: none; }
 .r-card-meta { font-size: 12.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .r-card-actions { display: flex; gap: 8px; margin-top: 4px; }
 .r-card-actions .r-row-action { min-height: 36px; display: inline-flex; align-items: center; padding: 0 12px; }
-.r-card-actions .r-row-stop { width: 36px; height: 36px; }
+
 
 /* ---------- Deployment detail ---------- */
 .r-dep-title { font-size: 21px; }
@@ -2278,8 +2277,9 @@ a.r-btn { text-decoration: none; }
 .r-rollout-step .dur { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; color: var(--text-soft); }
 
 @media (max-width: 767px) {
-    .r-meta-strip { flex-direction: column; }
-    .r-meta-strip .cell { flex-basis: auto; }
+    /* Two facts per row keep the strip short enough to scroll past. */
+    .r-meta-strip { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .r-meta-strip .cell { padding: 8px 12px; gap: 2px; }
     .r-page-actions { width: 100%; }
 }
 .r-nowrap { white-space: nowrap; }
@@ -2358,9 +2358,13 @@ a.r-btn { text-decoration: none; }
 .r-icon-btn.r-var-act { width: 28px; height: 28px; border-color: transparent; background: transparent; }
 .r-icon-btn.r-var-act:hover { background: var(--hover); }
 .r-icon-btn.r-var-act.danger:hover { color: var(--err); }
-.r-var-placeholder td { background: repeating-linear-gradient(-45deg, transparent 0 6px, color-mix(in oklch, var(--border-faint) 45%, transparent) 6px 7px); }
+/* Inherited keys read as quiet rows; only a key with no value at all draws the eye. */
 .r-var-placeholder .r-var-key { color: var(--text-soft); font-weight: 500; }
-.r-var-missing { color: var(--text-soft); font-size: 12.5px; font-style: italic; }
+.r-var-missing { color: var(--text-soft); font-size: 12.5px; }
+.r-var-placeholder.missing .r-var-key { color: var(--text); }
+.r-var-placeholder.missing .r-var-missing { color: var(--warn); }
+.r-var-placeholder .r-row-action { opacity: 0.8; }
+.r-var-placeholder:hover .r-row-action, .r-var-placeholder .r-row-action:focus-visible { opacity: 1; }
 .r-card.r-var-placeholder { border-style: dashed; background: transparent; }
 .r-vars-empty { padding: 16px; color: var(--text-soft); font-size: 13px; }
 @media (max-width: 767px) {
@@ -2592,3 +2596,65 @@ a.r-link:hover, .r-link-btn:hover { text-underline-offset: 3px; }
 .r-src-card-rows dd { margin: 0; min-width: 0; }
 .r-src-card-rows .r-dirty { display: block; margin: 2px 0 0; }
 .r-src-wrap { overflow-wrap: anywhere; font-size: 12px; }
+
+/* ---------- Recovery dialog: retry caution and variable changes ---------- */
+.r-retry-note {
+    display: grid;
+    gap: 4px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    background: var(--warn-bg);
+    border: 1px solid color-mix(in oklch, var(--warn) 30%, transparent);
+    font-size: 12.75px;
+    line-height: 1.5;
+    color: var(--text);
+    overflow-wrap: anywhere;
+}
+.r-var-changes { display: grid; gap: 6px; }
+.r-var-changes ul { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border-faint); border-radius: 6px; max-height: 180px; overflow: auto; }
+.r-var-change { display: grid; grid-template-columns: 14px minmax(0, auto) minmax(0, 1fr); gap: 8px; align-items: baseline; padding: 6px 10px; border-top: 1px solid var(--border-faint); font-size: 12.5px; }
+.r-var-change:first-child { border-top: none; }
+.r-var-change .mark { font-family: 'JetBrains Mono', ui-monospace, monospace; font-weight: 600; text-align: center; }
+.r-var-change.added .mark { color: var(--ok); }
+.r-var-change.removed .mark { color: var(--err); }
+.r-var-change.changed .mark { color: var(--warn); }
+.r-var-change.unknown .mark { color: var(--text-muted); }
+.r-var-change .key { white-space: nowrap; }
+.r-var-change .what { color: var(--text-muted); min-width: 0; overflow-wrap: anywhere; }
+.r-var-changes-note { margin: 0; font-size: 12.5px; color: var(--text-muted); }
+
+/* Keyboard focus for controls that draw no border of their own. */
+.r-icon-btn:focus-visible,
+.r-theme-btn:focus-visible,
+.r-user-main:focus-visible,
+.r-user-logout:focus-visible,
+.r-back-link:focus-visible,
+.r-link:focus-visible,
+.r-meta-link:focus-visible,
+.r-owner:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.r-input input[type="search"]::-webkit-search-cancel-button { display: none; }
+.r-row-link { color: inherit; text-decoration: none; }
+.r-row-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+.r-row-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+/* Section titles are headings for assistive tech; they keep their visual style. */
+h2.r-section-label, .r-vars-scope-head h2.title, .r-env-card-head h2.name { margin: 0; line-height: inherit; }
+
+/* Variables edited this session: offer the redeploy that applies them. */
+.r-apply-bar {
+    position: sticky;
+    bottom: 12px;
+    z-index: 5;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 16px;
+    margin-top: 16px;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+    border-radius: 6px;
+    box-shadow: var(--shadow-md);
+    font-size: 13px;
+}
+.r-apply-bar .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

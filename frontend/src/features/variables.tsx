@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from '../lib/api';
 import { useQueryParam } from '../lib/navigation';
 import { useCurrentProject, type Environment } from '../lib/project-context';
-import { sortEnvironments } from '../lib/env-state';
+import { envState, sortEnvironments } from '../lib/env-state';
+import { useDeployActions } from '../components/deploy-actions';
 import { useIsMobile } from '../lib/use-media';
 import { useToast } from '../components/toast';
 import { Icon } from '../components/icon';
@@ -81,6 +82,7 @@ export function VariablesSection() {
     const [importFile, setImportFile] = useState<{ name: string; entries: [string, string][] } | null>(null);
     const [exportOpen, setExportOpen] = useState(false);
     const { showToast } = useToast();
+    const { request } = useDeployActions();
     const isMobile = useIsMobile();
 
     const load = useCallback(async () => {
@@ -102,8 +104,12 @@ export function VariablesSection() {
         document.getElementById(`env-${envParam}`)?.scrollIntoView({ block: 'start' });
     }, [vars, envParam]);
 
-    const changed = (key: string) => {
+    // Scopes edited this session (null = Global): their environments run the
+    // old snapshot until the next deploy.
+    const [editedScopes, setEditedScopes] = useState<Set<string | null>>(() => new Set());
+    const changed = (key: string, ...scopes: (string | null)[]) => {
         setEdited(s => new Set(s).add(key));
+        setEditedScopes(s => { const next = new Set(s); scopes.forEach(sc => next.add(sc)); return next; });
         load();
         reload();
     };
@@ -141,7 +147,7 @@ export function VariablesSection() {
             }
             showToast(<><span className="mono">{key}</span> saved · redeploy to apply</>, 'success');
             setEditing(null);
-            changed(key);
+            changed(key, original?.environment || null, form.environment);
         } catch (err) {
             showToast(`Failed to save ${key}: ${(err as Error).message}`, 'error');
         } finally {
@@ -155,7 +161,7 @@ export function VariablesSection() {
         try {
             await api.deleteEnvVar(projectName, toDelete.key, toDelete.environment || null);
             showToast(<><span className="mono">{toDelete.key}</span> deleted · redeploy to apply</>, 'success');
-            changed(toDelete.key);
+            changed(toDelete.key, toDelete.environment || null);
             setToDelete(null);
         } catch (err) {
             showToast(`Failed to delete ${toDelete.key}: ${(err as Error).message}`, 'error');
@@ -225,6 +231,13 @@ export function VariablesSection() {
 
     const rowProps = { revealed, onReveal: reveal, onEdit: openEdit, onDelete: setToDelete, edited, isMobile };
 
+    // Environments whose running deployment predates this session's edits: a
+    // Global edit reaches every environment, a scoped one only its own.
+    const pending = editedScopes.size === 0 ? [] : environments
+        .filter(env => editedScopes.has(null) || editedScopes.has(env.name))
+        .map(env => ({ env, live: envState(env, current.deployments).live }))
+        .filter((x): x is { env: Environment; live: NonNullable<typeof x.live> } => !!x.live);
+
     return (
         <div>
             <SectionHead section="variables" actions={actions} />
@@ -253,7 +266,10 @@ export function VariablesSection() {
 
             {scopes.map(({ name, env }) => {
                 const own = new Map(vars.filter(v => v.environment === name).map(v => [v.key, v]));
-                const missing = envKeys.filter(k => !own.has(k)).length;
+                // A key another environment sets but this one doesn't is
+                // inherited when Global has it, and missing only when not.
+                const missing = envKeys.filter(k => !own.has(k) && !globalByKey.has(k)).length;
+                const inherited = envKeys.filter(k => !own.has(k) && globalByKey.has(k)).length;
                 return (
                     <VarTable
                         key={name}
@@ -263,6 +279,7 @@ export function VariablesSection() {
                         sub={env ? `Overrides Global in ${name}` : 'Environment no longer exists'}
                         count={own.size}
                         missing={missing}
+                        inherited={inherited}
                         emptyText={envKeys.length === 0 ? `Nothing set per environment yet. A value here overrides Global in ${name}.` : undefined}
                         onAdd={() => openAdd(name)}
                         isMobile={isMobile}
@@ -362,6 +379,20 @@ export function VariablesSection() {
                 loading={deleting}
             />
 
+            {pending.length > 0 && (
+                <div className="r-apply-bar" role="status">
+                    <span className="text">Edited variables apply on the next deployment.</span>
+                    <span className="actions">
+                        {pending.map(({ env, live }) => (
+                            <Button key={env.name} size="sm" icon="refresh" onClick={() => request({ kind: 'redeploy', source: live })}>
+                                Redeploy {env.name}
+                            </Button>
+                        ))}
+                        <button type="button" className="r-link r-link-btn" onClick={() => setEditedScopes(new Set())}>Later</button>
+                    </span>
+                </div>
+            )}
+
             <ImportEnvDialog
                 file={importFile}
                 onClose={() => setImportFile(null)}
@@ -370,6 +401,7 @@ export function VariablesSection() {
                 environments={environments}
                 onImported={written => {
                     setEdited(s => { const next = new Set(s); written.forEach(w => next.add(w.key)); return next; });
+                    setEditedScopes(s => { const next = new Set(s); written.forEach(w => next.add(w.environment)); return next; });
                     load();
                     reload();
                 }}
@@ -379,13 +411,14 @@ export function VariablesSection() {
     );
 }
 
-function VarTable({ id, title, sub, color, count, missing = 0, emptyText, onAdd, isMobile, children }: {
+function VarTable({ id, title, sub, color, count, missing = 0, inherited = 0, emptyText, onAdd, isMobile, children }: {
     id: string;
     title: string;
     sub: string;
     color?: string;
     count: number;
     missing?: number;
+    inherited?: number;
     emptyText?: string;
     onAdd: () => void;
     isMobile: boolean;
@@ -395,8 +428,8 @@ function VarTable({ id, title, sub, color, count, missing = 0, emptyText, onAdd,
         <section id={id} className="r-vars-scope">
             <div className="r-vars-scope-head">
                 {color && <EnvironmentIcon color={color} size={13} />}
-                <span className="title">{title}</span>
-                <span className="sub">{sub} · {count} set{missing > 0 && <span className="missing"> · {missing} missing</span>}</span>
+                <h2 className="title">{title}</h2>
+                <span className="sub">{sub} · {count} set{inherited > 0 && <> · {inherited} inherited</>}{missing > 0 && <span className="missing"> · {missing} missing</span>}</span>
                 <button type="button" className="r-row-action" onClick={onAdd}>
                     <Icon name="plus" size={12} /> Add
                 </button>
@@ -492,17 +525,21 @@ function PlaceholderRow({ varKey, env, inherited, onSet, isMobile }: {
     onSet: () => void;
     isMobile: boolean;
 }) {
+    // Inheriting Global is the normal case, not a gap: say so quietly and
+    // offer an override. Only a key with no value anywhere for this
+    // environment is flagged as missing.
     const state = inherited
-        ? <>Not set in {env} · uses the Global value</>
-        : <>Not set in {env}</>;
+        ? <>Uses the Global value</>
+        : <>Not set in {env}, and no Global value</>;
     const button = (
         <button type="button" className="r-row-action" onClick={e => { e.stopPropagation(); onSet(); }}>
-            Set value
+            {inherited ? 'Override' : 'Set value'}
         </button>
     );
+    const kind = inherited ? 'inherited' : 'missing';
     if (isMobile) {
         return (
-            <div className="r-card r-var-placeholder" role="button" tabIndex={0} onClick={onSet} onKeyDown={e => { if (e.key === 'Enter') onSet(); }}>
+            <div className={`r-card r-var-placeholder ${kind}`} role="button" tabIndex={0} onClick={onSet} onKeyDown={e => { if (e.key === 'Enter') onSet(); }}>
                 <div className="r-card-row">
                     <span className="mono r-var-key">{varKey}</span>
                     <span style={{ marginLeft: 'auto' }}>{button}</span>
@@ -512,7 +549,7 @@ function PlaceholderRow({ varKey, env, inherited, onSet, isMobile }: {
         );
     }
     return (
-        <tr className="r-var-placeholder">
+        <tr className={`r-var-placeholder ${kind}`}>
             <td><span className="mono r-var-key">{varKey}</span></td>
             <td className="r-var-missing">{state}</td>
             <td style={{ textAlign: 'right' }}>{button}</td>

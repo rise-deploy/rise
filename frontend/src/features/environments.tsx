@@ -75,7 +75,7 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
         <Panel className="r-env-card">
             <div className="r-env-card-head">
                 <EnvironmentIcon color={env.color} size={13} />
-                <span className="name">{env.name}</span>
+                <h2 className="name">{env.name}</h2>
                 {env.is_production && env.name !== 'production' && <span className="r-env-tag prod">production</span>}
                 <Status {...healthBadge(state)} />
                 <span className="right">{replicas ?? (live ? `${live.replicas} replica${live.replicas === 1 ? '' : 's'}` : '')}</span>
