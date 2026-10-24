@@ -6,62 +6,134 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "user_code",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "user_code"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "status",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "approved_user_id",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "approved_user_id"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "approved_session",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "approved_session"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "client_name",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "client_name"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "client_ip",
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "client_ip"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "requested_access",
-        "type_info": "Jsonb"
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "requested_access"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "interval_seconds",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "interval_seconds"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "last_polled_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "last_polled_at"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "created_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "expires_at",
-        "type_info": "Timestamptz"
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "device_authorizations",
+            "name": "expires_at"
+          }
+        }
       }
     ],
     "parameters": {

@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use anyhow::{Context, Result};
-use bollard::container::{DownloadFromContainerOptions, UploadToContainerOptions};
+use bollard::query_parameters::{DownloadFromContainerOptions, UploadToContainerOptions};
 use bollard::Docker;
 use futures::StreamExt;
 use tracing::warn;
@@ -131,10 +131,10 @@ pub async fn upload_identity(docker: &Docker, container: &str, tar: Vec<u8>) -> 
         .upload_to_container(
             container,
             Some(UploadToContainerOptions {
-                path: "/",
+                path: "/".to_string(),
                 ..Default::default()
             }),
-            tar.into(),
+            bollard::body_full(tar.into()),
         )
         .await
         .with_context(|| format!("Failed to upload identity files to container {container}"))

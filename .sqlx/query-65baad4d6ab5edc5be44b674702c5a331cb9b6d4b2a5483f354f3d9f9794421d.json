@@ -6,7 +6,13 @@
       {
         "ordinal": 0,
         "name": "resource_user_uid",
-        "type_info": "Uuid"
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "resource_user_uid"
+          }
+        }
       }
     ],
     "parameters": {

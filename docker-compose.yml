@@ -123,8 +123,11 @@ services:
   # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   vault:
     profiles: ["jfrog-vault"]
-    image: hashicorp/vault:1.21
+    image: hashicorp/vault:2.1
     container_name: rise-vault
+    # The image runs as the unprivileged `vault` user; the entrypoint installs
+    # curl with apk and writes into the plugin volume, both of which need root.
+    user: root
     restart: unless-stopped
     ports:
       - "8200:8200"
