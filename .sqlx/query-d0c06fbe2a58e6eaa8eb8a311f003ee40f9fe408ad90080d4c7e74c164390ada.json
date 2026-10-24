@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            p.id as \"project_id!\",\n            a.id as \"active_id?\",\n            a.status as \"active_status?: crate::db::models::DeploymentStatus\",\n            l.id as \"latest_id?\",\n            l.status as \"latest_status?: crate::db::models::DeploymentStatus\"\n        FROM unnest($1::uuid[]) AS p(id)\n        CROSS JOIN LATERAL (\n            SELECT COALESCE(\n                (SELECT e.primary_deployment_group FROM environments e\n                 WHERE e.project_id = p.id AND e.is_production = TRUE),\n                'default'\n            ) AS grp\n        ) g\n        LEFT JOIN deployments a ON a.project_id = p.id\n            AND a.is_active = TRUE\n            AND a.deployment_group = g.grp\n        LEFT JOIN LATERAL (\n            SELECT d.id, d.status\n            FROM deployments d\n            WHERE d.project_id = p.id AND d.deployment_group = g.grp\n            ORDER BY d.created_at DESC\n            LIMIT 1\n        ) l ON TRUE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project_id!",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "active_id?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "active_status?: crate::db::models::DeploymentStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "latest_id?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "latest_status?: crate::db::models::DeploymentStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "d0c06fbe2a58e6eaa8eb8a311f003ee40f9fe408ad90080d4c7e74c164390ada"
+}

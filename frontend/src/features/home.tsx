@@ -5,11 +5,13 @@ import { Button, EnvTag, OwnerLabel, Panel, Status, cx, statusTone } from '../co
 import { Icon } from '../components/icon';
 import { LoadingState, ErrorState } from '../components/states';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
-import { byNewest, deploymentSource, isInProgress } from '../lib/env-state';
+import { byNewest, isInProgress } from '../lib/env-state';
 import type { Deployment, Project } from '../lib/project-context';
 import { useRecentProjects } from '../lib/recent';
 import { deploymentPath, projectPath } from '../lib/routes';
 import { QuickstartPanel } from './quickstart-templates';
+import { effectiveStatus, hasFailedDeploy, statusLabel } from '../lib/project-status';
+import { DeploymentSource } from '../components/deployment-source';
 
 interface HomeProps {
     user: { email?: string; id?: string } | null;
@@ -104,14 +106,14 @@ export function Home({ user }: HomeProps) {
     if (!projects || !teams) return <LoadingState label="Loading workspace…" />;
 
     const byName = new Map(projects.map(p => [p.name, p]));
-    const healthy = projects.filter(p => p.status === 'Running').length;
+    const healthy = projects.filter(p => effectiveStatus(p) === 'Running').length;
     const attention = deployments
         ? Object.entries(deployments).flatMap(([name, ds]) => attentionFor(name, ds))
             .sort((a, b) => (a.kind === b.kind ? byNewest(a.deployment, b.deployment) : a.kind === 'failed' ? -1 : 1))
         : [];
     // Failed projects whose deployments weren't read still need a card.
     const covered = new Set(attention.map(a => a.project));
-    const failedProjects = projects.filter(p => (p.status === 'Failed' || p.status === 'Deleting') && !covered.has(p.name));
+    const failedProjects = projects.filter(p => (effectiveStatus(p) === 'Failed' || p.status === 'Deleting') && !covered.has(p.name));
     const needAttention = new Set([...attention.filter(a => a.kind === 'failed').map(a => a.project), ...failedProjects.map(p => p.name)]).size;
 
     const recentDeployments = deployments
@@ -164,7 +166,7 @@ export function Home({ user }: HomeProps) {
                                 <span className="tile failed"><Icon name="alert" size={15} /></span>
                                 <div className="body">
                                     <div className="title">{p.name}</div>
-                                    <div className="sub">Project status: {p.status}.</div>
+                                    <div className="sub">{hasFailedDeploy(p) ? <>Deploy <span className="mono">{p.latest_deployment_id}</span> failed; the previous deployment is still serving.</> : <>Project status: {p.status}.</>}</div>
                                 </div>
                                 <span className="cta">Open →</span>
                             </div>
@@ -188,7 +190,7 @@ export function Home({ user }: HomeProps) {
                                 <span className={cx('r-dot', statusTone(d.status))} title={d.status} />
                                 <span className="proj">{project}</span>
                                 {d.environment && <EnvTag env={d.environment} color={d.environment_color} />}
-                                <span className="msg">{deploymentSource(d)}</span>
+                                <span className="msg"><DeploymentSource d={d} projectName={project} /></span>
                                 <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                             </div>
                         ))}
@@ -211,7 +213,7 @@ export function Home({ user }: HomeProps) {
                                     onKeyDown={e => { if (e.key === 'Enter') navigate(projectPath(p.name)); }}>
                                     <div className="top">
                                         <span className="name">{p.name}</span>
-                                        <Status status={p.status || 'Unknown'} />
+                                        <Status status={effectiveStatus(p)} label={statusLabel(p)} />
                                     </div>
                                     {p.primary_url && <div className="url mono">{stripUrlScheme(p.primary_url)}</div>}
                                     <div className="meta">

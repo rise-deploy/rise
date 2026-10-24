@@ -691,11 +691,10 @@ impl DockerReconciler {
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Environment context.
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let env_name = environment.as_ref().map(|e| e.name.clone());
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
@@ -951,7 +950,7 @@ impl DockerReconciler {
         &self,
         extra_label_filter: String,
     ) -> Result<Vec<ActualContainer>> {
-        use bollard::container::ListContainersOptions;
+        use bollard::query_parameters::ListContainersOptions;
         let ns = &self.config.label_namespace;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert(
@@ -970,7 +969,7 @@ impl DockerReconciler {
             .docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await?;
@@ -1021,7 +1020,7 @@ impl DockerReconciler {
                     // Daemon-reported lifecycle state ("running", "exited",
                     // "created", "dead", …). Used by the diff to restart
                     // containers that exist but aren't running.
-                    state: s.state,
+                    state: s.state.map(|state| state.to_string()),
                 })
             })
             .collect())
@@ -1263,7 +1262,7 @@ impl DockerReconciler {
         already_pulled: bool,
         identity: Option<&PreparedIdentity>,
     ) -> Result<()> {
-        use bollard::container::{CreateContainerOptions, StartContainerOptions};
+        use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
         let built = container_builder::build_container(desired, builder_cfg);
 
@@ -1276,8 +1275,8 @@ impl DockerReconciler {
         self.docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: built.name.clone(),
-                    platform: None,
+                    name: Some(built.name.clone()),
+                    ..Default::default()
                 }),
                 built.config,
             )
@@ -1301,7 +1300,7 @@ impl DockerReconciler {
         }
 
         self.docker
-            .start_container(&built.name, None::<StartContainerOptions<String>>)
+            .start_container(&built.name, None::<StartContainerOptions>)
             .await?;
 
         if let Some(identity) = identity {
@@ -1699,15 +1698,16 @@ impl DockerReconciler {
     /// Resolve a deployment's environment name (`None` for the no-environment
     /// case), shared by identity preparation and refresh.
     async fn resolve_environment_name(&self, deployment: &Deployment) -> Result<Option<String>> {
-        match deployment.environment_id {
-            Some(env_id) => Ok(self.store.find_environment(env_id).await?.map(|e| e.name)),
-            None => Ok(None),
-        }
+        Ok(self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?
+            .map(|e| e.name))
     }
 
     async fn pull_image(&self, image: &str) -> Result<()> {
         use bollard::auth::DockerCredentials;
-        use bollard::image::CreateImageOptions;
+        use bollard::query_parameters::CreateImageOptions;
 
         let creds = match self.registry_provider.get_pull_credentials().await {
             Ok((username, password)) if !username.is_empty() || !password.is_empty() => {
@@ -1729,7 +1729,7 @@ impl DockerReconciler {
         };
 
         let options = Some(CreateImageOptions {
-            from_image: image.to_string(),
+            from_image: Some(image.to_string()),
             ..Default::default()
         });
         let mut stream = self.docker.create_image(options, None, creds);
@@ -1759,7 +1759,7 @@ impl DockerReconciler {
     /// failure still returns `Err`, so the Recreate guard keeps fencing a genuinely
     /// stuck remove.
     async fn remove_container(&self, id: &str) -> Result<()> {
-        use bollard::container::RemoveContainerOptions;
+        use bollard::query_parameters::RemoveContainerOptions;
         match self
             .docker
             .remove_container(
