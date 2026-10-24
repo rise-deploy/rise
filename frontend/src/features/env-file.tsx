@@ -145,13 +145,13 @@ export function ImportEnvDialog({ file, onClose, projectName, vars, environments
     onImported: (written: { key: string; environment: string | null }[]) => void;
 }) {
     const [scope, setScope] = useState<string | null>(null);
-    const [type, setType] = useState<ImportType>('plain');
+    const [type, setType] = useState<ImportType>('secret');
     const [skipped, setSkipped] = useState<Set<string>>(new Set());
     const [importing, setImporting] = useState(false);
     const { showToast } = useToast();
 
     useEffect(() => {
-        if (file) { setScope(null); setType('plain'); setSkipped(new Set()); }
+        if (file) { setScope(null); setType('secret'); setSkipped(new Set()); }
     }, [file]);
 
     const rows: Row[] = useMemo(() => (file?.entries || []).map(([key, value]) => {

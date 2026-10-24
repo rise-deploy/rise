@@ -132,15 +132,18 @@ export function AppUsersList({ projectName, project, accessClasses: unsortedAcce
         }
     };
 
-    // Narrowing who can reach the app applies at once; widening it is confirmed
-    // first, naming who will be able to reach the app afterwards.
+    // Every change is confirmed: operators configure access classes freely
+    // (ingress class, annotations such as IP allowlists), so only the sign-in
+    // requirement can be compared, and a class with the same requirement can
+    // still be reachable from a wider network.
     const handleChangeAccessClass = (newAccessClass) => {
         if (!project || !newAccessClass || newAccessClass === project.access_class) return;
-        const from = accessClasses.find(a => a.id === project.access_class);
         const to = accessClasses.find(a => a.id === newAccessClass);
-        if (widensAccess(from, to)) setPendingAccess(to || { id: newAccessClass, display_name: newAccessClass });
-        else applyAccessClass(newAccessClass);
+        setPendingAccess(to || { id: newAccessClass, display_name: newAccessClass });
     };
+    const pendingWidens = pendingAccess
+        ? widensAccess(accessClasses.find(a => a.id === project?.access_class), pendingAccess)
+        : false;
 
     // A project can move to a team its owner belongs to; admins may pick any team.
     const ownableTeams = currentUserIsAdmin ? teams : teams.filter(t =>
@@ -622,10 +625,10 @@ export function AppUsersList({ projectName, project, accessClasses: unsortedAcce
                 onConfirm={() => pendingAccess && applyAccessClass(pendingAccess.id)}
                 title={`Change access to ${pendingAccess?.display_name || ''}?`}
                 message={pendingAccess
-                    ? `${project?.primary_url || project?.default_url || projectName} will be reachable by ${audience(pendingAccess)}. This applies to every environment of ${projectName}.`
+                    ? `${pendingAccess.description ? `${pendingAccess.display_name}: ${pendingAccess.description}. ` : ''}${pendingWidens ? `Sign-in: ${audience(pendingAccess)} will be able to reach ${project?.primary_url || project?.default_url || projectName}. ` : ''}This applies to every environment of ${projectName}.`
                     : ''}
                 confirmText="Change access"
-                confirmTone="danger"
+                confirmTone={pendingWidens ? 'danger' : 'primary'}
                 loading={changingAccess}
             />
 
