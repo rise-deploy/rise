@@ -13,6 +13,12 @@ The Kubernetes controller manages application deployments on Kubernetes by:
 - Implementing blue/green deployments via Service selector updates
 - Automatically refreshing image pull secrets for private registries
 
+## Requirements
+
+Kubernetes **1.32** or newer. Rise's minimum is the oldest Kubernetes API that
+its Kubernetes client types (`k8s-openapi`) support, so it rises when they drop
+a version; the Helm chart's `kubeVersion` refuses to install on older clusters.
+
 ## Resources Managed
 
 Rise creates a `RiseProject` custom resource per project. Metacontroller watches these CRs and manages the following child resources based on the desired state returned by Rise's sync webhook:
