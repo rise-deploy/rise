@@ -645,6 +645,67 @@ async fn convert_deployment(
     custom_domain_urls: Vec<String>,
     all_urls: Vec<String>,
 ) -> Deployment {
+    let environment = match deployment.environment_id {
+        Some(env_id) => crate::db::environments::find_by_id(&state.db_pool, env_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let provenance = match crate::db::deployment_events::provenance_batch(
+        &state.db_pool,
+        &[deployment.id],
+    )
+    .await
+    {
+        Ok(mut map) => map.remove(&deployment.id).unwrap_or_default(),
+        Err(e) => {
+            error!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to read deployment provenance: {:?}", e
+            );
+            Default::default()
+        }
+    };
+    convert_deployment_with(
+        state,
+        deployment,
+        project,
+        created_by_email,
+        DeploymentUrls {
+            primary_url,
+            custom_domain_urls,
+            all_urls,
+        },
+        environment.as_ref(),
+        provenance,
+    )
+    .await
+}
+
+/// URLs a deployment is reachable at, as returned to clients.
+struct DeploymentUrls {
+    primary_url: Option<String>,
+    custom_domain_urls: Vec<String>,
+    all_urls: Vec<String>,
+}
+
+/// [`convert_deployment`] with the environment and provenance already looked
+/// up, so a list can fetch them for every row at once.
+async fn convert_deployment_with(
+    state: &AppState,
+    deployment: crate::db::models::Deployment,
+    project: &crate::db::models::Project,
+    created_by_email: String,
+    urls: DeploymentUrls,
+    environment: Option<&crate::db::models::Environment>,
+    provenance: crate::db::deployment_events::Provenance,
+) -> Deployment {
+    let DeploymentUrls {
+        primary_url,
+        custom_domain_urls,
+        all_urls,
+    } = urls;
     // Multi-container side-data, folded onto the row. `None` is a legacy
     // single-container deployment — the frontend reads the flat replicas/cpu/
     // memory fields in that case. A present-but-unparseable column is corrupt:
@@ -685,16 +746,8 @@ async fn convert_deployment(
     };
     let can_rollback = state_machine::can_create_from(&deployment);
 
-    // Resolve environment name and color
-    let (environment, environment_color) = if let Some(env_id) = deployment.environment_id {
-        let env = crate::db::environments::find_by_id(&state.db_pool, env_id)
-            .await
-            .ok()
-            .flatten();
-        (env.as_ref().map(|e| e.name.clone()), env.map(|e| e.color))
-    } else {
-        (None, None)
-    };
+    let environment_color = environment.map(|e| e.color.clone());
+    let environment = environment.map(|e| e.name.clone());
 
     Deployment {
         id: deployment.id.to_string(),
@@ -726,6 +779,10 @@ async fn convert_deployment(
         job_url: deployment.job_url,
         pull_request_url: deployment.pull_request_url,
         git_repository_url: deployment.git_repository_url,
+        git_revision: provenance.git_revision,
+        git_branch: provenance.git_branch,
+        git_dirty: provenance.git_dirty,
+        source_deployment_id: provenance.source_deployment_id,
         created: deployment.created_at.to_rfc3339(),
         updated: deployment.updated_at.to_rfc3339(),
     }
@@ -2356,8 +2413,33 @@ pub struct ListDeploymentsQuery {
     /// `true` lists only the deployments currently serving their group,
     /// `false` only the rest.
     pub active: Option<bool>,
+    /// Environment name.
+    pub environment: Option<String>,
+    /// Comma-separated status names (e.g. `Failed,Unhealthy`).
+    pub status: Option<String>,
+    /// Case-insensitive substring of the deployment ID, image, group or creator email.
+    pub q: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+/// Header carrying the number of deployments that match a list's filter
+/// across all pages.
+pub const TOTAL_COUNT_HEADER: &str = "x-total-count";
+
+/// Parse a comma-separated status filter, rejecting unknown names.
+fn parse_status_filter(raw: &str) -> Result<Vec<String>, ServerError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            serde_json::from_value::<DbDeploymentStatus>(serde_json::Value::String(
+                name.to_string(),
+            ))
+            .map(|status| status.to_string())
+            .map_err(|_| ServerError::bad_request(format!("Unknown deployment status '{name}'")))
+        })
+        .collect()
 }
 
 /// List deployments for a project
@@ -2367,7 +2449,7 @@ pub async fn list_deployments(
     MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_name): Path<String>,
     Query(query): Query<ListDeploymentsQuery>,
-) -> Result<Json<Vec<Deployment>>, ServerError> {
+) -> Result<(axum::http::HeaderMap, Json<Vec<Deployment>>), ServerError> {
     debug!(
         "Listing deployments for project: {} (group: {:?}, active: {:?})",
         project_name, query.deployment_group, query.active
@@ -2403,84 +2485,135 @@ pub async fn list_deployments(
         scope.require_reach(list_deployments, &project.name)?;
     }
 
-    // Get deployments from database (optionally filtered, with pagination)
-    let mut db_deployments = db_deployments::list_for_project_filtered(
+    let environments = db_environments::list_for_project(&state.db_pool, project.id)
+        .await
+        .internal_err("Failed to list environments")?;
+
+    let environment_id = match query.environment.as_deref().filter(|e| !e.is_empty()) {
+        Some(name) => Some(
+            environments
+                .iter()
+                .find(|environment| environment.name == name)
+                .map(|environment| environment.id)
+                .ok_or_else(|| ServerError::not_found(format!("Environment '{name}' not found")))?,
+        ),
+        None => None,
+    };
+    let statuses = match query.status.as_deref().filter(|s| !s.is_empty()) {
+        Some(raw) => Some(parse_status_filter(raw)?),
+        None => None,
+    };
+
+    // A scoped session sees the deployments of the environments it covers.
+    // Filtering in the query keeps pages full and the total accurate.
+    let allowed_environments = scope.as_ref().map(|scope| {
+        let ids = environments
+            .iter()
+            .filter(|environment| {
+                scope.allows(list_deployments, &project.name, Some(&environment.name))
+            })
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>();
+        (ids, scope.allows(list_deployments, &project.name, None))
+    });
+
+    let filter = db_deployments::DeploymentListFilter {
+        group: query.deployment_group.as_deref(),
+        active: query.active,
+        environment_id,
+        statuses,
+        search: query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+        allowed_environments,
+    };
+    let (db_deployments, total) = db_deployments::list_for_project_filtered(
         &state.db_pool,
         project.id,
-        query.deployment_group.as_deref(),
-        query.active,
+        &filter,
         query.limit,
         query.offset,
     )
     .await
     .internal_err("Failed to list deployments")?;
 
-    // A scoped session sees the deployments of the environments it covers. The
-    // filter runs on the requested page, so a page may come back short.
-    if let Some(scope) = &scope {
-        let environment_names: std::collections::HashMap<uuid::Uuid, String> =
-            db_environments::list_for_project(&state.db_pool, project.id)
-                .await
-                .internal_err("Failed to list environments")?
-                .into_iter()
-                .map(|environment| (environment.id, environment.name))
-                .collect();
-        db_deployments.retain(|deployment| {
-            let environment = deployment
-                .environment_id
-                .and_then(|id| environment_names.get(&id))
-                .map(String::as_str);
-            scope.allows(list_deployments, &project.name, environment)
-        });
-    }
+    // Look up what every row needs at once rather than per row.
+    let creator_ids: Vec<uuid::Uuid> = db_deployments.iter().map(|d| d.created_by_id).collect();
+    let creator_emails = users::get_emails_batch(&state.db_pool, &creator_ids)
+        .await
+        .internal_err("Failed to get creator emails")?;
+    let deployment_ids: Vec<uuid::Uuid> = db_deployments.iter().map(|d| d.id).collect();
+    let mut provenance =
+        crate::db::deployment_events::provenance_batch(&state.db_pool, &deployment_ids)
+            .await
+            .internal_err("Failed to get deployment provenance")?;
+    let environments_by_id: std::collections::HashMap<uuid::Uuid, &crate::db::models::Environment> =
+        environments
+            .iter()
+            .map(|environment| (environment.id, environment))
+            .collect();
 
-    // Convert to API models (fetch creator emails and calculate URLs)
     let mut deployments = Vec::with_capacity(db_deployments.len());
     for db_deployment in db_deployments {
-        let created_by_email = get_creator_email(&state.db_pool, db_deployment.created_by_id).await;
+        let created_by_email = creator_emails
+            .get(&db_deployment.created_by_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Only calculate URLs for non-terminal deployments that could receive traffic
-        let (primary_url, custom_domain_urls, all_urls) =
-            if state_machine::is_terminal(&db_deployment.status) {
-                // Terminal deployments (Failed, Stopped, Cancelled, Superseded, Expired) cannot receive traffic
-                (None, vec![], vec![])
-            } else {
-                // Calculate deployment URLs dynamically for active deployments
-                match state
-                    .deployment_backend
-                    .get_deployment_urls(&db_deployment, &project)
-                    .await
-                {
-                    Ok(urls) => (
-                        Some(urls.primary_url),
-                        urls.custom_domain_urls,
-                        urls.all_urls,
-                    ),
-                    Err(e) => {
-                        error!(
-                            "Failed to calculate URLs for deployment {}: {}",
-                            db_deployment.deployment_id, e
-                        );
-                        (None, vec![], vec![])
+        let urls = if state_machine::is_terminal(&db_deployment.status) {
+            DeploymentUrls {
+                primary_url: None,
+                custom_domain_urls: vec![],
+                all_urls: vec![],
+            }
+        } else {
+            match state
+                .deployment_backend
+                .get_deployment_urls(&db_deployment, &project)
+                .await
+            {
+                Ok(urls) => DeploymentUrls {
+                    primary_url: Some(urls.primary_url),
+                    custom_domain_urls: urls.custom_domain_urls,
+                    all_urls: urls.all_urls,
+                },
+                Err(e) => {
+                    error!(
+                        "Failed to calculate URLs for deployment {}: {}",
+                        db_deployment.deployment_id, e
+                    );
+                    DeploymentUrls {
+                        primary_url: None,
+                        custom_domain_urls: vec![],
+                        all_urls: vec![],
                     }
                 }
-            };
+            }
+        };
 
+        let environment = db_deployment
+            .environment_id
+            .and_then(|id| environments_by_id.get(&id).copied());
+        let deployment_provenance = provenance.remove(&db_deployment.id).unwrap_or_default();
         deployments.push(
-            convert_deployment(
+            convert_deployment_with(
                 &state,
                 db_deployment,
                 &project,
                 created_by_email,
-                primary_url,
-                custom_domain_urls,
-                all_urls,
+                urls,
+                environment,
+                deployment_provenance,
             )
             .await,
         );
     }
 
-    Ok(Json(deployments))
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        TOTAL_COUNT_HEADER,
+        axum::http::HeaderValue::from(total.max(0) as u64),
+    );
+    Ok((headers, Json(deployments)))
 }
 
 /// Query parameters for stopping deployments

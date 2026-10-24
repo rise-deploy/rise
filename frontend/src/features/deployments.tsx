@@ -134,6 +134,14 @@ function aggregateContainerResources(
 }
 
 
+/** Status names each status filter asks the server for; absent = no filter. */
+const STATUS_FILTERS: Record<string, string[] | undefined> = {
+    active: ['Pending', 'Building', 'Pushing', 'Pushed', 'Deploying', 'Healthy', 'Unhealthy', 'Cancelling', 'Terminating'],
+    healthy: ['Healthy'],
+    unhealthy: ['Unhealthy'],
+    failed: ['Failed'],
+};
+
 export function DeploymentsList({ projectName }: { projectName: string }) {
     const [deployments, setDeployments] = useState<Deployment[]>([]);
     const [loading, setLoading] = useState(true);
@@ -142,6 +150,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     const page = Math.max(0, Number.parseInt(pageParam || '0', 10) || 0);
     const setPage = (value: number) => setPageParam(value > 0 ? String(value) : null);
     const [hasMore, setHasMore] = useState(true);
+    const [total, setTotal] = useState<number | null>(null);
     const [groupParam, setGroupFilter] = useQueryParam('group');
     const groupFilter = groupParam || '';
     const [deploymentGroups, setDeploymentGroups] = useState<string[]>([]);
@@ -151,9 +160,16 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     const envFilter = envParam || '';
     const [statusParam, setStatusParam] = useQueryParam('status');
     const statusFilter = statusParam || 'all';
-    const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
-    const [searchParam, setSearch] = useQueryParam('search');
+    const setStatusFilter = (v: string) => { setStatusParam(v === 'all' ? null : v); setPage(0); };
+    const [searchParam, setSearchParam] = useQueryParam('search');
     const search = searchParam || '';
+    const setSearch = (v: string) => { setSearchParam(v || null); setPage(0); };
+    // The server does the filtering; wait for a pause in typing before asking.
+    const [query, setQuery] = useState(search);
+    useEffect(() => {
+        const t = window.setTimeout(() => setQuery(search.trim()), 300);
+        return () => window.clearTimeout(t);
+    }, [search]);
     const [deploymentToStop, setDeploymentToStop] = useState<Deployment | null>(null);
     const [stopping, setStopping] = useState(false);
     const { request } = useDeployActions();
@@ -169,21 +185,27 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
 
     const loadDeployments = useCallback(async () => {
         try {
-            const params: { limit: number; offset: number; group?: string } = {
+            const params: Record<string, string | number> = {
                 limit: pageSize,
                 offset: page * pageSize,
             };
             if (groupFilter) params.group = groupFilter;
-            const data: Deployment[] = await api.getProjectDeployments(projectName, params);
-            setDeployments(data);
-            setHasMore(data.length >= pageSize);
+            if (envFilter) params.environment = envFilter;
+            const statuses = STATUS_FILTERS[statusFilter];
+            if (statuses) params.status = statuses.join(',');
+            if (query) params.q = query;
+            const { items, total }: { items: Deployment[]; total: number | null } =
+                await api.getProjectDeploymentsPage(projectName, params);
+            setDeployments(items);
+            setTotal(total);
+            setHasMore(total !== null ? (page + 1) * pageSize < total : items.length >= pageSize);
             setError(null);
         } catch (err) {
             setError((err as Error).message);
         } finally {
             setLoading(false);
         }
-    }, [projectName, page, groupFilter]);
+    }, [projectName, page, groupFilter, envFilter, statusFilter, query]);
 
     useEffect(() => { loadDeployments(); }, [loadDeployments]);
     useEffect(() => {
@@ -223,20 +245,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
     if (loading && deployments.length === 0) return <LoadingState label="Loading deployments..." />;
     if (error && deployments.length === 0) return <ErrorState message={`Error loading deployments: ${error}`} onRetry={loadDeployments} />;
 
-    const matchesStatus = (d: Deployment) => {
-        switch (statusFilter) {
-            case 'active': return !isTerminal(d.status);
-            case 'healthy': return d.status === 'Healthy';
-            case 'unhealthy': return d.status === 'Unhealthy';
-            case 'failed': return d.status === 'Failed';
-            default: return true;
-        }
-    };
-    const q = search.trim().toLowerCase();
-    const filtered = sorted
-        .filter(d => !envFilter || d.environment === envFilter)
-        .filter(matchesStatus)
-        .filter(d => !q || `${d.deployment_id} ${d.image || ''} ${d.created_by_email || ''} ${d.deployment_group}`.toLowerCase().includes(q));
+    const filtered = sorted;
 
     const actionFor = (d: Deployment): React.ReactNode => {
         if (!d.can_rollback) return null;
@@ -370,7 +379,11 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
             {(page > 0 || hasMore) && (
                 <div className="r-pager">
                     <RButton size="sm" onClick={() => setPage(page - 1)} disabled={page === 0} icon="chevl">Newer</RButton>
-                    <span>Page {page + 1}</span>
+                    <span>
+                        {total !== null && filtered.length > 0
+                            ? `${page * pageSize + 1}–${page * pageSize + filtered.length} of ${total}`
+                            : `Page ${page + 1}`}
+                    </span>
                     <RButton size="sm" onClick={() => setPage(page + 1)} disabled={!hasMore}>Older</RButton>
                 </div>
             )}
@@ -533,7 +546,11 @@ export function EnvironmentDeploymentView({ projectName, environmentName, groupN
                     const envs = await api.getProjectEnvironments(projectName);
                     group = (envs || []).find((e) => e.name === environmentName)?.primary_deployment_group || null;
                 }
-                const deployments = await api.getProjectDeployments(projectName, { limit: 100 });
+                // Ask for the environment's active deployments directly: the
+                // live one can be older than any recent page.
+                const deployments = await api.getProjectDeployments(projectName, {
+                    environment: environmentName, active: true, limit: 50, ...(group ? { group } : {}),
+                });
                 const active = deployments.find(
                     (d) => d.environment === environmentName
                         && d.is_active
@@ -924,7 +941,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
 
             {activeTab === 'overview' && (
                 <div className="r-stack r-dep-diagnosis">
-                    <DeploymentMetaStrip deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
+                    <DeploymentMetaStrip projectName={projectName} deployment={deployment} endedAt={rolloutEnd(deployment, rollout?.steps ?? null)} />
                     {showFailure && (
                         <FailurePanel
                             projectName={projectName}

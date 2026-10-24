@@ -1,0 +1,236 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            d.id, d.deployment_id, d.project_id, d.created_by_id,\n            d.status as \"status: DeploymentStatus\",\n            d.deployment_group, d.environment_id, d.expires_at,\n            d.termination_reason as \"termination_reason: _\",\n            d.completed_at, d.error_message, d.build_logs,\n            d.controller_metadata as \"controller_metadata: serde_json::Value\",\n            d.image, d.image_digest, d.rolled_back_from_deployment_id,\n            d.http_port, d.needs_reconcile, d.is_active,\n            d.deploying_started_at,\n            d.first_healthy_at, d.job_url, d.pull_request_url, d.git_repository_url,\n            d.replicas, d.cpu, d.memory,\n            d.created_at, d.updated_at, d.identity_credential_hash,\n            d.identity_audiences as \"identity_audiences: serde_json::Value\",\n            d.containers as \"containers: serde_json::Value\",\n            d.routes as \"routes: serde_json::Value\"\n        FROM deployments d\n        WHERE d.project_id = $1\n          AND ($2::text IS NULL OR d.deployment_group = $2)\n          AND ($3::bool IS NULL OR d.is_active = $3)\n          AND ($4::uuid IS NULL OR d.environment_id = $4)\n          AND ($5::text[] IS NULL OR d.status = ANY($5))\n          AND ($6::text IS NULL\n               OR strpos(lower(d.deployment_id), lower($6)) > 0\n               OR strpos(lower(COALESCE(d.image, '')), lower($6)) > 0\n               OR strpos(lower(d.deployment_group), lower($6)) > 0\n               OR EXISTS (SELECT 1 FROM users u\n                          WHERE u.id = d.created_by_id\n                            AND strpos(lower(u.email), lower($6)) > 0))\n          AND ($7::uuid[] IS NULL\n               OR d.environment_id = ANY($7)\n               OR ($8 AND d.environment_id IS NULL))\n        ORDER BY d.created_at DESC\n        LIMIT $9 OFFSET $10\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "project_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_by_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "status: DeploymentStatus",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "deployment_group",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "environment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "termination_reason: _",
+        "type_info": {
+          "Custom": {
+            "name": "termination_reason",
+            "kind": {
+              "Enum": [
+                "UserStopped",
+                "Superseded",
+                "Cancelled",
+                "Failed",
+                "Expired"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "error_message",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "build_logs",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "controller_metadata: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 13,
+        "name": "image",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "image_digest",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "rolled_back_from_deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "http_port",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "needs_reconcile",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 19,
+        "name": "deploying_started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
+        "name": "first_healthy_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
+        "name": "job_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "pull_request_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 23,
+        "name": "git_repository_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "replicas",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 25,
+        "name": "cpu",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 26,
+        "name": "memory",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 28,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 29,
+        "name": "identity_credential_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 30,
+        "name": "identity_audiences: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 31,
+        "name": "containers: serde_json::Value",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 32,
+        "name": "routes: serde_json::Value",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "Uuid",
+        "TextArray",
+        "Text",
+        "UuidArray",
+        "Bool",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "18dd83909cce8c9afe4d4a9ab44b9c9b40d921186b797c6472eb28c5efcfdde1"
+}

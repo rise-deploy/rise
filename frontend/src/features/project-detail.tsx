@@ -17,22 +17,22 @@ import { useCurrentProject, type Project } from '../lib/project-context';
 import { useDeployActions } from '../components/deploy-actions';
 import { byNewest, deploymentSource, envState, productionEnv, sortEnvironments } from '../lib/env-state';
 import { deploymentPath, projectPath, type ProjectSection } from '../lib/routes';
+import type { AccessClass } from '../lib/access';
 import { SectionHead } from '../components/section-head';
 
 // Sections that render their own head because it carries actions.
 const SELF_HEADED = new Set<ProjectSection>(['environments', 'variables', 'domains', 'extensions']);
 
-interface AccessClass { id: string; display_name?: string; description?: string }
 
 export function ProjectDetail({ section }: { section: ProjectSection }) {
     const current = useCurrentProject()!;
     const { projectName, project, error, reload } = current;
     const [accessClasses, setAccessClasses] = useState<AccessClass[]>([]);
-    const [currentUserEmail, setCurrentUserEmail] = useState<string>('');
+    const [me, setMe] = useState<{ id?: string; email?: string; is_admin?: boolean }>({});
 
     useEffect(() => {
         api.getAccessClasses().then((d: { access_classes?: AccessClass[] }) => setAccessClasses(d?.access_classes || [])).catch(() => {});
-        api.getMe().then((u: { email?: string }) => setCurrentUserEmail(u?.email || '')).catch(() => {});
+        api.getMe().then((u: { id?: string; email?: string; is_admin?: boolean }) => setMe(u || {})).catch(() => {});
     }, []);
 
     if (error) return <ErrorState message={`Failed to load project: ${error}`} onRetry={reload} />;
@@ -60,7 +60,9 @@ export function ProjectDetail({ section }: { section: ProjectSection }) {
                         projectName={projectName}
                         project={project}
                         accessClasses={accessClasses}
-                        currentUserEmail={currentUserEmail}
+                        currentUserEmail={me.email || ''}
+                        currentUserId={me.id}
+                        currentUserIsAdmin={!!me.is_admin}
                         onProjectUpdated={reload}
                     />
                     <DangerZone project={project} />

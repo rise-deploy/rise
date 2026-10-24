@@ -7,6 +7,7 @@ import { useIsMobile } from '../lib/use-media';
 import { useToast } from '../components/toast';
 import { Icon } from '../components/icon';
 import { SectionHead } from '../components/section-head';
+import { ExportEnvDialog, ImportEnvDialog, parseEnvFile } from './env-file';
 import { ErrorState, LoadingState } from '../components/states';
 import {
     Button,
@@ -77,6 +78,8 @@ export function VariablesSection() {
     const [toDelete, setToDelete] = useState<EnvVar | null>(null);
     const [deleting, setDeleting] = useState(false);
     const importInputRef = useRef<HTMLInputElement>(null);
+    const [importFile, setImportFile] = useState<{ name: string; entries: [string, string][] } | null>(null);
+    const [exportOpen, setExportOpen] = useState(false);
     const { showToast } = useToast();
     const isMobile = useIsMobile();
 
@@ -175,25 +178,8 @@ export function VariablesSection() {
         }
     };
 
-    // Export the loaded variables as a .env file. Secret values never reach the
-    // browser, so secret keys are written without a value.
-    const exportEnv = () => {
-        const lines = (vars || []).map(v => {
-            const scope = v.environment ? ` (${v.environment})` : '';
-            if (v.is_secret) return `# ${v.key}${scope} is a secret; value not exported\n${v.key}=`;
-            return `${v.environment ? `# ${v.environment}\n` : ''}${v.key}=${v.value ?? ''}`;
-        });
-        const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${projectName}.env`;
-        a.click();
-        URL.revokeObjectURL(url);
-    };
-
-    // Import a .env file as plain Global variables.
-    const importEnv = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    // Import a .env file: parse it, then review where and how it lands.
+    const pickImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         e.target.value = '';
         if (!file) return;
@@ -204,43 +190,19 @@ export function VariablesSection() {
             showToast(`Failed to read file: ${(err as Error).message}`, 'error');
             return;
         }
-        const entries: [string, string][] = [];
-        for (const raw of text.split('\n')) {
-            const line = raw.trim();
-            if (!line || line.startsWith('#')) continue;
-            const eq = line.indexOf('=');
-            if (eq <= 0) continue;
-            let key = line.slice(0, eq).trim();
-            if (key.startsWith('export ')) key = key.slice(7).trim();
-            let value = line.slice(eq + 1).trim();
-            if (value.length >= 2 && ((value[0] === '"' && value.endsWith('"')) || (value[0] === "'" && value.endsWith("'")))) {
-                value = value.slice(1, -1);
-            }
-            if (key) entries.push([key, value]);
-        }
+        const entries = parseEnvFile(text);
         if (entries.length === 0) {
             showToast('No variables found in file', 'error');
             return;
         }
-        let ok = 0;
-        for (const [key, value] of entries) {
-            try {
-                await api.setEnvVar(projectName, key, value, false, false, null);
-                ok++;
-            } catch (err) {
-                showToast(`Failed to import ${key}: ${(err as Error).message}`, 'error');
-            }
-        }
-        if (ok > 0) showToast(`Imported ${ok} variable${ok === 1 ? '' : 's'} into Global`, 'success');
-        load();
-        reload();
+        setImportFile({ name: file.name, entries });
     };
 
     const actions = (
         <>
-            <input ref={importInputRef} type="file" accept=".env,text/plain" style={{ display: 'none' }} onChange={importEnv} />
-            <Button icon="download" onClick={() => importInputRef.current?.click()} title="Import a .env file as plain Global variables">Import .env</Button>
-            <Button icon="ext" onClick={exportEnv} disabled={!vars?.length}>Export</Button>
+            <input ref={importInputRef} type="file" accept=".env,text/plain" style={{ display: 'none' }} onChange={pickImportFile} />
+            <Button icon="arrow" onClick={() => importInputRef.current?.click()} title="Review a .env file, then import it into one scope">Import .env</Button>
+            <Button icon="download" onClick={() => setExportOpen(true)} disabled={!vars?.length}>Export</Button>
             <Button variant="primary" icon="plus" onClick={() => openAdd(null)}>Add variable</Button>
         </>
     );
@@ -399,6 +361,20 @@ export function VariablesSection() {
                 confirmTone="danger"
                 loading={deleting}
             />
+
+            <ImportEnvDialog
+                file={importFile}
+                onClose={() => setImportFile(null)}
+                projectName={projectName}
+                vars={vars || []}
+                environments={environments}
+                onImported={written => {
+                    setEdited(s => { const next = new Set(s); written.forEach(w => next.add(w.key)); return next; });
+                    load();
+                    reload();
+                }}
+            />
+            <ExportEnvDialog open={exportOpen} onClose={() => setExportOpen(false)} projectName={projectName} vars={vars || []} environments={environments} />
         </div>
     );
 }

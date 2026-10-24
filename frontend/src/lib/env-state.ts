@@ -105,9 +105,32 @@ export function shortImage(image?: string): string {
     return last.length > 40 ? `${last.slice(0, 37)}…` : last;
 }
 
+/** The first 7 characters of a commit hash. */
+export function shortRevision(revision?: string): string {
+    return revision ? revision.slice(0, 7) : '';
+}
+
 /** A one-line description of where a deployment came from. */
 export function deploymentSource(d: Deployment): string {
+    const parts: string[] = [];
     const pr = d.pull_request_url?.match(/\/(?:pull|merge_requests)\/(\d+)/);
-    if (pr) return `${d.pull_request_url!.includes('merge_requests') ? '!' : '#'}${pr[1]} · ${shortImage(d.image)}`;
-    return shortImage(d.image);
+    if (pr) parts.push(`${d.pull_request_url!.includes('merge_requests') ? '!' : '#'}${pr[1]}`);
+    if (d.git_revision) parts.push(shortRevision(d.git_revision));
+    parts.push(shortImage(d.image));
+    return parts.join(' · ');
+}
+
+/** A link to the commit on its forge, when the forge's URL layout is known. */
+export function commitUrl(repo: string | undefined, revision: string | undefined): string | null {
+    if (!repo || !revision) return null;
+    try {
+        const host = new URL(repo).hostname;
+        const base = repo.replace(/\/+$/, '');
+        if (host === 'github.com' || host.endsWith('.github.com')) return `${base}/commit/${revision}`;
+        if (host.includes('gitlab')) return `${base}/-/commit/${revision}`;
+        if (host === 'bitbucket.org') return `${base}/commits/${revision}`;
+    } catch {
+        // Not a URL.
+    }
+    return null;
 }

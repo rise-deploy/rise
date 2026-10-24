@@ -117,7 +117,7 @@ Group names must match `[a-z0-9][a-z0-9/-]*[a-z0-9]` (no consecutive hyphens `--
 
 ### Environments
 
-[Environments](../environments) give semantic meaning to deployment groups. Each environment has a primary deployment group and controls URL routing, variable scoping, and access. The environment marked as **production** determines which deployments receive production traffic and the project's main URL — not the deployment group name itself.
+[Environments](../environments) give semantic meaning to deployment groups. Each environment has a primary deployment group and controls URL routing, variable scoping, and access. The environment marked as **production** determines which deployments receive production traffic and the project's main URL — not the deployment group name itself. The project's status (`Running`, `Deploying`, `Failed`, `Stopped`) likewise follows what the production environment's primary group serves.
 
 New projects start with a `production` environment mapped to the `default` group. You can create additional environments for staging, dev, etc. See [Environments](../environments) for details.
 
@@ -132,6 +132,8 @@ When `rise deploy` runs inside a CI pipeline, the CLI automatically attaches dep
 | Git repository | `CI_PROJECT_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` | `BITBUCKET_GIT_HTTP_ORIGIN`, `CIRCLE_REPOSITORY_URL`, `BUILD_REPOSITORY_URI` (Azure), `BUILDKITE_REPO`, `DRONE_GIT_HTTP_URL`, `GIT_URL` (Jenkins) |
 
 This metadata is stored with the deployment and displayed in the Rise web UI, making it easy to trace a running deployment back to the pipeline job and merge/pull request that created it. No extra configuration is needed — detection is fully automatic.
+
+Outside CI too, `rise deploy` records the commit it built from (revision, branch, and whether the working tree had uncommitted changes); the web UI shows it on the deployment, and redeploys, rollbacks and promotions carry it over from the deployment they were created from.
 
 When no CI environment is detected, the Git repository falls back to the local `origin` remote. Repository URLs in `ssh://`, `git://`, and `git@host:owner/repo` form are normalized to `https://` (credentials, ports, and the trailing `.git` are stripped). You can override detection with `rise deploy --git-repository <url>`.
 
