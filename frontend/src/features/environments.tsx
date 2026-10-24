@@ -3,13 +3,14 @@ import { api } from '../lib/api';
 import { navigate } from '../lib/navigation';
 import { formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import { useCurrentProject, type Deployment, type Environment } from '../lib/project-context';
-import { deploymentSource, envState, healthBadge, promoteTargets, sortEnvironments, type EnvState } from '../lib/env-state';
+import { envState, healthBadge, promoteTargets, sortEnvironments, type EnvState } from '../lib/env-state';
 import { deploymentPath, logsPath, projectPath } from '../lib/routes';
 import { fetchDeploymentContainers } from './logs/api';
 import { useToast } from '../components/toast';
 import { useDeployActions } from '../components/deploy-actions';
 import { Icon } from '../components/icon';
 import { SectionHead } from '../components/section-head';
+import { DeploymentSource } from '../components/deployment-source';
 import {
     Button,
     ConfirmDialog,
@@ -96,7 +97,7 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
                         <>
                             <span className="line">
                                 <span className="mono id">{(live ?? latest)!.deployment_id}</span>
-                                <span className="msg">{deploymentSource((live ?? latest)!)}</span>
+                                <span className="msg"><DeploymentSource d={(live ?? latest)!} projectName={projectName} /></span>
                             </span>
                             <span className="meta">
                                 {(live ?? latest)!.created_by_email} · {formatRelativeTimeRounded((live ?? latest)!.created)}
@@ -437,7 +438,7 @@ export function EnvironmentRows({ states, projectName }: { states: EnvState[]; p
                         <span className="env-name"><EnvironmentIcon color={state.env.color} size={12} />{state.env.name}</span>
                         <span className="env-status"><Status {...healthBadge(state)} /></span>
                         <span className="mono id">{state.live?.deployment_id ?? '—'}</span>
-                        <span className="msg">{state.live ? deploymentSource(state.live) : 'Not deployed'}</span>
+                        <span className="msg">{state.live ? <DeploymentSource d={state.live} projectName={projectName} /> : 'Not deployed'}</span>
                         {url && (
                             <a className="r-link mono url" href={url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()}>
                                 {stripUrlScheme(url)}

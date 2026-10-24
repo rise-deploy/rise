@@ -1990,7 +1990,12 @@ a.r-meta-link:hover { color: var(--text); }
 }
 .r-issue > svg { color: var(--err); flex: 0 0 auto; }
 .r-issue .text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.r-issue .r-btn { color: var(--err); }
+.r-issue .r-btn:not(.primary) { color: var(--err); }
+.r-issue-title { font-weight: 600; }
+.r-issue-reason { color: var(--text); }
+.r-issue-serving { color: var(--text-muted); font-size: 12.5px; margin-top: 2px; }
+.r-issue-actions { display: flex; flex-wrap: wrap; gap: 8px; flex: 0 0 auto; }
+a.r-btn { text-decoration: none; }
 
 /* ---------- Environment cards ---------- */
 .r-env-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 14px; }
@@ -2517,7 +2522,7 @@ a.r-link:hover, .r-link-btn:hover { text-underline-offset: 3px; }
     /* The failure banner stacks: message, then its action. */
     .r-issue { flex-wrap: wrap; align-items: flex-start; }
     .r-issue .text { flex: 1 1 calc(100% - 30px); }
-    .r-issue .r-btn { margin-left: 28px; }
+    .r-issue-actions { margin-left: 28px; }
 }
 
 /* ---------- .env import review ---------- */
@@ -2547,3 +2552,43 @@ a.r-link:hover, .r-link-btn:hover { text-underline-offset: 3px; }
 
 /* A build from uncommitted changes: the commit alone does not reproduce it. */
 .r-dirty { margin-left: 6px; font-size: 11.5px; color: var(--warn); white-space: nowrap; }
+
+/* ---------- Deployment source: one fact, the rest in a card ---------- */
+.r-src {
+    all: unset;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    min-width: 0;
+    color: var(--text);
+    cursor: pointer;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+.r-src > svg { color: var(--text-muted); flex: 0 0 auto; }
+.r-src-text { overflow: hidden; text-overflow: ellipsis; text-decoration: underline dotted transparent; text-underline-offset: 3px; }
+.r-src-text.mono { font-size: 12.5px; }
+.r-src:hover .r-src-text, .r-src[aria-expanded="true"] .r-src-text { text-decoration-color: var(--text-soft); }
+.r-src:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.r-src-dim { color: var(--text-muted); }
+.r-src .r-dirty { margin-left: 0; }
+.r-src-card {
+    z-index: 100;
+    width: 300px;
+    max-width: calc(100vw - 16px);
+    padding: 10px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+    font-size: 12.5px;
+    color: var(--text);
+}
+.r-src-card-rows { display: grid; gap: 6px; margin: 0; }
+.r-src-card-rows > div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 10px; align-items: baseline; }
+.r-src-card-rows dt { color: var(--text-muted); }
+.r-src-card-rows dd { margin: 0; min-width: 0; }
+.r-src-card-rows .r-dirty { display: block; margin: 2px 0 0; }
+.r-src-wrap { overflow-wrap: anywhere; font-size: 12px; }

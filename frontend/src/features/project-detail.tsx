@@ -15,10 +15,11 @@ import { AppUsersList } from './projects';
 import { useQuickstartTemplates } from './quickstart-templates';
 import { useCurrentProject, type Project } from '../lib/project-context';
 import { useDeployActions } from '../components/deploy-actions';
-import { byNewest, deploymentSource, envState, productionEnv, sortEnvironments, type EnvState } from '../lib/env-state';
+import { byNewest, envState, productionEnv, sortEnvironments, type EnvState } from '../lib/env-state';
 import { deploymentPath, logsPath, projectPath, type ProjectSection } from '../lib/routes';
 import type { AccessClass } from '../lib/access';
 import { SectionHead } from '../components/section-head';
+import { DeploymentSource } from '../components/deployment-source';
 
 // Sections that render their own head because it carries actions.
 const SELF_HEADED = new Set<ProjectSection>(['environments', 'variables', 'domains', 'extensions']);
@@ -377,7 +378,7 @@ function ProjectOverview({ project, onUpdated }: { project: Project; onUpdated: 
                             <span className={cx('r-dot', statusTone(d.status))} title={d.status} />
                             <span className="mono id">{d.deployment_id}</span>
                             {d.environment && <EnvTag env={d.environment} />}
-                            <span className="msg">{deploymentSource(d)}</span>
+                            <span className="msg"><DeploymentSource d={d} projectName={projectName} /></span>
                             <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                         </div>
                     ))}

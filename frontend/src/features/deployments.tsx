@@ -19,6 +19,7 @@ import { useDeployActions } from '../components/deploy-actions';
 import { byNewest, deploymentSource, isInProgress, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
 import { DeploymentMetaStrip, FailurePanel, RolloutPanel, rolloutEnd, rolloutSteps, useDeploymentEvents } from './deployment-diagnosis';
 import { useIsMobile } from '../lib/use-media';
+import { DeploymentSource } from '../components/deployment-source';
 
 // ── CPU / memory parsing helpers for the multi-container resource breakdown ──
 // CPU is stored as the same string K8s accepts (`"500m"`, `"1"`, `"1.5"`).
@@ -328,7 +329,7 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                                 {groupFor(d)}
                                 <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                             </div>
-                            <div className="r-card-title">{deploymentSource(d)}</div>
+                            <div className="r-card-title"><DeploymentSource d={d} projectName={projectName} /></div>
                             <div className="r-card-meta"><span className="mono">{d.deployment_id}</span> · {d.created_by_email}</div>
                             {(actionFor(d) || stopFor(d)) && <div className="r-card-actions">{actionFor(d)}{stopFor(d)}</div>}
                         </div>
@@ -353,10 +354,10 @@ export function DeploymentsList({ projectName }: { projectName: string }) {
                                     <td><Status status={d.status} /></td>
                                     <td className="mono r-nowrap" style={{ fontSize: 12 }}>{d.deployment_id}</td>
                                     <td>
-                                        <div className="r-cell-main">{deploymentSource(d)}</div>
+                                        <div className="r-cell-main"><DeploymentSource d={d} projectName={projectName} /></div>
                                         <div className="r-cell-sub">
                                             {[d.created_by_email, durationNote(d)].filter(Boolean).join(' · ')}
-                                            {d.expires_at && <span title={formatISO8601(d.expires_at)}> · expires in {formatTimeRemaining(d.expires_at)}</span>}
+                                            {d.expires_at && <span title={formatISO8601(d.expires_at)}> · expires {formatTimeRemaining(d.expires_at)}</span>}
                                         </div>
                                     </td>
                                     <td>
