@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import { formatISO8601, formatRelativeTimeRounded, isSafeUrl, stripUrlScheme } from '../lib/utils';
 import type { Deployment } from '../lib/project-context';
-import { shortImage } from '../lib/env-state';
+import { commitUrl, shortImage, shortRevision } from '../lib/env-state';
+import { navigate } from '../lib/navigation';
 import { Icon } from '../components/icon';
 import { SourceLinkGroup, cx } from '../components/r-ui';
 import { fetchDeploymentEvents, streamLogs, type DeploymentEvent } from './logs/api';
@@ -214,7 +215,7 @@ export function rolloutEnd(deployment: Deployment, steps: RolloutStep[] | null):
     return healthy ?? deployment.completed_at ?? null;
 }
 
-export function DeploymentMetaStrip({ deployment, endedAt }: { deployment: Deployment; endedAt: string | null }) {
+export function DeploymentMetaStrip({ projectName, deployment, endedAt }: { projectName: string; deployment: Deployment; endedAt: string | null }) {
     const hasLinks = !!(deployment.pull_request_url || deployment.job_url);
     const repo = deployment.git_repository_url && isSafeUrl(deployment.git_repository_url) ? deployment.git_repository_url : null;
     const cells: { k: string; v: React.ReactNode }[] = [
@@ -229,6 +230,26 @@ export function DeploymentMetaStrip({ deployment, endedAt }: { deployment: Deplo
         { k: 'Duration', v: <span className="mono">{formatDuration(deployment.created, endedAt)}</span> },
         { k: 'Image', v: <span className="mono" title={deployment.image}>{shortImage(deployment.image)}</span> },
     ];
+    if (deployment.git_revision) {
+        const href = commitUrl(repo ?? undefined, deployment.git_revision);
+        const sha = shortRevision(deployment.git_revision);
+        cells.splice(1, 0, {
+            k: 'Commit',
+            v: <>
+                {href ? <a className="r-link mono" href={href} target="_blank" rel="noopener noreferrer" title={deployment.git_revision}>{sha}</a>
+                    : <span className="mono" title={deployment.git_revision}>{sha}</span>}
+                {deployment.git_branch && <span className="muted"> on <span className="mono">{deployment.git_branch}</span></span>}
+                {deployment.git_dirty && <span className="r-dirty" title="Built from a working tree with uncommitted changes; the commit alone does not reproduce this image">+ uncommitted</span>}
+            </>,
+        });
+    }
+    if (deployment.source_deployment_id) {
+        const href = `/deployment/${projectName}/${deployment.source_deployment_id}`;
+        cells.push({
+            k: 'Created from',
+            v: <a className="r-link mono" href={href} onClick={e => { if (e.button !== 0 || e.metaKey || e.ctrlKey) return; e.preventDefault(); navigate(href); }}>{deployment.source_deployment_id}</a>,
+        });
+    }
     return (
         <div className="r-meta-strip">
             {cells.map(c => (

@@ -105,6 +105,12 @@ pub async fn create_environment(
         }
     })?;
 
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
+    }
+
     tracing::info!(
         "Created environment '{}' for project '{}'",
         env.name,
@@ -344,6 +350,12 @@ pub async fn update_environment(
         .internal_err("Failed to update deployment constraints")?;
     }
 
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
+    }
+
     tracing::info!(
         "Updated environment '{}' in project '{}'",
         updated.name,
@@ -393,6 +405,12 @@ pub async fn delete_environment(
             "Environment '{}' not found",
             env_name
         )));
+    }
+
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
     }
 
     tracing::info!(

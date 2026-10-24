@@ -1,5 +1,6 @@
 // @ts-nocheck
 // API client for Rise backend
+import { ApiError, apiErrorFromResponse } from './api-error';
 
 class RiseAPI {
     constructor(baseUrl) {
@@ -20,20 +21,11 @@ class RiseAPI {
 
         if (response.status === 401) {
             // Authentication required - let the app handle showing login page
-            throw new Error('Authentication required');
-        }
-
-        if (response.status === 403) {
-            // Platform access denied - user is authenticated but lacks platform access
-            const errorText = await response.text();
-            const error = new Error(errorText || 'You do not have access to Rise platform features. Your account is configured for application access only. Please contact your administrator if you need platform access.');
-            error.isPlatformAccessDenied = true;
-            throw error;
+            throw new ApiError(401, 'Authentication required');
         }
 
         if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`API error: ${response.status} ${errorText}`);
+            throw await apiErrorFromResponse(response);
         }
 
         // Handle responses with no body (204 No Content, 202 Accepted)
@@ -156,10 +148,28 @@ class RiseAPI {
 
     // Deployment endpoints
     async getProjectDeployments(projectName, params = {}) {
+        return (await this.getProjectDeploymentsPage(projectName, params)).items;
+    }
+
+    /**
+     * One page of a project's deployments plus the number matching the filter
+     * across all pages. Filters: group, active, environment, status
+     * (comma-separated), q (ID, image or creator email), limit, offset.
+     */
+    async getProjectDeploymentsPage(projectName, params = {}) {
         const queryString = new URLSearchParams(
             Object.entries(params).filter(([_, v]) => v !== null && v !== undefined && v !== '')
         ).toString();
-        return this.request(`/projects/${projectName}/deployments${queryString ? '?' + queryString : ''}`);
+        const response = await fetch(
+            `${this.baseUrl}/api/v1/projects/${projectName}/deployments${queryString ? '?' + queryString : ''}`,
+            { headers: { 'Content-Type': 'application/json' }, credentials: 'include' },
+        );
+        if (response.status === 401) throw new ApiError(401, 'Authentication required');
+        if (!response.ok) throw await apiErrorFromResponse(response);
+        const items = await response.json();
+        const header = response.headers.get('X-Total-Count');
+        const total = header !== null && header !== '' ? Number(header) : null;
+        return { items, total: Number.isFinite(total) ? total : null };
     }
 
     async getDeployment(projectName, deploymentId) {
