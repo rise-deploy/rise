@@ -25,6 +25,12 @@ variable "rise_image" {
   default     = "ghcr.io/rise-deploy/rise"
 }
 
+variable "rise_cli_image" {
+  description = "The rise-cli image the workload-identity sidecar runs, at rise_image_tag. Public for the same reason as rise_image."
+  type        = string
+  default     = "ghcr.io/rise-deploy/rise-cli"
+}
+
 variable "rise_image_tag" {
   description = "The image under test. No default: the run must be explicit about what it exercises."
   type        = string

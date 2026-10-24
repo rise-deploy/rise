@@ -13,13 +13,14 @@
 mod claims;
 mod error;
 mod matchers;
+pub mod session_scope;
 mod signer;
 mod verify;
 mod workload;
 
 pub use claims::{
     AccessClaims, ActorClaim, ExternalClaims, IdentityClaims, PrincipalClaims, RiseClaims, Scope,
-    WorkloadClaims, WorkloadSubjectInfo, MAX_DELEGATION_DEPTH,
+    SessionClient, WorkloadClaims, WorkloadSubjectInfo, MAX_DELEGATION_DEPTH,
 };
 pub use error::{AuthError, JwtSignerError};
 pub use matchers::{
@@ -27,7 +28,8 @@ pub use matchers::{
     validate_oidc_issuer, TrustCandidate, TrustMatch,
 };
 pub use signer::{
-    compute_key_id, IdentityTokenSpec, RiseTokenSigner, RISE_ACCESS_TYP, RISE_IDENTITY_TYP,
+    compute_key_id, IdentityTokenSpec, RiseTokenSigner, SessionUser, RISE_ACCESS_TYP,
+    RISE_IDENTITY_TYP, RISE_SESSION_TYP,
 };
 pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 pub use workload::{

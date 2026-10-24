@@ -80,11 +80,10 @@ CI runs the same check as a step in the Rust quality job.
   (product-operation deferred) are intentionally out of scope and must not be
   claimed by any test.
 - Scenario 10 (operator selectors, JIT login, and User tokens carrying
-  `rise_uid`) is only partially covered: its "inactive User loses access"
-  half is tested, but the operator-selector and JIT-login halves depend on
-  live `User`/`UserIdentity` resolution, which is not implemented yet
-  (`ROADMAP.md` §1, the `operatorIdentities`/JIT-login item; `WORKLOG.md`
-  increment 10b).
+  `rise_uid`) is only partially covered: JIT login, session re-resolution,
+  and the inactive-User/identity halves are tested
+  (`src/server/auth/user_identity.rs`), but the operator-selector half waits
+  on `operatorIdentities` (`ROADMAP.md` §1; `WORKLOG.md` increment 10b).
 - No per-subject token count cap and no revocation list exist — the ADR
   accepts this (L1048-1050) — so neither is tested. Only the two caps the ADR
   does specify are: the platform-global maximum token TTL

@@ -1,0 +1,2639 @@
+{
+  "about": "Shared test cases for session ceilings (ADR-0006). Each ceiling is a CLI session's `authorization_details`; each case is an operation on a target and whether the ceiling admits it. The typed API's check (rise-backend-auth) and the resource API's engine (rise-authz) must both agree with every case, so a session means the same thing before and after a kind migrates. `environment` is the Environment's name for an Environment operation and the resource's `rise.dev/environment` label for an environment-bound kind. `refusedBy` lists the evaluators that must reject a ceiling outright (an invalid credential); the others still check its cases. Regenerate the `details` of request-backed ceilings with RISE_BLESS_SESSION_CEILINGS=1 cargo test -p rise-backend-auth.",
+  "cases": [
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-read",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-read",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-deploy",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-admin",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "project-admin",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-deploy",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-develop",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "staging-secrets",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "mixed",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "mixed",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Project",
+      "project": "shop",
+      "verb": "delete"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "production",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "preview",
+      "kind": "rise.dev/Environment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "status",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "environment": "production",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "logs",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "shop",
+      "subresource": "registry-credentials",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/EnvironmentVariable",
+      "project": "shop",
+      "subresource": "value",
+      "verb": "get"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/CustomDomain",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Extension",
+      "project": "shop",
+      "verb": "update"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/AppUser",
+      "project": "shop",
+      "verb": "list"
+    },
+    {
+      "allowed": true,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/ServiceAccount",
+      "project": "shop",
+      "subresource": "token",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "environment": "staging",
+      "kind": "rise.dev/Deployment",
+      "project": "other",
+      "verb": "create"
+    },
+    {
+      "allowed": false,
+      "ceiling": "wildcard",
+      "kind": "rise.dev/Project",
+      "project": "other",
+      "verb": "get"
+    }
+  ],
+  "ceilings": {
+    "empty": {
+      "about": "An empty list is an invalid credential, never full access.",
+      "details": [],
+      "refusedBy": [
+        "typed",
+        "engine"
+      ]
+    },
+    "mixed": {
+      "about": "`view`,`logs` project-wide plus `deploy` on staging. The engine can't read the `labelSelector` an environment grant carries until ADR-0006 §8 step 2.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project",
+                "rise.dev/Environment",
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable",
+                "rise.dev/CustomDomain",
+                "rise.dev/Extension",
+                "rise.dev/ServiceAccount",
+                "rise.dev/AppUser"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "logs"
+              ],
+              "verbs": [
+                "get"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Environment"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Environment/default/shop/staging",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "labelSelector": {
+            "key": "rise.dev/environment",
+            "value": "staging"
+          },
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "logs"
+              ],
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "verbs": [
+                "create",
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "status"
+              ],
+              "verbs": [
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "registry-credentials"
+              ],
+              "verbs": [
+                "create"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "refusedBy": [
+        "engine"
+      ],
+      "request": {
+        "grants": [
+          {
+            "permissions": [
+              "view",
+              "logs"
+            ],
+            "project": "shop"
+          },
+          {
+            "environment": "staging",
+            "preset": "deploy",
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "project-admin": {
+      "about": "`admin` on the whole project: every permission.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project",
+                "rise.dev/Environment",
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable",
+                "rise.dev/CustomDomain",
+                "rise.dev/Extension",
+                "rise.dev/ServiceAccount",
+                "rise.dev/AppUser"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "logs"
+              ],
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "verbs": [
+                "create",
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "status"
+              ],
+              "verbs": [
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "registry-credentials"
+              ],
+              "verbs": [
+                "create"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/EnvironmentVariable"
+              ],
+              "verbs": [
+                "create",
+                "update",
+                "delete"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/EnvironmentVariable"
+              ],
+              "subresources": [
+                "value"
+              ],
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Environment",
+                "rise.dev/CustomDomain",
+                "rise.dev/Extension",
+                "rise.dev/AppUser"
+              ],
+              "verbs": [
+                "create",
+                "update",
+                "delete"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/ServiceAccount"
+              ],
+              "verbs": [
+                "create",
+                "update",
+                "delete"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/ServiceAccount"
+              ],
+              "subresources": [
+                "token"
+              ],
+              "verbs": [
+                "create"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Project"
+              ],
+              "verbs": [
+                "update",
+                "delete"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "request": {
+        "grants": [
+          {
+            "preset": "admin",
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "project-deploy": {
+      "about": "`deploy` on the whole project.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project",
+                "rise.dev/Environment",
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable",
+                "rise.dev/CustomDomain",
+                "rise.dev/Extension",
+                "rise.dev/ServiceAccount",
+                "rise.dev/AppUser"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "logs"
+              ],
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "verbs": [
+                "create",
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "status"
+              ],
+              "verbs": [
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "registry-credentials"
+              ],
+              "verbs": [
+                "create"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "request": {
+        "grants": [
+          {
+            "preset": "deploy",
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "project-read": {
+      "about": "`read` on the whole project.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project",
+                "rise.dev/Environment",
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable",
+                "rise.dev/CustomDomain",
+                "rise.dev/Extension",
+                "rise.dev/ServiceAccount",
+                "rise.dev/AppUser"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "request": {
+        "grants": [
+          {
+            "preset": "read",
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "staging-deploy": {
+      "about": "`deploy` on one environment. The engine can't read the `labelSelector` an environment grant carries until ADR-0006 §8 step 2.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Environment"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Environment/default/shop/staging",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "labelSelector": {
+            "key": "rise.dev/environment",
+            "value": "staging"
+          },
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "logs"
+              ],
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "verbs": [
+                "create",
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "status"
+              ],
+              "verbs": [
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "registry-credentials"
+              ],
+              "verbs": [
+                "create"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "refusedBy": [
+        "engine"
+      ],
+      "request": {
+        "grants": [
+          {
+            "environment": "staging",
+            "preset": "deploy",
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "staging-develop": {
+      "about": "`develop` on one environment: deploy plus environment-specific env vars. The engine can't read the `labelSelector` an environment grant carries until ADR-0006 §8 step 2.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Environment"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Environment/default/shop/staging",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "labelSelector": {
+            "key": "rise.dev/environment",
+            "value": "staging"
+          },
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "logs"
+              ],
+              "verbs": [
+                "get"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "verbs": [
+                "create",
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "status"
+              ],
+              "verbs": [
+                "update"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/Deployment"
+              ],
+              "subresources": [
+                "registry-credentials"
+              ],
+              "verbs": [
+                "create"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/EnvironmentVariable"
+              ],
+              "verbs": [
+                "create",
+                "update",
+                "delete"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "refusedBy": [
+        "engine"
+      ],
+      "request": {
+        "grants": [
+          {
+            "environment": "staging",
+            "preset": "develop",
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "staging-secrets": {
+      "about": "`view` and `secrets` on one environment. The engine can't read the `labelSelector` an environment grant carries until ADR-0006 §8 step 2.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Environment"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Environment/default/shop/staging",
+          "type": "rise.dev/rbac"
+        },
+        {
+          "labelSelector": {
+            "key": "rise.dev/environment",
+            "value": "staging"
+          },
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Deployment",
+                "rise.dev/EnvironmentVariable"
+              ],
+              "verbs": [
+                "get",
+                "list"
+              ]
+            },
+            {
+              "kinds": [
+                "rise.dev/EnvironmentVariable"
+              ],
+              "subresources": [
+                "value"
+              ],
+              "verbs": [
+                "get"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "refusedBy": [
+        "engine"
+      ],
+      "request": {
+        "grants": [
+          {
+            "environment": "staging",
+            "permissions": [
+              "view",
+              "secrets"
+            ],
+            "project": "shop"
+          }
+        ],
+        "kind": "restricted"
+      }
+    },
+    "unknown-type": {
+      "about": "An entry of another type is an invalid credential.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": [
+                "rise.dev/Project"
+              ],
+              "verbs": [
+                "get"
+              ]
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/other"
+        }
+      ],
+      "refusedBy": [
+        "typed",
+        "engine"
+      ]
+    },
+    "wildcard": {
+      "about": "A `*` entry on the project. The engine's matchers accept wildcards; the typed check knows only the named kinds and verbs and refuses the claim. Rise never mints one.",
+      "details": [
+        {
+          "permissions": [
+            {
+              "kinds": "*",
+              "verbs": "*"
+            }
+          ],
+          "scope": "rise.dev/Project/default/shop",
+          "type": "rise.dev/rbac"
+        }
+      ],
+      "refusedBy": [
+        "typed"
+      ]
+    }
+  },
+  "organization": "default"
+}

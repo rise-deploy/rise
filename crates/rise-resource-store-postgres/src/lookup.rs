@@ -216,12 +216,24 @@ ORDER BY parent.name, parent.uid, membership.uid
 
 #[derive(Clone)]
 pub struct IdentityLookup {
-    pool: PgPool,
+    db: PgSession,
 }
 
 impl IdentityLookup {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            db: PgSession::pool(pool),
+        }
+    }
+
+    /// The same lookup, reading through `session`.
+    ///
+    /// Login's JIT provisioning (ADR-0001 §1) reads the mapping and creates the
+    /// User it lacks in one `SERIALIZABLE` transaction; this is how the lookup
+    /// joins it, so a concurrent first login either precedes the read or
+    /// forces a retry.
+    pub fn in_session(session: PgSession) -> Self {
+        Self { db: session }
     }
 
     /// Resolve a live mapping, including inactive mappings, and its live User.
@@ -235,12 +247,13 @@ impl IdentityLookup {
         // holds. Fetch two and refuse to guess if the invariant is ever broken:
         // this decides who a login belongs to, so returning an arbitrary row
         // would be worse than failing.
+        let mut connection = self.db.acquire().await?;
         let rows = sqlx::query_as::<_, IdentityFactRow>(USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL)
             .bind(issuer.as_str())
             .bind(subject.as_str())
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
-            .map_err(StoreError::backend)?;
+            .map_err(crate::session::map_sqlx_error)?;
         if rows.len() > 1 {
             return Err(StoreError::backend(std::io::Error::other(
                 "external identity resolves to more than one live UserIdentity",

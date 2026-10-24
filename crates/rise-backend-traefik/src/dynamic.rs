@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use rise_backend_core::desired::DesiredContainer;
+use rise_backend_core::desired::{DesiredContainer, DesiredRoute};
+use rise_backend_core::models::{CustomDomain, Deployment, Environment, Project};
+use rise_backend_core::{resolve_runtime_containers, DeploymentUrlBuilder};
 use rise_deployment_spec::AccessRequirement;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +24,7 @@ pub struct DynamicRouteTarget {
     pub deployment_id: String,
     pub container: String,
     pub port: Option<u16>,
-    pub routes: Vec<rise_backend_core::desired::DesiredRoute>,
+    pub routes: Vec<DesiredRoute>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,6 +93,52 @@ pub fn render_dynamic_config(
         cfg,
         native_provider,
     )
+}
+
+/// Route targets for `project`'s active deployments — one per container of
+/// each deployment group's active deployment, every group routed on its own
+/// hosts ([`DeploymentUrlBuilder::public_hosts_for_group`]).
+///
+/// A deployment whose container/route side-data does not decode fails the
+/// whole call: the HTTP-provider endpoint then errors and Traefik keeps
+/// serving its last good config, rather than dropping a live router.
+pub fn project_route_targets(
+    project: &Project,
+    active_deployments: &[Deployment],
+    all_environments: &[Environment],
+    custom_domains: &[CustomDomain],
+    url_builder: &DeploymentUrlBuilder,
+) -> anyhow::Result<Vec<DynamicRouteTarget>> {
+    let mut targets = Vec::new();
+    for deployment in active_deployments {
+        let (containers, routes) = resolve_runtime_containers(deployment)?;
+        let hosts = url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            all_environments,
+            custom_domains,
+        );
+        targets.extend(containers.into_iter().map(|container| {
+            DynamicRouteTarget {
+                project: project.name.clone(),
+                access_class: project.access_class.clone(),
+                deployment_group: deployment.deployment_group.clone(),
+                deployment_id: deployment.deployment_id.clone(),
+                port: container.port,
+                routes: routes
+                    .iter()
+                    .filter(|route| route.container == container.name)
+                    .map(|route| DesiredRoute {
+                        hosts: hosts.clone(),
+                        path_prefix: Some(route.path.clone()),
+                        access: route.access.clone(),
+                    })
+                    .collect(),
+                container: container.name,
+            }
+        }));
+    }
+    Ok(targets)
 }
 
 pub fn render_dynamic_route_targets(
@@ -204,8 +252,9 @@ pub fn merge_dynamic_configs(configs: impl IntoIterator<Item = DynamicConfig>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rise_backend_core::desired::DesiredRoute;
-    use rise_backend_core::test_helpers::desired;
+    use rise_backend_core::test_helpers::{
+        custom_domain, deployment, desired, environment, project, url_builder,
+    };
     use std::collections::HashMap;
 
     fn config<'a>(classes: &'a HashMap<String, AccessRequirement>) -> TraefikRenderConfig<'a> {
@@ -279,5 +328,71 @@ mod tests {
                 .address,
             "http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1"
         );
+    }
+
+    /// Regression for rise-deploy/rise#548: every active deployment group is
+    /// routed on its own hosts with its own auth middleware, and a production
+    /// custom domain stays on the production group's router.
+    #[test]
+    fn every_active_group_is_routed_on_its_own_hosts() {
+        let classes = HashMap::from([("private".to_string(), AccessRequirement::Member)]);
+        let project = project("docs-app", "private");
+        let production = environment(&project, "production", Some("default"));
+        let deployments = [
+            deployment(&project, "d3", "pr/124"),
+            deployment(&project, "d2", "pr/123"),
+            deployment(&project, "d1", "default"),
+        ];
+
+        let rendered = render_dynamic_route_targets(
+            project_route_targets(
+                &project,
+                &deployments,
+                std::slice::from_ref(&production),
+                &[custom_domain(&production, "docs.customer.com")],
+                &url_builder(),
+            )
+            .unwrap(),
+            &config(&classes),
+            "ecs",
+        );
+
+        assert_eq!(rendered.http.routers.len(), 3, "{rendered:#?}");
+        let rule_for = |host: &str| {
+            rendered
+                .http
+                .routers
+                .values()
+                .map(|router| router.rule.as_str())
+                .find(|rule| rule.contains(&format!("Host(`{host}`)")))
+                .unwrap_or_else(|| panic!("no router for {host}"))
+        };
+        let production_rule = rule_for("docs-app-default.preview.example.test");
+        assert!(production_rule.contains("Host(`docs-app.example.test`)"));
+        assert!(production_rule.contains("Host(`docs.customer.com`)"));
+        for preview in [
+            "docs-app-pr--123.preview.example.test",
+            "docs-app-pr--124.preview.example.test",
+        ] {
+            assert!(!rule_for(preview).contains("docs.customer.com"));
+        }
+        for (name, router) in &rendered.http.routers {
+            assert_eq!(router.middlewares, vec![format!("{name}-auth")]);
+            assert!(rendered
+                .http
+                .middlewares
+                .contains_key(&format!("{name}-auth")));
+        }
+    }
+
+    /// An undecodable active deployment fails the snapshot (Traefik keeps its
+    /// last good config) instead of silently dropping that group's router.
+    #[test]
+    fn undecodable_deployment_fails_the_snapshot() {
+        let project = project("docs-app", "private");
+        let mut corrupt = deployment(&project, "d2", "pr/123");
+        corrupt.containers = Some(serde_json::json!("not a container list"));
+        let deployments = [deployment(&project, "d1", "default"), corrupt];
+        assert!(project_route_targets(&project, &deployments, &[], &[], &url_builder()).is_err());
     }
 }

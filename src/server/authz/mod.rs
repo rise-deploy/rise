@@ -41,7 +41,6 @@ use rise_resource_store_postgres::{PgResourceStore, PgSession, SerializableTrans
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db::models::User;
 use crate::server::auth::context::{AnyAuth, AuthContext};
 use crate::server::error::ServerError;
 use crate::server::resources::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
@@ -50,7 +49,7 @@ pub use change::{
     change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
     label_changes, AuthorizationChangeSet,
 };
-pub use membership::{OperatorSelectors, RiseMembershipResolver};
+pub use membership::{OperatorSelectors, ResolvedUser, RiseMembershipResolver};
 pub use projection::{project_list_item, ReadGranularity};
 
 /// How many times a serializable write is replayed before the caller is told to
@@ -91,20 +90,21 @@ impl ResourceAuthorizer {
     /// Only a User carries a `User` row, so the second element is `None` for
     /// the others and the third is the actor string audit records use.
     ///
-    /// A User's subject is its stable identity as this install expresses it:
-    /// the typed `users` row's UID, which is also the credential's `rise_uid`.
-    /// ADR-0001 §1's generated `User` resource name replaces it when identity
-    /// resources go live; both are opaque, immutable, and never the email. A
-    /// Controller's or identity token's subject and UID are already its
-    /// resource's, and an identity token's ceiling travels with it: every
-    /// decision below intersects with that cap.
+    /// A User's subject is the canonical `user:<name>` of the live `User`
+    /// resource its session names, and its UID that resource's — the session's
+    /// `rise_uid`, already re-resolved by the auth middleware (ADR-0001 §7).
+    /// A legacy session names no User resource and is refused here: it cannot
+    /// be tied to one without a fresh login. A Controller's or identity
+    /// token's subject and UID are already its resource's, and an identity
+    /// token's ceiling travels with it: every decision below intersects with
+    /// that cap.
     ///
     /// The typed-table service accounts of the transitional exchange endpoint
     /// do not reach this API: they are bound to a Project, which is a typed
     /// concept the generic API does not share.
     fn principal(
         auth: &AnyAuth,
-    ) -> Result<(AuthenticatedPrincipal, Option<User>, String), ServerError> {
+    ) -> Result<(AuthenticatedPrincipal, Option<ResolvedUser>, String), ServerError> {
         match auth {
             AnyAuth::User(AuthContext::Identity(identity)) => {
                 let principal = AuthenticatedPrincipal::new(
@@ -116,16 +116,26 @@ impl ResourceAuthorizer {
                 Ok((principal, None, identity.subject.to_string()))
             }
             AnyAuth::User(auth_ctx) => {
-                let user = auth_ctx.user()?.clone();
-                let subject: SubjectId = format!("user:{}", user.id).parse().map_err(|error| {
-                    ServerError::internal(format!("principal is not a valid subject: {error}"))
+                let typed = auth_ctx.user()?.clone();
+                let resource = auth_ctx.user_principal().cloned().ok_or_else(|| {
+                    ServerError::unauthorized(
+                        "This session predates Rise user identities; log in again to use \
+                         the resource API",
+                    )
                 })?;
+                let subject = resource.subject();
                 // Unrestricted: a session token carries no authorization details.
-                let principal =
-                    AuthenticatedPrincipal::new(subject, user.id, AuthorizationCap::Unrestricted)
-                        .map_err(authorization_error_to_server_error)?;
-                let actor = user.email.clone();
-                Ok((principal, Some(user), actor))
+                let principal = AuthenticatedPrincipal::new(
+                    subject.clone(),
+                    resource.uid,
+                    AuthorizationCap::Unrestricted,
+                )
+                .map_err(authorization_error_to_server_error)?;
+                Ok((
+                    principal,
+                    Some(ResolvedUser { typed, resource }),
+                    subject.to_string(),
+                ))
             }
             AnyAuth::Controller(controller) => {
                 let subject: SubjectId = format!("controller:{}", controller.0.name)
@@ -156,7 +166,7 @@ impl ResourceAuthorizer {
     async fn context(
         &self,
         principal: AuthenticatedPrincipal,
-        user: Option<User>,
+        user: Option<ResolvedUser>,
         actor: String,
         session: PgSession,
     ) -> Result<AuthorizationContext, ServerError> {

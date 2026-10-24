@@ -3315,7 +3315,7 @@ async fn identity_admission_is_unbypassable_and_persists_canonical_defaults(
         USER_IDENTITY_KIND,
         "malformed",
         Some(user.uid),
-        json!({"issuer":"https://issuer.example/","subject":"alice"}),
+        json!({"issuer":"https://ISSUER.example","subject":"alice"}),
         vec![],
     )
     .await

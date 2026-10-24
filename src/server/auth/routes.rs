@@ -1,4 +1,4 @@
-use super::handlers;
+use super::{device, handlers};
 use crate::server::state::AppState;
 use axum::{
     routing::{get, post},
@@ -10,7 +10,7 @@ pub fn public_routes() -> Router<AppState> {
     Router::new()
         .route("/auth/authorize", post(handlers::authorize))
         .route("/auth/code/exchange", post(handlers::code_exchange))
-        .route("/auth/device/exchange", post(handlers::device_exchange))
+        .route("/auth/device/exchange", post(device::exchange))
         .route("/auth/signin", get(handlers::signin_page))
         .route("/auth/signin/start", get(handlers::oauth_signin_start))
         .route("/auth/callback", get(handlers::oauth_callback))
@@ -62,5 +62,9 @@ pub fn auth_only_routes() -> Router<AppState> {
 
 /// Protected routes that require authentication AND platform access
 pub fn platform_routes() -> Router<AppState> {
-    Router::new().route("/users/lookup", post(handlers::users_lookup))
+    Router::new()
+        .route("/users/lookup", post(handlers::users_lookup))
+        .route("/auth/device", get(device::lookup))
+        .route("/auth/device/approve", post(device::approve))
+        .route("/auth/device/deny", post(device::deny))
 }

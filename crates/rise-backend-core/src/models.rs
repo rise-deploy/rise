@@ -93,7 +93,7 @@ pub struct Deployment {
     pub created_by_id: Uuid,
     pub status: DeploymentStatus,
     pub deployment_group: String,
-    pub environment_id: Option<Uuid>,
+    pub environment_id: Uuid,
     pub expires_at: Option<DateTime<Utc>>,
     pub termination_reason: Option<TerminationReason>,
     pub completed_at: Option<DateTime<Utc>>,

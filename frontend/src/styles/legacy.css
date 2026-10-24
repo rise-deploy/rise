@@ -12,56 +12,6 @@
     animation: spin 1s linear infinite;
 }
 
-/* Toast Notifications */
-.toast-container {
-    position: fixed;
-    top: 1rem;
-    right: 1rem;
-    z-index: 9999;
-    display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-    max-width: 24rem;
-}
-
-@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-@keyframes slideOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(100%); opacity: 0; } }
-
-.toast {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 0.75rem;
-    padding: 0.85rem 1rem;
-    border-radius: 5px;
-    box-shadow: var(--shadow-lg);
-    animation: slideIn 0.25s ease-out;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    color: var(--text);
-}
-.toast-content { display: flex; align-items: center; gap: 0.6rem; flex: 1; }
-.toast-icon { width: 1.1rem; height: 1.1rem; flex-shrink: 0; }
-.toast-message { flex: 1; font-size: 13px; line-height: 1.35; }
-.toast-close {
-    flex-shrink: 0;
-    padding: 0.25rem;
-    border-radius: 4px;
-    transition: background-color 0.2s;
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: inherit;
-}
-.toast-close:hover { background-color: color-mix(in oklch, currentColor 10%, transparent); }
-
-.toast-success { background: var(--ok-bg); color: var(--ok); border-color: color-mix(in oklch, var(--ok) 25%, transparent); }
-.toast-error   { background: var(--err-bg); color: var(--err); border-color: color-mix(in oklch, var(--err) 25%, transparent); }
-.toast-info    { background: var(--info-bg); color: var(--info); border-color: color-mix(in oklch, var(--info) 25%, transparent); }
-
 /* Modal (legacy) */
 .modal-backdrop {
     position: fixed;
@@ -409,25 +359,8 @@
 }
 .mono-status-strip strong { font-size: 13.5px; font-weight: 500; color: var(--text); display: inline-flex; align-items: center; gap: 6px; }
 .mono-status-strip-normalcase strong { text-transform: none; }
-.mono-status-card { border-left: 3px solid transparent; padding-left: 10px; }
-.mono-status-card-ok    { border-left-color: var(--ok); }
-.mono-status-card-warn  { border-left-color: var(--warn); }
-.mono-status-card-bad   { border-left-color: var(--err); }
-.mono-status-card-muted { border-left-color: var(--text-soft); }
 
-.mono-active-deployment-card {
-    background: var(--surface);
-    border: 1px solid var(--border-faint) !important;
-    border-radius: 6px;
-    padding: 18px !important;
-    cursor: pointer;
-    transition: background 0.14s, border-color 0.14s;
-}
-.mono-active-deployment-card:hover { background: var(--surface-2); border-color: var(--border) !important; }
-.mono-active-deployments-grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
-@media (min-width: 768px) { .mono-active-deployments-grid { grid-template-columns: 1fr 1fr; } }
 
-.mono-active-deployment-card h5 { color: var(--text); font-size: 14px; font-weight: 600; margin: 0; }
 
 /* Inline copy buttons */
 .mono-copyable-value { display: inline-flex; align-items: center; gap: 6px; }
@@ -472,52 +405,6 @@
 .mono-state-error { color: var(--err); border-color: color-mix(in oklch, var(--err) 30%, var(--border)); background: var(--err-bg); }
 
 /* Legacy login wrap — still used as fallback */
-.mono-login-wrap {
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 40px;
-    background: var(--bg);
-}
-.mono-login-card {
-    width: 380px;
-    max-width: 100%;
-    padding: 32px;
-    border: 1px solid var(--border-faint);
-    background: var(--surface);
-    border-radius: 8px;
-    box-shadow: var(--shadow-md);
-    color: var(--text);
-}
-.mono-login-logo {
-    width: 48px;
-    height: 48px;
-    border-radius: 6px;
-    background: var(--accent);
-    color: var(--accent-fg);
-    display: grid;
-    place-items: center;
-    font-weight: 700;
-    font-size: 22px;
-    box-shadow: var(--shadow-sm);
-}
-.mono-login-title { font-size: 20px; font-weight: 600; color: var(--text); margin: 8px 0 4px; }
-.mono-login-subtitle { font-size: 13.5px; color: var(--text-muted); margin: 0; }
-.mono-login-button {
-    width: 100%;
-    padding: 10px 14px;
-    margin-top: 14px;
-    background: var(--accent);
-    color: var(--accent-fg);
-    border: none;
-    border-radius: 4px;
-    font-weight: 500;
-    font-size: 13.5px;
-    cursor: pointer;
-    transition: filter 0.14s;
-}
-.mono-login-button:hover { filter: brightness(1.06); }
 
 /* Shortcut hint */
 .mono-shortcut-hint {

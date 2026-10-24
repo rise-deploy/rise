@@ -1,3 +1,4 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{Context, Result};
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
@@ -156,7 +157,7 @@ async fn create_environment(
         .post(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to create environment")?;
 
@@ -204,7 +205,7 @@ async fn list_environments(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to list environments")?;
 
@@ -269,7 +270,7 @@ async fn show_environment(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to get environment")?;
 
@@ -370,7 +371,7 @@ async fn update_environment(
         .patch(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to update environment")?;
 
@@ -411,7 +412,7 @@ async fn delete_environment(
     let response = http_client
         .delete(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to delete environment")?;
 

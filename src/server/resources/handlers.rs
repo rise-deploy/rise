@@ -3612,7 +3612,7 @@ mod dispatch_tests {
         )
         .await;
         let caller = auth(PLAIN_USER);
-        let subject = format!("user:{}", caller.user().unwrap().id);
+        let subject = caller.user_subject();
 
         let resp = dispatch_post_inner(
             &ctx,
@@ -3665,7 +3665,7 @@ mod dispatch_tests {
         )
         .await;
         let caller = auth(PLAIN_USER);
-        let subject = format!("user:{}", caller.user().unwrap().id);
+        let subject = caller.user_subject();
 
         // Unowned, so the editor's access does not arrive through the label.
         let resp = dispatch_post_inner(
@@ -3739,7 +3739,7 @@ mod dispatch_tests {
         )
         .await;
         let caller = auth(PLAIN_USER);
-        let subject = format!("user:{}", caller.user().unwrap().id);
+        let subject = caller.user_subject();
 
         let resp = dispatch_post_inner(
             &ctx,
@@ -4601,7 +4601,7 @@ mod dispatch_tests {
         let user = crate::db::users::create(&pool, "grouped@example.com")
             .await
             .unwrap();
-        let auth_ctx = AnyAuth::User(AuthContext::User(user.clone()));
+        let auth_ctx = AnyAuth::User(AuthContext::User(user.clone(), Some(test_user_principal())));
 
         // Same-named team that the IdP did not create grants nothing.
         let self_made = crate::db::teams::create(&pool, "platform-operators")
@@ -6158,14 +6158,14 @@ mod dispatch_tests {
         // — the typed session's `user.id`, which is also what the
         // authorization snapshot names as this caller's subject.
         let alice = auth("alice@example.com");
-        let alice_uid = alice.user().unwrap().id;
+        let alice_name = alice.user_principal().unwrap().name.clone();
         create_at(
             &ctx,
             "rise.dev/v1alpha1/users",
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
-                "metadata": {"name": alice_uid.to_string()},
+                "metadata": {"name": alice_name.clone()},
                 "spec": {},
             }),
         )
@@ -6178,7 +6178,7 @@ mod dispatch_tests {
                 "kind": "RoleBinding",
                 "metadata": {"name": "admin"},
                 "spec": {
-                    "subject": format!("user:{alice_uid}"),
+                    "subject": format!("user:{alice_name}"),
                     "scope": "rise.dev/Organization/acme",
                     "roleRef": {"kind": "PlatformRole", "name": "org-admin"},
                 },
@@ -7111,7 +7111,7 @@ mod dispatch_tests {
         // No trust policy at all: delegated issuance never consults them.
 
         let operator = auth(OPERATOR);
-        let operator_id = operator.user().unwrap().id;
+        let operator_id = operator.user_principal().unwrap().clone();
         let resp = post_as(&ctx, SA_TOKEN, operator, json!({}))
             .await
             .expect("an operator holds every subresource");
@@ -7121,8 +7121,8 @@ mod dispatch_tests {
         assert_eq!(claims.sub, "serviceaccount:acme/ci");
         assert_eq!(claims.rise_uid, uid_of(&sa));
         let act = claims.act.expect("a delegated token records its delegator");
-        assert_eq!(act.sub, format!("user:{operator_id}"));
-        assert_eq!(act.rise_uid, operator_id);
+        assert_eq!(act.sub, operator_id.subject().to_string());
+        assert_eq!(act.rise_uid, operator_id.uid);
         assert!(act.act.is_none());
 
         // A caller with no grant may not learn the target exists.
@@ -7306,7 +7306,7 @@ mod dispatch_tests {
         create_controller(&ctx, "k8s").await;
 
         let operator = auth(OPERATOR);
-        let operator_id = operator.user().unwrap().id;
+        let operator_id = operator.user_principal().unwrap().clone();
         let resp = post_as(
             &ctx,
             "rise.dev/v1alpha1/controllers/k8s/token",
@@ -7368,7 +7368,7 @@ mod dispatch_tests {
         let act = claims.act.expect("act");
         assert_eq!(act.sub, "controller:k8s");
         let inner = act.act.expect("the controller's own delegator");
-        assert_eq!(inner.sub, format!("user:{operator_id}"));
+        assert_eq!(inner.sub, operator_id.subject().to_string());
         assert!(inner.act.is_none());
 
         // Actor data never grants: the ServiceAccount token holds only what the

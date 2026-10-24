@@ -5,8 +5,10 @@ use serde::{Deserialize, Serialize};
 pub struct ExchangeTokenRequest {
     /// Audience (`aud` claim) to mint the token for.
     pub audience: String,
-    /// Requested token lifetime in seconds. Capped at the server's configured maximum
-    /// (`workload_token_max_ttl_seconds`, default 900). Omitting this field uses the maximum.
+    /// Requested token lifetime in seconds. Capped at
+    /// `deployment_controller.identity_token_ttl_seconds` (default 3600) — the
+    /// same lifetime as the auto-minted token files. Omitting this field uses
+    /// the maximum.
     pub ttl_seconds: Option<u64>,
 }
 

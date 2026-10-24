@@ -16,6 +16,8 @@ mod bindings;
 mod gate;
 mod membership;
 mod principal;
+#[cfg(test)]
+mod session_ceiling_vectors;
 mod tree;
 
 use std::collections::HashMap;
