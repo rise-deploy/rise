@@ -27,6 +27,7 @@ mod membership;
 mod projection;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rise_authz::engine::{
     AuthenticatedPrincipal, AuthorizationCap, AuthorizationEngine, AuthorizationError,
@@ -57,10 +58,21 @@ pub use projection::{project_list_item, ReadGranularity};
 ///
 /// ADR-0001 §5 requires the retry to be bounded, not unbounded: a write that
 /// keeps losing is contending with something, and turning that into an
-/// unbounded loop hides the contention behind latency. Three attempts absorb the
-/// ordinary case — one concurrent policy write — while a persistently losing
-/// request surfaces as a 503 the caller can see.
-const MAX_SERIALIZATION_ATTEMPTS: u32 = 3;
+/// unbounded loop hides the contention behind latency. Five attempts, spaced by
+/// [`REPLAY_BACKOFF_BASE`], absorb a burst of concurrent policy writes within
+/// about 750 ms of waiting, while a persistently losing request surfaces as a
+/// 503 the caller can see.
+const MAX_SERIALIZATION_ATTEMPTS: u32 = 5;
+
+/// The ceiling of the random wait before the first replay; it doubles on each
+/// further replay.
+///
+/// The write that lost is usually aborted while the one it lost to is still in
+/// flight. Replaying at once overlaps that rival again, and PostgreSQL can
+/// abort the replay on the same conflict — or abort the rival, whose own replay
+/// then overlaps this one. Waiting first lets the rival commit, so the replay
+/// reads settled facts.
+const REPLAY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 
 /// Builds authorization contexts for requests, over the pool or over one
 /// serializable transaction.
@@ -209,6 +221,10 @@ impl ResourceAuthorizer {
     /// inline (a comparison happened, whatever the transaction goes on to do),
     /// so a replayed write emits the line more than once and an unmarked
     /// duplicate would read as two separate attempts to delegate.
+    ///
+    /// A replay (`attempt > 1`) first waits a random, growing interval — see
+    /// [`REPLAY_BACKOFF_BASE`]. The lost attempt is already dropped by then, so
+    /// the wait holds no connection and no locks.
     pub async fn begin_write(
         &self,
         auth: &AnyAuth,
@@ -218,6 +234,9 @@ impl ResourceAuthorizer {
         // accept should not cost one, and on a retry loop it would cost one per
         // attempt.
         let (principal, user, actor) = Self::principal(auth)?;
+        if attempt > 1 {
+            tokio::time::sleep(replay_backoff(attempt)).await;
+        }
         let transaction = SerializableTransaction::begin(&self.pool)
             .await
             .map_err(store_error_to_server_error)?;
@@ -246,6 +265,17 @@ impl ResourceAuthorizer {
         }
         retry
     }
+}
+
+/// How long replay `attempt` (2 or later) waits before opening its transaction.
+fn replay_backoff(attempt: u32) -> Duration {
+    use rand::RngExt;
+
+    let ceiling =
+        REPLAY_BACKOFF_BASE.saturating_mul(2u32.saturating_pow(attempt.saturating_sub(2)));
+    // Equal jitter: always some pause, so a replay never restarts in lockstep
+    // with its rival, and spread enough that the two rarely pick the same one.
+    rand::rng().random_range(ceiling / 2..=ceiling)
 }
 
 /// One attempt at a serializable write: the transaction, and the authorization
@@ -810,6 +840,16 @@ mod tests {
     use super::*;
     use rise_authz::policy::PermissionTuple;
     use rise_resource_api::BindingSubject;
+
+    #[test]
+    fn a_replay_waits_a_jittered_interval_that_doubles_per_attempt() {
+        for _ in 0..100 {
+            let second = replay_backoff(2);
+            assert!(REPLAY_BACKOFF_BASE / 2 <= second && second <= REPLAY_BACKOFF_BASE);
+            let third = replay_backoff(3);
+            assert!(REPLAY_BACKOFF_BASE <= third && third <= REPLAY_BACKOFF_BASE * 2);
+        }
+    }
 
     fn tuple(verb: Verb, kind: &str, subresource: Option<&str>) -> PermissionTuple {
         PermissionTuple {
