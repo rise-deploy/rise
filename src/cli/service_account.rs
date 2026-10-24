@@ -1,7 +1,7 @@
 use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -122,8 +122,7 @@ pub async fn list_service_accounts(
         } else {
             let mut table = Table::new();
             table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
+                .load_style(UTF8_FULL.with_rounded_corners())
                 .set_header(vec![
                     Cell::new("ID").add_attribute(Attribute::Bold),
                     Cell::new("EMAIL").add_attribute(Attribute::Bold),

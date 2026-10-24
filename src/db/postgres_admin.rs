@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 /// Sanitize a PostgreSQL identifier (database name, username, etc.) to prevent SQL injection.
 /// This function validates that the identifier contains only allowed characters and properly
@@ -45,7 +45,7 @@ pub async fn create_database(pool: &PgPool, database_name: &str, owner: &str) ->
     let sanitized_owner = sanitize_identifier(owner)?;
     let create_sql = format!("CREATE DATABASE {} OWNER {}", sanitized_db, sanitized_owner);
 
-    sqlx::query(&create_sql)
+    sqlx::query(AssertSqlSafe(create_sql))
         .execute(pool)
         .await
         .context("Failed to create database")?;
@@ -79,7 +79,7 @@ pub async fn create_user(pool: &PgPool, username: &str, password: &str) -> Resul
         sanitized_username, escaped_password
     );
 
-    sqlx::query(&create_sql)
+    sqlx::query(AssertSqlSafe(create_sql))
         .execute(pool)
         .await
         .context("Failed to create user")?;
@@ -100,7 +100,7 @@ pub async fn update_user_password(pool: &PgPool, username: &str, password: &str)
         sanitized_username, escaped_password
     );
 
-    sqlx::query(&alter_sql)
+    sqlx::query(AssertSqlSafe(alter_sql))
         .execute(pool)
         .await
         .context("Failed to update user password")?;
@@ -124,7 +124,7 @@ pub async fn change_database_owner(
         sanitized_db, sanitized_owner
     );
 
-    sqlx::query(&alter_sql)
+    sqlx::query(AssertSqlSafe(alter_sql))
         .execute(pool)
         .await
         .context("Failed to change database owner")?;
@@ -140,7 +140,7 @@ pub async fn drop_database(pool: &PgPool, database_name: &str) -> Result<()> {
     let sanitized_db = sanitize_identifier(database_name)?;
     let drop_sql = format!("DROP DATABASE {}", sanitized_db);
 
-    sqlx::query(&drop_sql)
+    sqlx::query(AssertSqlSafe(drop_sql))
         .execute(pool)
         .await
         .context("Failed to drop database")?;
@@ -156,7 +156,7 @@ pub async fn drop_user(pool: &PgPool, username: &str) -> Result<()> {
     let sanitized_username = sanitize_identifier(username)?;
     let drop_sql = format!("DROP USER {}", sanitized_username);
 
-    sqlx::query(&drop_sql)
+    sqlx::query(AssertSqlSafe(drop_sql))
         .execute(pool)
         .await
         .context("Failed to drop user")?;

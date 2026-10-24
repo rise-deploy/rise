@@ -1,8 +1,6 @@
 use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{bail, Context, Result};
-use comfy_table::{
-    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Color, Table,
-};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Color, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -427,8 +425,7 @@ pub async fn list_deployments(
     // Create table
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("DEPLOYMENT").add_attribute(Attribute::Bold),
             Cell::new("STATUS").add_attribute(Attribute::Bold),

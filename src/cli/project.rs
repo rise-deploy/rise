@@ -5,7 +5,7 @@ use crate::api::project::{
 use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -229,8 +229,7 @@ pub async fn list_projects(http_client: &Client, backend_url: &str, config: &Con
         } else {
             let mut table = Table::new();
             table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
+                .load_style(UTF8_FULL.with_rounded_corners())
                 .set_header(vec![
                     Cell::new("NAME").add_attribute(Attribute::Bold),
                     Cell::new("STATUS").add_attribute(Attribute::Bold),
@@ -832,8 +831,7 @@ pub async fn list_app_users(
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("TYPE").add_attribute(Attribute::Bold),
             Cell::new("IDENTIFIER").add_attribute(Attribute::Bold),

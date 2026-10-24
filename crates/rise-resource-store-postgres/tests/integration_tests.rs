@@ -3984,10 +3984,10 @@ async fn controller_candidates_by_issuer_filters_live_controllers_and_ignores_ot
         .execute("DROP INDEX resource_store.resources_child_kind_name_unique")
         .await?;
     connection.execute("SET enable_seqscan = off").await?;
-    let plan: Vec<String> = sqlx::query_scalar(&format!(
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         CONTROLLER_CANDIDATES_BY_ISSUER_SQL
-    ))
+    )))
     .bind("https://token.example")
     .fetch_all(&mut *connection)
     .await?;
@@ -3997,10 +3997,10 @@ async fn controller_candidates_by_issuer_filters_live_controllers_and_ignores_ot
         plan.join("\n")
     );
 
-    let exists_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let exists_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::CONTROLLER_ISSUER_EXISTS_SQL
-    ))
+    )))
     .bind("https://token.example")
     .fetch_all(&mut *connection)
     .await?;
@@ -4027,7 +4027,7 @@ async fn execute_resource_migration(pool: &sqlx::PgPool, version: i64) -> Result
     connection
         .execute("SET search_path TO resource_store, public")
         .await?;
-    connection.execute(&*migration.sql).await?;
+    connection.execute(migration.sql.clone()).await?;
     Ok(())
 }
 
@@ -4063,7 +4063,7 @@ async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
 
     // Each conflicting population is named specifically, and a rejected upgrade
     // leaves nothing behind — including the guard it would have installed.
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
     let guard_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_identity_reservations')",
@@ -4075,7 +4075,7 @@ async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
         .execute(&pool)
         .await?;
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy resource row(s)"));
 
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
@@ -4237,10 +4237,10 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     // them cannot silently drop to a sequential scan on the login path.
     let mut connection = pool.acquire().await?;
     connection.execute("SET enable_seqscan = off").await?;
-    let identity_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let identity_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL
-    ))
+    )))
     .bind("https://issuer.example")
     .bind("subject")
     .fetch_all(&mut *connection)
@@ -4249,10 +4249,10 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
         .join("\n")
         .contains("user_identities_issuer_subject_unique"));
 
-    let trust_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let trust_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::CONTROLLER_TRUST_POLICIES_SQL
-    ))
+    )))
     .bind(uuid::Uuid::nil())
     .bind("https://issuer.example")
     .fetch_all(&mut *connection)
@@ -4261,10 +4261,10 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
         .join("\n")
         .contains("workload_trust_issuer_parent"));
 
-    let membership_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let membership_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::GROUPS_FOR_USER_SQL
-    ))
+    )))
     .bind(uuid::Uuid::nil())
     .bind("member")
     .fetch_all(&mut *connection)
@@ -4278,10 +4278,10 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     // verbatim: PostgreSQL cannot derive that from `api_version = '...'`, so
     // dropping the seemingly-redundant line de-indexes the lookup entirely and
     // puts a relation-wide `SIReadLock` on every gated identity write.
-    let by_name_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let by_name_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::GROUP_TIES_BY_USER_NAME_SQL
-    ))
+    )))
     .bind("member")
     .fetch_all(&mut *connection)
     .await?;
@@ -5345,7 +5345,7 @@ async fn policy_activation_upgrade_audit_is_actionable_and_guard_is_durable(
 
     // Each conflicting population is named specifically, and a rejected upgrade
     // leaves nothing behind — including the guard it would have installed.
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
     let guard_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_policy_reservations')",
@@ -5357,7 +5357,7 @@ async fn policy_activation_upgrade_audit_is_actionable_and_guard_is_durable(
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
         .execute(&pool)
         .await?;
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy resource row(s)"));
 
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
