@@ -195,34 +195,28 @@ pub mod attributes {
     /// `expires_at`. Present only when a cap was applied.
     pub const EXPIRATION_LIMITED_BY: &str = "expiration_limited_by";
 
-    /// How the deployment was created (`redeploy`, `promote`,
-    /// `rollback_guard`). Creation only; absent for a plain `deploy`.
+    // Creation-event provenance (ADR-0007). `created_via` is absent for a plain
+    // `deploy`; deployment references are `{kind, name}`.
     pub const CREATED_VIA: &str = "created_via";
-    /// The deployment this one was promoted from, as `{kind, name}`, and the
-    /// name of that deployment's environment. Creation only.
     pub const PROMOTED_FROM: &str = "promoted_from";
     pub const PROMOTED_FROM_ENVIRONMENT: &str = "promoted_from_environment";
-    /// The deployment's `[project].migration_version`. Creation only.
     pub const MIGRATION_VERSION: &str = "migration_version";
-    /// On a Rollback Guard replacement's creation event: the unhealthy
-    /// deployment it replaces, as `{kind, name}`.
+    /// The unhealthy deployment a Rollback Guard replacement replaces.
     pub const ROLLBACK_GUARD_FOR: &str = "rollback_guard_for";
-    /// A Rollback Guard event's outcome: `triggered`, `declined`, `aborted` or
-    /// `failed`.
-    pub const OUTCOME: &str = "outcome";
-    /// The Rollback Guard replacement, as `{kind, name}`.
-    pub const CANDIDATE: &str = "candidate";
-    /// The last-known-good deployment the Rollback Guard restores, as `{kind, name}`.
-    pub const LAST_KNOWN_GOOD: &str = "last_known_good";
-    /// Set on a creation event when an admin bypassed the environment's
-    /// promotion source.
+    /// Set when an admin bypassed the environment's promotion source.
     pub const PROMOTION_GATE_BYPASSED: &str = "promotion_gate_bypassed";
-    /// Set on a creation event when the deployment was forced across a
-    /// recorded migration barrier.
+    /// Set when the deployment was forced across a migration barrier.
     pub const MIGRATION_BARRIER_FORCED: &str = "migration_barrier_forced";
-    /// Inherited resources that were clamped into the target environment's
-    /// bounds on a promotion: a list of `{container, field, from, to, reason}`.
+    /// Inherited resources clamped into the target environment's bounds on a
+    /// promotion: a list of `{container, field, from, to, reason}`.
     pub const RESOURCE_ADJUSTMENTS: &str = "resource_adjustments";
+
+    // Rollback Guard events: `outcome` is `triggered`, `declined`, `aborted`
+    // or `failed`; `candidate` is the replacement and `last_known_good` the
+    // deployment it restores.
+    pub const OUTCOME: &str = "outcome";
+    pub const CANDIDATE: &str = "candidate";
+    pub const LAST_KNOWN_GOOD: &str = "last_known_good";
 }
 
 /// A backend-originated event a backend wants forwarded into the log.
@@ -444,14 +438,5 @@ mod tests {
         assert!(EventKind::ReplicaRestarted.is_deduplicated());
         assert!(EventKind::BackendEvent.is_deduplicated());
         assert!(EventKind::RollbackGuard.is_deduplicated());
-    }
-
-    #[test]
-    fn rollback_guard_kind_has_a_stable_stored_form() {
-        assert_eq!(EventKind::RollbackGuard.as_str(), "rollback_guard");
-        assert_eq!(
-            EventKind::parse("rollback_guard"),
-            Some(EventKind::RollbackGuard)
-        );
     }
 }

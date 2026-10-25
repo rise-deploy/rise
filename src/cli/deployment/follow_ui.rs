@@ -396,40 +396,41 @@ pub fn print_deployment_snapshot(deployment: &Deployment) {
     }
 }
 
-/// How the deployment came to be (ADR-0007): its creation path, what it was
-/// promoted from or replaces, its migration version and how long it has been
-/// unhealthy. Lines are padded to line up with the rest of the snapshot.
-pub(super) fn provenance_lines(deployment: &Deployment) -> Vec<String> {
-    let mut lines = Vec::new();
-    match deployment.created_via.as_str() {
-        "" | "deploy" => {}
+/// How the deployment came to be (ADR-0007), padded to line up with the rest
+/// of the snapshot.
+pub(super) fn provenance_lines(d: &Deployment) -> Vec<String> {
+    let created_via = match d.created_via.as_str() {
+        "" | "deploy" => None,
         "promote" => {
-            let from = match (
-                deployment.promoted_from_deployment_id.as_deref(),
-                deployment.promoted_from_environment.as_deref(),
-            ) {
-                (Some(id), Some(env)) => format!(" (from {} in {})", id, env),
-                (Some(id), None) => format!(" (from {})", id),
-                (None, Some(env)) => format!(" (from {})", env),
-                (None, None) => String::new(),
-            };
-            lines.push(format!("Created via:    promote{}", from));
+            let from: Vec<&str> = [
+                d.promoted_from_deployment_id.as_deref(),
+                d.promoted_from_environment.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            Some(match from.as_slice() {
+                [] => "promote".to_string(),
+                parts => format!("promote (from {})", parts.join(" in ")),
+            })
         }
-        "rollback_guard" => {
-            lines.push("Created via:    Rollback Guard (automatic)".to_string());
-        }
-        other => lines.push(format!("Created via:    {}", other)),
-    }
-    if let Some(ref sick) = deployment.rollback_guard_for_deployment_id {
-        lines.push(format!("Rollback Guard replacement for: {}", sick));
-    }
-    if let Some(version) = deployment.migration_version {
-        lines.push(format!("Migration version: {}", version));
-    }
-    if let Some(ref since) = deployment.unhealthy_since {
-        lines.push(format!("Unhealthy since: {}", since));
-    }
-    lines
+        "rollback_guard" => Some("Rollback Guard (automatic)".to_string()),
+        other => Some(other.to_string()),
+    };
+    [
+        created_via.map(|via| format!("Created via:    {via}")),
+        d.rollback_guard_for_deployment_id
+            .as_ref()
+            .map(|sick| format!("Rollback Guard replacement for: {sick}")),
+        d.migration_version
+            .map(|v| format!("Migration version: {v}")),
+        d.unhealthy_since
+            .as_ref()
+            .map(|since| format!("Unhealthy since: {since}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Fetch project info to get project URL

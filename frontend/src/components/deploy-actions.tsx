@@ -1,71 +1,51 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { api } from '../lib/api';
-import { isApiError } from '../lib/api-error';
+import { isApiError, type ApiError } from '../lib/api-error';
 import { navigate } from '../lib/navigation';
 import { useCurrentProject, type Deployment } from '../lib/project-context';
-import { deploymentSource, envState, promoteTargetsFlagged } from '../lib/env-state';
+import { deploymentSource, envState, promoteTargetsFlagged, shortDeploymentId } from '../lib/env-state';
 import { formatRelativeTimeRounded } from '../lib/utils';
 import { Alert, Button, Modal, Select, cx } from './r-ui';
 import { useToast } from './toast';
 import { VarChanges } from './var-changes';
 
-const shortId = (id: string) => id.split('-').pop() || id;
-
-interface MigrationBarrier { version: number; reason: string; recorded_at?: string }
-
 interface BarrierDetails {
     candidate_version?: number | null;
     environment_version?: number | null;
-    barriers?: MigrationBarrier[];
+    barriers?: { version: number; reason: string }[];
 }
 
-/** What the server reports about a deployment made from another one, before it is made. */
+/** The server's preview of a deployment made from another one (`GET …/plan`). */
 interface CreateFromPlan {
-    kind?: string;
     pinned_image?: string | null;
-    gate?: { decision?: 'allowed' | 'admin_bypass' | 'denied'; promotion_source_environment?: string | null };
     migration?: { status?: 'ok' | 'unknown' | 'crossed' } & BarrierDetails;
-    adjustments?: ResourceAdjustment[];
+    adjustments?: { container: string; field: string; from: string; to: string; reason: string }[];
     warnings?: string[];
 }
 
-interface ResourceAdjustment { container: string; field: string; from: string; to: string; reason: string }
-
-interface CreateResponse { deployment_id?: string; warnings?: string[] }
-
-/** Why the server refused the deployment, when it is something the dialog can explain. */
-type Blocked =
-    | { code: 'migration_barrier'; message: string; details: BarrierDetails }
-    | { code: 'promotion_source_required'; message: string };
-
-function BarrierList({ details }: { details: BarrierDetails }) {
+function BarrierList({ details: d }: { details: BarrierDetails }) {
     return (
         <>
-            {details.candidate_version != null && details.environment_version != null && (
-                <div>This deployment is at migration version {details.candidate_version}; the environment has run version {details.environment_version}.</div>
+            {d.candidate_version != null && d.environment_version != null && (
+                <div>This deployment is at migration version {d.candidate_version}; the environment has run version {d.environment_version}.</div>
             )}
             <ul className="r-barrier-list">
-                {(details.barriers ?? []).map(b => (
-                    <li key={b.version}><span className="mono">v{b.version}</span> — {b.reason}</li>
-                ))}
+                {(d.barriers ?? []).map(b => <li key={b.version}><span className="mono">v{b.version}</span> — {b.reason}</li>)}
             </ul>
         </>
     );
 }
 
-/** The server's preview of the plan: pinned image, migration check, resource clamps. */
 function PlanSummary({ plan }: { plan: CreateFromPlan }) {
     const m = plan.migration;
-    const rows: React.ReactNode[] = [];
-    if (plan.pinned_image) rows.push(<li key="img">Image pinned to <span className="mono">{plan.pinned_image}</span></li>);
-    if (m?.status === 'crossed') {
-        rows.push(<li key="mig">Crosses migration barrier{(m.barriers?.length ?? 0) === 1 ? '' : 's'} {(m.barriers ?? []).map(b => `v${b.version}`).join(', ')}: the environment has run version {m.environment_version}, this deployment is at {m.candidate_version}.</li>);
-    }
-    if (m?.status === 'unknown') rows.push(<li key="mig">Migration version unknown: it can't be checked against recorded barriers.</li>);
-    for (const a of plan.adjustments ?? []) {
-        rows.push(<li key={`${a.container}-${a.field}`}><span className="mono">{a.container}</span> {a.field} {a.from} → {a.to} ({a.reason})</li>);
-    }
-    for (const w of plan.warnings ?? []) rows.push(<li key={`w-${w}`}>{w}</li>);
+    const barriers = m?.barriers ?? [];
+    const rows = [
+        plan.pinned_image && <li key="img">Image pinned to <span className="mono">{plan.pinned_image}</span></li>,
+        m?.status === 'crossed' && <li key="mig">Crosses migration barrier{barriers.length === 1 ? '' : 's'} {barriers.map(b => `v${b.version}`).join(', ')}: the environment has run version {m.environment_version}, this deployment is at {m.candidate_version}.</li>,
+        m?.status === 'unknown' && <li key="mig">Migration version unknown: it can't be checked against recorded barriers.</li>,
+        ...(plan.adjustments ?? []).map(a => <li key={`${a.container}-${a.field}`}><span className="mono">{a.container}</span> {a.field} {a.from} → {a.to} ({a.reason})</li>),
+        ...(plan.warnings ?? []).map(w => <li key={`w-${w}`}>{w}</li>),
+    ].filter(Boolean);
     if (rows.length === 0) return null;
     return (
         <div className="r-var-changes r-plan">
@@ -145,7 +125,8 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
     const targetGated = flagged.find(t => t.env.name === target)?.gated ?? false;
     const [useSourceEnvVars, setUseSourceEnvVars] = useState(false);
     const [busy, setBusy] = useState(false);
-    const [blocked, setBlocked] = useState<Blocked | null>(null);
+    // A refusal the dialog explains instead of toasting.
+    const [blocked, setBlocked] = useState<ApiError | null>(null);
     const [plan, setPlan] = useState<CreateFromPlan | null>(null);
 
     const envName = kind === 'promote' ? target : sourceEnv;
@@ -184,7 +165,7 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
         body = <>Ships the exact image running in {sourceEnv} to {target || 'another environment'}. Variables from {target || 'the target'} are used.</>;
         confirm = 'Promote';
     } else if (retrying) {
-        title = `Retry ${shortId(source.deployment_id)} in ${envName || source.deployment_group}?`;
+        title = `Retry ${shortDeploymentId(source.deployment_id)} in ${envName || source.deployment_group}?`;
         body = <>Deploys the image of <span className="mono">{source.deployment_id}</span> again, without a rebuild.</>;
         confirm = 'Retry';
     } else {
@@ -197,7 +178,7 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
         setBusy(true);
         setBlocked(null);
         try {
-            const res: CreateResponse | null = await api.createDeploymentFrom(
+            const res: { deployment_id?: string; warnings?: string[] } | null = await api.createDeploymentFrom(
                 project.projectName,
                 source.deployment_id,
                 kind === 'promote' ? false : useSourceEnvVars,
@@ -214,12 +195,8 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
             if (res?.deployment_id) navigate(`/deployment/${project.projectName}/${res.deployment_id}`);
         } catch (err) {
             setBusy(false);
-            if (isApiError(err) && err.code === 'migration_barrier') {
-                setBlocked({ code: 'migration_barrier', message: err.message, details: (err.details ?? {}) as BarrierDetails });
-                return;
-            }
-            if (isApiError(err) && err.code === 'promotion_source_required') {
-                setBlocked({ code: 'promotion_source_required', message: err.message });
+            if (isApiError(err) && (err.code === 'migration_barrier' || err.code === 'promotion_source_required')) {
+                setBlocked(err);
                 return;
             }
             showToast(`Failed to ${kind}: ${(err as Error).message}`, 'error');
@@ -257,7 +234,7 @@ function DeployActionDialog({ req, onClose }: { req: DeployActionRequest; onClos
             {blocked?.code === 'migration_barrier' && (
                 <Alert tone="err" icon="alert">
                     <strong>{blocked.message}</strong>
-                    <BarrierList details={blocked.details} />
+                    <BarrierList details={(blocked.details ?? {}) as BarrierDetails} />
                     <div>Deploying anyway runs this image against a database schema it may not support.</div>
                 </Alert>
             )}

@@ -115,16 +115,6 @@ impl CreatedVia {
             Self::RollbackGuard => "rollback_guard",
         }
     }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "deploy" => Some(Self::Deploy),
-            "redeploy" => Some(Self::Redeploy),
-            "promote" => Some(Self::Promote),
-            "rollback_guard" => Some(Self::RollbackGuard),
-            _ => None,
-        }
-    }
 }
 
 impl std::fmt::Display for CreatedVia {
@@ -337,21 +327,18 @@ impl EnvVarSource {
             "extension" => Some(Self::Extension),
             "toml" => Some(Self::Toml),
             "cli" => Some(Self::Cli),
-            _ => {
-                if let Some(name) = s.strip_prefix("toml:") {
-                    Some(Self::TomlEnv(name.to_string()))
-                } else {
+            _ => s
+                .strip_prefix("toml:")
+                .map(|name| Self::TomlEnv(name.to_string()))
+                .or_else(|| {
                     s.strip_prefix("env:")
                         .map(|name| Self::Env(name.to_string()))
-                }
-            }
+                }),
         }
     }
 
     /// Returns the set of source values that are allowed from client requests.
-    /// Server-managed sources (system, global, env:*, toml:*, extension) are not
-    /// accepted from clients; the server derives `toml:<env>` from a `toml`
-    /// override's target environment.
+    /// Server-managed sources (system, global, env:*, toml:*, extension) are not accepted from clients.
     pub fn is_client_allowed(&self) -> bool {
         matches!(self, Self::Toml | Self::Cli)
     }
@@ -436,29 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn env_var_source_toml_env_serializes_with_prefix() {
+    fn stored_forms() {
         assert_eq!(
             EnvVarSource::TomlEnv("staging".to_string()).as_str(),
             "toml:staging"
         );
-        assert_eq!(
-            EnvVarSource::parse("toml:staging"),
-            Some(EnvVarSource::TomlEnv("staging".to_string()))
-        );
-    }
-
-    #[test]
-    fn created_via_roundtrip() {
         for v in [
             CreatedVia::Deploy,
             CreatedVia::Redeploy,
             CreatedVia::Promote,
             CreatedVia::RollbackGuard,
         ] {
-            assert_eq!(CreatedVia::parse(v.as_str()), Some(v));
-            let json = serde_json::to_value(v).unwrap();
-            assert_eq!(json, serde_json::Value::String(v.as_str().to_string()));
+            assert_eq!(serde_json::to_value(v).unwrap(), v.as_str());
         }
-        assert_eq!(CreatedVia::parse("other"), None);
     }
 }

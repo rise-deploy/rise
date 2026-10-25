@@ -47,7 +47,7 @@ Reuse the image from a previous deployment, without a rebuild:
 rise deploy --from 20241205-1234
 ```
 
-Before creating anything, the CLI prints what will happen: the source deployment and its image, what the target currently runs, the migration check (see [Migration Compatibility Barriers](#migration-compatibility-barriers)) and the variable changes compared with the source's snapshot.
+Before creating anything, the CLI prints the source and its image, what the target currently runs, the [migration check](#migration-compatibility-barriers) and the variable changes against the source's snapshot.
 
 By default, the new deployment uses the project's current environment variables, with the source deployment's `rise.toml` and CLI-flag variables on top: like its port, resources and routes, they travel with the source. Variables passed with this command (`--env`, the local `rise.toml`) still take precedence. To copy the source deployment's variables instead:
 
@@ -55,9 +55,9 @@ By default, the new deployment uses the project's current environment variables,
 rise deploy --from 20241205-1234 --use-source-env-vars
 ```
 
-Either way, system variables (`PORT`, `RISE_*`) and extension-provided variables are generated fresh for the new deployment, so credentials an extension rotated since are not resurrected.
+Either way, system (`PORT`, `RISE_*`) and extension-provided variables are generated fresh, so credentials an extension rotated since are not resurrected.
 
-Without `-E` or `--group` (and without a `default = true` environment in the local `rise.toml`), the new deployment lands in the source's environment and group. With `-E` naming an environment other than the source's, `--from` is a [promotion](#promoting-between-environments): the image is pinned, the target's gates and migration check apply, and `--use-source-env-vars` is refused. Unlike `rise promote`, `rise deploy --from` still sends the local `rise.toml`'s `[project.env]` variables and its `[deploy]` resources; those resources are validated against the target's limits rather than clamped. Use `rise promote` to apply only `[environments.<target>]`.
+Without `-E`, `--group` or a `default = true` environment in the local `rise.toml`, the new deployment lands in the source's environment and group. Into another environment, `--from` is a [promotion](#promoting-between-environments) (pinned image, the target's gates and migration check, no `--use-source-env-vars`), except that it still sends the local `[project.env]` and `[deploy]` resources, which are validated against the target's limits rather than clamped. Use `rise promote` to apply only `[environments.<target>]`.
 
 ## Promoting Between Environments
 
@@ -86,7 +86,7 @@ A promotion:
 
 - **Pins the image** to its digest, so the target runs exactly the bytes the source ran.
 - **Sizes for the target.** Replicas, CPU and memory you pass (`--replicas`, `--cpu`, `--memory`, or `[environments.<target>.deploy]` in `rise.toml`) are validated as usual. Values inherited from the source are clamped into the target environment's limits, and each change is printed.
-- **Uses the target's variables**, in this order (later wins): the target's Global and environment-scoped variables; the source's `rise.toml`/CLI variables, minus those scoped to *other* environments; fresh extension variables; `[environments.<target>.env]` from the local `rise.toml` (skip with `--no-config`); then `PORT` and `RISE_*`.
+- **Uses the target's variables**, with the source's `rise.toml`/CLI variables (minus those scoped to *other* environments) and the local `[environments.<target>.env]` (skip with `--no-config`) on top — see [the full order](../environment-variables#variables-of-a-deployment-created-from-another).
 - **Records where it came from.** `rise deployment show` prints `Created via: promote (from 20261020-101500 in staging)`; the web UI links both ways.
 
 In CI, pass `--yes`: without it, `rise promote` refuses to run non-interactively. `--json` and `--status-file` work as for `rise deploy`. The web UI offers the same action as **Promote to …** on an environment or deployment.

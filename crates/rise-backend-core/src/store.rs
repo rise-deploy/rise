@@ -27,11 +27,9 @@ pub struct SupersessionOutcome {
     /// The previously-active deployment in the group, now `Terminating`, if
     /// there was one.
     pub superseded: Option<Deployment>,
-    /// The newer deployment that retired this one on the spot. Set when a
-    /// deployment created after this one was already `Healthy`/`Unhealthy` or
-    /// the group's active one: this deployment was marked healthy and then
-    /// straight away `Terminating(Superseded)`, and nothing else in the group
-    /// was touched. The caller must not activate it.
+    /// A newer deployment that already serves (or is the group's active
+    /// one): this deployment was marked healthy and straight away
+    /// `Terminating(Superseded)`, nothing else touched. Do not activate it.
     pub retired_by: Option<Deployment>,
 }
 
@@ -233,9 +231,8 @@ pub trait DeploymentStore: Send + Sync {
     /// `Terminating`) — the caller should stop there: no hook, no straggler
     /// cleanup, no activation.
     ///
-    /// Fenced by creation order: only a predecessor created before this
-    /// deployment is superseded, and when a newer one already serves this
-    /// deployment is retired instead (see [`SupersessionOutcome::retired_by`]).
+    /// Fenced by creation order: only an older predecessor is superseded (see
+    /// [`SupersessionOutcome::retired_by`]).
     async fn mark_deployment_healthy_and_supersede(
         &self,
         deployment_id: Uuid,

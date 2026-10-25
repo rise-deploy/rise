@@ -2,10 +2,8 @@
 //!
 //! Events are append-only: nothing here updates or deletes a row, and
 //! nothing prunes them yet — the table grows with the deployments it records.
-//!
-//! Status transitions are recorded by the writers in `deployments.rs`, in
-//! the same statement as the transition. [`record`] is for events that are
-//! not a transition (a Rollback Guard decision, for example).
+//! Status transitions are recorded by the writers in `deployments.rs`;
+//! [`record`] is for everything else (a Rollback Guard decision, say).
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -94,20 +92,17 @@ pub async fn list_for_deployment(
     Ok(events)
 }
 
-/// An event to append with [`record`].
+/// An event to append with [`record`]. `kind`, `severity` and `source` are
+/// the stored forms of their `rise_backend_core::events` types.
 #[derive(Debug, Clone)]
 pub struct NewEvent<'a> {
     pub deployment_id: Uuid,
-    /// An [`EventKind`](rise_backend_core::events::EventKind) in its stored form.
     pub kind: &'a str,
-    /// An [`EventSeverity`](rise_backend_core::events::EventSeverity) in its stored form.
     pub severity: &'a str,
-    /// An [`EventSource`](rise_backend_core::events::EventSource) in its stored form.
     pub source: &'a str,
     pub message: Option<&'a str>,
     pub attributes: &'a serde_json::Value,
-    /// With a key, the event is written at most once per
-    /// `(deployment, kind, dedupe_key)`.
+    /// With a key, written at most once per `(deployment, kind, dedupe_key)`.
     pub dedupe_key: Option<&'a str>,
 }
 
@@ -151,13 +146,12 @@ pub struct Provenance {
     /// `deployment_id` of the deployment this one was created from (redeploy,
     /// rollback, promote).
     pub source_deployment_id: Option<String>,
-    /// `deployment_id` of the deployment this one was promoted from (the
-    /// immediate source across environments), and that deployment's
-    /// environment name.
+    /// `deployment_id` (and environment name) of the deployment this one was
+    /// promoted from.
     pub promoted_from_deployment_id: Option<String>,
     pub promoted_from_environment: Option<String>,
     /// `deployment_id` of the unhealthy deployment this Rollback Guard
-    /// replacement was created for.
+    /// replacement replaces.
     pub rollback_guard_for_deployment_id: Option<String>,
 }
 

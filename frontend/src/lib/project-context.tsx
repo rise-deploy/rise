@@ -86,14 +86,12 @@ export interface Deployment {
     git_dirty?: boolean;
     /** The deployment this one was created from, if any. */
     source_deployment_id?: string;
-    /** How the deployment was made: a fresh deploy, a redeploy/rollback, a promotion, or by the Rollback Guard. */
     created_via?: CreatedVia | string;
-    /** The deployment this one was promoted from (its immediate source, in another environment). */
+    /** The immediate source of a promotion, in another environment. */
     promoted_from_deployment_id?: string;
     promoted_from_environment?: string;
     /** `[project].migration_version` of the code, inherited along redeploys and promotions. */
     migration_version?: number;
-    /** When the deployment last became Unhealthy; unset while Healthy. */
     unhealthy_since?: string;
     /** Set on a Rollback Guard replacement: the unhealthy deployment it replaces. */
     rollback_guard_for_deployment_id?: string;

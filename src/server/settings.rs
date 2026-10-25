@@ -25,9 +25,8 @@ pub struct Settings {
     #[serde(default)]
     pub deployment_retention: DeploymentRetentionSettings,
     /// The Rollback Guard controller (ADR-0007): replaces an environment's
-    /// active deployment that stays `Unhealthy` past the environment's timeout
-    /// with its last known good predecessor. Environments opt in individually;
-    /// this section is the operator-wide switch and its safety limits.
+    /// active deployment that stays `Unhealthy` past its timeout with its last
+    /// known good predecessor, in environments that opt in.
     #[serde(default)]
     pub rollback_guard: RollbackGuardSettings,
     #[serde(default)]
@@ -124,39 +123,24 @@ fn default_keep_primary_deployments_per_environment() -> i64 {
     10
 }
 
-/// Operator settings for the Rollback Guard controller.
-///
-/// The guard only acts in environments that enabled it (an environment's
-/// `rollback_guard.enabled`, admin-set); `enabled: false` here stops it
-/// platform-wide regardless.
+/// Operator settings for the Rollback Guard controller. `enabled: false` is a
+/// platform-wide kill switch, whatever an environment's own setting.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(default)]
 pub struct RollbackGuardSettings {
-    /// Run the controller. An operator kill switch: when off, no environment
-    /// is guarded, whatever its own setting.
-    #[serde(default = "default_true")]
     pub enabled: bool,
-
     /// How often the controller looks for deployments to replace, in seconds.
-    #[serde(default = "default_rollback_guard_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
-
-    /// Most Rollback Guard replacements on their way up at once, across the
-    /// platform. Further triggers are declined (`in_flight_limit`) until one
-    /// settles.
-    #[serde(default = "default_rollback_guard_max_in_flight")]
+    /// Most replacements on their way up at once, platform-wide. Further
+    /// triggers are declined (`in_flight_limit`) until one settles.
     pub max_in_flight: u32,
-
     /// Fleet circuit breaker: when at least `fleet_unhealthy_min_count` active
-    /// deployments are `Unhealthy` and they make up at least this fraction of
-    /// the active Healthy/Unhealthy ones, the problem is taken to be the
-    /// platform's (e.g. a Traefik API outage), and the guard declines every
-    /// trigger (`platform_wide_unhealthy`). In `(0, 1]`.
-    #[serde(default = "default_rollback_guard_fleet_unhealthy_ratio")]
+    /// deployments are `Unhealthy` and make up at least this fraction (in
+    /// `(0, 1]`) of the active Healthy/Unhealthy ones, the cause is taken to be
+    /// the platform's (e.g. a Traefik API outage) and every trigger is declined
+    /// (`platform_wide_unhealthy`).
     pub fleet_unhealthy_ratio: f64,
-
-    /// Minimum number of `Unhealthy` active deployments before the fleet
-    /// circuit breaker considers the ratio at all.
-    #[serde(default = "default_rollback_guard_fleet_unhealthy_min_count")]
+    /// See `fleet_unhealthy_ratio`.
     pub fleet_unhealthy_min_count: u32,
 }
 
@@ -164,10 +148,10 @@ impl Default for RollbackGuardSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            poll_interval_seconds: default_rollback_guard_poll_interval_seconds(),
-            max_in_flight: default_rollback_guard_max_in_flight(),
-            fleet_unhealthy_ratio: default_rollback_guard_fleet_unhealthy_ratio(),
-            fleet_unhealthy_min_count: default_rollback_guard_fleet_unhealthy_min_count(),
+            poll_interval_seconds: 10,
+            max_in_flight: 3,
+            fleet_unhealthy_ratio: 0.5,
+            fleet_unhealthy_min_count: 3,
         }
     }
 }
@@ -187,22 +171,6 @@ impl RollbackGuardSettings {
         }
         Ok(())
     }
-}
-
-fn default_rollback_guard_poll_interval_seconds() -> u64 {
-    10
-}
-
-fn default_rollback_guard_max_in_flight() -> u32 {
-    3
-}
-
-fn default_rollback_guard_fleet_unhealthy_ratio() -> f64 {
-    0.5
-}
-
-fn default_rollback_guard_fleet_unhealthy_min_count() -> u32 {
-    3
 }
 
 fn default_reserved_project_names() -> Vec<String> {
@@ -3323,33 +3291,31 @@ auth:
     }
 
     #[test]
-    fn rollback_guard_defaults_apply_when_the_section_is_omitted() {
-        let settings = settings_with("").unwrap();
-        let guard = &settings.rollback_guard;
+    fn rollback_guard_settings_default_and_validate() {
+        let guard = settings_with("").unwrap().rollback_guard;
         assert!(guard.enabled);
         assert_eq!(guard.poll_interval_seconds, 10);
-        assert_eq!(guard.max_in_flight, 3);
         assert_eq!(guard.fleet_unhealthy_ratio, 0.5);
-        assert_eq!(guard.fleet_unhealthy_min_count, 3);
-    }
 
-    #[test]
-    fn rollback_guard_settings_are_validated() {
-        let settings =
-            settings_with("rollback_guard:\n  enabled: false\n  max_in_flight: 1\n").unwrap();
-        assert!(!settings.rollback_guard.enabled);
-        assert_eq!(settings.rollback_guard.max_in_flight, 1);
-        assert_eq!(settings.rollback_guard.poll_interval_seconds, 10);
+        let guard = settings_with("rollback_guard:\n  enabled: false\n  max_in_flight: 1\n")
+            .unwrap()
+            .rollback_guard;
+        assert!(!guard.enabled);
+        assert_eq!(guard.max_in_flight, 1);
+        assert_eq!(
+            guard.poll_interval_seconds, 10,
+            "unset fields keep defaults"
+        );
 
-        let err = settings_with("rollback_guard:\n  poll_interval_seconds: 0\n")
-            .expect_err("a zero interval must be refused");
-        assert!(err.to_string().contains("poll_interval_seconds"), "{err}");
-        for ratio in ["0", "1.5", "-0.1"] {
-            let err = settings_with(&format!(
-                "rollback_guard:\n  fleet_unhealthy_ratio: {ratio}\n"
-            ))
-            .expect_err("an out-of-range ratio must be refused");
-            assert!(err.to_string().contains("fleet_unhealthy_ratio"), "{err}");
+        for bad in [
+            "poll_interval_seconds: 0",
+            "fleet_unhealthy_ratio: 0",
+            "fleet_unhealthy_ratio: 1.5",
+            "fleet_unhealthy_ratio: -0.1",
+        ] {
+            let err = settings_with(&format!("rollback_guard:\n  {bad}\n")).expect_err(bad);
+            let field = bad.split(':').next().unwrap();
+            assert!(err.to_string().contains(field), "{err}");
         }
     }
 

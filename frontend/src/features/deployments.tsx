@@ -169,22 +169,14 @@ function stopConsequence(d: Deployment | null | undefined, environments: Environ
     return { title: `Stop ${id}?`, message: `Stops ${id}.`, confirm: 'Stop deployment' };
 }
 
-/** A deployment ID linking to its page. */
 function DeploymentLink({ projectName, id }: { projectName: string; id: string }) {
     const href = deploymentPath(projectName, id);
-    return (
-        <a
-            className="r-link mono"
-            href={href}
-            onClick={(e) => {
-                if (e.metaKey || e.ctrlKey || e.shiftKey) return;
-                e.preventDefault();
-                navigate(href);
-            }}
-        >
-            {id}
-        </a>
-    );
+    const onClick = (e: React.MouseEvent) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+        e.preventDefault();
+        navigate(href);
+    };
+    return <a className="r-link mono" href={href} onClick={onClick}>{id}</a>;
 }
 
 /**
@@ -820,7 +812,7 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                     <KVRow k="Created by">
                         {deployment.created_via === 'rollback_guard' ? 'Rollback Guard (automatic)' : deployment.created_by_email || '-'}
                     </KVRow>
-                    {createdViaLabel(deployment.created_via) && deployment.created_via !== 'deploy' && (
+                    {createdViaLabel(deployment.created_via) && (
                         <KVRow k="Created via">
                             {createdViaLabel(deployment.created_via)}
                             {deployment.created_via === 'promote' && deployment.promoted_from_deployment_id && (

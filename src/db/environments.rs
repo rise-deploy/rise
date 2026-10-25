@@ -327,12 +327,10 @@ pub async fn update_deployment_constraints(
     Ok(env)
 }
 
-/// Update an environment's promotion policy and Rollback Guard settings.
-///
-/// `promotion_source`: `None` leaves it, `Some(None)` clears it, `Some(Some(id))`
-/// sets it. The other two leave their column alone when `None`. The database
-/// enforces that the source is another environment of the same project and that
-/// the timeout is within 60..=86400 seconds; cycle detection is the caller's.
+/// Update an environment's promotion source and Rollback Guard settings; `None`
+/// leaves a column alone (`Some(None)` clears the source). The database
+/// enforces a same-project, non-self source and a 60..=86400 s timeout;
+/// cycle detection is the caller's.
 pub async fn update_promotion_policy(
     pool: &PgPool,
     id: Uuid,
@@ -943,56 +941,39 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn cross_project_promotion_source_is_refused(pool: PgPool) -> Result<()> {
-        let (_, production, _) = project_with_staging(&pool, "policy-a").await?;
+    async fn promotion_policy_constraints(pool: PgPool) -> Result<()> {
+        let (_, production, staging) = project_with_staging(&pool, "policy-a").await?;
         let (_, _, other_staging) = project_with_staging(&pool, "policy-b").await?;
-
-        let err = update_promotion_policy(&pool, production, Some(Some(other_staging)), None, None)
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err:?}").contains("environments_promotion_source_fkey"),
-            "{err:?}"
-        );
-
-        let err = update_promotion_policy(&pool, production, Some(Some(production)), None, None)
-            .await
-            .unwrap_err();
-        assert!(
-            format!("{err:?}").contains("environments_promotion_source_not_self"),
-            "{err:?}"
-        );
-        Ok(())
-    }
-
-    #[sqlx::test]
-    async fn deleting_the_promotion_source_clears_it(pool: PgPool) -> Result<()> {
-        let (_, production, staging) = project_with_staging(&pool, "policy-delete").await?;
-        update_promotion_policy(&pool, production, Some(Some(staging)), None, None).await?;
-
-        assert!(delete(&pool, staging).await?);
-
-        let env = find_by_id(&pool, production).await?.unwrap();
-        assert_eq!(env.promotion_source_environment_id, None);
-        Ok(())
-    }
-
-    #[sqlx::test]
-    async fn rollback_guard_timeout_is_range_checked(pool: PgPool) -> Result<()> {
-        let (_, production, _) = project_with_staging(&pool, "policy-timeout").await?;
-        for bad in [59, 86401] {
-            let err = update_promotion_policy(&pool, production, None, None, Some(bad))
+        let timeout_range = "environments_rollback_guard_timeout_range";
+        for (source, timeout, constraint) in [
+            (
+                Some(other_staging),
+                None,
+                "environments_promotion_source_fkey",
+            ),
+            (
+                Some(production),
+                None,
+                "environments_promotion_source_not_self",
+            ),
+            (None, Some(59), timeout_range),
+            (None, Some(86401), timeout_range),
+        ] {
+            let err = update_promotion_policy(&pool, production, source.map(Some), None, timeout)
                 .await
                 .unwrap_err();
-            assert!(
-                format!("{err:?}").contains("environments_rollback_guard_timeout_range"),
-                "{bad}: {err:?}"
-            );
+            assert!(format!("{err:?}").contains(constraint), "{err:?}");
         }
         for ok in [60, 86400] {
             let env = update_promotion_policy(&pool, production, None, None, Some(ok)).await?;
             assert_eq!(env.rollback_guard_unhealthy_timeout_seconds, ok);
         }
+
+        // Deleting the source clears it.
+        update_promotion_policy(&pool, production, Some(Some(staging)), None, None).await?;
+        assert!(delete(&pool, staging).await?);
+        let env = find_by_id(&pool, production).await?.unwrap();
+        assert_eq!(env.promotion_source_environment_id, None);
         Ok(())
     }
 }

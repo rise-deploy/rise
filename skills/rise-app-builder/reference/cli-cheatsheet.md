@@ -77,7 +77,7 @@ View-only access to deployed apps.
 
 Plus all `BuildArgs` flags (see Build section below).
 
-`--from` with `-E` naming another environment is a promotion (pinned image, target gates and migration check, like `rise promote`; but unlike `rise promote` the local `[project.env]` and `[deploy]` still apply, and `[deploy]` resources are validated against the target's limits rather than clamped). Every `--from` prints a plan and variable diff first.
+Every `--from` prints a plan and variable diff first. Into another environment it is a promotion (like `rise promote`, except the local `[project.env]`/`[deploy]` still apply, validated rather than clamped).
 
 ## Promote (`rise promote` / `rise deployment promote`)
 

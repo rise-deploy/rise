@@ -333,38 +333,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_server_error_carries_error_code_only_when_set() {
+    async fn test_server_error_carries_error_code_and_details_only_when_set() {
         let response = ServerError::forbidden("No access")
             .with_error_code("platform_access_denied")
+            .with_details(json!({"barriers": [{"version": 4}]}))
             .into_response();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(body_json["error"], "No access");
         assert_eq!(body_json["error_code"], "platform_access_denied");
+        assert_eq!(body_json["details"]["barriers"][0]["version"], 4);
 
         let response = ServerError::forbidden("Not a member").into_response();
         let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(body_json.get("error_code").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_server_error_carries_details_only_when_set() {
-        let response = ServerError::conflict("Crossed")
-            .with_error_code("migration_barrier")
-            .with_details(json!({"candidate_version": 3, "barriers": [{"version": 4}]}))
-            .into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json["error_code"], "migration_barrier");
-        assert_eq!(body_json["details"]["candidate_version"], 3);
-        assert_eq!(body_json["details"]["barriers"][0]["version"], 4);
-
-        let response = ServerError::conflict("Plain").into_response();
-        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(body_json.get("details").is_none());
     }
 

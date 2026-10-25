@@ -17,8 +17,7 @@ struct EnvironmentDeploymentConstraints {
     max_memory: Option<String>,
 }
 
-/// The Rollback Guard settings of an environment.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 struct RollbackGuardConfig {
     enabled: bool,
     unhealthy_timeout_seconds: u32,
@@ -44,8 +43,7 @@ pub(crate) struct EnvironmentResponse {
     updated_at: String,
 }
 
-/// The Rollback Guard part of an environment update.
-#[derive(Debug, Serialize, Default, PartialEq, Clone)]
+#[derive(Debug, Serialize)]
 struct RollbackGuardUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
@@ -87,72 +85,57 @@ struct UpdateEnvironmentRequest {
 /// The promotion and Rollback Guard flags of `rise environment update`.
 #[derive(Debug, Default)]
 pub(crate) struct PromotionPolicyFlags<'a> {
-    /// `--promote-from`; an empty string clears it.
+    /// An empty string clears it.
     pub promote_from: Option<&'a str>,
-    /// `--rollback-guard`.
     pub rollback_guard: Option<bool>,
-    /// `--rollback-guard-timeout`, e.g. `5m`.
+    /// A duration, e.g. `5m`.
     pub rollback_guard_timeout: Option<&'a str>,
 }
 
 impl PromotionPolicyFlags<'_> {
     fn promotion_source(&self) -> Option<Option<String>> {
-        self.promote_from.map(|e| {
-            let e = e.trim();
-            (!e.is_empty()).then(|| e.to_string())
-        })
+        self.promote_from
+            .map(|e| Some(e.trim().to_string()).filter(|e| !e.is_empty()))
     }
 
     fn rollback_guard_update(&self) -> Result<Option<RollbackGuardUpdate>> {
-        let timeout = match self.rollback_guard_timeout {
-            Some(raw) => {
+        let timeout = self
+            .rollback_guard_timeout
+            .map(|raw| {
                 let seconds = crate::cli::deployment::parse_duration_to_seconds(raw)
                     .with_context(|| format!("Invalid --rollback-guard-timeout '{}'", raw))?;
-                let seconds = u32::try_from(seconds)
+                u32::try_from(seconds)
                     .ok()
                     .filter(|s| *s > 0)
-                    .with_context(|| {
-                        format!("--rollback-guard-timeout '{}' is out of range", raw)
-                    })?;
-                Some(seconds)
-            }
-            None => None,
-        };
-        if self.rollback_guard.is_none() && timeout.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(RollbackGuardUpdate {
-            enabled: self.rollback_guard,
-            unhealthy_timeout_seconds: timeout,
-        }))
+                    .with_context(|| format!("--rollback-guard-timeout '{}' is out of range", raw))
+            })
+            .transpose()?;
+        Ok(
+            (self.rollback_guard.is_some() || timeout.is_some()).then_some(RollbackGuardUpdate {
+                enabled: self.rollback_guard,
+                unhealthy_timeout_seconds: timeout,
+            }),
+        )
     }
 }
 
 /// Whether `env`, as returned by an update, reflects the requested promotion
-/// policy.
-fn policy_applied(
-    env: &EnvironmentResponse,
-    promotion_source: Option<&Option<String>>,
-    rollback_guard: Option<&RollbackGuardUpdate>,
-) -> bool {
-    if let Some(source) = promotion_source {
-        if env.promotion_source_environment != *source {
-            return false;
-        }
-    }
-    if let Some(update) = rollback_guard {
-        let Some(guard) = env.rollback_guard.as_ref() else {
-            return false;
-        };
-        if update.enabled.is_some_and(|e| e != guard.enabled)
-            || update
-                .unhealthy_timeout_seconds
-                .is_some_and(|t| t != guard.unhealthy_timeout_seconds)
-        {
-            return false;
-        }
-    }
-    true
+/// policy. A server without promotion policy ignores the fields and still
+/// answers 200.
+fn policy_applied(env: &EnvironmentResponse, request: &UpdateEnvironmentRequest) -> bool {
+    let source_applied = request
+        .promotion_source_environment
+        .as_ref()
+        .is_none_or(|source| env.promotion_source_environment == *source);
+    let guard_applied = request.rollback_guard.as_ref().is_none_or(|update| {
+        env.rollback_guard.as_ref().is_some_and(|guard| {
+            update.enabled.is_none_or(|e| e == guard.enabled)
+                && update
+                    .unhealthy_timeout_seconds
+                    .is_none_or(|t| t == guard.unhealthy_timeout_seconds)
+        })
+    });
+    source_applied && guard_applied
 }
 
 /// `300` → `5m`, `7200` → `2h`, `90` → `90s`.
@@ -518,8 +501,6 @@ async fn update_environment(
         promotion_source_environment: policy.promotion_source(),
         rollback_guard: policy.rollback_guard_update()?,
     };
-    let requested_source = payload.promotion_source_environment.clone();
-    let requested_guard = payload.rollback_guard.clone();
 
     let response = http_client
         .patch(&url)
@@ -543,8 +524,7 @@ async fn update_environment(
         .await
         .context("Failed to parse environment response")?;
 
-    // A server without promotion policy ignores the fields and still answers 200.
-    if !policy_applied(&env, requested_source.as_ref(), requested_guard.as_ref()) {
+    if !policy_applied(&env, &payload) {
         anyhow::bail!(
             "The server did not apply the promotion policy; it may not support \
              promotion sources or the Rollback Guard"
@@ -596,8 +576,8 @@ async fn delete_environment(
 mod tests {
     use super::*;
 
-    fn update_json(policy: PromotionPolicyFlags<'_>) -> serde_json::Value {
-        let request = UpdateEnvironmentRequest {
+    fn request(policy: PromotionPolicyFlags<'_>) -> UpdateEnvironmentRequest {
+        UpdateEnvironmentRequest {
             name: None,
             primary_deployment_group: None,
             is_production: None,
@@ -605,41 +585,47 @@ mod tests {
             max_deployment_expiration: None,
             promotion_source_environment: policy.promotion_source(),
             rollback_guard: policy.rollback_guard_update().unwrap(),
-        };
-        serde_json::to_value(request).unwrap()
+        }
     }
 
     #[test]
     fn promotion_flags_map_to_the_update_request() {
-        assert_eq!(
-            update_json(PromotionPolicyFlags {
-                promote_from: Some("staging"),
-                rollback_guard: Some(true),
-                rollback_guard_timeout: Some("5m"),
-            }),
-            serde_json::json!({
-                "promotion_source_environment": "staging",
-                "rollback_guard": {"enabled": true, "unhealthy_timeout_seconds": 300}
-            })
-        );
-        assert_eq!(
-            update_json(PromotionPolicyFlags {
-                promote_from: Some(""),
-                ..Default::default()
-            }),
-            serde_json::json!({"promotion_source_environment": null})
-        );
-        assert_eq!(
-            update_json(PromotionPolicyFlags {
-                rollback_guard: Some(false),
-                ..Default::default()
-            }),
-            serde_json::json!({"rollback_guard": {"enabled": false}})
-        );
-        assert_eq!(
-            update_json(PromotionPolicyFlags::default()),
-            serde_json::json!({})
-        );
+        let cases = [
+            (
+                PromotionPolicyFlags {
+                    promote_from: Some("staging"),
+                    rollback_guard: Some(true),
+                    rollback_guard_timeout: Some("5m"),
+                },
+                serde_json::json!({
+                    "promotion_source_environment": "staging",
+                    "rollback_guard": {"enabled": true, "unhealthy_timeout_seconds": 300}
+                }),
+            ),
+            (
+                PromotionPolicyFlags {
+                    promote_from: Some(""),
+                    ..Default::default()
+                },
+                serde_json::json!({"promotion_source_environment": null}),
+            ),
+            (
+                PromotionPolicyFlags {
+                    rollback_guard: Some(false),
+                    ..Default::default()
+                },
+                serde_json::json!({"rollback_guard": {"enabled": false}}),
+            ),
+            (PromotionPolicyFlags::default(), serde_json::json!({})),
+        ];
+        for (flags, expected) in cases {
+            assert_eq!(serde_json::to_value(request(flags)).unwrap(), expected);
+        }
+        let invalid = PromotionPolicyFlags {
+            rollback_guard_timeout: Some("soon"),
+            ..Default::default()
+        };
+        assert!(invalid.rollback_guard_update().is_err());
     }
 
     fn env_response(extra: serde_json::Value) -> EnvironmentResponse {
@@ -659,72 +645,49 @@ mod tests {
 
     #[test]
     fn update_detects_a_server_that_ignored_the_policy() {
-        let source = Some("staging".to_string());
-        let guard = RollbackGuardUpdate {
-            enabled: Some(true),
-            unhealthy_timeout_seconds: None,
-        };
+        let both = request(PromotionPolicyFlags {
+            promote_from: Some("staging"),
+            rollback_guard: Some(true),
+            ..Default::default()
+        });
         let applied = env_response(serde_json::json!({
             "promotion_source_environment": "staging",
-            "rollback_guard": {"enabled": true, "unhealthy_timeout_seconds": 300},
+            "rollback_guard": {"enabled": true, "unhealthy_timeout_seconds": 600},
         }));
-        assert!(policy_applied(&applied, Some(&source), Some(&guard)));
+        assert!(policy_applied(&applied, &both));
+        assert_eq!(
+            rollback_guard_summary(applied.rollback_guard.as_ref()),
+            "on (after 10m unhealthy)"
+        );
 
         let old_server = env_response(serde_json::json!({}));
-        assert!(!policy_applied(&old_server, Some(&source), None));
-        assert!(!policy_applied(&old_server, None, Some(&guard)));
-        assert!(policy_applied(&old_server, None, None));
-        assert!(policy_applied(&old_server, Some(&None), None));
-    }
-
-    #[test]
-    fn rollback_guard_timeout_must_be_a_duration() {
-        let flags = PromotionPolicyFlags {
-            rollback_guard_timeout: Some("soon"),
+        assert!(!policy_applied(&old_server, &both));
+        let guard_only = request(PromotionPolicyFlags {
+            rollback_guard: Some(true),
             ..Default::default()
-        };
-        assert!(flags.rollback_guard_update().is_err());
+        });
+        assert!(!policy_applied(&old_server, &guard_only));
+        let clear_source = request(PromotionPolicyFlags {
+            promote_from: Some(""),
+            ..Default::default()
+        });
+        assert!(policy_applied(&old_server, &clear_source));
+        assert!(policy_applied(&old_server, &request(Default::default())));
     }
 
     #[test]
     fn rollback_guard_summary_reads_naturally() {
-        let on = RollbackGuardConfig {
-            enabled: true,
-            unhealthy_timeout_seconds: 300,
+        let guard = |enabled, unhealthy_timeout_seconds| RollbackGuardConfig {
+            enabled,
+            unhealthy_timeout_seconds,
         };
-        assert_eq!(rollback_guard_summary(Some(&on)), "on (after 5m unhealthy)");
-        let off = RollbackGuardConfig {
-            enabled: false,
-            unhealthy_timeout_seconds: 7200,
-        };
-        assert_eq!(rollback_guard_summary(Some(&off)), "off");
+        assert_eq!(
+            rollback_guard_summary(Some(&guard(true, 300))),
+            "on (after 5m unhealthy)"
+        );
+        assert_eq!(rollback_guard_summary(Some(&guard(false, 7200))), "off");
         assert_eq!(rollback_guard_summary(None), "-");
         assert_eq!(format_seconds(7200), "2h");
         assert_eq!(format_seconds(90), "90s");
-    }
-
-    #[test]
-    fn environment_response_parses_with_and_without_policy_fields() {
-        let base = serde_json::json!({
-            "name": "production",
-            "primary_deployment_group": "default",
-            "is_production": true,
-            "color": "green",
-            "created_at": "t",
-            "updated_at": "t"
-        });
-        let old: EnvironmentResponse = serde_json::from_value(base.clone()).unwrap();
-        assert!(old.promotion_source_environment.is_none() && old.rollback_guard.is_none());
-
-        let mut new = base;
-        new["promotion_source_environment"] = serde_json::json!("staging");
-        new["rollback_guard"] =
-            serde_json::json!({"enabled": true, "unhealthy_timeout_seconds": 600});
-        let new: EnvironmentResponse = serde_json::from_value(new).unwrap();
-        assert_eq!(new.promotion_source_environment.as_deref(), Some("staging"));
-        assert_eq!(
-            rollback_guard_summary(new.rollback_guard.as_ref()),
-            "on (after 10m unhealthy)"
-        );
     }
 }

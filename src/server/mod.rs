@@ -180,8 +180,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     });
     controller_handles.push(handle);
 
-    // Start the Rollback Guard (ADR-0007). It only acts in environments that
-    // enabled it; the setting is the operator-wide switch.
+    // Rollback Guard (ADR-0007); environments opt in individually.
     #[cfg(feature = "backend")]
     if settings.rollback_guard.enabled {
         info!("Starting Rollback Guard controller");
@@ -189,13 +188,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
             state.clone(),
             settings.rollback_guard.clone(),
         );
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            if let Err(e) = controller.run(shutdown_clone).await {
+        let shutdown = shutdown.clone();
+        controller_handles.push(tokio::spawn(async move {
+            if let Err(e) = controller.run(shutdown).await {
                 tracing::error!("Rollback Guard controller error: {:#}", e);
             }
-        });
-        controller_handles.push(handle);
+        }));
     } else {
         info!("Rollback Guard disabled by rollback_guard.enabled");
     }

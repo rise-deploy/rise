@@ -11,55 +11,49 @@ use axum::{
     Json,
 };
 use rise_backend_auth::session_scope::{Kind, Operation, Verb};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Bounds of `rollback_guard.unhealthy_timeout_seconds`, mirrored by the
 /// `environments_rollback_guard_timeout_range` CHECK constraint.
 const GUARD_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 60..=86400;
 
-/// Validate a Rollback Guard timeout and convert it for storage.
 fn validate_guard_timeout(seconds: u32) -> Result<i32, ServerError> {
     if !GUARD_TIMEOUT_RANGE.contains(&seconds) {
         return Err(ServerError::bad_request(format!(
-            "rollback_guard.unhealthy_timeout_seconds must be between {} and {} (got {})",
+            "rollback_guard.unhealthy_timeout_seconds must be between {} and {} (got {seconds})",
             GUARD_TIMEOUT_RANGE.start(),
             GUARD_TIMEOUT_RANGE.end(),
-            seconds
         )));
     }
     Ok(seconds as i32)
 }
 
-/// The cycle that making `source` the promotion source of `target` would
-/// close, as the environment names along it (`[target, source, …, target]`),
-/// or `None` if there is none.
-///
-/// `sources` maps each environment's name to its current promotion source's
-/// name; `target`'s own entry is ignored, since this change replaces it.
+/// The cycle (`[target, source, …, target]`) that making `source` the
+/// promotion source of `target` would close. `sources` maps environment names
+/// to their promotion source's name; `target`'s own entry is replaced, so it
+/// is never followed.
 fn promotion_cycle(
     target: &str,
     source: &str,
     sources: &HashMap<String, String>,
 ) -> Option<Vec<String>> {
     let mut path = vec![target.to_string()];
-    let mut seen = HashSet::new();
     let mut current = source;
     loop {
         path.push(current.to_string());
         if current == target {
             return Some(path);
         }
-        if !seen.insert(current) {
-            // A cycle that does not pass through `target`; not this change's.
+        // A pre-existing cycle that does not pass through `target`.
+        if path[1..path.len() - 1].iter().any(|p| p == current) {
             return None;
         }
         current = sources.get(current)?;
     }
 }
 
-/// Resolve and validate a requested promotion source for `env`:
-/// `Some(None)` clears it, `Some(Some(id))` sets it.
+/// Resolve a requested promotion source for `env`; empty or `None` clears it.
 fn resolve_promotion_source(
     env: &Environment,
     requested: Option<&str>,
@@ -68,22 +62,24 @@ fn resolve_promotion_source(
     let Some(name) = requested.filter(|n| !n.is_empty()) else {
         return Ok(None);
     };
+    let by_id = |id| all.iter().find(|e| e.id == id);
     let source = all
         .iter()
         .find(|e| e.name == name)
-        .ok_or_else(|| ServerError::not_found(format!("Environment '{}' not found", name)))?;
+        .ok_or_else(|| ServerError::not_found(format!("Environment '{name}' not found")))?;
     if source.id == env.id {
         return Err(ServerError::bad_request(format!(
             "Environment '{}' cannot be its own promotion source",
             env.name
         )));
     }
-    let names: HashMap<Uuid, &str> = all.iter().map(|e| (e.id, e.name.as_str())).collect();
     let sources: HashMap<String, String> = all
         .iter()
         .filter_map(|e| {
-            let src = names.get(&e.promotion_source_environment_id?)?;
-            Some((e.name.clone(), src.to_string()))
+            Some((
+                e.name.clone(),
+                by_id(e.promotion_source_environment_id?)?.name.clone(),
+            ))
         })
         .collect();
     if let Some(cycle) = promotion_cycle(&env.name, &source.name, &sources) {
@@ -229,17 +225,19 @@ pub async fn list_environments(
     let all = db_environments::list_for_project(&state.db_pool, project.id)
         .await
         .internal_err("Failed to list environments")?;
-    let mut envs = all.clone();
 
     // A scoped session sees the environments it covers.
+    let list = Operation::new(Verb::List, Kind::Environment);
     if let Some(scope) = &scope {
-        let list = Operation::new(Verb::List, Kind::Environment);
         scope.require_reach(list, &project.name)?;
-        envs.retain(|environment| scope.allows(list, &project.name, Some(&environment.name)));
     }
-
     Ok(Json(
-        envs.into_iter()
+        all.iter()
+            .filter(|e| {
+                scope
+                    .as_ref()
+                    .is_none_or(|s| s.allows(list, &project.name, Some(&e.name)))
+            })
             .map(|e| EnvironmentResponse::with_names(e, &all))
             .collect(),
     ))
@@ -271,7 +269,6 @@ pub async fn get_environment(
     let env = all
         .iter()
         .find(|e| e.name == env_name)
-        .cloned()
         .ok_or_else(|| ServerError::not_found(format!("Environment '{}' not found", env_name)))?;
 
     Ok(Json(EnvironmentResponse::with_names(env, &all)))
@@ -496,7 +493,7 @@ pub async fn update_environment(
     let all = db_environments::list_for_project(&state.db_pool, project.id)
         .await
         .internal_err("Failed to list environments")?;
-    Ok(Json(EnvironmentResponse::with_names(updated, &all)))
+    Ok(Json(EnvironmentResponse::with_names(&updated, &all)))
 }
 
 /// Delete an environment
@@ -610,43 +607,30 @@ mod tests {
     use super::{promotion_cycle, validate_guard_timeout};
     use std::collections::HashMap;
 
-    fn sources(edges: &[(&str, &str)]) -> HashMap<String, String> {
-        edges
+    fn cycle(target: &str, source: &str, edges: &[(&str, &str)]) -> Option<String> {
+        let sources: HashMap<String, String> = edges
             .iter()
             .map(|(env, src)| (env.to_string(), src.to_string()))
-            .collect()
+            .collect();
+        promotion_cycle(target, source, &sources).map(|c| c.join(" → "))
     }
 
     #[test]
-    fn promotion_cycle_detects_direct_and_transitive_cycles() {
-        // staging promotes from production; production from staging closes it.
-        let edges = sources(&[("staging", "production")]);
+    fn promotion_cycles() {
+        let chain = [("staging", "dev"), ("production", "staging")];
         assert_eq!(
-            promotion_cycle("production", "staging", &edges),
-            Some(vec![
-                "production".to_string(),
-                "staging".to_string(),
-                "production".to_string()
-            ])
+            cycle("production", "staging", &[("staging", "production")]).as_deref(),
+            Some("production → staging → production")
         );
-
-        // dev ← staging ← production, then dev from production.
-        let edges = sources(&[("staging", "dev"), ("production", "staging")]);
         assert_eq!(
-            promotion_cycle("dev", "production", &edges).map(|c| c.join(" → ")),
-            Some("dev → production → staging → dev".to_string())
+            cycle("dev", "production", &chain).as_deref(),
+            Some("dev → production → staging → dev")
         );
-    }
-
-    #[test]
-    fn promotion_cycle_allows_chains_and_replacing_the_targets_own_source() {
-        let edges = sources(&[("staging", "dev"), ("production", "staging")]);
-        assert_eq!(promotion_cycle("qa", "production", &edges), None);
+        assert_eq!(cycle("qa", "production", &chain), None);
         // production's current source is replaced, not followed.
-        assert_eq!(promotion_cycle("production", "dev", &edges), None);
+        assert_eq!(cycle("production", "dev", &chain), None);
         // A pre-existing cycle elsewhere does not loop forever.
-        let edges = sources(&[("a", "b"), ("b", "a")]);
-        assert_eq!(promotion_cycle("c", "a", &edges), None);
+        assert_eq!(cycle("c", "a", &[("a", "b"), ("b", "a")]), None);
     }
 
     #[test]

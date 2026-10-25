@@ -71,32 +71,21 @@ export function productionEnv(envs: Environment[]): Environment | null {
     return envs.find(e => e.is_production) ?? envs.find(e => e.name === 'production') ?? envs[0] ?? null;
 }
 
-/** Whether `env` only accepts promotions from another environment than `from`. */
-export function isPromotionGated(env: Environment, from: string): boolean {
-    return !!env.promotion_source_environment && env.promotion_source_environment !== from;
-}
-
-export interface PromoteTarget {
-    env: Environment;
-    /** The environment only accepts promotions from elsewhere; only an admin can bypass that. */
-    gated: boolean;
-}
-
 /**
  * Environments a deployment in `from` can be promoted to: any other
  * environment with a primary group (a promote lands in that group), except
  * those whose promotion source is a different environment. The production
  * environment is offered first, since that's the usual direction.
- * With `includeGated` (admins), gated environments are kept and flagged.
  */
 export function promoteTargets(from: string, envs: Environment[]): Environment[] {
-    return promoteTargetsFlagged(from, envs).filter(t => !t.gated).map(t => t.env);
+    return promoteTargetsFlagged(from, envs).map(t => t.env);
 }
 
-export function promoteTargetsFlagged(from: string, envs: Environment[], includeGated = false): PromoteTarget[] {
+/** Like {@link promoteTargets}; with `includeGated` (admins, who may bypass the gate) gated environments are kept and flagged. */
+export function promoteTargetsFlagged(from: string, envs: Environment[], includeGated = false): { env: Environment; gated: boolean }[] {
     return sortEnvironments(envs)
         .filter(e => e.name !== from && !!e.primary_deployment_group)
-        .map(env => ({ env, gated: isPromotionGated(env, from) }))
+        .map(env => ({ env, gated: !!env.promotion_source_environment && env.promotion_source_environment !== from }))
         .filter(t => includeGated || !t.gated);
 }
 
@@ -130,15 +119,9 @@ export function shortDeploymentId(id: string): string {
     return id.split('-').pop() || id;
 }
 
-/** How a deployment was created, for display. */
+/** How a deployment was created, for display; `null` for a plain deploy. */
 export function createdViaLabel(via?: string): string | null {
-    switch (via) {
-        case 'promote': return 'Promotion';
-        case 'redeploy': return 'Redeploy';
-        case 'rollback_guard': return 'Rollback Guard (automatic)';
-        case 'deploy': return 'Deploy';
-        default: return null;
-    }
+    return ({ promote: 'Promotion', redeploy: 'Redeploy', rollback_guard: 'Rollback Guard (automatic)' } as Record<string, string>)[via ?? ''] ?? null;
 }
 
 /** The first 7 characters of a commit hash. */

@@ -1,27 +1,24 @@
-//! The Rollback Guard (ADR-0007, Phase 2).
-//!
-//! A leader-elected controller that replaces an environment's active
-//! deployment when it stays `Unhealthy` past the environment's timeout. The
-//! replacement is a new deployment created from the last deployment that
-//! served in the same environment and group (the last known good), through
-//! the same primitive as a manual rollback
+//! The Rollback Guard (ADR-0007, Phase 2): a leader-elected controller that
+//! replaces an environment's active deployment once it has stayed `Unhealthy`
+//! past the environment's timeout. The replacement is created from the last
+//! deployment that served in the same environment and group (the last known
+//! good) through the same primitive as a manual rollback
 //! ([`promotion::create_from_source`]).
 //!
-//! The guard never tears anything down. The unhealthy deployment keeps
-//! running until the replacement turns Healthy and the (fenced) supersession
-//! retires it; if it recovers first, the guard cancels the replacement.
-//! At most one replacement is ever created per unhealthy deployment (a
-//! partial unique index), and the trigger re-checks the subject under a row
-//! lock in the creating transaction, so a recovery and a trigger cannot both
-//! win. Every decision is recorded as a `rollback_guard` event on the
-//! unhealthy deployment.
+//! The guard never tears anything down: the unhealthy deployment keeps running
+//! until the replacement turns Healthy and the (fenced) supersession retires
+//! it, and if it recovers first the guard cancels the replacement. A partial
+//! unique index allows one replacement per unhealthy deployment, and the
+//! creating transaction re-checks the subject under a row lock, so a recovery
+//! and a trigger cannot both win. Every decision is recorded as a
+//! `rollback_guard` event on the unhealthy deployment.
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rise_backend_core::events::{attributes, EventKind, EventSeverity, EventSource};
 use rise_runtime_sync::{leader_controller, LeaderElection, LEASE_DURATION};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -42,92 +39,75 @@ const FAILED_CANDIDATE_LOOKBACK_HOURS: i64 = 24;
 
 /// Why the guard did not replace an unhealthy deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeclineReason {
-    /// The unhealthy deployment is itself a Rollback Guard replacement: the
-    /// guard makes one hop and never chains.
+enum DeclineReason {
     Chained,
-    /// So much of the fleet is unhealthy that the cause is taken to be the
-    /// platform's, not the deployment's.
     PlatformWideUnhealthy,
-    /// Too many replacements are already on their way up.
     InFlightLimit,
-    /// A newer deployment in the group is still in progress: a human fix is
-    /// underway.
     NewerDeploymentInProgress,
-    /// Nothing before it in the group ever served.
     NoLastKnownGood,
-    /// The last one that served was stopped, expired or failed rather than
-    /// replaced by a newer deployment.
     LastKnownGoodNotSuperseded,
-    /// The last one that served cannot be redeployed.
     LastKnownGoodUnavailable,
-    /// Going back to it crosses a recorded migration barrier.
     MigrationBarrier,
-    /// It declares no migration version, and the project records barriers.
     MigrationVersionUnknown,
 }
 
 impl DeclineReason {
-    pub fn as_str(self) -> &'static str {
+    /// The event's `reason` code and its human-readable description.
+    fn parts(self) -> (&'static str, &'static str) {
         match self {
-            Self::Chained => "chained",
-            Self::PlatformWideUnhealthy => "platform_wide_unhealthy",
-            Self::InFlightLimit => "in_flight_limit",
-            Self::NewerDeploymentInProgress => "newer_deployment_in_progress",
-            Self::NoLastKnownGood => "no_last_known_good",
-            Self::LastKnownGoodNotSuperseded => "last_known_good_not_superseded",
-            Self::LastKnownGoodUnavailable => "last_known_good_unavailable",
-            Self::MigrationBarrier => "migration_barrier",
-            Self::MigrationVersionUnknown => "migration_version_unknown",
+            Self::Chained => ("chained", "it is itself a Rollback Guard replacement"),
+            Self::PlatformWideUnhealthy => (
+                "platform_wide_unhealthy",
+                "a large share of the platform's deployments are unhealthy at once",
+            ),
+            Self::InFlightLimit => (
+                "in_flight_limit",
+                "too many Rollback Guard replacements are already in progress",
+            ),
+            Self::NewerDeploymentInProgress => (
+                "newer_deployment_in_progress",
+                "a newer deployment is in progress",
+            ),
+            Self::NoLastKnownGood => (
+                "no_last_known_good",
+                "no earlier deployment in the group ever served",
+            ),
+            Self::LastKnownGoodNotSuperseded => (
+                "last_known_good_not_superseded",
+                "the last deployment that served was not replaced by a newer one",
+            ),
+            Self::LastKnownGoodUnavailable => (
+                "last_known_good_unavailable",
+                "the last deployment that served cannot be reused",
+            ),
+            Self::MigrationBarrier => (
+                "migration_barrier",
+                "going back crosses a recorded migration barrier",
+            ),
+            Self::MigrationVersionUnknown => (
+                "migration_version_unknown",
+                "the last deployment that served declares no migration version",
+            ),
         }
     }
-
-    fn describe(self) -> &'static str {
-        match self {
-            Self::Chained => "it is itself a Rollback Guard replacement",
-            Self::PlatformWideUnhealthy => {
-                "a large share of the platform's deployments are unhealthy at once"
-            }
-            Self::InFlightLimit => "too many Rollback Guard replacements are already in progress",
-            Self::NewerDeploymentInProgress => "a newer deployment is in progress",
-            Self::NoLastKnownGood => "no earlier deployment in the group ever served",
-            Self::LastKnownGoodNotSuperseded => {
-                "the last deployment that served was not replaced by a newer one"
-            }
-            Self::LastKnownGoodUnavailable => "the last deployment that served cannot be reused",
-            Self::MigrationBarrier => "going back crosses a recorded migration barrier",
-            Self::MigrationVersionUnknown => {
-                "the last deployment that served declares no migration version"
-            }
-        }
-    }
-}
-
-/// What the guard does about one unhealthy deployment.
-#[derive(Debug, Clone)]
-pub enum Decision<'a> {
-    Trigger { last_known_good: &'a Deployment },
-    Decline { reason: DeclineReason },
 }
 
 /// Everything [`decide`] looks at besides the subject itself.
 #[derive(Debug, Clone)]
-pub struct GuardFacts<'a> {
-    pub fleet_tripped: bool,
+struct GuardFacts<'a> {
+    fleet_tripped: bool,
     /// Replacements on their way up right now.
-    pub in_flight: i64,
-    pub max_in_flight: u32,
-    pub newer_in_progress: bool,
+    in_flight: i64,
+    max_in_flight: u32,
+    newer_in_progress: bool,
     /// See [`db_deployments::find_last_served_before`].
-    pub last_known_good: Option<&'a Deployment>,
-    /// The migration-barrier check of the last known good's version against
-    /// the environment.
-    pub barriers: &'a BarrierOutcome,
+    last_known_good: Option<&'a Deployment>,
+    barriers: &'a BarrierOutcome,
 }
 
-/// The declines that need nothing from the database beyond the tick's
-/// shared counts, checked before anything else is loaded.
-pub fn early_decline(
+/// The declines that need nothing beyond the tick's shared counts, checked
+/// before anything else is loaded. The guard makes one hop and never chains.
+fn early_decline(
     subject: &Deployment,
     fleet_tripped: bool,
     in_flight: i64,
@@ -144,40 +124,29 @@ pub fn early_decline(
     }
 }
 
-/// Decide whether to replace `subject` with its last known good.
-pub fn decide<'a>(subject: &Deployment, facts: &GuardFacts<'a>) -> Decision<'a> {
-    let decline = |reason| Decision::Decline { reason };
-    if let Some(reason) = early_decline(
-        subject,
-        facts.fleet_tripped,
-        facts.in_flight,
-        facts.max_in_flight,
-    ) {
-        return decline(reason);
+/// Decide whether to replace `subject`; `Ok` carries the last known good.
+fn decide<'a>(subject: &Deployment, f: &GuardFacts<'a>) -> Result<&'a Deployment, DeclineReason> {
+    use DeclineReason::*;
+    if let Some(reason) = early_decline(subject, f.fleet_tripped, f.in_flight, f.max_in_flight) {
+        return Err(reason);
     }
-    if facts.newer_in_progress {
-        return decline(DeclineReason::NewerDeploymentInProgress);
+    if f.newer_in_progress {
+        return Err(NewerDeploymentInProgress);
     }
-    let Some(lkg) = facts.last_known_good else {
-        return decline(DeclineReason::NoLastKnownGood);
-    };
+    let lkg = f.last_known_good.ok_or(NoLastKnownGood)?;
     if lkg.status != DeploymentStatus::Superseded {
-        return decline(DeclineReason::LastKnownGoodNotSuperseded);
+        return Err(LastKnownGoodNotSuperseded);
     }
     if !state_machine::can_create_from(lkg) {
-        return decline(DeclineReason::LastKnownGoodUnavailable);
+        return Err(LastKnownGoodUnavailable);
     }
-    match facts.barriers {
+    match f.barriers {
         BarrierOutcome::Ok
         | BarrierOutcome::Unknown {
             has_barriers: false,
-        } => Decision::Trigger {
-            last_known_good: lkg,
-        },
-        BarrierOutcome::Unknown { has_barriers: true } => {
-            decline(DeclineReason::MigrationVersionUnknown)
-        }
-        BarrierOutcome::Crossed { .. } => decline(DeclineReason::MigrationBarrier),
+        } => Ok(lkg),
+        BarrierOutcome::Unknown { has_barriers: true } => Err(MigrationVersionUnknown),
+        BarrierOutcome::Crossed { .. } => Err(MigrationBarrier),
     }
 }
 
@@ -185,11 +154,7 @@ pub fn decide<'a>(subject: &Deployment, facts: &GuardFacts<'a>) -> Decision<'a> 
 /// they are a large enough share of the active ones, that the cause is more
 /// likely the platform (a Traefik API outage marks every health-checked
 /// Docker/ECS deployment Unhealthy) than any one deployment.
-pub fn fleet_breaker_tripped(
-    healthy: i64,
-    unhealthy: i64,
-    settings: &RollbackGuardSettings,
-) -> bool {
+fn fleet_breaker_tripped(healthy: i64, unhealthy: i64, settings: &RollbackGuardSettings) -> bool {
     let total = healthy + unhealthy;
     unhealthy >= i64::from(settings.fleet_unhealthy_min_count)
         && total > 0
@@ -198,15 +163,6 @@ pub fn fleet_breaker_tripped(
 
 fn deployment_ref(d: &Deployment) -> Value {
     json!({ "kind": "deployment", "name": d.deployment_id })
-}
-
-fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
-    Value::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
-}
-
-fn rfc3339(at: Option<DateTime<Utc>>) -> Value {
-    at.map(|t| Value::String(t.to_rfc3339()))
-        .unwrap_or(Value::Null)
 }
 
 /// Append a `rollback_guard` event to the unhealthy deployment `subject_id`,
@@ -235,31 +191,32 @@ async fn record_guard_event(
 }
 
 /// Record that the guard declined to replace `subject`, once per reason.
-/// `extra` is merged into the attributes.
-pub async fn record_decline(
+/// `extra` (an object, or null) is merged into the attributes.
+async fn record_decline(
     pool: &sqlx::PgPool,
     subject: &GuardSubject,
     reason: DeclineReason,
-    extra: Map<String, Value>,
+    extra: Value,
 ) -> anyhow::Result<bool> {
     let s = &subject.deployment;
-    let mut attrs = Map::new();
-    attrs.insert(attributes::OUTCOME.into(), json!("declined"));
-    attrs.insert(attributes::REASON.into(), json!(reason.as_str()));
-    attrs.insert("unhealthy_since".into(), rfc3339(s.unhealthy_since));
-    attrs.insert("timeout_seconds".into(), json!(subject.timeout_seconds));
-    attrs.extend(extra);
-    let message = format!(
-        "Rollback Guard did not replace this deployment: {}",
-        reason.describe()
-    );
+    let (code, description) = reason.parts();
+    let mut attrs = json!({
+        (attributes::OUTCOME): "declined",
+        (attributes::REASON): code,
+        "unhealthy_since": s.unhealthy_since.map(|t| t.to_rfc3339()),
+        "timeout_seconds": subject.timeout_seconds,
+    });
+    if let (Value::Object(attrs), Value::Object(extra)) = (&mut attrs, extra) {
+        attrs.extend(extra);
+    }
+    let message = format!("Rollback Guard did not replace this deployment: {description}");
     let recorded = record_guard_event(
         pool,
         s.id,
         EventSeverity::Warning,
         &message,
-        &Value::Object(attrs),
-        &format!("declined:{}", reason.as_str()),
+        &attrs,
+        &format!("declined:{code}"),
     )
     .await?;
     if recorded {
@@ -267,15 +224,11 @@ pub async fn record_decline(
             project = %subject.project_name,
             environment = %subject.environment_name,
             deployment = %s.deployment_id,
-            reason = reason.as_str(),
+            reason = code,
             "Rollback Guard declined to replace an unhealthy deployment"
         );
     } else {
-        debug!(
-            deployment = %s.deployment_id,
-            reason = reason.as_str(),
-            "Rollback Guard still declining"
-        );
+        debug!(deployment = %s.deployment_id, reason = code, "Rollback Guard still declining");
     }
     Ok(recorded)
 }
@@ -283,20 +236,22 @@ pub async fn record_decline(
 /// Cancel every open replacement whose subject no longer needs replacing:
 /// it recovered (`Healthy`), or it is being or has been retired by someone
 /// else (`Terminating` or terminal).
-pub async fn reconcile_open_candidates(
+async fn reconcile_open_candidates(
     pool: &sqlx::PgPool,
     kube_client: Option<&kube::Client>,
     election: &LeaderElection,
 ) -> anyhow::Result<()> {
     for (candidate, subject) in db_deployments::list_open_rollback_guard_candidates(pool).await? {
-        let reason = if subject.status == DeploymentStatus::Healthy {
-            "recovered"
-        } else if subject.status == DeploymentStatus::Terminating
-            || state_machine::is_terminal(&subject.status)
-        {
-            "replaced"
-        } else {
-            continue;
+        let (reason, message) = match &subject.status {
+            DeploymentStatus::Healthy => (
+                "recovered",
+                "Rollback Guard cancelled its replacement: this deployment recovered",
+            ),
+            st if *st == DeploymentStatus::Terminating || state_machine::is_terminal(st) => (
+                "replaced",
+                "Rollback Guard cancelled its replacement: this deployment was replaced or stopped",
+            ),
+            _ => continue,
         };
 
         election.assert_leader().await?;
@@ -319,40 +274,31 @@ pub async fn reconcile_open_candidates(
             );
         }
         if let Some(kube_client) = kube_client {
-            match db_projects::find_by_id(pool, candidate.project_id).await {
-                Ok(Some(project)) => {
-                    if let Err(e) = super::crd::trigger_resync(kube_client, &project.name).await {
-                        warn!(
-                            project = %project.name,
-                            "Failed to trigger CRD resync after cancelling a Rollback Guard \
-                             replacement: {:?}",
-                            e
-                        );
-                    }
+            let resync = async {
+                if let Some(project) = db_projects::find_by_id(pool, candidate.project_id).await? {
+                    super::crd::trigger_resync(kube_client, &project.name).await?;
                 }
-                Ok(None) => {}
-                Err(e) => warn!(
+                anyhow::Ok(())
+            };
+            if let Err(e) = resync.await {
+                warn!(
                     project_id = %candidate.project_id,
-                    "Failed to load project for CRD resync: {:?}", e
-                ),
+                    "Failed to trigger CRD resync after cancelling a Rollback Guard replacement: {:?}",
+                    e
+                );
             }
         }
 
-        let message = if reason == "recovered" {
-            "Rollback Guard cancelled its replacement: this deployment recovered"
-        } else {
-            "Rollback Guard cancelled its replacement: this deployment was replaced or stopped"
-        };
         record_guard_event(
             pool,
             subject.id,
             EventSeverity::Info,
             message,
-            &object([
-                (attributes::OUTCOME, json!("aborted")),
-                (attributes::REASON, json!(reason)),
-                (attributes::CANDIDATE, deployment_ref(&candidate)),
-            ]),
+            &json!({
+                (attributes::OUTCOME): "aborted",
+                (attributes::REASON): reason,
+                (attributes::CANDIDATE): deployment_ref(&candidate),
+            }),
             &format!("aborted:{}", candidate.id),
         )
         .await?;
@@ -363,25 +309,23 @@ pub async fn reconcile_open_candidates(
 /// Report replacements that failed since `since`, once each, on the
 /// deployment they were meant to replace. That deployment keeps running: the
 /// guard does not try again.
-pub async fn report_failed_candidates(
-    pool: &sqlx::PgPool,
-    since: DateTime<Utc>,
-) -> anyhow::Result<()> {
+async fn report_failed_candidates(pool: &sqlx::PgPool, since: DateTime<Utc>) -> anyhow::Result<()> {
     for (candidate, subject) in
         db_deployments::list_failed_rollback_guard_candidates(pool, since).await?
     {
-        let mut attrs = Map::new();
-        attrs.insert(attributes::OUTCOME.into(), json!("failed"));
-        attrs.insert(attributes::CANDIDATE.into(), deployment_ref(&candidate));
-        if let Some(message) = candidate.error_message.as_deref() {
-            attrs.insert(attributes::REASON.into(), json!(message));
+        let mut attrs = json!({
+            (attributes::OUTCOME): "failed",
+            (attributes::CANDIDATE): deployment_ref(&candidate),
+        });
+        if let Some(message) = &candidate.error_message {
+            attrs[attributes::REASON] = json!(message);
         }
         let recorded = record_guard_event(
             pool,
             subject.id,
             EventSeverity::Error,
             "Rollback Guard replacement failed; this deployment keeps running",
-            &Value::Object(attrs),
+            &attrs,
             &format!("failed:{}", candidate.id),
         )
         .await?;
@@ -401,8 +345,7 @@ pub async fn report_failed_candidates(
 /// good's image, containers, routes, identity and port, its sizing clamped
 /// into the environment's current range, and its variable snapshot (minus
 /// system and extension variables, which are derived fresh).
-#[allow(clippy::too_many_arguments)]
-pub fn guard_request<'a>(
+fn guard_request<'a>(
     project: &'a Project,
     environment: &'a Environment,
     subject: &'a Deployment,
@@ -423,16 +366,9 @@ pub fn guard_request<'a>(
         })?),
         None => lkg.containers.clone(),
     };
-
-    let mut extra = Map::new();
-    extra.insert(attributes::LAST_KNOWN_GOOD.into(), deployment_ref(lkg));
+    let mut extra = json!({ (attributes::LAST_KNOWN_GOOD): deployment_ref(lkg) });
     if !clamped.adjustments.is_empty() {
-        extra.insert(
-            attributes::RESOURCE_ADJUSTMENTS.into(),
-            serde_json::to_value(&clamped.adjustments).map_err(|e| {
-                ServerError::internal(format!("Failed to serialise adjustments: {e:?}"))
-            })?,
-        );
+        extra[attributes::RESOURCE_ADJUSTMENTS] = json!(clamped.adjustments);
     }
 
     Ok(CreateFromSource {
@@ -466,7 +402,7 @@ pub fn guard_request<'a>(
         git_repository_url: lkg.git_repository_url.clone(),
         rollback_guard_for: Some(subject.id),
         guard_lock: Some(timeout_seconds),
-        extra_event_attributes: Value::Object(extra),
+        extra_event_attributes: extra,
     })
 }
 
@@ -505,11 +441,8 @@ impl RollbackGuardController {
     async fn tick(&self, election: &LeaderElection) -> anyhow::Result<()> {
         let pool = &self.state.db_pool;
         reconcile_open_candidates(pool, self.state.kube_client.as_ref(), election).await?;
-        report_failed_candidates(
-            pool,
-            Utc::now() - chrono::Duration::hours(FAILED_CANDIDATE_LOOKBACK_HOURS),
-        )
-        .await?;
+        let since = Utc::now() - chrono::Duration::hours(FAILED_CANDIDATE_LOOKBACK_HOURS);
+        report_failed_candidates(pool, since).await?;
 
         let subjects = db_deployments::list_rollback_guard_subjects(pool).await?;
         if subjects.is_empty() {
@@ -518,8 +451,7 @@ impl RollbackGuardController {
         let (healthy, unhealthy) = db_deployments::active_health_counts(pool).await?;
         let fleet_tripped = fleet_breaker_tripped(healthy, unhealthy, &self.settings);
         if fleet_tripped {
-            // Every affected subject also records (and logs) a deduplicated
-            // `platform_wide_unhealthy` decline; this repeats every tick.
+            // Each subject also records a deduplicated decline; this repeats every tick.
             debug!(
                 healthy,
                 unhealthy,
@@ -555,9 +487,8 @@ impl RollbackGuardController {
         let pool = &self.state.db_pool;
         let s = &subject.deployment;
 
-        if let Some(reason) =
-            early_decline(s, fleet_tripped, *in_flight, self.settings.max_in_flight)
-        {
+        let max_in_flight = self.settings.max_in_flight;
+        if let Some(reason) = early_decline(s, fleet_tripped, *in_flight, max_in_flight) {
             if reason == DeclineReason::Chained {
                 error!(
                     project = %subject.project_name,
@@ -566,7 +497,7 @@ impl RollbackGuardController {
                     "A Rollback Guard replacement is itself unhealthy; not replacing it again"
                 );
             }
-            record_decline(pool, subject, reason, Map::new()).await?;
+            record_decline(pool, subject, reason, Value::Null).await?;
             return Ok(());
         }
 
@@ -590,17 +521,18 @@ impl RollbackGuardController {
         let facts = GuardFacts {
             fleet_tripped,
             in_flight: *in_flight,
-            max_in_flight: self.settings.max_in_flight,
+            max_in_flight,
             newer_in_progress,
             last_known_good: last_known_good.as_ref(),
             barriers: &barriers,
         };
 
         let lkg = match decide(s, &facts) {
-            Decision::Decline { reason } => {
-                let mut extra = Map::new();
-                if let Some(lkg) = last_known_good.as_ref() {
-                    extra.insert(attributes::LAST_KNOWN_GOOD.into(), deployment_ref(lkg));
+            Ok(lkg) => lkg,
+            Err(reason) => {
+                let mut extra = json!({});
+                if let Some(lkg) = &last_known_good {
+                    extra[attributes::LAST_KNOWN_GOOD] = deployment_ref(lkg);
                 }
                 if let BarrierOutcome::Crossed {
                     candidate,
@@ -608,20 +540,16 @@ impl RollbackGuardController {
                     barriers,
                 } = &barriers
                 {
-                    extra.insert(
-                        "barriers".into(),
-                        json!(barriers
-                            .iter()
-                            .map(|b| json!({ "version": b.version, "reason": b.reason }))
-                            .collect::<Vec<_>>()),
-                    );
-                    extra.insert("candidate_version".into(), json!(candidate));
-                    extra.insert("environment_version".into(), json!(environment));
+                    extra["barriers"] = barriers
+                        .iter()
+                        .map(|b| json!({ "version": b.version, "reason": b.reason }))
+                        .collect();
+                    extra["candidate_version"] = json!(candidate);
+                    extra["environment_version"] = json!(environment);
                 }
                 record_decline(pool, subject, reason, extra).await?;
                 return Ok(());
             }
-            Decision::Trigger { last_known_good } => last_known_good,
         };
 
         let project = db_projects::find_by_id(pool, s.project_id)
@@ -644,16 +572,12 @@ impl RollbackGuardController {
         ) {
             Ok(request) => request,
             Err(e) => {
-                let mut extra = Map::new();
-                extra.insert(attributes::LAST_KNOWN_GOOD.into(), deployment_ref(lkg));
-                extra.insert("detail".into(), json!(e.message));
-                record_decline(
-                    pool,
-                    subject,
-                    DeclineReason::LastKnownGoodUnavailable,
-                    extra,
-                )
-                .await?;
+                let extra = json!({
+                    (attributes::LAST_KNOWN_GOOD): deployment_ref(lkg),
+                    "detail": e.message,
+                });
+                let reason = DeclineReason::LastKnownGoodUnavailable;
+                record_decline(pool, subject, reason, extra).await?;
                 return Ok(());
             }
         };
@@ -687,13 +611,13 @@ impl RollbackGuardController {
                 "Rollback Guard is replacing this deployment with {} (a redeploy of {})",
                 candidate.deployment_id, lkg.deployment_id
             ),
-            &object([
-                (attributes::OUTCOME, json!("triggered")),
-                (attributes::CANDIDATE, deployment_ref(&candidate)),
-                (attributes::LAST_KNOWN_GOOD, deployment_ref(lkg)),
-                ("unhealthy_since", rfc3339(s.unhealthy_since)),
-                ("timeout_seconds", json!(subject.timeout_seconds)),
-            ]),
+            &json!({
+                (attributes::OUTCOME): "triggered",
+                (attributes::CANDIDATE): deployment_ref(&candidate),
+                (attributes::LAST_KNOWN_GOOD): deployment_ref(lkg),
+                "unhealthy_since": s.unhealthy_since.map(|t| t.to_rfc3339()),
+                "timeout_seconds": subject.timeout_seconds,
+            }),
             "triggered",
         )
         .await?;
@@ -704,189 +628,83 @@ impl RollbackGuardController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migration_barriers::MigrationBarrier;
     use crate::db::models::ProjectStatus;
     use crate::db::{deployments, environments, projects, users};
     use sqlx::PgPool;
+    use DeclineReason as R;
 
-    fn deployment(status: DeploymentStatus, created_via: CreatedVia) -> Deployment {
-        Deployment {
-            id: Uuid::new_v4(),
-            deployment_id: "20261025-000000".to_string(),
-            project_id: Uuid::nil(),
-            created_by_id: Uuid::nil(),
-            status,
-            deployment_group: "default".to_string(),
-            environment_id: Uuid::nil(),
-            expires_at: None,
-            termination_reason: None,
-            completed_at: None,
-            error_message: None,
-            build_logs: None,
-            controller_metadata: Value::Null,
-            image: None,
-            image_digest: Some("registry/app@sha256:abc".to_string()),
-            rolled_back_from_deployment_id: None,
-            http_port: 8080,
-            needs_reconcile: false,
-            is_active: false,
-            deploying_started_at: Some(Utc::now()),
-            first_healthy_at: Some(Utc::now()),
-            job_url: None,
-            pull_request_url: None,
-            git_repository_url: None,
-            replicas: 1,
-            cpu: "500m".to_string(),
-            memory: "256Mi".to_string(),
-            identity_credential_hash: None,
-            identity_audiences: json!({}),
-            containers: None,
-            routes: None,
-            created_via,
-            promoted_from_deployment_id: None,
-            promoted_from_environment_id: None,
-            migration_version: None,
-            unhealthy_since: None,
-            rollback_guard_for_deployment_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    fn reason_of(decision: Decision<'_>) -> Option<DeclineReason> {
-        match decision {
-            Decision::Decline { reason } => Some(reason),
-            Decision::Trigger { .. } => None,
-        }
+    fn deployment(status: &str, created_via: &str) -> Deployment {
+        serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "deployment_id": "20261025-000000",
+            "project_id": Uuid::nil(), "created_by_id": Uuid::nil(), "environment_id": Uuid::nil(),
+            "status": status, "created_via": created_via, "deployment_group": "default",
+            "image_digest": "registry/app@sha256:abc", "controller_metadata": null,
+            "http_port": 8080, "needs_reconcile": false, "is_active": false,
+            "replicas": 1, "cpu": "500m", "memory": "256Mi", "identity_audiences": {},
+            "created_at": Utc::now(), "updated_at": Utc::now(),
+        }))
+        .unwrap()
     }
 
     #[test]
     fn decide_table() {
-        let sick = deployment(DeploymentStatus::Unhealthy, CreatedVia::Deploy);
-        let chained = deployment(DeploymentStatus::Unhealthy, CreatedVia::RollbackGuard);
-        let good = deployment(DeploymentStatus::Superseded, CreatedVia::Deploy);
-        let stopped = deployment(DeploymentStatus::Stopped, CreatedVia::Deploy);
+        let sick = deployment("Unhealthy", "deploy");
+        let chained = deployment("Unhealthy", "rollback_guard");
+        let good = deployment("Superseded", "deploy");
+        let stopped = deployment("Stopped", "deploy");
         let ok = BarrierOutcome::Ok;
         let crossed = BarrierOutcome::Crossed {
             candidate: 1,
             environment: 3,
-            barriers: Vec::<MigrationBarrier>::new(),
+            barriers: vec![],
         };
-        let unknown_with = BarrierOutcome::Unknown { has_barriers: true };
-        let unknown_without = BarrierOutcome::Unknown {
-            has_barriers: false,
-        };
-        let base = GuardFacts {
-            fleet_tripped: false,
-            in_flight: 0,
-            max_in_flight: 3,
-            newer_in_progress: false,
-            last_known_good: Some(&good),
-            barriers: &ok,
-        };
+        let unknown = |has_barriers| BarrierOutcome::Unknown { has_barriers };
+        let (unknown_with, unknown_without) = (unknown(true), unknown(false));
+        let g = Some(&good);
 
-        let cases: Vec<(&str, &Deployment, GuardFacts<'_>, Option<DeclineReason>)> = vec![
-            ("trigger", &sick, base.clone(), None),
-            (
-                "unknown version without barriers triggers",
-                &sick,
-                GuardFacts {
-                    barriers: &unknown_without,
-                    ..base.clone()
-                },
-                None,
-            ),
-            (
-                "chained wins over everything",
-                &chained,
-                GuardFacts {
-                    fleet_tripped: true,
-                    in_flight: 9,
-                    ..base.clone()
-                },
-                Some(DeclineReason::Chained),
-            ),
-            (
-                "fleet breaker",
-                &sick,
-                GuardFacts {
-                    fleet_tripped: true,
-                    in_flight: 9,
-                    ..base.clone()
-                },
-                Some(DeclineReason::PlatformWideUnhealthy),
-            ),
-            (
-                "in-flight limit",
-                &sick,
-                GuardFacts {
-                    in_flight: 3,
-                    newer_in_progress: true,
-                    ..base.clone()
-                },
-                Some(DeclineReason::InFlightLimit),
-            ),
-            (
-                "newer deployment in progress",
-                &sick,
-                GuardFacts {
-                    newer_in_progress: true,
-                    last_known_good: None,
-                    ..base.clone()
-                },
-                Some(DeclineReason::NewerDeploymentInProgress),
-            ),
-            (
-                "no last known good",
-                &sick,
-                GuardFacts {
-                    last_known_good: None,
-                    ..base.clone()
-                },
-                Some(DeclineReason::NoLastKnownGood),
-            ),
-            (
-                "last known good was stopped",
-                &sick,
-                GuardFacts {
-                    last_known_good: Some(&stopped),
-                    ..base.clone()
-                },
-                Some(DeclineReason::LastKnownGoodNotSuperseded),
-            ),
-            (
-                "crossed barrier",
-                &sick,
-                GuardFacts {
-                    barriers: &crossed,
-                    ..base.clone()
-                },
-                Some(DeclineReason::MigrationBarrier),
-            ),
-            (
-                "unknown version with barriers",
-                &sick,
-                GuardFacts {
-                    barriers: &unknown_with,
-                    ..base.clone()
-                },
-                Some(DeclineReason::MigrationVersionUnknown),
-            ),
+        // (subject, fleet_tripped, in_flight, newer_in_progress, last known good, barriers, expected)
+        #[rustfmt::skip]
+        let cases = [
+            (&sick, false, 0, false, g, &ok, Ok(good.id)),
+            (&sick, false, 0, false, g, &unknown_without, Ok(good.id)),
+            // Chained wins over everything; then the fleet breaker; then the limit.
+            (&chained, true, 9, false, g, &ok, Err(R::Chained)),
+            (&sick, true, 9, false, g, &ok, Err(R::PlatformWideUnhealthy)),
+            (&sick, false, 3, true, g, &ok, Err(R::InFlightLimit)),
+            (&sick, false, 0, true, None, &ok, Err(R::NewerDeploymentInProgress)),
+            (&sick, false, 0, false, None, &ok, Err(R::NoLastKnownGood)),
+            (&sick, false, 0, false, Some(&stopped), &ok, Err(R::LastKnownGoodNotSuperseded)),
+            (&sick, false, 0, false, g, &crossed, Err(R::MigrationBarrier)),
+            (&sick, false, 0, false, g, &unknown_with, Err(R::MigrationVersionUnknown)),
         ];
-        for (name, subject, facts, expected) in cases {
-            assert_eq!(reason_of(decide(subject, &facts)), expected, "{name}");
+        for (
+            i,
+            (
+                subject,
+                fleet_tripped,
+                in_flight,
+                newer_in_progress,
+                last_known_good,
+                barriers,
+                expected,
+            ),
+        ) in cases.into_iter().enumerate()
+        {
+            let facts = GuardFacts {
+                fleet_tripped,
+                in_flight,
+                max_in_flight: 3,
+                newer_in_progress,
+                last_known_good,
+                barriers,
+            };
+            assert_eq!(decide(subject, &facts).map(|d| d.id), expected, "case {i}");
         }
-
-        assert!(matches!(
-            decide(&sick, &base),
-            Decision::Trigger { last_known_good } if last_known_good.id == good.id
-        ));
     }
 
     #[test]
     fn fleet_breaker_needs_both_count_and_ratio() {
         let settings = RollbackGuardSettings::default();
-        // (healthy, unhealthy, tripped)
         for (healthy, unhealthy, tripped) in [
             (0, 0, false),
             (0, 2, false), // ratio 1.0 but below the minimum count
@@ -904,9 +722,7 @@ mod tests {
         }
     }
 
-    // -----------------------------------------------------------------------
     // Database tests
-    // -----------------------------------------------------------------------
 
     struct Seeded {
         project: Project,
@@ -915,52 +731,15 @@ mod tests {
         subject: Deployment,
     }
 
-    async fn create_deployment(
-        pool: &PgPool,
-        project: &Project,
-        environment: &Environment,
-        user_id: Uuid,
-        deployment_id: &str,
-    ) -> Deployment {
-        deployments::create(
-            pool,
-            deployments::CreateDeploymentParams {
-                deployment_id,
-                project_id: project.id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pushed,
-                image: Some("nginx"),
-                image_digest: Some("docker.io/library/nginx@sha256:abc"),
-                rolled_back_from_deployment_id: None,
-                deployment_group: environment.primary_deployment_group.as_deref().unwrap(),
-                environment_id: environment.id,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: Some(3),
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
-        )
-        .await
-        .unwrap()
-    }
-
     async fn reload(pool: &PgPool, id: Uuid) -> Deployment {
         deployments::find_by_id(pool, id).await.unwrap().unwrap()
+    }
+
+    const RECOVER: &str =
+        "UPDATE deployments SET status = 'Healthy', unhealthy_since = NULL WHERE id = $1";
+
+    async fn execute(pool: &PgPool, sql: &'static str, id: Uuid) {
+        sqlx::query(sql).bind(id).execute(pool).await.unwrap();
     }
 
     /// A guarded production environment whose active deployment (`subject`)
@@ -985,41 +764,36 @@ mod tests {
                 .await
                 .unwrap();
 
-        let lkg = create_deployment(pool, &project, &environment, user.id, "lkg").await;
-        let subject = create_deployment(pool, &project, &environment, user.id, "sick").await;
-        sqlx::query(
-            "UPDATE deployments SET status = 'Superseded', termination_reason = 'Superseded', \
-             is_active = false, created_at = NOW() - interval '4 hours', \
-             deploying_started_at = NOW() - interval '4 hours', \
-             first_healthy_at = NOW() - interval '4 hours', \
-             completed_at = NOW() - interval '2 hours' WHERE id = $1",
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "INSERT INTO deployments (deployment_id, project_id, created_by_id, environment_id, \
+               deployment_group, image, image_digest, migration_version, status, \
+               termination_reason, is_active, created_at, deploying_started_at, \
+               first_healthy_at, completed_at, unhealthy_since) \
+             SELECT v.name, $1, $2, $3, $4, 'nginx', 'docker.io/library/nginx@sha256:abc', 3, \
+               v.status, v.reason::termination_reason, v.active, \
+               NOW() - v.age, NOW() - v.age, NOW() - v.age, v.completed, v.unhealthy \
+             FROM (VALUES \
+               (1, 'lkg', 'Superseded', 'Superseded', false, interval '4 hours', \
+                NOW() - interval '2 hours', NULL::timestamptz), \
+               (2, 'sick', 'Unhealthy', NULL, true, interval '2 hours', \
+                NULL, NOW() - interval '1 hour') \
+             ) AS v(n, name, status, reason, active, age, completed, unhealthy) \
+             ORDER BY v.n RETURNING id",
         )
-        .bind(lkg.id)
-        .execute(pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE deployments SET status = 'Unhealthy', is_active = true, \
-             created_at = NOW() - interval '2 hours', \
-             deploying_started_at = NOW() - interval '2 hours', \
-             first_healthy_at = NOW() - interval '2 hours', \
-             unhealthy_since = NOW() - interval '1 hour' WHERE id = $1",
-        )
-        .bind(subject.id)
-        .execute(pool)
+        .bind(project.id)
+        .bind(user.id)
+        .bind(environment.id)
+        .bind(environment.primary_deployment_group.as_deref().unwrap())
+        .fetch_all(pool)
         .await
         .unwrap();
 
         Seeded {
             project,
             environment,
-            lkg: reload(pool, lkg.id).await,
-            subject: reload(pool, subject.id).await,
+            lkg: reload(pool, ids[0]).await,
+            subject: reload(pool, ids[1]).await,
         }
-    }
-
-    fn constraints(environment: &Environment) -> EffectiveConstraints {
-        EffectiveConstraints::resolve(None, environment)
     }
 
     async fn create_candidate(
@@ -1027,7 +801,7 @@ mod tests {
         seeded: &Seeded,
         deployment_id: &str,
     ) -> Option<Deployment> {
-        let constraints = constraints(&seeded.environment);
+        let constraints = EffectiveConstraints::resolve(None, &seeded.environment);
         let request = guard_request(
             &seeded.project,
             &seeded.environment,
@@ -1071,7 +845,7 @@ mod tests {
         while !election.is_leader() {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "election did not acquire leadership within 5s"
+                "no leadership within 5s"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1079,14 +853,15 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn the_seeded_subject_is_found_and_its_last_known_good_qualifies(pool: PgPool) {
+    async fn trigger_creates_exactly_one_candidate(pool: PgPool) {
         let seeded = seed(&pool).await;
+
+        // The seeded subject is found, and its last known good qualifies.
         let subjects = deployments::list_rollback_guard_subjects(&pool)
             .await
             .unwrap();
         assert_eq!(subjects.len(), 1);
         assert_eq!(subjects[0].deployment.id, seeded.subject.id);
-
         let lkg = deployments::find_last_served_before(&pool, &seeded.subject)
             .await
             .unwrap()
@@ -1108,15 +883,7 @@ mod tests {
             last_known_good: Some(&lkg),
             barriers: &barriers,
         };
-        assert!(matches!(
-            decide(&seeded.subject, &facts),
-            Decision::Trigger { .. }
-        ));
-    }
-
-    #[sqlx::test]
-    async fn trigger_creates_exactly_one_candidate(pool: PgPool) {
-        let seeded = seed(&pool).await;
+        assert!(decide(&seeded.subject, &facts).is_ok());
 
         let (a, b) = tokio::join!(
             create_candidate(&pool, &seeded, "guard-a"),
@@ -1145,7 +912,6 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(create_candidate(&pool, &seeded, "guard-c").await.is_none());
-
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM deployments WHERE rollback_guard_for_deployment_id = $1",
         )
@@ -1171,13 +937,11 @@ mod tests {
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(300)).await;
-            sqlx::query(
-                "UPDATE deployments SET status = 'Healthy', unhealthy_since = NULL WHERE id = $1",
-            )
-            .bind(subject_id)
-            .execute(&mut *tx)
-            .await
-            .unwrap();
+            sqlx::query(RECOVER)
+                .bind(subject_id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
             tx.commit().await.unwrap();
         };
         let trigger = async {
@@ -1201,30 +965,19 @@ mod tests {
         let seeded = seed(&pool).await;
         let election = leader(&pool).await;
         let candidate = create_candidate(&pool, &seeded, "guard-a").await.unwrap();
+        let reconcile = || reconcile_open_candidates(&pool, None, &election);
 
         // Still unhealthy: the replacement is left alone.
-        reconcile_open_candidates(&pool, None, &election)
-            .await
-            .unwrap();
+        reconcile().await.unwrap();
         assert_eq!(
             reload(&pool, candidate.id).await.status,
             DeploymentStatus::Pushed
         );
         assert!(guard_events(&pool, seeded.subject.id).await.is_empty());
 
-        sqlx::query(
-            "UPDATE deployments SET status = 'Healthy', unhealthy_since = NULL WHERE id = $1",
-        )
-        .bind(seeded.subject.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        reconcile_open_candidates(&pool, None, &election)
-            .await
-            .unwrap();
-        reconcile_open_candidates(&pool, None, &election)
-            .await
-            .unwrap();
+        execute(&pool, RECOVER, seeded.subject.id).await;
+        reconcile().await.unwrap();
+        reconcile().await.unwrap();
 
         assert_eq!(
             reload(&pool, candidate.id).await.status,
@@ -1252,27 +1005,12 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
+        let decline = |reason, extra| record_decline(&pool, &subject, reason, extra);
 
-        assert!(
-            record_decline(&pool, &subject, DeclineReason::InFlightLimit, Map::new())
-                .await
-                .unwrap()
-        );
-        assert!(
-            !record_decline(&pool, &subject, DeclineReason::InFlightLimit, Map::new())
-                .await
-                .unwrap()
-        );
-        let mut extra = Map::new();
-        extra.insert(
-            attributes::LAST_KNOWN_GOOD.into(),
-            deployment_ref(&seeded.lkg),
-        );
-        assert!(
-            record_decline(&pool, &subject, DeclineReason::MigrationBarrier, extra)
-                .await
-                .unwrap()
-        );
+        assert!(decline(R::InFlightLimit, Value::Null).await.unwrap());
+        assert!(!decline(R::InFlightLimit, Value::Null).await.unwrap());
+        let extra = json!({ "last_known_good": deployment_ref(&seeded.lkg) });
+        assert!(decline(R::MigrationBarrier, extra).await.unwrap());
 
         let events = guard_events(&pool, seeded.subject.id).await;
         assert_eq!(events.len(), 2);
@@ -1289,14 +1027,9 @@ mod tests {
     async fn failed_candidates_are_reported_once(pool: PgPool) {
         let seeded = seed(&pool).await;
         let candidate = create_candidate(&pool, &seeded, "guard-a").await.unwrap();
-        sqlx::query(
-            "UPDATE deployments SET status = 'Failed', error_message = 'crash loop', \
-             completed_at = NOW() WHERE id = $1",
-        )
-        .bind(candidate.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        let fail = "UPDATE deployments SET status = 'Failed', error_message = 'crash loop', \
+                    completed_at = NOW() WHERE id = $1";
+        execute(&pool, fail, candidate.id).await;
 
         let since = Utc::now() - chrono::Duration::hours(1);
         report_failed_candidates(&pool, since).await.unwrap();
@@ -1318,7 +1051,7 @@ mod tests {
         let seeded = seed(&pool).await;
         let constraints = EffectiveConstraints {
             max_cpu: "250m".to_string(),
-            ..constraints(&seeded.environment)
+            ..EffectiveConstraints::resolve(None, &seeded.environment)
         };
         let request = guard_request(
             &seeded.project,
@@ -1343,18 +1076,17 @@ mod tests {
         assert_eq!(request.rollback_guard_for, Some(seeded.subject.id));
         assert_eq!(request.guard_lock, Some(120));
         assert_eq!(request.expires_at, None);
-        assert_eq!(request.cpu, "250m");
-        assert_eq!(request.memory, "256Mi");
         assert_eq!(
-            request.extra_event_attributes["last_known_good"]["name"],
-            "lkg"
+            (request.cpu.as_str(), request.memory.as_str()),
+            ("250m", "256Mi")
         );
-        let adjustments = request.extra_event_attributes["resource_adjustments"]
-            .as_array()
-            .unwrap();
-        assert_eq!(adjustments.len(), 1);
-        assert_eq!(adjustments[0]["field"], "cpu");
-        assert_eq!(adjustments[0]["from"], "500m");
-        assert_eq!(adjustments[0]["to"], "250m");
+        let attrs = &request.extra_event_attributes;
+        assert_eq!(attrs["last_known_good"]["name"], "lkg");
+        let adjustment = &attrs["resource_adjustments"][0];
+        assert_eq!(attrs["resource_adjustments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ["field", "from", "to"].map(|k| adjustment[k].as_str().unwrap()),
+            ["cpu", "500m", "250m"]
+        );
     }
 }

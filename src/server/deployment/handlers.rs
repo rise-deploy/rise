@@ -258,14 +258,14 @@ async fn insert_rise_env_vars(
         .acquire()
         .await
         .internal_err("Failed to acquire database connection")?;
-    super::promotion::insert_rise_env_vars_with(
-        &mut conn,
+    let vars = super::promotion::rise_system_env_vars(
         state,
         deployment,
         project,
         environment_name.as_deref(),
     )
     .await?;
+    super::promotion::write_env_vars(&mut conn, deployment.id, &vars).await?;
 
     info!(
         "Inserted Rise environment variables for deployment {}",
@@ -755,27 +755,6 @@ fn no_environments() -> ServerError {
     ServerError::internal("Project has no environments; every project needs at least one")
 }
 
-/// The environment name and group of deployment `deployment_id`, or `None`
-/// when it does not exist.
-async fn source_environment_and_group(
-    pool: &sqlx::PgPool,
-    project_id: uuid::Uuid,
-    deployment_id: &str,
-) -> Result<Option<(String, String)>, ServerError> {
-    let Some(source) =
-        db_deployments::find_by_project_and_deployment_id(pool, project_id, deployment_id)
-            .await
-            .internal_err("Failed to find source deployment")?
-    else {
-        return Ok(None);
-    };
-    let environment = db_environments::find_by_id(pool, source.environment_id)
-        .await
-        .internal_err("Failed to look up the source environment")?
-        .ok_or_else(|| ServerError::internal("Source deployment has no environment"))?;
-    Ok(Some((environment.name, source.deployment_group)))
-}
-
 async fn resolve_deployment_target(
     pool: &sqlx::PgPool,
     project_id: uuid::Uuid,
@@ -1232,23 +1211,41 @@ pub async fn create_deployment(
         )));
     }
 
-    // A deployment created from another one defaults to the source's
-    // environment and group, as the plan endpoint does. A missing source is
-    // reported after authorization, below.
-    let source_target = match (
-        payload.from_deployment.as_deref(),
-        &payload.environment,
-        &payload.group,
-    ) {
-        (Some(from_deployment_id), None, None) => {
-            source_environment_and_group(&state.db_pool, project.id, from_deployment_id).await?
-        }
-        _ => None,
+    // The deployment this one is created from (redeploy, rollback, promote)
+    // and its environment. A missing source is reported after authorization.
+    let source = match payload.from_deployment.as_deref() {
+        Some(from_deployment_id) => match db_deployments::find_by_project_and_deployment_id(
+            &state.db_pool,
+            project.id,
+            from_deployment_id,
+        )
+        .await
+        .internal_err("Failed to find source deployment")?
+        {
+            Some(source) => {
+                let environment =
+                    db_environments::find_by_id(&state.db_pool, source.environment_id)
+                        .await
+                        .internal_err("Failed to look up the source environment")?
+                        .ok_or_else(|| {
+                            ServerError::internal("Source deployment has no environment")
+                        })?;
+                Some((source, environment))
+            }
+            None => None,
+        },
+        None => None,
     };
-    let (requested_environment, requested_group) = match &source_target {
-        Some((environment, group)) => (Some(environment.as_str()), Some(group.as_str())),
-        None => (payload.environment.as_deref(), payload.group.as_deref()),
-    };
+    // Created from another deployment, the target defaults to the source's
+    // environment and group, as the plan endpoint does.
+    let (requested_environment, requested_group) =
+        match (&source, &payload.environment, &payload.group) {
+            (Some((source, environment)), None, None) => (
+                Some(environment.name.as_str()),
+                Some(source.deployment_group.as_str()),
+            ),
+            _ => (payload.environment.as_deref(), payload.group.as_deref()),
+        };
 
     // Resolve deployment target (group + environment) from request parameters
     let (resolved_group, resolved_environment) = resolve_deployment_target(
@@ -1342,60 +1339,31 @@ pub async fn create_deployment(
         }
     }
 
-    // The deployment this one is created from (redeploy, rollback, promote).
-    let source_deployment = match payload.from_deployment.as_deref() {
-        Some(from_deployment_id) => {
-            let source = db_deployments::find_by_project_and_deployment_id(
-                &state.db_pool,
-                project.id,
-                from_deployment_id,
-            )
-            .await
-            .internal_err("Failed to find source deployment")?
-            .ok_or_else(|| {
-                ServerError::not_found(format!(
-                    "Source deployment '{}' not found for project '{}'",
-                    from_deployment_id, payload.project
-                ))
-            })?;
-
-            // Verify the source deployment already has a reusable image.
-            if !state_machine::can_create_from(&source) {
-                return Err(ServerError::bad_request(format!(
-                    "Cannot create deployment from '{}' because its image is not available yet (status '{}').",
-                    from_deployment_id, source.status
-                )));
-            }
-            Some(source)
+    if let Some(from_deployment_id) = payload.from_deployment.as_deref() {
+        let Some((source, source_env)) = &source else {
+            return Err(ServerError::not_found(format!(
+                "Source deployment '{}' not found for project '{}'",
+                from_deployment_id, payload.project
+            )));
+        };
+        if !state_machine::can_create_from(source) {
+            return Err(super::promotion::source_unavailable_error(source));
         }
-        None => None,
-    };
-
-    if let Some(source) = source_deployment.as_ref() {
-        let created_via =
-            super::promotion::classify_created_via(source.environment_id, resolved_environment.id);
-        if created_via == crate::db::models::CreatedVia::Promote {
+        if source_env.id != resolved_environment.id {
             // Reading a deployment of another environment: a scoped session
             // must cover that one too.
             if let Some(scope) = &scope {
-                let source_env_name =
-                    db_environments::find_by_id(&state.db_pool, source.environment_id)
-                        .await
-                        .internal_err("Failed to look up the source environment")?
-                        .map(|e| e.name);
                 scope.require(
                     Operation::new(Verb::Get, Kind::Deployment),
                     &project.name,
-                    source_env_name.as_deref(),
+                    Some(source_env.name.as_str()),
                 )?;
             }
             if payload.use_source_env_vars {
-                return Err(ServerError::bad_request(format!(
-                    "--use-source-env-vars cannot be used across environments: deployment '{}' \
-                     is in another environment than '{}', and a promotion recomputes its \
-                     variables for the target",
-                    source.deployment_id, resolved_environment.name
-                )));
+                return Err(super::promotion::cross_environment_source_env_vars_error(
+                    source,
+                    &resolved_environment.name,
+                ));
             }
         }
         // Containers are not rebuilt for a deployment created from another
@@ -1419,79 +1387,21 @@ pub async fn create_deployment(
 
     // Promotion-source gate and migration barriers (ADR-0007).
     let admin_unscoped = !is_sa && scope.is_none() && state.is_admin(&user).await;
+    let source_deployment = source.as_ref().map(|(source, _)| source);
     let policy = super::promotion::evaluate_policy(
         &state.db_pool,
         project.id,
-        source_deployment.as_ref(),
+        source_deployment,
         payload.migration_version,
         &resolved_environment,
         admin_unscoped,
     )
     .await?;
-    let mut warnings: Vec<String> = Vec::new();
-    let mut extra_event_attributes = serde_json::Map::new();
-    match &policy.gate {
-        super::promotion::GateDecision::Allowed => {}
-        super::promotion::GateDecision::Denied { required } => {
-            return Err(super::promotion::gate_denied_error(
-                &resolved_environment.name,
-                required,
-            ));
-        }
-        super::promotion::GateDecision::AdminBypass { required } => {
-            warn!(
-                user = %user.email,
-                "Administrator bypassed the promotion gate of environment '{}' (requires '{}')",
-                resolved_environment.name, required
-            );
-            warnings.push(super::promotion::gate_bypass_warning(
-                &resolved_environment.name,
-                required,
-            ));
-            extra_event_attributes.insert(
-                rise_backend_core::events::attributes::PROMOTION_GATE_BYPASSED.to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-    }
-    match &policy.barriers {
-        super::promotion::BarrierOutcome::Crossed {
-            candidate,
-            environment,
-            barriers,
-        } => {
-            if !payload.force_migration_barrier {
-                return Err(super::promotion::barrier_crossed_error(
-                    &resolved_environment.name,
-                    *candidate,
-                    *environment,
-                    barriers,
-                ));
-            }
-            warn!(
-                user = %user.email,
-                "Forced deployment across migration barrier(s) into environment '{}'",
-                resolved_environment.name
-            );
-            warnings.push(super::promotion::barrier_forced_warning(
-                &resolved_environment.name,
-                *candidate,
-                *environment,
-                barriers,
-            ));
-            extra_event_attributes.insert(
-                rise_backend_core::events::attributes::MIGRATION_BARRIER_FORCED.to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        super::promotion::BarrierOutcome::Unknown { has_barriers: true } => {
-            warnings.push(super::promotion::barrier_unknown_warning(
-                &resolved_environment.name,
-            ));
-        }
-        super::promotion::BarrierOutcome::Unknown { .. } | super::promotion::BarrierOutcome::Ok => {
-        }
-    }
+    let (warnings, mut extra_event_attributes) = policy.enforce(
+        &resolved_environment.name,
+        payload.force_migration_barrier,
+        &user.email,
+    )?;
 
     // Generate deployment ID
     let deployment_id = generate_deployment_id();
@@ -1616,7 +1526,7 @@ pub async fn create_deployment(
 
     // Handle deployment creation from an existing deployment (redeploy,
     // rollback, promote)
-    if let Some(source_deployment) = source_deployment.as_ref() {
+    if let Some(source_deployment) = source_deployment {
         let from_deployment_id = &source_deployment.deployment_id;
         let created_via = super::promotion::classify_created_via(
             source_deployment.environment_id,
@@ -1757,8 +1667,9 @@ pub async fn create_deployment(
             (
                 pinned
                     .image_digest
+                    .clone()
                     .or_else(|| source_deployment.image_digest.clone()),
-                pinned.pinned_image,
+                pinned.image_digest,
             )
         } else {
             (source_deployment.image_digest.clone(), None)
@@ -3213,18 +3124,18 @@ pub async fn plan_deployment_from(
     }
 
     let admin_unscoped = !is_sa && scope.is_none() && state.is_admin(&user).await;
-    let plan = super::promotion::plan(
+    super::promotion::plan(
         &state,
         &project,
         &source,
         &source_env,
         &target_env,
         &group,
-        super::promotion::Caller { admin_unscoped },
+        admin_unscoped,
         query.use_source_env_vars,
     )
-    .await?;
-    Ok(Json(plan))
+    .await
+    .map(Json)
 }
 
 /// GET /projects/{project_name}/deployment-groups - List all deployment groups for a project

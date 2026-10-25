@@ -25,10 +25,6 @@ use crate::server::registry::ImageTagType;
 use crate::server::state::AppState;
 use rise_deployment_spec::project_config::DEFAULT_CONTAINER_NAME;
 
-// ---------------------------------------------------------------------------
-// Classification and the promotion-source gate
-// ---------------------------------------------------------------------------
-
 /// How a deployment created from `source_environment_id` into
 /// `target_environment_id` is recorded: crossing environments is a promotion.
 pub fn classify_created_via(
@@ -40,6 +36,23 @@ pub fn classify_created_via(
     } else {
         CreatedVia::Promote
     }
+}
+
+/// The 400 for a source whose image cannot be reused (yet).
+pub fn source_unavailable_error(source: &Deployment) -> ServerError {
+    ServerError::bad_request(format!(
+        "Cannot create deployment from '{}' because its image is not available yet (status '{}').",
+        source.deployment_id, source.status
+    ))
+}
+
+/// The 400 for `use_source_env_vars` on a promotion.
+pub fn cross_environment_source_env_vars_error(source: &Deployment, target: &str) -> ServerError {
+    ServerError::bad_request(format!(
+        "--use-source-env-vars cannot be used across environments: deployment '{}' is in another \
+         environment than '{target}', and a promotion recomputes its variables for the target",
+        source.deployment_id
+    ))
 }
 
 /// Outcome of the promotion-source gate for one create.
@@ -94,8 +107,7 @@ pub fn gate(
     }
 }
 
-/// The 403 for [`GateDecision::Denied`].
-pub fn gate_denied_error(target: &str, required: &str) -> ServerError {
+fn gate_denied_error(target: &str, required: &str) -> ServerError {
     ServerError::forbidden(format!(
         "Environment '{target}' only accepts deployments promoted from '{required}'. \
          Promote a {required} deployment: rise promote <deployment-id> -E {target}"
@@ -106,18 +118,6 @@ pub fn gate_denied_error(target: &str, required: &str) -> ServerError {
         "promotion_source_environment": required,
     }))
 }
-
-/// The warning returned when an administrator bypassed the gate.
-pub fn gate_bypass_warning(target: &str, required: &str) -> String {
-    format!(
-        "Environment '{target}' only accepts deployments promoted from '{required}'; \
-         this deployment was admitted because you are an administrator"
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Migration barriers
-// ---------------------------------------------------------------------------
 
 /// Outcome of the migration-barrier check for a candidate deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,35 +146,8 @@ impl BarrierOutcome {
     }
 }
 
-/// What the ledger has to be asked about a candidate, before asking it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BarrierRange {
-    Ok,
-    Unknown,
-    /// Barriers `v` with `low_exclusive < v <= high_inclusive` are crossed.
-    Check {
-        low_exclusive: i64,
-        high_inclusive: i64,
-    },
-}
-
-/// `candidate` is the deployment's `migration_version`, `high_water` the
-/// environment's (the highest version that may have run its migrations).
-fn barrier_range(candidate: Option<i64>, high_water: Option<i64>) -> BarrierRange {
-    match (candidate, high_water) {
-        // Nothing in the environment declared a version: nothing to protect.
-        (_, None) => BarrierRange::Ok,
-        (None, Some(_)) => BarrierRange::Unknown,
-        (Some(a), Some(b)) if a >= b => BarrierRange::Ok,
-        (Some(a), Some(b)) => BarrierRange::Check {
-            low_exclusive: a,
-            high_inclusive: b,
-        },
-    }
-}
-
-/// Check `candidate` against the target environment's high-water mark and
-/// the project's barrier ledger.
+/// Check `candidate` (a `migration_version`) against the target
+/// environment's high-water mark and the project's barrier ledger.
 pub async fn check_barriers(
     pool: &sqlx::PgPool,
     project_id: Uuid,
@@ -187,39 +160,39 @@ pub async fn check_barriers(
     check_barriers_against(pool, project_id, candidate, high_water).await
 }
 
+/// `high_water` is the highest version that may have run its migrations in
+/// the environment.
 async fn check_barriers_against(
     pool: &sqlx::PgPool,
     project_id: Uuid,
     candidate: Option<i64>,
     high_water: Option<i64>,
 ) -> Result<BarrierOutcome, ServerError> {
-    match barrier_range(candidate, high_water) {
-        BarrierRange::Ok => Ok(BarrierOutcome::Ok),
-        BarrierRange::Unknown => {
+    let (candidate, environment) = match (candidate, high_water) {
+        // Nothing in the environment declared a version: nothing to protect.
+        (_, None) => return Ok(BarrierOutcome::Ok),
+        (None, Some(_)) => {
             let has_barriers = migration_barriers::project_has_any(pool, project_id)
                 .await
                 .internal_err("Failed to read migration barriers")?;
-            Ok(BarrierOutcome::Unknown { has_barriers })
+            return Ok(BarrierOutcome::Unknown { has_barriers });
         }
-        BarrierRange::Check {
-            low_exclusive,
-            high_inclusive,
-        } => {
-            let barriers =
-                migration_barriers::list_crossed(pool, project_id, low_exclusive, high_inclusive)
-                    .await
-                    .internal_err("Failed to read migration barriers")?;
-            if barriers.is_empty() {
-                Ok(BarrierOutcome::Ok)
-            } else {
-                Ok(BarrierOutcome::Crossed {
-                    candidate: low_exclusive,
-                    environment: high_inclusive,
-                    barriers,
-                })
-            }
+        (Some(a), Some(b)) if a >= b => return Ok(BarrierOutcome::Ok),
+        (Some(a), Some(b)) => (a, b),
+    };
+    // Barriers `v` with `candidate < v <= environment` are crossed.
+    let barriers = migration_barriers::list_crossed(pool, project_id, candidate, environment)
+        .await
+        .internal_err("Failed to read migration barriers")?;
+    Ok(if barriers.is_empty() {
+        BarrierOutcome::Ok
+    } else {
+        BarrierOutcome::Crossed {
+            candidate,
+            environment,
+            barriers,
         }
-    }
+    })
 }
 
 /// A barrier as returned to clients.
@@ -251,8 +224,7 @@ fn barrier_list(barriers: &[MigrationBarrier]) -> String {
         .join(", ")
 }
 
-/// The 409 for a crossed barrier on a manual create.
-pub fn barrier_crossed_error(
+fn barrier_crossed_error(
     target: &str,
     candidate: i64,
     environment: i64,
@@ -271,32 +243,6 @@ pub fn barrier_crossed_error(
         "barriers": barriers.iter().map(BarrierView::from).collect::<Vec<_>>(),
     }))
 }
-
-/// The warning for a forced crossing.
-pub fn barrier_forced_warning(
-    target: &str,
-    candidate: i64,
-    environment: i64,
-    barriers: &[MigrationBarrier],
-) -> String {
-    format!(
-        "Forced across migration barrier(s) {}: '{target}' is at migration version \
-         {environment}, this deployment declares {candidate}",
-        barrier_list(barriers)
-    )
-}
-
-/// The warning for an undeclared version in a project that records barriers.
-pub fn barrier_unknown_warning(target: &str) -> String {
-    format!(
-        "This deployment declares no migration_version, so Rise cannot tell whether it is \
-         compatible with the database of '{target}'. Set [project].migration_version in rise.toml"
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Target-relative sizing
-// ---------------------------------------------------------------------------
 
 /// One change made to an inherited resource value to fit the target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -324,29 +270,17 @@ pub struct EffectiveConstraints {
 impl EffectiveConstraints {
     pub fn resolve(
         platform: Option<&crate::server::settings::DeploymentConstraints>,
-        environment: &Environment,
+        env: &Environment,
     ) -> Self {
-        let platform = platform.cloned().unwrap_or_default();
+        let p = platform.cloned().unwrap_or_default();
         Self {
-            environment: environment.name.clone(),
-            min_replicas: environment
-                .min_replicas
-                .map(|v| v as u32)
-                .unwrap_or(platform.min_replicas),
-            max_replicas: environment
-                .max_replicas
-                .map(|v| v as u32)
-                .unwrap_or(platform.max_replicas),
-            min_cpu: environment.min_cpu.clone().unwrap_or(platform.min_cpu),
-            max_cpu: environment.max_cpu.clone().unwrap_or(platform.max_cpu),
-            min_memory: environment
-                .min_memory
-                .clone()
-                .unwrap_or(platform.min_memory),
-            max_memory: environment
-                .max_memory
-                .clone()
-                .unwrap_or(platform.max_memory),
+            environment: env.name.clone(),
+            min_replicas: env.min_replicas.map_or(p.min_replicas, |v| v as u32),
+            max_replicas: env.max_replicas.map_or(p.max_replicas, |v| v as u32),
+            min_cpu: env.min_cpu.clone().unwrap_or(p.min_cpu),
+            max_cpu: env.max_cpu.clone().unwrap_or(p.max_cpu),
+            min_memory: env.min_memory.clone().unwrap_or(p.min_memory),
+            max_memory: env.max_memory.clone().unwrap_or(p.max_memory),
         }
     }
 }
@@ -372,23 +306,27 @@ pub struct ClampedResources {
     pub adjustments: Vec<ResourceAdjustment>,
 }
 
+/// Clamp `value` of `field` (`cpu` or `memory`) into the constraints' range.
 fn clamp_quantity(
     container: &str,
     field: &'static str,
     value: &str,
-    min: &str,
-    max: &str,
-    environment: &str,
+    c: &EffectiveConstraints,
     adjustments: &mut Vec<ResourceAdjustment>,
 ) -> Result<String, ServerError> {
     let clamp = match field {
         "cpu" => super::quantity::clamp_cpu_to_range,
         _ => super::quantity::clamp_memory_to_range,
     };
+    let (min, max) = match field {
+        "cpu" => (&c.min_cpu, &c.max_cpu),
+        _ => (&c.min_memory, &c.max_memory),
+    };
     let (clamped, changed) = clamp(value, min, max).map_err(|e| {
         ServerError::bad_request(format!(
             "Cannot fit inherited {field} '{value}' of container '{container}' into \
-             environment '{environment}': {e}"
+             environment '{}': {e}",
+            c.environment
         ))
     })?;
     if changed {
@@ -397,32 +335,30 @@ fn clamp_quantity(
             field,
             from: value.to_string(),
             to: clamped.clone(),
-            reason: format!("{environment} allows {field} in [{min}, {max}]"),
+            reason: format!("{} allows {field} in [{min}, {max}]", c.environment),
         });
     }
     Ok(clamped)
 }
 
 fn clamp_replicas(
-    container: &str,
     value: u32,
-    constraints: &EffectiveConstraints,
+    c: &EffectiveConstraints,
     adjustments: &mut Vec<ResourceAdjustment>,
 ) -> u32 {
-    let (lo, hi) = (constraints.min_replicas, constraints.max_replicas);
+    let (lo, hi) = (c.min_replicas, c.max_replicas);
     let clamped = value.max(lo).min(hi.max(lo));
     if clamped != value {
-        let reason = if clamped > value {
-            format!("{} requires ≥ {lo}", constraints.environment)
-        } else {
-            format!("{} allows ≤ {hi}", constraints.environment)
-        };
         adjustments.push(ResourceAdjustment {
-            container: container.to_string(),
+            container: DEFAULT_CONTAINER_NAME.to_string(),
             field: "replicas",
             from: value.to_string(),
             to: clamped.to_string(),
-            reason,
+            reason: if clamped > value {
+                format!("{} requires ≥ {lo}", c.environment)
+            } else {
+                format!("{} allows ≤ {hi}", c.environment)
+            },
         });
     }
     clamped
@@ -442,32 +378,16 @@ pub fn clamp_inherited_resources(
     explicit: &ExplicitResources,
     constraints: &EffectiveConstraints,
 ) -> Result<ClampedResources, ServerError> {
-    let mut adjustments = Vec::new();
-    let multi = specs.as_ref().is_some_and(|s| !s.is_empty());
-
+    let c = constraints;
     // Deployment-level values. For a multi-container source they only back
     // up unset container fields, so their adjustments are not reported.
-    let mut level_adjustments = Vec::new();
-    let replicas = match explicit.replicas {
-        Some(r) => r,
-        None => clamp_replicas(
-            DEFAULT_CONTAINER_NAME,
-            source.replicas.max(0) as u32,
-            constraints,
-            &mut level_adjustments,
-        ),
-    };
+    let mut level = Vec::new();
+    let replicas = explicit
+        .replicas
+        .unwrap_or_else(|| clamp_replicas(source.replicas.max(0) as u32, c, &mut level));
     let cpu = match &explicit.cpu {
         Some(cpu) => cpu.clone(),
-        None => clamp_quantity(
-            DEFAULT_CONTAINER_NAME,
-            "cpu",
-            &source.cpu,
-            &constraints.min_cpu,
-            &constraints.max_cpu,
-            &constraints.environment,
-            &mut level_adjustments,
-        )?,
+        None => clamp_quantity(DEFAULT_CONTAINER_NAME, "cpu", &source.cpu, c, &mut level)?,
     };
     let memory = match &explicit.memory {
         Some(memory) => memory.clone(),
@@ -475,53 +395,48 @@ pub fn clamp_inherited_resources(
             DEFAULT_CONTAINER_NAME,
             "memory",
             &source.memory,
-            &constraints.min_memory,
-            &constraints.max_memory,
-            &constraints.environment,
-            &mut level_adjustments,
+            c,
+            &mut level,
         )?,
     };
-    if !multi {
-        adjustments = level_adjustments;
-    }
 
+    let mut adjustments = Vec::new();
     let containers = match specs {
-        Some(mut specs) if multi => {
+        Some(mut specs) if !specs.is_empty() => {
             let total: u32 = specs.iter().map(|s| s.replicas.unwrap_or(replicas)).sum();
-            if total < constraints.min_replicas || total > constraints.max_replicas {
+            if total < c.min_replicas || total > c.max_replicas {
                 return Err(ServerError::bad_request(format!(
                     "The containers of the source deployment run {total} replicas in total, but \
                      environment '{}' allows [{}, {}]. Inherited per-container replicas are not \
                      adjusted automatically; ask an administrator to adjust the environment's \
                      replica constraints",
-                    constraints.environment, constraints.min_replicas, constraints.max_replicas
+                    c.environment, c.min_replicas, c.max_replicas
                 )));
             }
             for spec in &mut specs {
-                let spec_cpu = spec.cpu.clone().unwrap_or_else(|| cpu.clone());
+                let spec_cpu = spec.cpu.take().unwrap_or_else(|| cpu.clone());
                 spec.cpu = Some(clamp_quantity(
                     &spec.name,
                     "cpu",
                     &spec_cpu,
-                    &constraints.min_cpu,
-                    &constraints.max_cpu,
-                    &constraints.environment,
+                    c,
                     &mut adjustments,
                 )?);
-                let spec_memory = spec.memory.clone().unwrap_or_else(|| memory.clone());
+                let spec_memory = spec.memory.take().unwrap_or_else(|| memory.clone());
                 spec.memory = Some(clamp_quantity(
                     &spec.name,
                     "memory",
                     &spec_memory,
-                    &constraints.min_memory,
-                    &constraints.max_memory,
-                    &constraints.environment,
+                    c,
                     &mut adjustments,
                 )?);
             }
             Some(specs)
         }
-        _ => None,
+        _ => {
+            adjustments = level;
+            None
+        }
     };
 
     Ok(ClampedResources {
@@ -535,21 +450,20 @@ pub fn clamp_inherited_resources(
 
 /// Decode a deployment's persisted per-container specs.
 pub fn decode_source_specs(source: &Deployment) -> Result<Option<Vec<ContainerSpec>>, ServerError> {
-    match source.containers.as_ref() {
-        Some(v) => models::decode_side_data(v).map(Some).map_err(|e| {
-            ServerError::internal(format!(
-                "Source deployment {} ({}) has a non-NULL `containers` column that could not be \
-                 decoded into Vec<ContainerSpec>: {:?}",
-                source.id, source.deployment_id, e
-            ))
-        }),
-        None => Ok(None),
-    }
+    source
+        .containers
+        .as_ref()
+        .map(|v| {
+            models::decode_side_data(v).map_err(|e| {
+                ServerError::internal(format!(
+                    "Source deployment {} ({}) has a non-NULL `containers` column that could not \
+                     be decoded into Vec<ContainerSpec>: {:?}",
+                    source.id, source.deployment_id, e
+                ))
+            })
+        })
+        .transpose()
 }
-
-// ---------------------------------------------------------------------------
-// Image pinning
-// ---------------------------------------------------------------------------
 
 /// The deployment whose image `source` runs: itself, or the one it was
 /// created from.
@@ -557,15 +471,28 @@ pub fn image_origin_id(source: &Deployment) -> Uuid {
     source.rolled_back_from_deployment_id.unwrap_or(source.id)
 }
 
-/// A promotion's images, pinned to immutable digests.
-#[derive(Debug, Clone, Default)]
+/// A promotion's images, pinned to immutable digests: `image_digest` for a
+/// single-container deployment, the `containers` side-data with every image
+/// pinned for a multi-container one.
+#[derive(Debug, Clone)]
 pub struct PinnedImages {
-    /// Single-container: the digest reference to store as `image_digest`.
     pub image_digest: Option<String>,
-    /// Multi-container: the side-data with every image pinned.
     pub containers: Option<serde_json::Value>,
-    /// What to show the user as "the" pinned image (single-container only).
-    pub pinned_image: Option<String>,
+}
+
+async fn pin_image(
+    state: &AppState,
+    project: &Project,
+    image: &str,
+) -> Result<String, ServerError> {
+    super::handlers::resolve_image_digest(
+        &state.oci_client,
+        &state.registry_provider,
+        image,
+        &project.name,
+    )
+    .await
+    .map_err(|e| image_unresolvable(image, format!("{e:#}")))
 }
 
 fn image_unresolvable(image: &str, e: impl std::fmt::Display) -> ServerError {
@@ -592,77 +519,55 @@ pub async fn pin_images(
             .internal_err("Failed to decode container side-data")?;
         if !specs.is_empty() {
             for spec in &mut specs {
-                let Some(image) = spec.image.clone() else {
-                    return Err(image_unresolvable(&spec.name, "the container has no image"));
-                };
-                if image.contains("@sha256:") {
-                    continue;
+                let image = spec
+                    .image
+                    .as_deref()
+                    .ok_or_else(|| image_unresolvable(&spec.name, "the container has no image"))?;
+                if !image.contains("@sha256:") {
+                    spec.image = Some(pin_image(state, project, image).await?);
                 }
-                let pinned = super::handlers::resolve_image_digest(
-                    &state.oci_client,
-                    &state.registry_provider,
-                    &image,
-                    &project.name,
-                )
-                .await
-                .map_err(|e| image_unresolvable(&image, format!("{e:#}")))?;
-                spec.image = Some(pinned);
             }
-            let encoded =
-                models::encode_side_data(&specs).internal_err("Failed to serialise containers")?;
             return Ok(PinnedImages {
                 image_digest: None,
-                containers: Some(encoded),
-                pinned_image: None,
+                containers: Some(
+                    models::encode_side_data(&specs)
+                        .internal_err("Failed to serialise containers")?,
+                ),
             });
         }
     }
 
-    if let Some(digest) = source.image_digest.as_ref() {
-        return Ok(PinnedImages {
-            image_digest: Some(digest.clone()),
-            containers: None,
-            pinned_image: Some(digest.clone()),
-        });
-    }
-
-    let origin_id = image_origin_id(source);
-    let origin_tag = if origin_id == source.id {
-        source.deployment_id.clone()
-    } else {
-        db_deployments::find_by_id(&state.db_pool, origin_id)
-            .await
-            .internal_err("Failed to look up the image's origin deployment")?
-            .map(|d| d.deployment_id)
-            .ok_or_else(|| {
-                image_unresolvable(
-                    &source.deployment_id,
-                    "the deployment that built the image no longer exists",
-                )
-            })?
+    let image_digest = match &source.image_digest {
+        Some(digest) => digest.clone(),
+        None => {
+            let origin_id = image_origin_id(source);
+            let origin_tag = if origin_id == source.id {
+                source.deployment_id.clone()
+            } else {
+                db_deployments::find_by_id(&state.db_pool, origin_id)
+                    .await
+                    .internal_err("Failed to look up the image's origin deployment")?
+                    .map(|d| d.deployment_id)
+                    .ok_or_else(|| {
+                        image_unresolvable(
+                            &source.deployment_id,
+                            "the deployment that built the image no longer exists",
+                        )
+                    })?
+            };
+            let tag = state.registry_provider.get_image_tag(
+                &project.name,
+                &origin_tag,
+                ImageTagType::Internal,
+            );
+            pin_image(state, project, &tag).await?
+        }
     };
-    let tag =
-        state
-            .registry_provider
-            .get_image_tag(&project.name, &origin_tag, ImageTagType::Internal);
-    let pinned = super::handlers::resolve_image_digest(
-        &state.oci_client,
-        &state.registry_provider,
-        &tag,
-        &project.name,
-    )
-    .await
-    .map_err(|e| image_unresolvable(&tag, format!("{e:#}")))?;
     Ok(PinnedImages {
-        image_digest: Some(pinned.clone()),
+        image_digest: Some(image_digest),
         containers: None,
-        pinned_image: Some(pinned),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Environment variables
-// ---------------------------------------------------------------------------
 
 /// A deployment environment variable ready to write: validated, and
 /// encrypted when secret.
@@ -673,6 +578,24 @@ pub struct PreparedEnvVar {
     pub is_secret: bool,
     pub is_protected: bool,
     pub source: String,
+}
+
+impl PreparedEnvVar {
+    fn new(
+        key: String,
+        value: String,
+        is_secret: bool,
+        is_protected: bool,
+        source: EnvVarSource,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            is_secret,
+            is_protected,
+            source: source.as_str().into_owned(),
+        }
+    }
 }
 
 /// The `source` stored for a request override. Only client-allowed values
@@ -716,13 +639,13 @@ pub async fn prepare_env_overrides(
         } else {
             env_override.value.clone()
         };
-        prepared.push(PreparedEnvVar {
-            key: env_override.key.clone(),
+        prepared.push(PreparedEnvVar::new(
+            env_override.key.clone(),
             value,
-            is_secret: env_override.is_secret,
+            env_override.is_secret,
             is_protected,
-            source: override_source(env_override).as_str().into_owned(),
-        });
+            override_source(env_override),
+        ));
     }
     Ok(prepared)
 }
@@ -776,13 +699,13 @@ pub async fn run_extension_hooks(
                 InjectedEnvVarValue::Secret { encrypted, .. } => (encrypted, true, false),
                 InjectedEnvVarValue::Protected { encrypted, .. } => (encrypted, true, true),
             };
-            vars.push(PreparedEnvVar {
-                key: var.key,
+            vars.push(PreparedEnvVar::new(
+                var.key,
                 value,
                 is_secret,
                 is_protected,
-                source: EnvVarSource::Extension.as_str().into_owned(),
-            });
+                EnvVarSource::Extension,
+            ));
         }
     }
     Ok(vars)
@@ -807,31 +730,9 @@ pub async fn rise_system_env_vars(
         environment_name,
     )
     .into_iter()
-    .map(|(key, value)| PreparedEnvVar {
-        key: key.to_string(),
-        value,
-        is_secret: false,
-        is_protected: false,
-        source: EnvVarSource::System.as_str().into_owned(),
-    })
+    .map(|(key, value)| PreparedEnvVar::new(key, value, false, false, EnvVarSource::System))
     .collect())
 }
-
-/// Write the Rise system variables (`PORT` excluded) for `deployment`.
-pub async fn insert_rise_env_vars_with(
-    conn: &mut sqlx::PgConnection,
-    state: &AppState,
-    deployment: &Deployment,
-    project: &Project,
-    environment_name: Option<&str>,
-) -> Result<(), ServerError> {
-    let vars = rise_system_env_vars(state, deployment, project, environment_name).await?;
-    write_env_vars(conn, deployment.id, &vars).await
-}
-
-// ---------------------------------------------------------------------------
-// The primitive
-// ---------------------------------------------------------------------------
 
 /// Where a new deployment's project-level variables come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -884,11 +785,9 @@ pub struct CreateFromSource<'a> {
 
 /// Create a deployment from `req.source` in `req.target_env`.
 ///
-/// Extension hooks run and secret overrides are encrypted first; then the
-/// row (status `Pushed`), all of its environment variables and its creation
-/// event commit in one transaction (see [`create_from_source_in`]), so a
-/// `Pushed` deployment never exists without its variables and a failed hook
-/// leaves nothing behind.
+/// Extension hooks run and secret overrides are encrypted first, so a failed
+/// hook leaves nothing behind; then [`create_from_source_in`] commits the row
+/// (status `Pushed`), all of its variables and its creation event together.
 ///
 /// Returns `Ok(None)` only for a Rollback Guard create that lost: the subject
 /// recovered or no longer qualifies (`guard_lock`), or another replacement
@@ -900,7 +799,6 @@ pub async fn create_from_source(
     let extension_vars = run_extension_hooks(state, req.project.id, req.group).await?;
     let overrides = prepare_env_overrides(state, req.overrides, &req.target_env.name).await?;
     let project = req.project;
-    let project_name = project.name.clone();
     let environment_name = req.target_env.name.clone();
 
     let created = create_from_source_in(
@@ -914,27 +812,23 @@ pub async fn create_from_source(
     )
     .await?;
 
-    if created.is_some() {
-        if let Some(ref kube_client) = state.kube_client {
-            if let Err(e) = super::crd::trigger_resync(kube_client, &project_name).await {
-                warn!(
-                    project = %project_name,
-                    "Failed to trigger CRD resync after creating deployment from another: {:?}", e
-                );
-            }
+    if let (Some(_), Some(kube_client)) = (&created, &state.kube_client) {
+        if let Err(e) = super::crd::trigger_resync(kube_client, &project.name).await {
+            warn!(
+                project = %project.name,
+                "Failed to trigger CRD resync after creating deployment from another: {:?}", e
+            );
         }
     }
     Ok(created)
 }
 
-/// The transactional part of [`create_from_source`], with everything that
-/// needs more than the database already prepared: `extension_vars` (from the
-/// extension hooks), `overrides` (validated and encrypted request overrides)
-/// and `system_vars`, which derives the `RISE_*` variables of the new row.
+/// The transactional part of [`create_from_source`]. `system_vars` derives
+/// the `RISE_*` variables of the new row; `req.overrides` is not read here.
 ///
 /// Variables, later layers winning: the project's or the source's (per
 /// [`EnvMode`]), `extension_vars`, `overrides`, then `PORT` and the system
-/// variables. `req.overrides` is not read here.
+/// variables.
 pub async fn create_from_source_in<F, Fut>(
     pool: &sqlx::PgPool,
     req: CreateFromSource<'_>,
@@ -946,18 +840,14 @@ where
     F: FnOnce(Deployment) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<PreparedEnvVar>, ServerError>>,
 {
-    let (promoted_from_deployment_id, promoted_from_environment_id) =
-        if req.created_via == CreatedVia::Promote {
-            (Some(req.source.id), Some(req.source.environment_id))
-        } else {
-            (None, None)
-        };
+    let promoted = req.created_via == CreatedVia::Promote;
     let extra_event_attributes = req
         .extra_event_attributes
         .as_object()
         .filter(|o| !o.is_empty())
         .map(|_| &req.extra_event_attributes);
 
+    // Dropping `tx` on an early return rolls it back.
     let mut tx = pool
         .begin()
         .await
@@ -975,9 +865,6 @@ where
                 subject = %subject,
                 "Rollback Guard subject no longer qualifies; not creating a replacement"
             );
-            if let Err(e) = tx.rollback().await {
-                warn!("Failed to roll back Rollback Guard transaction: {:?}", e);
-            }
             return Ok(None);
         }
     }
@@ -1008,8 +895,8 @@ where
             routes: req.routes.as_ref(),
             expiration_cap: req.expiration_cap.as_ref(),
             created_via: req.created_via,
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
+            promoted_from_deployment_id: promoted.then_some(req.source.id),
+            promoted_from_environment_id: promoted.then_some(req.source.environment_id),
             migration_version: req.source.migration_version,
             rollback_guard_for_deployment_id: req.rollback_guard_for,
             extra_event_attributes,
@@ -1066,21 +953,18 @@ where
             .internal_err("Failed to copy environment variables")?;
         }
     }
-    write_env_vars(&mut tx, deployment.id, &extension_vars).await?;
-    write_env_vars(&mut tx, deployment.id, &overrides).await?;
-    crate::db::env_vars::upsert_deployment_env_var(
-        &mut *tx,
-        deployment.id,
-        "PORT",
-        &req.http_port.to_string(),
+    let port = req.http_port.to_string();
+    let mut system = vec![PreparedEnvVar::new(
+        "PORT".into(),
+        port,
         false,
         false,
-        "system",
-    )
-    .await
-    .internal_err("Failed to insert PORT env var")?;
-    let system = system_vars(deployment.clone()).await?;
-    write_env_vars(&mut tx, deployment.id, &system).await?;
+        EnvVarSource::System,
+    )];
+    system.extend(system_vars(deployment.clone()).await?);
+    for vars in [&extension_vars, &overrides, &system] {
+        write_env_vars(&mut tx, deployment.id, vars).await?;
+    }
 
     tx.commit()
         .await
@@ -1094,10 +978,6 @@ where
     Ok(Some(deployment))
 }
 
-// ---------------------------------------------------------------------------
-// Policy evaluation and the plan (preview)
-// ---------------------------------------------------------------------------
-
 /// The gate and barrier decisions for one create, as both the create handler
 /// and [`plan`] see them.
 #[derive(Debug, Clone)]
@@ -1108,6 +988,83 @@ pub struct PolicyEvaluation {
     pub candidate_version: Option<i64>,
     pub high_water: Option<i64>,
     pub barriers: BarrierOutcome,
+}
+
+impl PolicyEvaluation {
+    /// Warnings a create into `target` carries without being refused: an
+    /// administrator bypass of the gate, an undeclared migration version.
+    fn warnings(&self, target: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let GateDecision::AdminBypass { required } = &self.gate {
+            warnings.push(format!(
+                "Environment '{target}' only accepts deployments promoted from '{required}'; \
+                 this deployment was admitted because you are an administrator"
+            ));
+        }
+        if let BarrierOutcome::Unknown { has_barriers: true } = self.barriers {
+            warnings.push(format!(
+                "This deployment declares no migration_version, so Rise cannot tell whether it \
+                 is compatible with the database of '{target}'. Set [project].migration_version \
+                 in rise.toml"
+            ));
+        }
+        warnings
+    }
+
+    /// Enforce the decisions on a create into `target` by `actor`: a denied
+    /// gate is a 403, a crossed barrier a 409 unless `force_barrier`. Returns
+    /// the warnings for the response and the attributes for the creation
+    /// event.
+    pub fn enforce(
+        &self,
+        target: &str,
+        force_barrier: bool,
+        actor: &str,
+    ) -> Result<(Vec<String>, serde_json::Map<String, serde_json::Value>), ServerError> {
+        use rise_backend_core::events::attributes::{
+            MIGRATION_BARRIER_FORCED, PROMOTION_GATE_BYPASSED,
+        };
+        let mut warnings = self.warnings(target);
+        let mut attributes = serde_json::Map::new();
+        match &self.gate {
+            GateDecision::Allowed => {}
+            GateDecision::Denied { required } => return Err(gate_denied_error(target, required)),
+            GateDecision::AdminBypass { required } => {
+                warn!(
+                    user = %actor,
+                    "Administrator bypassed the promotion gate of environment '{target}' \
+                     (requires '{required}')"
+                );
+                attributes.insert(PROMOTION_GATE_BYPASSED.into(), true.into());
+            }
+        }
+        if let BarrierOutcome::Crossed {
+            candidate,
+            environment,
+            barriers,
+        } = &self.barriers
+        {
+            if !force_barrier {
+                return Err(barrier_crossed_error(
+                    target,
+                    *candidate,
+                    *environment,
+                    barriers,
+                ));
+            }
+            warn!(
+                user = %actor,
+                "Forced deployment across migration barrier(s) into environment '{target}'"
+            );
+            warnings.push(format!(
+                "Forced across migration barrier(s) {}: '{target}' is at migration version \
+                 {environment}, this deployment declares {candidate}",
+                barrier_list(barriers)
+            ));
+            attributes.insert(MIGRATION_BARRIER_FORCED.into(), true.into());
+        }
+        Ok((warnings, attributes))
+    }
 }
 
 /// Evaluate the promotion-source gate and the migration barriers for a
@@ -1134,10 +1091,7 @@ pub async fn evaluate_policy(
         promotion_source_environment.as_deref(),
         admin_unscoped,
     );
-    let candidate_version = match source {
-        Some(source) => source.migration_version,
-        None => fresh_version,
-    };
+    let candidate_version = source.map_or(fresh_version, |s| s.migration_version);
     let high_water = db_deployments::migration_high_water(pool, target_env.id)
         .await
         .internal_err("Failed to read the environment's migration version")?;
@@ -1149,13 +1103,6 @@ pub async fn evaluate_policy(
         high_water,
         barriers,
     })
-}
-
-/// Who asks for a plan.
-#[derive(Debug, Clone, Copy)]
-pub struct Caller {
-    /// An unscoped, human administrator session (may bypass the gate).
-    pub admin_unscoped: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1216,7 +1163,8 @@ pub struct CreateFromPlan {
 }
 
 /// Preview creating a deployment from `source` into `target_env`/`group`,
-/// from the same decisions [`create_from_source`]'s callers make.
+/// from the same decisions [`create_from_source`]'s callers make. Refusals
+/// the create would make are reported in `warnings` and the decisions.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan(
     state: &AppState,
@@ -1225,7 +1173,7 @@ pub async fn plan(
     source_env: &Environment,
     target_env: &Environment,
     group: &str,
-    caller: Caller,
+    admin_unscoped: bool,
     use_source_env_vars: bool,
 ) -> Result<CreateFromPlan, ServerError> {
     let kind = classify_created_via(source.environment_id, target_env.id);
@@ -1235,20 +1183,11 @@ pub async fn plan(
         Some(source),
         None,
         target_env,
-        caller.admin_unscoped,
+        admin_unscoped,
     )
     .await?;
 
-    let mut warnings = Vec::new();
-    match &policy.gate {
-        GateDecision::AdminBypass { required } => {
-            warnings.push(gate_bypass_warning(&target_env.name, required))
-        }
-        GateDecision::Denied { .. } | GateDecision::Allowed => {}
-    }
-    if let BarrierOutcome::Unknown { has_barriers: true } = policy.barriers {
-        warnings.push(barrier_unknown_warning(&target_env.name));
-    }
+    let mut warnings = policy.warnings(&target_env.name);
     let use_source_env_vars_allowed = kind == CreatedVia::Redeploy;
     if use_source_env_vars && !use_source_env_vars_allowed {
         warnings.push(
@@ -1257,7 +1196,7 @@ pub async fn plan(
                 .to_string(),
         );
     }
-    if !state_machine_can_create_from(source) {
+    if !super::state_machine::can_create_from(source) {
         warnings.push(format!(
             "Deployment '{}' cannot be used as a source: its image is not available (status '{}')",
             source.deployment_id, source.status
@@ -1276,21 +1215,17 @@ pub async fn plan(
             Err(e) => warnings.push(e.message),
         }
         match pin_images(state, project, source, source.containers.as_ref()).await {
-            Ok(pinned) => pinned_image = pinned.pinned_image,
+            Ok(pinned) => pinned_image = pinned.image_digest,
             Err(e) => warnings.push(e.message),
         }
     }
 
     let provenance = crate::db::deployment_events::provenance_batch(&state.db_pool, &[source.id])
         .await
-        .map_err(|e| {
-            error!("Failed to read deployment provenance: {:?}", e);
-            e
-        })
+        .map_err(|e| error!("Failed to read deployment provenance: {:?}", e))
         .ok()
         .and_then(|mut map| map.remove(&source.id))
         .unwrap_or_default();
-    let source_image = display_image(state, source, project).await;
 
     let current =
         db_deployments::find_active_deployment_for_group(&state.db_pool, project.id, group)
@@ -1307,7 +1242,7 @@ pub async fn plan(
         None => None,
     };
 
-    let (environment_version, barrier_views) = match &policy.barriers {
+    let (environment_version, barriers) = match &policy.barriers {
         BarrierOutcome::Crossed {
             environment,
             barriers,
@@ -1325,7 +1260,7 @@ pub async fn plan(
             deployment_id: source.deployment_id.clone(),
             environment: source_env.name.clone(),
             status: source.status.to_string(),
-            image: source_image,
+            image: display_image(state, source, project).await,
             image_digest: source.image_digest.clone(),
             migration_version: source.migration_version,
             git_revision: provenance.git_revision,
@@ -1339,22 +1274,18 @@ pub async fn plan(
         pinned_image,
         gate: PlanGate {
             decision: policy.gate.as_str(),
-            promotion_source_environment: policy.promotion_source_environment.clone(),
+            promotion_source_environment: policy.promotion_source_environment,
         },
         migration: PlanMigration {
             status: policy.barriers.as_str(),
             candidate_version: policy.candidate_version,
             environment_version,
-            barriers: barrier_views,
+            barriers,
         },
         adjustments,
         use_source_env_vars_allowed,
         warnings,
     })
-}
-
-fn state_machine_can_create_from(source: &Deployment) -> bool {
-    super::state_machine::can_create_from(source)
 }
 
 /// The image a deployment runs, for display: `None` for multi-container.
@@ -1374,112 +1305,7 @@ mod tests {
     use crate::db::models::ProjectStatus;
     use crate::db::{deployments, environments, projects, users};
     use sqlx::PgPool;
-
-    fn env(id: Uuid, name: &str, source: Option<Uuid>) -> Environment {
-        Environment {
-            id,
-            project_id: Uuid::nil(),
-            name: name.to_string(),
-            primary_deployment_group: Some(name.to_string()),
-            is_production: false,
-            color: "green".to_string(),
-            min_replicas: None,
-            max_replicas: None,
-            min_cpu: None,
-            max_cpu: None,
-            min_memory: None,
-            max_memory: None,
-            max_deployment_expiration: None,
-            promotion_source_environment_id: source,
-            rollback_guard_enabled: false,
-            rollback_guard_unhealthy_timeout_seconds: 300,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        }
-    }
-
-    #[test]
-    fn gate_table() {
-        let staging = Uuid::new_v4();
-        let production = Uuid::new_v4();
-        let dev = Uuid::new_v4();
-        let open = env(production, "production", None);
-        let gated = env(production, "production", Some(staging));
-        let denied = GateDecision::Denied {
-            required: "staging".to_string(),
-        };
-
-        // No policy: anything goes, fresh builds included.
-        assert_eq!(gate(&open, None, None, false), GateDecision::Allowed);
-        assert_eq!(gate(&open, Some(dev), None, false), GateDecision::Allowed);
-        // From the promotion source.
-        assert_eq!(
-            gate(&gated, Some(staging), Some("staging"), false),
-            GateDecision::Allowed
-        );
-        // Same environment: a redeploy or rollback of something admitted.
-        assert_eq!(
-            gate(&gated, Some(production), Some("staging"), false),
-            GateDecision::Allowed
-        );
-        // Another environment, and a fresh build.
-        assert_eq!(gate(&gated, Some(dev), Some("staging"), false), denied);
-        assert_eq!(gate(&gated, None, Some("staging"), false), denied);
-        // An unscoped human admin bypasses; a service account or scoped
-        // session reaches the gate with `admin_unscoped = false`.
-        assert_eq!(
-            gate(&gated, None, Some("staging"), true),
-            GateDecision::AdminBypass {
-                required: "staging".to_string()
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn gate_denial_carries_code_and_details() {
-        use axum::response::IntoResponse;
-        let response = gate_denied_error("production", "staging").into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["error_code"], "promotion_source_required");
-        assert_eq!(body["details"]["environment"], "production");
-        assert_eq!(body["details"]["promotion_source_environment"], "staging");
-        assert!(body["error"]
-            .as_str()
-            .unwrap()
-            .contains("rise promote <deployment-id> -E production"));
-    }
-
-    #[test]
-    fn created_via_classification() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        assert_eq!(classify_created_via(a, a), CreatedVia::Redeploy);
-        assert_eq!(classify_created_via(a, b), CreatedVia::Promote);
-    }
-
-    #[test]
-    fn barrier_range_table() {
-        // Forward and equal moves.
-        assert_eq!(barrier_range(Some(5), Some(4)), BarrierRange::Ok);
-        assert_eq!(barrier_range(Some(4), Some(4)), BarrierRange::Ok);
-        // Nothing in the environment declared a version.
-        assert_eq!(barrier_range(Some(1), None), BarrierRange::Ok);
-        assert_eq!(barrier_range(None, None), BarrierRange::Ok);
-        // Undeclared candidate.
-        assert_eq!(barrier_range(None, Some(3)), BarrierRange::Unknown);
-        // Backward: the ledger decides.
-        assert_eq!(
-            barrier_range(Some(2), Some(5)),
-            BarrierRange::Check {
-                low_exclusive: 2,
-                high_inclusive: 5
-            }
-        );
-    }
+    use std::collections::BTreeMap;
 
     fn deployment(replicas: i32, cpu: &str, memory: &str) -> Deployment {
         Deployment {
@@ -1525,8 +1351,11 @@ mod tests {
         }
     }
 
-    fn constraints() -> EffectiveConstraints {
-        EffectiveConstraints {
+    fn clamp(
+        specs: Option<Vec<ContainerSpec>>,
+        explicit: ExplicitResources,
+    ) -> Result<ClampedResources, ServerError> {
+        let constraints = EffectiveConstraints {
             environment: "production".to_string(),
             min_replicas: 2,
             max_replicas: 4,
@@ -1534,52 +1363,23 @@ mod tests {
             max_cpu: "1".to_string(),
             min_memory: "128Mi".to_string(),
             max_memory: "1Gi".to_string(),
-        }
+        };
+        clamp_inherited_resources(&deployment(1, "2", "512Mi"), specs, &explicit, &constraints)
     }
 
-    #[test]
-    fn single_container_inherited_values_are_clamped_and_reported() {
-        let source = deployment(1, "2", "512Mi");
-        let clamped =
-            clamp_inherited_resources(&source, None, &ExplicitResources::default(), &constraints())
-                .unwrap();
-        assert_eq!(clamped.replicas, 2);
-        assert_eq!(clamped.cpu, "1");
-        assert_eq!(clamped.memory, "512Mi");
-        assert!(clamped.containers.is_none());
-        assert_eq!(
-            clamped
-                .adjustments
-                .iter()
-                .map(|a| (
+    fn adjusted(clamped: &ClampedResources) -> Vec<(&str, &str, &str, &str)> {
+        clamped
+            .adjustments
+            .iter()
+            .map(|a| {
+                (
                     a.container.as_str(),
                     a.field,
                     a.from.as_str(),
-                    a.to.as_str()
-                ))
-                .collect::<Vec<_>>(),
-            vec![("app", "replicas", "1", "2"), ("app", "cpu", "2", "1")]
-        );
-        assert_eq!(clamped.adjustments[0].reason, "production requires ≥ 2");
-    }
-
-    #[test]
-    fn explicit_values_are_not_clamped() {
-        let source = deployment(1, "2", "512Mi");
-        let clamped = clamp_inherited_resources(
-            &source,
-            None,
-            &ExplicitResources {
-                replicas: Some(9),
-                cpu: Some("4".to_string()),
-                memory: None,
-            },
-            &constraints(),
-        )
-        .unwrap();
-        assert_eq!(clamped.replicas, 9);
-        assert_eq!(clamped.cpu, "4");
-        assert!(clamped.adjustments.is_empty());
+                    a.to.as_str(),
+                )
+            })
+            .collect()
     }
 
     fn spec(name: &str, replicas: u32, cpu: &str, memory: &str) -> ContainerSpec {
@@ -1596,45 +1396,61 @@ mod tests {
     }
 
     #[test]
+    fn single_container_clamps_inherited_values_but_not_explicit_ones() {
+        let clamped = clamp(None, ExplicitResources::default()).unwrap();
+        assert_eq!(
+            (
+                clamped.replicas,
+                clamped.cpu.as_str(),
+                clamped.memory.as_str()
+            ),
+            (2, "1", "512Mi")
+        );
+        assert!(clamped.containers.is_none());
+        assert_eq!(
+            adjusted(&clamped),
+            [("app", "replicas", "1", "2"), ("app", "cpu", "2", "1")]
+        );
+        assert_eq!(clamped.adjustments[0].reason, "production requires ≥ 2");
+
+        let explicit = ExplicitResources {
+            replicas: Some(9),
+            cpu: Some("4".to_string()),
+            memory: None,
+        };
+        let clamped = clamp(None, explicit).unwrap();
+        assert_eq!((clamped.replicas, clamped.cpu.as_str()), (9, "4"));
+        assert!(clamped.adjustments.is_empty());
+    }
+
+    #[test]
     fn multi_container_clamps_per_container_cpu_and_memory() {
-        let source = deployment(1, "500m", "256Mi");
-        let clamped = clamp_inherited_resources(
-            &source,
-            Some(vec![
-                spec("web", 2, "100m", "2Gi"),
-                spec("worker", 1, "500m", "256Mi"),
-            ]),
-            &ExplicitResources::default(),
-            &constraints(),
-        )
-        .unwrap();
+        let specs = vec![
+            spec("web", 2, "100m", "2Gi"),
+            spec("worker", 1, "500m", "256Mi"),
+        ];
+        let clamped = clamp(Some(specs), ExplicitResources::default()).unwrap();
+        // The deployment-level clamps only back up unset fields: unreported.
+        assert_eq!(
+            adjusted(&clamped),
+            [
+                ("web", "cpu", "100m", "250m"),
+                ("web", "memory", "2Gi", "1Gi")
+            ]
+        );
         let specs = clamped.containers.unwrap();
         assert_eq!(specs[0].cpu.as_deref(), Some("250m"));
         assert_eq!(specs[0].memory.as_deref(), Some("1Gi"));
         assert_eq!(specs[1].cpu.as_deref(), Some("500m"));
-        assert_eq!(
-            clamped
-                .adjustments
-                .iter()
-                .map(|a| (a.container.as_str(), a.field))
-                .collect::<Vec<_>>(),
-            vec![("web", "cpu"), ("web", "memory")]
-        );
     }
 
     #[test]
     fn multi_container_total_replicas_out_of_range_is_an_error() {
-        let source = deployment(1, "500m", "256Mi");
-        let err = clamp_inherited_resources(
-            &source,
-            Some(vec![
-                spec("web", 3, "500m", "256Mi"),
-                spec("worker", 3, "500m", "256Mi"),
-            ]),
-            &ExplicitResources::default(),
-            &constraints(),
-        )
-        .unwrap_err();
+        let specs = vec![
+            spec("web", 3, "500m", "256Mi"),
+            spec("worker", 3, "500m", "256Mi"),
+        ];
+        let err = clamp(Some(specs), ExplicitResources::default()).unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(
             err.message.contains("6 replicas in total"),
@@ -1644,159 +1460,249 @@ mod tests {
     }
 
     #[test]
-    fn toml_override_scoped_to_an_environment_is_stored_as_toml_env() {
-        let mut o = EnvOverride {
-            key: "LOG_LEVEL".to_string(),
-            value: "info".to_string(),
-            is_secret: false,
-            is_protected: None,
-            source: Some("toml".to_string()),
-            for_environment: Some("production".to_string()),
-        };
-        assert_eq!(
-            override_source(&o),
-            EnvVarSource::TomlEnv("production".to_string())
-        );
-        o.for_environment = None;
-        assert_eq!(override_source(&o), EnvVarSource::Toml);
-        o.source = Some("cli".to_string());
-        o.for_environment = Some("production".to_string());
-        assert_eq!(override_source(&o), EnvVarSource::Cli);
-        // Server-managed sources are never accepted from a client.
-        o.source = Some("toml:production".to_string());
-        assert_eq!(override_source(&o), EnvVarSource::Cli);
-        o.source = Some("system".to_string());
-        assert_eq!(override_source(&o), EnvVarSource::Cli);
+    fn override_source_accepts_only_client_sources() {
+        for (source, for_environment, expected) in [
+            (
+                "toml",
+                Some("production"),
+                EnvVarSource::TomlEnv("production".to_string()),
+            ),
+            ("toml", None, EnvVarSource::Toml),
+            ("cli", Some("production"), EnvVarSource::Cli),
+            // Server-managed sources are never accepted from a client.
+            ("toml:production", Some("production"), EnvVarSource::Cli),
+            ("system", Some("production"), EnvVarSource::Cli),
+        ] {
+            let o = EnvOverride {
+                key: "LOG_LEVEL".to_string(),
+                value: "info".to_string(),
+                is_secret: false,
+                is_protected: None,
+                source: Some(source.to_string()),
+                for_environment: for_environment.map(str::to_string),
+            };
+            assert_eq!(
+                override_source(&o),
+                expected,
+                "{source} / {for_environment:?}"
+            );
+        }
     }
 
-    async fn seed(pool: &PgPool) -> (Uuid, Uuid, Environment, Environment) {
-        let user = users::create(pool, "promotion@example.com").await.unwrap();
-        let project = projects::create(
-            pool,
-            "promotion-project",
-            ProjectStatus::Stopped,
-            "public".to_string(),
-            Some(user.id),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let production_id = environments::test_environment_id(pool, project.id).await;
-        let staging = environments::create(
-            pool,
-            project.id,
-            "staging",
-            Some("staging"),
-            false,
-            "blue",
-            None,
-        )
-        .await
-        .unwrap();
-        let production = environments::update_promotion_policy(
-            pool,
-            production_id,
-            Some(Some(staging.id)),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        (project.id, user.id, staging, production)
+    /// A project with a `staging` environment and a `production` one that
+    /// only accepts promotions from staging.
+    struct Fixture {
+        pool: PgPool,
+        project: Project,
+        staging: Environment,
+        production: Environment,
     }
 
-    async fn seed_deployment(
-        pool: &PgPool,
-        project_id: Uuid,
-        user_id: Uuid,
-        env: &Environment,
-        deployment_id: &str,
-        migration_version: Option<i64>,
-        started: bool,
-    ) -> Deployment {
-        let group = env.primary_deployment_group.clone().unwrap();
-        let d = deployments::create(
-            pool,
-            deployments::CreateDeploymentParams {
+    impl Fixture {
+        async fn new(pool: PgPool) -> Self {
+            let user = users::create(&pool, "promotion@example.com").await.unwrap();
+            let project = projects::create(
+                &pool,
+                "promotion-project",
+                ProjectStatus::Stopped,
+                "public".to_string(),
+                Some(user.id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let production_id = environments::test_environment_id(&pool, project.id).await;
+            let staging = environments::create(
+                &pool,
+                project.id,
+                "staging",
+                Some("staging"),
+                false,
+                "blue",
+                None,
+            )
+            .await
+            .unwrap();
+            let production = environments::update_promotion_policy(
+                &pool,
+                production_id,
+                Some(Some(staging.id)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            Self {
+                pool,
+                project,
+                staging,
+                production,
+            }
+        }
+
+        /// A deployment in `env`; `started` ones count towards the
+        /// environment's migration high-water mark.
+        async fn deploy(
+            &self,
+            env: &Environment,
+            deployment_id: &str,
+            migration_version: Option<i64>,
+            started: bool,
+        ) -> Deployment {
+            let d = deployments::create(
+                &self.pool,
+                deployments::CreateDeploymentParams {
+                    deployment_id,
+                    project_id: self.project.id,
+                    created_by_id: self.project.owner_user_id.unwrap(),
+                    status: DeploymentStatus::Pushed,
+                    image: Some("nginx"),
+                    image_digest: Some("docker.io/library/nginx@sha256:abc"),
+                    rolled_back_from_deployment_id: None,
+                    deployment_group: env.primary_deployment_group.as_deref().unwrap(),
+                    environment_id: env.id,
+                    expires_at: None,
+                    http_port: 80,
+                    is_active: false,
+                    job_url: None,
+                    pull_request_url: None,
+                    git_repository_url: None,
+                    replicas: 1,
+                    cpu: "500m",
+                    memory: "256Mi",
+                    identity_audiences: serde_json::json!({}),
+                    containers: None,
+                    routes: None,
+                    expiration_cap: None,
+                    created_via: CreatedVia::Deploy,
+                    promoted_from_deployment_id: None,
+                    promoted_from_environment_id: None,
+                    migration_version,
+                    rollback_guard_for_deployment_id: None,
+                    extra_event_attributes: None,
+                },
+            )
+            .await
+            .unwrap();
+            if !started {
+                return d;
+            }
+            deployments::update_status(&self.pool, d.id, DeploymentStatus::Deploying, None)
+                .await
+                .unwrap()
+        }
+
+        fn request<'a>(
+            &'a self,
+            source: &'a Deployment,
+            target_env: &'a Environment,
+            deployment_id: &'a str,
+            created_via: CreatedVia,
+            env_mode: EnvMode,
+        ) -> CreateFromSource<'a> {
+            CreateFromSource {
+                project: &self.project,
+                source,
+                target_env,
+                group: target_env.primary_deployment_group.as_deref().unwrap(),
                 deployment_id,
-                project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pushed,
-                image: Some("nginx"),
-                image_digest: Some("docker.io/library/nginx@sha256:abc"),
-                rolled_back_from_deployment_id: None,
-                deployment_group: &group,
-                environment_id: env.id,
+                created_by_id: source.created_by_id,
+                created_via,
+                env_mode,
+                overrides: &[],
+                http_port: 9090,
+                replicas: source.replicas as u32,
+                cpu: source.cpu.clone(),
+                memory: source.memory.clone(),
+                containers: None,
+                routes: None,
+                identity_audiences: serde_json::json!({}),
+                image: source.image.clone(),
+                image_digest: source.image_digest.clone(),
                 expires_at: None,
-                http_port: 80,
-                is_active: false,
+                expiration_cap: None,
                 job_url: None,
                 pull_request_url: None,
                 git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
-        )
-        .await
-        .unwrap();
-        if started {
-            deployments::update_status(pool, d.id, DeploymentStatus::Deploying, None)
+                rollback_guard_for: None,
+                guard_lock: None,
+                extra_event_attributes: serde_json::json!({}),
+            }
+        }
+
+        async fn exists(&self, deployment_id: &str) -> bool {
+            deployments::find_by_project_and_deployment_id(
+                &self.pool,
+                self.project.id,
+                deployment_id,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        }
+
+        /// `key -> (value, source)` of a deployment's variables.
+        async fn vars(&self, deployment_id: Uuid) -> BTreeMap<String, (String, String)> {
+            crate::db::env_vars::list_deployment_env_vars(&self.pool, deployment_id)
                 .await
                 .unwrap()
-        } else {
-            d
+                .into_iter()
+                .map(|v| (v.key, (v.value, v.source)))
+                .collect()
         }
+
+        async fn seed_source_vars(&self, source: Uuid) {
+            for (key, value, src) in [
+                ("FROM_TOML", "t", "toml"),
+                ("STAGING_ONLY", "s", "toml:staging"),
+                ("PROD_TOML", "p", "toml:production"),
+                ("FROM_CLI", "c", "cli"),
+                ("GLOBAL_VAR", "old", "global"),
+                ("EXT_VAR", "stale", "extension"),
+                ("PORT", "80", "system"),
+            ] {
+                crate::db::env_vars::upsert_deployment_env_var(
+                    &self.pool, source, key, value, false, false, src,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    }
+
+    fn var(key: &str, value: &str, source: &str) -> PreparedEnvVar {
+        PreparedEnvVar {
+            key: key.to_string(),
+            value: value.to_string(),
+            is_secret: false,
+            is_protected: false,
+            source: source.to_string(),
+        }
+    }
+
+    fn expected_vars(vars: &[(&str, &str, &str)]) -> BTreeMap<String, (String, String)> {
+        vars.iter()
+            .map(|(k, v, s)| (k.to_string(), (v.to_string(), s.to_string())))
+            .collect()
     }
 
     #[sqlx::test]
     async fn check_barriers_table(pool: PgPool) {
-        let (project_id, user_id, _staging, production) = seed(&pool).await;
-        // Nothing has run in production yet.
-        assert_eq!(
-            check_barriers(&pool, project_id, production.id, Some(1))
-                .await
-                .unwrap(),
-            BarrierOutcome::Ok
-        );
+        let fx = Fixture::new(pool).await;
+        let (project_id, production) = (fx.project.id, &fx.production);
+        let outcome = |c| check_barriers(&fx.pool, project_id, production.id, c);
+        // Nothing has run in production yet: nothing to protect.
+        assert_eq!(outcome(Some(1)).await.unwrap(), BarrierOutcome::Ok);
+        assert_eq!(outcome(None).await.unwrap(), BarrierOutcome::Ok);
 
-        seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            &production,
-            "d-5",
-            Some(5),
-            true,
-        )
-        .await;
+        fx.deploy(production, "d-5", Some(5), true).await;
         // A version that never started does not raise the high-water mark.
-        seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            &production,
-            "d-9",
-            Some(9),
-            false,
-        )
-        .await;
-        migration_barriers::create(&pool, project_id, 4, "drops column", None)
+        fx.deploy(production, "d-9", Some(9), false).await;
+        migration_barriers::create(&fx.pool, project_id, 4, "drops column", None)
             .await
             .unwrap();
 
-        let outcome = |c| check_barriers(&pool, project_id, production.id, c);
         // Forward and equal.
         assert_eq!(outcome(Some(6)).await.unwrap(), BarrierOutcome::Ok);
         assert_eq!(outcome(Some(5)).await.unwrap(), BarrierOutcome::Ok);
@@ -1823,29 +1729,21 @@ mod tests {
 
     #[sqlx::test]
     async fn evaluate_policy_gates_and_checks_barriers(pool: PgPool) {
-        let (project_id, user_id, staging, production) = seed(&pool).await;
-        seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            &production,
-            "d-prod",
-            Some(5),
-            true,
-        )
-        .await;
-        migration_barriers::create(&pool, project_id, 5, "renames table", None)
+        let fx = Fixture::new(pool).await;
+        let (pool, project_id) = (&fx.pool, fx.project.id);
+        let (staging, production) = (&fx.staging, &fx.production);
+        let in_production = fx.deploy(production, "d-prod", Some(5), true).await;
+        migration_barriers::create(pool, project_id, 5, "renames table", None)
             .await
             .unwrap();
-        let from_staging =
-            seed_deployment(&pool, project_id, user_id, &staging, "d-stg", Some(4), true).await;
+        let from_staging = fx.deploy(staging, "d-stg", Some(4), true).await;
 
         let promoted = evaluate_policy(
-            &pool,
+            pool,
             project_id,
             Some(&from_staging),
             None,
-            &production,
+            production,
             false,
         )
         .await
@@ -1855,12 +1753,20 @@ mod tests {
             promoted.promotion_source_environment.as_deref(),
             Some("staging")
         );
-        assert_eq!(promoted.candidate_version, Some(4));
-        assert_eq!(promoted.high_water, Some(5));
+        assert_eq!(
+            (promoted.candidate_version, promoted.high_water),
+            (Some(4), Some(5))
+        );
         assert!(matches!(promoted.barriers, BarrierOutcome::Crossed { .. }));
+        // Enforced: 409 unless forced, and a forced crossing is recorded.
+        let err = promoted.enforce("production", false, "a@b").unwrap_err();
+        assert_eq!(err.error_code, Some("migration_barrier"));
+        let (warnings, attributes) = promoted.enforce("production", true, "a@b").unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(attributes.len(), 1);
 
         // A fresh build is denied; its own declared version is the candidate.
-        let fresh = evaluate_policy(&pool, project_id, None, Some(6), &production, false)
+        let fresh = evaluate_policy(pool, project_id, None, Some(6), production, false)
             .await
             .unwrap();
         assert_eq!(
@@ -1870,133 +1776,89 @@ mod tests {
             }
         );
         assert_eq!(fresh.barriers, BarrierOutcome::Ok);
+        let err = fresh.enforce("production", true, "a@b").unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(err.error_code, Some("promotion_source_required"));
+        assert_eq!(
+            err.details.as_deref(),
+            Some(&serde_json::json!({
+                "environment": "production",
+                "promotion_source_environment": "staging",
+            }))
+        );
+        assert!(err
+            .message
+            .contains("rise promote <deployment-id> -E production"));
 
-        let bypass = evaluate_policy(&pool, project_id, None, Some(6), &production, true)
+        let bypass = evaluate_policy(pool, project_id, None, Some(6), production, true)
             .await
             .unwrap();
         assert!(matches!(bypass.gate, GateDecision::AdminBypass { .. }));
+        let (warnings, attributes) = bypass.enforce("production", false, "a@b").unwrap();
+        assert_eq!((warnings.len(), attributes.len()), (1, 1));
+
+        // A redeploy or rollback within the target was admitted before.
+        let redeploy = evaluate_policy(
+            pool,
+            project_id,
+            Some(&in_production),
+            None,
+            production,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(redeploy.gate, GateDecision::Allowed);
+
+        // A promotion from an environment other than the configured source.
+        let dev = environments::create(pool, project_id, "dev", Some("dev"), false, "green", None)
+            .await
+            .unwrap();
+        let from_dev = fx.deploy(&dev, "d-dev", Some(5), true).await;
+        let promoted = evaluate_policy(pool, project_id, Some(&from_dev), None, production, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted.gate,
+            GateDecision::Denied {
+                required: "staging".to_string()
+            }
+        );
 
         // Staging has no policy.
-        let staging_fresh = evaluate_policy(&pool, project_id, None, None, &staging, false)
+        let staging_fresh = evaluate_policy(pool, project_id, None, None, staging, false)
             .await
             .unwrap();
         assert_eq!(staging_fresh.gate, GateDecision::Allowed);
     }
 
-    fn request<'a>(
-        project: &'a Project,
-        source: &'a Deployment,
-        target_env: &'a Environment,
-        deployment_id: &'a str,
-        created_via: CreatedVia,
-        env_mode: EnvMode,
-    ) -> CreateFromSource<'a> {
-        CreateFromSource {
-            project,
-            source,
-            target_env,
-            group: target_env.primary_deployment_group.as_deref().unwrap(),
-            deployment_id,
-            created_by_id: source.created_by_id,
-            created_via,
-            env_mode,
-            overrides: &[],
-            http_port: 9090,
-            replicas: source.replicas as u32,
-            cpu: source.cpu.clone(),
-            memory: source.memory.clone(),
-            containers: None,
-            routes: None,
-            identity_audiences: serde_json::json!({}),
-            image: source.image.clone(),
-            image_digest: source.image_digest.clone(),
-            expires_at: None,
-            expiration_cap: None,
-            job_url: None,
-            pull_request_url: None,
-            git_repository_url: None,
-            rollback_guard_for: None,
-            guard_lock: None,
-            extra_event_attributes: serde_json::json!({}),
-        }
-    }
-
-    fn var(key: &str, value: &str, source: &str) -> PreparedEnvVar {
-        PreparedEnvVar {
-            key: key.to_string(),
-            value: value.to_string(),
-            is_secret: false,
-            is_protected: false,
-            source: source.to_string(),
-        }
-    }
-
-    async fn vars_of(pool: &PgPool, deployment_id: Uuid) -> Vec<(String, String, String)> {
-        crate::db::env_vars::list_deployment_env_vars(pool, deployment_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|v| (v.key, v.value, v.source))
-            .collect()
-    }
-
-    async fn seed_source_vars(pool: &PgPool, source: Uuid) {
-        for (key, value, src) in [
-            ("FROM_TOML", "t", "toml"),
-            ("STAGING_ONLY", "s", "toml:staging"),
-            ("PROD_TOML", "p", "toml:production"),
-            ("FROM_CLI", "c", "cli"),
-            ("GLOBAL_VAR", "old", "global"),
-            ("EXT_VAR", "stale", "extension"),
-            ("PORT", "80", "system"),
+    #[sqlx::test]
+    async fn promotion_recomputes_variables_for_the_target_in_one_transaction(pool: PgPool) {
+        let fx = Fixture::new(pool).await;
+        let source = fx.deploy(&fx.staging, "d-stg", Some(7), true).await;
+        fx.seed_source_vars(source.id).await;
+        for (key, value, env) in [
+            ("GLOBAL_VAR", "new", None),
+            ("PROD_ONLY", "yes", Some(fx.production.id)),
         ] {
-            crate::db::env_vars::upsert_deployment_env_var(
-                pool, source, key, value, false, false, src,
+            crate::db::env_vars::upsert_project_env_var(
+                &fx.pool,
+                fx.project.id,
+                key,
+                value,
+                false,
+                false,
+                env,
             )
             .await
             .unwrap();
         }
-    }
-
-    #[sqlx::test]
-    async fn promotion_recomputes_variables_for_the_target_in_one_transaction(pool: PgPool) {
-        let (project_id, user_id, staging, production) = seed(&pool).await;
-        let project = projects::find_by_id(&pool, project_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let source =
-            seed_deployment(&pool, project_id, user_id, &staging, "d-stg", Some(7), true).await;
-        seed_source_vars(&pool, source.id).await;
-        crate::db::env_vars::upsert_project_env_var(
-            &pool,
-            project_id,
-            "GLOBAL_VAR",
-            "new",
-            false,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        crate::db::env_vars::upsert_project_env_var(
-            &pool,
-            project_id,
-            "PROD_ONLY",
-            "yes",
-            false,
-            false,
-            Some(production.id),
-        )
-        .await
-        .unwrap();
 
         let created = create_from_source_in(
-            &pool,
-            request(
-                &project,
+            &fx.pool,
+            fx.request(
                 &source,
-                &production,
+                &fx.production,
                 "d-prod",
                 CreatedVia::Promote,
                 EnvMode::ProjectCurrent,
@@ -2012,45 +1874,38 @@ mod tests {
         assert_eq!(created.status, DeploymentStatus::Pushed);
         assert_eq!(created.created_via, CreatedVia::Promote);
         assert_eq!(created.promoted_from_deployment_id, Some(source.id));
-        assert_eq!(created.promoted_from_environment_id, Some(staging.id));
+        assert_eq!(created.promoted_from_environment_id, Some(fx.staging.id));
         assert_eq!(created.rolled_back_from_deployment_id, Some(source.id));
         assert_eq!(created.migration_version, Some(7));
-        assert_eq!(created.environment_id, production.id);
+        assert_eq!(created.environment_id, fx.production.id);
 
-        let vars = vars_of(&pool, created.id).await;
-        let get = |k: &str| {
-            vars.iter()
-                .find(|(key, _, _)| key == k)
-                .map(|(_, v, s)| (v.as_str(), s.as_str()))
-        };
-        assert_eq!(get("GLOBAL_VAR"), Some(("new", "global")));
-        assert_eq!(get("PROD_ONLY"), Some(("yes", "env:production")));
-        assert_eq!(get("FROM_TOML"), Some(("t", "toml")));
-        assert_eq!(get("PROD_TOML"), Some(("p", "toml:production")));
-        assert_eq!(get("STAGING_ONLY"), None);
-        assert_eq!(get("FROM_CLI"), Some(("override", "cli")));
-        assert_eq!(get("EXT_VAR"), Some(("fresh", "extension")));
-        assert_eq!(get("PORT"), Some(("9090", "system")));
-        assert_eq!(get("RISE_ENVIRONMENT"), Some(("production", "system")));
+        // Staging-scoped and stale extension/system variables do not travel.
+        assert_eq!(
+            fx.vars(created.id).await,
+            expected_vars(&[
+                ("GLOBAL_VAR", "new", "global"),
+                ("PROD_ONLY", "yes", "env:production"),
+                ("FROM_TOML", "t", "toml"),
+                ("PROD_TOML", "p", "toml:production"),
+                ("FROM_CLI", "override", "cli"),
+                ("EXT_VAR", "fresh", "extension"),
+                ("PORT", "9090", "system"),
+                ("RISE_ENVIRONMENT", "production", "system"),
+            ])
+        );
     }
 
     #[sqlx::test]
     async fn source_snapshot_skips_system_and_extension_variables(pool: PgPool) {
-        let (project_id, user_id, staging, _production) = seed(&pool).await;
-        let project = projects::find_by_id(&pool, project_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let source =
-            seed_deployment(&pool, project_id, user_id, &staging, "d-stg", None, true).await;
-        seed_source_vars(&pool, source.id).await;
+        let fx = Fixture::new(pool).await;
+        let source = fx.deploy(&fx.staging, "d-stg", None, true).await;
+        fx.seed_source_vars(source.id).await;
 
         let created = create_from_source_in(
-            &pool,
-            request(
-                &project,
+            &fx.pool,
+            fx.request(
                 &source,
-                &staging,
+                &fx.staging,
                 "d-stg-2",
                 CreatedVia::Redeploy,
                 EnvMode::SourceSnapshot,
@@ -2065,85 +1920,61 @@ mod tests {
         assert_eq!(created.created_via, CreatedVia::Redeploy);
         assert_eq!(created.promoted_from_deployment_id, None);
 
-        let vars = vars_of(&pool, created.id).await;
-        let get = |k: &str| {
-            vars.iter()
-                .find(|(key, _, _)| key == k)
-                .map(|(_, v, s)| (v.as_str(), s.as_str()))
-        };
-        assert_eq!(get("GLOBAL_VAR"), Some(("old", "global")));
-        assert_eq!(get("STAGING_ONLY"), Some(("s", "toml:staging")));
-        assert_eq!(get("EXT_VAR"), Some(("fresh", "extension")));
-        assert_eq!(get("PORT"), Some(("9090", "system")));
-    }
-
-    #[sqlx::test]
-    async fn a_failure_after_the_insert_leaves_no_deployment(pool: PgPool) {
-        let (project_id, user_id, staging, _production) = seed(&pool).await;
-        let project = projects::find_by_id(&pool, project_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let source =
-            seed_deployment(&pool, project_id, user_id, &staging, "d-stg", None, true).await;
-
-        let err = create_from_source_in(
-            &pool,
-            request(
-                &project,
-                &source,
-                &staging,
-                "d-stg-2",
-                CreatedVia::Redeploy,
-                EnvMode::ProjectCurrent,
-            ),
-            vec![],
-            vec![],
-            |_| async { Err(ServerError::internal("URLs unavailable")) },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.message, "URLs unavailable");
-        assert!(
-            deployments::find_by_project_and_deployment_id(&pool, project_id, "d-stg-2")
-                .await
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            fx.vars(created.id).await,
+            expected_vars(&[
+                ("FROM_TOML", "t", "toml"),
+                ("STAGING_ONLY", "s", "toml:staging"),
+                ("PROD_TOML", "p", "toml:production"),
+                ("FROM_CLI", "c", "cli"),
+                ("GLOBAL_VAR", "old", "global"),
+                ("EXT_VAR", "fresh", "extension"),
+                ("PORT", "9090", "system"),
+            ])
         );
     }
 
     #[sqlx::test]
-    async fn guard_lock_on_a_subject_that_does_not_qualify_creates_nothing(pool: PgPool) {
-        let (project_id, user_id, staging, _production) = seed(&pool).await;
-        let project = projects::find_by_id(&pool, project_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let last_known_good =
-            seed_deployment(&pool, project_id, user_id, &staging, "d-lkg", None, true).await;
-        // Not Unhealthy: the lock's re-check fails.
-        let subject =
-            seed_deployment(&pool, project_id, user_id, &staging, "d-sick", None, true).await;
+    async fn a_failure_after_the_insert_leaves_no_deployment(pool: PgPool) {
+        let fx = Fixture::new(pool).await;
+        let source = fx.deploy(&fx.staging, "d-stg", None, true).await;
+        let req = fx.request(
+            &source,
+            &fx.staging,
+            "d-stg-2",
+            CreatedVia::Redeploy,
+            EnvMode::ProjectCurrent,
+        );
+        let err = create_from_source_in(&fx.pool, req, vec![], vec![], |_| async {
+            Err(ServerError::internal("URLs unavailable"))
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.message, "URLs unavailable");
+        assert!(!fx.exists("d-stg-2").await);
+    }
 
-        let mut req = request(
-            &project,
+    #[sqlx::test]
+    async fn guard_lock_on_a_subject_that_does_not_qualify_creates_nothing(pool: PgPool) {
+        let fx = Fixture::new(pool).await;
+        let last_known_good = fx.deploy(&fx.staging, "d-lkg", None, true).await;
+        // Not Unhealthy: the lock's re-check fails.
+        let subject = fx.deploy(&fx.staging, "d-sick", None, true).await;
+
+        let mut req = fx.request(
             &last_known_good,
-            &staging,
+            &fx.staging,
             "d-guard",
             CreatedVia::RollbackGuard,
             EnvMode::SourceSnapshot,
         );
         req.rollback_guard_for = Some(subject.id);
         req.guard_lock = Some(60);
-        let created = create_from_source_in(&pool, req, vec![], vec![], |_| async { Ok(vec![]) })
-            .await
-            .unwrap();
-        assert!(created.is_none());
-        assert!(
-            deployments::find_by_project_and_deployment_id(&pool, project_id, "d-guard")
+        let created =
+            create_from_source_in(&fx.pool, req, vec![], vec![], |_| async { Ok(vec![]) })
                 .await
-                .unwrap()
-                .is_none()
-        );
+                .unwrap();
+        assert!(created.is_none());
+        assert!(!fx.exists("d-guard").await);
     }
 }

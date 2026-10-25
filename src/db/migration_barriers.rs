@@ -1,10 +1,8 @@
 //! Migration compatibility barriers (ADR-0007).
 //!
-//! A barrier records that the migrations shipped with `version` break code
-//! older than it: no deployment with a lower `migration_version` may replace
-//! one at or above it. The ledger is append-only (a trigger refuses updates)
-//! because a barrier can only restrict rollbacks, so recording one never
-//! needs undoing.
+//! A barrier records that the migrations shipped with `version` break older
+//! code: no deployment with a lower `migration_version` may replace one at or
+//! above it. The ledger is append-only (a trigger refuses updates).
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -74,25 +72,7 @@ pub fn is_duplicate(err: &anyhow::Error) -> bool {
 
 /// Every barrier of a project, by ascending version.
 pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<MigrationBarrier>> {
-    let barriers = sqlx::query_as!(
-        MigrationBarrier,
-        r#"
-        SELECT
-            b.id, b.project_id, b.version, b.reason,
-            u.email AS "recorded_by_email?",
-            b.recorded_at
-        FROM migration_barriers b
-        LEFT JOIN users u ON u.id = b.recorded_by_id
-        WHERE b.project_id = $1
-        ORDER BY b.version ASC
-        "#,
-        project_id
-    )
-    .fetch_all(pool)
-    .await
-    .context("Failed to list migration barriers")?;
-
-    Ok(barriers)
+    list_crossed(pool, project_id, 0, i64::MAX).await
 }
 
 /// The barriers a move from `high_inclusive` down to `low_exclusive` crosses:
@@ -123,7 +103,7 @@ pub async fn list_crossed(
     )
     .fetch_all(pool)
     .await
-    .context("Failed to list crossed migration barriers")?;
+    .context("Failed to list migration barriers")?;
 
     Ok(barriers)
 }
@@ -167,10 +147,15 @@ mod tests {
     #[sqlx::test]
     async fn create_and_list_in_version_order(pool: PgPool) {
         let (project_id, user_id) = seed(&pool).await;
+        assert!(!project_has_any(&pool, project_id).await.unwrap());
+        assert!(list_for_project(&pool, project_id)
+            .await
+            .unwrap()
+            .is_empty());
+
         let five = create(&pool, project_id, 5, "drops column a", Some(user_id))
             .await
             .unwrap();
-        assert_eq!(five.version, 5);
         assert_eq!(
             five.recorded_by_email.as_deref(),
             Some("barriers@example.com")
@@ -188,37 +173,19 @@ mod tests {
         assert!(project_has_any(&pool, project_id).await.unwrap());
     }
 
+    /// Duplicates are detected, and the trigger refuses updates.
     #[sqlx::test]
-    async fn project_without_barriers_has_none(pool: PgPool) {
-        let (project_id, _) = seed(&pool).await;
-        assert!(!project_has_any(&pool, project_id).await.unwrap());
-        assert!(list_for_project(&pool, project_id)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[sqlx::test]
-    async fn duplicate_version_is_detected(pool: PgPool) {
+    async fn duplicates_and_updates_are_refused(pool: PgPool) {
         let (project_id, user_id) = seed(&pool).await;
-        create(&pool, project_id, 3, "first", Some(user_id))
+        let barrier = create(&pool, project_id, 3, "first", Some(user_id))
             .await
             .unwrap();
         let err = create(&pool, project_id, 3, "second", Some(user_id))
             .await
             .unwrap_err();
         assert!(is_duplicate(&err), "{err:?}");
+        assert!(!is_duplicate(&anyhow::anyhow!("something else")));
 
-        let other = anyhow::anyhow!("something else");
-        assert!(!is_duplicate(&other));
-    }
-
-    #[sqlx::test]
-    async fn updates_are_rejected_by_the_trigger(pool: PgPool) {
-        let (project_id, user_id) = seed(&pool).await;
-        let barrier = create(&pool, project_id, 3, "first", Some(user_id))
-            .await
-            .unwrap();
         let err = sqlx::query("UPDATE migration_barriers SET reason = 'changed' WHERE id = $1")
             .bind(barrier.id)
             .execute(&pool)
@@ -233,27 +200,19 @@ mod tests {
         for v in [2, 4, 6] {
             create(&pool, project_id, v, "barrier", None).await.unwrap();
         }
-        let versions = |bs: Vec<MigrationBarrier>| bs.iter().map(|b| b.version).collect::<Vec<_>>();
-
-        // (2, 6]: the lower bound is excluded, the upper included.
-        assert_eq!(
-            versions(list_crossed(&pool, project_id, 2, 6).await.unwrap()),
-            vec![4, 6]
-        );
-        // (1, 4]
-        assert_eq!(
-            versions(list_crossed(&pool, project_id, 1, 4).await.unwrap()),
-            vec![2, 4]
-        );
-        // (4, 5]: nothing in between.
-        assert!(list_crossed(&pool, project_id, 4, 5)
-            .await
-            .unwrap()
-            .is_empty());
-        // Equal bounds cross nothing.
-        assert!(list_crossed(&pool, project_id, 6, 6)
-            .await
-            .unwrap()
-            .is_empty());
+        // (low, high]: the lower bound is excluded, the upper included.
+        for (low, high, expected) in [
+            (2, 6, vec![4, 6]),
+            (1, 4, vec![2, 4]),
+            (4, 5, vec![]),
+            (6, 6, vec![]),
+        ] {
+            let crossed = list_crossed(&pool, project_id, low, high).await.unwrap();
+            assert_eq!(
+                crossed.iter().map(|b| b.version).collect::<Vec<_>>(),
+                expected,
+                "({low}, {high}]"
+            );
+        }
     }
 }

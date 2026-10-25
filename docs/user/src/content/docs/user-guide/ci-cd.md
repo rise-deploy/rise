@@ -93,26 +93,9 @@ promote-production:
     - rise promote "$(jq -r .deployment_id deployment.json)" -E production --yes
 ```
 
-`--yes` is required in CI: without a terminal, `rise promote` refuses to wait for confirmation. It still prints the plan (pinned image, resource changes, variable changes) to the job log. The promoting job runs as a service account that may deploy to `production`.
+`--yes` is required in CI: without a terminal, `rise promote` refuses to wait for confirmation. It still prints the plan (pinned image, resource and variable changes) to the job log. The promoting job's service account must be allowed to deploy to `production`.
 
-Once every production deployment goes through promotion, an administrator can enforce it:
-
-```bash
-rise environment update production --promote-from staging
-```
-
-Afterwards, a direct `rise deploy -E production` (a fresh build or `--image`) fails:
-
-```json
-HTTP 403
-{
-  "error": "Environment 'production' only accepts deployments promoted from 'staging'. Promote a staging deployment: rise promote <deployment-id> -E production",
-  "error_code": "promotion_source_required",
-  "details": { "environment": "production", "promotion_source_environment": "staging" }
-}
-```
-
-The CLI exits with status 1 and prints the hint. Redeploys and rollbacks of what's already in production keep working.
+Once every production deployment goes through promotion, an administrator can enforce it with `rise environment update production --promote-from staging`. A direct `rise deploy -E production` (a fresh build or `--image`) then fails with `403` (`error_code: "promotion_source_required"`), and the CLI exits with status 1 and prints the `rise promote` hint. Redeploys and rollbacks of what's already in production keep working.
 
 If the project records [migration barriers](../deployments#migration-compatibility-barriers), a promotion or rollback that would move production back across one fails with `409` (`error_code: "migration_barrier"`). Only add `--force` to a pipeline step deliberately — usually after restoring a matching database snapshot.
 

@@ -186,8 +186,7 @@ interface EnvForm {
     max_cpu: string;
     min_memory: string;
     max_memory: string;
-    /** Empty: any environment (no promotion gate). */
-    promotion_source_environment: string;
+    promotion_source_environment: string; // '' = any environment
     rollback_guard_enabled: boolean;
     rollback_guard_timeout_seconds: string;
 }
@@ -307,14 +306,13 @@ export function EnvironmentsSection() {
                     if (formData.promotion_source_environment !== (editingEnv.promotion_source_environment ?? '')) {
                         updates.promotion_source_environment = formData.promotion_source_environment || null;
                     }
+                    const was = editingEnv.rollback_guard;
+                    const enabled = formData.rollback_guard_enabled;
                     const timeout = parseInt(formData.rollback_guard_timeout_seconds, 10);
-                    const guard: { enabled?: boolean; unhealthy_timeout_seconds?: number } = {};
-                    if (formData.rollback_guard_enabled !== (editingEnv.rollback_guard?.enabled ?? false)) {
-                        guard.enabled = formData.rollback_guard_enabled;
-                    }
-                    if (Number.isFinite(timeout) && timeout !== (editingEnv.rollback_guard?.unhealthy_timeout_seconds ?? DEFAULT_GUARD_TIMEOUT_SECONDS)) {
-                        guard.unhealthy_timeout_seconds = timeout;
-                    }
+                    const guard = {
+                        ...(enabled !== (was?.enabled ?? false) && { enabled }),
+                        ...(Number.isFinite(timeout) && timeout !== (was?.unhealthy_timeout_seconds ?? DEFAULT_GUARD_TIMEOUT_SECONDS) && { unhealthy_timeout_seconds: timeout }),
+                    };
                     if (Object.keys(guard).length > 0) updates.rollback_guard = guard;
                 }
                 await api.updateEnvironment(projectName, editingEnv.name, updates);

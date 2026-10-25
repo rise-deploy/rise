@@ -2122,29 +2122,28 @@
       "type": "object"
     },
     "RollbackGuardSettings": {
-      "description": "Operator settings for the Rollback Guard controller.\n\nThe guard only acts in environments that enabled it (an environment's\n`rollback_guard.enabled`, admin-set); `enabled: false` here stops it\nplatform-wide regardless.",
+      "description": "Operator settings for the Rollback Guard controller. `enabled: false` is a\nplatform-wide kill switch, whatever an environment's own setting.",
       "properties": {
         "enabled": {
           "default": true,
-          "description": "Run the controller. An operator kill switch: when off, no environment\nis guarded, whatever its own setting.",
           "type": "boolean"
         },
         "fleet_unhealthy_min_count": {
           "default": 3,
-          "description": "Minimum number of `Unhealthy` active deployments before the fleet\ncircuit breaker considers the ratio at all.",
+          "description": "See `fleet_unhealthy_ratio`.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "fleet_unhealthy_ratio": {
           "default": 0.5,
-          "description": "Fleet circuit breaker: when at least `fleet_unhealthy_min_count` active\ndeployments are `Unhealthy` and they make up at least this fraction of\nthe active Healthy/Unhealthy ones, the problem is taken to be the\nplatform's (e.g. a Traefik API outage), and the guard declines every\ntrigger (`platform_wide_unhealthy`). In `(0, 1]`.",
+          "description": "Fleet circuit breaker: when at least `fleet_unhealthy_min_count` active\ndeployments are `Unhealthy` and make up at least this fraction (in\n`(0, 1]`) of the active Healthy/Unhealthy ones, the cause is taken to be\nthe platform's (e.g. a Traefik API outage) and every trigger is declined\n(`platform_wide_unhealthy`).",
           "format": "double",
           "type": "number"
         },
         "max_in_flight": {
           "default": 3,
-          "description": "Most Rollback Guard replacements on their way up at once, across the\nplatform. Further triggers are declined (`in_flight_limit`) until one\nsettles.",
+          "description": "Most replacements on their way up at once, platform-wide. Further\ntriggers are declined (`in_flight_limit`) until one settles.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -2591,7 +2590,7 @@
         "max_in_flight": 3,
         "poll_interval_seconds": 10
       },
-      "description": "The Rollback Guard controller (ADR-0007): replaces an environment's\nactive deployment that stays `Unhealthy` past the environment's timeout\nwith its last known good predecessor. Environments opt in individually;\nthis section is the operator-wide switch and its safety limits."
+      "description": "The Rollback Guard controller (ADR-0007): replaces an environment's\nactive deployment that stays `Unhealthy` past its timeout with its last\nknown good predecessor, in environments that opt in."
     },
     "server": {
       "$ref": "#/$defs/ServerSettings"

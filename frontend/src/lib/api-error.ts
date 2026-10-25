@@ -43,7 +43,7 @@ export async function apiErrorFromResponse(response: Response): Promise<ApiError
         if (body && typeof body.error === 'string') message = body.error;
         if (body && typeof body.error_code === 'string') code = body.error_code;
         if (body && Array.isArray(body.suggestions)) suggestions = body.suggestions.map(String);
-        if (body && body.details !== undefined && body.details !== null) details = body.details;
+        if (body?.details != null) details = body.details;
     } catch {
         // Not JSON: keep the text.
     }

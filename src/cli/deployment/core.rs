@@ -773,14 +773,10 @@ pub(super) struct CreateDeploymentResponse {
     /// Absent for single-container responses; older backends omit it.
     #[serde(default)]
     container_images: Option<std::collections::BTreeMap<String, String>>,
-    /// Things to tell the caller: a bypassed promotion gate, a forced
-    /// migration barrier, an undeclared migration version.
     #[serde(default)]
     warnings: Vec<String>,
-    /// Inherited resource values the server changed to fit the target.
     #[serde(default)]
     adjustments: Vec<super::promote::ResourceAdjustment>,
-    /// The digest-pinned image a promotion runs.
     #[serde(default)]
     pinned_image: Option<String>,
 }
@@ -1043,15 +1039,17 @@ async fn fetch_backend_platform_hint(
 }
 
 /// A runtime environment variable override for a deployment
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EnvOverride {
     pub key: String,
     pub value: String,
     pub is_secret: bool,
     pub is_protected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// Target environment name. When set, the server only applies this override
     /// if the resolved deployment environment matches. `None` means global.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub for_environment: Option<String>,
 }
 
@@ -1095,10 +1093,6 @@ pub struct DeploymentOptions<'a> {
     pub json_output: bool,
     /// Write the completed deployment JSON to this file.
     pub status_file: Option<String>,
-    /// `[project].migration_version` from rise.toml. Sent for fresh builds and
-    /// `--image` deployments only; a deployment created from another one
-    /// inherits the source's.
-    pub migration_version: Option<u64>,
     /// Deploy even if the deployment crosses a recorded migration barrier.
     pub force: bool,
 }
@@ -1226,14 +1220,25 @@ pub async fn create_deployment(
             .toml_config
             .as_ref()
             .and_then(|c| c.identity.as_ref())
-            .map(|i| &i.audiences),
+            .map(|i| &i.audiences)
+            .filter(|a| !a.is_empty()),
         containers: containers_payload.as_deref(),
         routes: &routes_payload,
-        migration_version: deploy_opts.migration_version,
+        migration_version: deploy_opts
+            .toml_config
+            .as_ref()
+            .and_then(|c| c.project.as_ref())
+            .and_then(|p| p.migration_version),
         force_migration_barrier: deploy_opts.force,
     };
-    let deployment_info =
-        call_create_deployment_api(http_client, backend_url, &token, &payload).await?;
+    let deployment_info = call_create_deployment_api(
+        http_client,
+        backend_url,
+        &token,
+        &payload,
+        "Failed to create deployment",
+    )
+    .await?;
     report_create_response(&deployment_info, deploy_opts.json_output);
 
     info!("Deployment ID: {}", deployment_info.deployment_id);
@@ -2152,131 +2157,73 @@ fn normalize_git_url(raw: &str) -> Option<String> {
 
 /// Body of `POST /api/v1/deployments`. Optional fields are omitted when unset
 /// so an older server sees the request shape it knows.
-#[derive(Default)]
+#[derive(Default, Serialize)]
 pub(super) struct CreateDeploymentPayload<'a> {
     pub project: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub environment: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in: Option<&'a str>,
+    /// If not provided, the server resolves the port from the project's PORT
+    /// env var, the source deployment, or its default (8080).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub http_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub from_deployment: Option<&'a str>,
+    /// Sent only with `from_deployment`.
     pub use_source_env_vars: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub push_image: bool,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub env_overrides: &'a [EnvOverride],
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub job_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub git_repository_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub replicas: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<&'a str>,
+    /// `[identity]` audiences; `None` when there are none.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_audiences: Option<&'a std::collections::BTreeMap<String, String>>,
+    /// ContainerSpec/RouteSpec carry the same serde skip/default rules as the
+    /// server's structs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub containers: Option<&'a [ContainerSpec]>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub routes: &'a [RouteSpec],
-    /// `[project].migration_version` of the code being deployed. Ignored for a
-    /// deployment created from another one, which inherits the source's.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub migration_version: Option<u64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub force_migration_barrier: bool,
 }
 
 impl CreateDeploymentPayload<'_> {
     pub(super) fn to_json(&self) -> Result<serde_json::Value> {
-        let mut payload = serde_json::json!({
-            "project": self.project,
-        });
-
-        // If not provided, the server resolves the port from the project's
-        // PORT env var, the source deployment, or its default (8080).
-        if let Some(port) = self.http_port {
-            payload["http_port"] = serde_json::json!(port);
-        }
-        if let Some(image_ref) = self.image {
-            payload["image"] = serde_json::json!(image_ref);
-        }
-        if let Some(group_name) = self.group {
-            payload["group"] = serde_json::json!(group_name);
-        }
-        if let Some(env_name) = self.environment {
-            payload["environment"] = serde_json::json!(env_name);
-        }
-        if let Some(expiration) = self.expires_in {
-            payload["expires_in"] = serde_json::json!(expiration);
-        }
-        if let Some(source_deployment_id) = self.from_deployment {
-            payload["from_deployment"] = serde_json::json!(source_deployment_id);
-            payload["use_source_env_vars"] = serde_json::json!(self.use_source_env_vars);
-        }
-        if self.push_image {
-            payload["push_image"] = serde_json::json!(true);
-        }
-        if let Some(url) = self.job_url {
-            payload["job_url"] = serde_json::json!(url);
-        }
-        if let Some(url) = self.pull_request_url {
-            payload["pull_request_url"] = serde_json::json!(url);
-        }
-        if let Some(url) = self.git_repository_url {
-            payload["git_repository_url"] = serde_json::json!(url);
-        }
-        if let Some(r) = self.replicas {
-            payload["replicas"] = serde_json::json!(r);
-        }
-        if let Some(c) = self.cpu {
-            payload["cpu"] = serde_json::json!(c);
-        }
-        if let Some(m) = self.memory {
-            payload["memory"] = serde_json::json!(m);
-        }
-        if let Some(audiences) = self.identity_audiences {
-            if !audiences.is_empty() {
-                payload["identity_audiences"] = serde_json::json!(audiences);
+        let mut payload = serde_json::to_value(self)?;
+        let fields = payload
+            .as_object_mut()
+            .context("deployment payload is not an object")?;
+        if self.from_deployment.is_some() {
+            // A deployment created from another one runs the source's images
+            // and inherits its migration version: the local rise.toml's
+            // containers, routes and version describe code that is not being
+            // deployed.
+            for key in ["containers", "routes", "migration_version"] {
+                fields.remove(key);
             }
+        } else {
+            fields.remove("use_source_env_vars");
         }
-        if self.force_migration_barrier {
-            payload["force_migration_barrier"] = serde_json::json!(true);
-        }
-
-        if !self.env_overrides.is_empty() {
-            let overrides: Vec<serde_json::Value> = self
-                .env_overrides
-                .iter()
-                .map(|o| {
-                    let mut v = serde_json::json!({
-                        "key": o.key,
-                        "value": o.value,
-                        "is_secret": o.is_secret,
-                        "is_protected": o.is_protected,
-                    });
-                    if let Some(ref source) = o.source {
-                        v["source"] = serde_json::json!(source);
-                    }
-                    if let Some(ref env) = o.for_environment {
-                        v["for_environment"] = serde_json::json!(env);
-                    }
-                    v
-                })
-                .collect();
-            payload["env_overrides"] = serde_json::json!(overrides);
-        }
-
-        // A deployment created from another one runs the source's images and
-        // inherits its migration version: the local rise.toml's containers,
-        // routes and version describe code that is not being deployed.
-        if self.from_deployment.is_none() {
-            if let Some(version) = self.migration_version {
-                payload["migration_version"] = serde_json::json!(version);
-            }
-            // ContainerSpec/RouteSpec carry the same serde skip/default rules as
-            // the server's structs. Omit when absent/empty to match the
-            // single-container request shape.
-            if let Some(c) = self.containers {
-                payload["containers"] = serde_json::to_value(c)?;
-            }
-            if !self.routes.is_empty() {
-                payload["routes"] = serde_json::to_value(self.routes)?;
-            }
-        }
-
         Ok(payload)
     }
 }
@@ -2285,7 +2232,7 @@ impl CreateDeploymentPayload<'_> {
 /// terminal. A JSON error body yields its message, tagged with its
 /// `error_code`; a crossed migration barrier also lists the barriers and how
 /// to deploy anyway.
-pub(super) fn describe_api_error(body: &str) -> String {
+pub(crate) fn describe_api_error(body: &str) -> String {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
         return body.to_string();
     };
@@ -2298,14 +2245,11 @@ pub(super) fn describe_api_error(body: &str) -> String {
         None => message.to_string(),
     };
     if code == Some("migration_barrier") {
-        let barriers = json
-            .pointer("/details/barriers")
-            .and_then(|b| b.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for barrier in barriers {
+        let barriers = json.pointer("/details/barriers").and_then(|b| b.as_array());
+        // Parsed one by one so a single unexpected entry doesn't hide the rest.
+        for barrier in barriers.into_iter().flatten() {
             let barrier: super::promote::PlanBarrier =
-                serde_json::from_value(barrier).unwrap_or_default();
+                serde_json::from_value(barrier.clone()).unwrap_or_default();
             out.push_str(&format!("\n  {}", super::promote::format_barrier(&barrier)));
         }
         if !message.contains("--force") {
@@ -2315,19 +2259,18 @@ pub(super) fn describe_api_error(body: &str) -> String {
     out
 }
 
-async fn call_create_deployment_api(
+pub(super) async fn call_create_deployment_api(
     http_client: &Client,
     backend_url: &str,
     token: &str,
     payload: &CreateDeploymentPayload<'_>,
+    failure: &str,
 ) -> Result<CreateDeploymentResponse> {
     let url = format!("{}/api/v1/deployments", backend_url);
-    let body = payload.to_json()?;
-
     let response = http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .json(&body)
+        .json(&payload.to_json()?)
         .send_with_auth_hint(backend_url)
         .await
         .context("Failed to create deployment")?;
@@ -2338,44 +2281,37 @@ async fn call_create_deployment_api(
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        bail!(
-            "Failed to create deployment ({}): {}",
-            status,
-            describe_api_error(&error_text)
-        );
+        bail!("{failure} ({status}): {}", describe_api_error(&error_text));
     }
 
-    let deployment_info: CreateDeploymentResponse = response
+    response
         .json()
         .await
-        .context("Failed to parse deployment response")?;
+        .context("Failed to parse deployment response")
+}
 
-    Ok(deployment_info)
+/// Print a line to stdout, or to stderr when stdout carries JSON.
+pub(super) fn say(to_stderr: bool, line: &str) {
+    if to_stderr {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
 }
 
 /// Print what the server reported about a deployment it just created: its
 /// warnings (a bypassed promotion gate, a forced migration barrier, …), the
 /// resource values it changed to fit the target, and the pinned image.
 pub(super) fn report_create_response(response: &CreateDeploymentResponse, to_stderr: bool) {
-    let mut lines = Vec::new();
     if let Some(ref pinned) = response.pinned_image {
-        lines.push(format!("Image pinned to {}", pinned));
+        say(to_stderr, &format!("Image pinned to {pinned}"));
     }
     for adjustment in &response.adjustments {
-        lines.push(format!(
-            "Adjusted {}",
-            super::promote::format_adjustment(adjustment)
-        ));
+        let adjustment = super::promote::format_adjustment(adjustment);
+        say(to_stderr, &format!("Adjusted {adjustment}"));
     }
     for warning in &response.warnings {
-        lines.push(format!("Warning: {}", warning));
-    }
-    for line in lines {
-        if to_stderr {
-            eprintln!("{}", line);
-        } else {
-            println!("{}", line);
-        }
+        say(to_stderr, &format!("Warning: {warning}"));
     }
 }
 

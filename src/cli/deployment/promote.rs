@@ -7,12 +7,12 @@ use std::io::{BufRead as _, IsTerminal as _, Write as _};
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use tracing::{debug, info, warn};
 
 use super::core::{
-    describe_api_error, follow_created_deployment, report_create_response, CreateDeploymentPayload,
-    DeploymentOutputOptions, EnvOverride,
+    call_create_deployment_api, describe_api_error, follow_created_deployment,
+    report_create_response, say, CreateDeploymentPayload, DeploymentOutputOptions, EnvOverride,
 };
 use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
@@ -21,7 +21,7 @@ use crate::token_source::token_with_retry;
 /// What `GET /projects/{p}/deployments/{id}/plan` says creating a deployment
 /// from `{id}` into a target would do. Every field defaults so a server that
 /// adds fields, or leaves some out, still parses.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct CreateFromPlan {
     /// `redeploy` (same environment) or `promote` (another environment).
@@ -32,42 +32,34 @@ pub struct CreateFromPlan {
     pub gate: PlanGate,
     pub migration: PlanMigration,
     pub adjustments: Vec<ResourceAdjustment>,
-    pub use_source_env_vars_allowed: bool,
     pub warnings: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PlanSource {
     pub deployment_id: String,
     pub environment: String,
     pub status: String,
     pub image: Option<String>,
-    pub image_digest: Option<String>,
-    pub migration_version: Option<i64>,
-    pub git_revision: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PlanTarget {
     pub environment: String,
     pub group: String,
     pub current: Option<PlanCurrent>,
-    pub migration_high_water: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PlanCurrent {
     pub deployment_id: String,
     pub status: String,
-    pub image: Option<String>,
-    pub image_digest: Option<String>,
-    pub migration_version: Option<i64>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PlanGate {
     /// `allowed`, `admin_bypass` or `denied`.
@@ -75,7 +67,7 @@ pub struct PlanGate {
     pub promotion_source_environment: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PlanMigration {
     /// `ok`, `unknown` or `crossed`.
@@ -85,8 +77,7 @@ pub struct PlanMigration {
     pub barriers: Vec<PlanBarrier>,
 }
 
-/// A recorded migration barrier.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct PlanBarrier {
     pub version: i64,
@@ -96,7 +87,7 @@ pub struct PlanBarrier {
 }
 
 /// An inherited resource value changed to fit the target environment.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ResourceAdjustment {
     pub container: String,
@@ -108,14 +99,14 @@ pub struct ResourceAdjustment {
 
 /// `GET /projects/{p}/deployments/{id}/env/diff`: the source's variables
 /// against what a deployment created from it gets.
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct EnvVarDiff {
     pub environment: Option<String>,
     pub changes: Vec<EnvVarDiffEntry>,
 }
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct EnvVarDiffEntry {
     pub key: String,
@@ -131,234 +122,183 @@ pub struct EnvVarDiffEntry {
 
 /// One barrier as a line: `v5: drops column foo (recorded 2026-10-01 by a@b)`.
 pub(super) fn format_barrier(barrier: &PlanBarrier) -> String {
-    let mut line = format!("v{}: {}", barrier.version, barrier.reason);
     let date = barrier
         .recorded_at
         .get(..10)
-        .unwrap_or(barrier.recorded_at.as_str());
-    match (date.is_empty(), barrier.recorded_by.as_deref()) {
-        (false, Some(by)) => write!(line, " (recorded {} by {})", date, by),
-        (false, None) => write!(line, " (recorded {})", date),
-        (true, Some(by)) => write!(line, " (recorded by {})", by),
-        (true, None) => Ok(()),
-    }
-    .expect("writing to a String cannot fail");
-    line
+        .unwrap_or(&barrier.recorded_at);
+    let recorded = match (date, barrier.recorded_by.as_deref()) {
+        ("", None) => String::new(),
+        ("", Some(by)) => format!(" (recorded by {by})"),
+        (date, None) => format!(" (recorded {date})"),
+        (date, Some(by)) => format!(" (recorded {date} by {by})"),
+    };
+    format!("v{}: {}{recorded}", barrier.version, barrier.reason)
 }
 
 /// One adjustment as a line: `app replicas 1 → 2 (production requires ≥ 2)`.
-pub(super) fn format_adjustment(adjustment: &ResourceAdjustment) -> String {
-    let mut line = format!(
-        "{} {} {} → {}",
-        adjustment.container, adjustment.field, adjustment.from, adjustment.to
-    );
-    if !adjustment.reason.is_empty() {
-        write!(line, " ({})", adjustment.reason).expect("writing to a String cannot fail");
-    }
-    line
+pub(super) fn format_adjustment(a: &ResourceAdjustment) -> String {
+    let reason = if a.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", a.reason)
+    };
+    format!("{} {} {} → {}{reason}", a.container, a.field, a.from, a.to)
 }
 
 fn version_label(version: Option<i64>) -> String {
-    version
-        .map(|v| format!("v{}", v))
-        .unwrap_or_else(|| "undeclared".to_string())
+    version.map_or_else(|| "undeclared".to_string(), |v| format!("v{v}"))
 }
 
-fn format_migration(migration: &PlanMigration) -> Vec<String> {
-    let candidate = version_label(migration.candidate_version);
-    let mut lines = Vec::new();
-    match migration.status.as_str() {
-        "crossed" => {
-            lines.push(format!(
-                "{} → environment at {} (crosses {} migration barrier{})",
-                candidate,
-                version_label(migration.environment_version),
-                migration.barriers.len(),
-                if migration.barriers.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            ));
-            for barrier in &migration.barriers {
-                lines.push(format!("  {}", format_barrier(barrier)));
-            }
+fn format_migration(m: &PlanMigration) -> Vec<String> {
+    let candidate = version_label(m.candidate_version);
+    let env = version_label(m.environment_version);
+    let note = match (
+        m.status.as_str(),
+        m.candidate_version,
+        m.environment_version,
+    ) {
+        ("unknown", ..) => {
+            return vec![format!(
+                "{candidate} (environment at {env}; cannot check migration barriers)"
+            )]
         }
-        "unknown" => lines.push(format!(
-            "{} (environment at {}; cannot check migration barriers)",
-            candidate,
-            version_label(migration.environment_version)
-        )),
-        _ => {
-            let direction = match (migration.candidate_version, migration.environment_version) {
-                (Some(a), Some(b)) if a > b => "forward",
-                (Some(a), Some(b)) if a == b => "same version",
-                (Some(_), Some(_)) => "backward, no barrier crossed",
-                (_, None) => "environment has no recorded version",
-                (None, Some(_)) => "not declared",
-            };
-            lines.push(format!(
-                "{} → environment at {} ({})",
-                candidate,
-                version_label(migration.environment_version),
-                direction
-            ));
+        ("crossed", ..) => {
+            let n = m.barriers.len();
+            let mut lines = vec![format!(
+                "{candidate} → environment at {env} (crosses {n} migration barrier{})",
+                if n == 1 { "" } else { "s" }
+            )];
+            lines.extend(
+                m.barriers
+                    .iter()
+                    .map(|b| format!("  {}", format_barrier(b))),
+            );
+            return lines;
         }
-    }
-    lines
+        (_, Some(a), Some(b)) if a > b => "forward",
+        (_, Some(a), Some(b)) if a == b => "same version",
+        (_, Some(_), Some(_)) => "backward, no barrier crossed",
+        (_, _, None) => "environment has no recorded version",
+        (_, None, Some(_)) => "not declared",
+    };
+    vec![format!("{candidate} → environment at {env} ({note})")]
 }
 
-fn quoted(value: Option<&str>) -> String {
-    match value {
-        Some(v) => format!("{:?}", v),
-        None => "(hidden)".to_string(),
-    }
-}
-
-fn format_diff_entry(entry: &EnvVarDiffEntry) -> Option<String> {
-    let secret_kind = if entry.is_protected {
+fn format_diff_entry(e: &EnvVarDiffEntry) -> Option<String> {
+    let secret_kind = if e.is_protected {
         "protected value"
     } else {
         "secret value"
     };
-    let line = match entry.change.as_str() {
-        "added" => {
-            let value = if entry.is_secret {
-                format!("({})", secret_kind)
-            } else {
-                format!("= {}", quoted(entry.to.as_deref()))
-            };
-            format!(
-                "+ {:<16} {}  ({})",
-                entry.key,
-                value,
-                entry.to_source.as_deref().unwrap_or("-")
-            )
+    let quoted = |v: Option<&str>| v.map_or_else(|| "(hidden)".to_string(), |v| format!("{v:?}"));
+    let value = |v: Option<&String>| {
+        if e.is_secret {
+            format!("({secret_kind})")
+        } else {
+            format!("= {}", quoted(v.map(String::as_str)))
         }
-        "removed" => {
-            let value = if entry.is_secret {
-                format!("({})", secret_kind)
-            } else {
-                format!("= {}", quoted(entry.from.as_deref()))
-            };
-            format!(
-                "- {:<16} {}  ({})",
-                entry.key,
-                value,
-                entry.from_source.as_deref().unwrap_or("-")
-            )
-        }
+    };
+    let source = |s: &Option<String>| s.as_deref().unwrap_or("-").to_string();
+    Some(match e.change.as_str() {
+        "added" => format!(
+            "+ {:<16} {}  ({})",
+            e.key,
+            value(e.to.as_ref()),
+            source(&e.to_source)
+        ),
+        "removed" => format!(
+            "- {:<16} {}  ({})",
+            e.key,
+            value(e.from.as_ref()),
+            source(&e.from_source)
+        ),
         "changed" => {
-            let value = if entry.is_secret {
-                format!("{} changed", secret_kind)
+            let value = if e.is_secret {
+                format!("{secret_kind} changed")
             } else {
                 format!(
                     "{} → {}",
-                    quoted(entry.from.as_deref()),
-                    quoted(entry.to.as_deref())
+                    quoted(e.from.as_deref()),
+                    quoted(e.to.as_deref())
                 )
             };
-            let sources = match (entry.from_source.as_deref(), entry.to_source.as_deref()) {
-                (Some(a), Some(b)) if a != b => format!("  ({} → {})", a, b),
-                (_, Some(b)) => format!("  ({})", b),
-                (Some(a), None) => format!("  ({})", a),
+            let sources = match (e.from_source.as_deref(), e.to_source.as_deref()) {
+                (Some(a), Some(b)) if a != b => format!("  ({a} → {b})"),
+                (_, Some(s)) | (Some(s), None) => format!("  ({s})"),
                 (None, None) => String::new(),
             };
-            format!("~ {:<16} {}{}", entry.key, value, sources)
+            format!("~ {:<16} {value}{sources}", e.key)
         }
-        "unknown" => format!("? {:<16} {} not comparable", entry.key, secret_kind),
+        "unknown" => format!("? {:<16} {secret_kind} not comparable", e.key),
         _ => return None,
-    };
-    Some(line)
+    })
 }
 
 /// Render a plan and the variable changes it brings as the terminal shows them.
 pub fn format_plan(plan: &CreateFromPlan, diff: Option<&EnvVarDiff>) -> String {
-    let mut out = String::new();
     let verb = if plan.kind == "promote" {
         "Promoting"
     } else {
         "Redeploying"
     };
-    let mut head = format!("{} {}", verb, plan.source.deployment_id);
-    let mut about: Vec<&str> = Vec::new();
-    if !plan.source.environment.is_empty() {
-        about.push(&plan.source.environment);
-    }
-    if !plan.source.status.is_empty() {
-        about.push(&plan.source.status);
-    }
+    let mut out = format!("{verb} {}", plan.source.deployment_id);
+    let about: Vec<&str> = [&plan.source.environment, &plan.source.status]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .map(String::as_str)
+        .collect();
     if !about.is_empty() {
-        write!(head, " ({})", about.join(", ")).expect("writing to a String cannot fail");
+        let _ = write!(out, " ({})", about.join(", "));
     }
     if !plan.target.environment.is_empty() {
-        write!(head, " → {}", plan.target.environment).expect("writing to a String cannot fail");
+        let _ = write!(out, " → {}", plan.target.environment);
     }
     if !plan.target.group.is_empty() {
-        write!(head, " [group {}]", plan.target.group).expect("writing to a String cannot fail");
+        let _ = write!(out, " [group {}]", plan.target.group);
     }
-    out.push_str(&head);
     out.push('\n');
 
     let mut field = |label: &str, value: &str| {
         let label = if label.is_empty() {
             String::new()
         } else {
-            format!("{}:", label)
+            format!("{label}:")
         };
-        out.push_str(&format!("  {:<11} {}\n", label, value));
+        let _ = writeln!(out, "  {label:<11} {value}");
     };
-
     match (&plan.pinned_image, &plan.source.image) {
-        (Some(pinned), _) => field("Image", &format!("{}  (pinned)", pinned)),
+        (Some(pinned), _) => field("Image", &format!("{pinned}  (pinned)")),
         (None, Some(image)) => field("Image", image),
         (None, None) => {}
     }
     match &plan.target.current {
-        Some(current) => field(
-            "Replacing",
-            &format!("{} ({})", current.deployment_id, current.status),
-        ),
+        Some(c) => field("Replacing", &format!("{} ({})", c.deployment_id, c.status)),
         None => field("Replacing", "nothing (no active deployment)"),
     }
-    match plan.gate.decision.as_str() {
-        "denied" => field(
+    let required = plan.gate.promotion_source_environment.as_deref();
+    let decision = match plan.gate.decision.as_str() {
+        "denied" => Some("DENIED"),
+        "admin_bypass" => Some("administrator bypass"),
+        _ => None,
+    };
+    match (decision, required) {
+        (Some(decision), _) => field(
             "Gate",
             &format!(
-                "DENIED: {} only accepts deployments promoted from '{}'",
+                "{decision}: {} only accepts deployments promoted from '{}'",
                 plan.target.environment,
-                plan.gate
-                    .promotion_source_environment
-                    .as_deref()
-                    .unwrap_or("?")
+                required.unwrap_or("?")
             ),
         ),
-        "admin_bypass" => field(
-            "Gate",
-            &format!(
-                "administrator bypass: {} only accepts deployments promoted from '{}'",
-                plan.target.environment,
-                plan.gate
-                    .promotion_source_environment
-                    .as_deref()
-                    .unwrap_or("?")
-            ),
-        ),
-        _ => {
-            if let Some(ref from) = plan.gate.promotion_source_environment {
-                field("Gate", &format!("allowed (promotes from {})", from));
-            }
-        }
+        (None, Some(from)) => field("Gate", &format!("allowed (promotes from {from})")),
+        (None, None) => {}
     }
-    let migration = format_migration(&plan.migration);
-    for (i, line) in migration.iter().enumerate() {
+    for (i, line) in format_migration(&plan.migration).iter().enumerate() {
         field(if i == 0 { "Migration" } else { "" }, line);
     }
     for (i, adjustment) in plan.adjustments.iter().enumerate() {
-        field(
-            if i == 0 { "Resources" } else { "" },
-            &format_adjustment(adjustment),
-        );
+        let label = if i == 0 { "Resources" } else { "" };
+        field(label, &format_adjustment(adjustment));
     }
     for warning in &plan.warnings {
         field("Warning", warning);
@@ -368,138 +308,64 @@ pub fn format_plan(plan: &CreateFromPlan, diff: Option<&EnvVarDiff>) -> String {
         let target = diff
             .environment
             .as_deref()
-            .unwrap_or(plan.target.environment.as_str());
-        out.push_str(&format!(
-            "  Variables ({} now vs. {}):\n",
-            plan.source.deployment_id,
-            if target.is_empty() {
-                "the new deployment".to_string()
-            } else {
-                format!("the new deployment in {}", target)
-            }
-        ));
+            .unwrap_or(&plan.target.environment);
+        let into = if target.is_empty() {
+            String::new()
+        } else {
+            format!(" in {target}")
+        };
+        let _ = writeln!(
+            out,
+            "  Variables ({} now vs. the new deployment{into}):",
+            plan.source.deployment_id
+        );
         let lines: Vec<String> = diff.changes.iter().filter_map(format_diff_entry).collect();
-        let unchanged = diff
-            .changes
-            .iter()
-            .filter(|c| c.change == "unchanged")
-            .count();
         if lines.is_empty() {
             out.push_str("    (no changes)\n");
         }
         for line in lines {
-            out.push_str(&format!("    {}\n", line));
+            let _ = writeln!(out, "    {line}");
         }
+        let unchanged = diff.changes.iter().filter(|c| c.change == "unchanged");
+        let unchanged = unchanged.count();
         if unchanged > 0 {
-            out.push_str(&format!("    ({} unchanged)\n", unchanged));
+            let _ = writeln!(out, "    ({unchanged} unchanged)");
         }
     }
     out
 }
 
-/// Print a plan to stdout, or to stderr when stdout carries JSON.
-pub fn print_plan(plan: &CreateFromPlan, diff: Option<&EnvVarDiff>, to_stderr: bool) {
-    let text = format_plan(plan, diff);
-    if to_stderr {
-        eprint!("{}", text);
-    } else {
-        print!("{}", text);
-    }
-}
-
-/// Fetch the plan for creating a deployment from `deployment_id`. `Ok(None)`
-/// when the server has no plan endpoint (404).
-pub(super) async fn fetch_plan(
+/// GET a preview endpoint. `Ok(None)` when the server has none (404).
+async fn fetch_optional<T: DeserializeOwned>(
     http_client: &Client,
     backend_url: &str,
     token: &str,
-    request: &PreviewRequest<'_>,
-) -> Result<Option<CreateFromPlan>> {
-    let mut url = format!(
-        "{}/api/v1/projects/{}/deployments/{}/plan?use_source_env_vars={}",
-        backend_url,
-        urlencoding::encode(request.project),
-        urlencoding::encode(request.deployment_id),
-        request.use_source_env_vars
-    );
-    if let Some(env) = request.environment {
-        url.push_str(&format!("&environment={}", urlencoding::encode(env)));
-    }
-    if let Some(group) = request.group {
-        url.push_str(&format!("&group={}", urlencoding::encode(group)));
-    }
-
+    url: &str,
+    what: &str,
+) -> Result<Option<T>> {
     let response = http_client
-        .get(&url)
+        .get(url)
         .bearer_auth(token)
         .send_with_auth_hint(backend_url)
         .await
-        .context("Failed to fetch the deployment plan")?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        .with_context(|| format!("Failed to fetch {what}"))?;
+    let status = response.status();
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        debug!("No deployment plan available (404): {}", body);
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            debug!("The server does not provide {what} (404): {body}");
+            return Ok(None);
+        }
         bail!(
-            "Failed to fetch the deployment plan ({}): {}",
-            status,
+            "Failed to fetch {what} ({status}): {}",
             describe_api_error(&body)
         );
     }
-    let plan = response
+    let parsed = response
         .json()
         .await
-        .context("Failed to parse the deployment plan")?;
-    Ok(Some(plan))
-}
-
-/// Fetch how the variables of a deployment created from `deployment_id` into
-/// `environment` differ from the source's. `Ok(None)` when the server has no
-/// such endpoint.
-pub(super) async fn fetch_env_diff(
-    http_client: &Client,
-    backend_url: &str,
-    token: &str,
-    project: &str,
-    deployment_id: &str,
-    environment: Option<&str>,
-) -> Result<Option<EnvVarDiff>> {
-    let mut url = format!(
-        "{}/api/v1/projects/{}/deployments/{}/env/diff",
-        backend_url,
-        urlencoding::encode(project),
-        urlencoding::encode(deployment_id)
-    );
-    if let Some(env) = environment {
-        url.push_str(&format!("?environment={}", urlencoding::encode(env)));
-    }
-    let response = http_client
-        .get(&url)
-        .bearer_auth(token)
-        .send_with_auth_hint(backend_url)
-        .await
-        .context("Failed to fetch the variable changes")?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        debug!("No variable diff available (404)");
-        return Ok(None);
-    }
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!(
-            "Failed to fetch the variable changes ({}): {}",
-            status,
-            describe_api_error(&body)
-        );
-    }
-    let diff = response
-        .json()
-        .await
-        .context("Failed to parse the variable changes")?;
-    Ok(Some(diff))
+        .with_context(|| format!("Failed to parse {what}"))?;
+    Ok(Some(parsed))
 }
 
 /// A deployment to create from another one, as far as previewing it goes.
@@ -509,6 +375,60 @@ pub(super) struct PreviewRequest<'a> {
     pub environment: Option<&'a str>,
     pub group: Option<&'a str>,
     pub use_source_env_vars: bool,
+}
+
+impl PreviewRequest<'_> {
+    fn deployment_url(&self, backend_url: &str) -> String {
+        format!(
+            "{}/api/v1/projects/{}/deployments/{}",
+            backend_url,
+            urlencoding::encode(self.project),
+            urlencoding::encode(self.deployment_id)
+        )
+    }
+
+    async fn plan(
+        &self,
+        http_client: &Client,
+        backend_url: &str,
+        token: &str,
+    ) -> Result<Option<CreateFromPlan>> {
+        let mut url = format!(
+            "{}/plan?use_source_env_vars={}",
+            self.deployment_url(backend_url),
+            self.use_source_env_vars
+        );
+        if let Some(env) = self.environment {
+            let _ = write!(url, "&environment={}", urlencoding::encode(env));
+        }
+        if let Some(group) = self.group {
+            let _ = write!(url, "&group={}", urlencoding::encode(group));
+        }
+        fetch_optional(http_client, backend_url, token, &url, "the deployment plan").await
+    }
+
+    /// How the variables of a deployment created into `environment` differ
+    /// from the source's.
+    async fn env_diff(
+        &self,
+        http_client: &Client,
+        backend_url: &str,
+        token: &str,
+        environment: Option<&str>,
+    ) -> Result<Option<EnvVarDiff>> {
+        let mut url = format!("{}/env/diff", self.deployment_url(backend_url));
+        if let Some(env) = environment {
+            let _ = write!(url, "?environment={}", urlencoding::encode(env));
+        }
+        fetch_optional(
+            http_client,
+            backend_url,
+            token,
+            &url,
+            "the variable changes",
+        )
+        .await
+    }
 }
 
 /// Best-effort preview for `rise deploy --from`: print the plan and, unless
@@ -522,38 +442,26 @@ pub(super) async fn preview_create_from(
     request: PreviewRequest<'_>,
     to_stderr: bool,
 ) {
-    let plan = match fetch_plan(http_client, backend_url, token, &request).await {
+    let plan = match request.plan(http_client, backend_url, token).await {
         Ok(Some(plan)) => plan,
         Ok(None) => return,
-        Err(e) => {
-            warn!("Could not preview the deployment: {:?}", e);
-            return;
-        }
+        Err(e) => return warn!("Could not preview the deployment: {:?}", e),
     };
     let diff = if request.use_source_env_vars {
         None
     } else {
-        let target = (!plan.target.environment.is_empty())
-            .then_some(plan.target.environment.as_str())
+        let target = Some(plan.target.environment.as_str())
+            .filter(|t| !t.is_empty())
             .or(request.environment);
-        match fetch_env_diff(
-            http_client,
-            backend_url,
-            token,
-            request.project,
-            request.deployment_id,
-            target,
-        )
-        .await
-        {
-            Ok(diff) => diff,
-            Err(e) => {
+        request
+            .env_diff(http_client, backend_url, token, target)
+            .await
+            .unwrap_or_else(|e| {
                 warn!("Could not compare environment variables: {:?}", e);
                 None
-            }
-        }
+            })
     };
-    print_plan(&plan, diff.as_ref(), to_stderr);
+    say(to_stderr, format_plan(&plan, diff.as_ref()).trim_end());
 }
 
 /// Options for `rise promote`.
@@ -595,21 +503,20 @@ pub(super) fn toml_target_overrides(
     let Some(env_config) = config.and_then(|c| c.environments.get(target)) else {
         return TomlTargetOverrides::default();
     };
-    let env_overrides = env_config
-        .env
-        .iter()
-        .map(|(key, value)| EnvOverride {
-            key: key.clone(),
-            value: value.clone(),
-            is_secret: false,
-            is_protected: false,
-            source: Some("toml".to_string()),
-            for_environment: Some(target.to_string()),
-        })
-        .collect();
     let deploy = env_config.deploy.as_ref();
     TomlTargetOverrides {
-        env_overrides,
+        env_overrides: env_config
+            .env
+            .iter()
+            .map(|(key, value)| EnvOverride {
+                key: key.clone(),
+                value: value.clone(),
+                is_secret: false,
+                is_protected: false,
+                source: Some("toml".to_string()),
+                for_environment: Some(target.to_string()),
+            })
+            .collect(),
         replicas: deploy.and_then(|d| d.replicas),
         cpu: deploy.and_then(|d| d.cpu.clone()),
         memory: deploy.and_then(|d| d.memory.clone()),
@@ -619,15 +526,12 @@ pub(super) fn toml_target_overrides(
 /// The message for a promotion the target's promotion source does not allow.
 fn gate_denied_message(plan: &CreateFromPlan) -> String {
     let target = &plan.target.environment;
-    let required = plan
-        .gate
-        .promotion_source_environment
-        .as_deref()
-        .unwrap_or("?");
+    let required = plan.gate.promotion_source_environment.as_deref();
+    let required = required.unwrap_or("?");
     format!(
-        "Environment '{}' only accepts deployments promoted from '{}', and {} is in '{}'. \
-         Promote a {} deployment: rise promote <deployment-id> -E {}",
-        target, required, plan.source.deployment_id, plan.source.environment, required, target
+        "Environment '{target}' only accepts deployments promoted from '{required}', and {} is in '{}'. \
+         Promote a {required} deployment: rise promote <deployment-id> -E {target}",
+        plan.source.deployment_id, plan.source.environment
     )
 }
 
@@ -640,35 +544,9 @@ fn barrier_crossed_message(plan: &CreateFromPlan) -> String {
         version_label(plan.migration.environment_version)
     );
     for barrier in &plan.migration.barriers {
-        message.push_str(&format!("\n  {}", format_barrier(barrier)));
+        let _ = write!(message, "\n  {}", format_barrier(barrier));
     }
-    message.push_str("\nRe-run with --force to promote anyway.");
-    message
-}
-
-async fn resolve_target_environment(
-    http_client: &Client,
-    backend_url: &str,
-    token: &str,
-    project: &str,
-    explicit: Option<&str>,
-) -> Result<String> {
-    if let Some(target) = explicit {
-        return Ok(target.to_string());
-    }
-    let environments =
-        crate::cli::environment::fetch_environments(http_client, backend_url, token, project)
-            .await?;
-    environments
-        .into_iter()
-        .find(|e| e.is_production)
-        .map(|e| e.name)
-        .with_context(|| {
-            format!(
-                "Project '{}' has no production environment; pass the target with -E <environment>",
-                project
-            )
-        })
+    message + "\nRe-run with --force to promote anyway."
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
@@ -697,67 +575,49 @@ pub async fn promote(
     let provider = crate::token_source::resolve_token_provider(http_client, config)?;
     let token = token_with_retry(&provider).await?;
     let to_stderr = opts.json_output;
-    let say = |line: &str| {
-        if to_stderr {
-            eprintln!("{}", line);
-        } else {
-            println!("{}", line);
-        }
+    let (project, deployment_id) = (opts.project_name, opts.deployment_id);
+
+    let target = match opts.target_environment {
+        Some(target) => target.to_string(),
+        None => crate::cli::environment::fetch_environments(http_client, backend_url, &token, project)
+            .await?
+            .into_iter()
+            .find(|e| e.is_production)
+            .map(|e| e.name)
+            .with_context(|| {
+                format!("Project '{project}' has no production environment; pass the target with -E <environment>")
+            })?,
     };
 
-    let target = resolve_target_environment(
-        http_client,
-        backend_url,
-        &token,
-        opts.project_name,
-        opts.target_environment,
-    )
-    .await?;
-
     let request = PreviewRequest {
-        project: opts.project_name,
-        deployment_id: opts.deployment_id,
+        project,
+        deployment_id,
         environment: Some(&target),
         group: None,
         use_source_env_vars: false,
     };
-    let plan = fetch_plan(http_client, backend_url, &token, &request)
+    let plan = request
+        .plan(http_client, backend_url, &token)
         .await?
         .with_context(|| {
-            format!(
-                "Deployment '{}' not found in project '{}', or the server does not support promotion",
-                opts.deployment_id, opts.project_name
-            )
+            format!("Deployment '{deployment_id}' not found in project '{project}', or the server does not support promotion")
         })?;
     if plan.source.environment == target {
         bail!(
-            "Deployment {} is already in '{}'. To redeploy it there, run: rise deploy --from {} -E {}",
-            opts.deployment_id,
-            target,
-            opts.deployment_id,
-            target
+            "Deployment {deployment_id} is already in '{target}'. To redeploy it there, run: rise deploy --from {deployment_id} -E {target}"
         );
     }
-    let diff = fetch_env_diff(
-        http_client,
-        backend_url,
-        &token,
-        opts.project_name,
-        opts.deployment_id,
-        Some(&target),
-    )
-    .await?;
-    print_plan(&plan, diff.as_ref(), to_stderr);
+    let diff = request
+        .env_diff(http_client, backend_url, &token, Some(&target))
+        .await?;
+    say(to_stderr, format_plan(&plan, diff.as_ref()).trim_end());
 
     match plan.gate.decision.as_str() {
         "denied" => bail!("{}", gate_denied_message(&plan)),
         "admin_bypass" => warn!(
             "Bypassing the promotion gate as an administrator: '{}' only accepts deployments promoted from '{}'",
             target,
-            plan.gate
-                .promotion_source_environment
-                .as_deref()
-                .unwrap_or("?")
+            plan.gate.promotion_source_environment.as_deref().unwrap_or("?")
         ),
         _ => {}
     }
@@ -765,92 +625,75 @@ pub async fn promote(
         "crossed" if !opts.force => bail!("{}", barrier_crossed_message(&plan)),
         "crossed" => warn!("Promoting across recorded migration barriers (--force)"),
         "unknown" => warn!(
-            "{} declares no migration version, so migration barriers cannot be checked",
-            opts.deployment_id
+            "{deployment_id} declares no migration version, so migration barriers cannot be checked"
         ),
         _ => {}
     }
 
     let toml = toml_target_overrides(opts.toml_config.as_ref(), &target);
-    let replicas = opts.replicas.or(toml.replicas);
-    let cpu = opts.cpu.clone().or(toml.cpu.clone());
-    let memory = opts.memory.clone().or(toml.memory.clone());
     if toml != TomlTargetOverrides::default() {
-        let mut applied: Vec<String> = toml.env_overrides.iter().map(|o| o.key.clone()).collect();
-        if let Some(r) = toml.replicas {
-            applied.push(format!("replicas={}", r));
-        }
-        if let Some(ref c) = toml.cpu {
-            applied.push(format!("cpu={}", c));
-        }
-        if let Some(ref m) = toml.memory {
-            applied.push(format!("memory={}", m));
-        }
-        say(&format!(
-            "  rise.toml [environments.{}]: {}",
-            target,
-            applied.join(", ")
-        ));
+        let applied: Vec<String> = toml
+            .env_overrides
+            .iter()
+            .map(|o| o.key.clone())
+            .chain(toml.replicas.map(|r| format!("replicas={r}")))
+            .chain(toml.cpu.as_ref().map(|c| format!("cpu={c}")))
+            .chain(toml.memory.as_ref().map(|m| format!("memory={m}")))
+            .collect();
+        say(
+            to_stderr,
+            &format!(
+                "  rise.toml [environments.{target}]: {}",
+                applied.join(", ")
+            ),
+        );
     }
 
     if !opts.yes {
         let prompt = format!(
-            "Promote {} ({}) to {}?",
-            opts.deployment_id, plan.source.environment, target
+            "Promote {deployment_id} ({}) to {target}?",
+            plan.source.environment
         );
         if !confirm(&prompt)? {
             bail!("Promotion cancelled");
         }
     }
 
+    let cpu = opts.cpu.or(toml.cpu);
+    let memory = opts.memory.or(toml.memory);
     let payload = CreateDeploymentPayload {
-        project: opts.project_name,
+        project,
         environment: Some(&target),
-        from_deployment: Some(opts.deployment_id),
+        from_deployment: Some(deployment_id),
         env_overrides: &toml.env_overrides,
-        replicas,
+        replicas: opts.replicas.or(toml.replicas),
         cpu: cpu.as_deref(),
         memory: memory.as_deref(),
         force_migration_barrier: opts.force,
         ..Default::default()
     };
-    info!(
-        "Promoting deployment '{}' of project '{}' to '{}'",
-        opts.deployment_id, opts.project_name, target
-    );
+    info!("Promoting deployment '{deployment_id}' of project '{project}' to '{target}'");
+    // The confirmation may have outlived the first token.
     let token = token_with_retry(&provider).await?;
-    let url = format!("{}/api/v1/deployments", backend_url);
-    let response = http_client
-        .post(&url)
-        .bearer_auth(&token)
-        .json(&payload.to_json()?)
-        .send_with_auth_hint(backend_url)
-        .await
-        .context("Failed to create deployment")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        bail!(
-            "Failed to promote ({}): {}",
-            status,
-            describe_api_error(&body)
-        );
-    }
-    let created: super::core::CreateDeploymentResponse = response
-        .json()
-        .await
-        .context("Failed to parse deployment response")?;
+    let created = call_create_deployment_api(
+        http_client,
+        backend_url,
+        &token,
+        &payload,
+        "Failed to promote",
+    )
+    .await?;
     report_create_response(&created, to_stderr);
-    say(&format!(
-        "✓ Created deployment {} in {}",
-        created.deployment_id, target
-    ));
+    say(
+        to_stderr,
+        &format!("✓ Created deployment {} in {target}", created.deployment_id),
+    );
 
     follow_created_deployment(
         http_client,
         backend_url,
         config,
-        opts.project_name,
+        project,
         &created.deployment_id,
         DeploymentOutputOptions {
             json: opts.json_output,
@@ -864,30 +707,22 @@ pub async fn promote(
 mod tests {
     use super::*;
 
+    fn plan(value: serde_json::Value) -> CreateFromPlan {
+        serde_json::from_value(value).unwrap()
+    }
+
     fn promote_plan() -> CreateFromPlan {
-        serde_json::from_value(serde_json::json!({
+        plan(serde_json::json!({
             "kind": "promote",
-            "source": {
-                "deployment_id": "20261020-101500",
-                "environment": "staging",
-                "status": "Healthy",
-                "image": "registry.rise.dev/app:20261020-101500",
-                "migration_version": 5
-            },
-            "target": {
-                "environment": "production",
-                "group": "default",
-                "current": {"deployment_id": "20261001-090000", "status": "Healthy"},
-                "migration_high_water": 4
-            },
+            "source": {"deployment_id": "20261020-101500", "environment": "staging", "status": "Healthy",
+                       "image": "registry.rise.dev/app:20261020-101500"},
+            "target": {"environment": "production", "group": "default",
+                       "current": {"deployment_id": "20261001-090000", "status": "Healthy"}},
             "pinned_image": "registry.rise.dev/app@sha256:3f2a",
             "gate": {"decision": "allowed", "promotion_source_environment": "staging"},
-            "migration": {"status": "ok", "candidate_version": 5, "environment_version": 4, "barriers": []},
-            "adjustments": [{"container": "app", "field": "replicas", "from": "1", "to": "2", "reason": "production requires ≥ 2"}],
-            "use_source_env_vars_allowed": false,
-            "warnings": []
+            "migration": {"status": "ok", "candidate_version": 5, "environment_version": 4},
+            "adjustments": [{"container": "app", "field": "replicas", "from": "1", "to": "2", "reason": "production requires ≥ 2"}]
         }))
-        .unwrap()
     }
 
     #[test]
@@ -895,16 +730,15 @@ mod tests {
         let diff: EnvVarDiff = serde_json::from_value(serde_json::json!({
             "environment": "production",
             "changes": [
-                {"key": "FEATURE_X", "change": "added", "is_secret": false, "is_protected": false, "to": "on", "to_source": "env:production"},
-                {"key": "LOG_LEVEL", "change": "changed", "is_secret": false, "is_protected": false, "from": "debug", "to": "info", "from_source": "toml", "to_source": "env:production"},
+                {"key": "FEATURE_X", "change": "added", "to": "on", "to_source": "env:production"},
+                {"key": "LOG_LEVEL", "change": "changed", "from": "debug", "to": "info", "from_source": "toml", "to_source": "env:production"},
                 {"key": "DB_PASSWORD", "change": "changed", "is_secret": true, "is_protected": true, "from_source": "env:staging", "to_source": "env:production"},
-                {"key": "SAME", "change": "unchanged", "is_secret": false, "is_protected": false, "from": "1", "to": "1"}
+                {"key": "SAME", "change": "unchanged", "from": "1", "to": "1"}
             ]
         }))
         .unwrap();
-        let text = format_plan(&promote_plan(), Some(&diff));
         assert_eq!(
-            text,
+            format_plan(&promote_plan(), Some(&diff)),
             "Promoting 20261020-101500 (staging, Healthy) → production [group default]\n\
              \x20 Image:      registry.rise.dev/app@sha256:3f2a  (pinned)\n\
              \x20 Replacing:  20261001-090000 (Healthy)\n\
@@ -932,22 +766,13 @@ mod tests {
         .unwrap();
         plan.adjustments.clear();
         let text = format_plan(&plan, None);
-        assert!(
-            text.contains(
-                "  Gate:       DENIED: production only accepts deployments promoted from 'staging'\n"
-            ),
-            "{text}"
-        );
-        assert!(
-            text.contains("  Migration:  v3 → environment at v5 (crosses 1 migration barrier)\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "               v4: drops users.name (recorded 2026-10-01 by a@example.com)\n"
-            ),
-            "{text}"
-        );
+        for expected in [
+            "  Gate:       DENIED: production only accepts deployments promoted from 'staging'\n",
+            "  Migration:  v3 → environment at v5 (crosses 1 migration barrier)\n",
+            "               v4: drops users.name (recorded 2026-10-01 by a@example.com)\n",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
         assert!(!text.contains("Variables"), "{text}");
         assert!(barrier_crossed_message(&plan).contains("--force"));
         assert!(gate_denied_message(&plan)
@@ -956,22 +781,20 @@ mod tests {
 
     #[test]
     fn redeploy_plan_without_target_deployment_or_changes() {
-        let plan: CreateFromPlan = serde_json::from_value(serde_json::json!({
+        let plan = plan(serde_json::json!({
             "kind": "redeploy",
             "source": {"deployment_id": "d1", "environment": "production", "status": "Superseded", "image": "img:1"},
             "target": {"environment": "production", "group": "default", "current": null},
             "gate": {"decision": "allowed", "promotion_source_environment": null},
             "migration": {"status": "unknown", "candidate_version": null, "environment_version": 2},
             "warnings": ["no migration version declared"]
-        }))
-        .unwrap();
+        }));
         let diff = EnvVarDiff {
             environment: Some("production".to_string()),
             changes: vec![],
         };
-        let text = format_plan(&plan, Some(&diff));
         assert_eq!(
-            text,
+            format_plan(&plan, Some(&diff)),
             "Redeploying d1 (production, Superseded) → production [group default]\n\
              \x20 Image:      img:1\n\
              \x20 Replacing:  nothing (no active deployment)\n\
@@ -980,13 +803,6 @@ mod tests {
              \x20 Variables (d1 now vs. the new deployment in production):\n\
              \x20   (no changes)\n"
         );
-    }
-
-    #[test]
-    fn a_minimal_plan_parses() {
-        let plan: CreateFromPlan = serde_json::from_str(r#"{"kind":"promote"}"#).unwrap();
-        assert_eq!(plan.kind, "promote");
-        assert!(plan.adjustments.is_empty());
     }
 
     #[test]
@@ -1006,9 +822,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        let overrides = toml_target_overrides(Some(&config), "production");
         assert_eq!(
-            overrides,
+            toml_target_overrides(Some(&config), "production"),
             TomlTargetOverrides {
                 env_overrides: vec![EnvOverride {
                     key: "LOG_LEVEL".to_string(),
@@ -1025,10 +840,6 @@ mod tests {
         );
         assert_eq!(
             toml_target_overrides(Some(&config), "qa"),
-            TomlTargetOverrides::default()
-        );
-        assert_eq!(
-            toml_target_overrides(None, "production"),
             TomlTargetOverrides::default()
         );
     }

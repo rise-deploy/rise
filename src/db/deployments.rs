@@ -57,22 +57,57 @@ pub struct CreateDeploymentParams<'a> {
     /// `expires_at`. Recorded on the creation event so the timeline shows the
     /// cap alongside what was actually asked for.
     pub expiration_cap: Option<&'a rise_backend_core::expiration::ExpirationCap>,
-    /// How the deployment came to be (ADR-0007).
+    /// ADR-0007 provenance; see the matching [`Deployment`] fields.
     pub created_via: CreatedVia,
-    /// The deployment this one was promoted from: the immediate source, set
-    /// only when it crossed environments.
     pub promoted_from_deployment_id: Option<Uuid>,
-    /// The environment of `promoted_from_deployment_id`.
     pub promoted_from_environment_id: Option<Uuid>,
-    /// `[project].migration_version` of the code; inherited from the source by
-    /// every deployment created from another one.
     pub migration_version: Option<i64>,
-    /// Set only on a Rollback Guard replacement: the unhealthy deployment it
-    /// replaces. At most one replacement per deployment (unique index).
     pub rollback_guard_for_deployment_id: Option<Uuid>,
-    /// Caller-supplied attributes merged into the creation event's detail,
-    /// inside the same size budget (see [`create`]). Must be a JSON object.
+    /// A JSON object merged into the creation event's detail, inside the same
+    /// size budget; attributes the statement derives win over it.
     pub extra_event_attributes: Option<&'a serde_json::Value>,
+}
+
+/// Parameters for a plain test deployment; override fields with `..`.
+#[cfg(test)]
+pub fn test_params<'a>(
+    project_id: Uuid,
+    created_by_id: Uuid,
+    environment_id: Uuid,
+    deployment_id: &'a str,
+    deployment_group: &'a str,
+    status: DeploymentStatus,
+) -> CreateDeploymentParams<'a> {
+    CreateDeploymentParams {
+        deployment_id,
+        project_id,
+        created_by_id,
+        status,
+        image: None,
+        image_digest: None,
+        rolled_back_from_deployment_id: None,
+        deployment_group,
+        environment_id,
+        expires_at: None,
+        http_port: 8080,
+        is_active: false,
+        job_url: None,
+        pull_request_url: None,
+        git_repository_url: None,
+        replicas: 1,
+        cpu: "500m",
+        memory: "256Mi",
+        identity_audiences: serde_json::json!({}),
+        containers: None,
+        routes: None,
+        expiration_cap: None,
+        created_via: CreatedVia::Deploy,
+        promoted_from_deployment_id: None,
+        promoted_from_environment_id: None,
+        migration_version: None,
+        rollback_guard_for_deployment_id: None,
+        extra_event_attributes: None,
+    }
 }
 
 /// List deployments for a project
@@ -96,11 +131,8 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Dep
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE project_id = $1
@@ -169,11 +201,8 @@ pub async fn list_non_terminal_for_project(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE project_id = $1
@@ -214,11 +243,8 @@ pub async fn get_deployments_batch(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE id = ANY($1)
@@ -258,11 +284,8 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>> {
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE id = $1
@@ -300,11 +323,8 @@ pub async fn find_by_deployment_id(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE deployment_id = $1 AND project_id = $2
@@ -347,11 +367,8 @@ pub async fn find_by_deployment_id_unscoped(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE deployment_id = $1
@@ -368,11 +385,7 @@ pub async fn find_by_deployment_id_unscoped(
     Ok(deployments)
 }
 
-/// Create a new deployment.
-///
-/// Generic over the executor so a caller can create the row inside a
-/// transaction together with whatever must commit with it (its environment
-/// variables, a Rollback Guard subject lock).
+/// Create a new deployment (inside a caller's transaction, if given one).
 pub async fn create<'e, E>(executor: E, params: CreateDeploymentParams<'_>) -> Result<Deployment>
 where
     E: sqlx::PgExecutor<'e>,
@@ -413,9 +426,7 @@ where
                 END || jsonb_strip_nulls(jsonb_build_object('from', NULL, 'to', ins.status))
             FROM ins
             LEFT JOIN users u ON u.id = ins.created_by_id
-            -- Caller detail (a gate bypass, resource adjustments) goes
-            -- first, so the attributes this statement derives win over a
-            -- caller restating them.
+            -- Caller detail goes first, so derived attributes win over it.
             CROSS JOIN LATERAL (SELECT CASE
                     WHEN jsonb_typeof($31::jsonb) = 'object' THEN $31::jsonb
                     ELSE '{}'::jsonb
@@ -464,10 +475,7 @@ where
                     'requested_expires_at', $23::timestamptz,
                     'max_deployment_expiration', $24::text,
                     'expiration_limited_by', $25::text,
-                    -- Provenance (ADR-0007). `created_via` is omitted for a
-                    -- plain deploy, the case every other attribute already
-                    -- describes. Deployments are named by `deployment_id`,
-                    -- the name a reader follows.
+                    -- Provenance (ADR-0007); `created_via` is omitted for a plain deploy.
                     'created_via', NULLIF(ins.created_via, 'deploy'),
                     'promoted_from', (
                         SELECT jsonb_build_object('kind', 'deployment', 'name', src.deployment_id)
@@ -502,11 +510,8 @@ where
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM ins
         "#,
@@ -592,11 +597,8 @@ pub async fn update_status(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE id = $1
@@ -704,11 +706,8 @@ pub async fn update_status(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -790,11 +789,8 @@ pub async fn mark_failed(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -838,11 +834,8 @@ pub async fn update_controller_metadata(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         "#,
         id,
@@ -922,11 +915,8 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -996,11 +986,8 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1085,11 +1072,8 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1159,11 +1143,8 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1233,11 +1214,8 @@ pub async fn mark_healthy(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1312,11 +1290,8 @@ pub async fn mark_unhealthy(pool: &PgPool, id: Uuid, reason: String) -> Result<O
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1398,11 +1373,8 @@ pub async fn mark_terminating(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1471,11 +1443,8 @@ pub async fn mark_cancelling(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -1519,11 +1488,8 @@ pub async fn get_by_identity_credential_hash(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE identity_credential_hash = $1
@@ -1578,11 +1544,8 @@ pub async fn find_non_terminal_for_project_and_group(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE project_id = $1
@@ -1626,11 +1589,8 @@ pub async fn find_active_deployment_for_group(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE project_id = $1
@@ -1674,11 +1634,8 @@ pub async fn find_last_for_project_and_group(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE project_id = $1
@@ -1748,11 +1705,8 @@ pub async fn list_for_project_filtered(
             d.identity_audiences as "identity_audiences: serde_json::Value",
             d.containers as "containers: serde_json::Value",
             d.routes as "routes: serde_json::Value",
-            d.created_via as "created_via: CreatedVia",
-            d.promoted_from_deployment_id,
-            d.promoted_from_environment_id,
-            d.migration_version,
-            d.unhealthy_since,
+            d.created_via as "created_via: CreatedVia", d.promoted_from_deployment_id,
+            d.promoted_from_environment_id, d.migration_version, d.unhealthy_since,
             d.rollback_guard_for_deployment_id
         FROM deployments d
         WHERE d.project_id = $1
@@ -1954,9 +1908,8 @@ pub async fn mark_as_active(
 /// Atomically mark a deployment healthy and, if some older deployment is
 /// currently the group's active (most-recently-created `Healthy`)
 /// deployment, mark that one `Terminating(Superseded)` in the same
-/// transaction. When a newer deployment already serves, this one is retired
-/// instead and returned with `retired_by` set. See `rise_backend_core::store::SupersessionOutcome` for the
-/// `became_healthy: false` contract when the guard rejects the write.
+/// transaction; when a newer deployment already serves, retire this one
+/// instead. See `rise_backend_core::store::SupersessionOutcome`.
 #[cfg(feature = "backend")]
 pub async fn mark_healthy_and_supersede(
     pool: &PgPool,
@@ -2011,11 +1964,8 @@ pub async fn mark_healthy_and_supersede(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -2037,11 +1987,9 @@ pub async fn mark_healthy_and_supersede(
         });
     }
 
-    // Creation order decides which deployment serves, not the order in which
-    // they became healthy. If a deployment created after this one is already
-    // running (`Healthy`/`Unhealthy`) or is the group's selected target and not
-    // on its way out (`Terminating`/`Cancelling`), this one arrived late: it is
-    // retired on the spot instead of taking over.
+    // Creation order decides which deployment serves: if a newer one is
+    // already running, or is the group's selected target and not on its way
+    // out, this one arrived late and is retired instead of taking over.
     let newer = sqlx::query_as!(
         Deployment,
         r#"
@@ -2061,11 +2009,8 @@ pub async fn mark_healthy_and_supersede(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments n
         WHERE n.project_id = $2
@@ -2136,8 +2081,8 @@ pub async fn mark_healthy_and_supersede(
         });
     }
 
-    // The single most-recently-created other `Healthy` deployment in the
-    // group that was created before this one. Scoped to `status = 'Healthy'`
+    // The most recently created older `Healthy` deployment in the group.
+    // Scoped to `status = 'Healthy'`
     // (not `is_active(status)`): an old-active deployment currently sitting
     // in `Unhealthy` is caught by `handle_deployment_became_healthy`'s
     // straggler self-healing loop instead.
@@ -2206,11 +2151,8 @@ pub async fn mark_healthy_and_supersede(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM upd
         "#,
@@ -2255,11 +2197,8 @@ pub async fn get_active_deployments_for_project(
             identity_audiences as "identity_audiences: serde_json::Value",
             containers as "containers: serde_json::Value",
             routes as "routes: serde_json::Value",
-            created_via as "created_via: CreatedVia",
-            promoted_from_deployment_id,
-            promoted_from_environment_id,
-            migration_version,
-            unhealthy_since,
+            created_via as "created_via: CreatedVia", promoted_from_deployment_id,
+            promoted_from_environment_id, migration_version, unhealthy_since,
             rollback_guard_for_deployment_id
         FROM deployments
         WHERE project_id = $1 AND is_active = TRUE
@@ -2294,12 +2233,9 @@ pub async fn migration_high_water(pool: &PgPool, environment_id: Uuid) -> Result
     Ok(high)
 }
 
-/// The most recent deployment before `sick` (by creation order) in the same
-/// project, environment and deployment group that served at some point
-/// (`first_healthy_at` set) — the Rollback Guard's last-known-good candidate.
-///
-/// Returned whatever its status: the caller decides whether it is usable
-/// (the guard requires it to have been `Superseded`).
+/// The most recently created deployment before `sick` in its project,
+/// environment and group that ever served (`first_healthy_at` set): the
+/// Rollback Guard's last-known-good candidate, whatever its status now.
 #[cfg(feature = "backend")]
 pub async fn find_last_served_before(
     pool: &PgPool,
@@ -2309,44 +2245,23 @@ pub async fn find_last_served_before(
         Deployment,
         r#"
         SELECT
-            d.id,
-            d.deployment_id,
-            d.project_id,
-            d.created_by_id,
+            d.id, d.deployment_id, d.project_id, d.created_by_id,
             d.status as "status: DeploymentStatus",
-            d.deployment_group,
-            d.environment_id,
-            d.expires_at,
+            d.deployment_group, d.environment_id, d.expires_at,
             d.termination_reason as "termination_reason: _",
-            d.completed_at,
-            d.error_message,
-            d.build_logs,
+            d.completed_at, d.error_message, d.build_logs,
             d.controller_metadata as "controller_metadata: serde_json::Value",
-            d.image,
-            d.image_digest,
-            d.rolled_back_from_deployment_id,
-            d.http_port,
-            d.needs_reconcile,
-            d.is_active,
+            d.image, d.image_digest, d.rolled_back_from_deployment_id,
+            d.http_port, d.needs_reconcile, d.is_active,
             d.deploying_started_at,
-            d.first_healthy_at,
-            d.job_url,
-            d.pull_request_url,
-            d.git_repository_url,
-            d.replicas,
-            d.cpu,
-            d.memory,
-            d.created_at,
-            d.updated_at,
-            d.identity_credential_hash,
+            d.first_healthy_at, d.job_url, d.pull_request_url, d.git_repository_url,
+            d.replicas, d.cpu, d.memory,
+            d.created_at, d.updated_at, d.identity_credential_hash,
             d.identity_audiences as "identity_audiences: serde_json::Value",
             d.containers as "containers: serde_json::Value",
             d.routes as "routes: serde_json::Value",
-            d.created_via as "created_via: CreatedVia",
-            d.promoted_from_deployment_id,
-            d.promoted_from_environment_id,
-            d.migration_version,
-            d.unhealthy_since,
+            d.created_via as "created_via: CreatedVia", d.promoted_from_deployment_id,
+            d.promoted_from_environment_id, d.migration_version, d.unhealthy_since,
             d.rollback_guard_for_deployment_id
         FROM deployments d
         WHERE d.project_id = $1
@@ -2380,11 +2295,9 @@ pub struct GuardSubject {
     pub project_name: String,
 }
 
-/// Every deployment that has been continuously `Unhealthy` for longer than
-/// its environment's Rollback Guard timeout and has no replacement yet.
-///
-/// Only the active deployment of an environment's primary group, in an
-/// environment with the guard enabled, of a project that is not being deleted.
+/// Every active primary-group deployment, in an environment with the guard
+/// enabled and a project not being deleted, that has been continuously
+/// `Unhealthy` past the environment's timeout and has no replacement yet.
 #[cfg(feature = "backend")]
 pub async fn list_rollback_guard_subjects(pool: &PgPool) -> Result<Vec<GuardSubject>> {
     let rows = sqlx::query!(
@@ -2429,14 +2342,10 @@ pub async fn list_rollback_guard_subjects(pool: &PgPool) -> Result<Vec<GuardSubj
 }
 
 /// Lock a Rollback Guard subject inside `tx` and re-check that it still
-/// qualifies: `Unhealthy`, active, in its environment's primary group with the
-/// guard enabled, unhealthy for at least `timeout_seconds`, without a
-/// replacement, and without a newer non-terminal deployment in its group (a
-/// human fix). `None` when it no longer does.
-///
-/// The row lock linearizes against `mark_healthy`/`mark_unhealthy`, which
-/// lock the same row: either a recovery commits first and this returns
-/// `None`, or the replacement created in `tx` commits first.
+/// qualifies (as in [`list_rollback_guard_subjects`], for `timeout_seconds`,
+/// and with no newer non-terminal deployment in its group — a human fix).
+/// `None` when it no longer does. The row lock linearizes against the health
+/// writers: a recovery either commits first or waits for `tx`.
 #[cfg(feature = "backend")]
 pub async fn lock_rollback_guard_subject(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -2447,44 +2356,23 @@ pub async fn lock_rollback_guard_subject(
         Deployment,
         r#"
         SELECT
-            d.id,
-            d.deployment_id,
-            d.project_id,
-            d.created_by_id,
+            d.id, d.deployment_id, d.project_id, d.created_by_id,
             d.status as "status: DeploymentStatus",
-            d.deployment_group,
-            d.environment_id,
-            d.expires_at,
+            d.deployment_group, d.environment_id, d.expires_at,
             d.termination_reason as "termination_reason: _",
-            d.completed_at,
-            d.error_message,
-            d.build_logs,
+            d.completed_at, d.error_message, d.build_logs,
             d.controller_metadata as "controller_metadata: serde_json::Value",
-            d.image,
-            d.image_digest,
-            d.rolled_back_from_deployment_id,
-            d.http_port,
-            d.needs_reconcile,
-            d.is_active,
+            d.image, d.image_digest, d.rolled_back_from_deployment_id,
+            d.http_port, d.needs_reconcile, d.is_active,
             d.deploying_started_at,
-            d.first_healthy_at,
-            d.job_url,
-            d.pull_request_url,
-            d.git_repository_url,
-            d.replicas,
-            d.cpu,
-            d.memory,
-            d.created_at,
-            d.updated_at,
-            d.identity_credential_hash,
+            d.first_healthy_at, d.job_url, d.pull_request_url, d.git_repository_url,
+            d.replicas, d.cpu, d.memory,
+            d.created_at, d.updated_at, d.identity_credential_hash,
             d.identity_audiences as "identity_audiences: serde_json::Value",
             d.containers as "containers: serde_json::Value",
             d.routes as "routes: serde_json::Value",
-            d.created_via as "created_via: CreatedVia",
-            d.promoted_from_deployment_id,
-            d.promoted_from_environment_id,
-            d.migration_version,
-            d.unhealthy_since,
+            d.created_via as "created_via: CreatedVia", d.promoted_from_deployment_id,
+            d.promoted_from_environment_id, d.migration_version, d.unhealthy_since,
             d.rollback_guard_for_deployment_id
         FROM deployments d
         JOIN environments e ON e.id = d.environment_id
@@ -2540,13 +2428,69 @@ pub async fn exists_newer_non_terminal_in_group(pool: &PgPool, d: &Deployment) -
     Ok(exists)
 }
 
-/// Pair each Rollback Guard candidate with the subject it replaces, dropping
-/// candidates whose subject no longer exists.
+/// Rollback Guard candidates still on their way up (`Pending`, `Pushed`,
+/// `Deploying`), each with the subject it replaces: `(candidate, subject)`.
 #[cfg(feature = "backend")]
-async fn pair_with_subjects(
+pub async fn list_open_rollback_guard_candidates(
     pool: &PgPool,
-    candidates: Vec<Deployment>,
 ) -> Result<Vec<(Deployment, Deployment)>> {
+    list_rollback_guard_candidates(pool, None).await
+}
+
+/// Rollback Guard candidates that `Failed` at or after `since`, each with the
+/// subject it was meant to replace: `(candidate, subject)`.
+#[cfg(feature = "backend")]
+pub async fn list_failed_rollback_guard_candidates(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+) -> Result<Vec<(Deployment, Deployment)>> {
+    list_rollback_guard_candidates(pool, Some(since)).await
+}
+
+/// Open candidates, or with `failed_since` the ones that failed since then,
+/// paired with their subjects (candidates whose subject is gone are dropped).
+#[cfg(feature = "backend")]
+async fn list_rollback_guard_candidates(
+    pool: &PgPool,
+    failed_since: Option<DateTime<Utc>>,
+) -> Result<Vec<(Deployment, Deployment)>> {
+    let candidates = sqlx::query_as!(
+        Deployment,
+        r#"
+        SELECT
+            d.id, d.deployment_id, d.project_id, d.created_by_id,
+            d.status as "status: DeploymentStatus",
+            d.deployment_group, d.environment_id, d.expires_at,
+            d.termination_reason as "termination_reason: _",
+            d.completed_at, d.error_message, d.build_logs,
+            d.controller_metadata as "controller_metadata: serde_json::Value",
+            d.image, d.image_digest, d.rolled_back_from_deployment_id,
+            d.http_port, d.needs_reconcile, d.is_active,
+            d.deploying_started_at,
+            d.first_healthy_at, d.job_url, d.pull_request_url, d.git_repository_url,
+            d.replicas, d.cpu, d.memory,
+            d.created_at, d.updated_at, d.identity_credential_hash,
+            d.identity_audiences as "identity_audiences: serde_json::Value",
+            d.containers as "containers: serde_json::Value",
+            d.routes as "routes: serde_json::Value",
+            d.created_via as "created_via: CreatedVia", d.promoted_from_deployment_id,
+            d.promoted_from_environment_id, d.migration_version, d.unhealthy_since,
+            d.rollback_guard_for_deployment_id
+        FROM deployments d
+        WHERE d.created_via = 'rollback_guard'
+          AND d.rollback_guard_for_deployment_id IS NOT NULL
+          AND CASE
+              WHEN $1::timestamptz IS NULL THEN d.status IN ('Pending', 'Pushed', 'Deploying')
+              ELSE d.status = 'Failed' AND d.completed_at >= $1
+          END
+        ORDER BY COALESCE(d.completed_at, d.created_at) ASC
+        "#,
+        failed_since
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list Rollback Guard candidates")?;
+
     let subject_ids: Vec<Uuid> = candidates
         .iter()
         .filter_map(|c| c.rollback_guard_for_deployment_id)
@@ -2559,133 +2503,6 @@ async fn pair_with_subjects(
             Some((c, subject))
         })
         .collect())
-}
-
-/// Rollback Guard candidates still on their way up (`Pending`, `Pushed`,
-/// `Deploying`), each with the subject it replaces: `(candidate, subject)`.
-#[cfg(feature = "backend")]
-pub async fn list_open_rollback_guard_candidates(
-    pool: &PgPool,
-) -> Result<Vec<(Deployment, Deployment)>> {
-    let candidates = sqlx::query_as!(
-        Deployment,
-        r#"
-        SELECT
-            d.id,
-            d.deployment_id,
-            d.project_id,
-            d.created_by_id,
-            d.status as "status: DeploymentStatus",
-            d.deployment_group,
-            d.environment_id,
-            d.expires_at,
-            d.termination_reason as "termination_reason: _",
-            d.completed_at,
-            d.error_message,
-            d.build_logs,
-            d.controller_metadata as "controller_metadata: serde_json::Value",
-            d.image,
-            d.image_digest,
-            d.rolled_back_from_deployment_id,
-            d.http_port,
-            d.needs_reconcile,
-            d.is_active,
-            d.deploying_started_at,
-            d.first_healthy_at,
-            d.job_url,
-            d.pull_request_url,
-            d.git_repository_url,
-            d.replicas,
-            d.cpu,
-            d.memory,
-            d.created_at,
-            d.updated_at,
-            d.identity_credential_hash,
-            d.identity_audiences as "identity_audiences: serde_json::Value",
-            d.containers as "containers: serde_json::Value",
-            d.routes as "routes: serde_json::Value",
-            d.created_via as "created_via: CreatedVia",
-            d.promoted_from_deployment_id,
-            d.promoted_from_environment_id,
-            d.migration_version,
-            d.unhealthy_since,
-            d.rollback_guard_for_deployment_id
-        FROM deployments d
-        WHERE d.created_via = 'rollback_guard'
-          AND d.rollback_guard_for_deployment_id IS NOT NULL
-          AND d.status IN ('Pending', 'Pushed', 'Deploying')
-        ORDER BY d.created_at ASC
-        "#
-    )
-    .fetch_all(pool)
-    .await
-    .context("Failed to list open Rollback Guard candidates")?;
-    pair_with_subjects(pool, candidates).await
-}
-
-/// Rollback Guard candidates that `Failed` at or after `since`, each with the
-/// subject it was meant to replace: `(candidate, subject)`.
-#[cfg(feature = "backend")]
-pub async fn list_failed_rollback_guard_candidates(
-    pool: &PgPool,
-    since: DateTime<Utc>,
-) -> Result<Vec<(Deployment, Deployment)>> {
-    let candidates = sqlx::query_as!(
-        Deployment,
-        r#"
-        SELECT
-            d.id,
-            d.deployment_id,
-            d.project_id,
-            d.created_by_id,
-            d.status as "status: DeploymentStatus",
-            d.deployment_group,
-            d.environment_id,
-            d.expires_at,
-            d.termination_reason as "termination_reason: _",
-            d.completed_at,
-            d.error_message,
-            d.build_logs,
-            d.controller_metadata as "controller_metadata: serde_json::Value",
-            d.image,
-            d.image_digest,
-            d.rolled_back_from_deployment_id,
-            d.http_port,
-            d.needs_reconcile,
-            d.is_active,
-            d.deploying_started_at,
-            d.first_healthy_at,
-            d.job_url,
-            d.pull_request_url,
-            d.git_repository_url,
-            d.replicas,
-            d.cpu,
-            d.memory,
-            d.created_at,
-            d.updated_at,
-            d.identity_credential_hash,
-            d.identity_audiences as "identity_audiences: serde_json::Value",
-            d.containers as "containers: serde_json::Value",
-            d.routes as "routes: serde_json::Value",
-            d.created_via as "created_via: CreatedVia",
-            d.promoted_from_deployment_id,
-            d.promoted_from_environment_id,
-            d.migration_version,
-            d.unhealthy_since,
-            d.rollback_guard_for_deployment_id
-        FROM deployments d
-        WHERE d.created_via = 'rollback_guard'
-          AND d.rollback_guard_for_deployment_id IS NOT NULL
-          AND d.status = 'Failed'
-          AND d.completed_at >= $1
-        ORDER BY d.completed_at ASC
-        "#,
-        since
-    )
-    .fetch_all(pool)
-    .await
-    .context("Failed to list failed Rollback Guard candidates")?;
-    pair_with_subjects(pool, candidates).await
 }
 
 /// How many Rollback Guard candidates are still on their way up.
@@ -2724,8 +2541,8 @@ pub async fn active_health_counts(pool: &PgPool) -> Result<(i64, i64)> {
     Ok((row.healthy, row.unhealthy))
 }
 
-/// Whether `err` is the unique violation of "at most one Rollback Guard
-/// replacement per deployment" — a second, concurrent trigger lost the race.
+/// Whether `err` is a second Rollback Guard replacement for one deployment
+/// (a concurrent trigger lost the race).
 pub fn is_rollback_guard_candidate_conflict(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
@@ -2810,35 +2627,17 @@ mod tests {
         let created = create(
             &pool,
             CreateDeploymentParams {
-                deployment_id: "20260830-000009",
-                project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pending,
                 image: Some("registry.test/app:v1"),
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "default",
-                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                    .await,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
                 replicas: 2,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
                 containers: Some(&containers),
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
+                ..test_params(
+                    project_id,
+                    user_id,
+                    crate::db::environments::test_environment_id(&pool, project_id).await,
+                    "20260830-000009",
+                    "default",
+                    DeploymentStatus::Pending,
+                )
             },
         )
         .await
@@ -2916,35 +2715,17 @@ mod tests {
         let capped = create(
             &pool,
             CreateDeploymentParams {
-                deployment_id: "20260830-000010",
-                project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pending,
                 image: Some("registry.test/app:v1"),
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "mr/123",
-                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                    .await,
                 expires_at: Some(capped_expires_at),
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
                 expiration_cap: Some(&cap),
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
+                ..test_params(
+                    project_id,
+                    user_id,
+                    crate::db::environments::test_environment_id(&pool, project_id).await,
+                    "20260830-000010",
+                    "mr/123",
+                    DeploymentStatus::Pending,
+                )
             },
         )
         .await
@@ -2964,35 +2745,16 @@ mod tests {
         let uncapped = create(
             &pool,
             CreateDeploymentParams {
-                deployment_id: "20260830-000011",
-                project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pending,
                 image: Some("registry.test/app:v1"),
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "default",
-                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                    .await,
                 expires_at: Some(requested_expires_at),
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
+                ..test_params(
+                    project_id,
+                    user_id,
+                    crate::db::environments::test_environment_id(&pool, project_id).await,
+                    "20260830-000011",
+                    "default",
+                    DeploymentStatus::Pending,
+                )
             },
         )
         .await
@@ -3038,35 +2800,15 @@ mod tests {
             let created = create(
                 &pool,
                 CreateDeploymentParams {
-                    deployment_id: &deployment_id,
-                    project_id,
-                    created_by_id: user_id,
-                    status: DeploymentStatus::Pending,
-                    image: None,
-                    image_digest: None,
-                    rolled_back_from_deployment_id: None,
-                    deployment_group: "default",
-                    environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                        .await,
-                    expires_at: None,
-                    http_port: 8080,
-                    is_active: false,
-                    job_url: None,
-                    pull_request_url: None,
-                    git_repository_url: None,
-                    replicas: 1,
-                    cpu: "500m",
-                    memory: "256Mi",
-                    identity_audiences: serde_json::json!({}),
                     containers: Some(&containers),
-                    routes: None,
-                    expiration_cap: None,
-                    created_via: crate::db::models::CreatedVia::Deploy,
-                    promoted_from_deployment_id: None,
-                    promoted_from_environment_id: None,
-                    migration_version: None,
-                    rollback_guard_for_deployment_id: None,
-                    extra_event_attributes: None,
+                    ..test_params(
+                        project_id,
+                        user_id,
+                        crate::db::environments::test_environment_id(&pool, project_id).await,
+                        &deployment_id,
+                        "default",
+                        DeploymentStatus::Pending,
+                    )
                 },
             )
             .await
@@ -3989,37 +3731,14 @@ mod tests {
         // Create deployment in Pushed status so transition to Deploying is valid
         let deployment = create(
             &pool,
-            CreateDeploymentParams {
-                deployment_id: "test-deploy",
+            test_params(
                 project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pushed,
-                image: None,
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "default",
-                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                    .await,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
+                user_id,
+                crate::db::environments::test_environment_id(&pool, project_id).await,
+                "test-deploy",
+                "default",
+                DeploymentStatus::Pushed,
+            ),
         )
         .await
         .unwrap();
@@ -4087,37 +3806,14 @@ mod tests {
 
         let deployment = create(
             &pool,
-            CreateDeploymentParams {
-                deployment_id: "test-deploy",
+            test_params(
                 project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Deploying,
-                image: None,
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "default",
-                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                    .await,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
+                user_id,
+                crate::db::environments::test_environment_id(&pool, project_id).await,
+                "test-deploy",
+                "default",
+                DeploymentStatus::Deploying,
+            ),
         )
         .await
         .unwrap();
@@ -4171,37 +3867,14 @@ mod tests {
 
         let deployment = create(
             &pool,
-            CreateDeploymentParams {
-                deployment_id: "20260101-000000",
+            test_params(
                 project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Healthy,
-                image: None,
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "default",
-                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
-                    .await,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
+                user_id,
+                crate::db::environments::test_environment_id(&pool, project_id).await,
+                "20260101-000000",
+                "default",
+                DeploymentStatus::Healthy,
+            ),
         )
         .await
         .unwrap();
@@ -4284,37 +3957,14 @@ mod tests {
     ) -> Deployment {
         create(
             pool,
-            CreateDeploymentParams {
-                deployment_id,
+            test_params(
                 project_id,
-                created_by_id: user_id,
+                user_id,
+                crate::db::environments::test_environment_id(pool, project_id).await,
+                deployment_id,
+                group,
                 status,
-                image: None,
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: group,
-                environment_id: crate::db::environments::test_environment_id(pool, project_id)
-                    .await,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
+            ),
         )
         .await
         .unwrap()
@@ -4445,12 +4095,12 @@ mod tests {
 
     /// Pin a deployment's `created_at` relative to now, so creation order in a
     /// test does not depend on statement timing.
-    async fn set_created_at(pool: &PgPool, id: Uuid, minutes_ago: i64) {
+    async fn set_created_at(pool: &PgPool, id: Uuid, minutes_ago: i32) {
         sqlx::query(
-            "UPDATE deployments SET created_at = NOW() - make_interval(mins => $2::int) WHERE id = $1",
+            "UPDATE deployments SET created_at = NOW() - make_interval(mins => $2) WHERE id = $1",
         )
         .bind(id)
-        .bind(minutes_ago as i32)
+        .bind(minutes_ago)
         .execute(pool)
         .await
         .unwrap();
@@ -4467,14 +4117,10 @@ mod tests {
     ) {
         sqlx::query(
             "UPDATE deployments
-             SET status = $2,
-                 is_active = $3,
-                 first_healthy_at = CASE WHEN $4 THEN NOW() ELSE NULL END,
+             SET status = $2, is_active = $3,
+                 first_healthy_at = CASE WHEN $4 THEN NOW() END,
                  deploying_started_at = NOW(),
-                 unhealthy_since = CASE
-                     WHEN $5::int IS NULL THEN NULL
-                     ELSE NOW() - make_interval(mins => $5::int)
-                 END
+                 unhealthy_since = NOW() - make_interval(mins => $5::int)
              WHERE id = $1",
         )
         .bind(id)
@@ -4487,193 +4133,125 @@ mod tests {
         .unwrap();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn seed_full(
-        pool: &PgPool,
-        project_id: Uuid,
-        user_id: Uuid,
-        environment_id: Uuid,
-        deployment_id: &str,
-        group: &str,
-        created_via: CreatedVia,
-        rollback_guard_for: Option<Uuid>,
-        migration_version: Option<i64>,
-    ) -> Result<Deployment> {
+    /// A `Pushed` deployment of a fresh project's production environment.
+    async fn seed_pushed(pool: &PgPool, p: Uuid, u: Uuid, name: &str, group: &str) -> Deployment {
+        let env = crate::db::environments::test_environment_id(pool, p).await;
         create(
             pool,
-            CreateDeploymentParams {
-                deployment_id,
-                project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pushed,
-                image: Some("registry.example/app:v1"),
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: group,
-                environment_id,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version,
-                rollback_guard_for_deployment_id: rollback_guard_for,
-                extra_event_attributes: None,
-            },
+            test_params(p, u, env, name, group, DeploymentStatus::Pushed),
         )
         .await
+        .unwrap()
     }
 
+    async fn creation_attrs(pool: &PgPool, id: Uuid) -> serde_json::Value {
+        sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// An older deployment turning healthy after a newer one already serves
+    /// (or was selected as the target) is retired instead of taking over.
     #[sqlx::test]
     async fn an_older_deployment_turning_healthy_is_retired_by_the_newer(pool: PgPool) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
-        let older = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000000",
-            "default",
-            DeploymentStatus::Deploying,
-        )
-        .await;
-        let newer = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000001",
-            "default",
-            DeploymentStatus::Healthy,
-        )
-        .await;
-        set_created_at(&pool, older.id, 10).await;
-        set_created_at(&pool, newer.id, 5).await;
+        for (i, newer_status, select_newer) in [
+            (0, DeploymentStatus::Healthy, false),
+            (1, DeploymentStatus::Deploying, true),
+        ] {
+            let group = format!("g{i}");
+            let older = seed_deployment(
+                &pool,
+                project_id,
+                user_id,
+                &format!("20261025-00000{i}"),
+                &group,
+                DeploymentStatus::Deploying,
+            )
+            .await;
+            let newer = seed_deployment(
+                &pool,
+                project_id,
+                user_id,
+                &format!("20261025-00001{i}"),
+                &group,
+                newer_status.clone(),
+            )
+            .await;
+            set_created_at(&pool, older.id, 10).await;
+            set_created_at(&pool, newer.id, 5).await;
+            if select_newer {
+                mark_as_active(&pool, newer.id, project_id, &group)
+                    .await
+                    .unwrap();
+            }
 
-        let outcome = mark_healthy_and_supersede(&pool, older.id, project_id, "default")
+            let outcome = mark_healthy_and_supersede(&pool, older.id, project_id, &group)
+                .await
+                .unwrap();
+
+            assert!(outcome.became_healthy);
+            assert!(outcome.superseded.is_none());
+            assert_eq!(outcome.retired_by.map(|d| d.id), Some(newer.id));
+            let older_row = find_by_id(&pool, older.id).await.unwrap().unwrap();
+            assert_eq!(older_row.status, DeploymentStatus::Terminating);
+            assert_eq!(
+                older_row.termination_reason,
+                Some(TerminationReason::Superseded)
+            );
+            let newer_row = find_by_id(&pool, newer.id).await.unwrap().unwrap();
+            assert_eq!(newer_row.status, newer_status);
+            let superseded_by: serde_json::Value = sqlx::query_scalar(
+                "SELECT attributes->'superseded_by' FROM deployment_events
+                 WHERE deployment_id = $1 AND attributes->>'to' = 'Terminating'",
+            )
+            .bind(older.id)
+            .fetch_one(&pool)
             .await
             .unwrap();
-
-        assert!(outcome.became_healthy);
-        assert!(outcome.superseded.is_none());
-        assert_eq!(outcome.retired_by.map(|d| d.id), Some(newer.id));
-
-        let older_row = find_by_id(&pool, older.id).await.unwrap().unwrap();
-        assert_eq!(older_row.status, DeploymentStatus::Terminating);
-        assert_eq!(
-            older_row.termination_reason,
-            Some(TerminationReason::Superseded)
-        );
-        let newer_row = find_by_id(&pool, newer.id).await.unwrap().unwrap();
-        assert_eq!(newer_row.status, DeploymentStatus::Healthy);
-
-        let superseded_by: Option<serde_json::Value> = sqlx::query_scalar(
-            "SELECT attributes->'superseded_by' FROM deployment_events
-             WHERE deployment_id = $1 AND attributes->>'to' = 'Terminating'",
-        )
-        .bind(older.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            superseded_by,
-            Some(serde_json::json!({"kind": "deployment", "name": "20261025-000001"}))
-        );
-    }
-
-    #[sqlx::test]
-    async fn an_older_deployment_is_retired_by_a_newer_selected_target(pool: PgPool) {
-        let (project_id, user_id) = seed_project_and_user(&pool).await;
-        let older = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000000",
-            "default",
-            DeploymentStatus::Deploying,
-        )
-        .await;
-        let newer = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000001",
-            "default",
-            DeploymentStatus::Deploying,
-        )
-        .await;
-        set_created_at(&pool, older.id, 10).await;
-        set_created_at(&pool, newer.id, 5).await;
-        mark_as_active(&pool, newer.id, project_id, "default")
-            .await
-            .unwrap();
-
-        let outcome = mark_healthy_and_supersede(&pool, older.id, project_id, "default")
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.retired_by.map(|d| d.id), Some(newer.id));
+            assert_eq!(
+                superseded_by,
+                serde_json::json!({"kind": "deployment", "name": newer.deployment_id})
+            );
+        }
     }
 
     #[sqlx::test]
     async fn newer_healthy_supersedes_older_only(pool: PgPool) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
-        let oldest = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000000",
-            "default",
+        let mut ids = Vec::new();
+        for (i, status) in [
             DeploymentStatus::Healthy,
-        )
-        .await;
-        let middle = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000001",
-            "default",
             DeploymentStatus::Deploying,
-        )
-        .await;
-        let newest = seed_deployment(
-            &pool,
-            project_id,
-            user_id,
-            "20261025-000002",
-            "default",
             DeploymentStatus::Deploying,
-        )
-        .await;
-        set_created_at(&pool, oldest.id, 15).await;
-        set_created_at(&pool, middle.id, 10).await;
-        set_created_at(&pool, newest.id, 5).await;
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let name = format!("20261025-00000{i}");
+            let d = seed_deployment(&pool, project_id, user_id, &name, "default", status).await;
+            set_created_at(&pool, d.id, 15 - 5 * i as i32).await;
+            ids.push(d.id);
+        }
+        let (oldest, middle, newest) = (ids[0], ids[1], ids[2]);
 
-        let outcome = mark_healthy_and_supersede(&pool, middle.id, project_id, "default")
+        let outcome = mark_healthy_and_supersede(&pool, middle, project_id, "default")
             .await
             .unwrap();
 
         assert!(outcome.became_healthy);
         assert!(outcome.retired_by.is_none());
-        assert_eq!(outcome.superseded.map(|d| d.id), Some(oldest.id));
+        assert_eq!(outcome.superseded.map(|d| d.id), Some(oldest));
+        let pool = &pool;
+        let status = |id| async move { find_by_id(pool, id).await.unwrap().unwrap().status };
         assert_eq!(
-            find_by_id(&pool, newest.id).await.unwrap().unwrap().status,
+            status(newest).await,
             DeploymentStatus::Deploying,
             "a newer deployment still rolling out is never touched"
         );
-        assert_eq!(
-            find_by_id(&pool, middle.id).await.unwrap().unwrap().status,
-            DeploymentStatus::Healthy
-        );
+        assert_eq!(status(middle).await, DeploymentStatus::Healthy);
     }
 
     #[sqlx::test]
@@ -4690,48 +4268,41 @@ mod tests {
         .await;
         assert!(d.unhealthy_since.is_none());
 
-        let first = mark_unhealthy(&pool, d.id, "probe failing".to_string())
-            .await
-            .unwrap()
-            .unwrap();
-        let since = first.unhealthy_since.expect("stamped on entry");
-
-        let again = mark_unhealthy(&pool, d.id, "still failing".to_string())
-            .await
-            .unwrap()
-            .unwrap();
+        let (pool_ref, id) = (&pool, d.id);
+        let unhealthy = move |reason: &str| {
+            let reason = reason.to_string();
+            async move {
+                mark_unhealthy(pool_ref, id, reason)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unhealthy_since
+            }
+        };
+        let since = unhealthy("probe failing").await.expect("stamped on entry");
         assert_eq!(
-            again.unhealthy_since,
+            unhealthy("still failing").await,
             Some(since),
             "staying Unhealthy keeps the original start"
         );
-
         let recovered = mark_healthy(&pool, d.id).await.unwrap().unwrap();
         assert!(recovered.unhealthy_since.is_none());
 
-        let via_update = update_status(&pool, d.id, DeploymentStatus::Unhealthy, None)
-            .await
-            .unwrap();
-        assert!(via_update.unhealthy_since.is_some());
-        let back = update_status(&pool, d.id, DeploymentStatus::Healthy, None)
-            .await
-            .unwrap();
-        assert!(back.unhealthy_since.is_none());
+        for (status, stamped) in [
+            (DeploymentStatus::Unhealthy, true),
+            (DeploymentStatus::Healthy, false),
+        ] {
+            let row = update_status(&pool, d.id, status, None).await.unwrap();
+            assert_eq!(row.unhealthy_since.is_some(), stamped);
+        }
 
-        mark_unhealthy(&pool, d.id, "again".to_string())
-            .await
-            .unwrap()
-            .unwrap();
+        unhealthy("again").await;
         let outcome = mark_healthy_and_supersede(&pool, d.id, project_id, "default")
             .await
             .unwrap();
         assert!(outcome.became_healthy);
-        assert!(find_by_id(&pool, d.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .unhealthy_since
-            .is_none());
+        let row = find_by_id(&pool, d.id).await.unwrap().unwrap();
+        assert!(row.unhealthy_since.is_none());
     }
 
     #[sqlx::test]
@@ -4739,16 +4310,19 @@ mod tests {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
         let production = crate::db::environments::test_environment_id(&pool, project_id).await;
         let staging = seed_environment(&pool, project_id, "staging", "staging", false).await;
-        let source = seed_full(
+        let source = create(
             &pool,
-            project_id,
-            user_id,
-            staging,
-            "20261025-000000",
-            "staging",
-            CreatedVia::Deploy,
-            None,
-            Some(5),
+            CreateDeploymentParams {
+                migration_version: Some(5),
+                ..test_params(
+                    project_id,
+                    user_id,
+                    staging,
+                    "20261025-000000",
+                    "staging",
+                    DeploymentStatus::Pushed,
+                )
+            },
         )
         .await
         .unwrap();
@@ -4762,34 +4336,21 @@ mod tests {
         let promoted = create(
             &pool,
             CreateDeploymentParams {
-                deployment_id: "20261025-000001",
-                project_id,
-                created_by_id: user_id,
-                status: DeploymentStatus::Pushed,
                 image: Some("registry.example/app@sha256:abc"),
-                image_digest: None,
                 rolled_back_from_deployment_id: Some(source.id),
-                deployment_group: "default",
-                environment_id: production,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
                 created_via: CreatedVia::Promote,
                 promoted_from_deployment_id: Some(source.id),
                 promoted_from_environment_id: Some(staging),
                 migration_version: source.migration_version,
-                rollback_guard_for_deployment_id: None,
                 extra_event_attributes: Some(&extra),
+                ..test_params(
+                    project_id,
+                    user_id,
+                    production,
+                    "20261025-000001",
+                    "default",
+                    DeploymentStatus::Pushed,
+                )
             },
         )
         .await
@@ -4800,12 +4361,7 @@ mod tests {
         assert_eq!(promoted.promoted_from_environment_id, Some(staging));
         assert_eq!(promoted.migration_version, Some(5));
 
-        let attrs: serde_json::Value =
-            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
-                .bind(promoted.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let attrs = creation_attrs(&pool, promoted.id).await;
         assert_eq!(attrs["to"], "Pushed");
         assert_eq!(attrs["created_via"], "promote");
         assert_eq!(
@@ -4817,13 +4373,10 @@ mod tests {
         assert_eq!(attrs["promotion_gate_bypassed"], true);
 
         // A plain deploy records no `created_via`.
-        let source_attrs: serde_json::Value =
-            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
-                .bind(source.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(source_attrs.get("created_via").is_none());
+        assert!(creation_attrs(&pool, source.id)
+            .await
+            .get("created_via")
+            .is_none());
 
         let provenance = crate::db::deployment_events::provenance_batch(&pool, &[promoted.id])
             .await
@@ -4841,75 +4394,47 @@ mod tests {
     async fn second_rollback_guard_candidate_for_same_subject_is_rejected(pool: PgPool) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
         let env = crate::db::environments::test_environment_id(&pool, project_id).await;
-        let subject = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000000",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let first = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000001",
-            "default",
-            CreatedVia::RollbackGuard,
-            Some(subject.id),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(first.rollback_guard_for_deployment_id, Some(subject.id));
+        let subject = seed_pushed(&pool, project_id, user_id, "20261025-000000", "default").await;
+        let pool_ref = &pool;
+        let candidate = move |name: &'static str, created_via, subject_id| async move {
+            create(
+                pool_ref,
+                CreateDeploymentParams {
+                    created_via,
+                    rollback_guard_for_deployment_id: Some(subject_id),
+                    ..test_params(
+                        project_id,
+                        user_id,
+                        env,
+                        name,
+                        "default",
+                        DeploymentStatus::Pushed,
+                    )
+                },
+            )
+            .await
+        };
 
-        let attrs: serde_json::Value =
-            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
-                .bind(first.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let first = candidate("20261025-000001", CreatedVia::RollbackGuard, subject.id)
+            .await
+            .unwrap();
+        assert_eq!(first.rollback_guard_for_deployment_id, Some(subject.id));
+        let attrs = creation_attrs(&pool, first.id).await;
         assert_eq!(attrs["created_via"], "rollback_guard");
         assert_eq!(
             attrs["rollback_guard_for"],
             serde_json::json!({"kind": "deployment", "name": "20261025-000000"})
         );
 
-        let err = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000002",
-            "default",
-            CreatedVia::RollbackGuard,
-            Some(subject.id),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = candidate("20261025-000002", CreatedVia::RollbackGuard, subject.id)
+            .await
+            .unwrap_err();
         assert!(is_rollback_guard_candidate_conflict(&err), "{err:?}");
 
         // Only a Rollback Guard deployment may name a subject.
-        let err = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000003",
-            "default",
-            CreatedVia::Deploy,
-            Some(first.id),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = candidate("20261025-000003", CreatedVia::Deploy, first.id)
+            .await
+            .unwrap_err();
         assert!(!is_rollback_guard_candidate_conflict(&err));
         assert!(
             format!("{err:?}").contains("deployments_rollback_guard_candidate_via"),
@@ -4920,40 +4445,33 @@ mod tests {
     #[sqlx::test]
     async fn find_last_served_before_picks_latest_served_older(pool: PgPool) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
-        let env = crate::db::environments::test_environment_id(&pool, project_id).await;
+        let staging = seed_environment(&pool, project_id, "staging", "staging", false).await;
         let mut ids = Vec::new();
-        for (i, name) in [
-            "20261025-000000", // served long ago
-            "20261025-000001", // served, the expected answer
-            "20261025-000002", // never healthy
-            "20261025-000003", // the sick one
-            "20261025-000004", // newer and served
+        for (i, (group, status, served)) in [
+            ("default", "Superseded", true), // served long ago
+            ("default", "Superseded", true), // served, the expected answer
+            ("default", "Failed", false),    // never healthy
+            ("canary", "Superseded", true),  // another group
+            ("default", "Superseded", true), // another environment (below)
+            ("default", "Unhealthy", true),  // the sick one
+            ("default", "Healthy", true),    // newer and served
         ]
         .into_iter()
         .enumerate()
         {
-            let d = seed_full(
-                &pool,
-                project_id,
-                user_id,
-                env,
-                name,
-                "default",
-                CreatedVia::Deploy,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-            set_created_at(&pool, d.id, 50 - 10 * i as i64).await;
+            let name = format!("20261025-00000{i}");
+            let d = seed_pushed(&pool, project_id, user_id, &name, group).await;
+            set_created_at(&pool, d.id, 70 - 10 * i as i32).await;
+            force_row(&pool, d.id, status, status == "Unhealthy", served, None).await;
             ids.push(d.id);
         }
-        force_row(&pool, ids[0], "Superseded", false, true, None).await;
-        force_row(&pool, ids[1], "Superseded", false, true, None).await;
-        force_row(&pool, ids[2], "Failed", false, false, None).await;
-        force_row(&pool, ids[3], "Unhealthy", true, true, Some(10)).await;
-        force_row(&pool, ids[4], "Healthy", false, true, None).await;
-        let sick = find_by_id(&pool, ids[3]).await.unwrap().unwrap();
+        sqlx::query("UPDATE deployments SET environment_id = $1 WHERE id = $2")
+            .bind(staging)
+            .bind(ids[4])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sick = find_by_id(&pool, ids[5]).await.unwrap().unwrap();
 
         let lkg = find_last_served_before(&pool, &sick).await.unwrap();
         assert_eq!(lkg.map(|d| d.id), Some(ids[1]));
@@ -4964,69 +4482,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(lkg.id, ids[1]);
-        assert_eq!(lkg.status, DeploymentStatus::Stopped);
+        assert_eq!((lkg.id, lkg.status), (ids[1], DeploymentStatus::Stopped));
 
         // Nothing served before the oldest.
         let oldest = find_by_id(&pool, ids[0]).await.unwrap().unwrap();
         assert!(find_last_served_before(&pool, &oldest)
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[sqlx::test]
-    async fn find_last_served_before_stays_in_environment_and_group(pool: PgPool) {
-        let (project_id, user_id) = seed_project_and_user(&pool).await;
-        let env = crate::db::environments::test_environment_id(&pool, project_id).await;
-        let staging = seed_environment(&pool, project_id, "staging", "staging", false).await;
-        let other_env = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            staging,
-            "20261025-000000",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let other_group = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000001",
-            "canary",
-            CreatedVia::Deploy,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let sick = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000002",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        set_created_at(&pool, other_env.id, 30).await;
-        set_created_at(&pool, other_group.id, 20).await;
-        set_created_at(&pool, sick.id, 10).await;
-        force_row(&pool, other_env.id, "Superseded", false, true, None).await;
-        force_row(&pool, other_group.id, "Superseded", false, true, None).await;
-        let sick = find_by_id(&pool, sick.id).await.unwrap().unwrap();
-
-        assert!(find_last_served_before(&pool, &sick)
             .await
             .unwrap()
             .is_none());
@@ -5038,36 +4498,31 @@ mod tests {
         let env = crate::db::environments::test_environment_id(&pool, project_id).await;
         assert_eq!(migration_high_water(&pool, env).await.unwrap(), None);
 
-        let started = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000000",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            Some(4),
-        )
-        .await
-        .unwrap();
-        // Never reached Deploying: its migrations cannot have run.
-        seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000001",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            Some(9),
-        )
-        .await
-        .unwrap();
+        let mut seeded = Vec::new();
+        for (name, version) in [("20261025-000000", 4), ("20261025-000001", 9)] {
+            let p = test_params(
+                project_id,
+                user_id,
+                env,
+                name,
+                "default",
+                DeploymentStatus::Pushed,
+            );
+            let d = create(
+                &pool,
+                CreateDeploymentParams {
+                    migration_version: Some(version),
+                    ..p
+                },
+            )
+            .await
+            .unwrap();
+            seeded.push(d.id);
+        }
+        // Neither reached Deploying: their migrations cannot have run.
         assert_eq!(migration_high_water(&pool, env).await.unwrap(), None);
 
-        update_status(&pool, started.id, DeploymentStatus::Deploying, None)
+        update_status(&pool, seeded[0], DeploymentStatus::Deploying, None)
             .await
             .unwrap();
         assert_eq!(migration_high_water(&pool, env).await.unwrap(), Some(4));
@@ -5079,83 +4534,79 @@ mod tests {
     ) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
         let env = crate::db::environments::test_environment_id(&pool, project_id).await;
-        let seed = |name: &'static str, group: &'static str| {
-            let pool = pool.clone();
-            async move {
-                seed_full(
-                    &pool,
-                    project_id,
-                    user_id,
-                    env,
-                    name,
-                    group,
-                    CreatedVia::Deploy,
-                    None,
-                    None,
-                )
+        let mut seeded = Vec::new();
+        for (name, group, unhealthy_minutes) in [
+            ("20261025-000000", "default", 30), // the subject
+            ("20261025-000001", "fresh", 1),    // under the timeout
+            ("20261025-000002", "preview", 30), // a preview group is not guarded
+        ] {
+            let d = seed_pushed(&pool, project_id, user_id, name, group).await;
+            force_row(
+                &pool,
+                d.id,
+                "Unhealthy",
+                true,
+                true,
+                Some(unhealthy_minutes),
+            )
+            .await;
+            seeded.push(d);
+        }
+        let subject = &seeded[0];
+        let pool_ref = &pool;
+        let subject_ids = move || async move {
+            list_rollback_guard_subjects(pool_ref)
                 .await
                 .unwrap()
-            }
+                .into_iter()
+                .map(|s| s.deployment.id)
+                .collect::<Vec<_>>()
         };
 
-        // Long unhealthy, active, primary group: the subject.
-        let subject = seed("20261025-000000", "default").await;
-        force_row(&pool, subject.id, "Unhealthy", true, true, Some(30)).await;
-        // Unhealthy for less than the timeout.
-        let fresh = seed("20261025-000001", "fresh").await;
-        force_row(&pool, fresh.id, "Unhealthy", true, true, Some(1)).await;
-        // A preview group is not guarded.
-        let preview = seed("20261025-000002", "preview").await;
-        force_row(&pool, preview.id, "Unhealthy", true, true, Some(30)).await;
-
         // Guard disabled: nothing qualifies.
-        assert!(list_rollback_guard_subjects(&pool)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(subject_ids().await.is_empty());
 
         crate::db::environments::update_promotion_policy(&pool, env, None, Some(true), Some(300))
             .await
             .unwrap();
         let subjects = list_rollback_guard_subjects(&pool).await.unwrap();
-        assert_eq!(
-            subjects.iter().map(|s| s.deployment.id).collect::<Vec<_>>(),
-            vec![subject.id]
-        );
-        assert_eq!(subjects[0].timeout_seconds, 300);
-        assert_eq!(subjects[0].environment_name, "production");
-        assert_eq!(
-            subjects[0].project_name,
-            format!("test-project-{project_id}")
-        );
+        assert_eq!(subjects.len(), 1);
+        let s = &subjects[0];
+        assert_eq!(s.deployment.id, subject.id);
+        assert_eq!(s.timeout_seconds, 300);
+        assert_eq!(s.environment_name, "production");
+        assert_eq!(s.project_name, format!("test-project-{project_id}"));
 
         // Once a candidate exists, the subject is no longer listed.
-        let candidate = seed_full(
+        let candidate = create(
             &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000003",
-            "default",
-            CreatedVia::RollbackGuard,
-            Some(subject.id),
-            None,
+            CreateDeploymentParams {
+                created_via: CreatedVia::RollbackGuard,
+                rollback_guard_for_deployment_id: Some(subject.id),
+                ..test_params(
+                    project_id,
+                    user_id,
+                    env,
+                    "20261025-000003",
+                    "default",
+                    DeploymentStatus::Pushed,
+                )
+            },
         )
         .await
         .unwrap();
-        assert!(list_rollback_guard_subjects(&pool)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(subject_ids().await.is_empty());
 
         let open = list_open_rollback_guard_candidates(&pool).await.unwrap();
-        assert_eq!(open.len(), 1);
-        assert_eq!((open[0].0.id, open[0].1.id), (candidate.id, subject.id));
+        assert_eq!(
+            open.iter().map(|(c, s)| (c.id, s.id)).collect::<Vec<_>>(),
+            vec![(candidate.id, subject.id)]
+        );
         assert_eq!(
             count_open_rollback_guard_candidates(&pool).await.unwrap(),
             1
         );
-        assert!(exists_newer_non_terminal_in_group(&pool, &subject)
+        assert!(exists_newer_non_terminal_in_group(&pool, subject)
             .await
             .unwrap());
 
@@ -5163,21 +4614,27 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let failed =
-            list_failed_rollback_guard_candidates(&pool, Utc::now() - chrono::Duration::hours(1))
-                .await
-                .unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].1.id, subject.id);
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let failed = list_failed_rollback_guard_candidates(&pool, since)
+            .await
+            .unwrap();
+        assert_eq!(
+            failed.iter().map(|(c, s)| (c.id, s.id)).collect::<Vec<_>>(),
+            vec![(candidate.id, subject.id)]
+        );
+        assert!(list_open_rollback_guard_candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(
             count_open_rollback_guard_candidates(&pool).await.unwrap(),
             0
         );
-        assert!(!exists_newer_non_terminal_in_group(&pool, &subject)
+        assert!(!exists_newer_non_terminal_in_group(&pool, subject)
             .await
             .unwrap());
 
-        // `subject`, `fresh` and `preview` are active and Unhealthy.
+        // All three seeded deployments are active and Unhealthy.
         assert_eq!(active_health_counts(&pool).await.unwrap(), (0, 3));
     }
 
@@ -5185,75 +4642,35 @@ mod tests {
     async fn lock_rollback_guard_subject_rejects_recovered(pool: PgPool) {
         let (project_id, user_id) = seed_project_and_user(&pool).await;
         let env = crate::db::environments::test_environment_id(&pool, project_id).await;
-        let subject = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000000",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let subject = seed_pushed(&pool, project_id, user_id, "20261025-000000", "default").await;
         force_row(&pool, subject.id, "Unhealthy", true, true, Some(30)).await;
+        let (pool_ref, subject_id) = (&pool, subject.id);
+        let locks = move |timeout| async move {
+            let mut tx = pool_ref.begin().await.unwrap();
+            let locked = lock_rollback_guard_subject(&mut tx, subject_id, timeout)
+                .await
+                .unwrap();
+            tx.rollback().await.unwrap();
+            locked.is_some()
+        };
 
-        // The guard is disabled by default.
-        let mut tx = pool.begin().await.unwrap();
-        assert!(lock_rollback_guard_subject(&mut tx, subject.id, 300)
-            .await
-            .unwrap()
-            .is_none());
-        tx.rollback().await.unwrap();
+        assert!(!locks(300).await, "the guard is disabled by default");
         crate::db::environments::update_promotion_policy(&pool, env, None, Some(true), Some(300))
             .await
             .unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let locked = lock_rollback_guard_subject(&mut tx, subject.id, 300)
-            .await
-            .unwrap();
-        assert_eq!(locked.map(|d| d.id), Some(subject.id));
-        // Not yet past a longer timeout.
-        assert!(lock_rollback_guard_subject(&mut tx, subject.id, 3600)
-            .await
-            .unwrap()
-            .is_none());
-        tx.rollback().await.unwrap();
+        assert!(locks(300).await);
+        assert!(!locks(3600).await, "not yet past a longer timeout");
 
         // A newer non-terminal deployment in the group is a human fix in progress.
-        let fix = seed_full(
-            &pool,
-            project_id,
-            user_id,
-            env,
-            "20261025-000001",
-            "default",
-            CreatedVia::Deploy,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        assert!(lock_rollback_guard_subject(&mut tx, subject.id, 300)
-            .await
-            .unwrap()
-            .is_none());
-        tx.rollback().await.unwrap();
+        let fix = seed_pushed(&pool, project_id, user_id, "20261025-000001", "default").await;
+        assert!(!locks(300).await);
         mark_failed(&pool, fix.id, "build failed")
             .await
             .unwrap()
             .unwrap();
+        assert!(locks(300).await);
 
         mark_healthy(&pool, subject.id).await.unwrap().unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        assert!(lock_rollback_guard_subject(&mut tx, subject.id, 300)
-            .await
-            .unwrap()
-            .is_none());
-        tx.rollback().await.unwrap();
+        assert!(!locks(300).await);
     }
 }

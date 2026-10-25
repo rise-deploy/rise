@@ -1,10 +1,9 @@
--- ADR-0007 Phase 2: the Rollback Guard.
+-- ADR-0007: the Rollback Guard.
 ALTER TABLE deployments
-    -- When the deployment last moved into Unhealthy; NULL while Healthy. Unlike
-    -- first_healthy_at it resets on recovery, so it measures *continuous*
-    -- unhealthiness.
+    -- When the deployment last moved into Unhealthy; NULL while Healthy. Resets
+    -- on recovery, so it measures *continuous* unhealthiness.
     ADD COLUMN unhealthy_since TIMESTAMPTZ,
-    -- Set only on a Rollback Guard replacement: the unhealthy deployment it replaces.
+    -- Set only on a Rollback Guard replacement: the deployment it replaces.
     ADD COLUMN rollback_guard_for_deployment_id UUID REFERENCES deployments(id) ON DELETE SET NULL,
     ADD CONSTRAINT deployments_rollback_guard_candidate_via
         CHECK (rollback_guard_for_deployment_id IS NULL OR created_via = 'rollback_guard');

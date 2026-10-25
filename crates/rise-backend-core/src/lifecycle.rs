@@ -231,10 +231,7 @@ pub async fn handle_deployment_became_healthy(
     }
 
     if let Some(newer) = outcome.retired_by {
-        // A deployment created after this one already serves (or is the
-        // group's selected target): the store retired this one on the spot
-        // instead of letting it take over. It never becomes active, and the
-        // newer deployment is left alone.
+        // A newer deployment already serves: the store retired this one.
         info!(
             "Deployment {} became healthy after the newer {} in group '{}'; retiring it instead of activating it",
             deployment.deployment_id, newer.deployment_id, deployment.deployment_group
@@ -274,10 +271,7 @@ pub async fn handle_deployment_became_healthy(
     // deployment currently sitting in `Unhealthy` (not covered by the atomic
     // write above, which only supersedes a `Healthy` predecessor) the next
     // time some deployment in the group becomes healthy.
-    //
-    // Only deployments created before this one are retired: creation order
-    // decides which of two deployments wins, never the order in which they
-    // happened to become healthy.
+    // Only deployments created before this one are retired.
     let others = store
         .find_non_terminal_deployments_for_project_and_group(
             project.id,
@@ -396,12 +390,9 @@ pub async fn restore_traefik_predecessor_if_interrupted(
 /// predecessor healthy and intact. Returns `true` when the deployment was
 /// already selected and the caller may verify Traefik's applied router state.
 ///
-/// A deployment never takes routing from a *newer* active one: when the
-/// group's active deployment was created after `deployment` and is not on its
-/// way out (`Terminating`/`Cancelling`), this one is
-/// handed to [`handle_deployment_became_healthy`], whose creation-order fence
-/// retires it, and `false` is returned. `hook` is passed through for that
-/// retirement.
+/// A deployment never takes routing from a *newer* active one that is not on
+/// its way out: it is handed to [`handle_deployment_became_healthy`] instead,
+/// whose creation-order fence retires it (running `hook`).
 pub async fn prepare_traefik_cutover(
     store: &dyn DeploymentStore,
     hook: Option<&dyn SupersededHook>,
@@ -537,6 +528,19 @@ mod tests {
 
     /// A minimal in-memory `DeploymentStore` recording every call, just
     /// enough to assert the transition logic without a database.
+    #[derive(Default)]
+    struct RecordingHook {
+        called_with: Mutex<Option<Uuid>>,
+    }
+
+    #[async_trait]
+    impl SupersededHook for RecordingHook {
+        async fn on_superseded(&self, _project: &Project, superseded: &Deployment) -> Result<()> {
+            *self.called_with.lock().unwrap() = Some(superseded.id);
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct FakeStore {
         calls: Mutex<Vec<String>>,
@@ -783,7 +787,6 @@ mod tests {
             _project_id: Uuid,
             _deployment_group: &str,
         ) -> Result<()> {
-            self.calls.lock().unwrap().push("mark_active".to_string());
             self.calls
                 .lock()
                 .unwrap()
@@ -943,26 +946,11 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.starts_with(&format!("terminating:{}", old_active.id))));
-        assert!(calls.contains(&"mark_active".to_string()));
+        assert!(calls.iter().any(|c| c.starts_with("mark_active")));
     }
 
     #[tokio::test]
     async fn the_superseded_hook_runs_after_the_old_deployment_is_marked_terminating() {
-        struct RecordingHook {
-            called_with: Mutex<Option<Uuid>>,
-        }
-        #[async_trait]
-        impl SupersededHook for RecordingHook {
-            async fn on_superseded(
-                &self,
-                _project: &Project,
-                superseded: &Deployment,
-            ) -> Result<()> {
-                *self.called_with.lock().unwrap() = Some(superseded.id);
-                Ok(())
-            }
-        }
-
         let store = FakeStore::default();
         let project = project();
         let new = deployment(DeploymentStatus::Deploying);
@@ -972,9 +960,7 @@ mod tests {
             (project.id, new.deployment_group.clone()),
             old_active.clone(),
         );
-        let hook = RecordingHook {
-            called_with: Mutex::new(None),
-        };
+        let hook = RecordingHook::default();
 
         handle_deployment_became_healthy(&store, Some(&hook), &project, &new)
             .await
@@ -1044,21 +1030,6 @@ mod tests {
 
     #[tokio::test]
     async fn when_the_atomic_write_is_rejected_nothing_else_happens() {
-        struct RecordingHook {
-            called_with: Mutex<Option<Uuid>>,
-        }
-        #[async_trait]
-        impl SupersededHook for RecordingHook {
-            async fn on_superseded(
-                &self,
-                _project: &Project,
-                superseded: &Deployment,
-            ) -> Result<()> {
-                *self.called_with.lock().unwrap() = Some(superseded.id);
-                Ok(())
-            }
-        }
-
         let store = FakeStore::default();
         *store.reject_healthy.lock().unwrap() = true;
         let project = project();
@@ -1070,9 +1041,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert((project.id, new.deployment_group.clone()), old_active);
-        let hook = RecordingHook {
-            called_with: Mutex::new(None),
-        };
+        let hook = RecordingHook::default();
 
         handle_deployment_became_healthy(&store, Some(&hook), &project, &new)
             .await
@@ -1120,21 +1089,6 @@ mod tests {
 
     #[tokio::test]
     async fn retired_by_skips_activation_and_runs_hook() {
-        struct RecordingHook {
-            called_with: Mutex<Option<Uuid>>,
-        }
-        #[async_trait]
-        impl SupersededHook for RecordingHook {
-            async fn on_superseded(
-                &self,
-                _project: &Project,
-                superseded: &Deployment,
-            ) -> Result<()> {
-                *self.called_with.lock().unwrap() = Some(superseded.id);
-                Ok(())
-            }
-        }
-
         let store = FakeStore::default();
         let project = project();
         let mut old = deployment(DeploymentStatus::Deploying);
@@ -1150,9 +1104,7 @@ mod tests {
             (project.id, old.deployment_group.clone()),
             vec![sibling.clone(), newer.clone()],
         );
-        let hook = RecordingHook {
-            called_with: Mutex::new(None),
-        };
+        let hook = RecordingHook::default();
 
         handle_deployment_became_healthy(&store, Some(&hook), &project, &old)
             .await
@@ -1170,89 +1122,58 @@ mod tests {
         assert_eq!(*hook.called_with.lock().unwrap(), Some(old.id));
     }
 
+    /// A ready deployment cuts over unless the group's active deployment is
+    /// newer and not on its way out; then it is retired instead.
     #[tokio::test]
-    async fn older_ready_deployment_does_not_steal_traefik_cutover() {
-        let store = FakeStore::default();
-        let project = project();
-        let mut old = deployment(DeploymentStatus::Deploying);
-        old.created_at = Utc::now() - chrono::Duration::minutes(5);
-        old.controller_metadata = serde_json::json!({});
-        let mut newer = deployment(DeploymentStatus::Healthy);
-        newer.deployment_group = old.deployment_group.clone();
-        newer.is_active = true;
-        store.siblings_in_group.lock().unwrap().insert(
-            (project.id, old.deployment_group.clone()),
-            vec![newer.clone(), old.clone()],
-        );
-        *store.retired_by.lock().unwrap() = Some(newer.clone());
+    async fn traefik_cutover_respects_creation_order() {
+        for (ready_is_older, active_status, cuts_over) in [
+            (true, DeploymentStatus::Healthy, false),
+            (true, DeploymentStatus::Cancelling, true),
+            (false, DeploymentStatus::Healthy, true),
+        ] {
+            let store = FakeStore::default();
+            let project = project();
+            let mut ready = deployment(DeploymentStatus::Deploying);
+            ready.controller_metadata = serde_json::json!({});
+            let mut active = deployment(active_status.clone());
+            active.deployment_group = ready.deployment_group.clone();
+            active.is_active = true;
+            let five_minutes_ago = Utc::now() - chrono::Duration::minutes(5);
+            if ready_is_older {
+                ready.created_at = five_minutes_ago;
+            } else {
+                active.created_at = five_minutes_ago;
+            }
+            store.siblings_in_group.lock().unwrap().insert(
+                (project.id, ready.deployment_group.clone()),
+                vec![active.clone(), ready.clone()],
+            );
+            *store.retired_by.lock().unwrap() = Some(active.clone());
 
-        let selected = prepare_traefik_cutover(&store, None, &project, &old)
-            .await
-            .unwrap();
+            let selected = prepare_traefik_cutover(&store, None, &project, &ready)
+                .await
+                .unwrap();
 
-        assert!(!selected);
-        let calls = store.calls.lock().unwrap();
-        assert!(
-            !calls.iter().any(|c| c.starts_with("mark_active")),
-            "an older deployment must never be marked active over a newer one: {calls:?}"
-        );
-        assert!(!calls.iter().any(|c| c.starts_with("update_metadata")));
-        assert!(calls
-            .iter()
-            .any(|c| c.starts_with(&format!("terminating:{}", old.id))));
-    }
-
-    #[tokio::test]
-    async fn older_ready_deployment_takes_cutover_from_cancelling_newer() {
-        let store = FakeStore::default();
-        let project = project();
-        let mut old = deployment(DeploymentStatus::Deploying);
-        old.created_at = Utc::now() - chrono::Duration::minutes(5);
-        old.controller_metadata = serde_json::json!({});
-        let mut newer = deployment(DeploymentStatus::Cancelling);
-        newer.deployment_group = old.deployment_group.clone();
-        newer.is_active = true;
-        store.siblings_in_group.lock().unwrap().insert(
-            (project.id, old.deployment_group.clone()),
-            vec![newer.clone(), old.clone()],
-        );
-
-        prepare_traefik_cutover(&store, None, &project, &old)
-            .await
-            .unwrap();
-
-        let calls = store.calls.lock().unwrap();
-        assert!(
-            calls.iter().any(|c| c.starts_with("mark_active")),
-            "a newer deployment on its way out must not block cutover: {calls:?}"
-        );
-        assert!(!calls
-            .iter()
-            .any(|c| c.starts_with(&format!("terminating:{}", old.id))));
-    }
-
-    #[tokio::test]
-    async fn newer_ready_deployment_takes_traefik_cutover_from_older() {
-        let store = FakeStore::default();
-        let project = project();
-        let mut old = deployment(DeploymentStatus::Healthy);
-        old.created_at = Utc::now() - chrono::Duration::minutes(5);
-        old.is_active = true;
-        let mut newer = deployment(DeploymentStatus::Deploying);
-        newer.deployment_group = old.deployment_group.clone();
-        newer.controller_metadata = serde_json::json!({});
-        store.siblings_in_group.lock().unwrap().insert(
-            (project.id, old.deployment_group.clone()),
-            vec![old.clone(), newer.clone()],
-        );
-
-        let selected = prepare_traefik_cutover(&store, None, &project, &newer)
-            .await
-            .unwrap();
-
-        assert!(!selected);
-        let calls = store.calls.lock().unwrap();
-        assert!(calls.contains(&format!("update_metadata:{}", newer.id)));
-        assert!(calls.contains(&format!("mark_active:{}", newer.id)));
+            assert!(!selected);
+            let calls = store.calls.lock().unwrap();
+            let case = format!("older={ready_is_older} active={active_status:?}: {calls:?}");
+            assert_eq!(
+                calls.contains(&format!("mark_active:{}", ready.id)),
+                cuts_over,
+                "{case}"
+            );
+            assert_eq!(
+                calls.contains(&format!("update_metadata:{}", ready.id)),
+                cuts_over,
+                "{case}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with(&format!("terminating:{}", ready.id))),
+                !cuts_over,
+                "{case}"
+            );
+        }
     }
 }

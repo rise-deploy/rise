@@ -78,9 +78,7 @@ pub struct UpdateEnvironmentRequest {
 /// A partial update of an environment's Rollback Guard.
 #[derive(Debug, Deserialize, Default)]
 pub struct RollbackGuardUpdate {
-    #[serde(default)]
     pub enabled: Option<bool>,
-    #[serde(default)]
     pub unhealthy_timeout_seconds: Option<u32>,
 }
 
@@ -108,25 +106,22 @@ pub struct EnvironmentResponse {
 }
 
 impl EnvironmentResponse {
-    /// Build the response for `env`, resolving its promotion source's name
-    /// among `all`, the project's environments.
+    /// The response for `env`, resolving its promotion source's name among
+    /// `all`, the project's environments (which [`From`] leaves unset).
     pub fn with_names(
-        env: crate::db::models::Environment,
+        env: &crate::db::models::Environment,
         all: &[crate::db::models::Environment],
     ) -> Self {
-        let promotion_source_environment = env
-            .promotion_source_environment_id
-            .and_then(|id| all.iter().find(|e| e.id == id))
-            .map(|e| e.name.clone());
-        let mut response = Self::from(env);
-        response.promotion_source_environment = promotion_source_environment;
-        response
+        Self {
+            promotion_source_environment: env
+                .promotion_source_environment_id
+                .and_then(|id| all.iter().find(|e| e.id == id))
+                .map(|e| e.name.clone()),
+            ..Self::from(env.clone())
+        }
     }
 }
 
-/// Converts without resolving the promotion source's name, which needs the
-/// project's other environments; use [`EnvironmentResponse::with_names`]
-/// wherever one may be set.
 impl From<crate::db::models::Environment> for EnvironmentResponse {
     fn from(env: crate::db::models::Environment) -> Self {
         // Only include constraints if at least one field is set
@@ -203,36 +198,31 @@ mod tests {
     }
 
     #[test]
-    fn update_request_promotion_source_distinguishes_absent_null_and_value() {
-        let req: UpdateEnvironmentRequest = serde_json::from_str("{}").unwrap();
+    fn update_request_promotion_policy_fields() {
+        let parse = |json| serde_json::from_str::<UpdateEnvironmentRequest>(json).unwrap();
+        let req = parse("{}");
         assert_eq!(req.promotion_source_environment, None);
         assert!(req.rollback_guard.is_none());
-
-        let req: UpdateEnvironmentRequest =
-            serde_json::from_str(r#"{"promotion_source_environment": null}"#).unwrap();
-        assert_eq!(req.promotion_source_environment, Some(None));
-
-        let req: UpdateEnvironmentRequest =
-            serde_json::from_str(r#"{"promotion_source_environment": "staging"}"#).unwrap();
+        let src = |json| parse(json).promotion_source_environment;
+        assert_eq!(src(r#"{"promotion_source_environment": null}"#), Some(None));
         assert_eq!(
-            req.promotion_source_environment,
+            src(r#"{"promotion_source_environment": "staging"}"#),
             Some(Some("staging".to_string()))
         );
-    }
 
-    #[test]
-    fn update_request_rollback_guard_fields_are_optional() {
-        let req: UpdateEnvironmentRequest =
-            serde_json::from_str(r#"{"rollback_guard": {"enabled": true}}"#).unwrap();
-        let guard = req.rollback_guard.unwrap();
-        assert_eq!(guard.enabled, Some(true));
-        assert_eq!(guard.unhealthy_timeout_seconds, None);
-
-        let req: UpdateEnvironmentRequest =
-            serde_json::from_str(r#"{"rollback_guard": {"unhealthy_timeout_seconds": 600}}"#)
-                .unwrap();
-        let guard = req.rollback_guard.unwrap();
-        assert_eq!(guard.enabled, None);
-        assert_eq!(guard.unhealthy_timeout_seconds, Some(600));
+        let guard = parse(r#"{"rollback_guard": {"enabled": true}}"#)
+            .rollback_guard
+            .unwrap();
+        assert_eq!(
+            (guard.enabled, guard.unhealthy_timeout_seconds),
+            (Some(true), None)
+        );
+        let guard = parse(r#"{"rollback_guard": {"unhealthy_timeout_seconds": 600}}"#)
+            .rollback_guard
+            .unwrap();
+        assert_eq!(
+            (guard.enabled, guard.unhealthy_timeout_seconds),
+            (None, Some(600))
+        );
     }
 }

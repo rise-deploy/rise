@@ -386,44 +386,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_migration_version_parses_and_defaults_to_none() {
-        let config: ProjectBuildConfig = toml::from_str(
-            r#"
-            version = 1
-            [project]
-            name = "app"
-            migration_version = 5
-        "#,
-        )
-        .unwrap();
-        assert_eq!(config.project.unwrap().migration_version, Some(5));
-
-        let config: ProjectBuildConfig = toml::from_str(
-            r#"
-            [project]
-            name = "app"
-        "#,
-        )
-        .unwrap();
-        let project = config.project.unwrap();
+    fn project_migration_version_is_optional_and_non_negative() {
+        let parse = |extra: &str| {
+            toml::from_str::<ProjectBuildConfig>(&format!("[project]\nname = \"app\"\n{extra}"))
+        };
+        let project = parse("migration_version = 5").unwrap().project.unwrap();
+        assert_eq!(project.migration_version, Some(5));
+        let project = parse("").unwrap().project.unwrap();
         assert_eq!(project.migration_version, None);
         let rendered = toml::to_string(&project).unwrap();
         assert!(
             !rendered.contains("migration_version"),
             "an undeclared version is not written back: {rendered}"
         );
-    }
-
-    #[test]
-    fn project_migration_version_rejects_negative_values() {
-        let result: Result<ProjectBuildConfig, _> = toml::from_str(
-            r#"
-            [project]
-            name = "app"
-            migration_version = -1
-        "#,
-        );
-        assert!(result.is_err());
+        assert!(parse("migration_version = -1").is_err());
     }
 
     #[test]

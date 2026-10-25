@@ -148,25 +148,21 @@ pub fn validate_memory_range(value: &str, min: &str, max: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clamp a fixed or `request-limit` value into `[min, max]`.
-///
-/// The request is clamped into `[min, max]` and the limit into
-/// `[request', max]`, so the result always satisfies
-/// `min <= request <= limit <= max`. A side moved onto a bound takes that
-/// bound's string verbatim. The result is the fixed form when request and
-/// limit end up equal, `request-limit` otherwise; the `bool` says whether
-/// anything changed (an unchanged value is returned exactly as given).
+/// Clamp a fixed or `request-limit` value into `[min, max]`: the request into
+/// `[min, max]`, the limit into `[request', max]`. A side moved onto a bound
+/// takes that bound's string verbatim; equal sides collapse to the fixed form.
+/// The `bool` says whether anything changed (an unchanged value is returned as
+/// given).
 fn clamp_to_range(
     value: &str,
     min: &str,
     max: &str,
     kind: &str,
-    split: impl Fn(&str) -> Result<(String, String)>,
     parse: impl Fn(&str) -> Result<u64>,
 ) -> Result<(String, bool)> {
-    let (req, lim) = split(value).with_context(|| format!("invalid {kind} value: {value}"))?;
-    let req_v = parse(&req)?;
-    let lim_v = parse(&lim)?;
+    let (req, lim) = split_request_limit(value, kind, &parse)
+        .with_context(|| format!("invalid {kind} value: {value}"))?;
+    let (req_v, lim_v) = (parse(&req)?, parse(&lim)?);
     let lo = parse(min).with_context(|| format!("invalid min {kind}: {min}"))?;
     let hi = parse(max).with_context(|| format!("invalid max {kind}: {max}"))?;
     if lo > hi {
@@ -174,55 +170,37 @@ fn clamp_to_range(
     }
 
     let (new_req, new_req_v) = if req_v < lo {
-        (min.to_string(), lo)
+        (min, lo)
     } else if req_v > hi {
-        (max.to_string(), hi)
+        (max, hi)
     } else {
-        (req.clone(), req_v)
+        (req.as_str(), req_v)
     };
     let (new_lim, new_lim_v) = if lim_v < new_req_v {
-        (new_req.clone(), new_req_v)
+        (new_req, new_req_v)
     } else if lim_v > hi {
-        (max.to_string(), hi)
+        (max, hi)
     } else {
-        (lim.clone(), lim_v)
+        (lim.as_str(), lim_v)
     };
 
-    if new_req_v == req_v && new_lim_v == lim_v {
-        return Ok((value.to_string(), false));
+    if (new_req_v, new_lim_v) == (req_v, lim_v) {
+        Ok((value.to_string(), false))
+    } else if new_req_v == new_lim_v {
+        Ok((new_req.to_string(), true))
+    } else {
+        Ok((format!("{new_req}-{new_lim}"), true))
     }
-    let clamped = if new_req_v == new_lim_v {
-        new_req
-    } else {
-        format!("{new_req}-{new_lim}")
-    };
-    Ok((clamped, true))
 }
 
-/// Clamp a CPU value (fixed or `request-limit` range) into `[min, max]`.
-/// See [`clamp_to_range`] for the rules; the `bool` is whether it changed.
+/// Clamp a CPU value into `[min, max]` (see [`clamp_to_range`]).
 pub fn clamp_cpu_to_range(value: &str, min: &str, max: &str) -> Result<(String, bool)> {
-    clamp_to_range(
-        value,
-        min,
-        max,
-        "CPU",
-        parse_cpu_request_limit,
-        parse_cpu_millicores,
-    )
+    clamp_to_range(value, min, max, "CPU", parse_cpu_millicores)
 }
 
-/// Clamp a memory value (fixed or `request-limit` range) into `[min, max]`.
-/// See [`clamp_to_range`] for the rules; the `bool` is whether it changed.
+/// Clamp a memory value into `[min, max]` (see [`clamp_to_range`]).
 pub fn clamp_memory_to_range(value: &str, min: &str, max: &str) -> Result<(String, bool)> {
-    clamp_to_range(
-        value,
-        min,
-        max,
-        "memory",
-        parse_memory_request_limit,
-        parse_memory_bytes,
-    )
+    clamp_to_range(value, min, max, "memory", parse_memory_bytes)
 }
 
 #[cfg(test)]
@@ -356,55 +334,38 @@ mod tests {
         assert!(validate_memory_range("32Mi-1Gi", "64Mi", "2Gi").is_err());
     }
 
-    #[test]
-    fn clamp_cpu_to_range_table() {
-        let cases: &[(&str, &str, bool)] = &[
-            // Fixed, within range: unchanged and verbatim.
-            ("500m", "500m", false),
-            // Range within bounds: unchanged.
-            ("250m-1", "250m-1", false),
-            // Fixed below min: raised to the min bound.
-            ("50m", "100m", true),
-            // Fixed above max: lowered to the max bound.
-            ("4", "2", true),
-            // Range whose limit exceeds max: limit lowered.
-            ("500m-3", "500m-2", true),
-            // Range whose request is below min: request raised.
-            ("50m-1", "100m-1", true),
-            // Range entirely below min collapses to the fixed min.
-            ("10m-50m", "100m", true),
-            // Range entirely above max collapses to the fixed max.
-            ("3-4", "2", true),
-        ];
-        for (value, expected, changed) in cases {
-            let got = clamp_cpu_to_range(value, "100m", "2").unwrap();
-            assert_eq!(
-                (got.0.as_str(), got.1),
-                (*expected, *changed),
-                "clamping {value}"
-            );
-            assert!(validate_cpu_range(&got.0, "100m", "2").is_ok());
-        }
-    }
+    type Clamp = fn(&str, &str, &str) -> Result<(String, bool)>;
+    type Validate = fn(&str, &str, &str) -> Result<()>;
 
     #[test]
-    fn clamp_memory_to_range_table() {
-        let cases: &[(&str, &str, bool)] = &[
-            ("256Mi", "256Mi", false),
-            ("64Mi-1Gi", "64Mi-1Gi", false),
-            ("32Mi", "64Mi", true),
-            ("4Gi", "2Gi", true),
-            ("128Mi-4Gi", "128Mi-2Gi", true),
-            ("16Mi-32Mi", "64Mi", true),
+    fn clamp_to_range_table() {
+        let cpu: (Clamp, Validate, &str, &str) =
+            (clamp_cpu_to_range, validate_cpu_range, "100m", "2");
+        let mem: (Clamp, Validate, &str, &str) =
+            (clamp_memory_to_range, validate_memory_range, "64Mi", "2Gi");
+        let cases = [
+            // Within range, fixed or ranged: unchanged and verbatim.
+            (cpu, "500m", "500m", false),
+            (cpu, "250m-1", "250m-1", false),
+            (mem, "64Mi-1Gi", "64Mi-1Gi", false),
+            // A fixed value moves onto the bound it crossed.
+            (cpu, "50m", "100m", true),
+            (cpu, "4", "2", true),
+            (mem, "32Mi", "64Mi", true),
+            (mem, "4Gi", "2Gi", true),
+            // One side of a range out of bounds: only that side moves.
+            (cpu, "500m-3", "500m-2", true),
+            (cpu, "50m-1", "100m-1", true),
+            (mem, "128Mi-4Gi", "128Mi-2Gi", true),
+            // A range entirely outside collapses to the fixed bound.
+            (cpu, "10m-50m", "100m", true),
+            (cpu, "3-4", "2", true),
+            (mem, "16Mi-32Mi", "64Mi", true),
         ];
-        for (value, expected, changed) in cases {
-            let got = clamp_memory_to_range(value, "64Mi", "2Gi").unwrap();
-            assert_eq!(
-                (got.0.as_str(), got.1),
-                (*expected, *changed),
-                "clamping {value}"
-            );
-            assert!(validate_memory_range(&got.0, "64Mi", "2Gi").is_ok());
+        for ((clamp, validate, min, max), value, expected, changed) in cases {
+            let (got, did_change) = clamp(value, min, max).unwrap();
+            assert_eq!((got.as_str(), did_change), (expected, changed), "{value}");
+            assert!(validate(&got, min, max).is_ok());
         }
     }
 

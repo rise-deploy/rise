@@ -865,19 +865,33 @@ struct MigrationBarrier {
     recorded_at: String,
 }
 
-/// Turn an error response into its message, tagged with its `error_code`.
-fn describe_error_body(body: &str) -> String {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return body.to_string();
-    };
-    match (
-        json.get("error").and_then(|e| e.as_str()),
-        json.get("error_code").and_then(|c| c.as_str()),
-    ) {
-        (Some(message), Some(code)) => format!("[{}] {}", code, message),
-        (Some(message), None) => message.to_string(),
-        _ => body.to_string(),
+/// Send a migration-barrier request and parse its response; `action` names it
+/// in errors ("record migration barrier").
+async fn migration_barrier_request<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    backend_url: &str,
+    action: &str,
+) -> Result<T> {
+    let response = request
+        .send_with_auth_hint(backend_url)
+        .await
+        .with_context(|| format!("Failed to {action}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Failed to {action} ({status}): {}",
+            crate::cli::deployment::describe_api_error(&body)
+        );
     }
+    response
+        .json()
+        .await
+        .with_context(|| format!("Failed to parse the response to {action}"))
+}
+
+fn migration_barriers_url(backend_url: &str, project: &str) -> String {
+    format!("{backend_url}/api/v1/projects/{project}/migration-barriers")
 }
 
 /// Record that code below `version` must not run against a database migrated
@@ -897,38 +911,19 @@ pub async fn add_migration_barrier(
     if reason.is_empty() {
         anyhow::bail!("--reason must not be empty");
     }
-    let url = format!(
-        "{}/api/v1/projects/{}/migration-barriers",
-        backend_url, project
-    );
-    let response = http_client
-        .post(&url)
+    let request = http_client
+        .post(migration_barriers_url(backend_url, project))
         .bearer_auth(token)
-        .json(&serde_json::json!({ "version": version, "reason": reason }))
-        .send_with_auth_hint(backend_url)
-        .await
-        .context("Failed to record migration barrier")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Failed to record migration barrier ({}): {}",
-            status,
-            describe_error_body(&body)
-        );
-    }
-    let barrier: MigrationBarrier = response
-        .json()
-        .await
-        .context("Failed to parse migration barrier response")?;
+        .json(&serde_json::json!({ "version": version, "reason": reason }));
+    let barrier: MigrationBarrier =
+        migration_barrier_request(request, backend_url, "record migration barrier").await?;
     println!(
         "✓ Recorded migration barrier v{} for project '{}': {}",
         barrier.version, project, barrier.reason
     );
     println!(
-        "  Deployments with a migration version below {} can no longer be rolled back or promoted into an environment at v{} or above without --force.",
-        barrier.version, barrier.version
+        "  Deployments with a migration version below {v} can no longer be rolled back or promoted into an environment at v{v} or above without --force.",
+        v = barrier.version
     );
     Ok(())
 }
@@ -940,31 +935,11 @@ pub async fn list_migration_barriers(
     token: &str,
     project: &str,
 ) -> Result<()> {
-    let url = format!(
-        "{}/api/v1/projects/{}/migration-barriers",
-        backend_url, project
-    );
-    let response = http_client
-        .get(&url)
-        .bearer_auth(token)
-        .send_with_auth_hint(backend_url)
-        .await
-        .context("Failed to list migration barriers")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Failed to list migration barriers ({}): {}",
-            status,
-            describe_error_body(&body)
-        );
-    }
-    let barriers: Vec<MigrationBarrier> = response
-        .json()
-        .await
-        .context("Failed to parse migration barriers")?;
-
+    let request = http_client
+        .get(migration_barriers_url(backend_url, project))
+        .bearer_auth(token);
+    let barriers: Vec<MigrationBarrier> =
+        migration_barrier_request(request, backend_url, "list migration barriers").await?;
     if barriers.is_empty() {
         println!("No migration barriers recorded for project '{}'", project);
         return Ok(());
@@ -973,12 +948,10 @@ pub async fn list_migration_barriers(
     let mut table = Table::new();
     table
         .load_style(UTF8_FULL.with_rounded_corners())
-        .set_header(vec![
-            Cell::new("VERSION").add_attribute(Attribute::Bold),
-            Cell::new("REASON").add_attribute(Attribute::Bold),
-            Cell::new("RECORDED BY").add_attribute(Attribute::Bold),
-            Cell::new("RECORDED AT").add_attribute(Attribute::Bold),
-        ]);
+        .set_header(
+            ["VERSION", "REASON", "RECORDED BY", "RECORDED AT"]
+                .map(|h| Cell::new(h).add_attribute(Attribute::Bold)),
+        );
     for barrier in barriers {
         let recorded_at = chrono::DateTime::parse_from_rfc3339(&barrier.recorded_at)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
@@ -995,27 +968,14 @@ pub async fn list_migration_barriers(
 }
 
 #[cfg(test)]
-mod migration_barrier_tests {
-    use super::*;
-
+mod tests {
     #[test]
     fn barrier_list_parses_without_recorder() {
-        let barriers: Vec<MigrationBarrier> = serde_json::from_str(
+        let barriers: Vec<super::MigrationBarrier> = serde_json::from_str(
             r#"[{"version": 4, "reason": "drops users.name", "recorded_by": null, "recorded_at": "2026-10-01T09:00:00Z"}]"#,
         )
         .unwrap();
         assert_eq!(barriers[0].version, 4);
         assert!(barriers[0].recorded_by.is_none());
-    }
-
-    #[test]
-    fn error_bodies_carry_their_code() {
-        assert_eq!(
-            describe_error_body(
-                r#"{"error":"Barrier v4 already exists","error_code":"migration_barrier_exists"}"#
-            ),
-            "[migration_barrier_exists] Barrier v4 already exists"
-        );
-        assert_eq!(describe_error_body("plain"), "plain");
     }
 }

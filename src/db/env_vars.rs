@@ -429,71 +429,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::deployments::{self, CreateDeploymentParams};
+    use crate::db::deployments::{self, test_params};
     use crate::db::models::{DeploymentStatus, ProjectStatus};
     use crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP;
 
     /// A deployment created from another keeps the source's rise.toml and CLI
-    /// variables over the project's, and takes nothing else from it.
+    /// variables over the project's (only the target environment's scoped
+    /// ones), and takes nothing else from it.
     #[sqlx::test]
     async fn config_variables_follow_a_redeploy(pool: PgPool) {
-        let user = crate::db::users::create(&pool, "config-vars@example.com")
-            .await
-            .unwrap();
-        let project = crate::db::projects::create(
-            &pool,
-            "config-vars-project",
-            ProjectStatus::Stopped,
-            "default".to_string(),
-            Some(user.id),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        let mut ids = Vec::new();
-        for deployment_id in ["20261024-000001", "20261024-000002"] {
-            let d = deployments::create(
-                &pool,
-                CreateDeploymentParams {
-                    deployment_id,
-                    project_id: project.id,
-                    created_by_id: user.id,
-                    status: DeploymentStatus::Healthy,
-                    image: Some("test:v1"),
-                    image_digest: None,
-                    rolled_back_from_deployment_id: None,
-                    deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                    environment_id: crate::db::environments::test_environment_id(&pool, project.id)
-                        .await,
-                    expires_at: None,
-                    http_port: 8080,
-                    is_active: false,
-                    job_url: None,
-                    pull_request_url: None,
-                    git_repository_url: None,
-                    replicas: 1,
-                    cpu: "500m",
-                    memory: "256Mi",
-                    identity_audiences: serde_json::json!({}),
-                    containers: None,
-                    routes: None,
-                    expiration_cap: None,
-                    created_via: crate::db::models::CreatedVia::Deploy,
-                    promoted_from_deployment_id: None,
-                    promoted_from_environment_id: None,
-                    migration_version: None,
-                    rollback_guard_for_deployment_id: None,
-                    extra_event_attributes: None,
-                },
-            )
-            .await
-            .unwrap();
-            ids.push(d.id);
-        }
-        let (source, target) = (ids[0], ids[1]);
+        let (source, target) = two_deployments(&pool, "config-vars").await;
         for (key, value, origin) in [
             ("LOG_LEVEL", "debug", "toml"),
+            ("STAGING_ONLY", "s", "toml:staging"),
+            ("PROD_ONLY", "p", "toml:production"),
             ("FEATURE_X", "on", "cli"),
             ("DATABASE_URL", "from-source", "global"),
             ("PORT", "8080", "system"),
@@ -503,36 +452,27 @@ mod tests {
                 .unwrap();
         }
         // The new deployment already has the project's current values.
-        upsert_deployment_env_var(&pool, target, "LOG_LEVEL", "info", false, false, "global")
-            .await
-            .unwrap();
-        upsert_deployment_env_var(
-            &pool,
-            target,
-            "DATABASE_URL",
-            "current",
-            false,
-            false,
-            "global",
-        )
-        .await
-        .unwrap();
+        for (key, value) in [("LOG_LEVEL", "info"), ("DATABASE_URL", "current")] {
+            upsert_deployment_env_var(&pool, target, key, value, false, false, "global")
+                .await
+                .unwrap();
+        }
 
         copy_config_env_vars_to_deployment(&pool, source, target, "production")
             .await
             .unwrap();
 
-        let vars: std::collections::HashMap<String, (String, String)> =
-            list_deployment_env_vars(&pool, target)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|v| (v.key, (v.value, v.source)))
-                .collect();
-        assert_eq!(vars["LOG_LEVEL"], ("debug".into(), "toml".into()));
-        assert_eq!(vars["FEATURE_X"], ("on".into(), "cli".into()));
-        assert_eq!(vars["DATABASE_URL"], ("current".into(), "global".into()));
-        assert!(!vars.contains_key("PORT"));
+        assert_vars(
+            &pool,
+            target,
+            &[
+                ("DATABASE_URL", "current", "global"),
+                ("FEATURE_X", "on", "cli"),
+                ("LOG_LEVEL", "debug", "toml"),
+                ("PROD_ONLY", "p", "toml:production"),
+            ],
+        )
+        .await;
     }
 
     #[sqlx::test]
@@ -555,37 +495,14 @@ mod tests {
 
         let deployment = deployments::create(
             &pool,
-            CreateDeploymentParams {
-                deployment_id: "20260316-120000",
-                project_id: project.id,
-                created_by_id: user.id,
-                status: DeploymentStatus::Healthy,
-                image: Some("test:v1"),
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                environment_id: crate::db::environments::test_environment_id(&pool, project.id)
-                    .await,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
+            test_params(
+                project.id,
+                user.id,
+                crate::db::environments::test_environment_id(&pool, project.id).await,
+                "20260316-120000",
+                DEFAULT_DEPLOYMENT_GROUP,
+                DeploymentStatus::Healthy,
+            ),
         )
         .await
         .expect("Failed to create test deployment");
@@ -670,36 +587,14 @@ mod tests {
         // Copy to deployment should resolve: env-specific wins for DB_URL
         let deployment = deployments::create(
             &pool,
-            CreateDeploymentParams {
-                deployment_id: "20260424-120000",
-                project_id: project.id,
-                created_by_id: user.id,
-                status: DeploymentStatus::Pending,
-                image: None,
-                image_digest: None,
-                rolled_back_from_deployment_id: None,
-                deployment_group: "staging",
-                environment_id: env.id,
-                expires_at: None,
-                http_port: 8080,
-                is_active: false,
-                job_url: None,
-                pull_request_url: None,
-                git_repository_url: None,
-                replicas: 1,
-                cpu: "500m",
-                memory: "256Mi",
-                identity_audiences: serde_json::json!({}),
-                containers: None,
-                routes: None,
-                expiration_cap: None,
-                created_via: crate::db::models::CreatedVia::Deploy,
-                promoted_from_deployment_id: None,
-                promoted_from_environment_id: None,
-                migration_version: None,
-                rollback_guard_for_deployment_id: None,
-                extra_event_attributes: None,
-            },
+            test_params(
+                project.id,
+                user.id,
+                env.id,
+                "20260424-120000",
+                "staging",
+                DeploymentStatus::Pending,
+            ),
         )
         .await
         .unwrap();
@@ -733,64 +628,41 @@ mod tests {
         )
         .await
         .unwrap();
-        let environment_id = crate::db::environments::test_environment_id(pool, project.id).await;
+        let env = crate::db::environments::test_environment_id(pool, project.id).await;
         let mut ids = Vec::new();
         for deployment_id in ["20261025-000001", "20261025-000002"] {
-            let d = deployments::create(
-                pool,
-                CreateDeploymentParams {
-                    deployment_id,
-                    project_id: project.id,
-                    created_by_id: user.id,
-                    status: DeploymentStatus::Pushed,
-                    image: Some("test:v1"),
-                    image_digest: None,
-                    rolled_back_from_deployment_id: None,
-                    deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                    environment_id,
-                    expires_at: None,
-                    http_port: 8080,
-                    is_active: false,
-                    job_url: None,
-                    pull_request_url: None,
-                    git_repository_url: None,
-                    replicas: 1,
-                    cpu: "500m",
-                    memory: "256Mi",
-                    identity_audiences: serde_json::json!({}),
-                    containers: None,
-                    routes: None,
-                    expiration_cap: None,
-                    created_via: crate::db::models::CreatedVia::Deploy,
-                    promoted_from_deployment_id: None,
-                    promoted_from_environment_id: None,
-                    migration_version: None,
-                    rollback_guard_for_deployment_id: None,
-                    extra_event_attributes: None,
-                },
-            )
-            .await
-            .unwrap();
-            ids.push(d.id);
+            let params = test_params(
+                project.id,
+                user.id,
+                env,
+                deployment_id,
+                DEFAULT_DEPLOYMENT_GROUP,
+                DeploymentStatus::Pushed,
+            );
+            ids.push(deployments::create(pool, params).await.unwrap().id);
         }
         (ids[0], ids[1])
     }
 
-    async fn vars_by_key(
-        pool: &PgPool,
-        deployment_id: Uuid,
-    ) -> std::collections::HashMap<String, (String, String)> {
-        list_deployment_env_vars(pool, deployment_id)
+    /// Assert a deployment's variables, as `(key, value, source)` sorted by key.
+    async fn assert_vars(pool: &PgPool, deployment_id: Uuid, expected: &[(&str, &str, &str)]) {
+        let mut vars: Vec<_> = list_deployment_env_vars(pool, deployment_id)
             .await
             .unwrap()
             .into_iter()
-            .map(|v| (v.key, (v.value, v.source)))
-            .collect()
+            .map(|v| (v.key, v.value, v.source))
+            .collect();
+        vars.sort();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|(k, v, s)| (k.to_string(), v.to_string(), s.to_string()))
+            .collect();
+        assert_eq!(vars, expected);
     }
 
     /// Copying a snapshot onto a deployment whose extension variables are
-    /// already written must skip system and extension variables, so it does
-    /// not conflict with them on the `(deployment_id, key)` unique constraint.
+    /// already written skips system and extension variables, so it does not
+    /// conflict with them.
     #[sqlx::test]
     async fn snapshot_copy_skips_system_and_extension(pool: PgPool) {
         let (source, target) = two_deployments(&pool, "snapshot-copy").await;
@@ -824,66 +696,33 @@ mod tests {
             .await
             .unwrap();
 
-        let vars = vars_by_key(&pool, target).await;
-        assert_eq!(
-            vars["OAUTH_CLIENT_ID"],
-            ("fresh".into(), "extension".into())
-        );
-        assert!(!vars.contains_key("PORT"));
-        assert!(!vars.contains_key("RISE_APP_URL"));
-        assert_eq!(
-            vars["DATABASE_URL"],
-            ("from-source".into(), "global".into())
-        );
-        assert_eq!(vars["LOG_LEVEL"], ("debug".into(), "toml".into()));
-        assert_eq!(vars["ONLY_STAGING"], ("x".into(), "toml:staging".into()));
-        assert_eq!(vars["FEATURE_X"], ("on".into(), "cli".into()));
-        assert_eq!(vars["REGION"], ("eu".into(), "env:production".into()));
+        assert_vars(
+            &pool,
+            target,
+            &[
+                ("DATABASE_URL", "from-source", "global"),
+                ("FEATURE_X", "on", "cli"),
+                ("LOG_LEVEL", "debug", "toml"),
+                ("OAUTH_CLIENT_ID", "fresh", "extension"),
+                ("ONLY_STAGING", "x", "toml:staging"),
+                ("REGION", "eu", "env:production"),
+            ],
+        )
+        .await;
     }
 
-    #[sqlx::test]
-    async fn config_copy_carries_only_target_env_scoped_toml(pool: PgPool) {
-        let (source, target) = two_deployments(&pool, "config-copy-scoped").await;
-        for (key, value, origin) in [
-            ("LOG_LEVEL", "debug", "toml"),
-            ("STAGING_ONLY", "s", "toml:staging"),
-            ("PROD_ONLY", "p", "toml:production"),
-            ("FEATURE_X", "on", "cli"),
-        ] {
-            upsert_deployment_env_var(&pool, source, key, value, false, false, origin)
-                .await
-                .unwrap();
-        }
-
-        copy_config_env_vars_to_deployment(&pool, source, target, "production")
-            .await
-            .unwrap();
-
-        let vars = vars_by_key(&pool, target).await;
-        assert_eq!(vars["LOG_LEVEL"], ("debug".into(), "toml".into()));
-        assert_eq!(vars["FEATURE_X"], ("on".into(), "cli".into()));
-        assert_eq!(vars["PROD_ONLY"], ("p".into(), "toml:production".into()));
-        assert!(!vars.contains_key("STAGING_ONLY"));
-    }
-
-    /// The copies run inside a caller's transaction; nothing is visible until
-    /// it commits.
+    /// The copy joins the caller's transaction: nothing is left if it rolls back.
     #[sqlx::test]
     async fn copies_run_inside_a_transaction(pool: PgPool) {
         let (source, target) = two_deployments(&pool, "copy-in-tx").await;
         upsert_deployment_env_var(&pool, source, "LOG_LEVEL", "debug", false, false, "toml")
             .await
             .unwrap();
-
         let mut tx = pool.begin().await.unwrap();
         copy_snapshot_env_vars_to_deployment(&mut *tx, source, target)
             .await
             .unwrap();
-        upsert_deployment_env_var(&mut *tx, target, "PORT", "8080", false, false, "system")
-            .await
-            .unwrap();
         tx.rollback().await.unwrap();
-
-        assert!(vars_by_key(&pool, target).await.is_empty());
+        assert_vars(&pool, target, &[]).await;
     }
 }
