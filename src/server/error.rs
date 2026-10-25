@@ -51,6 +51,10 @@ pub struct ServerError {
     /// Optional stable, machine-readable code for errors a client branches on
     /// (e.g. `platform_access_denied`), returned as `error_code`.
     pub error_code: Option<&'static str>,
+    /// Optional structured payload for a client that branches on `error_code`
+    /// (e.g. the crossed barriers of a `migration_barrier` refusal), returned
+    /// as `details`. Boxed to keep `Result<_, ServerError>` small.
+    pub details: Option<Box<serde_json::Value>>,
     /// If true, skip error-level logging (for expected transient conditions)
     pub expected: bool,
     /// If true, the operation lost a `SERIALIZABLE` race and the caller may
@@ -74,6 +78,7 @@ impl ServerError {
             context: Vec::new(),
             suggestions: None,
             error_code: None,
+            details: None,
             expected: false,
             retryable: false,
         }
@@ -92,6 +97,7 @@ impl ServerError {
             context: Vec::new(),
             suggestions: None,
             error_code: None,
+            details: None,
             expected: false,
             retryable: false,
         }
@@ -112,6 +118,12 @@ impl ServerError {
     /// Attach a machine-readable error code to the response (chainable)
     pub fn with_error_code(mut self, code: &'static str) -> Self {
         self.error_code = Some(code);
+        self
+    }
+
+    /// Attach structured details to the response (chainable)
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(Box::new(details));
         self
     }
 
@@ -226,6 +238,9 @@ impl IntoResponse for ServerError {
         if let Some(code) = self.error_code {
             body["error_code"] = json!(code);
         }
+        if let Some(details) = self.details {
+            body["details"] = *details;
+        }
         let body = Json(body);
 
         (self.status, body).into_response()
@@ -332,6 +347,25 @@ mod tests {
         let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert!(body_json.get("error_code").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_server_error_carries_details_only_when_set() {
+        let response = ServerError::conflict("Crossed")
+            .with_error_code("migration_barrier")
+            .with_details(json!({"candidate_version": 3, "barriers": [{"version": 4}]}))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["error_code"], "migration_barrier");
+        assert_eq!(body_json["details"]["candidate_version"], 3);
+        assert_eq!(body_json["details"]["barriers"][0]["version"], 4);
+
+        let response = ServerError::conflict("Plain").into_response();
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert!(body_json.get("details").is_none());
     }
 
     #[tokio::test]

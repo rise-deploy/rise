@@ -81,7 +81,7 @@ fn is_valid_group_name(name: &str) -> bool {
 /// # Errors
 /// Returns error if image doesn't exist, requires authentication, registry is unreachable,
 /// or the image belongs to a different Rise project.
-async fn resolve_image_digest(
+pub(super) async fn resolve_image_digest(
     oci_client: &crate::server::oci::OciClient,
     registry_provider: &std::sync::Arc<dyn crate::server::registry::RegistryProvider>,
     image_ref: &str,
@@ -245,12 +245,6 @@ async fn insert_rise_env_vars(
     deployment: &crate::db::models::Deployment,
     project: &crate::db::models::Project,
 ) -> Result<(), ServerError> {
-    let deployment_urls = state
-        .deployment_backend
-        .get_deployment_urls(deployment, project)
-        .await
-        .internal_err("Failed to get deployment URLs")?;
-
     // Resolve environment name for RISE_ENVIRONMENT
     let environment_name =
         crate::db::environments::find_by_id(&state.db_pool, deployment.environment_id)
@@ -259,26 +253,19 @@ async fn insert_rise_env_vars(
             .flatten()
             .map(|e| e.name);
 
-    let vars = models::rise_system_env_vars(
-        &state.public_url,
-        &deployment.deployment_group,
-        &deployment_urls,
-        environment_name.as_deref(),
-    );
-
-    for (key, value) in &vars {
-        crate::db::env_vars::upsert_deployment_env_var(
-            &state.db_pool,
-            deployment.id,
-            key,
-            value,
-            false, // Not a secret
-            false, // is_protected
-            "system",
-        )
+    let mut conn = state
+        .db_pool
+        .acquire()
         .await
-        .internal_err(format!("Failed to insert {}", key))?;
-    }
+        .internal_err("Failed to acquire database connection")?;
+    super::promotion::insert_rise_env_vars_with(
+        &mut conn,
+        state,
+        deployment,
+        project,
+        environment_name.as_deref(),
+    )
+    .await?;
 
     info!(
         "Inserted Rise environment variables for deployment {}",
@@ -294,7 +281,7 @@ async fn insert_rise_env_vars(
 ///
 /// Logs a warning for each override that was dropped because its `for_environment`
 /// didn't match the resolved environment.
-fn filter_env_overrides_by_environment<'a>(
+pub(super) fn filter_env_overrides_by_environment<'a>(
     overrides: &'a [models::EnvOverride],
     resolved_environment: Option<&str>,
 ) -> Vec<&'a models::EnvOverride> {
@@ -317,13 +304,6 @@ fn filter_env_overrides_by_environment<'a>(
     result
 }
 
-/// Apply env var overrides from the deployment request.
-///
-/// Encrypts secret values and upserts each override into the deployment's env vars.
-/// Called after copying project/source env vars and before upserting PORT.
-///
-/// Only client-allowed source values (`toml`, `cli`) are accepted. Unknown or
-/// server-managed source values are replaced with `cli`.
 /// Outcome of `resolve_multi_container_images`.
 ///
 /// Holds everything the caller needs to: mint registry credentials with the
@@ -488,74 +468,40 @@ fn inherit_container_side_data_from_source(
     )
 }
 
+/// Apply env var overrides from the deployment request.
+///
+/// Encrypts secret values and upserts each override into the deployment's env
+/// vars. Called after copying project env vars and before upserting PORT.
+/// Only client-allowed sources (`toml`, `cli`) are accepted, anything else is
+/// stored as `cli`; a `rise.toml` variable scoped to an environment is stored
+/// as `toml:<env>` (see [`super::promotion::override_source`]).
 async fn apply_env_overrides(
     state: &AppState,
     deployment_id: uuid::Uuid,
     overrides: &[models::EnvOverride],
-    resolved_environment: Option<&str>,
+    resolved_environment: &str,
 ) -> Result<(), ServerError> {
-    use crate::db::models::EnvVarSource;
-
     if overrides.is_empty() {
         return Ok(());
     }
-
-    let filtered = filter_env_overrides_by_environment(overrides, resolved_environment);
-
-    if filtered.is_empty() {
+    let prepared =
+        super::promotion::prepare_env_overrides(state, overrides, resolved_environment).await?;
+    if prepared.is_empty() {
         return Ok(());
     }
-
     info!(
-        "Applying {} env override(s) to deployment {} ({} total, environment: {:?})",
-        filtered.len(),
+        "Applying {} env override(s) to deployment {} ({} total, environment: {})",
+        prepared.len(),
         deployment_id,
         overrides.len(),
         resolved_environment,
     );
-
-    for env_override in filtered {
-        let is_protected = validate_env_override(env_override)?;
-
-        // Validate source: only client-allowed values (toml, cli) are accepted.
-        // Default to "cli" if missing or invalid.
-        let source = env_override
-            .source
-            .as_deref()
-            .and_then(EnvVarSource::parse)
-            .filter(|s| s.is_client_allowed())
-            .unwrap_or(EnvVarSource::Cli);
-
-        // Encrypt if secret
-        let value_to_store = if env_override.is_secret {
-            let provider = state.encryption_provider.as_ref().ok_or_else(|| {
-                ServerError::bad_request(
-                    "Cannot store secret variables: no encryption provider configured",
-                )
-            })?;
-            provider
-                .encrypt(&env_override.value)
-                .await
-                .internal_err(format!("Failed to encrypt secret '{}'", env_override.key))?
-        } else {
-            env_override.value.clone()
-        };
-
-        let source_str = source.as_str();
-        crate::db::env_vars::upsert_deployment_env_var(
-            &state.db_pool,
-            deployment_id,
-            &env_override.key,
-            &value_to_store,
-            env_override.is_secret,
-            is_protected,
-            &source_str,
-        )
+    let mut conn = state
+        .db_pool
+        .acquire()
         .await
-        .internal_err(format!("Failed to set env override '{}'", env_override.key))?;
-    }
-
-    Ok(())
+        .internal_err("Failed to acquire database connection")?;
+    super::promotion::write_env_vars(&mut conn, deployment_id, &prepared).await
 }
 
 fn validate_env_override_key(key: &str) -> bool {
@@ -566,7 +512,9 @@ fn normalize_env_override_is_protected(env_override: &models::EnvOverride) -> bo
     env_override.is_protected.unwrap_or(env_override.is_secret)
 }
 
-fn validate_env_override(env_override: &models::EnvOverride) -> Result<bool, ServerError> {
+pub(super) fn validate_env_override(
+    env_override: &models::EnvOverride,
+) -> Result<bool, ServerError> {
     if !validate_env_override_key(&env_override.key) {
         return Err(ServerError::bad_request(format!(
             "Invalid env var key '{}' (must be alphanumeric with underscores)",
@@ -778,6 +726,12 @@ async fn convert_deployment_with(
         git_branch: provenance.git_branch,
         git_dirty: provenance.git_dirty,
         source_deployment_id: provenance.source_deployment_id,
+        created_via: deployment.created_via.to_string(),
+        promoted_from_deployment_id: provenance.promoted_from_deployment_id,
+        promoted_from_environment: provenance.promoted_from_environment,
+        migration_version: deployment.migration_version,
+        unhealthy_since: deployment.unhealthy_since.map(|dt| dt.to_rfc3339()),
+        rollback_guard_for_deployment_id: provenance.rollback_guard_for_deployment_id,
         created: deployment.created_at.to_rfc3339(),
         updated: deployment.updated_at.to_rfc3339(),
     }
@@ -799,6 +753,27 @@ async fn convert_deployment_with(
 /// is an internal error.
 fn no_environments() -> ServerError {
     ServerError::internal("Project has no environments; every project needs at least one")
+}
+
+/// The environment name and group of deployment `deployment_id`, or `None`
+/// when it does not exist.
+async fn source_environment_and_group(
+    pool: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    deployment_id: &str,
+) -> Result<Option<(String, String)>, ServerError> {
+    let Some(source) =
+        db_deployments::find_by_project_and_deployment_id(pool, project_id, deployment_id)
+            .await
+            .internal_err("Failed to find source deployment")?
+    else {
+        return Ok(None);
+    };
+    let environment = db_environments::find_by_id(pool, source.environment_id)
+        .await
+        .internal_err("Failed to look up the source environment")?
+        .ok_or_else(|| ServerError::internal("Source deployment has no environment"))?;
+    Ok(Some((environment.name, source.deployment_group)))
 }
 
 async fn resolve_deployment_target(
@@ -1257,12 +1232,30 @@ pub async fn create_deployment(
         )));
     }
 
+    // A deployment created from another one defaults to the source's
+    // environment and group, as the plan endpoint does. A missing source is
+    // reported after authorization, below.
+    let source_target = match (
+        payload.from_deployment.as_deref(),
+        &payload.environment,
+        &payload.group,
+    ) {
+        (Some(from_deployment_id), None, None) => {
+            source_environment_and_group(&state.db_pool, project.id, from_deployment_id).await?
+        }
+        _ => None,
+    };
+    let (requested_environment, requested_group) = match &source_target {
+        Some((environment, group)) => (Some(environment.as_str()), Some(group.as_str())),
+        None => (payload.environment.as_deref(), payload.group.as_deref()),
+    };
+
     // Resolve deployment target (group + environment) from request parameters
     let (resolved_group, resolved_environment) = resolve_deployment_target(
         &state.db_pool,
         project.id,
-        payload.environment.as_deref(),
-        payload.group.as_deref(),
+        requested_environment,
+        requested_group,
     )
     .await?;
 
@@ -1346,6 +1339,157 @@ pub async fn create_deployment(
                     "This service account is not allowed to deploy to the requested environment",
                 ));
             }
+        }
+    }
+
+    // The deployment this one is created from (redeploy, rollback, promote).
+    let source_deployment = match payload.from_deployment.as_deref() {
+        Some(from_deployment_id) => {
+            let source = db_deployments::find_by_project_and_deployment_id(
+                &state.db_pool,
+                project.id,
+                from_deployment_id,
+            )
+            .await
+            .internal_err("Failed to find source deployment")?
+            .ok_or_else(|| {
+                ServerError::not_found(format!(
+                    "Source deployment '{}' not found for project '{}'",
+                    from_deployment_id, payload.project
+                ))
+            })?;
+
+            // Verify the source deployment already has a reusable image.
+            if !state_machine::can_create_from(&source) {
+                return Err(ServerError::bad_request(format!(
+                    "Cannot create deployment from '{}' because its image is not available yet (status '{}').",
+                    from_deployment_id, source.status
+                )));
+            }
+            Some(source)
+        }
+        None => None,
+    };
+
+    if let Some(source) = source_deployment.as_ref() {
+        let created_via =
+            super::promotion::classify_created_via(source.environment_id, resolved_environment.id);
+        if created_via == crate::db::models::CreatedVia::Promote {
+            // Reading a deployment of another environment: a scoped session
+            // must cover that one too.
+            if let Some(scope) = &scope {
+                let source_env_name =
+                    db_environments::find_by_id(&state.db_pool, source.environment_id)
+                        .await
+                        .internal_err("Failed to look up the source environment")?
+                        .map(|e| e.name);
+                scope.require(
+                    Operation::new(Verb::Get, Kind::Deployment),
+                    &project.name,
+                    source_env_name.as_deref(),
+                )?;
+            }
+            if payload.use_source_env_vars {
+                return Err(ServerError::bad_request(format!(
+                    "--use-source-env-vars cannot be used across environments: deployment '{}' \
+                     is in another environment than '{}', and a promotion recomputes its \
+                     variables for the target",
+                    source.deployment_id, resolved_environment.name
+                )));
+            }
+        }
+        // Containers are not rebuilt for a deployment created from another
+        // one: a container without an image would reference a tag nobody pushes.
+        if let Some(specs) = payload.containers.as_deref() {
+            if let Some(spec) = specs.iter().find(|s| s.image.is_none()) {
+                return Err(ServerError::bad_request(format!(
+                    "Container '{}' has no image: containers cannot be rebuilt by a deployment \
+                     created from another one. Omit `containers` to reuse the source's.",
+                    spec.name
+                )));
+            }
+        }
+    }
+
+    if payload.migration_version.is_some_and(|v| v < 0) {
+        return Err(ServerError::bad_request(
+            "migration_version must not be negative",
+        ));
+    }
+
+    // Promotion-source gate and migration barriers (ADR-0007).
+    let admin_unscoped = !is_sa && scope.is_none() && state.is_admin(&user).await;
+    let policy = super::promotion::evaluate_policy(
+        &state.db_pool,
+        project.id,
+        source_deployment.as_ref(),
+        payload.migration_version,
+        &resolved_environment,
+        admin_unscoped,
+    )
+    .await?;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut extra_event_attributes = serde_json::Map::new();
+    match &policy.gate {
+        super::promotion::GateDecision::Allowed => {}
+        super::promotion::GateDecision::Denied { required } => {
+            return Err(super::promotion::gate_denied_error(
+                &resolved_environment.name,
+                required,
+            ));
+        }
+        super::promotion::GateDecision::AdminBypass { required } => {
+            warn!(
+                user = %user.email,
+                "Administrator bypassed the promotion gate of environment '{}' (requires '{}')",
+                resolved_environment.name, required
+            );
+            warnings.push(super::promotion::gate_bypass_warning(
+                &resolved_environment.name,
+                required,
+            ));
+            extra_event_attributes.insert(
+                rise_backend_core::events::attributes::PROMOTION_GATE_BYPASSED.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+    match &policy.barriers {
+        super::promotion::BarrierOutcome::Crossed {
+            candidate,
+            environment,
+            barriers,
+        } => {
+            if !payload.force_migration_barrier {
+                return Err(super::promotion::barrier_crossed_error(
+                    &resolved_environment.name,
+                    *candidate,
+                    *environment,
+                    barriers,
+                ));
+            }
+            warn!(
+                user = %user.email,
+                "Forced deployment across migration barrier(s) into environment '{}'",
+                resolved_environment.name
+            );
+            warnings.push(super::promotion::barrier_forced_warning(
+                &resolved_environment.name,
+                *candidate,
+                *environment,
+                barriers,
+            ));
+            extra_event_attributes.insert(
+                rise_backend_core::events::attributes::MIGRATION_BARRIER_FORCED.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        super::promotion::BarrierOutcome::Unknown { has_barriers: true } => {
+            warnings.push(super::promotion::barrier_unknown_warning(
+                &resolved_environment.name,
+            ));
+        }
+        super::promotion::BarrierOutcome::Unknown { .. } | super::promotion::BarrierOutcome::Ok => {
         }
     }
 
@@ -1470,50 +1614,19 @@ pub async fn create_deployment(
             serde_json::json!({})
         };
 
-    // Handle deployment creation from an existing deployment (redeploy/rollback)
-    if let Some(ref from_deployment_id) = payload.from_deployment {
-        info!(
-            "Creating deployment from existing deployment '{}'",
-            from_deployment_id
+    // Handle deployment creation from an existing deployment (redeploy,
+    // rollback, promote)
+    if let Some(source_deployment) = source_deployment.as_ref() {
+        let from_deployment_id = &source_deployment.deployment_id;
+        let created_via = super::promotion::classify_created_via(
+            source_deployment.environment_id,
+            resolved_environment.id,
         );
-
-        // Find the source deployment
-        let source_deployment = db_deployments::find_by_project_and_deployment_id(
-            &state.db_pool,
-            project.id,
-            from_deployment_id,
-        )
-        .await
-        .internal_err("Failed to find source deployment")?
-        .ok_or_else(|| {
-            ServerError::not_found(format!(
-                "Source deployment '{}' not found for project '{}'",
-                from_deployment_id, payload.project
-            ))
-        })?;
-
-        // Verify the source deployment already has a reusable image.
-        if !state_machine::can_create_from(&source_deployment) {
-            return Err(ServerError::bad_request(format!(
-                "Cannot create deployment from '{}' because its image is not available yet (status '{}').",
-                from_deployment_id, source_deployment.status
-            )));
-        }
-
-        // For chained redeployments, follow the chain to find the original source
-        // This ensures we use the correct image tag from the original deployment that built the image
-        let original_source_id =
-            if let Some(chained_source) = source_deployment.rolled_back_from_deployment_id {
-                // Source is itself a redeploy - use its source instead
-                debug!(
-                    "Source deployment {} is a redeploy, following chain to original source {}",
-                    from_deployment_id, chained_source
-                );
-                chained_source
-            } else {
-                // Source is the original - use it directly
-                source_deployment.id
-            };
+        let is_promotion = created_via == crate::db::models::CreatedVia::Promote;
+        info!(
+            "Creating deployment from existing deployment '{}' ({})",
+            from_deployment_id, created_via
+        );
 
         // Determine http_port for the new deployment:
         // - If explicit http_port was provided in request, use it (already in effective_http_port)
@@ -1524,53 +1637,66 @@ pub async fn create_deployment(
         } else {
             source_deployment.http_port as u16
         };
-
-        // Inherit resources from source deployment unless explicitly overridden
-        if payload.replicas.is_none() {
-            effective_replicas = source_deployment.replicas as u32;
-        }
-        if payload.cpu.is_none() {
-            effective_cpu = source_deployment.cpu.clone();
-        }
-        if payload.memory.is_none() {
-            effective_memory = source_deployment.memory.clone();
-        }
         if payload.identity_audiences.is_none() {
             effective_identity_audiences = source_deployment.identity_audiences.clone();
         }
 
-        // Validate resources against constraints (after rollback inheritance).
-        //
-        // When the redeploy request carries no `[containers]` block we must
-        // still re-validate against the SOURCE's persisted per-container specs:
-        // those replicas/cpu/memory can sum higher than the deployment-level
-        // `effective_replicas`, so a cap that tightened since the source was
-        // created would otherwise be silently bypassed on a bare redeploy.
-        #[cfg(feature = "backend")]
-        let inherited_source_specs: Option<
-            Vec<crate::server::deployment::models::ContainerSpec>,
-        > = if payload.containers.is_none() {
-            match source_deployment.containers.as_ref() {
-                Some(v) => Some(models::decode_side_data(v).map_err(|e| {
-                    ServerError::internal(format!(
-                        "Source deployment {} ({}) has a non-NULL `containers` column that could \
-                         not be decoded into Vec<ContainerSpec>: {:?}",
-                        source_deployment.id, source_deployment.deployment_id, e
-                    ))
-                })?),
-                None => None,
-            }
+        // The source's persisted per-container specs, when the request
+        // carries no `[containers]` block. Their replicas/cpu/memory can sum
+        // higher than the deployment-level values, so they are what the
+        // constraints are checked against.
+        let inherited_source_specs = if payload.containers.is_none() {
+            super::promotion::decode_source_specs(source_deployment)?
         } else {
             None
         };
 
-        #[cfg(feature = "backend")]
+        // Sizing. A redeploy inherits the source's values and validates them
+        // as they are; a promotion clamps inherited values into the target's
+        // range and reports each change. Explicit request values are
+        // validated either way.
+        let mut adjustments = Vec::new();
+        let mut clamped_specs = None;
+        if is_promotion {
+            let constraints = super::promotion::EffectiveConstraints::resolve(
+                state.deployment_constraints.as_ref(),
+                &resolved_environment,
+            );
+            let clamped = super::promotion::clamp_inherited_resources(
+                source_deployment,
+                inherited_source_specs.clone(),
+                &super::promotion::ExplicitResources {
+                    replicas: payload.replicas,
+                    cpu: payload.cpu.clone(),
+                    memory: payload.memory.clone(),
+                },
+                &constraints,
+            )?;
+            effective_replicas = clamped.replicas;
+            effective_cpu = clamped.cpu;
+            effective_memory = clamped.memory;
+            clamped_specs = clamped.containers;
+            adjustments = clamped.adjustments;
+        } else {
+            if payload.replicas.is_none() {
+                effective_replicas = source_deployment.replicas as u32;
+            }
+            if payload.cpu.is_none() {
+                effective_cpu = source_deployment.cpu.clone();
+            }
+            if payload.memory.is_none() {
+                effective_memory = source_deployment.memory.clone();
+            }
+        }
+
         {
-            // Prefer the request's containers; otherwise the source's inherited
-            // specs (so the across-container sum is re-checked); else single.
+            // Prefer the request's containers; otherwise the source's
+            // (clamped) specs so the across-container sum is re-checked;
+            // else single.
             let check_specs = payload
                 .containers
                 .as_deref()
+                .or(clamped_specs.as_deref())
                 .or(inherited_source_specs.as_deref());
             let (total_replicas, per_container) = resolve_resource_check_inputs(
                 check_specs,
@@ -1583,125 +1709,107 @@ pub async fn create_deployment(
                 Some(&resolved_environment),
                 total_replicas,
                 &per_container,
-                payload.from_deployment.is_some(),
+                true,
             )?;
         }
 
-        // Compute container side-data BEFORE the INSERT so it lands atomically
-        // with the deployments row. If the redeploy request carries its own
-        // `containers` block, use that; otherwise inherit the source's JSON
-        // verbatim so a redeploy of a multi-container source stays
-        // multi-container (the legacy fallback would drop every per-container
-        // K8s resource).
-        let (containers_json, routes_json): (Option<serde_json::Value>, Option<serde_json::Value>) =
-            if let Some(ref r) = multi_container_resolved {
-                let (c, ro) = build_container_side_data_json(
-                    &r.resolved_specs,
-                    &payload.routes,
-                    effective_replicas,
-                    &effective_cpu,
-                    &effective_memory,
-                )?;
-                (Some(c), ro)
-            } else {
-                inherit_container_side_data_from_source(&source_deployment)
-            };
-
-        // Create new deployment with Pushed status and invoke extension hooks
-        // Copy image and image_digest from source - the helper function will determine the tag
-        // For pre-built images: image_digest is copied, helper returns it
-        // For build-from-source: rolled_back_from_deployment_id is used to find the original source deployment's image
-        let new_deployment = create_deployment_with_hooks(
-            &state,
-            db_deployments::CreateDeploymentParams {
-                deployment_id: &deployment_id,
-                project_id: project.id,
-                created_by_id: user.id,
-                status: DbDeploymentStatus::Pushed, // Start in Pushed state so controller picks it up
-                image: source_deployment.image.as_deref(), // Copy image from source if present
-                image_digest: source_deployment.image_digest.as_deref(), // Copy digest from source if present
-                rolled_back_from_deployment_id: Some(original_source_id), // Track original source for image tag calculation
-                deployment_group: &resolved_group, // Use requested group (may be different from source)
-                environment_id: resolved_environment.id,
-                expires_at,                        // expires_at
-                http_port: final_http_port as i32, // Use determined http_port
-                is_active: false,                  // Deployments start as inactive
-                job_url: job_url.as_deref(),
-                pull_request_url: pull_request_url.as_deref(),
-                git_repository_url: git_repository_url.as_deref(),
-                replicas: effective_replicas as i32,
-                cpu: &effective_cpu,
-                memory: &effective_memory,
-                identity_audiences: effective_identity_audiences.clone(),
-                containers: containers_json.as_ref(),
-                routes: routes_json.as_ref(),
-                expiration_cap: expiration_cap.as_ref(),
-            },
-            &project,
-        )
-        .await?;
-
-        // Handle environment variables based on use_source_env_vars flag
-        if payload.use_source_env_vars {
-            // Copy environment variables from source deployment
-            info!(
-                "Copying environment variables from source deployment '{}'",
-                from_deployment_id
-            );
-            crate::db::env_vars::copy_deployment_env_vars_to_deployment(
-                &state.db_pool,
-                source_deployment.id,
-                new_deployment.id,
+        // Container side-data, inserted atomically with the row. The
+        // request's own `containers` (all pre-built) win; otherwise the
+        // source's are reused so a multi-container source stays
+        // multi-container.
+        let (mut containers_json, routes_json): (
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ) = if let Some(ref r) = multi_container_resolved {
+            let (c, ro) = build_container_side_data_json(
+                &r.resolved_specs,
+                &payload.routes,
+                effective_replicas,
+                &effective_cpu,
+                &effective_memory,
+            )?;
+            (Some(c), ro)
+        } else if let Some(specs) = clamped_specs.as_ref() {
+            (
+                Some(
+                    models::encode_side_data(specs)
+                        .internal_err("Failed to serialise containers")?,
+                ),
+                source_deployment.routes.clone(),
             )
-            .await
-            .internal_err("Failed to copy environment variables")?;
         } else {
-            // Copy current project environment variables to deployment
-            info!("Using current project environment variables");
-            crate::db::env_vars::copy_project_env_vars_to_deployment(
-                &state.db_pool,
-                project.id,
-                new_deployment.id,
-                new_deployment.environment_id,
-                &resolved_environment.name,
+            inherit_container_side_data_from_source(source_deployment)
+        };
+
+        // A promotion runs exactly the image the source environment ran:
+        // pin it to its digest so a moved tag cannot change it.
+        let (image_digest, pinned_image) = if is_promotion {
+            let pinned = super::promotion::pin_images(
+                &state,
+                &project,
+                source_deployment,
+                containers_json.as_ref(),
             )
-            .await
-            .internal_err("Failed to copy environment variables")?;
-            // rise.toml and CLI variables travel with the source's
-            // configuration, like its port, resources and routes do.
-            crate::db::env_vars::copy_config_env_vars_to_deployment(
-                &state.db_pool,
-                source_deployment.id,
-                new_deployment.id,
+            .await?;
+            if let Some(pinned_containers) = pinned.containers {
+                containers_json = Some(pinned_containers);
+            }
+            (
+                pinned
+                    .image_digest
+                    .or_else(|| source_deployment.image_digest.clone()),
+                pinned.pinned_image,
             )
-            .await
-            .internal_err("Failed to copy rise.toml and CLI variables")?;
+        } else {
+            (source_deployment.image_digest.clone(), None)
+        };
+
+        if !adjustments.is_empty() {
+            extra_event_attributes.insert(
+                rise_backend_core::events::attributes::RESOURCE_ADJUSTMENTS.to_string(),
+                serde_json::to_value(&adjustments)
+                    .internal_err("Failed to serialise adjustments")?,
+            );
         }
 
-        // Apply env overrides from the request
-        apply_env_overrides(
+        let env_mode = if payload.use_source_env_vars {
+            super::promotion::EnvMode::SourceSnapshot
+        } else {
+            super::promotion::EnvMode::ProjectCurrent
+        };
+        let new_deployment = super::promotion::create_from_source(
             &state,
-            new_deployment.id,
-            &payload.env_overrides,
-            Some(resolved_environment.name.as_str()),
+            super::promotion::CreateFromSource {
+                project: &project,
+                source: source_deployment,
+                target_env: &resolved_environment,
+                group: &resolved_group,
+                deployment_id: &deployment_id,
+                created_by_id: user.id,
+                created_via,
+                env_mode,
+                overrides: &payload.env_overrides,
+                http_port: final_http_port,
+                replicas: effective_replicas,
+                cpu: effective_cpu.clone(),
+                memory: effective_memory.clone(),
+                containers: containers_json,
+                routes: routes_json,
+                identity_audiences: effective_identity_audiences.clone(),
+                image: source_deployment.image.clone(),
+                image_digest,
+                expires_at,
+                expiration_cap: expiration_cap.clone(),
+                job_url: job_url.clone(),
+                pull_request_url: pull_request_url.clone(),
+                git_repository_url: git_repository_url.clone(),
+                rollback_guard_for: None,
+                guard_lock: None,
+                extra_event_attributes: serde_json::Value::Object(extra_event_attributes),
+            },
         )
-        .await?;
-
-        // Upsert PORT env var with the final http_port value
-        crate::db::env_vars::upsert_deployment_env_var(
-            &state.db_pool,
-            new_deployment.id,
-            "PORT",
-            &final_http_port.to_string(),
-            false, // not a secret
-            false, // is_protected
-            "system",
-        )
-        .await
-        .internal_err("Failed to insert PORT env var")?;
-
-        // Insert Rise-provided environment variables
-        insert_rise_env_vars(&state, &new_deployment, &project).await?;
+        .await?
+        .ok_or_else(|| ServerError::internal("Deployment was not created"))?;
 
         // Use helper to determine image tag (for logging/response only)
         let image_tag = crate::server::deployment::utils::get_deployment_image_tag(
@@ -1723,18 +1831,6 @@ pub async fn create_deployment(
             }
         );
 
-        // Trigger Metacontroller resync so the webhook picks up the new Pushed deployment
-        if let Some(ref kube_client) = state.kube_client {
-            if let Err(e) =
-                crate::server::deployment::crd::trigger_resync(kube_client, &project.name).await
-            {
-                tracing::warn!(
-                    project = %project.name,
-                    "Failed to trigger CRD resync after rollback deployment: {:?}", e
-                );
-            }
-        }
-
         // Return response with image tag and empty credentials (no push needed)
         return Ok(Json(CreateDeploymentResponse {
             deployment_id,
@@ -1749,8 +1845,15 @@ pub async fn create_deployment(
             container_images: multi_container_resolved
                 .as_ref()
                 .map(|r| r.container_images.clone()),
+            created_via: created_via.to_string(),
+            warnings,
+            adjustments,
+            pinned_image,
         }));
     }
+
+    let extra_event_attributes = (!extra_event_attributes.is_empty())
+        .then_some(serde_json::Value::Object(extra_event_attributes));
 
     // Validate resources against constraints (normal deployment path)
     #[cfg(feature = "backend")]
@@ -1834,6 +1937,12 @@ pub async fn create_deployment(
                     containers: containers_json.as_ref(),
                     routes: routes_json.as_ref(),
                     expiration_cap: expiration_cap.as_ref(),
+                    created_via: crate::db::models::CreatedVia::Deploy,
+                    promoted_from_deployment_id: None,
+                    promoted_from_environment_id: None,
+                    migration_version: payload.migration_version,
+                    rollback_guard_for_deployment_id: None,
+                    extra_event_attributes: extra_event_attributes.as_ref(),
                 },
                 &project,
             )
@@ -1860,7 +1969,7 @@ pub async fn create_deployment(
                 &state,
                 deployment.id,
                 &payload.env_overrides,
-                Some(resolved_environment.name.as_str()),
+                &resolved_environment.name,
             )
             .await?;
 
@@ -1885,6 +1994,10 @@ pub async fn create_deployment(
                 container_images: multi_container_resolved
                     .as_ref()
                     .map(|r| r.container_images.clone()),
+                created_via: crate::db::models::CreatedVia::Deploy.to_string(),
+                warnings,
+                adjustments: Vec::new(),
+                pinned_image: None,
             }));
         }
 
@@ -1933,6 +2046,12 @@ pub async fn create_deployment(
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
                 expiration_cap: expiration_cap.as_ref(),
+                created_via: crate::db::models::CreatedVia::Deploy,
+                promoted_from_deployment_id: None,
+                promoted_from_environment_id: None,
+                migration_version: payload.migration_version,
+                rollback_guard_for_deployment_id: None,
+                extra_event_attributes: extra_event_attributes.as_ref(),
             },
             &project,
         )
@@ -1959,7 +2078,7 @@ pub async fn create_deployment(
             &state,
             deployment.id,
             &payload.env_overrides,
-            Some(resolved_environment.name.as_str()),
+            &resolved_environment.name,
         )
         .await?;
 
@@ -2006,6 +2125,10 @@ pub async fn create_deployment(
             container_images: multi_container_resolved
                 .as_ref()
                 .map(|r| r.container_images.clone()),
+            created_via: crate::db::models::CreatedVia::Deploy.to_string(),
+            warnings,
+            adjustments: Vec::new(),
+            pinned_image: None,
         }))
     } else {
         // Path 2: Build from source (current behavior)
@@ -2064,6 +2187,12 @@ pub async fn create_deployment(
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
                 expiration_cap: expiration_cap.as_ref(),
+                created_via: crate::db::models::CreatedVia::Deploy,
+                promoted_from_deployment_id: None,
+                promoted_from_environment_id: None,
+                migration_version: payload.migration_version,
+                rollback_guard_for_deployment_id: None,
+                extra_event_attributes: extra_event_attributes.as_ref(),
             },
             &project,
         )
@@ -2090,7 +2219,7 @@ pub async fn create_deployment(
             &state,
             deployment.id,
             &payload.env_overrides,
-            Some(resolved_environment.name.as_str()),
+            &resolved_environment.name,
         )
         .await?;
 
@@ -2119,6 +2248,10 @@ pub async fn create_deployment(
             container_images: multi_container_resolved
                 .as_ref()
                 .map(|r| r.container_images.clone()),
+            created_via: crate::db::models::CreatedVia::Deploy.to_string(),
+            warnings,
+            adjustments: Vec::new(),
+            pinned_image: None,
         }))
     }
 }
@@ -2977,6 +3110,121 @@ pub async fn get_deployment_by_project(
         )
         .await,
     ))
+}
+
+/// Query of `GET /projects/{project_name}/deployments/{deployment_id}/plan`.
+#[derive(Debug, serde::Deserialize)]
+pub struct PlanQuery {
+    /// Target environment; defaults to the source's.
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Target deployment group; defaults to the environment's primary group
+    /// (or, without an environment either, the source's group).
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub use_source_env_vars: bool,
+}
+
+/// GET /projects/{project_name}/deployments/{deployment_id}/plan - Preview
+/// creating a deployment from this one (redeploy, rollback or promotion):
+/// the gate and migration-barrier decisions, the pinned image and the
+/// resource adjustments, without creating anything.
+pub async fn plan_deployment_from(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+    Query(query): Query<PlanQuery>,
+) -> Result<Json<super::promotion::CreateFromPlan>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to find project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    let (user, is_sa) = auth
+        .resolve_for_project(&state.db_pool, &project)
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &user, &project)
+            .await
+            .map_err(|_| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+    }
+
+    let source = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to find deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+    let source_env = db_environments::find_by_id(&state.db_pool, source.environment_id)
+        .await
+        .internal_err("Failed to look up the source environment")?
+        .ok_or_else(no_environments)?;
+
+    if let Some(ref group) = query.group {
+        if !is_valid_group_name(group) {
+            return Err(ServerError::bad_request(format!(
+                "Invalid group name '{}'",
+                group
+            )));
+        }
+    }
+    let (requested_environment, requested_group) = match (&query.environment, &query.group) {
+        (None, None) => (
+            Some(source_env.name.as_str()),
+            Some(source.deployment_group.as_str()),
+        ),
+        (environment, group) => (environment.as_deref(), group.as_deref()),
+    };
+    let (group, target_env) = resolve_deployment_target(
+        &state.db_pool,
+        project.id,
+        requested_environment,
+        requested_group,
+    )
+    .await?;
+
+    if let Some(scope) = &scope {
+        scope.require(
+            Operation::new(Verb::Get, Kind::Deployment),
+            &project.name,
+            Some(source_env.name.as_str()),
+        )?;
+        scope.require(
+            Operation::new(Verb::Create, Kind::Deployment),
+            &project.name,
+            Some(target_env.name.as_str()),
+        )?;
+    }
+
+    let admin_unscoped = !is_sa && scope.is_none() && state.is_admin(&user).await;
+    let plan = super::promotion::plan(
+        &state,
+        &project,
+        &source,
+        &source_env,
+        &target_env,
+        &group,
+        super::promotion::Caller { admin_unscoped },
+        query.use_source_env_vars,
+    )
+    .await?;
+    Ok(Json(plan))
 }
 
 /// GET /projects/{project_name}/deployment-groups - List all deployment groups for a project

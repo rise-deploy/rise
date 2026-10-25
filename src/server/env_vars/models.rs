@@ -99,7 +99,7 @@ pub struct EnvVarDiffEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
     /// Where the value comes from on each side: `global`, `env:<name>`,
-    /// `toml` or `cli`.
+    /// `toml`, `toml:<name>` (scoped to environment `<name>`) or `cli`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

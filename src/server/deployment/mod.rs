@@ -11,9 +11,13 @@ pub mod logs;
 pub mod models;
 pub mod pods;
 #[cfg(feature = "backend")]
+pub mod promotion;
+#[cfg(feature = "backend")]
 pub mod quantity;
 #[cfg(feature = "backend")]
 pub mod resource_builder;
+#[cfg(feature = "backend")]
+pub mod rollback_guard;
 pub mod routes;
 pub mod state_machine;
 pub mod utils;
