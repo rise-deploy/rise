@@ -202,6 +202,12 @@ pub fn deployment(project: &Project, deployment_id: &str, group: &str) -> Deploy
         identity_audiences: serde_json::json!({}),
         containers: None,
         routes: None,
+        created_via: crate::models::CreatedVia::Deploy,
+        promoted_from_deployment_id: None,
+        promoted_from_environment_id: None,
+        migration_version: None,
+        unhealthy_since: None,
+        rollback_guard_for_deployment_id: None,
         created_at: now,
         updated_at: now,
     }
@@ -224,6 +230,9 @@ pub fn environment(project: &Project, name: &str, group: Option<&str>) -> Enviro
         min_memory: None,
         max_memory: None,
         max_deployment_expiration: None,
+        promotion_source_environment_id: None,
+        rollback_guard_enabled: false,
+        rollback_guard_unhealthy_timeout_seconds: 300,
         created_at: now,
         updated_at: now,
     }

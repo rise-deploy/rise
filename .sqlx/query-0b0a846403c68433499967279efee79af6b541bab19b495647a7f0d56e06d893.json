@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM deployments n\n            WHERE n.project_id = $1\n              AND n.deployment_group = $2\n              AND (n.created_at, n.id) > ($3::timestamptz, $4::uuid)\n              AND NOT is_terminal(n.status)\n        ) AS \"exists!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0b0a846403c68433499967279efee79af6b541bab19b495647a7f0d56e06d893"
+}

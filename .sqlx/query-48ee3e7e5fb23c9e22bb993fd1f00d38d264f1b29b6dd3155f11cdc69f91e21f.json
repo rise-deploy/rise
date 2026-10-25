@@ -1,0 +1,239 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE environments\n        SET\n            name = COALESCE($2, name),\n            primary_deployment_group = CASE WHEN $3 THEN $4 ELSE primary_deployment_group END,\n            is_production = COALESCE($5, is_production),\n            color = COALESCE($6, color),\n            max_deployment_expiration = CASE WHEN $7 THEN $8 ELSE max_deployment_expiration END,\n            updated_at = NOW()\n        WHERE id = $1\n        RETURNING id, project_id, name, primary_deployment_group, is_production, color,\n                 min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,\n                 max_deployment_expiration,\n                 promotion_source_environment_id, rollback_guard_enabled,\n                 rollback_guard_unhealthy_timeout_seconds,\n                 created_at, updated_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "primary_deployment_group",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "primary_deployment_group"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "is_production",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "is_production"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "color",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "color"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "min_replicas",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "min_replicas"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "max_replicas",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "max_replicas"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "min_cpu",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "min_cpu"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "max_cpu",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "max_cpu"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "min_memory",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "min_memory"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "max_memory",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "max_memory"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "max_deployment_expiration",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "max_deployment_expiration"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "promotion_source_environment_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "promotion_source_environment_id"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "rollback_guard_enabled",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "rollback_guard_enabled"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "rollback_guard_unhealthy_timeout_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "rollback_guard_unhealthy_timeout_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Bool",
+        "Text",
+        "Bool",
+        "Text",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "48ee3e7e5fb23c9e22bb993fd1f00d38d264f1b29b6dd3155f11cdc69f91e21f"
+}

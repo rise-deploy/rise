@@ -160,6 +160,9 @@ mod tests {
             min_memory: None,
             max_memory: None,
             max_deployment_expiration: max.map(str::to_string),
+            promotion_source_environment_id: None,
+            rollback_guard_enabled: false,
+            rollback_guard_unhealthy_timeout_seconds: 300,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

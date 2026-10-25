@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT MAX(migration_version) AS \"high\"\n        FROM deployments\n        WHERE environment_id = $1\n          AND migration_version IS NOT NULL\n          AND deploying_started_at IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "high",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2688467cfc1209d41021a92893e611621c7744246ac832875213fd62aa25f7bf"
+}

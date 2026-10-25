@@ -2,6 +2,10 @@
 //!
 //! Events are append-only: nothing here updates or deletes a row, and
 //! nothing prunes them yet — the table grows with the deployments it records.
+//!
+//! Status transitions are recorded by the writers in `deployments.rs`, in
+//! the same statement as the transition. [`record`] is for events that are
+//! not a transition (a Rollback Guard decision, for example).
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -90,6 +94,53 @@ pub async fn list_for_deployment(
     Ok(events)
 }
 
+/// An event to append with [`record`].
+#[derive(Debug, Clone)]
+pub struct NewEvent<'a> {
+    pub deployment_id: Uuid,
+    /// An [`EventKind`](rise_backend_core::events::EventKind) in its stored form.
+    pub kind: &'a str,
+    /// An [`EventSeverity`](rise_backend_core::events::EventSeverity) in its stored form.
+    pub severity: &'a str,
+    /// An [`EventSource`](rise_backend_core::events::EventSource) in its stored form.
+    pub source: &'a str,
+    pub message: Option<&'a str>,
+    pub attributes: &'a serde_json::Value,
+    /// With a key, the event is written at most once per
+    /// `(deployment, kind, dedupe_key)`.
+    pub dedupe_key: Option<&'a str>,
+}
+
+/// Append one event, occurring now. Returns whether a row was written: `false`
+/// means an event with the same dedupe key was already recorded.
+pub async fn record<'e, E>(executor: E, ev: NewEvent<'_>) -> Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let result = sqlx::query!(
+        r#"
+        INSERT INTO deployment_events (
+            deployment_id, occurred_at, kind, severity, source, message, attributes, dedupe_key
+        )
+        VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (deployment_id, kind, dedupe_key) WHERE dedupe_key IS NOT NULL
+        DO NOTHING
+        "#,
+        ev.deployment_id,
+        ev.kind,
+        ev.severity,
+        ev.source,
+        ev.message,
+        ev.attributes,
+        ev.dedupe_key,
+    )
+    .execute(executor)
+    .await
+    .context("Failed to record deployment event")?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Where a deployment's image came from: the Git state the CLI reported when
 /// the image was built, and the deployment it was created from, if any.
 #[derive(Debug, Clone, Default)]
@@ -100,6 +151,14 @@ pub struct Provenance {
     /// `deployment_id` of the deployment this one was created from (redeploy,
     /// rollback, promote).
     pub source_deployment_id: Option<String>,
+    /// `deployment_id` of the deployment this one was promoted from (the
+    /// immediate source across environments), and that deployment's
+    /// environment name.
+    pub promoted_from_deployment_id: Option<String>,
+    pub promoted_from_environment: Option<String>,
+    /// `deployment_id` of the unhealthy deployment this Rollback Guard
+    /// replacement was created for.
+    pub rollback_guard_for_deployment_id: Option<String>,
 }
 
 /// Provenance for several deployments at once.
@@ -170,6 +229,37 @@ pub async fn provenance_batch(
 
     for row in source_rows {
         out.entry(row.id).or_default().source_deployment_id = Some(row.source_deployment_id);
+    }
+
+    let promotion_rows = sqlx::query!(
+        r#"
+        SELECT
+            d.id AS "id!",
+            pf.deployment_id AS "promoted_from_deployment_id?",
+            pe.name AS "promoted_from_environment?",
+            g.deployment_id AS "rollback_guard_for_deployment_id?"
+        FROM deployments d
+        LEFT JOIN deployments pf ON pf.id = d.promoted_from_deployment_id
+        LEFT JOIN environments pe ON pe.id = d.promoted_from_environment_id
+        LEFT JOIN deployments g ON g.id = d.rollback_guard_for_deployment_id
+        WHERE d.id = ANY($1)
+          AND (
+              d.promoted_from_deployment_id IS NOT NULL
+              OR d.promoted_from_environment_id IS NOT NULL
+              OR d.rollback_guard_for_deployment_id IS NOT NULL
+          )
+        "#,
+        deployment_ids
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to read promotion provenance")?;
+
+    for row in promotion_rows {
+        let entry = out.entry(row.id).or_default();
+        entry.promoted_from_deployment_id = row.promoted_from_deployment_id;
+        entry.promoted_from_environment = row.promoted_from_environment;
+        entry.rollback_guard_for_deployment_id = row.rollback_guard_for_deployment_id;
     }
 
     Ok(out)

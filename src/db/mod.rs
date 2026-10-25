@@ -8,6 +8,7 @@ pub mod device_authorizations;
 pub mod env_vars;
 pub mod environments;
 pub mod extensions;
+pub mod migration_barriers;
 pub mod models;
 pub mod oauth_transient_state;
 pub mod organization_links;

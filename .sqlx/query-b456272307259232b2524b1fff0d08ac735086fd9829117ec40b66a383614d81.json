@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"count!\"\n        FROM deployments\n        WHERE created_via = 'rollback_guard'\n          AND status IN ('Pending', 'Pushed', 'Deploying')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b456272307259232b2524b1fff0d08ac735086fd9829117ec40b66a383614d81"
+}

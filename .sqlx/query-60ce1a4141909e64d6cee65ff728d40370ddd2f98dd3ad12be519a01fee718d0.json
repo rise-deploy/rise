@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO deployment_env_vars (deployment_id, key, value, is_secret, is_protected, source)\n        SELECT $1, key, value, is_secret, is_protected, source\n        FROM deployment_env_vars\n        WHERE deployment_id = $2 AND source NOT IN ('system', 'extension')\n        ON CONFLICT (deployment_id, key) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "60ce1a4141909e64d6cee65ff728d40370ddd2f98dd3ad12be519a01fee718d0"
+}

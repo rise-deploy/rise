@@ -281,6 +281,12 @@ mod tests {
                             containers: None,
                             routes: None,
                             expiration_cap: None,
+                            created_via: crate::db::models::CreatedVia::Deploy,
+                            promoted_from_deployment_id: None,
+                            promoted_from_environment_id: None,
+                            migration_version: None,
+                            rollback_guard_for_deployment_id: None,
+                            extra_event_attributes: None,
                         },
                     )
                     .await

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            COUNT(*) FILTER (WHERE status = 'Healthy') AS \"healthy!\",\n            COUNT(*) FILTER (WHERE status = 'Unhealthy') AS \"unhealthy!\"\n        FROM deployments\n        WHERE is_active\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "healthy!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "unhealthy!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4321c50a8955398926bf825fd2599543dd82e3d1e4676a1fd9ec519c553a376d"
+}

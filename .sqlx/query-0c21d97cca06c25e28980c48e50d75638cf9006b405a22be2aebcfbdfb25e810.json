@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            d.id AS \"id!\",\n            pf.deployment_id AS \"promoted_from_deployment_id?\",\n            pe.name AS \"promoted_from_environment?\",\n            g.deployment_id AS \"rollback_guard_for_deployment_id?\"\n        FROM deployments d\n        LEFT JOIN deployments pf ON pf.id = d.promoted_from_deployment_id\n        LEFT JOIN environments pe ON pe.id = d.promoted_from_environment_id\n        LEFT JOIN deployments g ON g.id = d.rollback_guard_for_deployment_id\n        WHERE d.id = ANY($1)\n          AND (\n              d.promoted_from_deployment_id IS NOT NULL\n              OR d.promoted_from_environment_id IS NOT NULL\n              OR d.rollback_guard_for_deployment_id IS NOT NULL\n          )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "promoted_from_deployment_id?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "deployment_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "promoted_from_environment?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "rollback_guard_for_deployment_id?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "deployment_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "0c21d97cca06c25e28980c48e50d75638cf9006b405a22be2aebcfbdfb25e810"
+}
