@@ -2,7 +2,8 @@
  * An error response from the Rise API.
  *
  * The backend answers errors with `{"error": "...", "suggestions"?: [...],
- * "error_code"?: "..."}`; `message` is the `error` sentence, ready for a toast.
+ * "error_code"?: "...", "details"?: {...}}`; `message` is the `error`
+ * sentence, ready for a toast.
  */
 export class ApiError extends Error {
     readonly status: number;
@@ -10,13 +11,16 @@ export class ApiError extends Error {
     readonly code?: string;
     /** Close matches the backend offers, e.g. for a misspelled team name. */
     readonly suggestions?: string[];
+    /** Structured context for `code`, e.g. the barriers a `migration_barrier` crossed. */
+    readonly details?: unknown;
 
-    constructor(status: number, message: string, code?: string, suggestions?: string[]) {
+    constructor(status: number, message: string, code?: string, suggestions?: string[], details?: unknown) {
         super(message);
         this.name = 'ApiError';
         this.status = status;
         this.code = code;
         this.suggestions = suggestions;
+        this.details = details;
     }
 
     /** The account may not use the dashboard at all (as opposed to one resource). */
@@ -33,16 +37,18 @@ export async function apiErrorFromResponse(response: Response): Promise<ApiError
     let message = text.trim();
     let code: string | undefined;
     let suggestions: string[] | undefined;
+    let details: unknown;
     try {
         const body = JSON.parse(text);
         if (body && typeof body.error === 'string') message = body.error;
         if (body && typeof body.error_code === 'string') code = body.error_code;
         if (body && Array.isArray(body.suggestions)) suggestions = body.suggestions.map(String);
+        if (body && body.details !== undefined && body.details !== null) details = body.details;
     } catch {
         // Not JSON: keep the text.
     }
     if (!message) message = `Request failed (${response.status} ${response.statusText || 'error'})`;
-    return new ApiError(response.status, message, code, suggestions);
+    return new ApiError(response.status, message, code, suggestions, details);
 }
 
 export function isApiError(err: unknown, status?: number): err is ApiError {

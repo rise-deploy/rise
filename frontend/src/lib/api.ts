@@ -191,8 +191,11 @@ class RiseAPI {
     // rollback). With `target.environment` it lands in that environment's
     // primary group instead (promote); the backend resolves the group.
     // `useSourceEnvVars` copies the source's variable snapshot; otherwise the
-    // target's current project variables are used.
-    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false, target = null) {
+    // target's current project variables are used. A promotion (another
+    // environment) always uses the target's variables.
+    // `opts.force_migration_barrier` deploys even across a recorded migration
+    // barrier (the retry after a 409 `migration_barrier`).
+    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false, target = null, opts = {}) {
         let placement;
         if (target?.environment) {
             placement = { environment: target.environment };
@@ -211,6 +214,7 @@ class RiseAPI {
                 from_deployment: sourceDeploymentId,
                 use_source_env_vars: useSourceEnvVars,
                 ...placement,
+                ...(opts?.force_migration_barrier ? { force_migration_barrier: true } : {}),
             })
         });
     }
@@ -338,6 +342,14 @@ class RiseAPI {
      * `environment` (default: the deployment's own) would get now. Secrets are
      * compared on the server; only whether they changed comes back.
      */
+    // Preview of a deployment created from `deploymentId` into `environment`
+    // (default: the source's own): promotion gate, migration barriers, the
+    // pinned image and resource adjustments.
+    async getDeploymentPlan(projectName, deploymentId, environment = null) {
+        const qs = environment ? `?environment=${encodeURIComponent(environment)}` : '';
+        return this.request(`/projects/${projectName}/deployments/${deploymentId}/plan${qs}`);
+    }
+
     async diffDeploymentEnvVars(projectName, deploymentId, environment = null) {
         const qs = environment ? `?environment=${encodeURIComponent(environment)}` : '';
         return this.request(`/projects/${projectName}/deployments/${deploymentId}/env/diff${qs}`);

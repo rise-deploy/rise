@@ -22,6 +22,8 @@ import {
     Input,
     Modal,
     Panel,
+    Pill,
+    Select,
     Status,
     cx,
     statusTone,
@@ -78,6 +80,9 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
                 <h2 className="name">{env.name}</h2>
                 {env.is_production && env.name !== 'production' && <span className="r-env-tag prod">production</span>}
                 <Status {...healthBadge(state)} />
+                {env.rollback_guard?.enabled && (
+                    <Pill title={`Rolls back automatically after ${formatSeconds(env.rollback_guard.unhealthy_timeout_seconds)} unhealthy`}>Rollback Guard</Pill>
+                )}
                 <span className="right">{replicas ?? (live ? `${live.replicas} replica${live.replicas === 1 ? '' : 's'}` : '')}</span>
             </div>
             <div className="r-env-card-body">
@@ -85,6 +90,9 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
                     <a className="r-link mono r-env-url" href={url} target="_blank" rel="noopener noreferrer">{stripUrlScheme(url)}</a>
                 ) : (
                     <span className="r-env-url muted">{env.primary_deployment_group ? 'Not deployed' : 'No primary deployment group'}</span>
+                )}
+                {env.promotion_source_environment && (
+                    <span className="r-env-promotes-from muted">Promotes from {env.promotion_source_environment}</span>
                 )}
                 <button
                     type="button"
@@ -178,12 +186,28 @@ interface EnvForm {
     max_cpu: string;
     min_memory: string;
     max_memory: string;
+    /** Empty: any environment (no promotion gate). */
+    promotion_source_environment: string;
+    rollback_guard_enabled: boolean;
+    rollback_guard_timeout_seconds: string;
+}
+
+const DEFAULT_GUARD_TIMEOUT_SECONDS = 300;
+
+/** `300` → `5m`, `5400` → `1h 30m`, `90` → `90s`. */
+function formatSeconds(total: number): string {
+    if (total % 60 !== 0) return `${total}s`;
+    const h = Math.floor(total / 3600);
+    const m = (total % 3600) / 60;
+    return [h ? `${h}h` : '', m ? `${m}m` : ''].filter(Boolean).join(' ') || '0m';
 }
 
 const EMPTY_FORM: EnvForm = {
     name: '', primary_deployment_group: '', is_production: false, color: 'green',
     max_deployment_expiration: '',
     min_replicas: '', max_replicas: '', min_cpu: '', max_cpu: '', min_memory: '', max_memory: '',
+    promotion_source_environment: '', rollback_guard_enabled: false,
+    rollback_guard_timeout_seconds: String(DEFAULT_GUARD_TIMEOUT_SECONDS),
 };
 
 interface PlatformConstraints {
@@ -242,6 +266,9 @@ export function EnvironmentsSection() {
             max_cpu: c?.max_cpu ?? '',
             min_memory: c?.min_memory ?? '',
             max_memory: c?.max_memory ?? '',
+            promotion_source_environment: env.promotion_source_environment ?? '',
+            rollback_guard_enabled: env.rollback_guard?.enabled ?? false,
+            rollback_guard_timeout_seconds: String(env.rollback_guard?.unhealthy_timeout_seconds ?? DEFAULT_GUARD_TIMEOUT_SECONDS),
         });
         setIsModalOpen(true);
     };
@@ -276,6 +303,19 @@ export function EnvironmentsSection() {
                         min_memory: (hasAnyConstraint && formData.min_memory) || null,
                         max_memory: (hasAnyConstraint && formData.max_memory) || null,
                     };
+                    // Promotion policy: only what changed, so an unchanged form never trips validation.
+                    if (formData.promotion_source_environment !== (editingEnv.promotion_source_environment ?? '')) {
+                        updates.promotion_source_environment = formData.promotion_source_environment || null;
+                    }
+                    const timeout = parseInt(formData.rollback_guard_timeout_seconds, 10);
+                    const guard: { enabled?: boolean; unhealthy_timeout_seconds?: number } = {};
+                    if (formData.rollback_guard_enabled !== (editingEnv.rollback_guard?.enabled ?? false)) {
+                        guard.enabled = formData.rollback_guard_enabled;
+                    }
+                    if (Number.isFinite(timeout) && timeout !== (editingEnv.rollback_guard?.unhealthy_timeout_seconds ?? DEFAULT_GUARD_TIMEOUT_SECONDS)) {
+                        guard.unhealthy_timeout_seconds = timeout;
+                    }
+                    if (Object.keys(guard).length > 0) updates.rollback_guard = guard;
                 }
                 await api.updateEnvironment(projectName, editingEnv.name, updates);
                 showToast(`Environment ${editingEnv.name} updated`, 'success');
@@ -401,6 +441,43 @@ export function EnvironmentsSection() {
                             {constraintField('min_memory', 'Min memory', platformConstraints?.min_memory ?? '64Mi')}
                             {constraintField('max_memory', 'Max memory', platformConstraints?.max_memory ?? '2Gi')}
                         </div>
+                    </div>
+                )}
+
+                {isAdmin && editingEnv && (
+                    <div className="r-form-section">
+                        <div className="r-section-label">Release promotion</div>
+                        <Field
+                            label="Promote only from"
+                            hint={<>When set, deployments here must be promoted from that environment (<span className="mono">rise promote</span>); fresh builds and <span className="mono">--image</span> deploys are refused. Redeploys and rollbacks within this environment stay allowed.</>}
+                        >
+                            <Select
+                                value={formData.promotion_source_environment}
+                                onChange={v => set({ promotion_source_environment: v })}
+                                options={[
+                                    { value: '', label: 'Any' },
+                                    ...environments.filter(e => e.name !== editingEnv.name).map(e => ({ value: e.name, label: e.name })),
+                                ]}
+                            />
+                        </Field>
+                        <label className="r-check">
+                            <input type="checkbox" checked={formData.rollback_guard_enabled} onChange={e => set({ rollback_guard_enabled: e.target.checked })} />
+                            <span>
+                                Rollback Guard
+                                <span className="hint">When the live deployment of the primary group stays unhealthy, redeploy the last deployment that served before it.</span>
+                            </span>
+                        </label>
+                        {formData.rollback_guard_enabled && (
+                            <Field label="Unhealthy for (seconds)" hint="How long the live deployment must stay unhealthy before the guard acts (60–86400).">
+                                <Input
+                                    type="number"
+                                    min={60}
+                                    max={86400}
+                                    value={formData.rollback_guard_timeout_seconds}
+                                    onChange={e => set({ rollback_guard_timeout_seconds: e.target.value })}
+                                />
+                            </Field>
+                        )}
                     </div>
                 )}
             </Modal>

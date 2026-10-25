@@ -18,9 +18,13 @@ interface DiffEntry {
     to_source?: string;
 }
 
-/** `global` → Global, `env:staging` → staging, `toml` → rise.toml, `cli` → a CLI flag. */
+/**
+ * `global` → Global, `env:staging` → staging, `toml` → rise.toml,
+ * `toml:staging` → rise.toml ([environments.staging]), `cli` → a CLI flag.
+ */
 function sourceLabel(source?: string): string {
     if (!source || source === 'global') return 'Global';
+    if (source.startsWith('toml:')) return `rise.toml ([environments.${source.slice(5)}])`;
     if (source.startsWith('env:')) return source.slice(4);
     return source === 'toml' ? 'rise.toml' : source === 'cli' ? 'a CLI flag' : source;
 }

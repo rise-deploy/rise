@@ -17,7 +17,7 @@ import { fetchDeploymentEvents, type DeploymentEvent } from './logs/api';
 import { useCurrentProject, type Deployment, type Environment } from '../lib/project-context';
 import { deploymentPath } from '../lib/routes';
 import { useDeployActions } from '../components/deploy-actions';
-import { byNewest, deploymentSource, isInProgress, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
+import { byNewest, createdViaLabel, deploymentSource, isInProgress, isTerminal, promoteTargets, sortEnvironments } from '../lib/env-state';
 import { DeploymentMetaStrip, FailurePanel, RolloutPanel, rolloutEnd, rolloutSteps, useDeploymentEvents } from './deployment-diagnosis';
 import { useIsMobile } from '../lib/use-media';
 import { DeploymentSource } from '../components/deployment-source';
@@ -167,6 +167,24 @@ function stopConsequence(d: Deployment | null | undefined, environments: Environ
         };
     }
     return { title: `Stop ${id}?`, message: `Stops ${id}.`, confirm: 'Stop deployment' };
+}
+
+/** A deployment ID linking to its page. */
+function DeploymentLink({ projectName, id }: { projectName: string; id: string }) {
+    const href = deploymentPath(projectName, id);
+    return (
+        <a
+            className="r-link mono"
+            href={href}
+            onClick={(e) => {
+                if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+                e.preventDefault();
+                navigate(href);
+            }}
+        >
+            {id}
+        </a>
+    );
 }
 
 /**
@@ -799,7 +817,34 @@ export function DeploymentDetail({ projectName, deploymentId }) {
                             <span className="mono" style={{ fontSize: 12 }}>{deployment.http_port}</span>
                         </KVRow>
                     ) : null}
-                    <KVRow k="Created by">{deployment.created_by_email || '-'}</KVRow>
+                    <KVRow k="Created by">
+                        {deployment.created_via === 'rollback_guard' ? 'Rollback Guard (automatic)' : deployment.created_by_email || '-'}
+                    </KVRow>
+                    {createdViaLabel(deployment.created_via) && deployment.created_via !== 'deploy' && (
+                        <KVRow k="Created via">
+                            {createdViaLabel(deployment.created_via)}
+                            {deployment.created_via === 'promote' && deployment.promoted_from_deployment_id && (
+                                <> from <DeploymentLink projectName={projectName} id={deployment.promoted_from_deployment_id} />
+                                    {deployment.promoted_from_environment && <> in {deployment.promoted_from_environment}</>}</>
+                            )}
+                            {deployment.created_via === 'redeploy' && deployment.source_deployment_id && (
+                                <> of <DeploymentLink projectName={projectName} id={deployment.source_deployment_id} /></>
+                            )}
+                        </KVRow>
+                    )}
+                    {deployment.rollback_guard_for_deployment_id && (
+                        <KVRow k="Replaces">
+                            <DeploymentLink projectName={projectName} id={deployment.rollback_guard_for_deployment_id} /> (unhealthy)
+                        </KVRow>
+                    )}
+                    {deployment.migration_version != null && (
+                        <KVRow k="Migration version"><span className="mono" style={{ fontSize: 12 }}>{deployment.migration_version}</span></KVRow>
+                    )}
+                    {deployment.status === 'Unhealthy' && deployment.unhealthy_since && (
+                        <KVRow k="Unhealthy since">
+                            <span title={formatISO8601(deployment.unhealthy_since)}>{formatRelativeTimeRounded(deployment.unhealthy_since)}</span>
+                        </KVRow>
+                    )}
                     {[
                         { label: 'Repository', url: deployment.git_repository_url },
                         {

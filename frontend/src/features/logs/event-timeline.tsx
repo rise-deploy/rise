@@ -102,7 +102,10 @@ function EventRow({
     projectName: string;
 }) {
     const ts = new Date(event.occurred_at);
-    const reason = typeof event.attributes?.reason === 'string' ? event.attributes.reason : null;
+    // A Rollback Guard decision's reason is a code its label already spells out;
+    // only a failure's reason (the candidate's error) gets its own line.
+    const guardReasonInLabel = event.kind === ROLLBACK_GUARD && event.attributes?.outcome !== 'failed';
+    const reason = typeof event.attributes?.reason === 'string' && !guardReasonInLabel ? event.attributes.reason : null;
 
     return (
         <div className={`r-evt-row sev-${event.severity}`}>
@@ -127,6 +130,10 @@ function EventRow({
  * everything twice.
  */
 const RESERVED_KEYS = new Set(['from', 'to', 'reason']);
+
+const ROLLBACK_GUARD = 'rollback_guard';
+/** A Rollback Guard event's `outcome` and `reason` are its label. */
+const GUARD_LABEL_KEYS = new Set(['outcome']);
 
 /**
  * Presentation hints for keys we know about — a shorter label, and an order
@@ -158,6 +165,20 @@ const LABELS: Record<string, string> = {
     requested_expires_at: 'requested expiry',
     max_deployment_expiration: 'max expiration',
     expiration_limited_by: 'capped by environment',
+    created_via: 'via',
+    promoted_from: 'promoted from',
+    promoted_from_environment: 'from environment',
+    migration_version: 'migration version',
+    rollback_guard_for: 'Rollback Guard for',
+    candidate: 'candidate',
+    last_known_good: 'last known good',
+    unhealthy_since: 'unhealthy since',
+    timeout_seconds: 'timeout (s)',
+    candidate_version: 'candidate migration version',
+    environment_version: 'environment migration version',
+    promotion_gate_bypassed: 'promotion gate bypassed',
+    migration_barrier_forced: 'migration barrier forced',
+    resource_adjustments: 'resource adjustments',
 };
 
 /**
@@ -168,7 +189,8 @@ const LABELS: Record<string, string> = {
  */
 const ORDER = [
     // Who and what, before how much.
-    'created_by', 'superseded_by', 'rolled_back_from', 'stopped_by',
+    'created_by', 'created_via', 'promoted_from', 'promoted_from_environment', 'rollback_guard_for',
+    'candidate', 'last_known_good', 'superseded_by', 'rolled_back_from', 'stopped_by',
     'container', 'containers', 'replicas', 'cpu', 'memory',
     'requested_cpu', 'requested_memory', 'resolved_cpu_units', 'resolved_memory_mib',
     // Then what was built, and from what.
@@ -203,6 +225,7 @@ function EventAttributes({
 }) {
     const entries = Object.entries(event.attributes ?? {})
         .filter(([key, value]) => !RESERVED_KEYS.has(key) && !isEmptyValue(value))
+        .filter(([key]) => !(event.kind === ROLLBACK_GUARD && GUARD_LABEL_KEYS.has(key)))
         .sort(([a], [b]) => orderOf(a) - orderOf(b) || a.localeCompare(b));
 
     if (entries.length === 0) return null;
@@ -407,11 +430,37 @@ function describe(event: DeploymentEvent): string {
     if (event.kind === 'status_changed') {
         return transition ?? event.kind.replace(/_/g, ' ');
     }
+    if (event.kind === ROLLBACK_GUARD) return describeRollbackGuard(event);
 
     // Another kind names itself first — "replica restarted" — and then says
     // what moved, if anything did.
     const name = event.message || event.kind.replace(/_/g, ' ');
     return transition ? `${name} ${transition}` : name;
+}
+
+/** Readable forms of the Rollback Guard's decline and abort reasons. */
+const GUARD_REASONS: Record<string, string> = {
+    chained: 'this deployment is itself a Rollback Guard replacement',
+    platform_wide_unhealthy: 'too many deployments are unhealthy platform-wide',
+    in_flight_limit: 'too many guard replacements in flight',
+    newer_deployment_in_progress: 'a newer deployment is in progress',
+    no_last_known_good: 'no earlier deployment ever served',
+    last_known_good_not_superseded: 'the last good deployment was stopped, not replaced',
+    last_known_good_unavailable: 'the last good deployment can no longer be redeployed',
+    migration_barrier: 'it would cross a migration barrier',
+    migration_version_unknown: 'its migration version is unknown',
+    recovered: 'recovered',
+    replaced: 'replaced',
+};
+
+/** "Rollback Guard: triggered", "Rollback Guard: declined (a newer deployment is in progress)", … */
+function describeRollbackGuard(event: DeploymentEvent): string {
+    const outcome = scalar(event.attributes?.outcome) ?? 'decision';
+    const reason = scalar(event.attributes?.reason);
+    if (reason && outcome !== 'failed') {
+        return `Rollback Guard: ${outcome} (${GUARD_REASONS[reason] ?? reason.replace(/_/g, ' ')})`;
+    }
+    return `Rollback Guard: ${outcome}`;
 }
 
 /** A `from`/`to` endpoint, which may be a status name or a count. */
