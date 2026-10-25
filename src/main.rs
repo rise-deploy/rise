@@ -169,8 +169,55 @@ struct DeployArgs {
     /// Write the completed deployment JSON to this file.
     #[arg(long, value_name = "PATH")]
     status_file: Option<String>,
+    /// Deploy even if it crosses a recorded migration barrier
+    #[arg(long)]
+    force: bool,
     #[command(flatten)]
     build_args: build::BuildArgs,
+}
+
+/// Arguments for promoting a deployment into another environment
+#[derive(Debug, Clone, clap::Args)]
+struct PromoteArgs {
+    /// Deployment to promote (e.g., '20261020-101500')
+    deployment_id: String,
+    /// Project name (optional if rise.toml contains [project] section)
+    #[arg(long, short = 'p')]
+    project: Option<String>,
+    /// Directory containing rise.toml (defaults to current directory)
+    #[arg(long, default_value = ".")]
+    path: String,
+    /// Environment to promote into (defaults to the project's production environment)
+    #[arg(
+        long = "target-environment",
+        short = 'E',
+        visible_alias = "environment"
+    )]
+    target_environment: Option<String>,
+    /// Promote without asking for confirmation (required when not run interactively)
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Promote even if it crosses a recorded migration barrier
+    #[arg(long)]
+    force: bool,
+    /// Do not read rise.toml: no [environments.<target>] variables or resources are applied
+    #[arg(long)]
+    no_config: bool,
+    /// Number of replicas in the target (overrides rise.toml)
+    #[arg(long)]
+    replicas: Option<u32>,
+    /// CPU allocation in the target (overrides rise.toml)
+    #[arg(long)]
+    cpu: Option<String>,
+    /// Memory allocation in the target (overrides rise.toml)
+    #[arg(long)]
+    memory: Option<String>,
+    /// Emit the completed deployment as JSON on stdout.
+    #[arg(long)]
+    json: bool,
+    /// Write the completed deployment JSON to this file.
+    #[arg(long, value_name = "PATH")]
+    status_file: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -196,6 +243,11 @@ enum Commands {
     Deploy {
         #[command(flatten)]
         args: DeployArgs,
+    },
+    /// Promote a deployment into another environment (shortcut for 'deployment promote')
+    Promote {
+        #[command(flatten)]
+        args: PromoteArgs,
     },
     /// Deployment management commands
     #[command(subcommand)]
@@ -547,6 +599,41 @@ enum ProjectCommands {
     /// Manage app users/teams (view-only access to deployed apps)
     #[command(subcommand)]
     AppUser(AppUserCommands),
+    /// Manage migration barriers (database migrations older code must not run against)
+    #[command(subcommand)]
+    #[command(visible_alias = "mb")]
+    MigrationBarrier(MigrationBarrierCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum MigrationBarrierCommands {
+    /// Record a barrier: code with a lower migration version must not run
+    /// against a database migrated to this version
+    #[command(visible_alias = "a")]
+    Add {
+        /// Migration version that breaks older code
+        version: u64,
+        /// Why older code breaks (e.g., 'drops users.name')
+        #[arg(long)]
+        reason: String,
+        /// Project name (optional if rise.toml contains [project] section)
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+        /// Directory containing rise.toml (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
+    /// List recorded barriers
+    #[command(visible_alias = "ls")]
+    #[command(visible_alias = "l")]
+    List {
+        /// Project name (optional if rise.toml contains [project] section)
+        #[arg(long, short = 'p')]
+        project: Option<String>,
+        /// Directory containing rise.toml (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -652,6 +739,11 @@ enum DeploymentCommands {
         #[command(flatten)]
         args: DeployArgs,
     },
+    /// Promote a deployment into another environment
+    Promote {
+        #[command(flatten)]
+        args: PromoteArgs,
+    },
     /// List deployments for a project
     #[command(visible_alias = "ls")]
     #[command(visible_alias = "l")]
@@ -692,6 +784,9 @@ enum DeploymentCommands {
         /// Timeout for following deployment
         #[arg(long, default_value = "5m")]
         timeout: String,
+        /// Print the deployment as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Stop all deployments in a group
     Stop {
@@ -1002,6 +1097,18 @@ enum EnvironmentCommands {
         /// (empty string clears)
         #[arg(long, value_name = "DURATION")]
         max_expiration: Option<String>,
+        /// Only accept deployments promoted from this environment (empty string clears;
+        /// administrators only)
+        #[arg(long, value_name = "ENV")]
+        promote_from: Option<String>,
+        /// Automatically roll back to the last good deployment after sustained
+        /// unhealthiness (administrators only)
+        #[arg(long, value_name = "BOOL")]
+        rollback_guard: Option<bool>,
+        /// How long a deployment must stay unhealthy before the Rollback Guard acts,
+        /// e.g. '5m', '1h' (administrators only)
+        #[arg(long, value_name = "DURATION")]
+        rollback_guard_timeout: Option<String>,
     },
     /// Delete an environment
     #[command(visible_alias = "del")]
@@ -1242,6 +1349,7 @@ async fn main() -> Result<()> {
     // Transform Deploy command to Deployment::Create for zero-duplication aliasing
     let cli_command = match cli.command {
         Commands::Deploy { args } => Commands::Deployment(DeploymentCommands::Create { args }),
+        Commands::Promote { args } => Commands::Deployment(DeploymentCommands::Promote { args }),
         other => other,
     };
 
@@ -1421,6 +1529,39 @@ async fn main() -> Result<()> {
                     }
                     AppUserCommands::List { .. } => {
                         cli::project::list_app_users(
+                            &http_client,
+                            &backend_url,
+                            &token,
+                            &project_name,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            ProjectCommands::MigrationBarrier(barrier_cmd) => {
+                let (project, path) = match barrier_cmd {
+                    MigrationBarrierCommands::Add { project, path, .. }
+                    | MigrationBarrierCommands::List { project, path } => (project, path),
+                };
+                let project_name = resolve_project_name(project.clone(), path)?;
+                let token =
+                    cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
+                match barrier_cmd {
+                    MigrationBarrierCommands::Add {
+                        version, reason, ..
+                    } => {
+                        cli::project::add_migration_barrier(
+                            &http_client,
+                            &backend_url,
+                            &token,
+                            &project_name,
+                            *version,
+                            reason,
+                        )
+                        .await?;
+                    }
+                    MigrationBarrierCommands::List { .. } => {
+                        cli::project::list_migration_barriers(
                             &http_client,
                             &backend_url,
                             &token,
@@ -1703,6 +1844,17 @@ async fn main() -> Result<()> {
                     .or_else(|| toml_env_deploy.and_then(|d| d.memory.clone()))
                     .or_else(|| toml_global_deploy.and_then(|d| d.memory.clone()));
 
+                // The migration version describes the code in this checkout, so it
+                // only applies when that code is what gets deployed.
+                let migration_version = if args.from.is_none() {
+                    toml_config
+                        .as_ref()
+                        .and_then(|c| c.project.as_ref())
+                        .and_then(|p| p.migration_version)
+                } else {
+                    None
+                };
+
                 deployment::create_deployment(
                     &http_client,
                     &backend_url,
@@ -1727,6 +1879,40 @@ async fn main() -> Result<()> {
                         replicas,
                         cpu,
                         memory,
+                        json_output: args.json,
+                        status_file: args.status_file.clone(),
+                        migration_version,
+                        force: args.force,
+                    },
+                )
+                .await?;
+            }
+            DeploymentCommands::Promote { args } => {
+                let toml_config = if args.no_config {
+                    None
+                } else {
+                    build::config::load_full_project_config(&args.path)
+                        .context("Failed to load rise.toml")?
+                };
+                let project_name = resolve_project_name_with_config(
+                    args.project.clone(),
+                    &args.path,
+                    toml_config.as_ref(),
+                )?;
+                deployment::promote(
+                    &http_client,
+                    &backend_url,
+                    &config,
+                    deployment::PromoteOptions {
+                        project_name: &project_name,
+                        deployment_id: &args.deployment_id,
+                        target_environment: args.target_environment.as_deref(),
+                        yes: args.yes,
+                        force: args.force,
+                        toml_config,
+                        replicas: args.replicas,
+                        cpu: args.cpu.clone(),
+                        memory: args.memory.clone(),
                         json_output: args.json,
                         status_file: args.status_file.clone(),
                     },
@@ -1762,6 +1948,7 @@ async fn main() -> Result<()> {
                 deployment_id,
                 follow,
                 timeout,
+                json,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
                 deployment::show_deployment(
@@ -1772,6 +1959,7 @@ async fn main() -> Result<()> {
                     deployment_id,
                     *follow,
                     timeout,
+                    *json,
                 )
                 .await?;
             }
@@ -2326,9 +2514,9 @@ async fn main() -> Result<()> {
                 .await?;
             }
         },
-        Commands::Deploy { .. } => {
-            // Already transformed to Deployment(Create) above
-            unreachable!("Deploy command should have been transformed to Deployment(Create)")
+        Commands::Deploy { .. } | Commands::Promote { .. } => {
+            // Already transformed to Deployment(Create/Promote) above
+            unreachable!("Deploy and Promote are transformed to Deployment subcommands")
         }
     }
 
@@ -2376,9 +2564,156 @@ mod log_color_tests {
 #[cfg(all(test, feature = "cli"))]
 mod deployment_output_cli_tests {
     use super::{
-        project_config_directory, Cli, Commands, DeploymentCommands, EnvCommands, ProfileCommands,
+        project_config_directory, Cli, Commands, DeploymentCommands, EnvCommands,
+        EnvironmentCommands, MigrationBarrierCommands, ProfileCommands, ProjectCommands,
     };
     use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn promote_parses_with_target_and_flags() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "promote",
+            "20261020-101500",
+            "-p",
+            "app",
+            "-E",
+            "production",
+            "--yes",
+            "--force",
+            "--no-config",
+            "--replicas",
+            "2",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Promote { args } => {
+                assert_eq!(args.deployment_id, "20261020-101500");
+                assert_eq!(args.project.as_deref(), Some("app"));
+                assert_eq!(args.target_environment.as_deref(), Some("production"));
+                assert!(args.yes && args.force && args.no_config);
+                assert_eq!(args.replicas, Some(2));
+                assert_eq!(args.path, ".");
+            }
+            _ => panic!("expected promote command"),
+        }
+
+        let cli = Cli::try_parse_from(["rise", "deployment", "promote", "d1"]).unwrap();
+        match cli.command {
+            Commands::Deployment(DeploymentCommands::Promote { args }) => {
+                assert_eq!(args.deployment_id, "d1");
+                assert!(args.target_environment.is_none() && !args.yes);
+            }
+            _ => panic!("expected deployment promote command"),
+        }
+    }
+
+    #[test]
+    fn deploy_accepts_force() {
+        let cli = Cli::try_parse_from(["rise", "deploy", "--from", "d1", "--force"]).unwrap();
+        match cli.command {
+            Commands::Deploy { args } => {
+                assert!(args.force);
+                assert_eq!(args.from.as_deref(), Some("d1"));
+            }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn migration_barrier_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "project",
+            "mb",
+            "add",
+            "5",
+            "--reason",
+            "drops users.name",
+            "-p",
+            "app",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Project(ProjectCommands::MigrationBarrier(
+                MigrationBarrierCommands::Add {
+                    version,
+                    reason,
+                    project,
+                    ..
+                },
+            )) => {
+                assert_eq!(version, 5);
+                assert_eq!(reason, "drops users.name");
+                assert_eq!(project.as_deref(), Some("app"));
+            }
+            _ => panic!("expected migration-barrier add"),
+        }
+        let cli =
+            Cli::try_parse_from(["rise", "project", "migration-barrier", "list", "-p", "app"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Project(ProjectCommands::MigrationBarrier(
+                MigrationBarrierCommands::List { .. }
+            ))
+        ));
+        assert!(Cli::try_parse_from(["rise", "project", "mb", "add", "5"]).is_err());
+    }
+
+    #[test]
+    fn environment_update_accepts_promotion_and_guard_flags() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "environment",
+            "update",
+            "production",
+            "--promote-from",
+            "staging",
+            "--rollback-guard",
+            "true",
+            "--rollback-guard-timeout",
+            "10m",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Environment(EnvironmentCommands::Update {
+                promote_from,
+                rollback_guard,
+                rollback_guard_timeout,
+                ..
+            }) => {
+                assert_eq!(promote_from.as_deref(), Some("staging"));
+                assert_eq!(rollback_guard, Some(true));
+                assert_eq!(rollback_guard_timeout.as_deref(), Some("10m"));
+            }
+            _ => panic!("expected environment update"),
+        }
+        let cli = Cli::try_parse_from([
+            "rise",
+            "environment",
+            "update",
+            "production",
+            "--promote-from",
+            "",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Environment(EnvironmentCommands::Update { promote_from, .. }) => {
+                assert_eq!(promote_from.as_deref(), Some(""));
+            }
+            _ => panic!("expected environment update"),
+        }
+    }
+
+    #[test]
+    fn deployment_show_accepts_json() {
+        let cli = Cli::try_parse_from(["rise", "deployment", "show", "d1", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Deployment(DeploymentCommands::Show { json: true, .. })
+        ));
+    }
 
     #[test]
     fn deploy_accepts_json_and_status_file_flags() {

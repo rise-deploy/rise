@@ -2121,6 +2121,44 @@
       },
       "type": "object"
     },
+    "RollbackGuardSettings": {
+      "description": "Operator settings for the Rollback Guard controller.\n\nThe guard only acts in environments that enabled it (an environment's\n`rollback_guard.enabled`, admin-set); `enabled: false` here stops it\nplatform-wide regardless.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Run the controller. An operator kill switch: when off, no environment\nis guarded, whatever its own setting.",
+          "type": "boolean"
+        },
+        "fleet_unhealthy_min_count": {
+          "default": 3,
+          "description": "Minimum number of `Unhealthy` active deployments before the fleet\ncircuit breaker considers the ratio at all.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fleet_unhealthy_ratio": {
+          "default": 0.5,
+          "description": "Fleet circuit breaker: when at least `fleet_unhealthy_min_count` active\ndeployments are `Unhealthy` and they make up at least this fraction of\nthe active Healthy/Unhealthy ones, the problem is taken to be the\nplatform's (e.g. a Traefik API outage), and the guard declines every\ntrigger (`platform_wide_unhealthy`). In `(0, 1]`.",
+          "format": "double",
+          "type": "number"
+        },
+        "max_in_flight": {
+          "default": 3,
+          "description": "Most Rollback Guard replacements on their way up at once, across the\nplatform. Further triggers are declined (`in_flight_limit`) until one\nsettles.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "poll_interval_seconds": {
+          "default": 10,
+          "description": "How often the controller looks for deployments to replace, in seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ServerSettings": {
       "properties": {
         "auth_token_max_ttl_seconds": {
@@ -2543,6 +2581,17 @@
         }
       ],
       "description": "Background garbage-collection worker for the generic resource store.\nDrains tombstoned resource rows once their controller finalizers clear.\nOmitting the section keeps the worker running with the documented defaults;\nthe worker is essential to draining cascading deletes and is therefore\nalways on when the `backend` feature is enabled."
+    },
+    "rollback_guard": {
+      "$ref": "#/$defs/RollbackGuardSettings",
+      "default": {
+        "enabled": true,
+        "fleet_unhealthy_min_count": 3,
+        "fleet_unhealthy_ratio": 0.5,
+        "max_in_flight": 3,
+        "poll_interval_seconds": 10
+      },
+      "description": "The Rollback Guard controller (ADR-0007): replaces an environment's\nactive deployment that stays `Unhealthy` past the environment's timeout\nwith its last known good predecessor. Environments opt in individually;\nthis section is the operator-wide switch and its safety limits."
     },
     "server": {
       "$ref": "#/$defs/ServerSettings"

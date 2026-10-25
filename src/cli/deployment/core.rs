@@ -534,7 +534,8 @@ pub async fn list_deployments(
     Ok(())
 }
 
-/// Show deployment details and optionally follow until terminal state
+/// Show deployment details and optionally follow until terminal state. With
+/// `json`, the deployment is printed as the API returns it.
 #[allow(clippy::too_many_arguments)]
 pub async fn show_deployment(
     http_client: &Client,
@@ -544,51 +545,48 @@ pub async fn show_deployment(
     deployment_id: &str,
     follow: bool,
     timeout_str: &str,
+    json: bool,
 ) -> Result<()> {
-    if follow {
-        // Use new enhanced UI for follow mode
-        let deployment = super::follow_ui::follow_deployment_with_ui(
+    let deployment = if follow {
+        super::follow_ui::follow_deployment_with_ui(
             http_client,
             backend_url,
             config,
             project,
             deployment_id,
             timeout_str,
-            false,
+            json,
         )
-        .await?;
-
-        // Exit with error if deployment failed
-        if deployment.status == DeploymentStatus::Failed {
-            if let Some(error) = deployment.error_message {
-                bail!("Deployment failed: {}", error);
-            } else {
-                bail!("Deployment failed");
-            }
-        }
-
-        Ok(())
+        .await?
     } else {
-        // One-shot display (no follow)
         let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
-
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
-
-        // Use the same UI as follow mode
-        super::follow_ui::print_deployment_snapshot(&deployment);
-
-        // Exit with error if deployment failed
-        if deployment.status == DeploymentStatus::Failed {
-            if let Some(error) = deployment.error_message {
-                bail!("Deployment failed: {}", error);
-            } else {
-                bail!("Deployment failed");
-            }
+        if !json {
+            // Use the same UI as follow mode
+            super::follow_ui::print_deployment_snapshot(&deployment);
         }
+        deployment
+    };
 
-        Ok(())
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&deployment)
+                .context("Failed to serialize deployment as JSON")?
+        );
     }
+
+    // Exit with error if deployment failed
+    if deployment.status == DeploymentStatus::Failed {
+        if let Some(error) = deployment.error_message {
+            bail!("Deployment failed: {}", error);
+        } else {
+            bail!("Deployment failed");
+        }
+    }
+
+    Ok(())
 }
 
 /// Rollback to a previous deployment
@@ -763,8 +761,8 @@ impl TimedRegistryCredentials {
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateDeploymentResponse {
-    deployment_id: String,
+pub(super) struct CreateDeploymentResponse {
+    pub(super) deployment_id: String,
     image_tag: String,
     /// Deprecated: credentials are now fetched from the deployment-scoped endpoint.
     /// Kept for deserialization compatibility with older backends.
@@ -775,6 +773,16 @@ struct CreateDeploymentResponse {
     /// Absent for single-container responses; older backends omit it.
     #[serde(default)]
     container_images: Option<std::collections::BTreeMap<String, String>>,
+    /// Things to tell the caller: a bypassed promotion gate, a forced
+    /// migration barrier, an undeclared migration version.
+    #[serde(default)]
+    warnings: Vec<String>,
+    /// Inherited resource values the server changed to fit the target.
+    #[serde(default)]
+    adjustments: Vec<super::promote::ResourceAdjustment>,
+    /// The digest-pinned image a promotion runs.
+    #[serde(default)]
+    pinned_image: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1035,7 +1043,7 @@ async fn fetch_backend_platform_hint(
 }
 
 /// A runtime environment variable override for a deployment
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EnvOverride {
     pub key: String,
     pub value: String,
@@ -1087,6 +1095,12 @@ pub struct DeploymentOptions<'a> {
     pub json_output: bool,
     /// Write the completed deployment JSON to this file.
     pub status_file: Option<String>,
+    /// `[project].migration_version` from rise.toml. Sent for fresh builds and
+    /// `--image` deployments only; a deployment created from another one
+    /// inherits the source's.
+    pub migration_version: Option<u64>,
+    /// Deploy even if the deployment crosses a recorded migration barrier.
+    pub force: bool,
 }
 
 pub async fn create_deployment(
@@ -1160,45 +1174,67 @@ pub async fn create_deployment(
 
     // Multi-container: if rise.toml has [containers], build the wire-format
     // spec list now and validate the request shape before talking to the
-    // server. v1 requires every container to declare an `image` directly;
-    // per-container build orchestration is a follow-up.
-    let (containers_payload, routes_payload) =
-        build_multi_container_payload(deploy_opts.toml_config.as_ref())?;
+    // server. A deployment created from another one runs the source's images,
+    // so the local containers are not sent.
+    let (containers_payload, routes_payload) = if deploy_opts.from_deployment.is_some() {
+        (None, Vec::new())
+    } else {
+        build_multi_container_payload(deploy_opts.toml_config.as_ref())?
+    };
+
+    // Show what creating from an existing deployment will do before doing it.
+    if let Some(from_deployment_id) = deploy_opts.from_deployment {
+        super::promote::preview_create_from(
+            http_client,
+            backend_url,
+            &token,
+            super::promote::PreviewRequest {
+                project: deploy_opts.project_name,
+                deployment_id: from_deployment_id,
+                environment: deploy_opts.environment,
+                group: deploy_opts.group,
+                use_source_env_vars: deploy_opts.use_source_env_vars,
+            },
+            deploy_opts.json_output,
+        )
+        .await;
+    }
 
     // Step 1: Create deployment and get deployment ID + credentials
     info!(
         "Creating deployment for project '{}'",
         deploy_opts.project_name
     );
-    let deployment_info = call_create_deployment_api(
-        http_client,
-        backend_url,
-        &token,
-        deploy_opts.project_name,
-        deploy_opts.image,
-        deploy_opts.group,
-        deploy_opts.environment,
-        deploy_opts.expires_in,
-        deploy_opts.http_port,
-        deploy_opts.from_deployment,
-        deploy_opts.use_source_env_vars,
-        deploy_opts.push_image,
-        &deploy_opts.env_overrides,
-        resolved_job_url.as_deref(),
-        resolved_pull_request_url.as_deref(),
-        resolved_git_repository_url.as_deref(),
-        deploy_opts.replicas,
-        deploy_opts.cpu.as_deref(),
-        deploy_opts.memory.as_deref(),
-        deploy_opts
+    let payload = CreateDeploymentPayload {
+        project: deploy_opts.project_name,
+        image: deploy_opts.image,
+        group: deploy_opts.group,
+        environment: deploy_opts.environment,
+        expires_in: deploy_opts.expires_in,
+        http_port: deploy_opts.http_port,
+        from_deployment: deploy_opts.from_deployment,
+        use_source_env_vars: deploy_opts.use_source_env_vars,
+        push_image: deploy_opts.push_image,
+        env_overrides: &deploy_opts.env_overrides,
+        job_url: resolved_job_url.as_deref(),
+        pull_request_url: resolved_pull_request_url.as_deref(),
+        git_repository_url: resolved_git_repository_url.as_deref(),
+        replicas: deploy_opts.replicas,
+        cpu: deploy_opts.cpu.as_deref(),
+        memory: deploy_opts.memory.as_deref(),
+        identity_audiences: deploy_opts
             .toml_config
             .as_ref()
             .and_then(|c| c.identity.as_ref())
             .map(|i| &i.audiences),
-        containers_payload.as_deref(),
-        &routes_payload,
-    )
-    .await?;
+        containers: containers_payload.as_deref(),
+        routes: &routes_payload,
+        migration_version: deploy_opts.migration_version,
+        force_migration_barrier: deploy_opts.force,
+    };
+    let deployment_info =
+        call_create_deployment_api(http_client, backend_url, &token, &payload).await?;
+    report_create_response(&deployment_info, deploy_opts.json_output);
 
     info!("Deployment ID: {}", deployment_info.deployment_id);
     info!("Image tag: {}", deployment_info.image_tag);
@@ -1510,36 +1546,57 @@ pub async fn create_deployment(
     }
     info!("  Deployment ID: {}", deployment_info.deployment_id);
 
-    if !deploy_opts.json_output {
-        println!();
-    }
-
     // Step 7: Follow deployment until completion
-    let final_deployment = super::follow_ui::follow_deployment_with_ui(
+    follow_created_deployment(
         http_client,
         backend_url,
         config,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
+        DeploymentOutputOptions {
+            json: deploy_opts.json_output,
+            status_file: deploy_opts.status_file.as_deref(),
+        },
+    )
+    .await
+}
+
+/// Follow a freshly created deployment to a terminal state, emit its JSON when
+/// asked, and fail when the deployment failed.
+pub(super) async fn follow_created_deployment(
+    http_client: &Client,
+    backend_url: &str,
+    config: &Config,
+    project_name: &str,
+    deployment_id: &str,
+    output: DeploymentOutputOptions<'_>,
+) -> Result<()> {
+    if !output.json {
+        println!();
+    }
+
+    let final_deployment = super::follow_ui::follow_deployment_with_ui(
+        http_client,
+        backend_url,
+        config,
+        project_name,
+        deployment_id,
         "10m",
-        deploy_opts.json_output,
+        output.json,
     )
     .await?;
 
-    let deployment_json = if deploy_opts.json_output || deploy_opts.status_file.is_some() {
+    let deployment_json = if output.json || output.status_file.is_some() {
         Some(deployment_json(&final_deployment)?)
     } else {
         None
     };
 
-    if let (Some(path), Some(json)) = (
-        deploy_opts.status_file.as_deref(),
-        deployment_json.as_deref(),
-    ) {
+    if let (Some(path), Some(json)) = (output.status_file, deployment_json.as_deref()) {
         write_json_status_file(path, json)?;
     }
 
-    if deploy_opts.json_output {
+    if output.json {
         println!("{}", deployment_json.expect("JSON was serialized above"));
     }
 
@@ -2093,144 +2150,184 @@ fn normalize_git_url(raw: &str) -> Option<String> {
     Some(format!("https://{host}/{path}"))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Body of `POST /api/v1/deployments`. Optional fields are omitted when unset
+/// so an older server sees the request shape it knows.
+#[derive(Default)]
+pub(super) struct CreateDeploymentPayload<'a> {
+    pub project: &'a str,
+    pub image: Option<&'a str>,
+    pub group: Option<&'a str>,
+    pub environment: Option<&'a str>,
+    pub expires_in: Option<&'a str>,
+    pub http_port: Option<u16>,
+    pub from_deployment: Option<&'a str>,
+    pub use_source_env_vars: bool,
+    pub push_image: bool,
+    pub env_overrides: &'a [EnvOverride],
+    pub job_url: Option<&'a str>,
+    pub pull_request_url: Option<&'a str>,
+    pub git_repository_url: Option<&'a str>,
+    pub replicas: Option<u32>,
+    pub cpu: Option<&'a str>,
+    pub memory: Option<&'a str>,
+    pub identity_audiences: Option<&'a std::collections::BTreeMap<String, String>>,
+    pub containers: Option<&'a [ContainerSpec]>,
+    pub routes: &'a [RouteSpec],
+    /// `[project].migration_version` of the code being deployed. Ignored for a
+    /// deployment created from another one, which inherits the source's.
+    pub migration_version: Option<u64>,
+    pub force_migration_barrier: bool,
+}
+
+impl CreateDeploymentPayload<'_> {
+    pub(super) fn to_json(&self) -> Result<serde_json::Value> {
+        let mut payload = serde_json::json!({
+            "project": self.project,
+        });
+
+        // If not provided, the server resolves the port from the project's
+        // PORT env var, the source deployment, or its default (8080).
+        if let Some(port) = self.http_port {
+            payload["http_port"] = serde_json::json!(port);
+        }
+        if let Some(image_ref) = self.image {
+            payload["image"] = serde_json::json!(image_ref);
+        }
+        if let Some(group_name) = self.group {
+            payload["group"] = serde_json::json!(group_name);
+        }
+        if let Some(env_name) = self.environment {
+            payload["environment"] = serde_json::json!(env_name);
+        }
+        if let Some(expiration) = self.expires_in {
+            payload["expires_in"] = serde_json::json!(expiration);
+        }
+        if let Some(source_deployment_id) = self.from_deployment {
+            payload["from_deployment"] = serde_json::json!(source_deployment_id);
+            payload["use_source_env_vars"] = serde_json::json!(self.use_source_env_vars);
+        }
+        if self.push_image {
+            payload["push_image"] = serde_json::json!(true);
+        }
+        if let Some(url) = self.job_url {
+            payload["job_url"] = serde_json::json!(url);
+        }
+        if let Some(url) = self.pull_request_url {
+            payload["pull_request_url"] = serde_json::json!(url);
+        }
+        if let Some(url) = self.git_repository_url {
+            payload["git_repository_url"] = serde_json::json!(url);
+        }
+        if let Some(r) = self.replicas {
+            payload["replicas"] = serde_json::json!(r);
+        }
+        if let Some(c) = self.cpu {
+            payload["cpu"] = serde_json::json!(c);
+        }
+        if let Some(m) = self.memory {
+            payload["memory"] = serde_json::json!(m);
+        }
+        if let Some(audiences) = self.identity_audiences {
+            if !audiences.is_empty() {
+                payload["identity_audiences"] = serde_json::json!(audiences);
+            }
+        }
+        if self.force_migration_barrier {
+            payload["force_migration_barrier"] = serde_json::json!(true);
+        }
+
+        if !self.env_overrides.is_empty() {
+            let overrides: Vec<serde_json::Value> = self
+                .env_overrides
+                .iter()
+                .map(|o| {
+                    let mut v = serde_json::json!({
+                        "key": o.key,
+                        "value": o.value,
+                        "is_secret": o.is_secret,
+                        "is_protected": o.is_protected,
+                    });
+                    if let Some(ref source) = o.source {
+                        v["source"] = serde_json::json!(source);
+                    }
+                    if let Some(ref env) = o.for_environment {
+                        v["for_environment"] = serde_json::json!(env);
+                    }
+                    v
+                })
+                .collect();
+            payload["env_overrides"] = serde_json::json!(overrides);
+        }
+
+        // A deployment created from another one runs the source's images and
+        // inherits its migration version: the local rise.toml's containers,
+        // routes and version describe code that is not being deployed.
+        if self.from_deployment.is_none() {
+            if let Some(version) = self.migration_version {
+                payload["migration_version"] = serde_json::json!(version);
+            }
+            // ContainerSpec/RouteSpec carry the same serde skip/default rules as
+            // the server's structs. Omit when absent/empty to match the
+            // single-container request shape.
+            if let Some(c) = self.containers {
+                payload["containers"] = serde_json::to_value(c)?;
+            }
+            if !self.routes.is_empty() {
+                payload["routes"] = serde_json::to_value(self.routes)?;
+            }
+        }
+
+        Ok(payload)
+    }
+}
+
+/// Turn an error response of the deployments API into a message for the
+/// terminal. A JSON error body yields its message, tagged with its
+/// `error_code`; a crossed migration barrier also lists the barriers and how
+/// to deploy anyway.
+pub(super) fn describe_api_error(body: &str) -> String {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    let Some(message) = json.get("error").and_then(|e| e.as_str()) else {
+        return body.to_string();
+    };
+    let code = json.get("error_code").and_then(|c| c.as_str());
+    let mut out = match code {
+        Some(code) => format!("[{}] {}", code, message),
+        None => message.to_string(),
+    };
+    if code == Some("migration_barrier") {
+        let barriers = json
+            .pointer("/details/barriers")
+            .and_then(|b| b.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for barrier in barriers {
+            let barrier: super::promote::PlanBarrier =
+                serde_json::from_value(barrier).unwrap_or_default();
+            out.push_str(&format!("\n  {}", super::promote::format_barrier(&barrier)));
+        }
+        if !message.contains("--force") {
+            out.push_str("\nRe-run with --force to deploy across the barrier anyway.");
+        }
+    }
+    out
+}
+
 async fn call_create_deployment_api(
     http_client: &Client,
     backend_url: &str,
     token: &str,
-    project_name: &str,
-    image: Option<&str>,
-    group: Option<&str>,
-    environment: Option<&str>,
-    expires_in: Option<&str>,
-    http_port: Option<u16>,
-    from_deployment: Option<&str>,
-    use_source_env_vars: bool,
-    push_image: bool,
-    env_overrides: &[EnvOverride],
-    job_url: Option<&str>,
-    pull_request_url: Option<&str>,
-    git_repository_url: Option<&str>,
-    replicas: Option<u32>,
-    cpu: Option<&str>,
-    memory: Option<&str>,
-    identity_audiences: Option<&std::collections::BTreeMap<String, String>>,
-    containers: Option<&[ContainerSpec]>,
-    routes: &[RouteSpec],
+    payload: &CreateDeploymentPayload<'_>,
 ) -> Result<CreateDeploymentResponse> {
     let url = format!("{}/api/v1/deployments", backend_url);
-    let mut payload = serde_json::json!({
-        "project": project_name,
-    });
-
-    // Add http_port field if explicitly provided
-    // If not provided, server will resolve from project's PORT env var or use default (8080)
-    if let Some(port) = http_port {
-        payload["http_port"] = serde_json::json!(port);
-    }
-
-    // Add image field if provided
-    if let Some(image_ref) = image {
-        payload["image"] = serde_json::json!(image_ref);
-    }
-
-    // Add group field if provided (defaults to "default" on backend)
-    if let Some(group_name) = group {
-        payload["group"] = serde_json::json!(group_name);
-    }
-
-    // Add environment field if provided
-    if let Some(env_name) = environment {
-        payload["environment"] = serde_json::json!(env_name);
-    }
-
-    // Add expires_in field if provided
-    if let Some(expiration) = expires_in {
-        payload["expires_in"] = serde_json::json!(expiration);
-    }
-
-    // Add from_deployment field if provided
-    if let Some(source_deployment_id) = from_deployment {
-        payload["from_deployment"] = serde_json::json!(source_deployment_id);
-        payload["use_source_env_vars"] = serde_json::json!(use_source_env_vars);
-    }
-
-    // Add push_image field if set
-    if push_image {
-        payload["push_image"] = serde_json::json!(true);
-    }
-
-    // Add job_url if provided
-    if let Some(url) = job_url {
-        payload["job_url"] = serde_json::json!(url);
-    }
-
-    // Add pull_request_url if provided
-    if let Some(url) = pull_request_url {
-        payload["pull_request_url"] = serde_json::json!(url);
-    }
-
-    // Add git_repository_url if provided
-    if let Some(url) = git_repository_url {
-        payload["git_repository_url"] = serde_json::json!(url);
-    }
-
-    // Add resource fields if provided
-    if let Some(r) = replicas {
-        payload["replicas"] = serde_json::json!(r);
-    }
-    if let Some(c) = cpu {
-        payload["cpu"] = serde_json::json!(c);
-    }
-    if let Some(m) = memory {
-        payload["memory"] = serde_json::json!(m);
-    }
-
-    // Add identity audiences from [identity] in rise.toml if any
-    if let Some(audiences) = identity_audiences {
-        if !audiences.is_empty() {
-            payload["identity_audiences"] = serde_json::json!(audiences);
-        }
-    }
-
-    // Add env_overrides if any
-    if !env_overrides.is_empty() {
-        let overrides: Vec<serde_json::Value> = env_overrides
-            .iter()
-            .map(|o| {
-                let mut v = serde_json::json!({
-                    "key": o.key,
-                    "value": o.value,
-                    "is_secret": o.is_secret,
-                    "is_protected": o.is_protected,
-                });
-                if let Some(ref source) = o.source {
-                    v["source"] = serde_json::json!(source);
-                }
-                if let Some(ref env) = o.for_environment {
-                    v["for_environment"] = serde_json::json!(env);
-                }
-                v
-            })
-            .collect();
-        payload["env_overrides"] = serde_json::json!(overrides);
-    }
-
-    // Serialize the typed container/route specs. ContainerSpec/RouteSpec carry
-    // the same serde skip/default rules as the server's structs, so this
-    // produces exactly what the server deserializes. Omit when absent/empty to
-    // match the legacy single-container request shape.
-    if let Some(c) = containers {
-        payload["containers"] = serde_json::to_value(c)?;
-    }
-    if !routes.is_empty() {
-        payload["routes"] = serde_json::to_value(routes)?;
-    }
+    let body = payload.to_json()?;
 
     let response = http_client
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .json(&payload)
+        .json(&body)
         .send_with_auth_hint(backend_url)
         .await
         .context("Failed to create deployment")?;
@@ -2241,7 +2338,11 @@ async fn call_create_deployment_api(
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        bail!("Failed to create deployment ({}): {}", status, error_text);
+        bail!(
+            "Failed to create deployment ({}): {}",
+            status,
+            describe_api_error(&error_text)
+        );
     }
 
     let deployment_info: CreateDeploymentResponse = response
@@ -2250,6 +2351,32 @@ async fn call_create_deployment_api(
         .context("Failed to parse deployment response")?;
 
     Ok(deployment_info)
+}
+
+/// Print what the server reported about a deployment it just created: its
+/// warnings (a bypassed promotion gate, a forced migration barrier, …), the
+/// resource values it changed to fit the target, and the pinned image.
+pub(super) fn report_create_response(response: &CreateDeploymentResponse, to_stderr: bool) {
+    let mut lines = Vec::new();
+    if let Some(ref pinned) = response.pinned_image {
+        lines.push(format!("Image pinned to {}", pinned));
+    }
+    for adjustment in &response.adjustments {
+        lines.push(format!(
+            "Adjusted {}",
+            super::promote::format_adjustment(adjustment)
+        ));
+    }
+    for warning in &response.warnings {
+        lines.push(format!("Warning: {}", warning));
+    }
+    for line in lines {
+        if to_stderr {
+            eprintln!("{}", line);
+        } else {
+            println!("{}", line);
+        }
+    }
 }
 
 /// Cancel a deployment by marking it as Cancelling
@@ -2645,7 +2772,7 @@ fn print_log_status(data: &str) {
 }
 
 /// Parse duration string (e.g., "5m", "1h", "30s") into seconds
-fn parse_duration_to_seconds(duration: &str) -> anyhow::Result<i64> {
+pub(crate) fn parse_duration_to_seconds(duration: &str) -> anyhow::Result<i64> {
     let duration = duration.trim();
 
     if let Some(num_str) = duration.strip_suffix('s') {
@@ -3215,6 +3342,100 @@ mod tests {
                 "routes": [ { "path": "/api", "container": "api" } ]
             })
         );
+    }
+
+    #[test]
+    fn from_deployment_payload_omits_local_containers_and_version() {
+        use super::{CreateDeploymentPayload, EnvOverride};
+        use crate::api::models::{ContainerSpec, RouteSpec};
+
+        let containers = vec![ContainerSpec {
+            name: "api".to_string(),
+            image: None,
+            port: Some(8080),
+            replicas: None,
+            cpu: None,
+            memory: None,
+            env_overrides: Vec::new(),
+            health_check: None,
+        }];
+        let routes = vec![RouteSpec {
+            path: "/".to_string(),
+            container: "api".to_string(),
+            access: None,
+        }];
+        let overrides = vec![EnvOverride {
+            key: "LOG_LEVEL".to_string(),
+            value: "info".to_string(),
+            is_secret: false,
+            is_protected: false,
+            source: Some("toml".to_string()),
+            for_environment: Some("production".to_string()),
+        }];
+        let payload = CreateDeploymentPayload {
+            project: "app",
+            environment: Some("production"),
+            from_deployment: Some("20261020-101500"),
+            env_overrides: &overrides,
+            containers: Some(&containers),
+            routes: &routes,
+            migration_version: Some(5),
+            force_migration_barrier: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            payload.to_json().unwrap(),
+            serde_json::json!({
+                "project": "app",
+                "environment": "production",
+                "from_deployment": "20261020-101500",
+                "use_source_env_vars": false,
+                "force_migration_barrier": true,
+                "env_overrides": [{
+                    "key": "LOG_LEVEL",
+                    "value": "info",
+                    "is_secret": false,
+                    "is_protected": false,
+                    "source": "toml",
+                    "for_environment": "production"
+                }]
+            })
+        );
+
+        let fresh = CreateDeploymentPayload {
+            project: "app",
+            containers: Some(&containers),
+            routes: &routes,
+            migration_version: Some(5),
+            ..Default::default()
+        };
+        let json = fresh.to_json().unwrap();
+        assert_eq!(json["migration_version"], 5);
+        assert_eq!(json["containers"][0]["name"], "api");
+        assert_eq!(json["routes"][0]["path"], "/");
+        assert!(json.get("force_migration_barrier").is_none());
+    }
+
+    #[test]
+    fn api_errors_are_described_with_code_and_barriers() {
+        use super::describe_api_error;
+
+        let gate = r#"{"error":"Environment 'production' only accepts deployments promoted from 'staging'. Promote a staging deployment: rise promote <deployment-id> -E production","error_code":"promotion_source_required","details":{"environment":"production","promotion_source_environment":"staging"}}"#;
+        assert_eq!(
+            describe_api_error(gate),
+            "[promotion_source_required] Environment 'production' only accepts deployments \
+             promoted from 'staging'. Promote a staging deployment: rise promote <deployment-id> -E production"
+        );
+
+        let barrier = r#"{"error":"Crosses migration barriers","error_code":"migration_barrier","details":{"candidate_version":3,"environment_version":5,"barriers":[{"version":4,"reason":"drops users.name","recorded_at":"2026-10-01T09:00:00Z"}]}}"#;
+        assert_eq!(
+            describe_api_error(barrier),
+            "[migration_barrier] Crosses migration barriers\n  \
+             v4: drops users.name (recorded 2026-10-01)\n\
+             Re-run with --force to deploy across the barrier anyway."
+        );
+
+        assert_eq!(describe_api_error("not json"), "not json");
     }
 
     #[test]
