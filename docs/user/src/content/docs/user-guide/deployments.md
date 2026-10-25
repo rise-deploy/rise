@@ -41,17 +41,84 @@ When using `--image`, no build occurs and `--http-port` is required.
 
 ### Deploying from an Existing Deployment
 
-Reuse the image from a previous deployment:
+Reuse the image from a previous deployment, without a rebuild:
 
 ```bash
 rise deploy --from 20241205-1234
 ```
 
-By default, the new deployment uses the project's current environment variables, with the source deployment's `rise.toml` and CLI-flag variables on top: like its port, resources and routes, they travel with the source. Variables passed with this command (`--env`, the local `rise.toml`) still take precedence. To copy all environment variables from the source deployment instead:
+Before creating anything, the CLI prints what will happen: the source deployment and its image, what the target currently runs, the migration check (see [Migration Compatibility Barriers](#migration-compatibility-barriers)) and the variable changes compared with the source's snapshot.
+
+By default, the new deployment uses the project's current environment variables, with the source deployment's `rise.toml` and CLI-flag variables on top: like its port, resources and routes, they travel with the source. Variables passed with this command (`--env`, the local `rise.toml`) still take precedence. To copy the source deployment's variables instead:
 
 ```bash
 rise deploy --from 20241205-1234 --use-source-env-vars
 ```
+
+Either way, system variables (`PORT`, `RISE_*`) and extension-provided variables are generated fresh for the new deployment, so credentials an extension rotated since are not resurrected.
+
+Without `-E` or `--group` (and without a `default = true` environment in the local `rise.toml`), the new deployment lands in the source's environment and group. With `-E` naming an environment other than the source's, `--from` is a [promotion](#promoting-between-environments): the image is pinned, the target's gates and migration check apply, and `--use-source-env-vars` is refused. Unlike `rise promote`, `rise deploy --from` still sends the local `rise.toml`'s `[project.env]` variables and its `[deploy]` resources; those resources are validated against the target's limits rather than clamped. Use `rise promote` to apply only `[environments.<target>]`.
+
+## Promoting Between Environments
+
+Promotion ships an image that has already run in one environment — typically staging — to another, without rebuilding it:
+
+```bash
+rise promote 20261020-101500 -E production
+```
+
+The deployment ID is required: Rise never guesses "the current staging deployment", so how long a build soaked is your decision. `-E` defaults to the project's production environment. The CLI shows the plan and asks for confirmation:
+
+```
+Promoting 20261020-101500 (staging, Healthy) → production [group default]
+  Image:      registry.rise.dev/app@sha256:3f2a…  (pinned)
+  Replacing:  20261001-090000 (Healthy)
+  Migration:  v5 → environment at v4 (forward)
+  Resources:  app replicas 1 → 2 (production requires ≥ 2)
+  Variables (20261020-101500 now vs. the new deployment in production):
+    + FEATURE_X        = "on"  (env:production)
+    ~ LOG_LEVEL        "debug" → "info"  (toml → env:production)
+    (12 unchanged)
+Promote 20261020-101500 (staging) to production? [y/N]
+```
+
+A promotion:
+
+- **Pins the image** to its digest, so the target runs exactly the bytes the source ran.
+- **Sizes for the target.** Replicas, CPU and memory you pass (`--replicas`, `--cpu`, `--memory`, or `[environments.<target>.deploy]` in `rise.toml`) are validated as usual. Values inherited from the source are clamped into the target environment's limits, and each change is printed.
+- **Uses the target's variables**, in this order (later wins): the target's Global and environment-scoped variables; the source's `rise.toml`/CLI variables, minus those scoped to *other* environments; fresh extension variables; `[environments.<target>.env]` from the local `rise.toml` (skip with `--no-config`); then `PORT` and `RISE_*`.
+- **Records where it came from.** `rise deployment show` prints `Created via: promote (from 20261020-101500 in staging)`; the web UI links both ways.
+
+In CI, pass `--yes`: without it, `rise promote` refuses to run non-interactively. `--json` and `--status-file` work as for `rise deploy`. The web UI offers the same action as **Promote to …** on an environment or deployment.
+
+An environment can require that it is only fed by promotions — see [Promotion Source](../environments#promotion-source).
+
+## Migration Compatibility Barriers
+
+Rolling back or promoting an image doesn't roll back the database. Barriers let Rise refuse a move that would run code against a schema it no longer understands.
+
+1. Declare the migration version of your code in `rise.toml`, and bump it whenever you add a migration:
+
+   ```toml
+   [project]
+   name = "my-app"
+   migration_version = 5
+   ```
+
+   Each deployment records it; redeploys, rollbacks and promotions inherit the source's value.
+
+2. When a migration breaks *older* code (drops or renames a column it reads), record a barrier at that version:
+
+   ```bash
+   rise project migration-barrier add 5 --reason "drops users.name"
+   rise project mb list
+   ```
+
+   Barriers can only be added, never edited or removed. Any project owner or member can record one.
+
+Rise tracks the highest version that has started deploying in each environment. A deployment at version `A` into an environment that has reached `B > A` is blocked if a barrier lies in `(A, B]`: the command fails (HTTP `409`, `error_code: "migration_barrier"`) and lists the barriers crossed. Moving forward, or backward without crossing a barrier, is fine.
+
+Pass `--force` (`rise deploy --force`, `rise promote --force`, or **Deploy anyway** in the web UI) when you know it's safe — for example after restoring a database snapshot. A deployment without a migration version gets a warning when the project has barriers. Barriers apply to fresh deploys too: deploying an older checkout is also a backward move.
 
 ## Deployment Lifecycle
 
@@ -74,7 +141,7 @@ Deployments progress through the following states:
 | `Healthy` | Running and passing health checks |
 | `Unhealthy` | Running but failing health checks |
 
-Once a deployment enters a running state it stays there indefinitely — Rise does **not** automatically terminate or fail a deployment that has been `Unhealthy` for a long time. An unhealthy deployment continues to receive traffic (or not, depending on your ingress health-check configuration) until you explicitly stop it or a new deployment supersedes it in the same group.
+Once a deployment enters a running state it stays there indefinitely — Rise does **not** automatically terminate or fail a deployment that has been `Unhealthy` for a long time. An unhealthy deployment continues to receive traffic (or not, depending on your ingress health-check configuration) until you explicitly stop it or a new deployment supersedes it in the same group. Environments with the [Rollback Guard](#automatic-rollback-rollback-guard) enabled replace it automatically instead.
 
 ### Cancellation States (Before Infrastructure)
 
@@ -100,7 +167,7 @@ Once a deployment enters a running state it stays there indefinitely — Rise do
 
 ## Deployment Groups
 
-A deployment group is a label that identifies a set of related deployments. Only one deployment per group can be active at a time — when a new deployment in a group reaches `Healthy`, the previous one is `Superseded`.
+A deployment group is a label that identifies a set of related deployments. Only one deployment per group can be active at a time — when a new deployment in a group reaches `Healthy`, the previous one is `Superseded`. Creation order decides: a deployment only supersedes older ones, and one that becomes `Healthy` after a newer one already serves the group is superseded itself.
 
 **Group names are just labels — they carry no intrinsic meaning on their own.** A group name only acquires routing, URL, and variable-scoping semantics when it is set as the primary group of an [Environment](../environments). Every deployment still belongs to an environment: a deployment to a custom group takes the one you name with `-E` (or the project's only one) and gets that environment's variables, but the group's own staging URL rather than the environment's.
 
@@ -195,6 +262,7 @@ Status files are replaced atomically after a complete JSON document is available
 ```bash
 rise deployment show -p my-app 20241205-1234
 rise d s -p my-app latest
+rise d s -p my-app latest --json   # the full deployment as JSON, incl. created_via and promotion provenance
 ```
 
 ### Deployment Logs
@@ -229,9 +297,39 @@ The primary rollback mechanism is redeploying from a previous deployment's image
 rise deploy --from 20241205-1234
 ```
 
-This fetches the target deployment's image digest and creates a new deployment with it. The original deployment is not modified.
+This fetches the target deployment's image digest and creates a new deployment with it, in the source's environment and group (unless `-E`, `--group` or a `default = true` environment in the local `rise.toml` names another target). The original deployment is not modified. The web UI offers **Roll back** on an environment whose live deployment replaced another.
 
-> **Warning — database migrations:** Rollback only restores the container image, not the database schema. If a migration ran between the current and target deployment, rolling back may leave your application running against a schema it doesn't understand, causing errors or data corruption. Before rolling back, verify whether migrations are involved and plan accordingly (e.g., ensure migrations are backward-compatible, or restore a database snapshot alongside the image rollback).
+> **Warning — database migrations:** Rollback only restores the container image, not the database schema. If a migration ran between the current and target deployment, rolling back may leave your application running against a schema it doesn't understand, causing errors or data corruption. Declare a `migration_version` and record [migration barriers](#migration-compatibility-barriers) so Rise refuses such a rollback; otherwise verify whether migrations are involved and plan accordingly (e.g., ensure migrations are backward-compatible, or restore a database snapshot alongside the image rollback).
+
+## Automatic Rollback (Rollback Guard)
+
+An environment with the Rollback Guard enabled (an administrator sets it, see [Environments](../environments#rollback-guard)) recovers on its own when its live deployment stays `Unhealthy`:
+
+1. The live deployment of the environment's **primary** group has been `Unhealthy` continuously for the configured time (default 5 minutes; a recovery resets the clock).
+2. Rise picks the **last known good** deployment: the newest older deployment in the same group that served traffic and was later replaced by a newer one (`Superseded`).
+3. It redeploys that deployment's image with its variables (system and extension variables regenerated) **while the unhealthy one keeps running**. Once the replacement is `Healthy`, it supersedes the unhealthy deployment as any new deployment would.
+
+Guarantees:
+
+- **One hop.** At most one replacement per unhealthy deployment. If the replacement fails too, the guard stops and records a failure; it never rolls back a replacement it made.
+- **Abort on recovery.** If the unhealthy deployment recovers (or you deploy a fix) before the replacement is healthy, the replacement is cancelled.
+- **Nothing is torn down** by the guard itself; preview groups are never guarded.
+
+The guard declines — and records why on the unhealthy deployment's timeline — when:
+
+| Reason | Meaning |
+|---|---|
+| `newer_deployment_in_progress` | A newer deployment is already rolling out; a fix is underway |
+| `no_last_known_good` | No older deployment in the group ever served |
+| `last_known_good_not_superseded` | The last good deployment was stopped, expired or failed rather than replaced |
+| `last_known_good_unavailable` | Its image can no longer be redeployed |
+| `migration_barrier` / `migration_version_unknown` | Going back would cross a [migration barrier](#migration-compatibility-barriers), or the version is unknown while the project has barriers |
+| `chained` | The unhealthy deployment is itself a guard replacement |
+| `platform_wide_unhealthy` / `in_flight_limit` | Many deployments are unhealthy at once (likely a platform problem, not your app), or too many guard replacements are in progress |
+
+A replacement shows as **Rollback Guard (automatic)** in `rise deployment show` and the web UI, linked to the deployment it replaced.
+
+> **The guard only sees what health checks see.** Without a `health_check` in `[deploy]`, `Unhealthy` means only that the process crashed or isn't running; an app that runs but answers every request with an error stays `Healthy` and is never rolled back. Configure a `health_check` path that exercises what matters.
 
 ## Stopping Deployments
 

@@ -27,6 +27,7 @@ A [JSON Schema](https://rise-deploy.github.io/rise/user/schemas/rise-toml-v1.sch
 |-------|------|-------------|
 | `name` | `String` | Project name (used for URLs, registry paths, `-p` default) |
 | `env` | `map<String, String>` | Plain-text environment variables (non-secret) |
+| `migration_version` | `u64` | Database migration version of this code; bump with every migration. Inherited by redeploys, rollbacks and promotions; checked against recorded migration barriers |
 
 ```toml
 [project]

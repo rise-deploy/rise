@@ -116,6 +116,18 @@ rise env show-deployment -p my-app 20241205-1234
 
 This is a read-only view of the variables as they existed when the deployment was created.
 
+### Variables of a Deployment Created from Another
+
+A redeploy or rollback (`rise deploy --from`) uses the environment's current variables plus the source's `rise.toml` and CLI variables, or the source's snapshot with `--use-source-env-vars`. A promotion into another environment always recomputes against the target, in this order (later wins):
+
+1. The target environment's current Global and environment-scoped variables.
+2. The source's `toml`/`cli` variables, minus `toml:<env>` variables of other environments.
+3. Extension-provided variables, generated fresh.
+4. Overrides from this command (`[environments.<target>.env]` in the local `rise.toml`, unless `--no-config`).
+5. `PORT` and the `RISE_*` variables.
+
+System and extension variables are never copied from the source, not even with `--use-source-env-vars`.
+
 ## Auto-Injected Variables
 
 Rise automatically injects these variables into every deployment:
@@ -213,7 +225,9 @@ env.DATABASE_URL = "postgres://prod-db/mydb"
 When deploying, variables are merged in this order (later overrides earlier):
 
 1. `[project.env]` variables (source: `toml`)
-2. `[environments.<target>.env]` variables for the target environment (source: `toml`)
+2. `[environments.<target>.env]` variables for the target environment (source: `toml:<target>`, e.g. `toml:staging`)
 3. CLI deploy-time overrides (`-e`, `--secret-env`, `--protected-env`, `--env-file`) (source: `cli`)
+
+Recording the environment in the source lets a [promotion](../deployments#promoting-between-environments) drop values meant for another environment: promoting a staging deployment carries its `toml` and `cli` variables, but not its `toml:staging` ones. Variables recorded as plain `toml` carry no environment, so a promotion carries them all.
 
 Only plain-text variables can be managed in `rise.toml`. Secrets must be set via the CLI (`rise env set --secret` or `rise env set --protected`) or passed at deploy time (`--secret-env`, `--protected-env`).

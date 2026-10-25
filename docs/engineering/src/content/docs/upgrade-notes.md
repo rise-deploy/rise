@@ -31,6 +31,80 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Release promotion and guarded rollback (ADR-0007).** Two migrations add
+  deployment provenance (`created_via`, `promoted_from_*`,
+  `migration_version`, `unhealthy_since`, `rollback_guard_for_deployment_id`),
+  environment promotion/guard columns and the `migration_barriers` table.
+  Existing rows that have an image origin are backfilled as `redeploy`;
+  deployments already `Unhealthy` start their guard timer at upgrade. The
+  individual changes:
+
+  - **Supersession is fenced by creation order.** *Behavior change.* A
+    deployment that turns Healthy supersedes only *older* deployments of its
+    group. One that turns Healthy after a newer deployment already serves the
+    group is retired (`Superseded`) instead of taking over, and on Docker/ECS an
+    older, slower rollout no longer steals the Traefik target from a newer
+    active one. Previously the last deployment to turn Healthy won.
+
+  - **`--use-source-env-vars` no longer copies `system` or `extension`
+    variables.** Those are recomputed for the new deployment, which also fixes
+    the `500` that `--from … --use-source-env-vars` returned on projects with
+    active extensions.
+
+  - **A cross-environment `--from` is a promotion.** *Breaking* for scripts that
+    pass `--use-source-env-vars` across environments: that now returns `400`.
+    A promotion digest-pins the image, clamps inherited replicas/cpu/memory
+    into the target environment's constraints (reported as adjustments, where it
+    previously failed validation), and recomputes variables against the target.
+    `toml` vars scoped to other environments are not carried over. The new
+    `rise promote` command is the purpose-built entry point.
+
+  - **Multi-container `--from` no longer references unpushed images.** The CLI
+    stops sending `rise.toml` containers with `--from`, and the API rejects
+    containers without an image on a create-from with `400`.
+
+  - **Promotion-source gating.** *Action required before enabling.* An admin
+    can set `rise environment update production --promote-from staging`. From
+    then on, deployments into `production` must be created from a `staging`
+    (or `production`) deployment; fresh builds and `--image` deploys get `403`
+    `promotion_source_required`. Unscoped human admins can bypass (recorded as
+    a warning and on the creation event); service accounts and `--scope`
+    sessions cannot. **Switch CI to `rise deploy -E staging` followed by
+    `rise promote <id> -E production --yes` before you set the policy.**
+    Deleting an environment that is another's promotion source returns `409`.
+
+  - **Rollback Guard.** *Config change.* Opt-in per environment
+    (`rise environment update <env> --rollback-guard true
+    [--rollback-guard-timeout 5m]`, admin-only). A new top-level backend
+    setting controls the controller; defaults:
+
+    ```yaml
+    rollback_guard:
+      enabled: true               # operator kill switch; environments still opt in
+      poll_interval_seconds: 10
+      max_in_flight: 3
+      fleet_unhealthy_ratio: 0.5
+      fleet_unhealthy_min_count: 3
+    ```
+
+    Nothing changes until an environment enables it. Its health signal is the
+    backend's: on Docker and ECS that is Traefik's `serverStatus`, so keep
+    `traefik_api_url` reachable; without a `health_check` only crashes are seen.
+
+  - **Migration barriers.** Projects can declare `[project].migration_version`
+    in `rise.toml` and record breaking migrations with
+    `rise project migration-barrier add`. A deploy that would move an
+    environment back across a recorded barrier returns `409`
+    `migration_barrier` unless forced (`--force`). Projects that declare
+    nothing are unaffected.
+
+  - **Pre-upgrade `toml` variables can't be told apart by environment.**
+    Variables from `[environments.<env>.env]` are now stored with source
+    `toml:<env>` so promotions drop other environments' values. Deployments
+    created before the upgrade recorded them as plain `toml`, so promoting one
+    of those carries all of its `toml` values. Redeploy from `rise.toml` once
+    to get the new attribution.
+
 - **Kubernetes 1.32 is the minimum supported version.** *Breaking.* Rise's
   Kubernetes client now targets the 1.32 API, and the Helm chart declares
   `kubeVersion: ">=1.32.0-0"`, so `helm install`/`helm upgrade` fails on older
