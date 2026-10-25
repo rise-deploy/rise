@@ -8,6 +8,19 @@ pub enum BackendCommands {
     /// Check backend configuration for errors and unused options
     #[cfg(feature = "backend")]
     CheckConfig,
+    /// Probe this container's own `/health`, for a container health check.
+    ///
+    /// Exists so the image need not carry `curl`. An ECS health check is a
+    /// command run *inside* the container -- there is no out-of-band HTTP probe
+    /// like a Kubernetes `httpGet` or a load-balancer target group -- so
+    /// something in the image has to make the request, and the `rise` binary is
+    /// already there.
+    #[cfg(feature = "backend")]
+    Health {
+        /// Seconds to wait for a response before reporting unhealthy.
+        #[arg(long, default_value_t = 3)]
+        timeout_secs: u64,
+    },
     /// Print backend settings JSON schema
     #[cfg(feature = "backend")]
     ConfigSchema,
@@ -52,6 +65,28 @@ pub async fn handle_backend_command(cmd: BackendCommands) -> Result<()> {
         BackendCommands::Server => {
             let settings = crate::server::settings::Settings::new()?;
             crate::server::run_server(settings).await
+        }
+        #[cfg(feature = "backend")]
+        BackendCommands::Health { timeout_secs } => {
+            // Reads the same settings the server binds from, so a non-default
+            // port is followed rather than guessed. Over loopback: this asks
+            // whether *this* container is serving, not whether it is reachable.
+            let settings = crate::server::settings::Settings::new()?;
+            let url = format!("http://127.0.0.1:{}/health", settings.server.port);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .build()?;
+            match client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => Ok(()),
+                Ok(r) => {
+                    eprintln!("unhealthy: {url} returned HTTP {}", r.status());
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("unhealthy: {url} did not answer: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         #[cfg(feature = "backend")]
         BackendCommands::CheckConfig => {

@@ -19,6 +19,10 @@ pub struct ProjectBuildConfig {
     #[serde(default)]
     pub project: Option<ProjectConfig>,
 
+    /// CLI backend targets. The `default` entry applies when no explicit URL or profile is set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub targets: BTreeMap<String, TargetConfig>,
+
     /// Build configuration (optional)
     #[serde(default)]
     pub build: Option<BuildConfig>,
@@ -49,6 +53,15 @@ pub struct ProjectBuildConfig {
     pub routes: BTreeMap<String, RouteConfig>,
 }
 
+/// A backend target specifies exactly one URL or local profile name.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum TargetConfig {
+    Url(String),
+    Profile(String),
+}
+
 /// Configuration for one container in a multi-container deployment.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -68,6 +81,10 @@ pub struct ContainerConfig {
     /// Plain-text environment variables scoped to this container. Merged on top
     /// of any project-level env vars; container-scoped values win on conflict.
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
+    )]
     pub env: BTreeMap<String, String>,
 
     /// Deployment resource configuration (replicas, cpu, memory, health_check).
@@ -646,6 +663,10 @@ pub struct EnvironmentConfig {
 
     /// Plain-text environment variables scoped to this environment
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
+    )]
     pub env: BTreeMap<String, String>,
 
     /// Environment-specific deployment resource overrides
@@ -692,6 +713,10 @@ pub struct ProjectConfig {
 
     /// Plain-text environment variables (non-secret)
     #[serde(default)]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
+    )]
     pub env: BTreeMap<String, String>,
 }
 

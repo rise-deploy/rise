@@ -57,6 +57,55 @@ pub fn get_auth(url: &str, bearer: &str) -> Result<HttpResponse> {
     Ok(HttpResponse { status, body })
 }
 
+/// POST a JSON body to `url`, with an optional `Bearer` token — for Rise API
+/// calls. `None` sends no credential at all, which is what a workload token
+/// exchange at a `/token` subresource looks like.
+pub fn post_json(
+    url: &str,
+    bearer: Option<&str>,
+    body: &serde_json::Value,
+) -> Result<HttpResponse> {
+    let mut req = shared_client().post(url).json(body);
+    if let Some(bearer) = bearer {
+        req = req.bearer_auth(bearer);
+    }
+    let resp = req.send().with_context(|| format!("POST {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    Ok(HttpResponse { status, body })
+}
+
+/// Send `body` as JSON with any method and a `Bearer` token — for the Rise API
+/// calls the narrower helpers don't cover (`PUT`, `PATCH`).
+pub fn send_json(
+    method: reqwest::Method,
+    url: &str,
+    bearer: &str,
+    body: &serde_json::Value,
+) -> Result<HttpResponse> {
+    let resp = shared_client()
+        .request(method.clone(), url)
+        .bearer_auth(bearer)
+        .json(body)
+        .send()
+        .with_context(|| format!("{method} {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    Ok(HttpResponse { status, body })
+}
+
+/// DELETE `url` with a `Bearer` token — for authenticated Rise API calls.
+pub fn delete_auth(url: &str, bearer: &str) -> Result<HttpResponse> {
+    let resp = shared_client()
+        .delete(url)
+        .bearer_auth(bearer)
+        .send()
+        .with_context(|| format!("DELETE {url}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+    Ok(HttpResponse { status, body })
+}
+
 /// A client that does NOT follow redirects — for asserting 3xx + `Location`.
 fn no_redirect_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();

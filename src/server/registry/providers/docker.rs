@@ -6,10 +6,11 @@ use crate::server::registry::{
     ImageTagType, RegistryProvider,
 };
 
-/// OCI registry provider that relies on client-side authentication
+/// OCI registry provider with optional static authentication
 ///
-/// This provider assumes the user has already authenticated via `docker login`
-/// or equivalent. It simply returns the registry URL - no credential generation.
+/// With no configured credentials, this provider assumes the user has already
+/// authenticated via `docker login` or equivalent. Static credentials, when
+/// configured, are returned to authorized clients and used for image pulls.
 ///
 /// Works with any OCI-compliant registry (Docker Hub, Harbor, Quay, etc.)
 pub struct OciClientAuthProvider {
@@ -23,6 +24,11 @@ pub struct OciClientAuthProvider {
 impl OciClientAuthProvider {
     /// Create a new OCI client-auth registry provider
     pub fn new(config: OciClientAuthConfig) -> Result<Self> {
+        anyhow::ensure!(
+            config.username.is_empty() == config.password.is_empty(),
+            "OCI registry static credentials require both username and password"
+        );
+
         // Extract host from registry_url (remove protocol and path)
         let registry_host = config
             .registry_url
@@ -75,21 +81,19 @@ impl RegistryProvider for OciClientAuthProvider {
     ) -> Result<RegistryCredentials> {
         tracing::info!("Returning OCI registry info for repository: {}", repository);
 
-        // Return client-facing registry URL - credentials assumed to be configured via docker login
-        // The client_registry_url is used for push operations, while registry_url is used by deployment controllers
+        // The client_registry_url is used for push operations, while registry_url is used by deployment controllers.
+        // Empty credentials preserve client-managed authentication via docker login.
         Ok(RegistryCredentials {
             registry_url: self.client_registry_url.clone(),
-            username: String::new(), // Empty - docker CLI uses stored credentials
-            password: String::new(), // Empty - docker CLI uses stored credentials
+            username: self.config.username.clone(),
+            password: self.config.password.clone(),
             expires_in: None,
             auth_method: Default::default(),
         })
     }
 
     async fn get_pull_credentials(&self) -> Result<(String, String)> {
-        // Client-auth provider assumes docker login was used
-        // Return empty credentials - the docker CLI will use stored credentials
-        Ok((String::new(), String::new()))
+        Ok((self.config.username.clone(), self.config.password.clone()))
     }
 
     fn registry_host(&self) -> &str {
@@ -106,5 +110,64 @@ impl RegistryProvider for OciClientAuthProvider {
             ImageTagType::Internal => &self.registry_url,
         };
         format!("{}/{}:{}", registry_url, repository, tag)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(username: &str, password: &str) -> OciClientAuthConfig {
+        OciClientAuthConfig {
+            registry_url: "registry.internal:5000".to_string(),
+            namespace: "rise-apps".to_string(),
+            client_registry_url: Some("registry.example.com".to_string()),
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_static_credentials_for_push_and_pull() {
+        let provider = OciClientAuthProvider::new(config("rise", "secret")).unwrap();
+
+        let push = provider
+            .get_credentials("my-app", &["deployment-1"])
+            .await
+            .unwrap();
+        assert_eq!(push.registry_url, "registry.example.com/rise-apps");
+        assert_eq!(push.username, "rise");
+        assert_eq!(push.password, "secret");
+        assert_eq!(push.expires_in, None);
+
+        let pull = provider.get_pull_credentials().await.unwrap();
+        assert_eq!(pull, ("rise".to_string(), "secret".to_string()));
+    }
+
+    #[tokio::test]
+    async fn preserves_client_managed_auth_when_credentials_are_empty() {
+        let provider = OciClientAuthProvider::new(config("", "")).unwrap();
+
+        let push = provider
+            .get_credentials("my-app", &["deployment-1"])
+            .await
+            .unwrap();
+        assert!(push.username.is_empty());
+        assert!(push.password.is_empty());
+        assert_eq!(
+            provider.get_pull_credentials().await.unwrap(),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn rejects_partial_static_credentials() {
+        let error = OciClientAuthProvider::new(config("rise", ""))
+            .err()
+            .expect("partial credentials must fail");
+        assert_eq!(
+            error.to_string(),
+            "OCI registry static credentials require both username and password"
+        );
     }
 }

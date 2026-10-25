@@ -4,7 +4,9 @@ use crate::server::extensions::{Extension, InjectedEnvVar};
 use crate::server::settings::{PrivateKeySource, SnowflakeAuth};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Duration, Utc};
+use openssl::{pkey::PKey, rand::rand_bytes, symm::Cipher};
 use rise_runtime_sync::{with_leader_election, LeaderElection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -17,6 +19,47 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use snowflake_connector_rs::{SnowflakeAuthMethod, SnowflakeClient, SnowflakeClientConfig};
+
+fn prepare_snowflake_private_key(
+    private_key_pem: String,
+    configured_password: Option<&str>,
+) -> Result<(String, Vec<u8>)> {
+    if private_key_pem.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+        return Ok((
+            private_key_pem,
+            configured_password.unwrap_or_default().as_bytes().to_vec(),
+        ));
+    }
+
+    let is_unencrypted = private_key_pem.contains("BEGIN PRIVATE KEY")
+        || private_key_pem.contains("BEGIN RSA PRIVATE KEY");
+    if !is_unencrypted {
+        return Err(anyhow!(
+            "Unsupported private key format. Expected encrypted PKCS#8, unencrypted PKCS#8, or an RSA PKCS#1 PEM key"
+        ));
+    }
+
+    let private_key = PKey::private_key_from_pem(private_key_pem.as_bytes())
+        .context("Failed to parse unencrypted Snowflake private key")?;
+    private_key
+        .rsa()
+        .context("Snowflake private key must use RSA")?;
+    let password = match configured_password.filter(|password| !password.is_empty()) {
+        Some(password) => password.as_bytes().to_vec(),
+        None => {
+            let mut random = [0_u8; 32];
+            rand_bytes(&mut random).context("Failed to generate temporary private-key password")?;
+            URL_SAFE_NO_PAD.encode(random).into_bytes()
+        }
+    };
+    let encrypted = private_key
+        .private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), &password)
+        .context("Failed to encrypt Snowflake private key in memory")?;
+    let encrypted = String::from_utf8(encrypted)
+        .context("OpenSSL returned a non-UTF-8 encrypted private key")?;
+
+    Ok((encrypted, password))
+}
 
 /// User-facing extension spec - minimal configuration
 /// Backend connection credentials are configured in config/{RISE_CONFIG_RUN_MODE}.yaml
@@ -290,6 +333,61 @@ impl SnowflakeOAuthProvisioner {
         }
     }
 
+    /// Keep the generated Generic OAuth extension's scopes aligned with the
+    /// effective Snowflake provisioner configuration. This is called both from
+    /// the spec update hook (for immediate propagation) and from steady-state
+    /// reconciliation (to repair drift).
+    async fn sync_oauth_extension_scopes(
+        &self,
+        project_id: Uuid,
+        oauth_extension_name: &str,
+        current_oauth_spec: &Value,
+        provisioner_spec: &SnowflakeOAuthProvisionerSpec,
+    ) -> Result<bool> {
+        let effective_config = self.get_effective_config(provisioner_spec);
+        let Some(updated_spec) =
+            oauth_spec_with_synced_scopes(current_oauth_spec, &effective_config.scopes)?
+        else {
+            return Ok(false);
+        };
+
+        if let Some(oauth_provider) = &self.oauth_provider {
+            oauth_provider
+                .validate_spec(&updated_spec)
+                .await
+                .context("Generated OAuth extension spec is invalid after syncing scopes")?;
+        }
+
+        db_extensions::update_spec(
+            &self.db_pool,
+            project_id,
+            oauth_extension_name,
+            &updated_spec,
+        )
+        .await
+        .context("Failed to sync scopes to generated OAuth extension")?;
+
+        if let Some(oauth_provider) = &self.oauth_provider {
+            oauth_provider
+                .on_spec_updated(
+                    current_oauth_spec,
+                    &updated_spec,
+                    project_id,
+                    oauth_extension_name,
+                    &self.db_pool,
+                )
+                .await
+                .context("Failed to reconcile generated OAuth extension after syncing scopes")?;
+        }
+
+        info!(
+            "Synced OAuth scopes for generated extension {}: {:?}",
+            oauth_extension_name, effective_config.scopes
+        );
+
+        Ok(true)
+    }
+
     /// Get the finalizer name for this extension instance
     fn finalizer_name(&self, extension_name: &str) -> String {
         format!(
@@ -332,44 +430,10 @@ impl SnowflakeOAuthProvisioner {
                     PrivateKeySource::Inline { private_key } => private_key.clone(),
                 };
 
-                // Detect if key is encrypted or unencrypted based on PEM header
-                let is_encrypted = private_key_pem.contains("BEGIN ENCRYPTED PRIVATE KEY");
-                let is_unencrypted_pkcs8 = private_key_pem.contains("BEGIN PRIVATE KEY");
-                let is_rsa_key = private_key_pem.contains("BEGIN RSA PRIVATE KEY");
-
-                // For unencrypted keys, we need to convert to encrypted PKCS#8 format
-                // because the Snowflake connector library only supports encrypted keys
-                let password_bytes = if is_encrypted {
-                    // Key is already encrypted, use provided password
-                    private_key_password
-                        .as_ref()
-                        .map(|p| p.as_bytes().to_vec())
-                        .unwrap_or_default()
-                } else if is_unencrypted_pkcs8 || is_rsa_key {
-                    // Key is unencrypted - the library doesn't support this
-                    // We need to return a clear error
-                    return Err(anyhow!(
-                        "Unencrypted private keys are not supported by the Snowflake connector. \n\
-                         \n\
-                         Please encrypt your private key using:\n\
-                         openssl pkcs8 -topk8 -v2 aes256 -in unencrypted_key.pem -out encrypted_key.p8\n\
-                         \n\
-                         Then update your config/{{RISE_CONFIG_RUN_MODE}}.yaml:\n\
-                         auth_type: private_key\n\
-                         private_key: \"$${{SNOWFLAKE_PRIVATE_KEY}}\"  # encrypted key\n\
-                         private_key_password: \"$${{SNOWFLAKE_PRIVATE_KEY_PASSWORD}}\"\n\
-                         \n\
-                         Alternatively, use password authentication instead of private key."
-                    ));
-                } else {
-                    // Unknown key format
-                    return Err(anyhow!(
-                        "Unsupported private key format. Expected PEM format with one of:\n\
-                         - BEGIN ENCRYPTED PRIVATE KEY (PKCS#8 encrypted)\n\
-                         - BEGIN PRIVATE KEY (PKCS#8 unencrypted - not supported, must be encrypted)\n\
-                         - BEGIN RSA PRIVATE KEY (PKCS#1 - not supported, must be PKCS#8 encrypted)"
-                    ));
-                };
+                let (private_key_pem, password_bytes) = prepare_snowflake_private_key(
+                    private_key_pem,
+                    private_key_password.as_deref(),
+                )?;
 
                 SnowflakeAuthMethod::KeyPair {
                     encrypted_pem: private_key_pem,
@@ -401,33 +465,8 @@ impl SnowflakeOAuthProvisioner {
             config.warehouse = Some(warehouse.clone());
         }
 
-        let client = SnowflakeClient::new(&self.user, auth_method, config).map_err(|e| {
-            // Provide helpful error messages for common issues
-            let error_str = format!("{:?}", e);
-            if error_str.contains("ENCRYPTED PRIVATE KEY") {
-                anyhow!(
-                    "Failed to create Snowflake client: {}. \n\
-                     \n\
-                     The snowflake-connector-rs library expects private keys in PKCS#8 encrypted format.\n\
-                     \n\
-                     If you have an unencrypted private key, you can encrypt it with:\n\
-                     openssl pkcs8 -topk8 -v2 aes256 -in rsa_key.p8 -out rsa_key_encrypted.p8\n\
-                     \n\
-                     Or generate a new encrypted key pair:\n\
-                     openssl genrsa 2048 | openssl pkcs8 -topk8 -v2 aes256 -out rsa_key.p8\n\
-                     \n\
-                     Then configure the encrypted key and password in config/{{RISE_CONFIG_RUN_MODE}}.yaml:\n\
-                     auth_type: private_key\n\
-                     private_key: \"$${{SNOWFLAKE_PRIVATE_KEY}}\"\n\
-                     private_key_password: \"$${{SNOWFLAKE_PRIVATE_KEY_PASSWORD}}\"\n\
-                     \n\
-                     Alternatively, use password authentication instead.",
-                    e
-                )
-            } else {
-                anyhow!("Failed to create Snowflake client: {}", e)
-            }
-        })?;
+        let client = SnowflakeClient::new(&self.user, auth_method, config)
+            .map_err(|e| anyhow!("Failed to create Snowflake client: {}", e))?;
 
         Ok(client)
     }
@@ -873,6 +912,7 @@ impl SnowflakeOAuthProvisioner {
                 "https://{}.snowflakecomputing.com/oauth/token-request",
                 self.account
             )),
+            token_endpoint_auth_method: Default::default(),
             scopes: effective_config.scopes,
         };
 
@@ -927,7 +967,7 @@ impl SnowflakeOAuthProvisioner {
         project_id: Uuid,
         project_name: &str,
         _extension_name: &str,
-        _spec: &SnowflakeOAuthProvisionerSpec,
+        spec: &SnowflakeOAuthProvisionerSpec,
     ) -> Result<()> {
         let integration_name = status
             .integration_name
@@ -987,6 +1027,13 @@ impl SnowflakeOAuthProvisioner {
             status.error = None;
             return Ok(());
         }
+
+        // The provisioner remains the source of truth for OAuth scopes after
+        // initial creation. Reconcile the generated extension here as a drift
+        // repair path in addition to the immediate spec update hook.
+        let oauth_ext = oauth_ext.expect("checked above");
+        self.sync_oauth_extension_scopes(project_id, oauth_extension_name, &oauth_ext.spec, spec)
+            .await?;
 
         let expected_redirect_uri = format!(
             "{}/oidc/{}/{}/callback",
@@ -1367,6 +1414,38 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
         Ok(())
     }
 
+    async fn on_spec_updated(
+        &self,
+        _old_spec: &Value,
+        new_spec: &Value,
+        project_id: Uuid,
+        extension_name: &str,
+        db_pool: &sqlx::PgPool,
+    ) -> Result<()> {
+        let provisioner_spec: SnowflakeOAuthProvisionerSpec =
+            serde_json::from_value(new_spec.clone())
+                .context("Invalid Snowflake OAuth provisioner spec")?;
+        let oauth_extension_name = self.generate_oauth_extension_name(extension_name);
+
+        // During initial creation the child does not exist yet; the normal
+        // provisioning lifecycle will create it with the effective scopes.
+        if let Some(oauth_ext) =
+            db_extensions::find_by_project_and_name(db_pool, project_id, &oauth_extension_name)
+                .await?
+                .filter(|extension| extension.deleted_at.is_none())
+        {
+            self.sync_oauth_extension_scopes(
+                project_id,
+                &oauth_extension_name,
+                &oauth_ext.spec,
+                &provisioner_spec,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     fn format_status(&self, status: &Value) -> String {
         match serde_json::from_value::<SnowflakeOAuthProvisionerStatus>(status.clone()) {
             Ok(status) => {
@@ -1481,5 +1560,134 @@ Deletion removes all resources: Snowflake integration and OAuth extension.
                 );
             }
         })
+    }
+}
+
+fn oauth_spec_with_synced_scopes(
+    current_spec: &Value,
+    desired_scopes: &[String],
+) -> Result<Option<Value>> {
+    let desired_scopes = serde_json::to_value(desired_scopes)
+        .context("Failed to serialize effective OAuth scopes")?;
+
+    if current_spec.get("scopes") == Some(&desired_scopes) {
+        return Ok(None);
+    }
+
+    let mut updated_spec = current_spec.clone();
+    let object = updated_spec
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Generated OAuth extension spec must be a JSON object"))?;
+    object.insert("scopes".to_string(), desired_scopes);
+
+    Ok(Some(updated_spec))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{oauth_spec_with_synced_scopes, prepare_snowflake_private_key};
+    use openssl::{pkey::PKey, rsa::Rsa, symm::Cipher};
+    use rsa::{pkcs8::DecodePrivateKey, traits::PublicKeyParts, RsaPrivateKey};
+    use serde_json::json;
+
+    fn assert_unencrypted_key_is_prepared(pem: Vec<u8>) {
+        let original = PKey::private_key_from_pem(&pem).unwrap();
+        let (encrypted, password) =
+            prepare_snowflake_private_key(String::from_utf8(pem).unwrap(), None).unwrap();
+
+        assert!(encrypted.contains("BEGIN ENCRYPTED PRIVATE KEY"));
+        let prepared = RsaPrivateKey::from_pkcs8_encrypted_pem(&encrypted, &password).unwrap();
+        let original = original.rsa().unwrap();
+        assert_eq!(original.n().to_vec(), prepared.n().to_bytes_be());
+        assert_eq!(original.e().to_vec(), prepared.e().to_bytes_be());
+    }
+
+    #[test]
+    fn unencrypted_pkcs8_private_key_is_encrypted_in_memory() {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        assert_unencrypted_key_is_prepared(key.private_key_to_pem_pkcs8().unwrap());
+    }
+
+    #[test]
+    fn unencrypted_pkcs1_private_key_is_encrypted_in_memory() {
+        let key = Rsa::generate(2048).unwrap();
+        assert_unencrypted_key_is_prepared(key.private_key_to_pem().unwrap());
+    }
+
+    #[test]
+    fn encrypted_pkcs8_private_key_and_password_pass_through() {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let pem = String::from_utf8(
+            key.private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), b"known-password")
+                .unwrap(),
+        )
+        .unwrap();
+
+        let (prepared, password) =
+            prepare_snowflake_private_key(pem.clone(), Some("known-password")).unwrap();
+
+        assert_eq!(prepared, pem);
+        assert_eq!(password, b"known-password");
+    }
+
+    #[test]
+    fn malformed_unencrypted_private_key_is_rejected() {
+        let error = prepare_snowflake_private_key(
+            "-----BEGIN PRIVATE KEY-----\nnot-a-key\n-----END PRIVATE KEY-----".to_string(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Failed to parse unencrypted Snowflake private key"));
+    }
+
+    #[test]
+    fn oauth_scope_sync_updates_scopes_and_preserves_other_fields() {
+        let current = json!({
+            "provider_name": "Snowflake",
+            "client_id": "client-id",
+            "scopes": ["refresh_token"]
+        });
+        let desired = vec![
+            "refresh_token".to_string(),
+            "session:role:DATA_VIEWER".to_string(),
+        ];
+
+        let updated = oauth_spec_with_synced_scopes(&current, &desired)
+            .expect("scope sync should succeed")
+            .expect("different scopes should produce an update");
+
+        assert_eq!(updated["scopes"], json!(desired));
+        assert_eq!(updated["provider_name"], "Snowflake");
+        assert_eq!(updated["client_id"], "client-id");
+    }
+
+    #[test]
+    fn oauth_scope_sync_is_noop_when_scopes_match() {
+        let current = json!({
+            "provider_name": "Snowflake",
+            "scopes": ["refresh_token", "session:role:DATA_VIEWER"]
+        });
+        let desired = vec![
+            "refresh_token".to_string(),
+            "session:role:DATA_VIEWER".to_string(),
+        ];
+
+        let updated =
+            oauth_spec_with_synced_scopes(&current, &desired).expect("scope sync should succeed");
+
+        assert!(updated.is_none());
+    }
+
+    #[test]
+    fn oauth_scope_sync_rejects_non_object_specs() {
+        let error = oauth_spec_with_synced_scopes(&json!([]), &["refresh_token".to_string()])
+            .expect_err("non-object specs should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("Generated OAuth extension spec must be a JSON object"));
     }
 }

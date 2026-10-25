@@ -1,14 +1,20 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{bail, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write as _};
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::debug;
 
-use crate::api::models::{Deployment, DeploymentStatus};
+use crate::api::models::{Deployment, DeploymentEvent, DeploymentStatus};
 use crate::config::Config;
 
-use super::core::{fetch_deployment, open_log_stream, parse_duration, LogStreamError};
+use super::core::{
+    fetch_deployment, fetch_deployment_events, fetch_latest_deployment_events, open_log_stream,
+    parse_duration, LogStreamError,
+};
 use crate::token_source::token_with_retry;
 
 // Project info for fetching project URL
@@ -16,26 +22,6 @@ use crate::token_source::token_with_retry;
 struct ProjectInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     primary_url: Option<String>,
-}
-
-// Legacy Docker controller metadata structures (for backward compatibility with old deployments)
-#[derive(Deserialize, Debug, Clone, PartialEq)]
-struct DockerMetadata {
-    #[serde(default)]
-    reconcile_phase: ReconcilePhase,
-    container_id: Option<String>,
-    container_name: Option<String>,
-    assigned_port: Option<u16>,
-}
-
-#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
-enum ReconcilePhase {
-    #[default]
-    NotStarted,
-    CreatingContainer,
-    StartingContainer,
-    WaitingForHealth,
-    Completed,
 }
 
 // ANSI escape codes for terminal manipulation
@@ -59,45 +45,139 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 
 /// State tracking between polls
 struct FollowState {
-    last_status: DeploymentStatus,
-    last_controller_phase: Option<ReconcilePhase>,
-    last_error: Option<String>,
-    last_url: Option<String>,
-    last_metadata: serde_json::Value,
     spinner_frame: usize,
-    is_first_poll: bool,
 }
 
 impl FollowState {
     fn new() -> Self {
+        Self { spinner_frame: 0 }
+    }
+}
+
+/// Keeps the deployment event log visible while the deploy command follows a
+/// deployment. The initial read includes the complete history; later reads use
+/// only the newest page and the event id set makes the output idempotent.
+struct EventReporter {
+    seen: HashSet<i64>,
+    initialized: bool,
+}
+
+impl EventReporter {
+    fn new() -> Self {
         Self {
-            last_status: DeploymentStatus::Pending,
-            last_controller_phase: None,
-            last_error: None,
-            last_url: None,
-            last_metadata: serde_json::Value::Null,
-            spinner_frame: 0,
-            is_first_poll: true,
+            seen: HashSet::new(),
+            initialized: false,
         }
     }
 
-    fn should_log_state_change(
-        &self,
-        deployment: &Deployment,
-        controller_phase: &Option<ReconcilePhase>,
-    ) -> bool {
-        self.is_first_poll
-            || self.last_status != deployment.status
-            || self.last_controller_phase != *controller_phase
+    async fn poll(
+        &mut self,
+        http_client: &Client,
+        backend_url: &str,
+        provider: &crate::token_source::TokenProvider,
+        project: &str,
+        deployment_id: &str,
+    ) -> Vec<DeploymentEvent> {
+        let token = match token_with_retry(provider).await {
+            Ok(token) => token,
+            Err(error) => {
+                debug!(
+                    "Could not resolve a token for deployment events: {:?}",
+                    error
+                );
+                return Vec::new();
+            }
+        };
+
+        let result = if self.initialized {
+            fetch_latest_deployment_events(http_client, backend_url, &token, project, deployment_id)
+                .await
+        } else {
+            fetch_deployment_events(http_client, backend_url, &token, project, deployment_id).await
+        };
+
+        let events = match result {
+            Ok(events) => events,
+            Err(error) => {
+                debug!("Could not read deployment events: {:?}", error);
+                return Vec::new();
+            }
+        };
+        self.initialized = true;
+
+        unseen_events(&mut self.seen, events)
+    }
+}
+
+fn unseen_events(seen: &mut HashSet<i64>, events: Vec<DeploymentEvent>) -> Vec<DeploymentEvent> {
+    let mut new_events: Vec<_> = events
+        .into_iter()
+        .filter(|event| seen.insert(event.id))
+        .collect();
+    // The API returns newest-first; command output follows the order in which
+    // the server recorded events.
+    new_events.reverse();
+    new_events
+}
+
+fn print_deployment_events(events: &[DeploymentEvent]) {
+    for event in events {
+        let subject = event
+            .subject
+            .as_deref()
+            .map(|value| format!(" {value}:"))
+            .unwrap_or_default();
+        let description = event_description(event);
+        let attributes = if event.attributes.is_object()
+            && event
+                .attributes
+                .as_object()
+                .is_some_and(|attrs| !attrs.is_empty())
+        {
+            format!(
+                " {}",
+                serde_json::to_string(&event.attributes).unwrap_or_else(|_| "{}".to_string())
+            )
+        } else {
+            String::new()
+        };
+
+        println!(
+            "{} [{}] {}{} {}{}",
+            event.occurred_at,
+            event.severity.to_uppercase(),
+            event.source,
+            subject,
+            description,
+            attributes
+        );
+    }
+}
+
+fn event_description(event: &DeploymentEvent) -> String {
+    if event.kind == "status_changed" {
+        let from = event.attributes.get("from").and_then(event_scalar);
+        let to = event.attributes.get("to").and_then(event_scalar);
+        if let Some(to) = to {
+            return match from {
+                Some(from) => format!("status changed: {from} → {to}"),
+                None => format!("status: {to}"),
+            };
+        }
     }
 
-    fn update(&mut self, deployment: &Deployment, controller_phase: Option<ReconcilePhase>) {
-        self.last_status = deployment.status.clone();
-        self.last_controller_phase = controller_phase;
-        self.last_error = deployment.error_message.clone();
-        self.last_url = deployment.primary_url.clone();
-        self.last_metadata = deployment.controller_metadata.clone();
-        self.is_first_poll = false;
+    event
+        .message
+        .clone()
+        .unwrap_or_else(|| event.kind.replace('_', " "))
+}
+
+fn event_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        _ => None,
     }
 }
 
@@ -127,12 +207,7 @@ impl LiveStatusSection {
         }
     }
 
-    fn render(
-        &mut self,
-        deployment: &Deployment,
-        state: &FollowState,
-        controller_phase: &Option<ReconcilePhase>,
-    ) -> String {
+    fn render(&mut self, deployment: &Deployment, state: &FollowState) -> String {
         // Clear previous output
         self.clear_previous();
 
@@ -148,12 +223,7 @@ impl LiveStatusSection {
             String::new()
         };
 
-        // Show deployment status + controller phase if available
-        let status_text = if let Some(phase) = controller_phase {
-            format!("{} ({})", deployment.status, format_controller_phase(phase))
-        } else {
-            format!("{}", deployment.status)
-        };
+        let status_text = format!("{}", deployment.status);
 
         output.push_str(&format!(
             "{}{} Status:    {}{}{}\n",
@@ -179,12 +249,6 @@ impl LiveStatusSection {
                 ansi::RESET,
                 error
             ));
-            line_count += 1;
-        }
-
-        // Controller metadata summary (container ID if available)
-        if let Some(container_id) = extract_container_id(&deployment.controller_metadata) {
-            output.push_str(&format!("   Container: {}\n", container_id));
             line_count += 1;
         }
 
@@ -260,50 +324,6 @@ fn is_terminal_state(status: &DeploymentStatus) -> bool {
     )
 }
 
-/// Parse controller metadata to extract deployment phase info (handles legacy Docker deployments)
-fn parse_controller_metadata(metadata: &serde_json::Value) -> Option<DockerMetadata> {
-    if metadata.is_null() || metadata == &serde_json::json!({}) {
-        return None;
-    }
-
-    // Try to parse as Docker metadata (for legacy deployments)
-    // For Kubernetes deployments, this will return None, which is fine
-    serde_json::from_value::<DockerMetadata>(metadata.clone()).ok()
-}
-
-/// Extract container ID from metadata for display
-fn extract_container_id(metadata: &serde_json::Value) -> Option<String> {
-    parse_controller_metadata(metadata)
-        .and_then(|m| m.container_id.map(|id| id[..12.min(id.len())].to_string()))
-}
-
-/// Format controller phase for display
-fn format_controller_phase(phase: &ReconcilePhase) -> String {
-    match phase {
-        ReconcilePhase::NotStarted => "not started".to_string(),
-        ReconcilePhase::CreatingContainer => "creating container".to_string(),
-        ReconcilePhase::StartingContainer => "starting container".to_string(),
-        ReconcilePhase::WaitingForHealth => "waiting for health".to_string(),
-        ReconcilePhase::Completed => "running".to_string(),
-    }
-}
-
-/// Log state change to tracing (appears in history)
-fn log_state_change(
-    project: &str,
-    deployment_id: &str,
-    status: &DeploymentStatus,
-    controller_phase: &Option<ReconcilePhase>,
-) {
-    let status_text = if let Some(phase) = controller_phase {
-        format!("{} ({})", status, format_controller_phase(phase))
-    } else {
-        format!("{}", status)
-    };
-
-    info!("Deployment {}:{} → {}", project, deployment_id, status_text);
-}
-
 /// Check if stdout is a TTY
 fn is_tty() -> bool {
     io::stdout().is_terminal()
@@ -311,24 +331,11 @@ fn is_tty() -> bool {
 
 /// Print deployment snapshot (for non-follow mode)
 pub fn print_deployment_snapshot(deployment: &Deployment) {
-    // Parse controller metadata
-    let controller_phase =
-        parse_controller_metadata(&deployment.controller_metadata).map(|m| m.reconcile_phase);
-
     // Status line with icon and color
     let icon = status_icon(&deployment.status);
     let color = status_color(&deployment.status);
 
-    // Show deployment status + controller phase if available
-    let status_text = if let Some(phase) = controller_phase {
-        format!(
-            "{} ({})",
-            deployment.status,
-            format_controller_phase(&phase)
-        )
-    } else {
-        format!("{}", deployment.status)
-    };
+    let status_text = format!("{}", deployment.status);
 
     println!(
         "{} Status:         {}{}{}",
@@ -379,11 +386,6 @@ pub fn print_deployment_snapshot(deployment: &Deployment) {
         println!("   URL:            {}", url);
     }
 
-    // Controller metadata summary (container ID if available)
-    if let Some(container_id) = extract_container_id(&deployment.controller_metadata) {
-        println!("   Container:      {}", container_id);
-    }
-
     // Error message if present
     if let Some(ref error) = deployment.error_message {
         println!("   \x1B[31mError:{} {}", ansi::RESET, error);
@@ -399,7 +401,11 @@ async fn fetch_project_info(
 ) -> Result<ProjectInfo> {
     let url = format!("{}/api/v1/projects/{}", backend_url, project);
 
-    let response = http_client.get(&url).bearer_auth(token).send().await?;
+    let response = http_client
+        .get(&url)
+        .bearer_auth(token)
+        .send_with_auth_hint(backend_url)
+        .await?;
 
     if !response.status().is_success() {
         bail!("Failed to fetch project info");
@@ -421,6 +427,7 @@ fn should_stream_logs(status: &DeploymentStatus) -> bool {
 ///
 /// Opens an SSE log stream and polls deployment status every 3 seconds.
 /// Returns the final deployment when a terminal state is reached.
+#[allow(clippy::too_many_arguments)]
 async fn stream_logs_with_status_polling(
     http_client: &Client,
     backend_url: &str,
@@ -429,6 +436,7 @@ async fn stream_logs_with_status_polling(
     deployment_id: &str,
     timeout: Duration,
     start_time: Instant,
+    event_reporter: &mut EventReporter,
 ) -> Result<Deployment> {
     let mut log_stream = None;
     let mut retry_count: usize = 0;
@@ -494,6 +502,16 @@ async fn stream_logs_with_status_polling(
                     let deployment = fetch_deployment(
                         http_client, backend_url, &token, project, deployment_id,
                     ).await?;
+                    let events = event_reporter
+                        .poll(
+                            http_client,
+                            backend_url,
+                            provider,
+                            project,
+                            deployment_id,
+                        )
+                        .await;
+                    print_deployment_events(&events);
                     if is_terminal_state(&deployment.status) {
                         drain_log_stream(stream).await;
                         return Ok(deployment);
@@ -512,6 +530,7 @@ async fn stream_logs_with_status_polling(
                     deployment_id,
                     timeout,
                     start_time,
+                    event_reporter,
                 )
                 .await;
             }
@@ -546,6 +565,16 @@ async fn stream_logs_with_status_polling(
                     let deployment = fetch_deployment(
                         http_client, backend_url, &token, project, deployment_id,
                     ).await?;
+                    let events = event_reporter
+                        .poll(
+                            http_client,
+                            backend_url,
+                            provider,
+                            project,
+                            deployment_id,
+                        )
+                        .await;
+                    print_deployment_events(&events);
                     if is_terminal_state(&deployment.status) {
                         return Ok(deployment);
                     }
@@ -572,6 +601,7 @@ async fn drain_log_stream(stream: &mut super::core::LogStream) {
 }
 
 /// Fall back to status-only polling when log streaming is unavailable.
+#[allow(clippy::too_many_arguments)]
 async fn status_only_polling(
     http_client: &Client,
     backend_url: &str,
@@ -580,6 +610,7 @@ async fn status_only_polling(
     deployment_id: &str,
     timeout: Duration,
     start_time: Instant,
+    event_reporter: &mut EventReporter,
 ) -> Result<Deployment> {
     loop {
         // Resolve a fresh token per poll so a long wait doesn't outlast a
@@ -587,6 +618,10 @@ async fn status_only_polling(
         let token = token_with_retry(provider).await?;
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
+        let events = event_reporter
+            .poll(http_client, backend_url, provider, project, deployment_id)
+            .await;
+        print_deployment_events(&events);
         if is_terminal_state(&deployment.status) {
             return Ok(deployment);
         }
@@ -608,6 +643,7 @@ pub async fn follow_deployment_with_ui(
     project: &str,
     deployment_id: &str,
     timeout_str: &str,
+    quiet: bool,
 ) -> Result<Deployment> {
     // The follow/poll loop can run for up to ~10 minutes, so resolve a fresh
     // token before each request rather than capturing one up front: in CI the
@@ -617,6 +653,19 @@ pub async fn follow_deployment_with_ui(
 
     let timeout = parse_duration(timeout_str)?;
     let start_time = Instant::now();
+
+    if quiet {
+        return follow_deployment_quiet(
+            http_client,
+            backend_url,
+            &provider,
+            project,
+            deployment_id,
+            timeout,
+            start_time,
+        )
+        .await;
+    }
 
     // Check if we're in a TTY - if not, fall back to simple mode
     if !is_tty() {
@@ -633,6 +682,7 @@ pub async fn follow_deployment_with_ui(
 
     let mut state = FollowState::new();
     let mut live_section = LiveStatusSection::new();
+    let mut event_reporter = EventReporter::new();
 
     // Hide cursor for cleaner output
     print!("{}", ansi::HIDE_CURSOR);
@@ -646,25 +696,19 @@ pub async fn follow_deployment_with_ui(
             let deployment =
                 fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
-            let controller_phase = parse_controller_metadata(&deployment.controller_metadata)
-                .map(|m| m.reconcile_phase);
-
-            if state.should_log_state_change(&deployment, &controller_phase) {
+            let events = event_reporter
+                .poll(http_client, backend_url, &provider, project, deployment_id)
+                .await;
+            if !events.is_empty() {
                 live_section.clear_previous();
-                log_state_change(
-                    project,
-                    deployment_id,
-                    &deployment.status,
-                    &controller_phase,
-                );
                 live_section.last_line_count = 0;
-            } else {
-                let output = live_section.render(&deployment, &state, &controller_phase);
-                print!("{}", output);
-                io::stdout().flush().unwrap();
+                print_deployment_events(&events);
             }
 
-            state.update(&deployment, controller_phase);
+            let output = live_section.render(&deployment, &state);
+            print!("{}", output);
+            io::stdout().flush().unwrap();
+
             state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
 
             // Terminal state reached before Deploying - skip to Phase 3
@@ -715,6 +759,7 @@ pub async fn follow_deployment_with_ui(
             deployment_id,
             timeout,
             start_time,
+            &mut event_reporter,
         )
         .await?
     } else {
@@ -741,6 +786,36 @@ pub async fn follow_deployment_with_ui(
     Ok(final_deployment)
 }
 
+/// Follow a deployment without writing progress to stdout.
+async fn follow_deployment_quiet(
+    http_client: &Client,
+    backend_url: &str,
+    provider: &crate::token_source::TokenProvider,
+    project: &str,
+    deployment_id: &str,
+    timeout: Duration,
+    start_time: Instant,
+) -> Result<Deployment> {
+    loop {
+        let token = token_with_retry(provider).await?;
+        let deployment =
+            fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
+
+        if is_terminal_state(&deployment.status) {
+            return Ok(deployment);
+        }
+
+        if start_time.elapsed() >= timeout {
+            bail!(
+                "Timeout waiting for deployment to complete after {:?}",
+                timeout
+            );
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Simple fallback for non-TTY environments (pipes, redirects)
 async fn follow_deployment_simple(
     http_client: &Client,
@@ -751,27 +826,18 @@ async fn follow_deployment_simple(
     timeout: Duration,
 ) -> Result<Deployment> {
     let start_time = Instant::now();
-    let mut state = FollowState::new();
+    let mut event_reporter = EventReporter::new();
 
-    // Phase 1: Status polling (print state changes as text lines)
+    // Phase 1: Status polling with the event log as the permanent output.
     let deployment = loop {
         let token = token_with_retry(provider).await?;
         let deployment =
             fetch_deployment(http_client, backend_url, &token, project, deployment_id).await?;
 
-        let controller_phase =
-            parse_controller_metadata(&deployment.controller_metadata).map(|m| m.reconcile_phase);
-
-        if state.should_log_state_change(&deployment, &controller_phase) {
-            log_state_change(
-                project,
-                deployment_id,
-                &deployment.status,
-                &controller_phase,
-            );
-        }
-
-        state.update(&deployment, controller_phase);
+        let events = event_reporter
+            .poll(http_client, backend_url, provider, project, deployment_id)
+            .await;
+        print_deployment_events(&events);
 
         if is_terminal_state(&deployment.status) {
             break deployment;
@@ -800,6 +866,7 @@ async fn follow_deployment_simple(
             deployment_id,
             timeout,
             start_time,
+            &mut event_reporter,
         )
         .await?
     } else {
@@ -822,4 +889,64 @@ async fn follow_deployment_simple(
     }
 
     Ok(final_deployment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(id: i64, kind: &str, message: Option<&str>, attributes: Value) -> DeploymentEvent {
+        DeploymentEvent {
+            id,
+            occurred_at: "2026-09-01T09:11:03.969119Z".to_string(),
+            kind: kind.to_string(),
+            severity: "info".to_string(),
+            source: "control-plane".to_string(),
+            subject: None,
+            message: message.map(str::to_string),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn unseen_events_are_returned_in_recorded_order_once() {
+        let mut seen = HashSet::from([2]);
+        let events = vec![
+            event(3, "backend_event", Some("third"), Value::Null),
+            event(2, "backend_event", Some("second"), Value::Null),
+            event(1, "backend_event", Some("first"), Value::Null),
+        ];
+
+        let fresh = unseen_events(&mut seen, events);
+        assert_eq!(
+            fresh.iter().map(|event| event.id).collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert!(unseen_events(&mut seen, fresh).is_empty());
+    }
+
+    #[test]
+    fn status_events_get_a_readable_transition_description() {
+        let status = event(
+            1,
+            "status_changed",
+            None,
+            serde_json::json!({ "from": "Pending", "to": "Building" }),
+        );
+        assert_eq!(
+            event_description(&status),
+            "status changed: Pending → Building"
+        );
+    }
+
+    #[test]
+    fn backend_events_keep_their_message_as_the_description() {
+        let backend = event(
+            1,
+            "backend_event",
+            Some("Resources were rounded up"),
+            serde_json::json!({ "type": "resource_adjusted" }),
+        );
+        assert_eq!(event_description(&backend), "Resources were rounded up");
+    }
 }

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployments\n         SET is_active = TRUE, updated_at = NOW()\n         WHERE id = $1\n           AND project_id = $2\n           AND deployment_group = $3\n           AND NOT is_terminal(status)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "04ed2c99949a89ac0b2c1bbf58d62f7e8ab324133c416b595717ccea1370d95e"
+}

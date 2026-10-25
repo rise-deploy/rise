@@ -15,6 +15,7 @@ import '@fontsource/jetbrains-mono/500.css';
 import '@fontsource/jetbrains-mono/600.css';
 import './styles/index.css';
 import './styles/rise.css';
+import './styles/logs-console.css';
 import './styles/legacy.css';
 
 // Apply theme/density/palette before first paint so we don't flash defaults.

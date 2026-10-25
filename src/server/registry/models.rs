@@ -33,6 +33,10 @@ pub struct EcrConfig {
     /// If false, repos are tagged as orphaned instead
     #[serde(default)]
     pub auto_remove: bool,
+    /// Registry host override; `None` (or empty) derives
+    /// `{account_id}.dkr.ecr.{region}.amazonaws.com`
+    #[serde(default)]
+    pub registry_host: Option<String>,
 }
 
 #[cfg(feature = "backend")]
@@ -40,11 +44,11 @@ fn default_repo_prefix() -> String {
     "rise/".to_string()
 }
 
-/// Configuration for OCI registry with client-side authentication
+/// Configuration for an OCI registry with optional static authentication
 ///
-/// This provider is for OCI-compliant registries where the client has already
-/// authenticated (e.g., via `docker login`). The backend only provides the
-/// registry URL and namespace; credentials are managed by the client's Docker config.
+/// When `username` and `password` are empty, the client must already be
+/// authenticated (e.g., via `docker login`). When configured, the backend
+/// returns the static credentials to authorized clients and uses them for pulls.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OciClientAuthConfig {
     /// Registry URL (e.g., "localhost:5000", "registry.example.com")
@@ -56,6 +60,12 @@ pub struct OciClientAuthConfig {
     /// If not specified, defaults to registry_url
     #[serde(default)]
     pub client_registry_url: Option<String>,
+    /// Optional static username returned to authorized CLI clients and used for pulls
+    #[serde(default)]
+    pub username: String,
+    /// Optional static password returned to authorized CLI clients and used for pulls
+    #[serde(default)]
+    pub password: String,
 }
 
 fn default_namespace() -> String {

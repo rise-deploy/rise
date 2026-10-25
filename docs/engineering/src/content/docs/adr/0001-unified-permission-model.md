@@ -6,6 +6,19 @@ title: "ADR-0001: Unified Permission Model"
 
 **Proposed** (under review). Date: 2026-07-10.
 
+Implementation progress: §1–§6 are live on the generic resource API — the
+policy and identity resources, the evaluation engine, the write-time grant
+gate, and the centralized choke point. §7's `token` subresource is live for
+`ServiceAccount` and `Controller`: target-bound workload exchange, delegated
+issuance, the `rise.dev/rbac` authorization-detail ceiling, UID-bound
+re-resolution on every request, and the bounded `act` chain. Interactive logins
+resolve to live `User`/`UserIdentity` resources with JIT provisioning, and User
+sessions carry canonical `sub` plus `rise_uid`. The conformance suite covers
+appendix scenarios 1–57 and is enforced by `mise run adr:conformance:check`.
+Still open: `operatorIdentities` selectors — which complete scenario 10's
+operator-selector half — and retirement of the typed-table exchange
+endpoint. `ROADMAP.md` §§1–3 hold the remaining steps.
+
 scope: the generic resource API (`/api/v1/resources/...`) and
 ServiceAccount/Controller token issuance (the `token` subresource). It does
 not change how `rise project create`, `rise deployment create`, or other
@@ -159,7 +172,7 @@ The separate trust-policy kinds are intentional: a generic kind has exactly one 
 
 A `GroupMembership` may omit owner references, in which case deleting its named User leaves the marker in place and recreating that User name deliberately reactivates the name-bound membership. Alternatively, it may carry exactly one owner reference, which must identify that same User; deleting that User then garbage-collects the membership. Backend-managed JIT or directory synchronization should attach this reference when it owns the membership lifecycle, avoiding zombie membership markers. An operator creating durable policy by hand may omit it intentionally. In both cases the membership's structural parent remains its Group, so deleting the Group also deletes the membership.
 
-**User names are stable generated identifiers, not email addresses.** A User gets an immutable, collision-resistant DNS-safe resource name such as `u-<lowercase-ulid>` (with the store's ordinary uniqueness constraint as the final authority). The generic resource-name grammar remains unchanged and does not admit `@`; relaxing it for one identity kind would either weaken every resource path or require kind-specific metadata-name parsing in the core. `User.spec` may carry presentation fields such as `displayName` and `primaryEmail`, but email is mutable, case-sensitive in troublesome ways, and non-unique across issuers, so it is never a subject key and Rise never auto-links accounts by email. `UserIdentity.spec` carries the authoritative external `issuer` and `subject`; that pair is globally unique among live UserIdentity resources. Issuers must already use their canonical URL spelling, including the no-trailing-slash convention; admission rejects aliases instead of silently repairing an authentication identifier. Both kinds also carry a platform-managed `spec.active` boolean, defaulting to `true`. An inactive User cannot log in and every already-issued token for that User fails authentication. An inactive UserIdentity blocks login through that exact upstream identity and is excluded from operator-selector matching, but does not invalidate sessions established through the User's other identities. These fields are governed resource data, but shipped policy does not let Users edit their own identity records. UI/CLI surfaces resolve and display email/name while bindings, references, URLs, and audit records use the canonical User name.
+**User names are stable generated identifiers, not email addresses.** A User gets an immutable, collision-resistant DNS-safe resource name such as `u-<lowercase-ulid>` (with the store's ordinary uniqueness constraint as the final authority). The generic resource-name grammar remains unchanged and does not admit `@`; relaxing it for one identity kind would either weaken every resource path or require kind-specific metadata-name parsing in the core. `User.spec` may carry presentation fields such as `displayName` and `primaryEmail`, but email is mutable, case-sensitive in troublesome ways, and non-unique across issuers, so it is never a subject key and Rise never auto-links accounts by email. `UserIdentity.spec` carries the authoritative external `issuer` and `subject`; that pair is globally unique among live UserIdentity resources. Issuers must already use their canonical URL spelling: the exact `iss` string the IdP stamps, with at most one trailing slash (OIDC compares issuers as exact strings, and IdPs differ on the slash), a lower-case host, and no default port; admission rejects aliases instead of silently repairing an authentication identifier. Both kinds also carry a platform-managed `spec.active` boolean, defaulting to `true`. An inactive User cannot log in and every already-issued token for that User fails authentication. An inactive UserIdentity blocks login through that exact upstream identity, ends the sessions established through it (each User session records the identity it was minted through), and is excluded from operator-selector matching, but does not invalidate sessions established through the User's other identities; deleting the identity ends its sessions the same way. These fields are governed resource data, but shipped policy does not let Users edit their own identity records. UI/CLI surfaces resolve and display email/name while bindings, references, URLs, and audit records use the canonical User name.
 
 Literal subjects, `roleRef`s, and Group memberships are deliberately **name-bound**: deleting and recreating an identity or Role under the same canonical name makes existing policy refer to the replacement, matching Kubernetes RBAC's name-based references. Credentials add a separate immutable binding. Every persisted User, ServiceAccount, and Controller has a store-assigned UID, and every Rise-issued token carries both the canonical `sub` and that UID in `rise_uid`. Authentication requires both values to identify the same live, enabled resource. Recreating `serviceaccount:acme/ci` may intentionally reactivate name-bound RoleBindings for the replacement, but every token issued for the old UID fails immediately. Dynamic label subjects follow the same name-bound policy semantics. Optional owner references affect lifecycle only: they remain UID-bound and can remove a membership before a same-name User replacement appears, but never change which User a surviving membership names.
 
@@ -198,7 +211,9 @@ SSO/directory synchronization creates and deletes ordinary `GroupMembership` res
 
 The absolute `org:<name>` form is useful to an operator binding an org population to a root-scoped resource (§9). Inside an org-parented binding the name is redundant — `system:authenticated` already clamps to that binding's org — but the absolute form retains one meaning everywhere and is not overloaded with relative names such as `org:admins`.
 
-**Org bindings target only their own org.** An org-parented `RoleBinding`'s grant to any subject is intersected with live membership in that binding's *own* org — a subject receives the grant only while it is a current member of that org. An org-native subject (`Group`/`ServiceAccount`) whose baked-in org differs from the binding's org is provably foreign and contributes no grant; a `User` subject receives the grant only while a live member of the binding's org through a Group tie or the direct admin bootstrap edge above (so a user in `acme` and `beta` gets an `acme`-scoped binding's grant in `acme` alone, and loses it on leaving `acme`); `system:authenticated` inside an org binding auto-clamps to that org's authenticated members and cannot expose platform-wide. A `Controller` — org-agnostic, a member of no single org — likewise receives no org-binding grant. These semantically inert bindings remain valid, safe policy data and are surfaced by policy auditing rather than rejected synchronously. `PlatformRoleBinding`s are root-placed and normalize to `subjectMembership: Any`, allowing deliberate cross-org or platform-wide operator grants. A PlatformRoleBinding may opt back into contextual containment with `ResourceOrganization` (§4); the seeded ownership binding does so, while RuntimeClass availability and explicit non-member grants use `Any` as appropriate. This bans cross-org sharing through org bindings by construction and prevents contextual ownership from outliving org membership; a first-class tenant-authorable cross-org sharing primitive is deferred (§10).
+**Org bindings target only their own org.** An org-parented `RoleBinding`'s grant to any subject is intersected with live membership in that binding's *own* org — a subject receives the grant only while it is a current member of that org. An org-native subject (`Group`/`ServiceAccount`) whose baked-in org differs from the binding's org is provably foreign and contributes no grant — and because both orgs are fixed once the row exists, that is decidable at write time, so admission refuses it outright (§6.7); a `User` subject receives the grant only while a live member of the binding's org through a Group tie or the direct admin bootstrap edge above (so a user in `acme` and `beta` gets an `acme`-scoped binding's grant in `acme` alone, and loses it on leaving `acme`); `system:authenticated` inside an org binding auto-clamps to that org's authenticated members and cannot expose platform-wide. A `Controller` — org-agnostic, a member of no single org — likewise receives no org-binding grant. The remaining inert combinations are *contingently* inert — a membership can change, a caller's affiliation differs per request — so they remain valid, safe policy data and are surfaced by policy auditing rather than rejected synchronously.
+
+Because an org `RoleBinding`'s Organization is fixed by placement, its `subject` also accepts the relative form `group:<name>`, normalized against the parent before storage. This is ergonomics for the common case, not part of the boundary: the absolute form remains writable and is what the row holds. `PlatformRoleBinding`s are root-placed and normalize to `subjectMembership: Any`, allowing deliberate cross-org or platform-wide operator grants. A PlatformRoleBinding may opt back into contextual containment with `ResourceOrganization` (§4); the seeded ownership binding does so, while RuntimeClass availability and explicit non-member grants use `Any` as appropriate. This bans cross-org sharing through org bindings by construction and prevents contextual ownership from outliving org membership; a first-class tenant-authorable cross-org sharing primitive is deferred (§10).
 
 **The binding is data; the operator predicate is derived — deliberately.** `system:operators`'s grant (the binding above) is a stored row, same table as every other binding. Membership is never stored as a separate RBAC record: evaluation intersects restart-loaded `operatorIdentities` configuration with the active User's live, active UserIdentity children. This is forced by the bootstrap problem the Operator concept exists to solve: if the initial relationship required an already-authorized RBAC write, nothing could create the first operator. The configured selector set is the one root of trust originating outside the system Rise governs; UserIdentity rows remain ordinary inspectable resources plus the narrow JIT bootstrap path above.
 
@@ -273,13 +288,12 @@ shared. Rise applies the same machinery to `/finalizers` as a deliberate
 hardening extension: finalizers remain part of `metadata`, but main writes
 preserve them and only `(update, ResourceKind, finalizers)` may change them.
 
-The target model removes `ResourceDefinition.allowedStatusControllerIds` and
-the corresponding collection metadata. A Controller is an authenticated
-subject, so its `status` and `finalizers` access comes solely from ordinary
-RoleBindings over the registered subresource tuples above. The legacy allowlist
-remains transitional only until controller requests pass through the unified
-authorization choke point; it is not a second authorization mechanism in the
-target API.
+`ResourceDefinition.allowedStatusControllerIds` and the corresponding
+collection metadata no longer exist. A Controller is an authenticated
+subject — `controller:<name>` — so its `status` and `finalizers` access comes
+solely from ordinary RoleBindings over the registered subresource tuples
+above, evaluated by the same choke point every other principal goes through.
+There is no separate controller authorization mechanism.
 
 This ADR standardizes that shared authorization and handler seam, plus
 the concrete `status`, `finalizers`, and `token` strategies. Streaming,
@@ -707,7 +721,7 @@ Referential-integrity validation (§6.7) runs only *after* this gate passes — 
 - **Referential integrity at write time.** A value written to a label some binding selects on must parse through that binding's declared template and resolve to every required concrete subject. For `${ref.subject}`, that means an existing User or same-org Group. Invalid kind prefixes and nonexistent subjects are rejected synchronously, with an authorized fuzzy-match suggestion where appropriate. Current membership is deliberately not a validity condition: a foreign or group-less User may be recorded as an owner while `ResourceOrganization` makes the binding grant nothing, and a later membership change may make it effective only through the ordinary serializable grant gate.
 - **Admin access stays independently derived, enforced structurally.** `PlatformRole/org-admin` may only be referenced by an exact org-root, scope-only RoleBinding, never a `labelSelector` binding (§5). Admin status therefore cannot depend on an access-driving label, and an operator can recover an orphaned resource without any magic Group name.
 
-Semantically inert policy is an auditing concern, not a write-time validity error. A future Role/policy auditing workflow should flag ownership labels that currently grant nobody, selectors that match no resources, recipient-boundary or `subjectMembership` combinations that are no-ops, stale references, and Allows shadowed by replacement or Deny. Explain output must show why such data contributes no effective tuple. The synchronous mutation path retains only the checks needed for safe interpretation and non-escalation: closed-schema parsing, referential integrity, structural scope/placement constraints, and the effective-delta grant gate.
+Semantically inert policy is an auditing concern, not a write-time validity error — with one exception, drawn at *permanent* rather than *currently* inert. Where inertness follows from the stored row alone, so that no membership change, later resource, or restored reference could ever make the binding grant something, admission rejects it: an org `RoleBinding` whose subject names a different organization is the one shape that qualifies today, because both organizations are frozen at write time. Everything §6.7 protects stays contingent and therefore admissible — a `user:` subject is live exactly while that user is affiliated, and `subjectMembership: ResourceOrganization` compares against the *resource's* organization, which varies per request. A future Role/policy auditing workflow should flag ownership labels that currently grant nobody, selectors that match no resources, recipient-boundary or `subjectMembership` combinations that are no-ops, stale references, and Allows shadowed by replacement or Deny. Explain output must show why such data contributes no effective tuple. The synchronous mutation path retains only the checks needed for safe interpretation and non-escalation: closed-schema parsing, referential integrity, structural scope/placement constraints, and the effective-delta grant gate.
 
 ### 7. Rise-issued identities and token issuance
 
@@ -851,6 +865,28 @@ EffectivePolicy must authorize token creation, but the child does not silently
 inherit the caller's cap: token-create is the explicit delegation boundary and
 the requested child details constrain the target.
 
+Both modes may also name an `audience` (RFC 8693). Omitted, the token is for
+Rise's own API. Any other value mints the same kind of token with that `aud`
+for an external verifier — a secrets manager, a cloud STS, a Controller the
+apiserver forwards to — which checks it against Rise's published JWKS. Identity
+tokens are therefore always signed asymmetrically, whatever their audience:
+one token kind and one verification path, rather than a symmetric internal
+variant beside an asymmetric external one. Rise's API accepts only its own
+audience, and `authorization_details` — a ceiling over Rise's RBAC that means
+nothing to another verifier — is refused together with an external audience.
+The same `(create, ResourceKind, token)` grant governs delegated issuance for
+every audience: minting a token in the target's name for a third party is the
+same authority as minting one for Rise. This mirrors Kubernetes'
+`TokenRequest` API, where a single `create` on `serviceaccounts/token`
+authorizes minting for any `spec.audiences` value, internal or external, with
+no separate grant per audience. Kubernetes has no per-token ceiling at all —
+RBAC is always re-evaluated live against the caller's current bindings, never
+baked into the token — so it has no analogue of `authorization_details`
+either. Rise's asymmetry, where a ceiling narrows a Rise-audience token but
+cannot apply to an external one, follows from `authorization_details` only
+ever meaning something against Rise's own RBAC, not from a difference in how
+the audience itself is authorized.
+
 Tokens carry identity and a ceiling, never a snapshot of grants. Every request
 re-resolves the target identity, Groups, Roles, bindings, and Denies. Narrowing
 or deleting the target affects outstanding tokens immediately; recreating the
@@ -914,7 +950,7 @@ resource admission policy, which is out of scope (§10).
 ### 10. Explicitly out of scope
 
 - Org-registrable Controllers/ResourceDefinitions — falls out for free once registration is just another grant-gated verb, not designed now.
-- Migrating today's typed-table-backed APIs (`Project`, `User`, existing `Team`, `ServiceAccount`, `Deployment`, …) onto this model — happens separately. Existing Teams become `Group` resources and `team_members` become `GroupMembership`; ServiceAccounts move from Project to Organization placement and cease masquerading as synthetic Users.
+- Migrating today's typed-table-backed APIs (`Project`, `User`, existing `Team`, `ServiceAccount`, `Deployment`, …) onto this model — happens separately. Existing Teams become `Group` resources and `team_members` become `GroupMembership`; ServiceAccounts move from Project to Organization placement and cease masquerading as synthetic Users. A typed-table identity mechanism is retired only once it is safe to: either it never carried production traffic — `auth.controllers[]` static configuration, removed unconditionally in the same change that introduced live `ControllerTrustPolicy` resources (§1), because no installation had ever configured it — or every identity of that kind has migrated to its resource-API-backed replacement and the legacy path's traffic has drained to zero, evidenced the same way as any other breaking auth change (the `rise::deprecation`-style telemetry gating `auth.allow_raw_external_tokens`). Introducing a kind's `/token` subresource is additive and does not by itself retire that kind's legacy path — the typed `service_accounts` table keeps serving every service account still on it, unmodified, for as long as any remain.
 - Ingress-level authentication for a deployed application's own end users — a different problem domain entirely.
 - A pluggable subject-kind registry letting organizations define groups with custom membership semantics (§6.4) — organization-specific *naming* of a grouping concept is supported today by pairing an existing kind with an organization-chosen label key; genuinely custom membership resolution is not, and would need a larger extension to the closed subject-kind list.
 - A first-class cross-org sharing primitive — a deliberate grant reaching subjects of another org. The recipient boundary (§1) bans cross-org sharing through org bindings by construction; operator-authored `PlatformRoleBinding`s are the only cross-org grant path today. A tenant-authorable sharing mechanism is deferred; nothing here forecloses it.
@@ -1409,7 +1445,7 @@ tagged `§9 deferred` or `product-operation deferred`.
 - `ROADMAP.md` §§1–4 — owns live delivery status for the unified RBAC,
   authentication, subresource, and typed-object migration work this model
   informs.
-- [Generic Resource API](../generic-resource-api.md) — the shipped,
-  operator-only surface this model will govern.
+- [Generic resource HTTP API](../resources/api) — the shipped surface this
+  model governs.
 - `crates/rise-resource-api`, `crates/rise-resource-store-postgres` — the envelope types
   and the `ResourceStore` trait/impl the Implementation structure builds on.

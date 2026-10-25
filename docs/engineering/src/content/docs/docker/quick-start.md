@@ -12,6 +12,20 @@ docker compose -f docker-compose.standalone.yaml \
                -f docker-compose.standalone.local.yaml up -d
 ```
 
+The command above uses the Compose file's pinned stable image by default. To
+validate a release candidate, first check out its Git tag and derive the exact
+published GHCR tag (the release workflow removes the leading `v`):
+
+```bash
+export RISE_IMAGE_TAG="$(git describe --tags --exact-match --match 'v*' HEAD | sed 's/^v//')"
+docker compose -f docker-compose.standalone.yaml \
+               -f docker-compose.standalone.local.yaml up -d
+```
+
+`git describe --exact-match` deliberately fails on an untagged checkout instead
+of silently running a different image. Run this only after that tag's CI has
+published `ghcr.io/rise-deploy/rise:${RISE_IMAGE_TAG}`.
+
 This serves the control plane on `http://rise.localhost:3000` and apps on
 `http://{project}.rise.localhost` over plain HTTP. The `.localhost` suffix
 resolves to `127.0.0.1` in most browsers, so no `/etc/hosts` edits are needed

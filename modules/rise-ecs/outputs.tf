@@ -1,0 +1,165 @@
+# -----------------------------------------------------------------------------
+# Network
+# -----------------------------------------------------------------------------
+
+output "vpc_id" {
+  description = "VPC the install runs in, created or brought."
+  value       = local.vpc_id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnets (load balancer, NAT)."
+  value       = local.public_subnet_ids
+}
+
+output "private_subnet_ids" {
+  description = "Private subnets. Deployed workloads land here."
+  value       = local.private_subnet_ids
+}
+
+output "database_subnet_ids" {
+  description = "Database subnets."
+  value       = local.database_subnet_ids
+}
+
+output "apps_security_group_id" {
+  description = "Security group deployed workloads run in — the value of deployment_controller.security_groups."
+  value       = module.security.groups.apps
+}
+
+# -----------------------------------------------------------------------------
+# Runtime
+# -----------------------------------------------------------------------------
+
+output "cluster_name" {
+  description = "ECS cluster name."
+  value       = local.cluster_name
+}
+
+output "cluster_arn" {
+  description = "ECS cluster ARN."
+  value       = local.cluster_arn
+}
+
+output "cloud_map_namespace_name" {
+  description = "Private DNS namespace backing the internal service URLs."
+  value       = local.namespace_name
+}
+
+output "log_group_name" {
+  description = "CloudWatch log group carrying control-plane and workload logs."
+  value       = module.cluster.logging.name
+}
+
+output "rise_service_name" {
+  description = "ECS service running the control plane."
+  value       = module.runtime.rise.service_name
+}
+
+output "traefik_service_name" {
+  description = "ECS service running the ingress router."
+  value       = module.runtime.traefik.service_name
+}
+
+# -----------------------------------------------------------------------------
+# Reaching the install
+# -----------------------------------------------------------------------------
+
+output "load_balancer_dns_name" {
+  description = "DNS name of the edge load balancer."
+  value       = module.ingress.load_balancer.dns_name
+}
+
+output "public_url" {
+  description = "Rise's public URL."
+  value       = local.public_url
+}
+
+output "dns_records_required" {
+  description = <<-EOT
+    DNS records to create, unless route53_zone was set and the module made
+    them. The wildcard is required, not optional: projects are served at
+    <project>.<domain>, and groups and environments add another label.
+  EOT
+  value = local.create_dns_records ? [] : [
+    "${var.ingress_domain}    ALIAS/CNAME -> ${module.ingress.load_balancer.dns_name}",
+    "*.${var.ingress_domain}  ALIAS/CNAME -> ${module.ingress.load_balancer.dns_name}",
+  ]
+}
+
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+output "rise_task_environment" {
+  description = <<-EOT
+    The plain environment variables the control plane needs, exactly as this
+    module sets them on its own task definition. Useful when running Rise
+    somewhere else — the two cannot drift, because the module consumes this same
+    map. Contains no secrets; those are in `rise_task_secrets`.
+  EOT
+  value       = local.rise_environment
+}
+
+output "rise_task_secrets" {
+  description = "Secrets Manager valueFrom references injected as environment variables, keyed by variable name."
+  value       = local.control_plane_secret_environment
+}
+
+output "secret_arns_for_execution_role" {
+  description = <<-EOT
+    Pass to modules/rise-aws's `ecs_secret_arns` so the task execution role may
+    read them. Secrets Manager appends a random suffix to every ARN, so these
+    are exact ARNs rather than patterns.
+  EOT
+  value = concat([
+    local.database_url_secret_arn,
+    module.secrets.environment.RISE_JWT_SIGNING_SECRET,
+    module.secrets.environment.RISE_ENCRYPTION_KEY,
+    module.secrets.environment.OIDC_CLIENT_SECRET,
+    ], var.repository_credentials_secret_arn == null ? [] : [
+    var.repository_credentials_secret_arn,
+    ], var.control_plane_local_config_secret_arn == null ? [] : [
+    var.control_plane_local_config_secret_arn,
+  ], local.control_plane_additional_secret_arns)
+}
+
+output "database_endpoint" {
+  description = "Control-plane database endpoint, when the module created one."
+  value       = local.create_database ? module.database.endpoint : null
+}
+
+output "rise_config" {
+  description = "Aggregate view of what this module configured, mirroring modules/rise-aws's rise_config."
+  sensitive   = true
+  value = {
+    ecs = {
+      region                  = local.region
+      cluster                 = local.cluster_name
+      subnets                 = local.private_subnet_ids
+      security_groups         = [module.security.groups.apps]
+      assign_public_ip        = false
+      execution_role_arn      = var.execution_role_arn
+      task_role_arn           = local.workload_task_role_arn
+      log_group               = module.cluster.logging.name
+      resource_prefix         = var.resource_prefix
+      ssm_parameter_prefix    = var.ssm_parameter_prefix
+      ssm_kms_key_id          = var.ssm_kms_key_arn
+      cpu_architecture        = var.cpu_architecture
+      auth_backend_url        = local.auth_backend_url
+      traefik_api_url         = local.traefik_api_url
+      traefik_entrypoint      = local.traefik_entrypoint
+      traefik_certresolver    = local.acme_enabled ? "letsencrypt" : null
+      reconcile_interval_secs = var.reconcile_interval_secs
+    }
+    ingress = {
+      domain     = var.ingress_domain
+      scheme     = local.ingress_scheme
+      public_url = local.public_url
+    }
+    auth = {
+      issuer    = local.oidc_issuer
+      client_id = var.oidc_client_id
+    }
+  }
+}

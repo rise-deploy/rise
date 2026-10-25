@@ -5,7 +5,7 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use futures::StreamExt;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -15,11 +15,17 @@ use super::models::{self, *};
 use super::state_machine;
 use super::utils::{create_deployment_with_hooks, generate_deployment_id};
 use crate::db::models::DeploymentStatus as DbDeploymentStatus;
-use crate::db::{deployments as db_deployments, projects, service_accounts, users};
+use crate::db::{
+    deployments as db_deployments, environments as db_environments, projects, service_accounts,
+    users,
+};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::registry::ImageTagType;
 use crate::server::state::AppState;
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
+use rise_backend_core::events::EventSeverity;
 
 /// Validate group name format: must be 'default' or match [a-z0-9][a-z0-9/-]*[a-z0-9]
 /// with additional constraints:
@@ -55,37 +61,6 @@ fn is_valid_group_name(name: &str) -> bool {
     }
 
     true
-}
-
-/// Parse expiration duration string (e.g., "7d", "2h", "30m") to DateTime
-fn parse_expiration(expires_in: &str) -> Result<DateTime<Utc>, String> {
-    let s = expires_in.trim();
-    let (num_str, unit) = if let Some(num_str) = s.strip_suffix('d') {
-        (num_str, "d")
-    } else if let Some(num_str) = s.strip_suffix('h') {
-        (num_str, "h")
-    } else if let Some(num_str) = s.strip_suffix('m') {
-        (num_str, "m")
-    } else {
-        return Err("Duration must end with d, h, or m".to_string());
-    };
-
-    let num: i64 = num_str
-        .parse()
-        .map_err(|_| "Invalid number in duration".to_string())?;
-
-    if num <= 0 {
-        return Err("Duration must be positive".to_string());
-    }
-
-    let duration = match unit {
-        "d" => chrono::Duration::days(num),
-        "h" => chrono::Duration::hours(num),
-        "m" => chrono::Duration::minutes(num),
-        _ => return Err("Invalid duration unit".to_string()),
-    };
-
-    Ok(Utc::now() + duration)
 }
 
 /// Resolve image tag to digest by contacting OCI registry directly
@@ -173,6 +148,70 @@ async fn resolve_image_digest(
     Ok(digest_ref)
 }
 
+/// Largest reporter-supplied attribute payload accepted on a status update.
+///
+/// The column's own CHECK caps a stored event at 16 KiB, and the transition
+/// adds its own keys, so the incoming half is bounded well below that. This is
+/// deliberately not enough room for a build log: that is a separate, larger
+/// artifact and belongs behind its own endpoint.
+const MAX_REPORTED_ATTRIBUTES_BYTES: usize = 8 * 1024;
+
+/// Check reporter-supplied event attributes before they reach the database.
+///
+/// Only a JSON object is accepted: the value is merged into the event's
+/// attributes, and merging an array or scalar has no meaning. An explicit
+/// `null` or an empty object is treated as "nothing reported", which is the
+/// normal case for a CLI that predates the field.
+fn validate_reported_attributes(
+    attributes: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ServerError> {
+    let Some(value) = attributes else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let object = value.as_object().ok_or_else(|| {
+        ServerError::bad_request("Status attributes must be a JSON object".to_string())
+    })?;
+    if object.is_empty() {
+        return Ok(None);
+    }
+
+    // Postgres `jsonb` cannot store a NUL, and serde_json will happily carry one
+    // through. Rejecting it here turns a 500 that also rolls the transition back
+    // into a 400 that says what is wrong.
+    if contains_nul(&value) {
+        return Err(ServerError::bad_request(
+            "Status attributes must not contain NUL characters".to_string(),
+        ));
+    }
+
+    let size = serde_json::to_vec(&value)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_REPORTED_ATTRIBUTES_BYTES {
+        return Err(ServerError::bad_request(format!(
+            "Status attributes are {size} bytes, over the {MAX_REPORTED_ATTRIBUTES_BYTES} byte limit"
+        )));
+    }
+
+    Ok(Some(value))
+}
+
+/// Whether any string anywhere in the value contains a NUL character.
+fn contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(items) => items.iter().any(contains_nul),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .any(|(key, v)| key.contains('\0') || contains_nul(v)),
+        _ => false,
+    }
+}
+
 /// Convert API DeploymentStatus to DB DeploymentStatus
 fn convert_status_to_db(status: DeploymentStatus) -> DbDeploymentStatus {
     match status {
@@ -213,15 +252,12 @@ async fn insert_rise_env_vars(
         .internal_err("Failed to get deployment URLs")?;
 
     // Resolve environment name for RISE_ENVIRONMENT
-    let environment_name = if let Some(env_id) = deployment.environment_id {
-        crate::db::environments::find_by_id(&state.db_pool, env_id)
+    let environment_name =
+        crate::db::environments::find_by_id(&state.db_pool, deployment.environment_id)
             .await
             .ok()
             .flatten()
-            .map(|e| e.name)
-    } else {
-        None
-    };
+            .map(|e| e.name);
 
     let vars = models::rise_system_env_vars(
         &state.public_url,
@@ -538,12 +574,6 @@ fn validate_env_override(env_override: &models::EnvOverride) -> Result<bool, Ser
         )));
     }
 
-    if env_override.key == "PORT" {
-        return Err(ServerError::bad_request(
-            "PORT cannot be set via env overrides. Use http_port/--http-port instead.",
-        ));
-    }
-
     if models::is_reserved_env_var_key(&env_override.key) {
         return Err(ServerError::bad_request(format!(
             "Env override '{}' uses the reserved '{}' prefix, which is reserved for Rise-injected variables.",
@@ -612,6 +642,65 @@ async fn convert_deployment(
     custom_domain_urls: Vec<String>,
     all_urls: Vec<String>,
 ) -> Deployment {
+    let environment =
+        crate::db::environments::find_by_id(&state.db_pool, deployment.environment_id)
+            .await
+            .ok()
+            .flatten();
+    let provenance = match crate::db::deployment_events::provenance_batch(
+        &state.db_pool,
+        &[deployment.id],
+    )
+    .await
+    {
+        Ok(mut map) => map.remove(&deployment.id).unwrap_or_default(),
+        Err(e) => {
+            error!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to read deployment provenance: {:?}", e
+            );
+            Default::default()
+        }
+    };
+    convert_deployment_with(
+        state,
+        deployment,
+        project,
+        created_by_email,
+        DeploymentUrls {
+            primary_url,
+            custom_domain_urls,
+            all_urls,
+        },
+        environment.as_ref(),
+        provenance,
+    )
+    .await
+}
+
+/// URLs a deployment is reachable at, as returned to clients.
+struct DeploymentUrls {
+    primary_url: Option<String>,
+    custom_domain_urls: Vec<String>,
+    all_urls: Vec<String>,
+}
+
+/// [`convert_deployment`] with the environment and provenance already looked
+/// up, so a list can fetch them for every row at once.
+async fn convert_deployment_with(
+    state: &AppState,
+    deployment: crate::db::models::Deployment,
+    project: &crate::db::models::Project,
+    created_by_email: String,
+    urls: DeploymentUrls,
+    environment: Option<&crate::db::models::Environment>,
+    provenance: crate::db::deployment_events::Provenance,
+) -> Deployment {
+    let DeploymentUrls {
+        primary_url,
+        custom_domain_urls,
+        all_urls,
+    } = urls;
     // Multi-container side-data, folded onto the row. `None` is a legacy
     // single-container deployment — the frontend reads the flat replicas/cpu/
     // memory fields in that case. A present-but-unparseable column is corrupt:
@@ -652,16 +741,8 @@ async fn convert_deployment(
     };
     let can_rollback = state_machine::can_create_from(&deployment);
 
-    // Resolve environment name and color
-    let (environment, environment_color) = if let Some(env_id) = deployment.environment_id {
-        let env = crate::db::environments::find_by_id(&state.db_pool, env_id)
-            .await
-            .ok()
-            .flatten();
-        (env.as_ref().map(|e| e.name.clone()), env.map(|e| e.color))
-    } else {
-        (None, None)
-    };
+    let environment_color = environment.map(|e| e.color.clone());
+    let environment = environment.map(|e| e.name.clone());
 
     Deployment {
         id: deployment.id.to_string(),
@@ -693,6 +774,10 @@ async fn convert_deployment(
         job_url: deployment.job_url,
         pull_request_url: deployment.pull_request_url,
         git_repository_url: deployment.git_repository_url,
+        git_revision: provenance.git_revision,
+        git_branch: provenance.git_branch,
+        git_dirty: provenance.git_dirty,
+        source_deployment_id: provenance.source_deployment_id,
         created: deployment.created_at.to_rfc3339(),
         updated: deployment.updated_at.to_rfc3339(),
     }
@@ -705,15 +790,23 @@ async fn convert_deployment(
 ///   deployment group of a *different* environment.
 /// - If environment specified, no group: use environment's primary deployment group.
 /// - If group specified, no environment: look up environment whose primary group matches;
-///   then auto-resolve (0 envs → none, 1 env → use it, 2+ → error).
+///   then auto-resolve (1 env → use it, 2+ → error).
 /// - If neither specified: if the project has exactly one environment, use it.
-///   If zero, use the default group with no environment. If more than one, error.
+///   If more than one, error.
+///
+/// Every deployment belongs to an environment. A project always has one
+/// (`production` is created with it and cannot be deleted), so finding none
+/// is an internal error.
+fn no_environments() -> ServerError {
+    ServerError::internal("Project has no environments; every project needs at least one")
+}
+
 async fn resolve_deployment_target(
     pool: &sqlx::PgPool,
     project_id: uuid::Uuid,
     requested_environment: Option<&str>,
     requested_group: Option<&str>,
-) -> Result<(String, Option<crate::db::models::Environment>), ServerError> {
+) -> Result<(String, crate::db::models::Environment), ServerError> {
     use crate::db::environments;
 
     match (requested_environment, requested_group) {
@@ -737,7 +830,7 @@ async fn resolve_deployment_target(
                     )));
                 }
             }
-            Ok((group.to_string(), Some(env)))
+            Ok((group.to_string(), env))
         }
         // Environment only, no group
         (Some(env_name), None) => {
@@ -753,7 +846,7 @@ async fn resolve_deployment_target(
                     env_name
                 ))
             })?;
-            Ok((group, Some(env)))
+            Ok((group, env))
         }
         // Group only, no environment
         (None, Some(group)) => {
@@ -761,7 +854,7 @@ async fn resolve_deployment_target(
             let env = environments::find_by_primary_group(pool, project_id, group)
                 .await
                 .internal_err("Failed to look up environment by group")?;
-            if env.is_some() {
+            if let Some(env) = env {
                 Ok((group.to_string(), env))
             } else {
                 // No primary group match. Auto-resolve from available environments.
@@ -769,11 +862,8 @@ async fn resolve_deployment_target(
                     .await
                     .internal_err("Failed to list environments")?;
                 match all_envs.len() {
-                    0 => Ok((group.to_string(), None)),
-                    1 => Ok((
-                        group.to_string(),
-                        Some(all_envs.into_iter().next().unwrap()),
-                    )),
+                    0 => Err(no_environments()),
+                    1 => Ok((group.to_string(), all_envs.into_iter().next().unwrap())),
                     _ => Err(ServerError::bad_request(
                         "Multiple environments configured. Specify an environment to select one.",
                     )),
@@ -786,14 +876,14 @@ async fn resolve_deployment_target(
                 .await
                 .internal_err("Failed to list environments")?;
             match all_envs.len() {
-                0 => Ok((models::DEFAULT_DEPLOYMENT_GROUP.to_string(), None)),
+                0 => Err(no_environments()),
                 1 => {
                     let env = all_envs.into_iter().next().unwrap();
                     let group = env
                         .primary_deployment_group
                         .clone()
                         .unwrap_or_else(|| models::DEFAULT_DEPLOYMENT_GROUP.to_string());
-                    Ok((group, Some(env)))
+                    Ok((group, env))
                 }
                 _ => Err(ServerError::bad_request(
                     "Multiple environments configured. Specify an environment to select one.",
@@ -807,19 +897,33 @@ async fn resolve_deployment_target(
 ///
 /// Priority:
 /// 1. Explicit http_port from request (if provided)
-/// 2. PORT env var from project (if set and valid)
-/// 3. Default: 8080
+/// 2. PORT from deployment-level env overrides (if set and valid)
+/// 3. PORT env var from project (if set and valid)
+/// 4. Default: 8080
 async fn resolve_effective_http_port(
     state: &AppState,
     project_id: uuid::Uuid,
     explicit_port: Option<u16>,
+    port_from_env_override: Option<u16>,
 ) -> Result<u16, ServerError> {
-    // 1. Explicit port takes precedence
+    // 1. Explicit port takes precedence; warn if a PORT env override is also present
     if let Some(port) = explicit_port {
+        if port_from_env_override.is_some() {
+            warn!(
+                "Both --http-port ({}) and PORT env override are set; --http-port takes precedence and PORT override is ignored",
+                port
+            );
+        }
         return Ok(port);
     }
 
-    // 2. Check project's PORT env var
+    // 2. PORT from deployment env overrides
+    if let Some(port) = port_from_env_override {
+        debug!("Using PORT {} from deployment env override", port);
+        return Ok(port);
+    }
+
+    // 3. Check project's PORT env var
     let project_env_vars =
         crate::db::env_vars::list_project_env_vars(&state.db_pool, project_id, None)
             .await
@@ -839,7 +943,7 @@ async fn resolve_effective_http_port(
         );
     }
 
-    // 3. Default to 8080
+    // 4. Default to 8080
     debug!("No explicit port or PORT env var, defaulting to 8080");
     Ok(8080)
 }
@@ -957,7 +1061,7 @@ fn validate_container_resource_names(
 #[cfg(feature = "backend")]
 fn validate_resource_constraints(
     state: &AppState,
-    resolved_environment: &Option<crate::db::models::Environment>,
+    resolved_environment: Option<&crate::db::models::Environment>,
     // Total replicas across the deployment. For single-container this is the
     // container's `replicas`; for multi-container it MUST be the sum across
     // all containers — the limit applies to the deployment as a whole.
@@ -975,29 +1079,23 @@ fn validate_resource_constraints(
         .unwrap_or_default();
 
     let eff_min_replicas = resolved_environment
-        .as_ref()
         .and_then(|e| e.min_replicas)
         .map(|v| v as u32)
         .unwrap_or(platform_constraints.min_replicas);
     let eff_max_replicas = resolved_environment
-        .as_ref()
         .and_then(|e| e.max_replicas)
         .map(|v| v as u32)
         .unwrap_or(platform_constraints.max_replicas);
     let eff_min_cpu = resolved_environment
-        .as_ref()
         .and_then(|e| e.min_cpu.as_deref())
         .unwrap_or(&platform_constraints.min_cpu);
     let eff_max_cpu = resolved_environment
-        .as_ref()
         .and_then(|e| e.max_cpu.as_deref())
         .unwrap_or(&platform_constraints.max_cpu);
     let eff_min_memory = resolved_environment
-        .as_ref()
         .and_then(|e| e.min_memory.as_deref())
         .unwrap_or(&platform_constraints.min_memory);
     let eff_max_memory = resolved_environment
-        .as_ref()
         .and_then(|e| e.max_memory.as_deref())
         .unwrap_or(&platform_constraints.max_memory);
 
@@ -1050,6 +1148,7 @@ fn validate_resource_constraints(
 pub async fn create_deployment(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Json(payload): Json<CreateDeploymentRequest>,
 ) -> Result<Json<CreateDeploymentResponse>, ServerError> {
     info!("Creating deployment for project '{}'", payload.project);
@@ -1103,7 +1202,7 @@ pub async fn create_deployment(
     // (no `containers`) pass through unchanged.
     models::validate_containers_and_routes(payload.containers.as_deref(), &payload.routes)?;
 
-    // Per-container env overrides go through the same key/`PORT`/protected
+    // Per-container env overrides go through the same key/protected
     // validation as top-level overrides (`validate_containers_and_routes` only
     // enforces the is_secret restriction). An invalid key would otherwise reach
     // the pod spec and wedge the reconcile.
@@ -1115,14 +1214,25 @@ pub async fn create_deployment(
         }
     }
 
-    // Parse expiration duration if provided
-    let expires_at = if let Some(ref expires_in) = payload.expires_in {
-        Some(parse_expiration(expires_in).map_err(|e| {
-            ServerError::bad_request(format!(
-                "Invalid expiration duration '{}': {}",
-                expires_in, e
-            ))
-        })?)
+    // Parse expiration duration if provided. This is the caller's ask; whether
+    // it survives unmodified or gets capped by the target environment's
+    // `max_deployment_expiration` is decided once the target is resolved below.
+    let requested_expires_at = if let Some(ref expires_in) = payload.expires_in {
+        Some(
+            rise_backend_core::expiration::ExpirationDuration::parse(expires_in)
+                .and_then(|d| d.to_duration())
+                .and_then(|dur| {
+                    Utc::now()
+                        .checked_add_signed(dur)
+                        .ok_or_else(|| "Duration is too large".to_string())
+                })
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Invalid expiration duration '{}': {}",
+                        expires_in, e
+                    ))
+                })?,
+        )
     } else {
         None
     };
@@ -1156,15 +1266,34 @@ pub async fn create_deployment(
     )
     .await?;
 
+    // Apply the target environment's max_deployment_expiration, if any. Errs
+    // only when the stored cap fails to parse — the CHECK constraint on
+    // `environments.max_deployment_expiration` should make that impossible.
+    let (expires_at, expiration_cap) = rise_backend_core::expiration::effective_expiration(
+        requested_expires_at,
+        Utc::now(),
+        Some(&resolved_environment),
+        &resolved_group,
+    )
+    .map_err(|e| {
+        ServerError::internal_anyhow(
+            anyhow::anyhow!("{e}"),
+            "Failed to resolve deployment expiration",
+        )
+    })?;
+    if let Some(ref cap) = expiration_cap {
+        info!(
+            "Capped expires_at for deployment into group '{}': environment '{}' \
+             caps max_deployment_expiration at {}",
+            resolved_group, cap.environment, cap.max_deployment_expiration
+        );
+    }
+
     // Resolve auth for project scope (validates SA claims if external token)
     // Only mask auth failures (401/403) as 404 to prevent project existence leakage;
     // preserve 409 (SA collision) and 5xx (misconfiguration) for diagnosability.
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -1181,6 +1310,15 @@ pub async fn create_deployment(
             .map_err(|_| {
                 ServerError::not_found(format!("Project '{}' not found", payload.project))
             })?;
+    }
+
+    // A scoped session deploys only into the environments it covers.
+    if let Some(scope) = &scope {
+        scope.require(
+            Operation::new(Verb::Create, Kind::Deployment),
+            &project.name,
+            Some(resolved_environment.name.as_str()),
+        )?;
     }
 
     // Enforce service account environment restrictions.
@@ -1203,21 +1341,10 @@ pub async fn create_deployment(
         };
 
         if let Some(ref allowed_env_ids) = allowed_env_ids {
-            let target_env_id = resolved_environment.as_ref().map(|e| e.id);
-            match target_env_id {
-                Some(env_id) if !allowed_env_ids.contains(&env_id) => {
-                    return Err(ServerError::forbidden(
-                        "This service account is not allowed to deploy to the requested environment",
-                    ));
-                }
-                None => {
-                    // SA has environment restrictions but no environment was specified;
-                    // block the deployment since we can't verify the target is allowed.
-                    return Err(ServerError::forbidden(
-                        "This service account requires an explicit environment target",
-                    ));
-                }
-                _ => {} // target environment is in the allowed list
+            if !allowed_env_ids.contains(&resolved_environment.id) {
+                return Err(ServerError::forbidden(
+                    "This service account is not allowed to deploy to the requested environment",
+                ));
             }
         }
     }
@@ -1246,11 +1373,41 @@ pub async fn create_deployment(
 
     // Resolve effective http_port:
     // 1. Explicit http_port from request (if provided)
-    // 2. Source deployment's http_port (if --from is used, handled below)
-    // 3. PORT env var from project (if set and valid)
-    // 4. Default: 8080
-    let effective_http_port =
-        resolve_effective_http_port(&state, project.id, payload.http_port).await?;
+    // 2. PORT from deployment-level env overrides (if set and valid)
+    // 3. Source deployment's http_port (if --from is used, handled below)
+    // 4. PORT env var from project (if set and valid)
+    // 5. Default: 8080
+
+    // Extract PORT from top-level env overrides (filtered by resolved environment).
+    // If the value is present but invalid, warn so users know it was ignored.
+    let port_from_env_override: Option<u16> = {
+        let filtered = filter_env_overrides_by_environment(
+            &payload.env_overrides,
+            Some(resolved_environment.name.as_str()),
+        );
+        if let Some(port_override) = filtered.iter().rfind(|o| o.key == "PORT") {
+            match port_override.value.parse::<u16>() {
+                Ok(p) if p > 0 => Some(p),
+                _ => {
+                    warn!(
+                        "PORT env override '{}' is not a valid port number (1-65535), ignoring",
+                        port_override.value
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let effective_http_port = resolve_effective_http_port(
+        &state,
+        project.id,
+        payload.http_port,
+        port_from_env_override,
+    )
+    .await?;
     info!(
         "Using http_port {} for deployment {}",
         effective_http_port, deployment_id
@@ -1360,8 +1517,9 @@ pub async fn create_deployment(
 
         // Determine http_port for the new deployment:
         // - If explicit http_port was provided in request, use it (already in effective_http_port)
-        // - If no explicit port, inherit from source deployment
-        let final_http_port = if payload.http_port.is_some() {
+        // - If PORT env override was provided, use it (already in effective_http_port)
+        // - If no explicit port or env override, inherit from source deployment
+        let final_http_port = if payload.http_port.is_some() || port_from_env_override.is_some() {
             effective_http_port
         } else {
             source_deployment.http_port as u16
@@ -1422,7 +1580,7 @@ pub async fn create_deployment(
             );
             validate_resource_constraints(
                 &state,
-                &resolved_environment,
+                Some(&resolved_environment),
                 total_replicas,
                 &per_container,
                 payload.from_deployment.is_some(),
@@ -1464,7 +1622,7 @@ pub async fn create_deployment(
                 image_digest: source_deployment.image_digest.as_deref(), // Copy digest from source if present
                 rolled_back_from_deployment_id: Some(original_source_id), // Track original source for image tag calculation
                 deployment_group: &resolved_group, // Use requested group (may be different from source)
-                environment_id: resolved_environment.as_ref().map(|e| e.id),
+                environment_id: resolved_environment.id,
                 expires_at,                        // expires_at
                 http_port: final_http_port as i32, // Use determined http_port
                 is_active: false,                  // Deployments start as inactive
@@ -1477,6 +1635,7 @@ pub async fn create_deployment(
                 identity_audiences: effective_identity_audiences.clone(),
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
+                expiration_cap: expiration_cap.as_ref(),
             },
             &project,
         )
@@ -1504,10 +1663,19 @@ pub async fn create_deployment(
                 project.id,
                 new_deployment.id,
                 new_deployment.environment_id,
-                resolved_environment.as_ref().map(|e| e.name.as_str()),
+                &resolved_environment.name,
             )
             .await
             .internal_err("Failed to copy environment variables")?;
+            // rise.toml and CLI variables travel with the source's
+            // configuration, like its port, resources and routes do.
+            crate::db::env_vars::copy_config_env_vars_to_deployment(
+                &state.db_pool,
+                source_deployment.id,
+                new_deployment.id,
+            )
+            .await
+            .internal_err("Failed to copy rise.toml and CLI variables")?;
         }
 
         // Apply env overrides from the request
@@ -1515,7 +1683,7 @@ pub async fn create_deployment(
             &state,
             new_deployment.id,
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         )
         .await?;
 
@@ -1595,7 +1763,7 @@ pub async fn create_deployment(
         );
         validate_resource_constraints(
             &state,
-            &resolved_environment,
+            Some(&resolved_environment),
             total_replicas,
             &per_container,
             false,
@@ -1652,7 +1820,7 @@ pub async fn create_deployment(
                     image_digest: None, // No digest — controller will use internal registry tag
                     rolled_back_from_deployment_id: None,
                     deployment_group: &resolved_group,
-                    environment_id: resolved_environment.as_ref().map(|e| e.id),
+                    environment_id: resolved_environment.id,
                     expires_at,
                     http_port: effective_http_port as i32,
                     is_active: false,
@@ -1665,6 +1833,7 @@ pub async fn create_deployment(
                     identity_audiences: effective_identity_audiences.clone(),
                     containers: containers_json.as_ref(),
                     routes: routes_json.as_ref(),
+                    expiration_cap: expiration_cap.as_ref(),
                 },
                 &project,
             )
@@ -1681,7 +1850,7 @@ pub async fn create_deployment(
                 project.id,
                 deployment.id,
                 deployment.environment_id,
-                resolved_environment.as_ref().map(|e| e.name.as_str()),
+                &resolved_environment.name,
             )
             .await
             .internal_err("Failed to copy environment variables")?;
@@ -1691,7 +1860,7 @@ pub async fn create_deployment(
                 &state,
                 deployment.id,
                 &payload.env_overrides,
-                resolved_environment.as_ref().map(|e| e.name.as_str()),
+                Some(resolved_environment.name.as_str()),
             )
             .await?;
 
@@ -1750,7 +1919,7 @@ pub async fn create_deployment(
                 image_digest: Some(&image_digest),
                 rolled_back_from_deployment_id: None,
                 deployment_group: &resolved_group,
-                environment_id: resolved_environment.as_ref().map(|e| e.id),
+                environment_id: resolved_environment.id,
                 expires_at,
                 http_port: effective_http_port as i32,
                 is_active: false,
@@ -1763,6 +1932,7 @@ pub async fn create_deployment(
                 identity_audiences: effective_identity_audiences.clone(),
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
+                expiration_cap: expiration_cap.as_ref(),
             },
             &project,
         )
@@ -1779,7 +1949,7 @@ pub async fn create_deployment(
             project.id,
             deployment.id,
             deployment.environment_id,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            &resolved_environment.name,
         )
         .await
         .internal_err("Failed to copy environment variables")?;
@@ -1789,7 +1959,7 @@ pub async fn create_deployment(
             &state,
             deployment.id,
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         )
         .await?;
 
@@ -1880,7 +2050,7 @@ pub async fn create_deployment(
                 image_digest: None, // image_digest - NULL for build-from-source
                 rolled_back_from_deployment_id: None, // Not a rollback
                 deployment_group: &resolved_group, // deployment_group
-                environment_id: resolved_environment.as_ref().map(|e| e.id),
+                environment_id: resolved_environment.id,
                 expires_at,                            // expires_at
                 http_port: effective_http_port as i32, // http_port
                 is_active: false,                      // Deployments start as inactive
@@ -1893,6 +2063,7 @@ pub async fn create_deployment(
                 identity_audiences: effective_identity_audiences.clone(),
                 containers: containers_json.as_ref(),
                 routes: routes_json.as_ref(),
+                expiration_cap: expiration_cap.as_ref(),
             },
             &project,
         )
@@ -1909,7 +2080,7 @@ pub async fn create_deployment(
             project.id,
             deployment.id,
             deployment.environment_id,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            &resolved_environment.name,
         )
         .await
         .internal_err("Failed to copy environment variables")?;
@@ -1919,7 +2090,7 @@ pub async fn create_deployment(
             &state,
             deployment.id,
             &payload.env_overrides,
-            resolved_environment.as_ref().map(|e| e.name.as_str()),
+            Some(resolved_environment.name.as_str()),
         )
         .await?;
 
@@ -1975,6 +2146,12 @@ async fn perform_status_update(
             })?;
     }
 
+    // Reporter-supplied detail is untrusted: it comes from whatever CLI made
+    // the call and is rendered back in the UI. Reject it rather than storing
+    // something unreadable — a malformed payload should tell the reporter it is
+    // malformed, not silently vanish.
+    let reported = validate_reported_attributes(payload.attributes.clone())?;
+
     // Update status in database
     let status_copy = payload.status.clone();
     let updated_deployment = match payload.status {
@@ -1982,7 +2159,12 @@ async fn perform_status_update(
             let error_msg = payload.error_message.as_deref().unwrap_or("Unknown error");
             let deployment = db_deployments::mark_failed(&state.db_pool, deployment.id, error_msg)
                 .await
-                .internal_err("Failed to update deployment")?;
+                .internal_err("Failed to update deployment")?
+                .ok_or_else(|| {
+                    ServerError::conflict(
+                        "Deployment was modified concurrently; please retry".to_string(),
+                    )
+                })?;
 
             // Update project status to Failed
             projects::update_calculated_status(&state.db_pool, project.id)
@@ -1994,19 +2176,23 @@ async fn perform_status_update(
         _ => {
             // update_status will validate the state transition
             let db_status = convert_status_to_db(payload.status);
-            let deployment =
-                db_deployments::update_status(&state.db_pool, deployment.id, db_status)
-                    .await
-                    .map_err(|e| {
-                        // State transition validation errors are returned as anyhow errors
-                        // Return BAD_REQUEST for validation errors, INTERNAL_SERVER_ERROR otherwise
-                        let error_msg = e.to_string();
-                        if error_msg.contains("Invalid deployment state transition") {
-                            ServerError::bad_request(error_msg)
-                        } else {
-                            ServerError::internal_anyhow(e, "Failed to update deployment")
-                        }
-                    })?;
+            let deployment = db_deployments::update_status(
+                &state.db_pool,
+                deployment.id,
+                db_status,
+                reported.as_ref(),
+            )
+            .await
+            .map_err(|e| {
+                // State transition validation errors are returned as anyhow errors
+                // Return BAD_REQUEST for validation errors, INTERNAL_SERVER_ERROR otherwise
+                let error_msg = e.to_string();
+                if error_msg.contains("Invalid deployment state transition") {
+                    ServerError::bad_request(error_msg)
+                } else {
+                    ServerError::internal_anyhow(e, "Failed to update deployment")
+                }
+            })?;
 
             // Update project status (e.g., to Deploying)
             projects::update_calculated_status(&state.db_pool, project.id)
@@ -2095,11 +2281,7 @@ pub async fn update_deployment_status_by_project(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2192,11 +2374,7 @@ pub async fn update_deployment_status(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2223,20 +2401,49 @@ pub async fn update_deployment_status(
 pub struct ListDeploymentsQuery {
     #[serde(rename = "group")]
     pub deployment_group: Option<String>,
+    /// `true` lists only the deployments currently serving their group,
+    /// `false` only the rest.
+    pub active: Option<bool>,
+    /// Environment name.
+    pub environment: Option<String>,
+    /// Comma-separated status names (e.g. `Failed,Unhealthy`).
+    pub status: Option<String>,
+    /// Case-insensitive substring of the deployment ID, image, group or creator email.
+    pub q: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+/// Header carrying the number of deployments that match a list's filter
+/// across all pages.
+pub const TOTAL_COUNT_HEADER: &str = "x-total-count";
+
+/// Parse a comma-separated status filter, rejecting unknown names.
+fn parse_status_filter(raw: &str) -> Result<Vec<String>, ServerError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            serde_json::from_value::<DbDeploymentStatus>(serde_json::Value::String(
+                name.to_string(),
+            ))
+            .map(|status| status.to_string())
+            .map_err(|_| ServerError::bad_request(format!("Unknown deployment status '{name}'")))
+        })
+        .collect()
 }
 
 /// List deployments for a project
 pub async fn list_deployments(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_name): Path<String>,
     Query(query): Query<ListDeploymentsQuery>,
-) -> Result<Json<Vec<Deployment>>, ServerError> {
+) -> Result<(axum::http::HeaderMap, Json<Vec<Deployment>>), ServerError> {
     debug!(
-        "Listing deployments for project: {} (group: {:?})",
-        project_name, query.deployment_group
+        "Listing deployments for project: {} (group: {:?}, active: {:?})",
+        project_name, query.deployment_group, query.active
     );
 
     // Find the project by name
@@ -2247,11 +2454,7 @@ pub async fn list_deployments(
 
     // Resolve auth for project scope
     let (user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2268,64 +2471,139 @@ pub async fn list_deployments(
             .map_err(|_| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
     }
 
-    // Get deployments from database (optionally filtered by group, with pagination)
-    let db_deployments = db_deployments::list_for_project_and_group(
+    let list_deployments = Operation::new(Verb::List, Kind::Deployment);
+    if let Some(scope) = &scope {
+        scope.require_reach(list_deployments, &project.name)?;
+    }
+
+    let environments = db_environments::list_for_project(&state.db_pool, project.id)
+        .await
+        .internal_err("Failed to list environments")?;
+
+    let environment_id = match query.environment.as_deref().filter(|e| !e.is_empty()) {
+        Some(name) => Some(
+            environments
+                .iter()
+                .find(|environment| environment.name == name)
+                .map(|environment| environment.id)
+                .ok_or_else(|| ServerError::not_found(format!("Environment '{name}' not found")))?,
+        ),
+        None => None,
+    };
+    let statuses = match query.status.as_deref().filter(|s| !s.is_empty()) {
+        Some(raw) => Some(parse_status_filter(raw)?),
+        None => None,
+    };
+
+    // A scoped session sees the deployments of the environments it covers.
+    // Filtering in the query keeps pages full and the total accurate.
+    let allowed_environments = scope.as_ref().map(|scope| {
+        environments
+            .iter()
+            .filter(|environment| {
+                scope.allows(list_deployments, &project.name, Some(&environment.name))
+            })
+            .map(|environment| environment.id)
+            .collect::<Vec<_>>()
+    });
+
+    let filter = db_deployments::DeploymentListFilter {
+        group: query.deployment_group.as_deref(),
+        active: query.active,
+        environment_id,
+        statuses,
+        search: query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()),
+        allowed_environments,
+    };
+    let (db_deployments, total) = db_deployments::list_for_project_filtered(
         &state.db_pool,
         project.id,
-        query.deployment_group.as_deref(),
+        &filter,
         query.limit,
         query.offset,
     )
     .await
     .internal_err("Failed to list deployments")?;
 
-    // Convert to API models (fetch creator emails and calculate URLs)
+    // Look up what every row needs at once rather than per row.
+    let creator_ids: Vec<uuid::Uuid> = db_deployments.iter().map(|d| d.created_by_id).collect();
+    let creator_emails = users::get_emails_batch(&state.db_pool, &creator_ids)
+        .await
+        .internal_err("Failed to get creator emails")?;
+    let deployment_ids: Vec<uuid::Uuid> = db_deployments.iter().map(|d| d.id).collect();
+    let mut provenance =
+        crate::db::deployment_events::provenance_batch(&state.db_pool, &deployment_ids)
+            .await
+            .internal_err("Failed to get deployment provenance")?;
+    let environments_by_id: std::collections::HashMap<uuid::Uuid, &crate::db::models::Environment> =
+        environments
+            .iter()
+            .map(|environment| (environment.id, environment))
+            .collect();
+
     let mut deployments = Vec::with_capacity(db_deployments.len());
     for db_deployment in db_deployments {
-        let created_by_email = get_creator_email(&state.db_pool, db_deployment.created_by_id).await;
+        let created_by_email = creator_emails
+            .get(&db_deployment.created_by_id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Only calculate URLs for non-terminal deployments that could receive traffic
-        let (primary_url, custom_domain_urls, all_urls) =
-            if state_machine::is_terminal(&db_deployment.status) {
-                // Terminal deployments (Failed, Stopped, Cancelled, Superseded, Expired) cannot receive traffic
-                (None, vec![], vec![])
-            } else {
-                // Calculate deployment URLs dynamically for active deployments
-                match state
-                    .deployment_backend
-                    .get_deployment_urls(&db_deployment, &project)
-                    .await
-                {
-                    Ok(urls) => (
-                        Some(urls.primary_url),
-                        urls.custom_domain_urls,
-                        urls.all_urls,
-                    ),
-                    Err(e) => {
-                        error!(
-                            "Failed to calculate URLs for deployment {}: {}",
-                            db_deployment.deployment_id, e
-                        );
-                        (None, vec![], vec![])
+        let urls = if state_machine::is_terminal(&db_deployment.status) {
+            DeploymentUrls {
+                primary_url: None,
+                custom_domain_urls: vec![],
+                all_urls: vec![],
+            }
+        } else {
+            match state
+                .deployment_backend
+                .get_deployment_urls(&db_deployment, &project)
+                .await
+            {
+                Ok(urls) => DeploymentUrls {
+                    primary_url: Some(urls.primary_url),
+                    custom_domain_urls: urls.custom_domain_urls,
+                    all_urls: urls.all_urls,
+                },
+                Err(e) => {
+                    error!(
+                        "Failed to calculate URLs for deployment {}: {}",
+                        db_deployment.deployment_id, e
+                    );
+                    DeploymentUrls {
+                        primary_url: None,
+                        custom_domain_urls: vec![],
+                        all_urls: vec![],
                     }
                 }
-            };
+            }
+        };
 
+        let environment = environments_by_id
+            .get(&db_deployment.environment_id)
+            .copied();
+        let deployment_provenance = provenance.remove(&db_deployment.id).unwrap_or_default();
         deployments.push(
-            convert_deployment(
+            convert_deployment_with(
                 &state,
                 db_deployment,
                 &project,
                 created_by_email,
-                primary_url,
-                custom_domain_urls,
-                all_urls,
+                urls,
+                environment,
+                deployment_provenance,
             )
             .await,
         );
     }
 
-    Ok(Json(deployments))
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        TOTAL_COUNT_HEADER,
+        axum::http::HeaderValue::from(total.max(0) as u64),
+    );
+    Ok((headers, Json(deployments)))
 }
 
 /// Query parameters for stopping deployments
@@ -2369,11 +2647,7 @@ pub async fn stop_deployments_by_group(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2406,23 +2680,33 @@ pub async fn stop_deployments_by_group(
         let result = if state_machine::is_cancellable(&deployment.status) {
             db_deployments::mark_cancelling(&state.db_pool, deployment.id)
                 .await
-                .map(|_| "Cancelling")
+                .map(|opt| opt.map(|_| "Cancelling"))
         } else {
             db_deployments::mark_terminating(
                 &state.db_pool,
                 deployment.id,
                 crate::db::models::TerminationReason::UserStopped,
+                None,
             )
             .await
-            .map(|_| "Terminating")
+            .map(|opt| opt.map(|_| "Terminating"))
         };
         match result {
-            Ok(new_status) => {
+            Ok(Some(new_status)) => {
                 info!(
                     "Marked deployment {} as {}",
                     deployment.deployment_id, new_status
                 );
                 stopped_ids.push(deployment.deployment_id);
+            }
+            Ok(None) => {
+                // Guard rejected the write: some other request already moved
+                // this deployment on. Benign in a bulk group-stop — nothing
+                // left for this one to do.
+                info!(
+                    "Deployment {} was already transitioning concurrently; skipping",
+                    deployment.deployment_id
+                );
             }
             Err(e) => {
                 error!(
@@ -2484,11 +2768,7 @@ pub async fn stop_deployment(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2525,10 +2805,17 @@ pub async fn stop_deployment(
     // Use the appropriate state transition based on current status:
     // Pre-infrastructure states (Pending, Building, Pushing, Pushed, Deploying) → Cancelling
     // Infrastructure states (Healthy, Unhealthy) → Terminating
+    let concurrently_modified = || {
+        ServerError::conflict(format!(
+            "Deployment '{}' was modified concurrently; please retry",
+            deployment_id
+        ))
+    };
     let updated_deployment = if state_machine::is_cancellable(&deployment.status) {
         let d = db_deployments::mark_cancelling(&state.db_pool, deployment.id)
             .await
-            .internal_err("Failed to cancel deployment")?;
+            .internal_err("Failed to cancel deployment")?
+            .ok_or_else(concurrently_modified)?;
         info!("Marked deployment {} as Cancelling", deployment_id);
         d
     } else {
@@ -2536,9 +2823,11 @@ pub async fn stop_deployment(
             &state.db_pool,
             deployment.id,
             crate::db::models::TerminationReason::UserStopped,
+            None,
         )
         .await
-        .internal_err("Failed to stop deployment")?;
+        .internal_err("Failed to stop deployment")?
+        .ok_or_else(concurrently_modified)?;
         info!("Marked deployment {} as Terminating", deployment_id);
         d
     };
@@ -2616,11 +2905,7 @@ pub async fn get_deployment_by_project(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2710,11 +2995,7 @@ pub async fn list_deployment_groups(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2754,10 +3035,7 @@ pub struct LogStreamParams {
     pub since: Option<i64>,
     /// Start of an explicit time range in RFC3339 format
     pub start: Option<String>,
-    /// End of an explicit time range in RFC3339 format. Honored by the Loki
-    /// backend. The Kubernetes backend has no `pods/log` end-time filter and
-    /// silently ignores this — for past windows on the Kubernetes backend,
-    /// use the Loki backend instead.
+    /// Exclusive end of an explicit time range in RFC3339 format.
     pub end: Option<String>,
     /// Restrict to lines whose backend-emitted level matches one of these
     /// values. Repeated query param: `?level=info&level=warn`. Empty list
@@ -2767,12 +3045,15 @@ pub struct LogStreamParams {
     pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
-    /// For backward pagination: skip this many of the most-recent qualifying
-    /// lines before returning. Used by the Kubernetes backend (whose
-    /// `pods/log` API has no end-time filter) so the frontend can scroll
-    /// further back than the initial tail window. The Loki backend ignores
-    /// this and uses its own timestamp-based pagination.
-    pub skip_recent: Option<i64>,
+    /// Restrict to lines from these containers of the deployment. Repeated
+    /// query param: `?container=web&container=api`. Empty list (param absent)
+    /// means every container. Accepted values are the deployment's own
+    /// container names — `app` for a single-container deployment.
+    #[serde(default, rename = "container")]
+    pub container: Vec<String>,
+    /// Opaque continuation returned by `page_complete`, `backlog_complete`, or
+    /// `cursor`. The configured backend owns its contents and validation.
+    pub cursor: Option<String>,
 }
 
 /// Query parameters for log volume
@@ -2791,11 +3072,305 @@ pub struct LogVolumeParams {
     pub level: Vec<String>,
     /// Case-insensitive substring filter applied to each line.
     pub search: Option<String>,
+    /// Restrict counts to lines from these containers of the deployment.
+    /// Repeated query param: `?container=web&container=api`.
+    #[serde(default, rename = "container")]
+    pub container: Vec<String>,
 }
 
 /// Stream logs from a deployment via Server-Sent Events
 ///
 /// GET /projects/{project_name}/deployments/{deployment_id}/logs
+/// Query parameters for the deployment event log.
+#[derive(serde::Deserialize)]
+pub struct EventListParams {
+    /// Page size. Clamped to `MAX_EVENT_PAGE`.
+    pub limit: Option<i64>,
+    /// Opaque continuation from a previous page's `next_cursor`.
+    pub cursor: Option<String>,
+    /// Restrict to these kinds. Repeated query param: `?kind=a&kind=b`.
+    #[serde(default, rename = "kind")]
+    pub kind: Vec<String>,
+    /// Lowest severity to return. Defaults to `info`, so `debug` detail is
+    /// opt-in rather than filling the default view. `all` disables the filter.
+    pub min_severity: Option<String>,
+    /// Restrict to events about one thing inside the deployment — a container
+    /// replica as the runtime labels it. Omitted returns every event, including
+    /// the deployment-level ones.
+    pub subject: Option<String>,
+}
+
+/// The wire version of the container-status response.
+///
+/// Bumped when the shape changes incompatibly, so a client can tell what it is
+/// reading rather than guessing from which fields happen to be present.
+const CONTAINER_STATUS_VERSION: u32 = 1;
+
+/// One replica, as the backend last saw it.
+///
+/// Deliberately not the storage row. The row carries `instance`, which exists so
+/// the derivation can tell a recreated container from a quiet one — a detail of
+/// how history is computed, not something a caller should build on. Serializing
+/// the row directly is how a storage format becomes a public contract by
+/// accident.
+#[derive(serde::Serialize)]
+pub struct ContainerStatus {
+    /// The backend's stable handle for this replica: `web[0]` on Docker, a pod
+    /// name on Kubernetes, a task id on ECS. Stable across ticks, and the same
+    /// value the event log uses as an event's `subject`.
+    pub subject: String,
+    /// The declared container this is an instance of.
+    pub container: String,
+    /// Replica ordinal, present only where the backend has a stable one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replica: Option<u32>,
+    /// `pending` | `running` | `exited` | `unknown`.
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    /// The runtime's restart counter, where it keeps one. Absent on ECS, which
+    /// replaces tasks rather than restarting containers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ContainerStatusResponse {
+    pub version: u32,
+    pub containers: Vec<ContainerStatus>,
+}
+
+/// Read the current state of a deployment's replicas.
+///
+/// A snapshot, not a history: what each replica is doing now. The log at
+/// `/events` says how it got there, and the two share a vocabulary — a
+/// container's `subject` here is the same string an event carries.
+///
+/// Empty is a real answer. A deployment whose backend has not observed it yet,
+/// or one that has finished, has no replicas to report.
+pub async fn list_deployment_containers(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+) -> Result<Json<ContainerStatusResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    // Mirrors the log endpoint: a caller who cannot see the project is told it
+    // does not exist, so existence itself does not leak.
+    let (user, is_sa) = auth
+        .resolve_for_project(&state.db_pool, &project)
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let observations =
+        crate::db::container_observations::list_for_deployment(&state.db_pool, deployment.id)
+            .await
+            .internal_err("Failed to list container observations")?;
+
+    Ok(Json(ContainerStatusResponse {
+        version: CONTAINER_STATUS_VERSION,
+        containers: observations
+            .into_iter()
+            .map(|o| ContainerStatus {
+                subject: o.subject,
+                container: o.container,
+                replica: o.replica,
+                state: o.state.as_str().to_string(),
+                started_at: o.started_at.map(|t| t.to_rfc3339()),
+                finished_at: o.finished_at.map(|t| t.to_rfc3339()),
+                exit_code: o.exit_code,
+                restart_count: o.restart_count,
+                health: o.health,
+                reason: o.reason,
+                image: o.image,
+            })
+            .collect(),
+    }))
+}
+
+const DEFAULT_EVENT_PAGE: i64 = 100;
+const MAX_EVENT_PAGE: i64 = 500;
+
+#[derive(serde::Serialize)]
+pub struct EventListResponse {
+    pub events: Vec<crate::db::deployment_events::DeploymentEvent>,
+    /// Absent when the page reached the end of the log.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Read a deployment's event log.
+///
+/// GET /projects/{project_name}/deployments/{deployment_id}/events
+///
+/// Pages are cut on `(recorded_at, id)` rather than on `occurred_at`: an event
+/// derived from a late observation carries an older `occurred_at` than one
+/// already returned, and a cursor over that would step past it permanently.
+/// Clients sort a page by `occurred_at` to display it.
+pub async fn list_deployment_events(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path((project_name, deployment_id)): Path<(String, String)>,
+    axum_extra::extract::Query(params): axum_extra::extract::Query<EventListParams>,
+) -> Result<Json<EventListResponse>, ServerError> {
+    let project = projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to fetch project")?
+        .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
+
+    // Mirrors the log endpoint: a caller who cannot see the project is told it
+    // does not exist, so existence itself does not leak.
+    let (user, is_sa) = auth
+        .resolve_for_project(&state.db_pool, &project)
+        .await
+        .map_err(|e| {
+            if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
+                ServerError::not_found(format!("Project '{}' not found", project.name))
+            } else {
+                e
+            }
+        })?;
+    if !is_sa {
+        crate::server::project::handlers::ensure_project_access_or_admin(&state, &user, &project)
+            .await?;
+    }
+
+    let deployment = db_deployments::find_by_project_and_deployment_id(
+        &state.db_pool,
+        project.id,
+        &deployment_id,
+    )
+    .await
+    .internal_err("Failed to fetch deployment")?
+    .ok_or_else(|| {
+        ServerError::not_found(format!(
+            "Deployment '{}' not found for project '{}'",
+            deployment_id, project_name
+        ))
+    })?;
+
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_EVENT_PAGE)
+        .clamp(1, MAX_EVENT_PAGE);
+    // The accepted set, not a rank: `EventSeverity` owns the ordering and this
+    // asks it which severities qualify.
+    let severities = match params.min_severity.as_deref() {
+        None => Some(EventSeverity::Info.at_least()),
+        Some("all") => None,
+        Some(value) => Some(
+            EventSeverity::parse(value)
+                .ok_or_else(|| {
+                    ServerError::bad_request(format!(
+                        "Unknown severity '{}'. Expected debug, info, warning, error, or all.",
+                        value
+                    ))
+                })?
+                .at_least(),
+        ),
+    };
+
+    let after = params
+        .cursor
+        .as_deref()
+        .map(decode_event_cursor)
+        .transpose()?;
+
+    // Fetch one extra row to learn whether another page exists without a
+    // second query.
+    let mut events = crate::db::deployment_events::list_for_deployment(
+        &state.db_pool,
+        deployment.id,
+        limit + 1,
+        after,
+        &params.kind,
+        severities.as_deref(),
+        params.subject.as_deref(),
+    )
+    .await
+    .internal_err("Failed to list deployment events")?;
+
+    let next_cursor = if events.len() as i64 > limit {
+        events.truncate(limit as usize);
+        events
+            .last()
+            .map(|e| encode_event_cursor(e.recorded_at, e.id))
+    } else {
+        None
+    };
+
+    Ok(Json(EventListResponse {
+        events,
+        next_cursor,
+    }))
+}
+
+/// The cursor is a position, not a capability: `deployment_id` is always taken
+/// from the path, so a forged cursor cannot page across deployments.
+fn encode_event_cursor(recorded_at: chrono::DateTime<chrono::Utc>, id: i64) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(
+        "{}:{}",
+        recorded_at.timestamp_micros(),
+        id
+    ))
+}
+
+fn decode_event_cursor(
+    cursor: &str,
+) -> Result<crate::db::deployment_events::EventCursor, ServerError> {
+    use base64::Engine;
+    let invalid = || ServerError::bad_request("The event cursor is invalid.");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|_| invalid())?;
+    let text = String::from_utf8(raw).map_err(|_| invalid())?;
+    let (micros, id) = text.split_once(':').ok_or_else(invalid)?;
+    let micros: i64 = micros.parse().map_err(|_| invalid())?;
+    let id: i64 = id.parse().map_err(|_| invalid())?;
+    Ok(crate::db::deployment_events::EventCursor {
+        recorded_at: chrono::DateTime::from_timestamp_micros(micros).ok_or_else(invalid)?,
+        id,
+    })
+}
+
 pub async fn stream_deployment_logs(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -2810,11 +3385,7 @@ pub async fn stream_deployment_logs(
 
     // Resolve auth for project scope
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -2847,25 +3418,27 @@ pub async fn stream_deployment_logs(
 
     let start_time = parse_log_time(params.start.as_deref())?;
     let end_time = parse_log_time(params.end.as_deref())?;
+    validate_log_stream_query(&params, start_time.as_ref(), end_time.as_ref())?;
     let followable = crate::server::deployment::logs::is_followable_status(&deployment.status);
-    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
-        if start_time >= end_time {
-            return Err(ServerError::bad_request(
-                "Log range start must be before end",
-            ));
-        }
-    }
 
     // Get log stream from configured runtime log backend.
     // Follow defaults to 1 line so active deployments start at the most
     // recent log entry, while non-follow requests keep the broader backlog.
+    // The backend's advertised ceiling is enforced here rather than trusted:
+    // `tail` sizes a server-side merge buffer, so an unclamped one is a
+    // memory request from the caller.
     let tail = params
         .tail
-        .or(Some(if params.follow && followable { 1 } else { 1000 }));
+        .or(Some(if params.follow && followable { 1 } else { 1000 }))
+        .map(|tail| match state.runtime_log_backend.max_tail() {
+            Some(max_tail) => tail.clamp(1, max_tail.max(1)),
+            None => tail.max(1),
+        });
     let follow = params.follow && followable;
 
     validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
     let levels = params.level.clone();
+    let containers = validate_log_containers(&params.container, &deployment)?;
     let search = params
         .search
         .as_ref()
@@ -2898,7 +3471,8 @@ pub async fn stream_deployment_logs(
                 end_time,
                 levels,
                 search,
-                skip_recent: params.skip_recent.filter(|n| *n > 0),
+                containers,
+                cursor: params.cursor,
                 namespace_prefix: Some(namespace_prefix),
             },
         )
@@ -2907,6 +3481,9 @@ pub async fn stream_deployment_logs(
             let error_msg = format!("{:#}", e);
             if error_msg.contains("not ready yet") || error_msg.contains("waiting to start") {
                 ServerError::service_unavailable("Deployment logs are not ready yet.").expected()
+            } else if error_msg.contains("invalid log cursor") {
+                ServerError::bad_request("The log pagination cursor is invalid or expired.")
+                    .expected()
             } else if error_msg.contains("exceeds the limit") {
                 ServerError::bad_request(
                     "Selected time range is too large for the log backend. Pick a shorter range.",
@@ -2919,17 +3496,27 @@ pub async fn stream_deployment_logs(
 
     // Convert typed log events to SSE events.
     //
-    // The `log` event payload is a JSON object `{"line": ..., "level": ...}`
-    // so the frontend chart (counted by `detected_level`) and the live log
-    // list classify each line identically — the backend is now the single
-    // source of truth for per-line level. See the wire-format contract in
-    // PR #333 / src/server/deployment/logs.rs (ClassifiedLevel).
+    // Each `log` event carries a stable id alongside its rendered line and
+    // backend classification. Finite pages end with `page_complete`; combined
+    // backlog/follow streams expose the same continuation through
+    // `backlog_complete` or `cursor`.
     use futures::stream;
     let sse_stream = log_stream.flat_map(|result| match result {
-        Ok(crate::server::deployment::logs::LogEvent::Line { text, level }) => {
+        Ok(crate::server::deployment::logs::LogEvent::Line {
+            id,
+            text,
+            level,
+            container,
+        }) => {
+            let mut payload = serde_json::json!({ "id": id, "line": text, "level": level });
+            // Only backends that can attribute a line emit `container`; leave
+            // the key out entirely rather than sending an explicit null.
+            if let (Some(container), Some(object)) = (container, payload.as_object_mut()) {
+                object.insert("container".into(), serde_json::Value::String(container));
+            }
             stream::iter(vec![Event::default()
                 .event("log")
-                .json_data(serde_json::json!({ "line": text, "level": level }))
+                .json_data(payload)
                 .map_err(anyhow::Error::from)])
         }
         Ok(crate::server::deployment::logs::LogEvent::Status(status)) => {
@@ -2938,10 +3525,25 @@ pub async fn stream_deployment_logs(
                 .json_data(status)
                 .map_err(anyhow::Error::from)])
         }
-        Ok(crate::server::deployment::logs::LogEvent::BacklogLoaded { count }) => {
+        Ok(crate::server::deployment::logs::LogEvent::BacklogLoaded { count, next_cursor }) => {
             stream::iter(vec![Event::default()
                 .event("backlog_complete")
-                .json_data(serde_json::json!({ "count": count }))
+                .json_data(serde_json::json!({
+                    "count": count,
+                    "next_cursor": next_cursor,
+                }))
+                .map_err(anyhow::Error::from)])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::PageLoaded { next_cursor }) => {
+            stream::iter(vec![Event::default()
+                .event("page_complete")
+                .json_data(serde_json::json!({ "next_cursor": next_cursor }))
+                .map_err(anyhow::Error::from)])
+        }
+        Ok(crate::server::deployment::logs::LogEvent::CursorUpdated { next_cursor }) => {
+            stream::iter(vec![Event::default()
+                .event("cursor")
+                .json_data(serde_json::json!({ "next_cursor": next_cursor }))
                 .map_err(anyhow::Error::from)])
         }
         Err(e) => {
@@ -2969,11 +3571,7 @@ pub async fn query_deployment_log_volume(
         .ok_or_else(|| ServerError::not_found(format!("Project '{}' not found", project_name)))?;
 
     let (_user, is_sa) = auth
-        .resolve_for_project(
-            &state.db_pool,
-            &project,
-            state.controllers_by_issuer.as_ref(),
-        )
+        .resolve_for_project(&state.db_pool, &project)
         .await
         .map_err(|e| {
             if e.status == StatusCode::UNAUTHORIZED || e.status == StatusCode::FORBIDDEN {
@@ -3014,6 +3612,7 @@ pub async fn query_deployment_log_volume(
 
     validate_log_levels(&params.level, state.runtime_log_backend.levels())?;
     let levels = params.level.clone();
+    let containers = validate_log_containers(&params.container, &deployment)?;
     let search = params
         .search
         .as_ref()
@@ -3044,6 +3643,7 @@ pub async fn query_deployment_log_volume(
                 step_seconds,
                 levels,
                 search,
+                containers,
             },
         )
         .await
@@ -3080,6 +3680,86 @@ fn validate_log_levels(levels: &[String], allowed: &[&'static str]) -> Result<()
     Ok(())
 }
 
+/// Validate caller-supplied `?container=` values against the deployment's own
+/// container names, so a typo (or a name from a different deployment) surfaces
+/// as a 400 with the accepted values instead of silently matching nothing.
+/// A single-container deployment declares no side-data and accepts only the
+/// implicit `app`. An empty list means "no filter" and is accepted.
+fn validate_log_containers(
+    requested: &[String],
+    deployment: &crate::db::models::Deployment,
+) -> Result<Vec<String>, ServerError> {
+    check_log_containers(requested, &declared_container_names(deployment))
+}
+
+/// The deployment's container names. A single-container deployment carries no
+/// side-data and runs the one implicit container. Unreadable side-data is
+/// treated the same way — `to_response` already logs and renders that row
+/// best-effort rather than failing the request.
+fn declared_container_names(deployment: &crate::db::models::Deployment) -> Vec<String> {
+    let declared: Vec<String> = deployment
+        .containers
+        .as_ref()
+        .and_then(|value| {
+            models::decode_side_data::<crate::server::deployment::models::ContainerSpec>(value).ok()
+        })
+        .map(|specs| specs.into_iter().map(|spec| spec.name).collect())
+        .unwrap_or_default();
+    if declared.is_empty() {
+        vec![crate::rise_toml::DEFAULT_CONTAINER_NAME.to_string()]
+    } else {
+        declared
+    }
+}
+
+fn check_log_containers(
+    requested: &[String],
+    declared: &[String],
+) -> Result<Vec<String>, ServerError> {
+    let requested: Vec<String> = requested
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    for container in &requested {
+        if !declared.contains(container) {
+            return Err(ServerError::bad_request(format!(
+                "Unknown container '{}' for this deployment.",
+                container
+            ))
+            .with_suggestions(Some(declared.to_vec())));
+        }
+    }
+    Ok(requested)
+}
+
+fn validate_log_stream_query(
+    params: &LogStreamParams,
+    start_time: Option<&chrono::DateTime<chrono::Utc>>,
+    end_time: Option<&chrono::DateTime<chrono::Utc>>,
+) -> Result<(), ServerError> {
+    if params.cursor.is_some()
+        && (params.follow || params.since.is_some() || start_time.is_some() || end_time.is_some())
+    {
+        return Err(ServerError::bad_request(
+            "A log cursor cannot be combined with follow or time-range parameters",
+        ));
+    }
+    if params.follow && end_time.is_some() {
+        return Err(ServerError::bad_request(
+            "Following logs cannot be combined with an explicit end time",
+        ));
+    }
+    if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
+        if start_time >= end_time {
+            return Err(ServerError::bad_request(
+                "Log range start must be before end",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_log_time(
     value: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, ServerError> {
@@ -3101,13 +3781,60 @@ fn default_log_count_step_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_env_override_is_protected, resolve_resource_check_inputs,
+        check_log_containers, normalize_env_override_is_protected, resolve_resource_check_inputs,
         validate_container_resource_names, validate_env_override, validate_env_override_key,
-        validate_identity_audiences,
+        validate_identity_audiences, validate_log_stream_query, validate_reported_attributes,
+        LogStreamParams, MAX_REPORTED_ATTRIBUTES_BYTES,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn log_container_filter_accepts_only_declared_containers() {
+        let declared = vec!["web".to_string(), "worker".to_string()];
+        assert_eq!(
+            check_log_containers(&[], &declared).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            check_log_containers(&[" web ".to_string()], &declared).unwrap(),
+            vec!["web".to_string()]
+        );
+
+        // A name from another deployment (or a typo) is a 400 with the
+        // accepted values, not a filter that silently matches nothing.
+        let err = check_log_containers(&["api".to_string()], &declared).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.suggestions, Some(declared));
+    }
+
+    #[test]
+    fn log_follow_rejects_an_explicit_end_time() {
+        let params = LogStreamParams {
+            follow: true,
+            tail: None,
+            timestamps: false,
+            since: None,
+            start: None,
+            end: Some("2026-08-29T12:00:00Z".into()),
+            level: Vec::new(),
+            search: None,
+            container: Vec::new(),
+            cursor: None,
+        };
+        let end = chrono::DateTime::parse_from_rfc3339(params.end.as_deref().unwrap())
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let error = validate_log_stream_query(&params, None, Some(&end)).unwrap_err();
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message,
+            "Following logs cannot be combined with an explicit end time"
+        );
+    }
 
     fn make_spec(
         name: &str,
@@ -3247,22 +3974,18 @@ mod tests {
     }
 
     #[test]
-    fn env_override_validation_rejects_port_overrides() {
-        let err = validate_env_override(&EnvOverride {
+    fn env_override_validation_allows_port_overrides() {
+        // PORT is now accepted as an env override; it informs http_port resolution
+        let result = validate_env_override(&EnvOverride {
             key: "PORT".to_string(),
             value: "3000".to_string(),
             is_secret: false,
             is_protected: Some(false),
             source: None,
             for_environment: None,
-        })
-        .unwrap_err();
+        });
 
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.message,
-            "PORT cannot be set via env overrides. Use http_port/--http-port instead."
-        );
+        assert!(result.is_ok(), "PORT env override should be accepted");
     }
 
     #[test]
@@ -3436,16 +4159,24 @@ mod tests {
         .unwrap();
 
         // Create a single environment
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Neither environment nor group specified → should auto-select the single env
         let (group, env) = super::resolve_deployment_target(&pool, project.id, None, None)
             .await
             .unwrap();
         assert_eq!(group, "staging");
-        assert_eq!(env.unwrap().name, "staging");
+        assert_eq!(env.name, "staging");
     }
 
     #[sqlx::test]
@@ -3468,9 +4199,17 @@ mod tests {
         .unwrap();
 
         // Create two environments
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
         environments::create(
             &pool,
             project.id,
@@ -3478,6 +4217,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -3514,9 +4254,17 @@ mod tests {
         .unwrap();
 
         // Create two environments
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
         environments::create(
             &pool,
             project.id,
@@ -3524,6 +4272,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -3566,12 +4315,21 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
 
         // "default" is primary of "production", but env is "staging" → should reject
         let err =
@@ -3606,9 +4364,17 @@ mod tests {
         .unwrap();
 
         // Create two environments
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
         environments::create(
             &pool,
             project.id,
@@ -3616,6 +4382,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -3658,6 +4425,7 @@ mod tests {
             Some("default"),
             true,
             "green",
+            None,
         )
         .await
         .unwrap();
@@ -3672,7 +4440,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(group, "default");
-        assert_eq!(env.unwrap().name, "production");
+        assert_eq!(env.name, "production");
     }
 
     #[sqlx::test]
@@ -3694,9 +4462,17 @@ mod tests {
         .await
         .unwrap();
 
-        environments::create(&pool, project.id, "staging", Some("staging"), false, "blue")
-            .await
-            .unwrap();
+        environments::create(
+            &pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await
+        .unwrap();
 
         // Non-primary group with single env → auto-resolve to that env
         let (group, env) =
@@ -3704,6 +4480,45 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(group, "mr/123");
-        assert_eq!(env.unwrap().name, "staging");
+        assert_eq!(env.name, "staging");
+    }
+
+    /// Absence, an explicit null and an empty object all mean the same thing:
+    /// the reporter had nothing to add. Every CLI predating the field is in
+    /// this case, so it must stay indistinguishable from a deliberate no-op.
+    #[test]
+    fn nothing_reported_is_accepted_as_nothing() {
+        assert!(validate_reported_attributes(None).unwrap().is_none());
+        assert!(validate_reported_attributes(Some(serde_json::Value::Null))
+            .unwrap()
+            .is_none());
+        assert!(validate_reported_attributes(Some(serde_json::json!({})))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reported_attributes_must_be_an_object() {
+        // The value is merged into the event's attributes, so anything that is
+        // not a set of keys has no meaning to merge.
+        for bad in [
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("build ok"),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                validate_reported_attributes(Some(bad.clone())).is_err(),
+                "{bad} should be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_reported_attributes_are_rejected() {
+        let big = serde_json::json!({ "log": "x".repeat(MAX_REPORTED_ATTRIBUTES_BYTES) });
+        assert!(validate_reported_attributes(Some(big)).is_err());
+
+        let ok = serde_json::json!({ "images": [{ "container": "web", "build_ms": 1 }] });
+        assert!(validate_reported_attributes(Some(ok)).unwrap().is_some());
     }
 }

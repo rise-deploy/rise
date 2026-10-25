@@ -65,6 +65,13 @@ export default defineConfig({
                     { label: 'Troubleshooting', slug: 'docker/troubleshooting' },
                   ],
                 },
+                {
+                  label: 'Amazon ECS',
+                  items: [
+                    { label: 'Overview', slug: 'ecs' },
+                    { label: 'Terraform', slug: 'ecs/terraform' },
+                  ],
+                },
               ],
             },
             {
@@ -110,7 +117,7 @@ export default defineConfig({
         },
         {
           label: 'Architecture Decisions',
-          autogenerate: { directory: 'adr' },
+          items: [{ autogenerate: { directory: 'adr' } }],
         },
       ],
     }),

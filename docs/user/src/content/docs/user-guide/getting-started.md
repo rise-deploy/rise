@@ -20,13 +20,7 @@ This guide walks you through everything you need to deploy your first applicatio
 **With mise (preferred)** — downloads a pre-built binary from GitHub releases, no Rust toolchain required:
 
 ```bash
-mise use -g ubi:rise-deploy/rise
-```
-
-**With cargo** — builds from source (requires Rust):
-
-```bash
-cargo install rise-deploy
+mise use -g github:rise-deploy/rise
 ```
 
 Your platform team may also distribute the `rise` binary directly — check your internal tooling documentation.
@@ -116,7 +110,7 @@ See [Deployments](../deployments) for the full lifecycle and [Environments](../e
 Set runtime environment variables for your project:
 
 ```bash
-rise env set -p my-app DATABASE_URL postgres://db.example.com/mydb
+rise env set -p my-app DATABASE_URL postgres://db.example.com/mydb --plain
 rise env set -p my-app API_KEY s3cret --secret
 ```
 
@@ -179,13 +173,14 @@ rise run --project my-app --http-port 3000
 **Run your app directly** with Rise env vars exported to your shell (no image build needed):
 
 ```bash
+eval "$(rise env export -p my-app)"
+npm run dev
+# Or save the commands and source them later:
 rise env export -p my-app > .env.rise
-# then load with your preferred tool, e.g.:
-export $(cat .env.rise | xargs)
-# or: direnv, dotenv, etc.
+source .env.rise
 ```
 
-`rise env export` fetches the resolved set of non-secret environment variables Rise would inject into a deployment, letting you run your app natively without Docker. This is useful when your local dev workflow builds and runs the app directly (e.g. `cargo run`, `npm run dev`).
+`rise env export` fetches the resolved set of loadable environment variables Rise would inject into a deployment as shell-safe `export` commands, letting you run your app natively without Docker. Protected secrets are omitted. This is useful when your local dev workflow builds and runs the app directly (e.g. `cargo run`, `npm run dev`).
 
 Note that variables sourced from extensions (e.g., database credentials from the RDS extension) are not included — use a local database for development instead.
 

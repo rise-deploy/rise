@@ -11,14 +11,7 @@ use axum::{extract::State, Json};
 /// avoids the awkward middle ground of accepting any JWKS-valid token without
 /// the per-project claim validation that scoped endpoints perform.
 pub async fn platform_capabilities(State(state): State<AppState>) -> Json<PlatformCapabilities> {
-    // When no Kubernetes controller is configured (local dev / non-K8s
-    // runtimes) there is no resource builder, so we advertise an unconstrained
-    // platform.
-    let runtime_arch = state
-        .resource_builder
-        .as_ref()
-        .and_then(|rb| rb.node_selector.get("kubernetes.io/arch"))
-        .cloned();
+    let runtime_arch = state.runtime_arch.clone();
     let pod_security_enabled = state
         .resource_builder
         .as_ref()

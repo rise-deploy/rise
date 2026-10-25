@@ -2,17 +2,18 @@
 title: "Persistent Logs"
 ---
 
-Rise exposes deployment logs through its API, frontend, and CLI. Two
+Rise exposes deployment logs through its API, frontend, and CLI. Three
 backends are available, selected by the `deployment_logs.type` setting:
 
 | Backend | What it queries | Historical reach |
 |---|---|---|
 | `kubernetes` (default) | `pods/log` on the active Pod | Only while the Pod exists |
 | `loki` | Grafana Loki via HTTP | As long as Loki retains the lines |
+| `cloudwatch` | One ECS deployment's streams in the configured CloudWatch Logs group | As long as CloudWatch retains the events |
 
 Regardless of the backend, the Rise API is the only thing clients talk
 to — Rise enforces project authorization before reading from the backing
-log store. Loki (or the Kubernetes API) is never exposed to end users.
+log store. The backing log service is never exposed to end users.
 
 ## Kubernetes backend (default)
 
@@ -41,7 +42,26 @@ Limitations:
   count query that this backend can't serve; it reports "Log volume
   charts aren't supported by the configured log backend."
 
-For any of the above, switch to the Loki backend.
+For any of the above, switch to a persistent backend.
+
+## CloudWatch backend
+
+```yaml
+deployment_logs:
+  type: cloudwatch
+  retention_hint: 30d
+```
+
+This backend is paired with the ECS deployment controller and uses its AWS
+configuration and `log_group`. App task streams begin with
+`{resource_prefix}/{project_uuid}/{deployment_uuid}/`; the `awslogs` driver
+adds the container name and task ID. Rise merges those streams for tailing,
+search, level filtering, live follow, and log-volume buckets.
+
+The control-plane identity needs `logs:FilterLogEvents` and
+`logs:StartLiveTail` on that group. `retention_hint` only improves the empty
+state shown for an old deployment; CloudWatch's log-group retention policy is
+authoritative.
 
 ## Loki backend
 

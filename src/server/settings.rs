@@ -7,6 +7,11 @@ use std::env;
 pub struct Settings {
     pub server: ServerSettings,
     pub auth: AuthSettings,
+    /// Project names that are reserved for control-plane hostnames and cannot
+    /// be used when creating a project. Later config layers replace this list
+    /// as a whole. Default: ["rise", "dex", "registry", "www"].
+    #[serde(default = "default_reserved_project_names")]
+    pub reserved_project_names: Vec<String>,
     #[serde(default)]
     pub database: DatabaseSettings,
     #[serde(default)]
@@ -15,6 +20,10 @@ pub struct Settings {
     pub deployment_controller: Option<DeploymentControllerSettings>,
     #[serde(default)]
     pub deployment_logs: DeploymentLogsSettings,
+    /// Bounds the growth of deployment history. Omitting the section keeps the
+    /// event cap on and deletion of old deployments off.
+    #[serde(default)]
+    pub deployment_retention: DeploymentRetentionSettings,
     #[serde(default)]
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
@@ -41,10 +50,79 @@ pub struct Settings {
     /// Curated catalog of stateless container images surfaced as one-click
     /// "quickstart" deploys in the UI. The catalog is layered: `default.yaml`
     /// ships the built-in selection and any `quickstart.templates` list in a
-    /// later layer (run-mode or `local.yaml`) *replaces* it entirely. Operators
-    /// who want to add to the defaults must re-include them.
+    /// later layer (run-mode or the local configuration layer) *replaces* it
+    /// entirely. Operators who want to add to the defaults must re-include
+    /// them.
     #[serde(default)]
     pub quickstart: Option<QuickstartSettings>,
+}
+
+/// Bounds on how much deployment history Rise keeps.
+///
+/// The two halves have deliberately different defaults. Capping a single
+/// deployment's events discards only the middle of a flap it already summarises,
+/// so it is on. Deleting a deployment discards its event log *and* the
+/// environment-variable snapshot that makes it re-deployable, and no amount of
+/// care makes that reversible — so it is off until an operator asks for it.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct DeploymentRetentionSettings {
+    /// Most events kept for one deployment. Its first event — the creation
+    /// event, which anchors the timeline — is always kept regardless.
+    #[serde(default = "default_max_events_per_deployment")]
+    pub max_events_per_deployment: i64,
+
+    /// Delete finished deployments once they are older than
+    /// `max_deployment_age_days`. Off by default: this is irreversible, and an
+    /// upgrade must not start deleting history nobody asked it to.
+    #[serde(default)]
+    pub delete_aged_deployments: bool,
+
+    /// How old a finished deployment must be before deletion considers it.
+    /// Only consulted when `delete_aged_deployments` is on.
+    #[serde(default = "default_max_deployment_age_days")]
+    pub max_deployment_age_days: u32,
+
+    /// How many of each environment's most recent *finished* primary-group
+    /// deployments survive deletion regardless of age. These are what a
+    /// rollback reaches for, so an environment that has not deployed in a long
+    /// time keeps a usable history rather than being emptied by the age rule.
+    ///
+    /// Counts finished deployments only. The active deployment and anything
+    /// still running are never deleted, so spending these slots on them would
+    /// leave no rollback history at all.
+    #[serde(default = "default_keep_primary_deployments_per_environment")]
+    pub keep_primary_deployments_per_environment: i64,
+}
+
+impl Default for DeploymentRetentionSettings {
+    fn default() -> Self {
+        Self {
+            max_events_per_deployment: default_max_events_per_deployment(),
+            delete_aged_deployments: false,
+            max_deployment_age_days: default_max_deployment_age_days(),
+            keep_primary_deployments_per_environment:
+                default_keep_primary_deployments_per_environment(),
+        }
+    }
+}
+
+fn default_max_events_per_deployment() -> i64 {
+    1000
+}
+
+fn default_max_deployment_age_days() -> u32 {
+    90
+}
+
+fn default_keep_primary_deployments_per_environment() -> i64 {
+    10
+}
+
+fn default_reserved_project_names() -> Vec<String> {
+    ["rise", "dex", "registry", "www"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 /// Catalog of quickstart templates exposed via `GET /api/v1/quickstart-templates`.
@@ -155,6 +233,10 @@ fn default_loki_deployment_id_label() -> String {
     "rise_deployment_id".to_string()
 }
 
+fn default_loki_container_label() -> String {
+    "container".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct LokiLabels {
     /// Loki stream label that carries the Rise project name.
@@ -165,6 +247,12 @@ pub struct LokiLabels {
     /// identify a deployment's log stream.
     #[serde(default = "default_loki_deployment_id_label")]
     pub deployment_id: String,
+    /// Loki stream label that carries the deployment's container name, used
+    /// by the `?container=` filter and for per-line attribution. The bundled
+    /// Alloy config writes the Kubernetes container name here, which is the
+    /// Rise container name (`app` for a single-container deployment).
+    #[serde(default = "default_loki_container_label")]
+    pub container: String,
 }
 
 impl Default for LokiLabels {
@@ -172,6 +260,7 @@ impl Default for LokiLabels {
         Self {
             project: default_loki_project_label(),
             deployment_id: default_loki_deployment_id_label(),
+            container: default_loki_container_label(),
         }
     }
 }
@@ -180,9 +269,9 @@ impl Default for LokiLabels {
 pub struct KubernetesLogBackendSettings {
     /// Upper bound on the number of lines the backend will ever request from
     /// the kubelet in a single call. The frontend pages backward by widening
-    /// `tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,
-    /// paging stops yielding new lines — the same outcome as when the
-    /// kubelet's own ring buffer is exhausted. Default: 100000.
+    /// `tail_lines` through an opaque continuation; paging stops at this
+    /// ceiling or when the kubelet's own ring buffer is exhausted. Default:
+    /// 100000.
     #[serde(default = "default_kubernetes_max_tail_lines")]
     pub max_tail_lines: i64,
 }
@@ -207,6 +296,21 @@ pub enum DeploymentLogsSettings {
     /// client is shared from the Docker deployment controller, so this variant
     /// carries no connection fields of its own.
     Docker {},
+    /// Read deployment logs from the CloudWatch log group configured by the
+    /// active ECS deployment controller. AWS connection settings and the log
+    /// group stay single-sourced on that controller so the writer and reader
+    /// cannot point at different regions or groups.
+    Cloudwatch {
+        /// Display-only retention hint used to explain an empty historical
+        /// result. An empty env-interpolated value is treated as unset.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        retention_hint: Option<String>,
+    },
+    /// No runtime log backend.
+    ///
+    /// The API answers with `historical_backend_not_configured` and the UI
+    /// renders its empty state.
+    None {},
     Loki {
         url: String,
         #[serde(default)]
@@ -310,11 +414,9 @@ pub struct ServerSettings {
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
 
-    /// Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.
-    /// Requests that specify a higher TTL are silently capped to this value.
-    /// Default: 900 (15 minutes).
-    #[serde(default = "default_workload_token_max_ttl_seconds")]
-    pub workload_token_max_ttl_seconds: u64,
+    /// Rate limiting for the workload identity token-exchange endpoint.
+    #[serde(default)]
+    pub workload_token_rate_limit: WorkloadTokenRateLimitSettings,
 
     /// Lifetime in seconds of Rise access tokens minted by the auth
     /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
@@ -363,6 +465,55 @@ pub struct OAuthRateLimitSettings {
     /// Window in seconds for the global limit (default: 60)
     #[serde(default = "default_oauth_global_window_secs")]
     pub global_window_secs: u64,
+}
+
+/// Rate limiting for the workload identity token-exchange endpoint
+/// (`POST /api/v1/identity/token`), kept apart from the OAuth limiter so login
+/// traffic and token minting never share a budget.
+///
+/// A valid bootstrap credential is 256 random bits naming one deployment, a
+/// better caller identity than an address: workloads behind one NAT gateway, or
+/// reaching Rise over an internal address with no proxy headers, would all look
+/// like one client. So a request with a valid credential counts only against its
+/// deployment's budget, and the per-IP budget counts only rejected credentials —
+/// which is what slows guessing without throttling every task behind a NAT.
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+pub struct WorkloadTokenRateLimitSettings {
+    /// Maximum requests per deployment (valid credential) per window (default: 500)
+    #[serde(default = "default_workload_token_per_deployment_max")]
+    pub per_deployment_max: u32,
+    /// Window for the per-deployment limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub per_deployment_window_secs: u64,
+    /// Maximum rejected credentials per client IP per window (default: 50)
+    #[serde(default = "default_workload_token_rejected_per_ip_max")]
+    pub rejected_per_ip_max: u32,
+    /// Window for the rejected-credential limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub rejected_per_ip_window_secs: u64,
+}
+
+impl Default for WorkloadTokenRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            per_deployment_max: default_workload_token_per_deployment_max(),
+            per_deployment_window_secs: default_workload_token_window_secs(),
+            rejected_per_ip_max: default_workload_token_rejected_per_ip_max(),
+            rejected_per_ip_window_secs: default_workload_token_window_secs(),
+        }
+    }
+}
+
+fn default_workload_token_per_deployment_max() -> u32 {
+    500
+}
+
+fn default_workload_token_rejected_per_ip_max() -> u32 {
+    50
+}
+
+fn default_workload_token_window_secs() -> u64 {
+    60
 }
 
 impl Default for OAuthRateLimitSettings {
@@ -424,6 +575,62 @@ where
     }
 }
 
+/// Deserialize a list of strings from either a YAML sequence or a single
+/// comma-separated string, dropping blank entries.
+///
+/// A scalar environment variable cannot express a YAML list, but subnet and
+/// security-group lists are exactly the settings an operator wants to inject
+/// from the environment (they differ per account and are often produced by
+/// Terraform outputs). Accepting `"subnet-a,subnet-b"` alongside
+/// `["subnet-a", "subnet-b"]` makes `subnets: "${RISE_ECS_SUBNETS}"` work
+/// without a bespoke config file per install.
+fn deserialize_string_list_flexible<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ListOrString {
+        List(Vec<String>),
+        Str(String),
+    }
+
+    let raw = match ListOrString::deserialize(deserializer)? {
+        ListOrString::List(items) => items,
+        ListOrString::Str(s) => s.split(',').map(|part| part.to_string()).collect(),
+    };
+    Ok(raw
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Accept a `u64` from either a JSON number or a numeric string, for the same
+/// reason as [`deserialize_u32_flexible`]: an env-driven `${VAR:-N}` reaches
+/// serde as a string, and serde will not coerce it.
+fn deserialize_u64_flexible<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U64OrString {
+        Num(u64),
+        Str(String),
+    }
+
+    match U64OrString::deserialize(deserializer)? {
+        U64OrString::Num(n) => Ok(n),
+        U64OrString::Str(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| D::Error::custom(format!("invalid integer string {s:?}; expected a u64"))),
+    }
+}
+
 /// Deserialize a list of strings, dropping blank/whitespace-only entries.
 ///
 /// The settings loader interpolates `${VAR}` per string element, so an
@@ -456,10 +663,6 @@ fn default_jwt_claims() -> Vec<String> {
 
 fn default_jwt_expiry_seconds() -> u64 {
     86400 // 24 hours
-}
-
-fn default_workload_token_max_ttl_seconds() -> u64 {
-    900 // 15 minutes
 }
 
 fn default_auth_token_max_ttl_seconds() -> u64 {
@@ -510,6 +713,10 @@ fn default_idp_group_sync_enabled() -> bool {
     true
 }
 
+fn default_idp_group_claim() -> String {
+    "groups".to_string()
+}
+
 fn default_active_sync_interval_secs() -> u64 {
     300 // 5 minutes
 }
@@ -551,17 +758,24 @@ pub struct AuthSettings {
     /// `operator_users` separately if needed.
     #[serde(default)]
     pub admin_users: Vec<String>,
+    /// IdP groups whose members are admins, as an alternative to listing every
+    /// admin email in `admin_users`. A user matches when they belong to an
+    /// IdP-managed team of that name (matching is case-insensitive). Blank
+    /// entries are filtered out so an unset `${VAR}` default collapses to an
+    /// empty list.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
+    pub admin_idp_groups: Vec<String>,
     /// List of Operator user emails. Operators have full access to generic
     /// resource storage and built-in resource management. This is a separate
     /// role from `admin_users`. Matching is case-insensitive. Blank entries are
     /// filtered out so an unset `${VAR}` default collapses to an empty list.
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub operator_users: Vec<String>,
-    /// Trusted external controller identities. Each entry binds a stable
-    /// controller ID to an OIDC issuer plus required claim constraints.
-    /// Used by generic-resource controller endpoints.
-    #[serde(default)]
-    pub controllers: Vec<crate::server::auth::controller::ControllerIdentity>,
+    /// IdP groups whose members hold the Operator role, as an alternative to
+    /// listing every Operator email in `operator_users`. Matches the same way
+    /// as `admin_idp_groups`.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
+    pub operator_idp_groups: Vec<String>,
     /// Platform access control configuration
     #[serde(default)]
     pub platform_access: PlatformAccessConfig,
@@ -601,10 +815,20 @@ pub struct AuthSettings {
     /// or default to {issuer}/token
     #[serde(default)]
     pub token_url: Option<String>,
-    /// Enable IdP group synchronization (default: true)
-    /// When enabled, user team memberships are automatically synced from IdP groups claim on login
+    /// Enable IdP group synchronization (default: true).
+    /// When enabled, user team memberships are synchronized from the configured
+    /// IdP group claim on login.
     #[serde(default = "default_idp_group_sync_enabled")]
     pub idp_group_sync_enabled: bool,
+    /// Claim in the IdP ID token that contains group names (default: "groups").
+    /// For example, AWS Cognito commonly exposes groups as "cognito:groups".
+    #[serde(default = "default_idp_group_claim")]
+    pub idp_group_claim: String,
+    /// Optional prefixes limiting which canonical IdP group names are mirrored
+    /// into Rise teams during login. An empty list accepts every canonical
+    /// group name.
+    #[serde(default, deserialize_with = "deserialize_string_list_flexible")]
+    pub idp_group_sync_prefixes: Vec<String>,
     /// Optional active sync source for pulling users and groups from an external IdP.
     /// When configured, Rise will periodically query the IdP for users and groups
     /// assigned to the app and sync them as Rise teams.
@@ -745,6 +969,94 @@ fn default_reconcile_interval_secs() -> u64 {
     5
 }
 
+// ── Amazon ECS deployment controller defaults ──────────────────────────────
+
+/// ECS is a polled, throttled control plane — service reads sustain 20 req/s and
+/// `RegisterTaskDefinition` only 1 req/s — so the loop ticks far less often than
+/// the Docker backend's 5s against a local daemon.
+#[cfg(feature = "backend")]
+/// ECS caps an `awsvpcConfiguration` at 16 subnets and 5 security groups.
+/// Checked at config load so the operator learns at startup rather than from a
+/// failed `CreateService` on the first deploy.
+#[cfg(feature = "backend")]
+const MAX_SUBNETS_PER_AWSVPC: usize = 16;
+#[cfg(feature = "backend")]
+const MAX_SECURITY_GROUPS_PER_AWSVPC: usize = 5;
+
+fn default_ecs_reconcile_interval_secs() -> u64 {
+    30
+}
+
+/// Prefix for generated ECS resource names (cluster-scoped, so it also namespaces
+/// two Rise installs sharing one cluster).
+#[cfg(feature = "backend")]
+fn default_ecs_resource_prefix() -> String {
+    "rise".to_string()
+}
+
+/// Root of the SSM Parameter Store hierarchy holding secret env vars.
+#[cfg(feature = "backend")]
+fn default_ssm_parameter_prefix() -> String {
+    "rise".to_string()
+}
+
+/// Fargate CPU architecture. `ARM64` is cheaper where images support it.
+#[cfg(feature = "backend")]
+fn default_cpu_architecture() -> String {
+    "X86_64".to_string()
+}
+
+/// Fargate: an install that never sets the key keeps behaving exactly as it did
+/// before the key existed.
+#[cfg(feature = "backend")]
+fn default_ecs_capacity() -> String {
+    "FARGATE".to_string()
+}
+
+/// Canonicalise the configured ECS capacity at load.
+///
+/// Rejecting here rather than defaulting: an unrecognised capacity has no safe
+/// fallback. Quietly using Fargate would bill an operator who asked for their own
+/// container instances for serverless capacity they did not want, and passing the
+/// string through would surface as an AWS error on every deploy instead of once
+/// at startup.
+#[cfg(feature = "backend")]
+fn deserialize_ecs_capacity<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    rise_backend_ecs::capacity::canonical(&raw)
+        .map(str::to_string)
+        .map_err(|e| serde::de::Error::custom(format!("deployment_controller.{e}")))
+}
+
+/// Canonicalise the configured Fargate CPU architecture at load, so everything
+/// downstream — the task definition, the CLI's platform hint — sees exactly one
+/// of the two tokens ECS accepts.
+///
+/// Rejecting here is the whole point: an architecture we can neither recognise
+/// nor normalise has no safe default. Guessing `X86_64` would hand ARM64
+/// operators images their tasks cannot execute, and passing the string through
+/// would surface as an AWS error on every deploy instead of once at startup.
+#[cfg(feature = "backend")]
+fn deserialize_fargate_cpu_architecture<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    rise_backend_ecs::task_definition::canonical_cpu_architecture(&raw)
+        .map(str::to_string)
+        .map_err(|e| serde::de::Error::custom(format!("deployment_controller.{e}")))
+}
+
+/// Mirrors [`default_docker_access_classes`]: a permissive `public` class so an
+/// install works before an operator defines their own.
+#[cfg(feature = "backend")]
+fn default_ecs_access_classes() -> std::collections::HashMap<String, Option<AccessClass>> {
+    default_docker_access_classes()
+}
+
 fn default_crd_upsert_interval_ms() -> u64 {
     1000
 }
@@ -775,10 +1087,10 @@ pub struct AccessClass {
     pub custom_annotations: std::collections::HashMap<String, String>,
 }
 
-/// Validate that a Docker deployment controller can actually enforce the
-/// authentication required by its configured access classes.
+/// Validate that a Traefik-fronted deployment controller (Docker or ECS) can
+/// actually enforce the authentication required by its configured access classes.
 ///
-/// The Docker backend wires ingress authentication via a Traefik forwardAuth
+/// Both backends wire ingress authentication via a Traefik forwardAuth
 /// middleware whose address is derived from `auth_backend_url`. If that URL is
 /// empty/blank, no middleware is stamped and any access class requiring
 /// `Authenticated`/`Member` would be served PUBLICLY — failing open. To fail
@@ -788,7 +1100,7 @@ pub struct AccessClass {
 /// `null`-valued access classes (used to remove inherited entries) are ignored.
 /// Returns the names of offending access classes (sorted) when the config is
 /// invalid, or an empty `Vec` when it is acceptable.
-pub fn docker_access_classes_missing_auth_backend_url(
+pub fn access_classes_missing_auth_backend_url(
     access_classes: &std::collections::HashMap<String, Option<AccessClass>>,
     auth_backend_url: &str,
 ) -> Vec<String> {
@@ -1184,9 +1496,10 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens auto-minted by the controller
-        /// and mounted into deployment pods. The controller re-mints tokens when they
-        /// are older than half this value. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those auto-minted by
+        /// the controller and mounted into deployment pods (re-minted once older
+        /// than half this value), and the cap on tokens from the token-exchange
+        /// endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1218,9 +1531,10 @@ pub enum DeploymentControllerSettings {
 
     /// Docker deployment controller.
     ///
-    /// Deploys app containers to a single Docker host and lets Traefik's Docker
-    /// provider route to them via container labels Rise stamps. No Kubernetes,
-    /// no Metacontroller — reconciliation runs in-process (see
+    /// Deploys app containers to a single Docker host. Traefik's Docker provider
+    /// discovers deployment services from labels, while its HTTP provider reads
+    /// the active public routes from Rise. No Kubernetes, no Metacontroller —
+    /// reconciliation runs in-process (see
     /// `controller::docker::DockerReconciler`).
     #[cfg(feature = "backend")]
     Docker {
@@ -1250,7 +1564,7 @@ pub enum DeploymentControllerSettings {
         /// identifier (e.g. "public", "private"). Mirrors the Kubernetes variant
         /// so the typed project API can validate a project's access class. For
         /// access classes whose `access_requirement` is `Authenticated`/`Member`,
-        /// the Docker controller stamps Traefik forwardAuth middleware labels
+        /// the HTTP-provider configuration includes a Traefik forwardAuth middleware
         /// (requires `auth_backend_url` to be set). A permissive "public" class
         /// is provided by default; operators may override.
         /// Use `null` in YAML to remove an inherited access class.
@@ -1372,8 +1686,9 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens minted for
-        /// deployments. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those minted into
+        /// the `[identity]` token files, and the cap on tokens from the
+        /// token-exchange endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1399,8 +1714,8 @@ pub enum DeploymentControllerSettings {
         /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
         /// or `http://localhost:8090` for a host-run dev backend). Read to learn
         /// per-server health status (the top-level `serverStatus` map) from
-        /// Traefik so the old deployment is retired only once the new servers are
-        /// actually in Traefik's rotation. Optional basic-auth may be embedded in
+        /// Traefik so a deployment is finalized only once its native service is
+        /// ready and the HTTP-provider routers select it. Optional basic-auth may be embedded in
         /// the URL (userinfo). **Required for projects that set a `health_check`**:
         /// Traefik's `serverStatus` is the authoritative readiness signal (no
         /// fallback), so without a reachable API a health-checked deployment never
@@ -1408,6 +1723,237 @@ pub enum DeploymentControllerSettings {
         /// checks (ready-when-running gates on run-state alone).
         #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
         traefik_api_url: Option<String>,
+    },
+
+    /// Amazon ECS deployment controller (Fargate launch type).
+    ///
+    /// Deploys each container spec as its own ECS service. Traefik's ECS provider
+    /// discovers deployment services from container-definition labels, while its
+    /// HTTP provider reads active public routes from Rise. No Kubernetes, no
+    /// Metacontroller — reconciliation runs
+    /// in-process (see `rise_backend_ecs::reconciler::EcsReconciler`).
+    ///
+    /// See ADR-0005 for the design and its deliberate v1 limitations.
+    #[cfg(feature = "backend")]
+    Ecs {
+        /// AWS region hosting the cluster.
+        region: String,
+
+        /// Override the AWS service endpoint (VPC/PrivateLink or FIPS endpoints).
+        /// The AWS SDK also honours `AWS_ENDPOINT_URL`; this is the explicit form.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        endpoint_url: Option<String>,
+
+        /// Static credentials, for a control plane running outside AWS. Leave
+        /// unset in production so the standard chain (task role / instance
+        /// profile) applies.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        access_key_id: Option<String>,
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        secret_access_key: Option<String>,
+
+        /// ECS cluster name that carries the deployed workloads.
+        cluster: String,
+
+        /// Subnets for the tasks' `awsvpc` ENIs. At least one is required; ECS
+        /// caps an `awsvpcConfiguration` at 16. Accepts a YAML sequence or a
+        /// comma-separated string so it can come straight from an env var.
+        #[serde(deserialize_with = "deserialize_string_list_flexible")]
+        #[schemars(with = "Vec<String>")]
+        subnets: Vec<String>,
+
+        /// Security groups applied to the tasks' ENIs. ECS caps this at 5.
+        /// Accepts a YAML sequence or a comma-separated string.
+        #[serde(default, deserialize_with = "deserialize_string_list_flexible")]
+        #[schemars(with = "Vec<String>")]
+        security_groups: Vec<String>,
+
+        /// Assign a public IP to each task. Required when the subnets are public
+        /// (no NAT gateway), since Fargate must reach ECR and CloudWatch to start.
+        // Accepts a YAML boolean or a string, so it can be env-driven — the
+        // loader interpolates `${VAR}` into a string before deserialization.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
+        assign_public_ip: bool,
+
+        /// IAM role ECS itself assumes to pull images and resolve SSM secrets.
+        /// Required whenever a project uses secret env vars or a private registry.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        execution_role_arn: Option<String>,
+
+        /// IAM role the application containers run as (their AWS identity).
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        task_role_arn: Option<String>,
+
+        /// ARN of a Secrets Manager secret holding `{"username": …, "password": …}`
+        /// for a private registry that is not ECR.
+        ///
+        /// ECS re-authenticates on every task start and cannot take inline
+        /// credentials, so a static-credential registry needs the credentials
+        /// parked somewhere ECS can read them itself. The ARN is stamped onto
+        /// each container definition as `repositoryCredentials`; the execution
+        /// role needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`
+        /// when the secret uses a customer-managed key).
+        ///
+        /// Leave unset for ECR (the execution role authenticates the pull) and
+        /// for anonymous registries.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        repository_credentials_secret_arn: Option<String>,
+
+        /// CloudWatch log group for app containers (`awslogs` driver). When
+        /// unset, containers get no log driver and runtime logs are unavailable.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        log_group: Option<String>,
+
+        /// Prefix for generated ECS resource names. Defaults to `rise`.
+        #[serde(default = "default_ecs_resource_prefix")]
+        resource_prefix: String,
+
+        /// Root of the SSM hierarchy holding secret env vars. Defaults to `rise`.
+        #[serde(default = "default_ssm_parameter_prefix")]
+        ssm_parameter_prefix: String,
+
+        /// KMS key for the `SecureString` parameters. Unset uses the AWS-managed
+        /// `alias/aws/ssm` key.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        ssm_kms_key_id: Option<String>,
+
+        /// Fargate CPU architecture: `X86_64` or `ARM64`. Defaults to `X86_64`.
+        #[serde(
+            default = "default_cpu_architecture",
+            deserialize_with = "deserialize_fargate_cpu_architecture"
+        )]
+        cpu_architecture: String,
+
+        /// Which ECS capacity carries the workload services: `fargate` (AWS
+        /// schedules the tasks) or `ec2` (they are placed on the cluster's own
+        /// container instances).
+        ///
+        /// Networking is `awsvpc` either way — readiness keys Traefik's
+        /// `serverStatus` on each task's own ENI address — so `subnets` stays
+        /// required. On `ec2`, enable ENI trunking on the container instances or
+        /// the per-instance attachment limit becomes the real ceiling on how many
+        /// tasks a host can run.
+        #[serde(
+            default = "default_ecs_capacity",
+            deserialize_with = "deserialize_ecs_capacity"
+        )]
+        capacity: String,
+
+        /// Ingress URL template for the production (default) deployment group.
+        /// Same semantics as the other backends. Must contain `{project_name}`.
+        production_ingress_url_template: String,
+
+        /// Ingress URL template for staging (non-default) deployment groups.
+        /// Must contain both `{project_name}` and `{deployment_group}`.
+        #[serde(default)]
+        staging_ingress_url_template: Option<String>,
+
+        /// Ingress URL template for named environments.
+        /// Must contain both `{project_name}` and `{environment}`.
+        #[serde(default)]
+        environment_ingress_url_template: Option<String>,
+
+        /// Optional port appended to all generated ingress URLs.
+        #[serde(default)]
+        ingress_port: Option<u16>,
+
+        /// URL scheme for generated ingress URLs. Defaults to `https`.
+        #[serde(default = "default_ingress_schema")]
+        ingress_schema: String,
+
+        /// Access classes defining ingress authentication levels. For classes
+        /// whose `access_requirement` is `Authenticated`/`Member` the HTTP-provider
+        /// configuration includes Traefik forwardAuth, which requires `auth_backend_url`;
+        /// the backend refuses to start otherwise rather than serve those
+        /// projects publicly with no auth enforced.
+        #[serde(default = "default_ecs_access_classes")]
+        access_classes: std::collections::HashMap<String, Option<AccessClass>>,
+
+        /// Internal URL Traefik uses to reach the Rise backend for the forwardAuth
+        /// subrequest. Must be resolvable **from inside the cluster** — a Cloud Map
+        /// name or an internal load balancer, not the public URL.
+        #[serde(default)]
+        auth_backend_url: String,
+
+        /// Browser-facing base URL for the login redirect. Falls back to the
+        /// server `public_url` when empty.
+        #[serde(default)]
+        auth_signin_url: String,
+
+        /// Traefik entrypoint name routers bind to. Defaults to `web`.
+        #[serde(default = "default_traefik_entrypoint")]
+        traefik_entrypoint: String,
+
+        /// Optional Traefik certresolver name for automatic TLS.
+        #[serde(default)]
+        traefik_certresolver: Option<String>,
+
+        /// Base URL of Traefik's API. Read for per-server `serverStatus`, the
+        /// authoritative readiness signal (no fallback), so this is **required
+        /// for projects that set a `health_check`** — without it such a
+        /// deployment never becomes Healthy.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        traefik_api_url: Option<String>,
+
+        /// Label namespace prefix for Rise bookkeeping tags. Defaults to `rise.dev`.
+        #[serde(default = "default_label_namespace")]
+        label_namespace: String,
+
+        /// Stable identifier for this deployment controller. The reconciler only
+        /// reconciles projects matching this class. Defaults to `default`.
+        #[serde(default = "default_controller_class_name")]
+        controller_class_name: String,
+
+        /// Interval in seconds between reconcile ticks. Defaults to 30 — ECS is
+        /// a throttled API, unlike a local Docker daemon.
+        #[serde(
+            default = "default_ecs_reconcile_interval_secs",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
+        reconcile_interval_secs: u64,
+
+        /// Default resource values for new deployments when not specified.
+        #[serde(default)]
+        deployment_defaults: DeploymentDefaults,
+
+        /// Platform-level constraints for deployment resources.
+        #[serde(default)]
+        deployment_constraints: DeploymentConstraints,
+
+        /// Health probe configuration.
+        #[serde(default)]
+        health_probes: Option<HealthProbeConfig>,
+
+        /// Lifetime in seconds of workload identity tokens: the `[identity]`
+        /// token files, which the identity sidecar in each task refreshes at half
+        /// this, and the cap on tokens from the token-exchange endpoint.
+        #[serde(
+            default = "default_identity_token_ttl_seconds",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
+        identity_token_ttl_seconds: u64,
+
+        /// The `rise-cli` image the workload-identity sidecar in every task
+        /// runs (`rise identity agent`), normally the same release as this
+        /// server. Required, like the server's own image: nothing infers it.
+        /// The workload execution role must be able to pull it. Changing it
+        /// affects new deployments only: running services keep the sidecar they
+        /// started with.
+        #[serde(default)]
+        identity_agent_image: String,
+
+        /// Base URL at which the identity sidecar reaches the Rise API to fetch
+        /// `[identity]` tokens. Defaults to the server `public_url` — the URL
+        /// the workload itself uses for `rise identity token`. Set it to an
+        /// internal address when tasks have no route to the public one.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        identity_exchange_url: Option<String>,
     },
 }
 
@@ -1427,7 +1973,14 @@ pub enum RegistrySettings {
         #[allow(dead_code)]
         push_role_arn: String,
         /// Whether to automatically delete ECR repos when projects are deleted
-        #[serde(default)]
+        // Env-drivable: the loader interpolates `${VAR}` into a string before
+        // deserialization, so a config value of "${RISE_ECR_AUTO_REMOVE:-false}"
+        // reaches serde as the string "false", not a bool.
+        #[serde(
+            default,
+            deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+        )]
+        #[schemars(with = "bool")]
         #[allow(dead_code)]
         auto_remove: bool,
         #[serde(default)]
@@ -1436,6 +1989,13 @@ pub enum RegistrySettings {
         #[serde(default)]
         #[allow(dead_code)]
         secret_access_key: Option<String>,
+        /// Registry host images are pushed to and pulled from, as `host[:port]`
+        /// with no scheme or path. Empty uses
+        /// `<account_id>.dkr.ecr.<region>.amazonaws.com`; set it for another
+        /// ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+        #[serde(default)]
+        #[allow(dead_code)]
+        registry_host: Option<String>,
     },
     #[serde(rename = "oci-client-auth")]
     OciClientAuth {
@@ -1446,6 +2006,13 @@ pub enum RegistrySettings {
         /// If not specified, defaults to registry_url
         #[serde(default)]
         client_registry_url: Option<String>,
+        /// Optional static registry username. When set with `password`, Rise returns
+        /// the credentials to authorized clients instead of relying on prior docker login.
+        #[serde(default)]
+        username: String,
+        /// Optional static registry password. Intended for small trusted-user setups.
+        #[serde(default)]
+        password: String,
     },
     /// GitLab container registry — mints scoped JWTs per deployment
     #[serde(rename = "gitlab")]
@@ -1731,8 +2298,17 @@ impl Settings {
         // 2. Load environment-specific config (required)
         Self::try_add_config_file(&mut builder, config_dir, run_mode, true)?;
 
-        // 3. Load local config (optional, not checked into git)
-        Self::try_add_config_file(&mut builder, config_dir, "local", false)?;
+        // 3. Load the local config layer from the environment when supplied,
+        //    otherwise from the optional file that is not checked into git.
+        if let Some(local_yaml) = env_lookup("RISE_LOCAL_CONFIG_YAML") {
+            tracing::info!("Loading local config from RISE_LOCAL_CONFIG_YAML");
+            builder = builder.add_source(config::File::from_str(
+                &local_yaml,
+                config::FileFormat::Yaml,
+            ));
+        } else {
+            Self::try_add_config_file(&mut builder, config_dir, "local", false)?;
+        }
 
         // Build config and substitute environment variables
         let config = builder.build()?;
@@ -1756,6 +2332,23 @@ impl Settings {
             unused_fields.push(path.to_string());
         })
         .map_err(|e| ConfigError::Message(format!("Failed to deserialize settings: {}", e)))?;
+
+        // A removed key that capped token lifetimes must not be silently
+        // ignored: an operator who set it chose a shorter lifetime, and ignoring
+        // it would lengthen every exchanged token behind their back.
+        if unused_fields
+            .iter()
+            .any(|f| f == "server.workload_token_max_ttl_seconds")
+        {
+            return Err(ConfigError::Message(
+                "server.workload_token_max_ttl_seconds has been removed. Workload identity \
+                 tokens from the token-exchange endpoint are now capped by \
+                 deployment_controller.identity_token_ttl_seconds, the same lifetime as the \
+                 auto-minted [identity] token files. Remove the key and set \
+                 identity_token_ttl_seconds to the lifetime you want."
+                    .to_string(),
+            ));
+        }
 
         // Warn about unused fields
         for field in &unused_fields {
@@ -1783,6 +2376,110 @@ impl Settings {
             return Err(ConfigError::Message(
                 "JWT signing secret not configured. Set RISE_SERVER__JWT_SIGNING_SECRET environment variable or [server] jwt_signing_secret in config. Generate with: openssl rand -base64 32".to_string()
             ));
+        }
+
+        if settings.auth.idp_group_claim.trim().is_empty() {
+            return Err(ConfigError::Message(
+                "auth.idp_group_claim must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(prefix) = settings
+            .auth
+            .idp_group_sync_prefixes
+            .iter()
+            .find(|prefix| !crate::db::teams::is_valid_team_name(prefix))
+        {
+            return Err(ConfigError::Message(format!(
+                "auth.idp_group_sync_prefixes contains invalid prefix {prefix:?}; use only lowercase ASCII letters, digits, and hyphens"
+            )));
+        }
+
+        for access_group in settings
+            .auth
+            .admin_idp_groups
+            .iter()
+            .chain(settings.auth.operator_idp_groups.iter())
+            .chain(settings.auth.platform_access.allowed_idp_groups.iter())
+        {
+            let canonical = access_group.to_ascii_lowercase();
+            if !crate::db::teams::is_valid_team_name(&canonical) {
+                return Err(ConfigError::Message(format!(
+                    "IdP access group {access_group:?} cannot be represented as a Rise team; use only ASCII letters, digits, and hyphens"
+                )));
+            }
+            if !settings.auth.idp_group_sync_prefixes.is_empty()
+                && !settings
+                    .auth
+                    .idp_group_sync_prefixes
+                    .iter()
+                    .any(|prefix| canonical.starts_with(prefix))
+            {
+                return Err(ConfigError::Message(format!(
+                    "IdP access group {access_group:?} cannot be synchronized by auth.idp_group_sync_prefixes"
+                )));
+            }
+        }
+
+        // A password without a username would be silently treated by the CLI as
+        // client-managed auth, while a username without a password would cause a
+        // confusing login failure. Keep static registry auth explicitly paired.
+        if let Some(RegistrySettings::OciClientAuth {
+            username, password, ..
+        }) = &settings.registry
+        {
+            if username.is_empty() != password.is_empty() {
+                return Err(ConfigError::Message(
+                    "OCI registry static credentials require both username and password"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // `account_id` and `push_role_arn` are string-formatted into every image
+        // reference and into the STS AssumeRole call. Neither can be blank in a
+        // working install, so catching them here turns a first-deploy failure
+        // into a startup error.
+        if let Some(RegistrySettings::Ecr {
+            account_id,
+            push_role_arn,
+            repo_prefix,
+            registry_host,
+            ..
+        }) = &settings.registry
+        {
+            if let Some(host) = registry_host.as_deref().filter(|h| !h.is_empty()) {
+                if host.contains("://") || host.contains('/') || host.trim() != host {
+                    return Err(ConfigError::Message(format!(
+                        "registry.registry_host must be a bare host[:port], with no scheme \
+                         or path, got {host:?}"
+                    )));
+                }
+            }
+            if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
+                return Err(ConfigError::Message(format!(
+                    "registry.account_id must be a 12-digit AWS account ID, got {account_id:?}"
+                )));
+            }
+            if push_role_arn.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "registry.push_role_arn must name the IAM role Rise assumes to mint \
+                     scoped ECR credentials"
+                        .to_string(),
+                ));
+            }
+            // The prefix is concatenated literally, so `rise` yields repositories
+            // named `risemyapp`. That is a working configuration for an install
+            // already running on it, so warn rather than refuse to start.
+            if !repo_prefix.is_empty() && !repo_prefix.ends_with('/') {
+                tracing::warn!(
+                    "registry.repo_prefix {:?} does not end in '/': repositories will be \
+                     named {}<project> rather than {}/<project>",
+                    repo_prefix,
+                    repo_prefix,
+                    repo_prefix
+                );
+            }
         }
 
         // Validate deployment controller settings if configured
@@ -1921,6 +2618,198 @@ impl Settings {
             }
         }
 
+        // Validate the ECS deployment controller variant with the same contract
+        // as the other two, plus the ECS-specific requirements a misconfiguration
+        // of which would otherwise surface as an opaque AWS error on the first
+        // deploy rather than at startup.
+        #[cfg(feature = "backend")]
+        if let Some(DeploymentControllerSettings::Ecs {
+            ref production_ingress_url_template,
+            ref staging_ingress_url_template,
+            ref environment_ingress_url_template,
+            ref controller_class_name,
+            ref cluster,
+            ref subnets,
+            ref security_groups,
+            assign_public_ip,
+            ref capacity,
+            ref execution_role_arn,
+            ref repository_credentials_secret_arn,
+            ref identity_agent_image,
+            ..
+        }) = settings.deployment_controller
+        {
+            Self::validate_format_string(
+                production_ingress_url_template,
+                "production_ingress_url_template",
+                "{project_name}",
+            )?;
+
+            Self::validate_label_value(
+                controller_class_name,
+                "deployment_controller.controller_class_name",
+            )?;
+
+            if let Some(ref staging_template) = staging_ingress_url_template {
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    staging_template,
+                    "staging_ingress_url_template",
+                    "{deployment_group}",
+                )?;
+            }
+
+            if let Some(ref environment_template) = environment_ingress_url_template {
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{project_name}",
+                )?;
+                Self::validate_format_string(
+                    environment_template,
+                    "environment_ingress_url_template",
+                    "{environment}",
+                )?;
+            }
+
+            if cluster.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.cluster must name an ECS cluster".to_string(),
+                ));
+            }
+
+            // Every task runs the identity sidecar, so without an image no task
+            // can start. Required rather than inferred: a guessed image may
+            // predate the agent.
+            if identity_agent_image.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.identity_agent_image (RISE_ECS_IDENTITY_AGENT_IMAGE) \
+                     must name the rise-cli image the workload-identity sidecar runs, \
+                     normally the same release as this server, e.g. \
+                     ghcr.io/rise-deploy/rise-cli:<version>"
+                        .to_string(),
+                ));
+            }
+
+            // A task with no subnet cannot be placed at all, and ECS's own error
+            // for it arrives only on the first CreateService — long after startup.
+            if subnets.is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.subnets must list at least one subnet for the \
+                     tasks' awsvpc network interfaces"
+                        .to_string(),
+                ));
+            }
+            if subnets.len() > MAX_SUBNETS_PER_AWSVPC {
+                return Err(ConfigError::Message(format!(
+                    "deployment_controller.subnets has {} entries, over the ECS limit of {}",
+                    subnets.len(),
+                    MAX_SUBNETS_PER_AWSVPC
+                )));
+            }
+            if security_groups.len() > MAX_SECURITY_GROUPS_PER_AWSVPC {
+                return Err(ConfigError::Message(format!(
+                    "deployment_controller.security_groups has {} entries, over the ECS \
+                     limit of {}",
+                    security_groups.len(),
+                    MAX_SECURITY_GROUPS_PER_AWSVPC
+                )));
+            }
+            // ECS refuses `assignPublicIp` outright on the EC2 launch type
+            // ("Assign public IP is not supported for this launch type"), so this
+            // pair would fail every CreateService rather than degrade. An
+            // `awsvpc` task ENI on a container instance never gets a public
+            // address; egress is the subnet's job there.
+            if capacity == "EC2" && assign_public_ip {
+                return Err(ConfigError::Message(
+                    "deployment_controller.assign_public_ip is true, but ECS does not \
+                     support assigning a public IP on the EC2 capacity: an awsvpc task \
+                     ENI on a container instance never receives one. Give the workload \
+                     subnets a NAT gateway (or VPC endpoints for ECR, CloudWatch and \
+                     SSM) and set assign_public_ip to false."
+                        .to_string(),
+                ));
+            }
+            // ECS authenticates every image pull itself, at every task start —
+            // scale-out, task replacement, AZ rebalance. It never receives a
+            // credential Rise minted, so a registry whose only pull mechanism is
+            // a short-lived Rise-issued token cannot work here, and one that
+            // needs static credentials must park them where ECS can read them.
+            // Deciding that at startup is the difference between a clear error
+            // and an opaque `CannotPullContainerError` on the first deploy.
+            match &settings.registry {
+                Some(RegistrySettings::Ecr { .. }) if execution_role_arn.is_none() => {
+                    return Err(ConfigError::Message(
+                        "registry.type is 'ecr' but deployment_controller.execution_role_arn \
+                         is unset: ECS pulls from ECR with the task execution role, so \
+                         without one every task fails with CannotPullContainerError. Create \
+                         a role ECS can assume (trust principal ecs-tasks.amazonaws.com) \
+                         with the AmazonECSTaskExecutionRolePolicy managed policy attached, \
+                         and set its ARN here."
+                            .to_string(),
+                    ));
+                }
+                // ECR with an execution role: exactly the supported shape.
+                Some(RegistrySettings::Ecr { .. }) => {}
+                Some(RegistrySettings::OciClientAuth {
+                    username, password, ..
+                }) => {
+                    let anonymous = username.is_empty() && password.is_empty();
+                    if !anonymous && repository_credentials_secret_arn.is_none() {
+                        return Err(ConfigError::Message(
+                            "registry.type is 'oci-client-auth' with static credentials, but \
+                             deployment_controller.repository_credentials_secret_arn is unset: \
+                             ECS cannot be handed inline registry credentials. Store the \
+                             username/password in a Secrets Manager secret, set its ARN here, \
+                             and grant the execution role secretsmanager:GetSecretValue on it."
+                                .to_string(),
+                        ));
+                    }
+                }
+                Some(RegistrySettings::GitLab { .. }) | Some(RegistrySettings::Jfrog { .. }) => {
+                    return Err(ConfigError::Message(
+                        "registry.type is not supported by the ECS deployment controller: \
+                         GitLab and JFrog pull credentials are short-lived scoped tokens that \
+                         Rise refreshes on the puller's behalf, which ECS gives it no way to \
+                         do — deploys would succeed and then fail once the token expired. Use \
+                         'ecr', or an 'oci-client-auth' registry that is either anonymous or \
+                         reachable through repository_credentials_secret_arn."
+                            .to_string(),
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        if matches!(
+            &settings.deployment_logs,
+            DeploymentLogsSettings::Cloudwatch { .. }
+        ) {
+            match &settings.deployment_controller {
+                Some(DeploymentControllerSettings::Ecs {
+                    log_group: Some(log_group),
+                    ..
+                }) if !log_group.trim().is_empty() => {}
+                Some(DeploymentControllerSettings::Ecs { .. }) => {
+                    return Err(ConfigError::Message(
+                        "deployment_logs.type is 'cloudwatch' but deployment_controller.log_group \
+                         is unset: the reader must use the same group as ECS's awslogs driver"
+                            .to_string(),
+                    ));
+                }
+                _ => {
+                    return Err(ConfigError::Message(
+                        "deployment_logs.type 'cloudwatch' requires an ECS deployment controller"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         if let Some(ref resource_gc) = settings.resource_gc {
             resource_gc.validate()?;
         }
@@ -1995,6 +2884,78 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn minimal_settings_json() -> serde_json::Value {
+        serde_json::json!({
+            "server": {
+                "host": "0.0.0.0",
+                "port": 3000,
+                "public_url": "http://test.local",
+                "jwt_signing_secret": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            },
+            "auth": {
+                "issuer": "http://test.local",
+                "client_id": "test",
+                "client_secret": "test"
+            }
+        })
+    }
+
+    #[test]
+    fn reserved_project_names_use_control_plane_defaults() {
+        let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
+
+        assert_eq!(
+            settings.reserved_project_names,
+            ["rise", "dex", "registry", "www"]
+        );
+    }
+
+    #[test]
+    fn reserved_project_names_can_be_replaced_by_configuration() {
+        let mut json = minimal_settings_json();
+        json["reserved_project_names"] = serde_json::json!(["grafana", "prometheus"]);
+
+        let settings: Settings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(settings.reserved_project_names, ["grafana", "prometheus"]);
+    }
+
+    #[test]
+    fn idp_group_claim_defaults_to_groups() {
+        let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
+
+        assert_eq!(settings.auth.idp_group_claim, "groups");
+    }
+
+    #[test]
+    fn idp_group_claim_can_be_customized() {
+        let mut json = minimal_settings_json();
+        json["auth"]["idp_group_claim"] = serde_json::json!("cognito:groups");
+
+        let settings: Settings = serde_json::from_value(json).unwrap();
+
+        assert_eq!(settings.auth.idp_group_claim, "cognito:groups");
+    }
+
+    #[test]
+    fn idp_group_sync_prefixes_accept_a_sequence_or_comma_separated_string() {
+        let mut sequence = minimal_settings_json();
+        sequence["auth"]["idp_group_sync_prefixes"] = serde_json::json!(["rise-", "platform-"]);
+        let settings: Settings = serde_json::from_value(sequence).unwrap();
+        assert_eq!(
+            settings.auth.idp_group_sync_prefixes,
+            ["rise-", "platform-"]
+        );
+
+        let mut scalar = minimal_settings_json();
+        scalar["auth"]["idp_group_sync_prefixes"] = serde_json::json!("rise-, platform-");
+        let settings: Settings = serde_json::from_value(scalar).unwrap();
+        assert_eq!(
+            settings.auth.idp_group_sync_prefixes,
+            ["rise-", "platform-"]
+        );
+    }
 
     #[test]
     fn deserialize_u32_flexible_accepts_number_and_numeric_string() {
@@ -2207,6 +3168,41 @@ unknown_top_level: "also unknown"
             result.is_ok(),
             "Config should load despite unknown fields: {:?}",
             result.err()
+        );
+    }
+
+    /// Removing the exchanged-token cap must not silently lengthen tokens for an
+    /// operator who had set it: the key fails startup with its replacement.
+    #[test]
+    fn the_removed_exchange_ttl_cap_fails_startup_instead_of_being_ignored() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("development.yaml"),
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+  workload_token_max_ttl_seconds: 300
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let err =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+                .expect_err("the removed key must be refused");
+        assert!(
+            err.to_string().contains("identity_token_ttl_seconds"),
+            "should name the replacement: {err}"
         );
     }
 
@@ -2607,11 +3603,11 @@ auth:
             Some(access_class(AccessRequirement::Member)),
         );
 
-        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        let offending = access_classes_missing_auth_backend_url(&classes, "");
         assert_eq!(offending, vec!["private".to_string()]);
 
         // Whitespace-only is treated as blank.
-        let offending_ws = docker_access_classes_missing_auth_backend_url(&classes, "   ");
+        let offending_ws = access_classes_missing_auth_backend_url(&classes, "   ");
         assert_eq!(offending_ws, vec!["private".to_string()]);
     }
 
@@ -2623,7 +3619,7 @@ auth:
             Some(access_class(AccessRequirement::Authenticated)),
         );
 
-        let offending = docker_access_classes_missing_auth_backend_url(&classes, "");
+        let offending = access_classes_missing_auth_backend_url(&classes, "");
         assert_eq!(offending, vec!["authed".to_string()]);
     }
 
@@ -2635,7 +3631,7 @@ auth:
             Some(access_class(AccessRequirement::None)),
         );
 
-        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+        assert!(access_classes_missing_auth_backend_url(&classes, "").is_empty());
     }
 
     #[test]
@@ -2651,9 +3647,7 @@ auth:
         );
 
         // Mirrors config/docker.yaml (private + auth URL set).
-        assert!(
-            docker_access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty()
-        );
+        assert!(access_classes_missing_auth_backend_url(&classes, "http://rise:3000").is_empty());
     }
 
     /// Stage the real shipped `config/docker.yaml` plus a minimal `default.yaml`
@@ -2662,6 +3656,13 @@ auth:
     /// env vars the config interpolates (`${VAR}` / `${VAR:-default}`).
     fn load_shipped_docker_config(
         env: &std::collections::HashMap<&'static str, &'static str>,
+    ) -> Result<Settings, ConfigError> {
+        load_shipped_docker_config_with_overlay(env, None)
+    }
+
+    fn load_shipped_docker_config_with_overlay(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+        overlay: Option<&str>,
     ) -> Result<Settings, ConfigError> {
         use std::fs;
         use tempfile::TempDir;
@@ -2675,6 +3676,9 @@ auth:
         // the docker.yaml layer carries everything the assertions check.
         fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
         fs::write(temp_dir.path().join("docker.yaml"), docker_yaml).unwrap();
+        if let Some(overlay) = overlay {
+            fs::write(temp_dir.path().join("local.yaml"), overlay).unwrap();
+        }
 
         let owned: std::collections::HashMap<String, String> = env
             .iter()
@@ -2683,6 +3687,494 @@ auth:
         let env_lookup = move |name: &str| owned.get(name).cloned();
 
         Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &env_lookup)
+    }
+
+    /// Load the real shipped `config/ecs.yaml` the same way an operator's install
+    /// does, so a typo or a field rename in the YAML fails here rather than at
+    /// their startup.
+    fn load_shipped_ecs_config(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+    ) -> Result<Settings, ConfigError> {
+        load_shipped_ecs_config_with_overlay(env, None)
+    }
+
+    /// As above, with an optional environment-backed local layer over the
+    /// shipped file — the way ECS supplies settings that do not belong in its
+    /// task definition (a registry credential, say).
+    fn load_shipped_ecs_config_with_overlay(
+        env: &std::collections::HashMap<&'static str, &'static str>,
+        overlay: Option<&str>,
+    ) -> Result<Settings, ConfigError> {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let ecs_yaml = fs::read_to_string(format!("{manifest_dir}/config/ecs.yaml"))
+            .expect("config/ecs.yaml must exist");
+
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("default.yaml"), "{}\n").unwrap();
+        fs::write(temp_dir.path().join("ecs.yaml"), ecs_yaml).unwrap();
+
+        let mut owned: std::collections::HashMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        if let Some(overlay) = overlay {
+            owned.insert("RISE_LOCAL_CONFIG_YAML".to_string(), overlay.to_string());
+        }
+        let env_lookup = move |name: &str| owned.get(name).cloned();
+
+        Settings::new_with_env(temp_dir.path().to_str().unwrap(), "ecs", &env_lookup)
+    }
+
+    #[test]
+    fn shipped_ecs_config_loads_and_selects_the_ecs_controller() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
+        env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+        env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
+        env.insert("RISE_IDP_GROUP_SYNC_PREFIXES", "rise-,platform-");
+
+        let settings = load_shipped_ecs_config(&env).expect("shipped ecs.yaml must load");
+
+        let Some(DeploymentControllerSettings::Ecs {
+            cluster,
+            subnets,
+            reconcile_interval_secs,
+            cpu_architecture,
+            access_classes,
+            resource_prefix,
+            ..
+        }) = settings.deployment_controller
+        else {
+            panic!("config/ecs.yaml must select the ECS deployment controller");
+        };
+        assert_eq!(cluster, "rise-e2e");
+        // A comma-separated env var is split — a scalar env var cannot carry a
+        // YAML list, and subnet lists are exactly what operators inject that way.
+        assert_eq!(
+            subnets,
+            vec!["subnet-abc".to_string(), "subnet-def".to_string()]
+        );
+        // ECS is a throttled API: a Docker-like 5s tick would burn the quota.
+        assert_eq!(reconcile_interval_secs, 30);
+        assert_eq!(cpu_architecture, "X86_64");
+        assert_eq!(resource_prefix, "rise");
+        assert!(access_classes.contains_key("public"));
+        assert!(access_classes.contains_key("private"));
+        assert_eq!(
+            settings.auth.idp_group_sync_prefixes,
+            ["rise-", "platform-"]
+        );
+
+        assert!(matches!(
+            settings.deployment_logs,
+            DeploymentLogsSettings::Cloudwatch {
+                retention_hint: None
+            }
+        ));
+    }
+
+    #[test]
+    fn shipped_ecs_config_passes_the_cloudwatch_retention_hint() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_LOG_RETENTION_HINT", "30d");
+
+        let settings = load_shipped_ecs_config(&env).expect("retention hint must load");
+        assert!(matches!(
+            settings.deployment_logs,
+            DeploymentLogsSettings::Cloudwatch {
+                retention_hint: Some(ref hint)
+            } if hint == "30d"
+        ));
+    }
+
+    #[test]
+    fn cloudwatch_logs_require_the_ecs_log_group() {
+        let mut env = ecs_base_env();
+        env.remove("RISE_ECS_LOG_GROUP");
+
+        let err = load_shipped_ecs_config(&env).expect_err("missing log group must fail");
+        assert!(
+            err.to_string().contains("deployment_controller.log_group"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn cloudwatch_logs_require_the_ecs_controller() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_APP_BACKEND_HOST_ALIAS", "rise.localhost");
+        let overlay = "\
+deployment_logs:
+  type: cloudwatch
+";
+
+        let err = load_shipped_docker_config_with_overlay(&env, Some(overlay))
+            .expect_err("cloudwatch with Docker must fail");
+        assert!(
+            err.to_string()
+                .contains("requires an ECS deployment controller"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_local_config_yaml_supplies_the_local_layer() {
+        let mut env = ecs_base_env();
+        env.insert("OVERLAY_PUBLIC_URL", "https://control.example.com");
+
+        let settings = load_shipped_ecs_config_with_overlay(
+            &env,
+            Some(
+                r#"
+server:
+  public_url: "${OVERLAY_PUBLIC_URL}"
+"#,
+            ),
+        )
+        .expect("environment-backed local YAML must load");
+
+        assert_eq!(settings.server.public_url, "https://control.example.com");
+        assert_eq!(settings.server.port, 3000);
+    }
+
+    /// Every task runs the identity sidecar; with no image, none can start.
+    #[test]
+    fn ecs_config_without_an_identity_agent_image_is_rejected_at_load() {
+        let mut env = ecs_base_env();
+        env.remove("RISE_ECS_IDENTITY_AGENT_IMAGE");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("identity_agent_image"),
+            "should name the missing setting: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_without_subnets_is_rejected_at_load() {
+        // A task with no subnet cannot be placed at all, and ECS only says so on
+        // the first CreateService — long after startup, and to nobody watching.
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
+        env.insert("RISE_ECS_SUBNETS", "");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("at least one subnet"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_rejects_a_noncanonical_group_sync_prefix() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_IDP_GROUP_SYNC_PREFIXES", "Rise_");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject invalid prefix");
+        assert!(
+            err.to_string()
+                .contains("auth.idp_group_sync_prefixes contains invalid prefix"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_rejects_an_access_group_outside_the_sync_prefixes() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_IDP_GROUP_SYNC_PREFIXES", "rise-");
+        env.insert("RISE_ADMIN_IDP_GROUP", "platform-admins");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject unreachable access group");
+        assert!(
+            err.to_string().contains(
+                "IdP access group \"platform-admins\" cannot be synchronized by auth.idp_group_sync_prefixes"
+            ),
+            "unhelpful message: {err}"
+        );
+    }
+
+    #[test]
+    fn ecs_config_rejects_an_access_group_that_cannot_be_a_team() {
+        let mut env = ecs_base_env();
+        env.insert("RISE_ADMIN_IDP_GROUP", "rise_admins");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject invalid access group");
+        assert!(
+            err.to_string()
+                .contains("cannot be represented as a Rise team"),
+            "unhelpful message: {err}"
+        );
+    }
+
+    /// The env every ECS-mode load needs before it can get as far as the
+    /// registry checks these tests are about.
+    fn ecs_base_env() -> std::collections::HashMap<&'static str, &'static str> {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
+        env.insert("RISE_ECS_SUBNETS", "subnet-abc");
+        env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
+        env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
+        env
+    }
+
+    #[test]
+    fn shipped_ecs_config_selects_ecr_from_one_env_flip() {
+        // The file's own comment recommends ECR; if switching to it needed the
+        // file edited, that recommendation would be advice nobody can take.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+        env.insert(
+            "RISE_ECS_EXECUTION_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-exec",
+        );
+
+        let settings = load_shipped_ecs_config(&env).expect("ecr mode must load");
+        let Some(RegistrySettings::Ecr {
+            account_id,
+            repo_prefix,
+            registry_host,
+            ..
+        }) = settings.registry
+        else {
+            panic!("RISE_REGISTRY_TYPE=ecr must select the ECR registry");
+        };
+        assert_eq!(account_id, "123456789012");
+        assert_eq!(repo_prefix, "rise/");
+        // Unset means the regional endpoint; the provider treats empty as unset.
+        assert!(registry_host.unwrap_or_default().is_empty());
+    }
+
+    fn ecs_ecr_env() -> std::collections::HashMap<&'static str, &'static str> {
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+        env.insert(
+            "RISE_ECS_EXECUTION_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-exec",
+        );
+        env
+    }
+
+    #[test]
+    fn the_ecr_registry_host_can_be_overridden_from_the_environment() {
+        let mut env = ecs_ecr_env();
+        env.insert(
+            "RISE_ECR_REGISTRY_HOST",
+            "123456789012.dkr.ecr.us-east-1.localhost:4566",
+        );
+        let settings = load_shipped_ecs_config(&env).expect("a host:port must load");
+        let Some(RegistrySettings::Ecr { registry_host, .. }) = settings.registry else {
+            panic!("expected the ECR registry");
+        };
+        assert_eq!(
+            registry_host.as_deref(),
+            Some("123456789012.dkr.ecr.us-east-1.localhost:4566")
+        );
+    }
+
+    #[test]
+    fn an_ecr_registry_host_with_a_scheme_or_path_is_rejected() {
+        for bad in ["https://registry.example.com", "registry.example.com/rise"] {
+            let mut env = ecs_ecr_env();
+            env.insert("RISE_ECR_REGISTRY_HOST", bad);
+            let err = load_shipped_ecs_config(&env).expect_err(bad);
+            assert!(err.to_string().contains("registry_host"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn cpu_architecture_is_canonicalised_at_load_and_a_bad_one_is_rejected() {
+        // `RISE_ECS_CPU_ARCHITECTURE` is an env var, so lower case and the
+        // Docker/OCI spelling are what operators actually type. Canonicalising
+        // at load is what lets the rest of the system assume one of two tokens.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CPU_ARCHITECTURE", "aarch64");
+        let settings = load_shipped_ecs_config(&env).expect("aarch64 must be accepted");
+        let Some(DeploymentControllerSettings::Ecs {
+            cpu_architecture, ..
+        }) = settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(cpu_architecture, "ARM64");
+
+        // An architecture we can neither recognise nor normalise has no safe
+        // default: guessing would build images the tasks cannot execute.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CPU_ARCHITECTURE", "riscv64");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("X86_64 or ARM64"),
+            "should name the valid values: {err}"
+        );
+    }
+
+    #[test]
+    fn capacity_defaults_to_fargate_and_ec2_is_accepted() {
+        // The key is new, so every install that predates it must keep placing
+        // tasks exactly where it did before.
+        let settings = load_shipped_ecs_config(&ecs_base_env()).expect("shipped config loads");
+        let Some(DeploymentControllerSettings::Ecs { capacity, .. }) =
+            settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(capacity, "FARGATE");
+
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "ec2");
+        let settings = load_shipped_ecs_config(&env).expect("ec2 must be accepted");
+        let Some(DeploymentControllerSettings::Ecs {
+            capacity, subnets, ..
+        }) = settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(capacity, "EC2");
+        // Both capacities run on awsvpc, so the subnets stay load-bearing --
+        // they are what the tasks' ENIs attach to either way.
+        assert!(!subnets.is_empty());
+    }
+
+    #[test]
+    fn a_public_ip_on_ec2_capacity_is_rejected_at_load() {
+        // ECS refuses `assignPublicIp` on the EC2 launch type outright, so this
+        // pair would fail every CreateService. Catching it at startup beats an
+        // InvalidParameterException on the first deploy.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "ec2");
+        env.insert("RISE_ECS_ASSIGN_PUBLIC_IP", "true");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("assign_public_ip"), "{msg}");
+        assert!(msg.contains("NAT gateway"), "should name the fix: {msg}");
+
+        // The same flag is exactly how a public-subnet Fargate install works.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_ASSIGN_PUBLIC_IP", "true");
+        load_shipped_ecs_config(&env).expect("public IP on Fargate is supported");
+    }
+
+    #[test]
+    fn an_unknown_capacity_is_rejected_at_load() {
+        // Defaulting would bill an operator who asked for their own container
+        // instances for serverless capacity they never wanted.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "spot");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fargate"),
+            "should name the valid values: {msg}"
+        );
+        assert!(msg.contains("ec2"), "should name the valid values: {msg}");
+    }
+
+    #[test]
+    fn ecr_on_ecs_without_an_execution_role_is_rejected() {
+        // ECS pulls from ECR with the execution role and nothing else. Without
+        // one every task dies with CannotPullContainerError, which names neither
+        // the cause nor the fix.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("execution_role_arn"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("AmazonECSTaskExecutionRolePolicy"),
+            "should name the policy that fixes it: {msg}"
+        );
+    }
+
+    #[test]
+    fn static_credential_oci_on_ecs_needs_a_secrets_manager_secret() {
+        // Anonymous is fine; static credentials are not, because ECS cannot be
+        // handed them inline and would fail at task start instead.
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_USERNAME", "u");
+        env.insert("RISE_REGISTRY_PASSWORD", "p");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("repository_credentials_secret_arn"),
+            "unhelpful: {err}"
+        );
+
+        // With the ARN supplied it loads.
+        let mut env = env.clone();
+        env.insert(
+            "RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN",
+            "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise-registry",
+        );
+        load_shipped_ecs_config(&env).expect("static creds plus a secret ARN must load");
+    }
+
+    #[test]
+    fn anonymous_oci_on_ecs_is_accepted() {
+        // The shipped defaults leave username/password empty, so this is also a
+        // guard that the static-credential check does not fire on them.
+        load_shipped_ecs_config(&ecs_base_env()).expect("anonymous OCI must load");
+    }
+
+    #[test]
+    fn short_lived_token_registries_are_rejected_on_ecs() {
+        // GitLab and JFrog pull credentials expire and are refreshed by Rise on
+        // Kubernetes. ECS re-authenticates at every task start with no refresh
+        // path, so these deploy successfully and break hours later.
+        let overlay = "\
+registry:
+  type: gitlab
+  gitlab_url: https://gitlab.example.com
+  registry_url: registry.gitlab.example.com
+  namespace: org/project
+  username: rise
+  token: glpat-xxx
+";
+        let err = load_shipped_ecs_config_with_overlay(&ecs_base_env(), Some(overlay))
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("not supported"), "unhelpful: {msg}");
+        assert!(
+            msg.contains("ecr"),
+            "should name a supported alternative: {msg}"
+        );
     }
 
     #[test]
@@ -2939,7 +4431,7 @@ auth:
         );
         classes.insert("private".to_string(), None);
 
-        assert!(docker_access_classes_missing_auth_backend_url(&classes, "").is_empty());
+        assert!(access_classes_missing_auth_backend_url(&classes, "").is_empty());
     }
 }
 
@@ -3155,7 +4647,8 @@ pub struct PlatformAccessConfig {
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_user_emails: Vec<String>,
 
-    /// IdP groups whose members get platform access
+    /// IdP groups whose members get platform access. A user matches when they
+    /// belong to an IdP-managed team of that name (case-insensitive).
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub allowed_idp_groups: Vec<String>,
 }

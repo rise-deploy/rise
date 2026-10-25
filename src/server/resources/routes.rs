@@ -6,13 +6,24 @@
 //!
 //! All resource paths are dispatched through four handler functions that parse
 //! the wildcard `{*path}` capture and classify it against the resource store.
+//!
+//! The router carries its own authentication and platform-access layers rather
+//! than the platform-wide ones, because one request shape must reach its
+//! handler without a credential: a workload token exchange at a `/token`
+//! subresource, whose credential is the external assertion in the body
+//! (ADR-0001 §7). Every other request is authenticated exactly as the
+//! platform-wide layers authenticate it.
 
 use axum::{
+    middleware::from_fn_with_state,
     routing::{delete, get, post, put},
     Router,
 };
 
 use super::handlers;
+use crate::server::auth::middleware::{
+    resource_auth_middleware, resource_platform_access_middleware,
+};
 use crate::server::state::AppState;
 
 /// Wildcard route pattern for the generic resource API. `{*path}` captures the
@@ -20,12 +31,22 @@ use crate::server::state::AppState;
 /// the full resource path rather than just its first component.
 const RESOURCE_PATH_ROUTE: &str = "/resources/{*path}";
 
-pub fn routes() -> Router<AppState> {
+pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route(RESOURCE_PATH_ROUTE, get(handlers::dispatch_get))
         .route(RESOURCE_PATH_ROUTE, post(handlers::dispatch_post))
         .route(RESOURCE_PATH_ROUTE, put(handlers::dispatch_put))
         .route(RESOURCE_PATH_ROUTE, delete(handlers::dispatch_delete))
+        // Scoped CLI sessions are refused third (ADR-0006 §7).
+        .route_layer(axum::middleware::from_fn(
+            crate::server::auth::session_scope::refuse_on_resource_api,
+        ))
+        // Platform access runs second, after authentication.
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            resource_platform_access_middleware,
+        ))
+        .route_layer(from_fn_with_state(state, resource_auth_middleware))
 }
 
 #[cfg(test)]
@@ -37,15 +58,6 @@ mod tests {
         http::{Request, StatusCode},
     };
     use tower::ServiceExt; // for `oneshot`
-
-    /// matchit (the router behind axum) panics at registration time when two
-    /// routes are ambiguous. Building the full router here catches that early
-    /// instead of at server startup. The router has no state at this stage —
-    /// `Router::<AppState>` is generic over state until it's mounted.
-    #[test]
-    fn routes_build_without_conflict() {
-        let _router: Router<crate::server::state::AppState> = routes();
-    }
 
     /// HTTP-layer test for the resource-API route table.
     ///

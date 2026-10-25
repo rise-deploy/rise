@@ -78,6 +78,13 @@ pub struct Deployment {
     pub completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_logs: Option<String>,
+    /// Opaque controller bookkeeping, surfaced for introspection only.
+    ///
+    /// Each backend writes whatever it needs to track its own convergence — the
+    /// ECS reconciler records the task-definition hash its service settled on.
+    /// The shape is the controller's business and changes with it, so nothing
+    /// outside the controller may depend on the keys inside: read it to see what
+    /// a controller is thinking, never to drive behaviour.
     #[serde(default)]
     pub controller_metadata: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -116,6 +123,20 @@ pub struct Deployment {
     pub pull_request_url: Option<String>, // URL to the PR/MR associated with this deployment
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_repository_url: Option<String>, // HTTPS URL of the Git repository this deployment was created from
+    /// Commit the image was built from, as the CLI reported it. Inherited from
+    /// the source deployment for redeploys, rollbacks and promotions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// The build ran on a working tree with uncommitted changes, so the image
+    /// cannot be reproduced from `git_revision` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
+    /// `deployment_id` of the deployment this one was created from (redeploy,
+    /// rollback, promote), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_deployment_id: Option<String>,
     #[serde(default)]
     pub created: String,
     #[serde(default)]
@@ -145,19 +166,11 @@ fn default_memory() -> String {
 pub use rise_backend_core::group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use rise_backend_core::system_env::rise_system_env_vars;
 
-/// Prefix reserved for Rise-injected pod env vars (see `rise_system_env_vars`).
-///
-/// User-supplied env-var keys in this namespace are rejected so they cannot
-/// silently collide with / shadow a Rise-injected value (injected vars are set
-/// as explicit pod `env`, which Kubernetes resolves *after* `envFrom`).
-pub const RESERVED_ENV_VAR_PREFIX: &str = "RISE_";
-
-/// True if `key` falls in the reserved `RISE_*` namespace and must be rejected
-/// for user-supplied env vars. Case-sensitive: K8s env names are case-sensitive
-/// and the injected vars are uppercase.
-pub fn is_reserved_env_var_key(key: &str) -> bool {
-    key.starts_with(RESERVED_ENV_VAR_PREFIX)
-}
+// Reserved `RISE_*` env-var namespace (see `rise_system_env_vars`), shared
+// with the CLI's rise.toml validation. Injected vars are set as explicit pod
+// `env`, which Kubernetes resolves *after* `envFrom`, so a user key there would
+// silently shadow them.
+pub use rise_deployment_spec::validation::{is_reserved_env_var_key, RESERVED_ENV_VAR_PREFIX};
 
 /// Validate the wire-level multi-container spec (containers + routes) from a
 /// `CreateDeploymentRequest`. Returns `Ok(())` for legacy single-container
@@ -258,6 +271,16 @@ pub struct UpdateDeploymentStatusRequest {
     pub status: DeploymentStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// What the reporter observed while making this transition — the build
+    /// method it chose, the registry it pushed to, per-image durations and
+    /// sizes. Recorded on the transition's event and nowhere else: this
+    /// describes one moment, not the deployment's state.
+    ///
+    /// Optional by design. The phases before `Pushed` are driven by the CLI,
+    /// so the backend cannot observe them and an older CLI simply sends
+    /// nothing — the transition is still recorded, just without detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
 }
 
 #[cfg(test)]

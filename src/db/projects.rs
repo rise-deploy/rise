@@ -470,12 +470,15 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<()> {
 }
 
 /// Count projects owned by a team
-pub async fn count_owned_by_team(pool: &PgPool, team_id: Uuid) -> Result<i64> {
+pub async fn count_owned_by_team<'a, E>(executor: E, team_id: Uuid) -> Result<i64>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     let result = sqlx::query!(
         r#"SELECT COUNT(*) as "count!" FROM projects WHERE owner_team_id = $1"#,
         team_id
     )
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
     .context("Failed to count projects owned by team")?;
 
@@ -526,14 +529,12 @@ pub async fn update_calculated_status(pool: &PgPool, project_id: Uuid) -> Result
         return Ok(project);
     }
 
-    // Get active deployment from the "default" group only
-    // Other deployment groups (e.g., for merge requests) don't affect project status
-    let active_deployment = deployments::find_active_deployment_for_group(
-        pool,
-        project_id,
-        crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
-    )
-    .await?;
+    // The project's status follows what its production environment serves:
+    // the primary group of the production environment. Other groups (previews,
+    // merge requests, other environments) don't affect project status.
+    let group = production_deployment_group(pool, project_id).await?;
+    let active_deployment =
+        deployments::find_active_deployment_for_group(pool, project_id, &group).await?;
 
     // Determine status based on active deployment first, then check for in-progress deployments
     let status = if let Some(active) = active_deployment.as_ref() {
@@ -560,12 +561,8 @@ pub async fn update_calculated_status(pool: &PgPool, project_id: Uuid) -> Result
         }
     } else {
         // No active deployment - check last deployment for in-progress or recent activity
-        let last_deployment = deployments::find_last_for_project_and_group(
-            pool,
-            project_id,
-            crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
-        )
-        .await?;
+        let last_deployment =
+            deployments::find_last_for_project_and_group(pool, project_id, &group).await?;
 
         if let Some(last) = last_deployment.as_ref() {
             match last.status {
@@ -592,7 +589,7 @@ pub async fn update_calculated_status(pool: &PgPool, project_id: Uuid) -> Result
                 DeploymentStatus::Healthy | DeploymentStatus::Unhealthy => ProjectStatus::Stopped,
             }
         } else {
-            // No deployments in default group at all
+            // No deployments in the production group at all
             ProjectStatus::Stopped
         }
     };
@@ -600,30 +597,75 @@ pub async fn update_calculated_status(pool: &PgPool, project_id: Uuid) -> Result
     update_status(pool, project_id, status).await
 }
 
-/// Active deployment info returned by batch queries
+/// The deployment group whose active deployment a project's status reflects:
+/// the primary group of its production environment, or `default` when the
+/// project has no production environment or it has no primary group.
+pub async fn production_deployment_group(pool: &PgPool, project_id: Uuid) -> Result<String> {
+    let group = sqlx::query_scalar!(
+        r#"
+        SELECT primary_deployment_group
+        FROM environments
+        WHERE project_id = $1 AND is_production = TRUE
+        "#,
+        project_id
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to look up the production deployment group")?
+    .flatten();
+
+    Ok(group
+        .unwrap_or_else(|| crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP.to_string()))
+}
+
+/// Deployment info returned by batch queries
 #[derive(Debug, Clone)]
 pub struct ActiveDeploymentInfo {
     pub id: Uuid,
     pub status: crate::db::models::DeploymentStatus,
 }
 
-/// Get active deployment info (deployment_id and status) for multiple projects (batch operation)
-/// Returns a map of project_id -> ActiveDeploymentInfo
-/// Fetches the active deployment from the default deployment group using the is_active flag
+/// What a project's production group is doing: the deployment serving it and
+/// the newest deployment in it (the same one unless a newer deploy is in
+/// flight or failed).
+#[derive(Debug, Clone, Default)]
+pub struct ProductionDeploymentInfo {
+    pub active: Option<ActiveDeploymentInfo>,
+    pub latest: Option<ActiveDeploymentInfo>,
+}
+
+/// Get the active and latest deployment of each project's production group
+/// (see [`production_deployment_group`]) for multiple projects (batch operation).
 pub async fn get_active_deployment_info_batch(
     pool: &PgPool,
     project_ids: &[Uuid],
-) -> Result<HashMap<Uuid, Option<ActiveDeploymentInfo>>> {
+) -> Result<HashMap<Uuid, ProductionDeploymentInfo>> {
     let results = sqlx::query!(
         r#"
         SELECT
-            p.id as project_id,
-            d.id as "id?",
-            d.status as "status?: crate::db::models::DeploymentStatus"
+            p.id as "project_id!",
+            a.id as "active_id?",
+            a.status as "active_status?: crate::db::models::DeploymentStatus",
+            l.id as "latest_id?",
+            l.status as "latest_status?: crate::db::models::DeploymentStatus"
         FROM unnest($1::uuid[]) AS p(id)
-        LEFT JOIN deployments d ON d.project_id = p.id
-            AND d.is_active = TRUE
-            AND d.deployment_group = 'default'
+        CROSS JOIN LATERAL (
+            SELECT COALESCE(
+                (SELECT e.primary_deployment_group FROM environments e
+                 WHERE e.project_id = p.id AND e.is_production = TRUE),
+                'default'
+            ) AS grp
+        ) g
+        LEFT JOIN deployments a ON a.project_id = p.id
+            AND a.is_active = TRUE
+            AND a.deployment_group = g.grp
+        LEFT JOIN LATERAL (
+            SELECT d.id, d.status
+            FROM deployments d
+            WHERE d.project_id = p.id AND d.deployment_group = g.grp
+            ORDER BY d.created_at DESC
+            LIMIT 1
+        ) l ON TRUE
         "#,
         project_ids
     )
@@ -633,15 +675,16 @@ pub async fn get_active_deployment_info_batch(
 
     Ok(results
         .into_iter()
-        .filter_map(|r| {
-            r.project_id.map(|project_id| {
-                // In sqlx 0.8, LEFT JOIN makes fields Option<T> (already nullable)
-                let info = match (r.id, r.status) {
-                    (Some(id), Some(status)) => Some(ActiveDeploymentInfo { id, status }),
-                    _ => None,
-                };
-                (project_id, info)
-            })
+        .map(|r| {
+            let active = match (r.active_id, r.active_status) {
+                (Some(id), Some(status)) => Some(ActiveDeploymentInfo { id, status }),
+                _ => None,
+            };
+            let latest = match (r.latest_id, r.latest_status) {
+                (Some(id), Some(status)) => Some(ActiveDeploymentInfo { id, status }),
+                _ => None,
+            };
+            (r.project_id, ProductionDeploymentInfo { active, latest })
         })
         .collect())
 }
@@ -858,7 +901,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project.id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false, // Initially not active
@@ -871,6 +915,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -910,7 +955,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project.id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false, // This is NOT active
@@ -923,6 +969,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -1173,7 +1220,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: DEFAULT_DEPLOYMENT_GROUP,
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project.id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -1186,6 +1234,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await

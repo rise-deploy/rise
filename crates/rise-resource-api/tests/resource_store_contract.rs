@@ -2,15 +2,15 @@ use std::error::Error as _;
 use std::sync::Arc;
 
 use rise_resource_api::{
-    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceRow, ResourceStore,
-    StoreError, UpdateResourceParams, ValidationError,
+    CollectionInfo, CreateResourceParams, DeleteOutcome, PathSegment, ResourceApi, ResourceRow,
+    ResourceStore, StoreError, UpdateResourceParams, ValidationError,
 };
 use uuid::Uuid;
 
 struct FakeStore;
 
 #[async_trait::async_trait]
-impl ResourceStore for FakeStore {
+impl ResourceApi for FakeStore {
     async fn create(&self, _: CreateResourceParams) -> Result<ResourceRow, StoreError> {
         Err(StoreError::NotFound)
     }
@@ -48,6 +48,27 @@ impl ResourceStore for FakeStore {
     async fn delete(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         Err(StoreError::NotFound)
     }
+    async fn update_controller_status(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: serde_json::Value,
+    ) -> Result<ResourceRow, StoreError> {
+        Err(StoreError::NotFound)
+    }
+    async fn update_controller_finalizers(
+        &self,
+        _: Uuid,
+        _: &str,
+        _: &[String],
+        _: &[String],
+    ) -> Result<ResourceRow, StoreError> {
+        Err(StoreError::NotFound)
+    }
+}
+
+#[async_trait::async_trait]
+impl ResourceStore for FakeStore {
     async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         Err(StoreError::NotFound)
     }
@@ -67,22 +88,22 @@ impl ResourceStore for FakeStore {
         }
         Ok(vec![])
     }
-    async fn update_controller_status(
-        &self,
-        _: Uuid,
-        _: &str,
-        _: serde_json::Value,
-    ) -> Result<ResourceRow, StoreError> {
-        Err(StoreError::NotFound)
+    async fn ancestors(&self, _: Uuid) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(vec![])
     }
-    async fn update_controller_finalizers(
+    async fn label_inheriting_descendants(
         &self,
         _: Uuid,
         _: &str,
-        _: &[String],
-        _: &[String],
-    ) -> Result<ResourceRow, StoreError> {
-        Err(StoreError::NotFound)
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(vec![])
+    }
+    async fn list_label_setters(
+        &self,
+        _: &rise_resource_api::LabelKey,
+        _: i64,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(vec![])
     }
     async fn operator_update_status(
         &self,
@@ -145,6 +166,15 @@ async fn separate_consumer_can_implement_and_type_erase_the_api_store_contract()
         store.resolve_path(&[]).await,
         Err(StoreError::EmptyPath)
     ));
+
+    // The split (ADR-0004 §3) is only usable because a wide handle narrows to
+    // the remotable one without re-wrapping: production upcasts both by value
+    // and by reference. Pin both here, since losing either would break every
+    // caller held to `ResourceApi` and nothing else in this file would notice.
+    let api: Arc<dyn ResourceApi> = store.clone();
+    assert!(api.get(Uuid::nil()).await.unwrap().is_none());
+    let api_ref: &dyn ResourceApi = store.as_ref();
+    assert!(api_ref.get(Uuid::nil()).await.unwrap().is_none());
 }
 
 #[test]
@@ -187,6 +217,7 @@ fn row(
         parent_uid: None,
         name: "widget-a".into(),
         discriminator: "abc123de".into(),
+        labels: Default::default(),
         metadata,
         spec,
         status,

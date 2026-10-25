@@ -2,138 +2,37 @@
 //!
 //! Everything here is deterministic and daemon-free so it can be unit-tested:
 //! the reconciler resolves the dynamic inputs (env vars, image, URLs) and calls
-//! [`build_container`] to produce the [`bollard::container::Config`] plus the
+//! [`build_container`] to produce the [`ContainerCreateBody`] plus the
 //! container name and labels.
 
 use std::collections::HashMap;
 
-use bollard::container::Config;
-use bollard::secret::{EndpointSettings, HostConfig, RestartPolicy, RestartPolicyNameEnum};
+use bollard::models::{
+    ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig, RestartPolicy,
+    RestartPolicyNameEnum,
+};
 
-use super::labels::{self, BookkeepingLabels, ForwardAuth, TraefikRoute};
+use super::labels::{self, BookkeepingLabels};
 use rise_backend_core::quantity::{
     parse_cpu_millicores, parse_cpu_request_limit, parse_memory_bytes, parse_memory_request_limit,
 };
 use rise_backend_core::AccessRequirement;
+use rise_backend_traefik::render::TraefikRenderConfig;
 
-/// Per-route forwardAuth outcome for a single Traefik router.
-enum RouteForwardAuth {
-    /// No auth requirement — emit the router with no forwardAuth middleware.
-    Open,
-    /// Auth required and wired — attach forwardAuth pointing at this address.
-    Gated(String),
-    /// Auth required but no `auth_backend_url` to wire it — withhold this router
-    /// (fail closed) rather than expose an unauthenticated public route.
-    Withheld,
-}
-
-/// One ingress route attached to a routable container.
-#[derive(Debug, Clone)]
-pub struct DesiredRoute {
-    /// Hosts that resolve to this container, priority order.
-    pub hosts: Vec<String>,
-    /// Optional path prefix (`None` / `/` → host-only).
-    pub path_prefix: Option<String>,
-    /// Per-route ingress auth requirement override (`.rise.toml` `[routes].access`).
-    /// `None` means the route inherits the project's access-class requirement; the
-    /// effective requirement decides this router's forwardAuth middleware.
-    pub access: Option<AccessRequirement>,
-}
-
-/// Fully-resolved description of a single container Rise wants running. Built by
-/// the reconciler; consumed by [`build_container`]. All identity fields are
-/// owned strings so the struct can be tested without a live deployment row.
-#[derive(Debug, Clone)]
-pub struct DesiredContainer {
-    pub project: String,
-    /// Name of the project's access class (looked up in
-    /// [`BuilderConfig::access_classes`] to decide whether to stamp Traefik
-    /// forwardAuth middleware labels).
-    pub access_class: String,
-    pub deployment_group: String,
-    pub deployment_id: String,
-    pub deployment_uuid: String,
-    /// Container name within the deployment (`app` for single-container).
-    pub container: String,
-    pub environment: Option<String>,
-    pub image: String,
-    /// `None` for workers (no Service / routing / probe).
-    pub port: Option<u16>,
-    pub cpu: String,
-    pub memory: String,
-    /// Merged env vars as `(KEY, VALUE)` pairs, already in final precedence.
-    pub env: Vec<(String, String)>,
-    /// sha256 of the *entire* merged env (plain + system/RISE_* + secret),
-    /// computed over a deterministically-sorted copy. Drift here forces
-    /// recreation, so editing/deleting any env var of any kind recreates the
-    /// container. See [`super::reconciler::hash_env`].
-    pub env_hash: String,
-    /// Routes for this container (empty for workers / unrouted containers).
-    pub routes: Vec<DesiredRoute>,
-    /// Whether this container should be routable (emit Traefik router/service
-    /// labels). `true` for every infra-bearing deployment of a group — the old
-    /// active and the new Deploying deployment both join the one group-scoped
-    /// Traefik service, and Traefik's per-server health check drains the old
-    /// servers as the new ones come up. `false` only when the router would be
-    /// withheld (unknown access class, or auth required without an
-    /// `auth_backend_url`), so the readiness path doesn't report a never-routed
-    /// container as Healthy.
-    pub routable: bool,
-    /// Recreate-signature hash: sha256 of the fully-rendered Traefik label set
-    /// for this container PLUS whether its app port is published to a loopback
-    /// host port (`publish_app_ports`). Precomputed by the reconciler via
-    /// [`route_hash_for`] so the (pure) diff can compare it against the
-    /// `route-hash` bookkeeping label stamped on the actual container, and force
-    /// a recreate when either changes — a deployment becoming/ceasing to be
-    /// active, or the published-port binding being added/removed. Docker can't
-    /// mutate a running container's labels or port bindings in place, so such a
-    /// transition must be reconciled by recreation.
-    pub route_hash: String,
-    /// Resolved monotonic generation for this container's `--name` suffix
-    /// (`..._g{n}`). NOT an identity field and NOT fed into routing or any hash.
-    /// `compute_desired_for_deployment` can't know it (it depends on the live
-    /// container's current generation), so it seeds `1` as a placeholder and the
-    /// diff resolves the real value before apply: a brand-new slot → `1`, a
-    /// recreate → live `g{n}` + 1.
-    pub generation: u32,
-    /// Zero-based replica index of this container within its spec (`0..N`). IS an
-    /// identity field (folded into [`identity_key`] and the `..._r{n}` name
-    /// segment) so each replica is matched/recreated independently. Deliberately
-    /// NOT fed into routing/recreate hashes, the network alias, or the Traefik
-    /// labels: all replicas of a spec carry one replica-free alias (Docker DNS
-    /// round-robins) and one router+service (Traefik load-balances).
-    pub replica: u32,
-    /// Effective HTTP health-probe path for this container (already resolved from
-    /// the spec's `health_check`): `Some("/healthz")` to probe, or `None` when the
-    /// probe is disabled or the container is a port-less worker. Drives the
-    /// Traefik load-balancer health-check labels (and is thus folded into the
-    /// rendered label set the route-hash covers, so changing the effective health
-    /// path forces a recreate), and gates the rolling-recreate throttle's
-    /// requirement that every OTHER replica be healthy before a running drifted
-    /// replica is recreated. NOT an identity field.
-    pub health_path: Option<String>,
-    /// Traefik load-balancer health-check interval, in seconds (the spec's
-    /// `period_seconds` when set). Only consulted when `health_path` is `Some`, to
-    /// render `...loadbalancer.healthcheck.interval`. `None` → a sensible default.
-    pub health_check_interval_secs: Option<i32>,
-    /// Traefik load-balancer health-check timeout, in seconds (the spec's
-    /// `timeout_seconds` when set). Same gating as `health_check_interval_secs`;
-    /// renders `...loadbalancer.healthcheck.timeout`. `None` → a sensible
-    /// default.
-    pub health_check_timeout_secs: Option<i32>,
-}
-
-/// Default Traefik health-check interval (Go duration `10s`) when the
-/// `health_check` spec sets no `period_seconds`.
-const DEFAULT_HEALTHCHECK_INTERVAL_SECS: i32 = 10;
-/// Default Traefik health-check timeout (Go duration `5s`) when the
-/// `health_check` spec sets no `timeout_seconds`. Matches the Kubernetes
-/// default (`HealthProbeConfig::timeout_seconds` = 5 in
-/// `resource_builder::create_http_probe_with_override`) so the same public
-/// input — a `health_check` with no explicit `timeout_seconds` — yields the
-/// same effective timeout on both backends (no Docker-stricter divergence
-/// that could mark a slow-but-healthy endpoint DOWN on Docker but UP on K8s).
-const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 5;
+// The desired-state shape, the name derivations and the Traefik label renderer
+// are backend-agnostic and now live in `rise-backend-core`, shared with the ECS
+// backend. Re-exported here so every existing `container_builder::…` path — in
+// this crate and in `rise-deploy` — resolves unchanged.
+pub use rise_backend_core::desired::{DesiredContainer, DesiredRoute};
+pub use rise_backend_core::naming::MAX_NAME_LEN;
+pub use rise_backend_core::naming::{container_name, group_app_name, stable_identity_name};
+pub use rise_backend_traefik::naming::{
+    deployment_service_base, group_service_base, group_service_name,
+};
+pub use rise_backend_traefik::naming::{deployment_service_names, MAX_SERVICE_BASE_LEN};
+pub use rise_backend_traefik::render::{
+    render_traefik_labels_for, routes_withheld, TraefikRenderConfig as _TraefikRenderConfig,
+};
 
 /// Static controller configuration the builder needs.
 pub struct BuilderConfig<'a> {
@@ -169,116 +68,39 @@ pub struct BuilderConfig<'a> {
     pub publish_app_ports: bool,
 }
 
+impl<'a> BuilderConfig<'a> {
+    /// Project onto the backend-agnostic renderer config. The Docker provider
+    /// needs `traefik.docker.network`, so the network is always `Some` here.
+    pub fn render_config(&self) -> TraefikRenderConfig<'_> {
+        TraefikRenderConfig {
+            label_namespace: self.label_namespace,
+            controller_class: self.controller_class,
+            traefik_entrypoint: self.traefik_entrypoint,
+            catalog_entrypoint: "rise-catalog",
+            traefik_certresolver: self.traefik_certresolver,
+            network: Some(self.traefik_network),
+            auth_backend_url: self.auth_backend_url,
+            access_classes: self.access_classes,
+        }
+    }
+}
+
+/// Compute the `route-hash` recreate signature for a desired container without
+/// building the full create spec, folding in this backend's `publish_app_ports`
+/// binding (a create-time-only property Docker can't mutate in place).
+pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> String {
+    rise_backend_traefik::render::route_hash_for(
+        desired,
+        &cfg.render_config(),
+        desired.port.is_some() && cfg.publish_app_ports,
+    )
+}
+
 /// Result of building one container: the deterministic name and the bollard
 /// create config (which already carries the network attachment).
 pub struct BuiltContainer {
     pub name: String,
-    pub config: Config<String>,
-}
-
-/// Maximum length of a Docker container name segment we emit before hashing.
-const MAX_NAME_LEN: usize = 63;
-
-/// Compute the live container's `--name`:
-/// `<prefix>_<project>_<group>_<deploymentid>_<container>_r<replica>_g<generation>`,
-/// sanitized to `[a-zA-Z0-9_.-]`, hash-suffixed when longer than
-/// [`MAX_NAME_LEN`]. The `_r{n}_g{n}` suffix is folded into the raw string BEFORE
-/// the length cap, so the >63-char hash-truncation branch still caps the whole
-/// string (suffix included). The replica index keeps each replica's name
-/// distinct; the generation makes a recreated container's name visibly newer
-/// than the one it replaced. Matching is by bookkeeping LABELS (the stable
-/// identity tuple including the replica), never by this name — see
-/// [`group_app_name`] for the group-scoped, deployment-id-free identity used by
-/// DNS / env.
-pub fn container_name(
-    prefix: &str,
-    project: &str,
-    deployment_group: &str,
-    deployment_id: &str,
-    container: &str,
-    replica: u32,
-    generation: u32,
-) -> String {
-    let raw = format!(
-        "{prefix}_{project}_{deployment_group}_{deployment_id}_{container}_r{replica}_g{generation}"
-    );
-    sanitize_and_cap(&raw)
-}
-
-/// Replica- and generation-FREE stable identity name:
-/// `<prefix>_<project>_<group>_<deploymentid>_<container>`, sanitized + capped
-/// the same way as [`container_name`] but with no `_r{n}` / `_g{n}` suffix.
-///
-/// Still deployment-id-BEARING (unlike [`group_app_name`]). Used only to
-/// synthesize a stable per-replica placeholder pod name for diagnostics when a
-/// replica has no live container yet (the diff appends `_r{n}`). The DNS-facing
-/// names — the network alias and the `RISE_CONTAINER_HOST__<NAME>` discovery host
-/// — are GROUP-scoped now (see [`group_app_name`]) so they stay stable across
-/// deployments, not just across replicas/generations of one deployment.
-pub fn stable_identity_name(
-    prefix: &str,
-    project: &str,
-    deployment_group: &str,
-    deployment_id: &str,
-    container: &str,
-) -> String {
-    let raw = format!("{prefix}_{project}_{deployment_group}_{deployment_id}_{container}");
-    sanitize_and_cap(&raw)
-}
-
-/// Group-scoped, deployment-id-FREE application name:
-/// `<prefix>_<project>_<group>_<container>`, sanitized + capped exactly like
-/// [`container_name`] but with NO deployment-id, replica, or generation segment.
-///
-/// This is the stable, deployment-id-free name shared by ALL of a group's
-/// deployments and replicas. EVERY container that belongs to a (project, group,
-/// container) — regardless of which deployment created it — attaches this same
-/// name as its Docker NETWORK ALIAS, so Docker's embedded DNS ROUND-ROBINS the
-/// alias across whatever containers currently carry it (matching the Kubernetes
-/// group Service, whose name is likewise deployment-id-free). It is also the
-/// `RISE_CONTAINER_HOST__<NAME>` sibling-discovery host. Because the name is
-/// stable across deployments, an old and a new deployment of the same group can
-/// share one DNS name during a rolling overlap — foundational for
-/// health-driven rolling-overlap routing.
-pub fn group_app_name(
-    prefix: &str,
-    project: &str,
-    deployment_group: &str,
-    container: &str,
-) -> String {
-    let raw = format!("{prefix}_{project}_{deployment_group}_{container}");
-    sanitize_and_cap(&raw)
-}
-
-/// Sanitize a raw name to `[a-zA-Z0-9_.-]` and hash-truncate it when it exceeds
-/// [`MAX_NAME_LEN`]. Shared by [`container_name`], [`stable_identity_name`] and
-/// [`group_app_name`] so the 63-char cap logic lives in one place.
-/// Deterministic: same input → same output.
-fn sanitize_and_cap(raw: &str) -> String {
-    let sanitized = sanitize_name(raw);
-    if sanitized.len() <= MAX_NAME_LEN {
-        return sanitized;
-    }
-    // Hash the full sanitized name and truncate the prefix to leave room for a
-    // short stable suffix. Deterministic: same inputs → same name.
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(sanitized.as_bytes());
-    let suffix: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    let suffix = &suffix[..10];
-    let keep = MAX_NAME_LEN - suffix.len() - 1;
-    format!("{}_{}", &sanitized[..keep], suffix)
-}
-
-fn sanitize_name(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    pub config: ContainerCreateBody,
 }
 
 /// Build the bollard create spec for one desired container.
@@ -299,7 +121,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     // detect create-time-only changes Docker can't apply to a running container
     // in place — routing transitions (a deployment becoming/ceasing to be
     // active) AND whether the app port is published to a loopback host port.
-    let traefik_labels = render_traefik_labels_for(desired, cfg);
+    let traefik_labels = render_traefik_labels_for(desired, &cfg.render_config());
     let route_hash = labels::hash_recreate_signature(
         &traefik_labels,
         desired.port.is_some() && cfg.publish_app_ports,
@@ -310,6 +132,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         label_namespace: cfg.label_namespace,
         controller_class: cfg.controller_class,
         project: &desired.project,
+        project_uuid: &desired.project_uuid,
         deployment_group: &desired.deployment_group,
         deployment_id: &desired.deployment_id,
         deployment_uuid: &desired.deployment_uuid,
@@ -435,8 +258,7 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
     let (exposed_ports, port_bindings) = match publish_port {
         Some(port) => {
             let key = format!("{port}/tcp");
-            let mut exposed: HashMap<String, HashMap<(), ()>> = HashMap::new();
-            exposed.insert(key.clone(), HashMap::new());
+            let exposed = vec![key.clone()];
             let mut bindings: bollard::models::PortMap = HashMap::new();
             bindings.insert(
                 key,
@@ -464,369 +286,19 @@ pub fn build_container(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> B
         ..Default::default()
     };
 
-    let config = Config {
+    let config = ContainerCreateBody {
         image: Some(desired.image.clone()),
         env: if env.is_empty() { None } else { Some(env) },
         labels: Some(all_labels),
         exposed_ports,
         host_config: Some(host_config),
-        networking_config: Some(bollard::container::NetworkingConfig {
-            endpoints_config: endpoints,
+        networking_config: Some(NetworkingConfig {
+            endpoints_config: Some(endpoints),
         }),
         ..Default::default()
     };
 
     BuiltContainer { name, config }
-}
-
-/// Maximum length of the human-readable (sanitized) portion of a Traefik
-/// router/service base name, before the `-{hex16}` injective suffix is appended.
-/// Comfortably inside Traefik/Docker name limits even with the suffix and any
-/// per-route `-{idx}` / `-auth` decorations [`group_service_name`] /
-/// [`render_traefik_labels_for`] add on top.
-const MAX_SERVICE_BASE_LEN: usize = 48;
-
-/// Group-scoped Traefik router/service BASE name for a (project, group,
-/// container), deployment-id-FREE so ALL routers/services/middlewares of a
-/// (project, group, container) are named IDENTICALLY across every deployment of
-/// the group. This lets an old and a new deployment share one Traefik service
-/// (their replica containers register as servers of the same load balancer),
-/// setting up health-driven rolling overlap. Mirrors the K8s group
-/// Service/Ingress naming, which is likewise deployment-id-free.
-///
-/// **Injective.** [`sanitize_router_name`] is lossy — it lowercases and
-/// collapses every run of non-`[a-z0-9]` to a single `-`, so distinct tuples
-/// that differ only in separators or case (e.g. `("a.b", …)` vs `("a-b", …)`,
-/// or `Foo` vs `foo`) would otherwise collapse to the SAME router/service name.
-/// Two projects pooled behind one Traefik load balancer is a multi-tenant
-/// boundary break (one project's labels could suppress the other's forwardAuth).
-/// To guarantee distinct tuples get distinct names, we append a short stable
-/// hash of the STRUCTURED `(project, group, container)` tuple — the first 8 bytes
-/// (16 hex chars) of a SHA-256 over a NUL-separated (collision-free, since NUL can't
-/// appear in any field) encoding of the three fields. The human-readable base
-/// is length-capped first so the total stays well within name limits.
-///
-/// Shared by [`render_traefik_labels_for`] (which stamps the labels) and the
-/// reconciler's `serverStatus` lookup (which queries `{service}@docker`) so the
-/// two can't drift on how the service is named.
-pub fn group_service_base(project: &str, deployment_group: &str, container: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut sanitized =
-        labels::sanitize_router_name(&format!("{project}-{deployment_group}-{container}"));
-    sanitized.truncate(MAX_SERVICE_BASE_LEN);
-    // Trim any trailing `-` left by truncation so the base reads cleanly before
-    // the suffix join (and never yields a `--` run).
-    let base = sanitized.trim_end_matches('-');
-
-    // Hash the STRUCTURED tuple (not the lossy sanitized string) with NUL field
-    // separators, so two tuples collide here only if they are byte-identical.
-    // 64 bits of suffix (16 hex chars): this name is a multi-tenant boundary and
-    // an attacker controls their own project/group/container names, so a shorter
-    // suffix would be grindable into a deliberate collision with a victim's
-    // service; 64 bits makes that infeasible.
-    let mut hasher = Sha256::new();
-    hasher.update(project.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(deployment_group.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(container.as_bytes());
-    let digest = hasher.finalize();
-    let suffix: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-
-    if base.is_empty() {
-        suffix
-    } else {
-        format!("{base}-{suffix}")
-    }
-}
-
-/// Per-route Traefik service/router name for route `route_idx` of a container
-/// that emits `route_count` routes. A single-route container uses the bare
-/// [`group_service_base`]; a multi-route container gets per-route services
-/// `{base}-{idx}` (so multiple path prefixes don't collide on one router/service
-/// name). The reconciler queries these SAME names for `serverStatus`, so the
-/// derivation lives in ONE place. Routes are sorted longest-path-prefix-first by
-/// [`render_traefik_labels_for`] before indexing, so callers that need the names
-/// in label order must sort the same way.
-pub fn group_service_name(base: &str, route_idx: usize, route_count: usize) -> String {
-    if route_count > 1 {
-        format!("{base}-{route_idx}")
-    } else {
-        base.to_string()
-    }
-}
-
-/// The full set of Traefik service names a container's routable routes emit, in
-/// the same order [`render_traefik_labels_for`] stamps them (longest path-prefix
-/// first). Empty when the container is not routable / portless / has no host.
-///
-/// The reconciler reads `serverStatus` for the same service(s) via the runtime
-/// [`DesiredContainer`]-free path
-/// ([`super::reconciler::service_names_for_spec`]); this `DesiredContainer`-based
-/// form is the reference used to assert the two derivations agree.
-#[cfg(test)]
-pub fn group_service_names(desired: &DesiredContainer) -> Vec<String> {
-    if desired.port.filter(|_| desired.routable).is_none() {
-        return Vec::new();
-    }
-    let base = group_service_base(
-        &desired.project,
-        &desired.deployment_group,
-        &desired.container,
-    );
-    let mut routes = desired.routes.clone();
-    routes.sort_by(|a, b| {
-        let al = a.path_prefix.as_deref().unwrap_or("/").len();
-        let bl = b.path_prefix.as_deref().unwrap_or("/").len();
-        bl.cmp(&al)
-    });
-    // Enumerate over the FULL sorted list (matching `render_traefik_labels_for`,
-    // where the `{base}-{idx}` index is the position in the full list and the
-    // multi-route test is `routes.len() > 1`), but only emit a name for routes
-    // that actually produce a router — those with at least one host.
-    let route_count = routes.len();
-    routes
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| !r.hosts.is_empty())
-        .map(|(idx, _)| group_service_name(&base, idx, route_count))
-        .collect()
-}
-
-/// Whether all Traefik routers must be withheld for a container because its
-/// access class is unknown, or at least one effective route needs forwardAuth
-/// but no backend URL is configured. Dropping only the gated router would let a
-/// broader public sibling serve that path, so the whole container fails closed.
-///
-/// This is the authoritative predicate for label rendering, desired routability,
-/// and readiness. Route overrides are included so all three paths agree when a
-/// public project tightens only one route.
-pub(crate) fn routes_withheld<'a>(
-    access_class: &str,
-    access_classes: &HashMap<String, AccessRequirement>,
-    auth_backend_url: &str,
-    route_overrides: impl IntoIterator<Item = Option<&'a AccessRequirement>>,
-) -> bool {
-    let mut route_overrides = route_overrides.into_iter().peekable();
-    // A removed/renamed class is a control-plane configuration error. Route
-    // overrides must never weaken that failure into public access: Kubernetes
-    // emits no ingress for the same state, so Docker withholds every router too.
-    let Some(project_requirement) = access_classes.get(access_class) else {
-        return route_overrides.peek().is_some();
-    };
-    if !auth_backend_url.trim().is_empty() {
-        return false;
-    }
-    route_overrides.any(|route_override| {
-        !matches!(
-            rise_backend_core::effective_access_requirement(route_override, project_requirement),
-            AccessRequirement::None
-        )
-    })
-}
-
-/// Render the full Traefik label map for a desired container.
-///
-/// Empty when the container is not routable, has no port (worker), or has no
-/// host to route. Every infra-bearing deployment of a group is routable — the
-/// old active and the new Deploying deployment both advertise a router on the
-/// shared `Host(...)` rule and join the one group-scoped Traefik service, and
-/// Traefik's per-server health check drains the old servers as the new ones come
-/// up (the rolling overlap). `routable` is `false` only when the router is
-/// withheld (unknown access class, or auth required without an
-/// `auth_backend_url`), so a misconfigured deployment never advertises an
-/// unauthenticated router.
-fn render_traefik_labels_for(
-    desired: &DesiredContainer,
-    cfg: &BuilderConfig<'_>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let Some(port) = desired.port.filter(|_| desired.routable) else {
-        return out;
-    };
-
-    // Resolve the project's access requirement. For Authenticated/Member, and
-    // when an internal backend URL is configured, build the Traefik forwardAuth
-    // address pointing at Rise's ingress-auth endpoint. `signin_redirect=1` puts
-    // the handler in Traefik mode (302 to the login page on unauthenticated,
-    // since Traefik has no nginx-style auth-signin). The project name is
-    // URL-encoded into the query. `None` leaves forward_auth unset → no auth.
-    //
-    // FAIL CLOSED on an unknown access class: a project referencing a
-    // missing/removed class must NOT silently become public (mirroring the K8s
-    // path, which errors on an unknown class). Route overrides cannot weaken a
-    // missing class, so suppress every router rather than inventing a default.
-    let requirement = match cfg.access_classes.get(&desired.access_class) {
-        Some(req) => req.clone(),
-        None => {
-            tracing::error!(
-                project = %desired.project,
-                access_class = %desired.access_class,
-                "Access class not configured — withholding all Traefik routers \
-                 to avoid a silent public route"
-            );
-            return out;
-        }
-    };
-    // Per-route effective requirement decides that router's forwardAuth. The
-    // address stamps `&access=<req>` so the shared `ingress_auth` handler enforces
-    // exactly this route group's requirement (never re-matching the request path).
-    // `signin_redirect=1` puts the handler in Traefik mode (302 to login on
-    // unauthenticated). A `None` route gets no middleware (open); an auth route on
-    // a project whose `auth_backend_url` is empty is withheld per-route below.
-    let route_forward_auth = |route_requirement: &AccessRequirement| -> RouteForwardAuth {
-        match route_requirement {
-            AccessRequirement::None => RouteForwardAuth::Open,
-            AccessRequirement::Authenticated | AccessRequirement::Member => {
-                if cfg.auth_backend_url.trim().is_empty() {
-                    RouteForwardAuth::Withheld
-                } else {
-                    RouteForwardAuth::Gated(format!(
-                        "{}/api/v1/auth/ingress?project={}&access={}&signin_redirect=1",
-                        cfg.auth_backend_url.trim().trim_end_matches('/'),
-                        urlencoding::encode(&desired.project),
-                        route_requirement.as_query_param(),
-                    ))
-                }
-            }
-        }
-    };
-
-    // FAIL CLOSED: an unknown access class or an auth-required route without a
-    // forwardAuth address must expose nothing. Stamping a router in either state
-    // could turn a control-plane error into public access.
-    if routes_withheld(
-        &desired.access_class,
-        cfg.access_classes,
-        cfg.auth_backend_url,
-        desired
-            .routes
-            .iter()
-            .filter(|route| !route.hosts.is_empty())
-            .map(|route| route.access.as_ref()),
-    ) {
-        tracing::warn!(
-            project = %desired.project,
-            access_class = %desired.access_class,
-            "Withholding Traefik router(s): access class is unknown or forwardAuth \
-             could not be wired — refusing to expose an unauthenticated public route"
-        );
-        return out;
-    }
-
-    // One router per (host-set × route). Single-container apps have a single
-    // `/` route, so this yields exactly one router. Longest path-prefix first
-    // matches the nginx semantics used by the K8s path.
-    let mut routes = desired.routes.clone();
-    routes.sort_by(|a, b| {
-        let al = a.path_prefix.as_deref().unwrap_or("/").len();
-        let bl = b.path_prefix.as_deref().unwrap_or("/").len();
-        bl.cmp(&al)
-    });
-    // GROUP-scoped router/service base name — deployment-id-FREE, shared with
-    // the reconciler's `serverStatus` lookup via [`group_service_base`] so the
-    // two can't drift. Distinct per-route service names (`{base}-{idx}` when
-    // there is more than one route) keep multiple path prefixes from colliding;
-    // [`group_service_name`] is the single source for that derivation.
-    let route_count = routes.len();
-    let base = group_service_base(
-        &desired.project,
-        &desired.deployment_group,
-        &desired.container,
-    );
-    for (idx, route) in routes.iter().enumerate() {
-        if route.hosts.is_empty() {
-            continue;
-        }
-        // Effective requirement: the route's `access` override, else the
-        // project's (already failed-closed to Member on an unknown class).
-        let route_requirement = route.access.clone().unwrap_or_else(|| requirement.clone());
-        let forward_auth_address = match route_forward_auth(&route_requirement) {
-            RouteForwardAuth::Open => None,
-            RouteForwardAuth::Gated(address) => Some(address),
-            // Unreachable: the pre-loop scan above withholds the whole container
-            // if any route is Withheld. Fail closed defensively regardless.
-            RouteForwardAuth::Withheld => continue,
-        };
-        let router_name = group_service_name(&base, idx, route_count);
-        let traefik = labels::render_traefik_labels(&TraefikRoute {
-            router_name: &router_name,
-            hosts: &route.hosts,
-            path_prefix: route.path_prefix.as_deref(),
-            port,
-            entrypoint: cfg.traefik_entrypoint,
-            network: cfg.traefik_network,
-            certresolver: cfg.traefik_certresolver,
-            forward_auth: forward_auth_address.as_deref().map(|address| ForwardAuth {
-                address,
-                auth_response_headers: "X-Auth-Request-Email,X-Auth-Request-User",
-            }),
-        });
-        out.extend(traefik);
-
-        // Explicit longest-prefix-first router priority (parity with nginx's
-        // implicit longest-match). Traefik would otherwise fall back to implicit
-        // rule-LENGTH priority, which conflates host-rule length with path
-        // specificity; deriving the priority from the route's path-prefix length
-        // makes a more-specific prefix (`/api/v1`) deterministically outrank a
-        // shorter/host-only one (`/`). The `+1` keeps even a host-only (empty/`/`)
-        // route at a positive, non-zero priority.
-        let path_len = route
-            .path_prefix
-            .as_deref()
-            .filter(|p| !p.is_empty() && *p != "/")
-            .map(str::len)
-            .unwrap_or(0);
-        out.insert(
-            format!("traefik.http.routers.{router_name}.priority"),
-            (path_len + 1).to_string(),
-        );
-
-        // Traefik load-balancer health-check labels — emitted when this container
-        // has an effective health path (a `health_check` is configured). A
-        // ready-when-running container (no `health_check`) emits none. The service
-        // name matches the router/service base (`router_name`), so the check
-        // attaches to this route's service. These labels are part of the rendered
-        // set, so toggling them changes the route-hash and forces a recreate
-        // automatically.
-        if let Some(health_path) = desired.health_path.as_deref() {
-            let interval = desired
-                .health_check_interval_secs
-                .unwrap_or(DEFAULT_HEALTHCHECK_INTERVAL_SECS);
-            let timeout = desired
-                .health_check_timeout_secs
-                .unwrap_or(DEFAULT_HEALTHCHECK_TIMEOUT_SECS);
-            out.insert(
-                format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.path"),
-                health_path.to_string(),
-            );
-            out.insert(
-                format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.interval"),
-                format!("{interval}s"),
-            );
-            out.insert(
-                format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.timeout"),
-                format!("{timeout}s"),
-            );
-            out.insert(
-                format!("traefik.http.services.{router_name}.loadbalancer.healthcheck.scheme"),
-                "http".to_string(),
-            );
-        }
-    }
-    out
-}
-
-/// Compute the `route-hash` recreate signature for a desired container without
-/// building the full create spec. Used by the reconciler's diff so a routing
-/// transition (a deployment becoming or ceasing to be active) OR a change in
-/// whether the app port is published to a loopback host port forces a recreate.
-/// Must stay consistent with the hash stamped by [`build_container`].
-pub fn route_hash_for(desired: &DesiredContainer, cfg: &BuilderConfig<'_>) -> String {
-    labels::hash_recreate_signature(
-        &render_traefik_labels_for(desired, cfg),
-        desired.port.is_some() && cfg.publish_app_ports,
-    )
 }
 
 #[cfg(test)]
@@ -870,6 +342,7 @@ mod tests {
     fn single_container() -> DesiredContainer {
         DesiredContainer {
             project: "myapp".to_string(),
+            project_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
             access_class: "public".to_string(),
             deployment_group: "default".to_string(),
             deployment_id: "20260101-120000".to_string(),
@@ -1066,6 +539,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .endpoints_config
+            .as_ref()
+            .unwrap()
             .get("rise_default")
             .unwrap()
             .aliases
@@ -1104,6 +579,8 @@ mod tests {
                 .networking_config
                 .unwrap()
                 .endpoints_config
+                .as_ref()
+                .unwrap()
                 .get("rise_default")
                 .unwrap()
                 .aliases
@@ -1135,6 +612,8 @@ mod tests {
                 .networking_config
                 .unwrap()
                 .endpoints_config
+                .as_ref()
+                .unwrap()
                 .get("rise_default")
                 .unwrap()
                 .aliases
@@ -1179,13 +658,12 @@ mod tests {
             t0, t1,
             "replicas must render identical Traefik labels (shared router+service)"
         );
-        // Spot-check the shared service/router name is group-scoped (replica- and
-        // deployment-id-free). The base carries the injective `-{hex16}` suffix.
-        let base = group_service_base("myapp", "default", "app");
+        // Replicas share the deployment-scoped service name.
+        let base = deployment_service_base("myapp", "default", &r0.deployment_id, "app");
         assert!(t0.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
-        assert!(t0.contains_key(&format!("traefik.http.routers.{base}.rule")));
+        assert!(t0.contains_key(&format!("traefik.http.routers.{base}-catalog.rule")));
         assert!(
             !t0.keys().any(|k| k.contains("-r0") || k.contains("-r1")),
             "Traefik router/service names must not include a replica index"
@@ -1197,10 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn traefik_names_stable_across_different_deployment_ids() {
-        // Two DIFFERENT deployment_ids of the same (project, group, container)
-        // must render the SAME Traefik service/router names, so an old and a new
-        // deployment register as servers of ONE Traefik service (rolling overlap).
+    fn traefik_names_isolate_different_deployment_ids() {
         let cfg = test_cfg();
         let mut d1 = single_container();
         d1.deployment_id = "20260101-120000".to_string();
@@ -1216,14 +691,14 @@ mod tests {
                 .filter(|(k, _)| k.starts_with("traefik."))
                 .collect()
         };
-        assert_eq!(
+        assert_ne!(
             traefik_of(&d1),
             traefik_of(&d2),
-            "different deployments of a group must share one Traefik router+service"
+            "different deployments must publish distinct native-provider services"
         );
         let t = traefik_of(&d1);
-        let base = group_service_base("myapp", "default", "app");
-        assert!(t.contains_key(&format!("traefik.http.routers.{base}.rule")));
+        let base = deployment_service_base("myapp", "default", &d1.deployment_id, "app");
+        assert!(t.contains_key(&format!("traefik.http.routers.{base}-catalog.rule")));
         assert!(t.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
@@ -1253,17 +728,18 @@ mod tests {
             labels.get("rise.dev/image").map(String::as_str),
             Some("registry.example.test/rise/myapp:20260101-120000")
         );
-        // Traefik router present for the single `/` route.
+        // The native provider publishes the deployment service through an
+        // internal catalog router; public routing comes from the HTTP provider.
         assert_eq!(
             labels.get("traefik.enable").map(String::as_str),
             Some("true")
         );
-        let base = group_service_base("myapp", "default", "app");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{base}.rule"))
+                .get(&format!("traefik.http.routers.{base}-catalog.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`)")
+            Some("PathPrefix(`/`)")
         );
         assert_eq!(
             labels
@@ -1435,7 +911,7 @@ mod tests {
             .exposed_ports
             .as_ref()
             .expect("exposed_ports must be set when publishing");
-        assert!(exposed.contains_key("8080/tcp"));
+        assert!(exposed.iter().any(|p| p == "8080/tcp"));
 
         let bindings = built
             .config
@@ -1646,21 +1122,20 @@ mod tests {
         ];
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
-        // Two routers, index suffixed. Longest prefix (/api/v1) sorts first → -0.
-        let base = group_service_base("myapp", "default", "api");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "api");
         let r0 = group_service_name(&base, 0, 2);
         let r1 = group_service_name(&base, 1, 2);
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{r0}.rule"))
+                .get(&format!("traefik.http.routers.{r0}-catalog.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`) && (Path(`/api/v1`) || PathPrefix(`/api/v1/`))")
+            Some("PathPrefix(`/`)")
         );
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{r1}.rule"))
+                .get(&format!("traefik.http.routers.{r1}-catalog.rule"))
                 .map(String::as_str),
-            Some("Host(`myapp.rise.dev`)")
+            Some("PathPrefix(`/`)")
         );
     }
 
@@ -1686,26 +1161,12 @@ mod tests {
         ];
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
-        let base = group_service_base("myapp", "default", "api");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "api");
         // r0 = longest prefix (/api/v1, sorts first); r1 = host-only (/).
         let r0 = group_service_name(&base, 0, 2);
         let r1 = group_service_name(&base, 1, 2);
-        let p0: usize = labels
-            .get(&format!("traefik.http.routers.{r0}.priority"))
-            .expect("longer-prefix route must carry a priority label")
-            .parse()
-            .unwrap();
-        let p1: usize = labels
-            .get(&format!("traefik.http.routers.{r1}.priority"))
-            .expect("host-only route must carry a priority label")
-            .parse()
-            .unwrap();
-        assert!(
-            p0 > p1,
-            "longer prefix /api/v1 (priority {p0}) must outrank host-only / (priority {p1})"
-        );
-        // Host-only route still has a positive, non-zero priority.
-        assert!(p1 >= 1, "host-only route priority must be positive");
+        assert!(!labels.contains_key(&format!("traefik.http.routers.{r0}.priority")));
+        assert!(!labels.contains_key(&format!("traefik.http.routers.{r1}.priority")));
     }
 
     #[test]
@@ -1715,30 +1176,24 @@ mod tests {
         // heuristic.
         let built = build_container(&single_container(), &test_cfg());
         let labels = built.config.labels.as_ref().unwrap();
-        let base = group_service_base("myapp", "default", "app");
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{base}.priority"))
-                .map(String::as_str),
-            Some("1"),
-            "host-only single route gets priority 1 (path_len 0 + 1)"
-        );
+        let base = deployment_service_base("myapp", "default", "20260101-120000", "app");
+        assert!(!labels.contains_key(&format!("traefik.http.routers.{base}.priority")));
     }
 
     #[test]
-    fn group_service_names_single_route_matches_emitted_service_label() {
+    fn deployment_service_names_single_route_matches_emitted_service_label() {
         // A single-route container's `serverStatus` lookup name must equal the
         // bare base service the labels stamp (`{project}-{group}-{container}`).
         let desired = single_container();
         let built = build_container(&desired, &test_cfg());
         let labels = built.config.labels.unwrap();
-        let base = group_service_base("myapp", "default", "app");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         // The label set carries exactly one loadbalancer service for the base.
         assert!(labels.contains_key(&format!(
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
 
-        let names = group_service_names(&desired);
+        let names = deployment_service_names(&desired);
         assert_eq!(names, vec![base.clone()]);
         // Every derived name corresponds to a service the labels actually emit.
         for name in &names {
@@ -1752,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn group_service_names_multi_route_matches_per_route_service_labels() {
+    fn deployment_service_names_multi_route_matches_per_route_service_labels() {
         // A multi-route container emits per-route services `{base}-{idx}`; the
         // reconciler's lookup names must match those EXACTLY (the bug behind the
         // 404 → serverStatus None fallback for multi-route containers).
@@ -1774,7 +1229,7 @@ mod tests {
         let labels = built.config.labels.unwrap();
 
         // Labels emit per-route services -0 (longest prefix /api/v1) and -1 (/).
-        let base = group_service_base("myapp", "default", "api");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "api");
         let svc0 = group_service_name(&base, 0, 2);
         let svc1 = group_service_name(&base, 1, 2);
         assert!(labels.contains_key(&format!(
@@ -1788,7 +1243,7 @@ mod tests {
             "traefik.http.services.{base}.loadbalancer.server.port"
         )));
 
-        let names = group_service_names(&desired);
+        let names = deployment_service_names(&desired);
         assert_eq!(
             names,
             vec![svc0.clone(), svc1.clone()],
@@ -1805,16 +1260,16 @@ mod tests {
     }
 
     #[test]
-    fn group_service_names_empty_for_non_routable_or_worker() {
+    fn deployment_service_names_empty_for_non_routable_or_worker() {
         // Non-routable (router-withheld) container: no Traefik service, so no lookup.
         let mut non_routable = single_container();
         non_routable.routable = false;
-        assert!(group_service_names(&non_routable).is_empty());
+        assert!(deployment_service_names(&non_routable).is_empty());
         // Worker (no port): never routed.
         let mut worker = single_container();
         worker.port = None;
         worker.routes = vec![];
-        assert!(group_service_names(&worker).is_empty());
+        assert!(deployment_service_names(&worker).is_empty());
     }
 
     #[test]
@@ -1826,19 +1281,8 @@ mod tests {
         let desired = single_container();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let base = group_service_base("myapp", "default", "app");
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{base}.tls"))
-                .map(String::as_str),
-            Some("true")
-        );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{base}.tls.certresolver"))
-                .map(String::as_str),
-            Some("le")
-        );
+        assert!(!labels.keys().any(|key| key.ends_with(".tls")));
+        assert!(!labels.keys().any(|key| key.ends_with(".tls.certresolver")));
     }
 
     /// An access-class map where `public` is `None` and `private` is `Member`.
@@ -1850,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn private_access_class_stamps_forward_auth_labels() {
+    fn private_access_class_keeps_forward_auth_out_of_native_labels() {
         let map = public_private_map();
         let cfg = BuilderConfig {
             // Config values are trimmed before constructing the middleware URL.
@@ -1862,33 +1306,11 @@ mod tests {
         desired.access_class = "private".to_string();
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let r = group_service_base("myapp", "default", "app");
-        assert_eq!(
-            labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
-                ))
-                .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
-        );
-        assert_eq!(
-            labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.authResponseHeaders"
-                ))
-                .map(String::as_str),
-            Some("X-Auth-Request-Email,X-Auth-Request-User")
-        );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{r}.middlewares"))
-                .map(String::as_str),
-            Some(format!("{r}-auth@docker").as_str())
-        );
+        assert!(labels.keys().all(|key| !key.contains("forwardauth")));
     }
 
     #[test]
-    fn per_route_access_overrides_forward_auth_independently() {
+    fn per_route_access_stays_out_of_native_provider_labels() {
         // A public project (access_class None) with two routes: `/` inherits
         // public, `/admin` is tightened to Member. Only the `/admin` router gets
         // forwardAuth, and its address stamps `&access=Member`.
@@ -1915,44 +1337,22 @@ mod tests {
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
 
-        // Routers are indexed longest-path-prefix first, so `/admin` (idx 0)
-        // precedes `/` (idx 1).
-        let base = group_service_base("myapp", "default", "app");
+        let base = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         let member_router = group_service_name(&base, 0, 2);
         let public_router = group_service_name(&base, 1, 2);
 
         assert_eq!(
             labels
-                .get(&format!("traefik.http.routers.{member_router}.rule"))
-                .map(String::as_str),
-            Some("Host(`myapp.rise.dev`) && (Path(`/admin`) || PathPrefix(`/admin/`))"),
-            "the gated route must not capture a neighboring path such as /administrator"
-        );
-
-        // `/` router: no forwardAuth middleware.
-        assert!(
-            labels
-                .get(&format!("traefik.http.routers.{public_router}.middlewares"))
-                .is_none(),
-            "public route must not be gated"
-        );
-        // `/admin` router: forwardAuth wired with `&access=Member`.
-        assert_eq!(
-            labels
                 .get(&format!(
-                    "traefik.http.middlewares.{member_router}-auth.forwardauth.address"
+                    "traefik.http.routers.{member_router}-catalog.rule"
                 ))
                 .map(String::as_str),
-            Some(
-                "http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1"
-            )
+            Some("PathPrefix(`/`)")
         );
-        assert_eq!(
-            labels
-                .get(&format!("traefik.http.routers.{member_router}.middlewares"))
-                .map(String::as_str),
-            Some(format!("{member_router}-auth@docker").as_str())
-        );
+        assert!(labels.contains_key(&format!(
+            "traefik.http.routers.{public_router}-catalog.rule"
+        )));
+        assert!(labels.keys().all(|key| !key.contains("forwardauth")));
     }
 
     #[test]
@@ -2013,7 +1413,7 @@ mod tests {
     fn private_access_class_without_backend_url_stamps_no_forward_auth() {
         // Member requirement but no auth_backend_url → forwardAuth disabled.
         // In a running backend this state is unreachable because startup fails
-        // closed (see settings::docker_access_classes_missing_auth_backend_url);
+        // closed (see settings::access_classes_missing_auth_backend_url);
         // the builder still refuses to stamp an auth-less middleware here.
         let mut map = HashMap::new();
         map.insert("private".to_string(), AccessRequirement::Member);
@@ -2151,20 +1551,12 @@ mod tests {
         member_c.access_class = "private".to_string();
         let member_built = build_container(&member_c, &set_cfg);
         let member_labels = member_built.config.labels.as_ref().unwrap();
-        let r = group_service_base("myapp", "default", "app");
         assert_eq!(
             member_labels.get("traefik.enable").map(String::as_str),
             Some("true"),
             "Member route IS routed when forwardAuth can be wired"
         );
-        assert_eq!(
-            member_labels
-                .get(&format!(
-                    "traefik.http.middlewares.{r}-auth.forwardauth.address"
-                ))
-                .map(String::as_str),
-            Some("http://rise:3000/api/v1/auth/ingress?project=myapp&access=Member&signin_redirect=1")
-        );
+        assert!(member_labels.keys().all(|key| !key.contains("forwardauth")));
     }
 
     #[test]
@@ -2189,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn forward_auth_changes_route_hash() {
+    fn forward_auth_does_not_change_native_service_hash() {
         let map = public_private_map();
         let cfg = BuilderConfig {
             auth_backend_url: "http://rise:3000",
@@ -2200,10 +1592,10 @@ mod tests {
         public_c.access_class = "public".to_string();
         let mut private_c = single_container();
         private_c.access_class = "private".to_string();
-        assert_ne!(
+        assert_eq!(
             route_hash_for(&public_c, &cfg),
             route_hash_for(&private_c, &cfg),
-            "access-class change must change the route hash to trigger recreate"
+            "public auth policy belongs to the HTTP provider, not native service labels"
         );
     }
 
@@ -2218,7 +1610,7 @@ mod tests {
         desired.health_check_timeout_secs = None;
         let built = build_container(&desired, &cfg);
         let labels = built.config.labels.as_ref().unwrap();
-        let svc = group_service_base("myapp", "default", "app");
+        let svc = deployment_service_base("myapp", "default", &desired.deployment_id, "app");
         assert_eq!(
             labels
                 .get(&format!(

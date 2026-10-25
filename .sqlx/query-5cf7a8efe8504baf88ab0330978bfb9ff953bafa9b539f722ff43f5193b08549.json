@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO deployment_container_observations (\n                deployment_id, subject, container, instance, replica, state,\n                started_at, finished_at, exit_code, restart_count, health, reason,\n                image, observed_at\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())\n            ON CONFLICT (deployment_id, subject) DO UPDATE SET\n                container = EXCLUDED.container,\n                instance = EXCLUDED.instance,\n                replica = EXCLUDED.replica,\n                state = EXCLUDED.state,\n                started_at = EXCLUDED.started_at,\n                finished_at = EXCLUDED.finished_at,\n                exit_code = EXCLUDED.exit_code,\n                restart_count = EXCLUDED.restart_count,\n                health = EXCLUDED.health,\n                reason = EXCLUDED.reason,\n                image = EXCLUDED.image,\n                observed_at = NOW()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Int4",
+        "Text",
+        "Timestamptz",
+        "Timestamptz",
+        "Int8",
+        "Int8",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5cf7a8efe8504baf88ab0330978bfb9ff953bafa9b539f722ff43f5193b08549"
+}

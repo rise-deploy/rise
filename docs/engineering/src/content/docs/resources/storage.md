@@ -104,6 +104,20 @@ reference with `blockOwnerDeletion: true` additionally keeps that owner visible
 until the dependent is collected. Owner references are lifecycle-only and
 confer no authorization.
 
+## Labels
+
+`metadata.labels` is a flat string-to-string map, stored in the
+`resources.labels` JSONB column. A resource's *effective* labels are resolved
+by nearest-wins inheritance down its ancestry (ADR-0001 §6.1), not stored
+per-row, so `labels` always holds only what that resource sets itself.
+
+Two GIN indexes support the two directions authorization reads this column: a
+default `jsonb_ops` index (`resources_labels_gin`, partial on live rows)
+accelerates `labels ? <key>` existence lookups — `list_label_setters` uses it
+to find every resource that sets a given key without a subtree walk. It uses
+the default operator class rather than `owner_references`'s `jsonb_path_ops`
+because `?` is not supported by `jsonb_path_ops`.
+
 ## Lifecycle: create
 
 The create path validates the spec (via the typed validator for built-ins, JSON Schema for external custom resources), generates a discriminator, and inserts the row at `revision = 1`. Same-level name and discriminator conflicts surface as `409 Conflict`.

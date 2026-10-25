@@ -31,6 +31,21 @@ RISE_IMAGE_REPOSITORY=ghcr.io/rise-deploy/rise \
 RISE_E2E_BACKEND=minikube RISE_IMAGE_TAG=<tag> \
   cargo run --manifest-path tests/e2e/Cargo.toml
 
+# ECS backend (runs against the persistent environment — see "ECS Backend"
+# below, and apply bootstrap/ once first).
+AWS_PROFILE=<scratch> AWS_REGION=eu-central-1 \
+RISE_E2E_BACKEND=ecs RISE_E2E_ENV=rise-e2e RISE_IMAGE_TAG=<published-tag> \
+  cargo run --manifest-path tests/e2e/Cargo.toml
+
+# AWS install suite (no Rise backend, no AWS account; needs terraform, aws v2
+# and a running Floci -- see "AWS Install Suite" below).
+docker run -d --name floci -p 4566:4566 \
+  -e FLOCI_SERVICES_ECS_MOCK=true -e FLOCI_SERVICES_RDS_MOCK=true \
+  -e FLOCI_SERVICES_ELBV2_MOCK=true -e FLOCI_SERVICES_EC2_MOCK=true \
+  floci/floci:nightly-09252026
+RISE_E2E_SUITE=aws-install \
+  cargo run --manifest-path tests/e2e/Cargo.toml
+
 # Local compose suite (no Rise backend; needs Docker and a rise CLI).
 RISE_E2E_SUITE=compose \
 RISE_BIN=./target/debug/rise \
@@ -50,7 +65,179 @@ cargo test --manifest-path tests/e2e/Cargo.toml
 ```
 
 Backend scenarios run in-order as one suite (they share the single backend
-bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
+bring-up). Set `RISE_E2E_SCENARIOS` to a comma-separated list of scenario ids to
+run only those, e.g. `RISE_E2E_SCENARIOS=device-login,scoped-device-login`. Standalone suites run separately via `RISE_E2E_SUITE`.
+
+## ECS Backend
+
+Unlike the other two backends this one runs against **real AWS**. There is
+setup to do once per account before the first run.
+
+The infrastructure half of it -- does the install apply, converge, grant what
+Rise needs and tear down -- runs against an emulator on every pull request; see
+[AWS Install Suite](#aws-install-suite). The runtime half cannot yet: LocalStack
+puts ECS behind a paid plan and Cloud Map behind its top one, and
+[Floci](https://github.com/floci-io/floci), which runs ECS tasks as real
+containers for free, reports awsvpc task addresses that nothing can route to.
+Its security-group mode maps those addresses onto the containers, but refuses
+to start an ECS task with it on (Docker rejects its `--dns` alongside the
+`container:` network mode it uses) and ships without the helper image it needs.
+Traefik discovers tasks by exactly that address, and Rise reaches Postgres and
+Dex through the Cloud Map names that resolve to it, so neither works until
+Floci fixes that. (Pushing to Floci's registry is covered: point
+`registry.registry_host` at it.)
+
+### On the machine
+
+`aws` (v2), `terraform` (pinned in `mise.toml`), and a working **Docker daemon**
+— the harness extracts the `rise` CLI out of the image with `docker cp`, and the
+`registry-build-push-pull` scenario builds a fixture image locally and pushes it
+to ECR.
+
+Your public address must be stable for the run: the harness authorizes it on the
+edge security group at bring-up and revokes it at teardown, and the group is
+closed the rest of the time. A VPN that reconnects mid-run will look like a hung
+scenario.
+
+### In the account
+
+Use a **sandbox account**. The stack creates IAM roles that carry `ecs:*`, so
+the caller needs IAM write permissions; that is not a credential to hold in an
+account you care about.
+
+1. **A default VPC with at least one subnet** in the region. The script takes
+   `Vpcs[?is-default]` and the first subnet under it, and fails if there is
+   none — a region where the default VPC has been deleted needs one recreated
+   (`aws ec2 create-default-vpc`).
+2. **Fargate on-demand vCPU headroom.** A fresh account's quota is **6**. The
+   control plane takes 1.5 (Traefik 0.25 + Postgres 0.5 + Dex 0.25 + Rise 0.5)
+   and each app task resolves to 0.5 — Rise's `500m` default rounds up to a
+   Fargate 512-unit size. **No scenario stops its deployment or deletes its
+   project**, so app tasks accumulate for the whole run: four scenarios deploy
+   one each (`public-deploy`, `registry-build-push-pull`, `private-ingress-auth`,
+   `route-access-override`; `sa-token-exchange` deploys none), for **~3.5 vCPU
+   at the end of a clean run**. That fits the default, but by one task — a stuck
+   task, a second concurrent run, or a stack a previous `KEEP=1` left up spends
+   the margin. Ask for **16** (Service Quotas → Amazon ECS → *Fargate On-Demand
+   vCPU resource count*), and suspect the quota first when a task will not leave
+   `PROVISIONING`.
+3. **A published `RISE_IMAGE_TAG`.** ECS pulls the control-plane image from
+   GHCR, so a local build is not visible to it. Same constraint the Docker
+   driver already has.
+4. **The domain delegated to the zone `bootstrap/` creates.** Set its
+   `dns_name_servers` output as the domain's nameservers at the registrar.
+   Watch for a second zone: registering through Route 53 Domains creates one
+   itself and delegates the domain there, so an apply leaves two zones for the
+   same name — both valid, with different nameservers, and records written to
+   the one the domain does *not* point at resolve for nobody. Keep exactly one.
+   The harness checks resolution at bring-up and prints the zone's nameservers
+   when it fails.
+
+The environment is **persistent** — applied once by hand, not per run. See
+[`bootstrap/README.md`](bootstrap/README.md) for what it creates and how to wire
+CI to it. Per run the harness applies `run/` — Traefik, Dex, Postgres and the
+control plane — so every run starts on a fresh database, a fresh proxy and the
+image under test, and destroys the lot afterwards.
+
+Rise and Traefik use the same [`runtime`](../../modules/rise-ecs/modules/runtime)
+module as production. The run workspace supplies scoped networking and the
+Postgres and Dex fixtures; the bootstrap supplies shared infrastructure and IAM.
+
+### Caller permissions
+
+Applying the bootstrap needs IAM write, which is why it is done by hand. Running
+the suite does not: `bootstrap/` creates a GitHub OIDC role holding only what
+a run needs — ECS, the EC2 describes plus edge security-group rules, Route 53
+record changes on the environment's zone, ECR and SSM for the sweep, S3 for the
+per-run state, and `iam:PassRole` on exactly the three pre-created roles. Nothing
+in the per-run path writes IAM.
+
+### Registry
+
+The environment runs with `registry: ecr` under a repository prefix, so the suite
+exercises the real path: Rise provisions a repository per project, the CLI pushes
+with the STS-scoped credentials Rise mints, and the task execution role pulls.
+
+### The scope, and what it isolates
+
+Every run picks a **scope** — `pr-<number>` in CI, `nightly` on the schedule and
+on a manual dispatch, `dev-<user>` locally — and that one token names everything
+the run touches, so concurrent runs share the cluster without seeing each other:
+
+| | |
+|---|---|
+| Terraform state | `run/<scope>/terraform.tfstate` |
+| DNS | `rise.<scope>.<zone>`, `dex.<scope>.<zone>` |
+| Controller class | `<scope>`, which is also this run's Traefik constraint |
+| ECS services, task families, log stream prefixes | `…-<scope>-…` |
+| Rise's own resource, ECR and SSM prefixes | scoped, so the sweep below can enumerate its own |
+
+Anything added here has to carry it. An unscoped ECS service name fails a
+concurrent run's `CreateService` outright; an unscoped ECR or SSM prefix is worse
+than that, because the bring-up sweep enumerates by prefix and would delete a
+live run's images and secrets. The per-run plan tests assert the scope on all of
+these.
+
+### Cleanup, and why the sweep runs at bring-up
+
+Deployments the suite creates are ECS services **Rise** owns, not Terraform.
+Destroying the per-run stack removes Rise *and its database*, after which nothing
+collects them — the reconciler only visits services whose project it can still
+see. Left alone they hold Fargate quota until a later run fails mid-suite.
+
+So teardown deletes projects through the API first (which also exercises project
+delete and ECR auto-removal), and bring-up sweeps by tag before anything else —
+a crashed or cancelled run never reaches teardown.
+
+The sweep is same-scope only, and so is Rise's own orphan collector, so a scope
+that never runs again would keep its leftovers for good — a pull request whose
+last run was cancelled mid-suite, or one merged and never re-labelled. The
+workflow's backstop destroys the Terraform stack, but nothing Rise created
+inside it.
+
+Bring-up therefore also **reaps scopes whose control plane is gone**. That is
+the condition that makes leftovers uncollectable in the first place: Rise is
+what would have retired them, and once its service is destroyed nothing will.
+It needs no clock and no notion of which pull requests are still open, and a
+scope mid-run counts as live from the moment its stack applies — before Rise
+has created anything to reap. It collects ECR repositories and SSM parameters;
+workload services of a dead scope still need the same-scope sweep, because
+identifying them cluster-wide means trusting a tag rather than a name.
+
+**`KEEP=1` leaves the per-run stack up** for inspection. It keeps consuming quota
+and leaves the edge open until you destroy it:
+
+```bash
+terraform -chdir=tests/e2e/run destroy -auto-approve
+```
+
+## AWS Install Suite
+
+`RISE_E2E_SUITE=aws-install` applies the documented production install --
+[`rise-aws`](../../modules/rise-aws) wired into
+[`rise-ecs`](../../modules/rise-ecs) as that module's README shows, from
+[`aws-install/`](aws-install) -- against [Floci](https://github.com/floci-io/floci),
+a local AWS emulator, and then:
+
+1. **plans it again.** Anything a second plan would change is a perpetual diff
+   an operator's every `apply` would churn. Attributes Floci itself reports
+   back differently are listed, with the reason, in `EMULATOR_DRIFT`
+   ([`src/aws_install.rs`](src/aws_install.rs)); anything else fails.
+2. **asks IAM whether the two modules agree.** rise-aws scopes its policies by
+   names it derives independently of rise-ecs, so a mismatch applies cleanly
+   and fails only when Rise first makes the call. The suite reads Rise's
+   environment off the control-plane task definition and runs
+   `iam simulate-principal-policy` for each call the control plane, its
+   workloads' execution role and Traefik make -- and for a few that must be
+   *denied*, since those are the scoping. Floci evaluates policies, condition
+   keys and AWS-managed policies faithfully enough for that.
+3. **destroys it**, which must succeed: deletion protection, secret recovery
+   windows and dependency order are the module's to get right.
+
+It needs no credentials, so CI runs it on every pull request, forks included
+(`E2E / AWS install (Floci)`). What it cannot say is whether Rise *runs* on
+ECS: Floci is started with ECS tasks, RDS, ELBv2 and EC2 mocked, so no
+container behind the install starts. That is the ECS suite's job.
 
 ## Layout
 
@@ -58,7 +245,16 @@ bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
   own stack: `DockerBackend` via `docker compose` (CLI extraction via `docker cp`,
   Traefik reach); `MinikubeBackend` via `minikube start` + `helm upgrade --install`
   + the JFrog/Vault registry stack + background `kubectl port-forward`s (server,
-  Dex, per-app reach).
+  Dex, per-app reach); `EcsBackend` by driving `terraform` against `run/` in a
+  persistent cluster, where Traefik, Postgres, Dex and Rise all run as ECS
+  services (CLI extraction via `docker cp`, reach via Traefik's address with an
+  explicit `Host` header).
+- `aws-install/` — the production install (rise-aws + rise-ecs) pointed at
+  Floci, driven by `src/aws_install.rs`.
+- `bootstrap/` — the persistent shell (VPC, cluster, zone, state bucket) and its
+  IAM, applied by hand.
+- `run/` — Traefik, Dex, Postgres and the control plane, applied and destroyed
+  per run.
 - `src/scenario.rs` — backend-agnostic scenarios + the matrix runner. Each
   `Scenario::applies_to(backend)` returns `Run` or `Skip(reason)`.
 - `src/compose.rs` — standalone `rise compose` suite. It runs the CLI directly
@@ -72,21 +268,29 @@ bring-up). Standalone suites run separately via `RISE_E2E_SUITE`.
 
 ## Scenarios
 
-| id                  | docker | minikube | asserts |
-|---------------------|--------|----------|---------|
-| `public-deploy`     | Run    | Run      | deploy a sample app → Healthy; HTTP 200 (+ body marker) |
-| `sa-token-exchange` | Run    | Run      | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
-| `loki-log-retention`| Skip   | Run      | stop deployment, pods gone, `/logs/volume` total>0 + `rise deployment logs` returns backlog (served by Loki) |
-| `helm-idempotency`  | Skip   | Run      | re-run `helm upgrade` applies cleanly |
-| `workload-identity` | Skip   | Run¹     | build fixture from source; `/identity` reports valid file+exchanged tokens, project-bound sub, matching iss; file token re-mints (new jti) |
+| id                  | docker | minikube | ECS  | asserts |
+|---------------------|--------|----------|------|---------|
+| `public-deploy`     | Run    | Run      | Run  | deploy a sample app → Healthy; HTTP 200 (+ body marker) |
+| `sa-token-exchange` | Run    | Run      | Run  | SA + Dex password-grant id_token + `RISE_IDENTITY` → `project list` returns the SA's project; un-exchanged token rejected |
+| `device-login` | Run | Run | Skip³ | `rise login --device` approved from a real browser session yields a session for the approver's `User`/`UserIdentity`; CLI and device sessions can't approve; a code redeems once; denial reaches the CLI |
+| `scoped-device-login` | Run | Run | Skip³ | a device login asking for, and granted, `deploy` on one environment (approved by an admin): the session deploys there through the CLI and lists only that project, environment and its deployments; production, the other project, project- and install-wide writes, and the resource API answer 403; granting `read` for a `deploy` request yields a session that can't deploy |
+| `resource-token-exchange` | Run | Run    | Skip² | resource `ServiceAccount` + `ServiceAccountTrustPolicy` (Dex); credential-less `POST …/token` with the Dex id_token mints an identity token; that token reaches the resource API only once a `PlatformRoleBinding` grants it; wrong claims and an unknown target are the same 401; operator delegation mints too |
+| `persistent-log-retention` | Skip | Run | Run | stop deployment, workload gone, `/logs/volume` total>0 + `rise deployment logs` returns retained backlog |
+| `helm-idempotency`  | Skip   | Run      | Skip | re-run `helm upgrade` applies cleanly |
+| `workload-identity` | Run    | Run¹     | Skip | build fixture from source; `/identity` reports valid file+exchanged tokens, project-bound sub, matching iss; file token re-mints (new jti) |
 
 ¹ minikube only in `jfrog-vault` registry mode (source build needs a cluster-pullable registry); otherwise `Skip`.
+
+² the ECS stack grants no operator, and the generic resource API needs one to author the resources the scenario exercises.
+
+³ the ECS stack's Dex serves only the password grant, not the browser sign-in that approves a device login.
 
 ## Standalone Suites
 
 | suite     | backend required | asserts |
 |-----------|------------------|---------|
 | `compose` | No               | `rise compose up` builds and starts `example/multi-container`; frontend and API routes respond; API reaches Redis; worker completes a Redis-backed job |
+| `aws-install` | No (Floci)   | rise-aws + rise-ecs apply from nothing; a second plan is empty; the control plane, execution and Traefik roles may make the calls Rise makes against what the install configured, and are denied a sample outside that scope; destroy succeeds |
 
 ## Upgrade Suite
 

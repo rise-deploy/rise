@@ -1,6 +1,7 @@
 [package]
 name = "rise-deployment-spec"
 version = "0.1.0"
+publish = false
 edition = "2021"
 license = "MIT OR Apache-2.0"
 

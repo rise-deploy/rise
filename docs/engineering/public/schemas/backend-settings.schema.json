@@ -86,6 +86,14 @@
           ],
           "description": "Optional active sync source for pulling users and groups from an external IdP.\nWhen configured, Rise will periodically query the IdP for users and groups\nassigned to the app and sync them as Rise teams."
         },
+        "admin_idp_groups": {
+          "default": [],
+          "description": "IdP groups whose members are admins, as an alternative to listing every\nadmin email in `admin_users`. A user matches when they belong to an\nIdP-managed team of that name (matching is case-insensitive). Blank\nentries are filtered out so an unset `${VAR}` default collapses to an\nempty list.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "admin_users": {
           "default": [],
           "description": "List of admin user emails for the default organization. Admins do NOT\nimplicitly receive the Operator role — list the email in\n`operator_users` separately if needed.",
@@ -123,21 +131,34 @@
         "client_secret": {
           "type": "string"
         },
-        "controllers": {
-          "default": [],
-          "description": "Trusted external controller identities. Each entry binds a stable\ncontroller ID to an OIDC issuer plus required claim constraints.\nUsed by generic-resource controller endpoints.",
-          "items": {
-            "$ref": "#/$defs/ControllerIdentity"
-          },
-          "type": "array"
+        "idp_group_claim": {
+          "default": "groups",
+          "description": "Claim in the IdP ID token that contains group names (default: \"groups\").\nFor example, AWS Cognito commonly exposes groups as \"cognito:groups\".",
+          "type": "string"
         },
         "idp_group_sync_enabled": {
           "default": true,
-          "description": "Enable IdP group synchronization (default: true)\nWhen enabled, user team memberships are automatically synced from IdP groups claim on login",
+          "description": "Enable IdP group synchronization (default: true).\nWhen enabled, user team memberships are synchronized from the configured\nIdP group claim on login.",
           "type": "boolean"
+        },
+        "idp_group_sync_prefixes": {
+          "default": [],
+          "description": "Optional prefixes limiting which canonical IdP group names are mirrored\ninto Rise teams during login. An empty list accepts every canonical\ngroup name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "issuer": {
           "type": "string"
+        },
+        "operator_idp_groups": {
+          "default": [],
+          "description": "IdP groups whose members hold the Operator role, as an alternative to\nlisting every Operator email in `operator_users`. Matches the same way\nas `admin_idp_groups`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "operator_users": {
           "default": [],
@@ -176,32 +197,6 @@
         "issuer",
         "client_id",
         "client_secret"
-      ],
-      "type": "object"
-    },
-    "ControllerIdentity": {
-      "description": "A trusted external controller identity configured under `auth.controllers`.\n\nEach entry binds a stable controller ID (the key used under\n`status.controllers`) to an OIDC issuer plus required claim constraints.\n`claims.aud` is mandatory. Wildcards follow [`validate_custom_claims`]\nglob rules (`*` matches any sequence of characters).",
-      "properties": {
-        "claims": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "description": "Expected string-valued claim constraints. `aud` is required and may\nmatch either a string JWT `aud` or one member of an array JWT `aud`.\nPut `sub` here when a subject constraint is needed. Glob `*` supported.",
-          "type": "object"
-        },
-        "id": {
-          "description": "Stable controller ID written under `status.controllers`. Must be a\nDNS subdomain with an optional single `/name` suffix, e.g.\n`controller.example.com` or `controller.example.com/my-ctrl`.",
-          "type": "string"
-        },
-        "issuer": {
-          "description": "OIDC issuer URL. Used for JWKS discovery and `iss` validation.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "id",
-        "issuer"
       ],
       "type": "object"
     },
@@ -399,7 +394,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens auto-minted by the controller\nand mounted into deployment pods. The controller re-mints tokens when they\nare older than half this value. Default: 3600 (1 hour).",
+              "description": "Lifetime in seconds of workload identity tokens: those auto-minted by\nthe controller and mounted into deployment pods (re-minted once older\nthan half this value), and the cap on tokens from the token-exchange\nendpoint. Default: 3600 (1 hour).",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -541,7 +536,7 @@
           "type": "object"
         },
         {
-          "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host and lets Traefik's Docker\nprovider route to them via container labels Rise stamps. No Kubernetes,\nno Metacontroller — reconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
+          "description": "Docker deployment controller.\n\nDeploys app containers to a single Docker host. Traefik's Docker provider\ndiscovers deployment services from labels, while its HTTP provider reads\nthe active public routes from Rise. No Kubernetes, no Metacontroller —\nreconciliation runs in-process (see\n`controller::docker::DockerReconciler`).",
           "properties": {
             "access_classes": {
               "additionalProperties": {
@@ -563,7 +558,7 @@
                   "ingress_class": "traefik"
                 }
               },
-              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe Docker controller stamps Traefik forwardAuth middleware labels\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
+              "description": "Access classes defining ingress authentication levels, keyed by\nidentifier (e.g. \"public\", \"private\"). Mirrors the Kubernetes variant\nso the typed project API can validate a project's access class. For\naccess classes whose `access_requirement` is `Authenticated`/`Member`,\nthe HTTP-provider configuration includes a Traefik forwardAuth middleware\n(requires `auth_backend_url` to be set). A permissive \"public\" class\nis provided by default; operators may override.\nUse `null` in YAML to remove an inherited access class.",
               "type": "object"
             },
             "app_backend_host_aliases": {
@@ -639,7 +634,7 @@
             },
             "identity_token_ttl_seconds": {
               "default": 3600,
-              "description": "Lifetime in seconds of workload identity tokens minted for\ndeployments. Default: 3600 (1 hour).",
+              "description": "Lifetime in seconds of workload identity tokens: those minted into\nthe `[identity]` token files, and the cap on tokens from the\ntoken-exchange endpoint. Default: 3600 (1 hour).",
               "format": "uint64",
               "minimum": 0,
               "type": "integer"
@@ -691,7 +686,7 @@
             },
             "traefik_api_url": {
               "default": null,
-              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so the old deployment is retired only once the new servers are\nactually in Traefik's rotation. Optional basic-auth may be embedded in\nthe URL (userinfo). **Required for projects that set a `health_check`**:\nTraefik's `serverStatus` is the authoritative readiness signal (no\nfallback), so without a reachable API a health-checked deployment never\nbecomes Healthy. May be left empty only when no project uses health\nchecks (ready-when-running gates on run-state alone).",
+              "description": "Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network\nor `http://localhost:8090` for a host-run dev backend). Read to learn\nper-server health status (the top-level `serverStatus` map) from\nTraefik so a deployment is finalized only once its native service is\nready and the HTTP-provider routers select it. Optional basic-auth may be embedded in\nthe URL (userinfo). **Required for projects that set a `health_check`**:\nTraefik's `serverStatus` is the authoritative readiness signal (no\nfallback), so without a reachable API a health-checked deployment never\nbecomes Healthy. May be left empty only when no project uses health\nchecks (ready-when-running gates on run-state alone).",
               "type": [
                 "string",
                 "null"
@@ -723,6 +718,280 @@
             "type",
             "production_ingress_url_template",
             "traefik_network"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Amazon ECS deployment controller (Fargate launch type).\n\nDeploys each container spec as its own ECS service. Traefik's ECS provider\ndiscovers deployment services from container-definition labels, while its\nHTTP provider reads active public routes from Rise. No Kubernetes, no\nMetacontroller — reconciliation runs\nin-process (see `rise_backend_ecs::reconciler::EcsReconciler`).\n\nSee ADR-0005 for the design and its deliberate v1 limitations.",
+          "properties": {
+            "access_classes": {
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/AccessClass"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "default": {
+                "public": {
+                  "access_requirement": "None",
+                  "custom_annotations": {},
+                  "description": "Fully public — no authentication required.",
+                  "display_name": "Public",
+                  "ingress_class": "traefik"
+                }
+              },
+              "description": "Access classes defining ingress authentication levels. For classes\nwhose `access_requirement` is `Authenticated`/`Member` the HTTP-provider\nconfiguration includes Traefik forwardAuth, which requires `auth_backend_url`;\nthe backend refuses to start otherwise rather than serve those\nprojects publicly with no auth enforced.",
+              "type": "object"
+            },
+            "access_key_id": {
+              "default": null,
+              "description": "Static credentials, for a control plane running outside AWS. Leave\nunset in production so the standard chain (task role / instance\nprofile) applies.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "assign_public_ip": {
+              "default": false,
+              "description": "Assign a public IP to each task. Required when the subnets are public\n(no NAT gateway), since Fargate must reach ECR and CloudWatch to start.",
+              "type": "boolean"
+            },
+            "auth_backend_url": {
+              "default": "",
+              "description": "Internal URL Traefik uses to reach the Rise backend for the forwardAuth\nsubrequest. Must be resolvable **from inside the cluster** — a Cloud Map\nname or an internal load balancer, not the public URL.",
+              "type": "string"
+            },
+            "auth_signin_url": {
+              "default": "",
+              "description": "Browser-facing base URL for the login redirect. Falls back to the\nserver `public_url` when empty.",
+              "type": "string"
+            },
+            "capacity": {
+              "default": "FARGATE",
+              "description": "Which ECS capacity carries the workload services: `fargate` (AWS\nschedules the tasks) or `ec2` (they are placed on the cluster's own\ncontainer instances).\n\nNetworking is `awsvpc` either way — readiness keys Traefik's\n`serverStatus` on each task's own ENI address — so `subnets` stays\nrequired. On `ec2`, enable ENI trunking on the container instances or\nthe per-instance attachment limit becomes the real ceiling on how many\ntasks a host can run.",
+              "type": "string"
+            },
+            "cluster": {
+              "description": "ECS cluster name that carries the deployed workloads.",
+              "type": "string"
+            },
+            "controller_class_name": {
+              "default": "default",
+              "description": "Stable identifier for this deployment controller. The reconciler only\nreconciles projects matching this class. Defaults to `default`.",
+              "type": "string"
+            },
+            "cpu_architecture": {
+              "default": "X86_64",
+              "description": "Fargate CPU architecture: `X86_64` or `ARM64`. Defaults to `X86_64`.",
+              "type": "string"
+            },
+            "deployment_constraints": {
+              "$ref": "#/$defs/DeploymentConstraints",
+              "description": "Platform-level constraints for deployment resources."
+            },
+            "deployment_defaults": {
+              "$ref": "#/$defs/DeploymentDefaults",
+              "description": "Default resource values for new deployments when not specified."
+            },
+            "endpoint_url": {
+              "default": null,
+              "description": "Override the AWS service endpoint (VPC/PrivateLink or FIPS endpoints).\nThe AWS SDK also honours `AWS_ENDPOINT_URL`; this is the explicit form.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "environment_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "execution_role_arn": {
+              "default": null,
+              "description": "IAM role ECS itself assumes to pull images and resolve SSM secrets.\nRequired whenever a project uses secret env vars or a private registry.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "health_probes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HealthProbeConfig"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Health probe configuration."
+            },
+            "identity_agent_image": {
+              "default": "",
+              "description": "The `rise-cli` image the workload-identity sidecar in every task\nruns (`rise identity agent`), normally the same release as this\nserver. Required, like the server's own image: nothing infers it.\nThe workload execution role must be able to pull it. Changing it\naffects new deployments only: running services keep the sidecar they\nstarted with.",
+              "type": "string"
+            },
+            "identity_exchange_url": {
+              "default": null,
+              "description": "Base URL at which the identity sidecar reaches the Rise API to fetch\n`[identity]` tokens. Defaults to the server `public_url` — the URL\nthe workload itself uses for `rise identity token`. Set it to an\ninternal address when tasks have no route to the public one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "identity_token_ttl_seconds": {
+              "default": 3600,
+              "description": "Lifetime in seconds of workload identity tokens: the `[identity]`\ntoken files, which the identity sidecar in each task refreshes at half\nthis, and the cap on tokens from the token-exchange endpoint.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ingress_port": {
+              "default": null,
+              "description": "Optional port appended to all generated ingress URLs.",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "ingress_schema": {
+              "default": "https",
+              "description": "URL scheme for generated ingress URLs. Defaults to `https`.",
+              "type": "string"
+            },
+            "label_namespace": {
+              "default": "rise.dev",
+              "description": "Label namespace prefix for Rise bookkeeping tags. Defaults to `rise.dev`.",
+              "type": "string"
+            },
+            "log_group": {
+              "default": null,
+              "description": "CloudWatch log group for app containers (`awslogs` driver). When\nunset, containers get no log driver and runtime logs are unavailable.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "production_ingress_url_template": {
+              "description": "Ingress URL template for the production (default) deployment group.\nSame semantics as the other backends. Must contain `{project_name}`.",
+              "type": "string"
+            },
+            "reconcile_interval_secs": {
+              "default": 30,
+              "description": "Interval in seconds between reconcile ticks. Defaults to 30 — ECS is\na throttled API, unlike a local Docker daemon.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "region": {
+              "description": "AWS region hosting the cluster.",
+              "type": "string"
+            },
+            "repository_credentials_secret_arn": {
+              "default": null,
+              "description": "ARN of a Secrets Manager secret holding `{\"username\": …, \"password\": …}`\nfor a private registry that is not ECR.\n\nECS re-authenticates on every task start and cannot take inline\ncredentials, so a static-credential registry needs the credentials\nparked somewhere ECS can read them itself. The ARN is stamped onto\neach container definition as `repositoryCredentials`; the execution\nrole needs `secretsmanager:GetSecretValue` on it (and `kms:Decrypt`\nwhen the secret uses a customer-managed key).\n\nLeave unset for ECR (the execution role authenticates the pull) and\nfor anonymous registries.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "resource_prefix": {
+              "default": "rise",
+              "description": "Prefix for generated ECS resource names. Defaults to `rise`.",
+              "type": "string"
+            },
+            "secret_access_key": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "security_groups": {
+              "default": [],
+              "description": "Security groups applied to the tasks' ENIs. ECS caps this at 5.\nAccepts a YAML sequence or a comma-separated string.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "ssm_kms_key_id": {
+              "default": null,
+              "description": "KMS key for the `SecureString` parameters. Unset uses the AWS-managed\n`alias/aws/ssm` key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ssm_parameter_prefix": {
+              "default": "rise",
+              "description": "Root of the SSM hierarchy holding secret env vars. Defaults to `rise`.",
+              "type": "string"
+            },
+            "staging_ingress_url_template": {
+              "default": null,
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "subnets": {
+              "description": "Subnets for the tasks' `awsvpc` ENIs. At least one is required; ECS\ncaps an `awsvpcConfiguration` at 16. Accepts a YAML sequence or a\ncomma-separated string so it can come straight from an env var.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "task_role_arn": {
+              "default": null,
+              "description": "IAM role the application containers run as (their AWS identity).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_api_url": {
+              "default": null,
+              "description": "Base URL of Traefik's API. Read for per-server `serverStatus`, the\nauthoritative readiness signal (no fallback), so this is **required\nfor projects that set a `health_check`** — without it such a\ndeployment never becomes Healthy.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_certresolver": {
+              "default": null,
+              "description": "Optional Traefik certresolver name for automatic TLS.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_entrypoint": {
+              "default": "web",
+              "description": "Traefik entrypoint name routers bind to. Defaults to `web`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "ecs",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "region",
+            "cluster",
+            "subnets",
+            "production_ingress_url_template"
           ],
           "type": "object"
         }
@@ -757,7 +1026,7 @@
           "properties": {
             "max_tail_lines": {
               "default": 100000,
-              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines`; once `tail_lines + skip_recent` reaches this ceiling,\npaging stops yielding new lines — the same outcome as when the\nkubelet's own ring buffer is exhausted. Default: 100000.",
+              "description": "Upper bound on the number of lines the backend will ever request from\nthe kubelet in a single call. The frontend pages backward by widening\n`tail_lines` through an opaque continuation; paging stops at this\nceiling or when the kubelet's own ring buffer is exhausted. Default:\n100000.",
               "format": "int64",
               "type": "integer"
             },
@@ -776,6 +1045,40 @@
           "properties": {
             "type": {
               "const": "docker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Read deployment logs from the CloudWatch log group configured by the\nactive ECS deployment controller. AWS connection settings and the log\ngroup stay single-sourced on that controller so the writer and reader\ncannot point at different regions or groups.",
+          "properties": {
+            "retention_hint": {
+              "default": null,
+              "description": "Display-only retention hint used to explain an empty historical\nresult. An empty env-interpolated value is treated as unset.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "cloudwatch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "No runtime log backend.\n\nThe API answers with `historical_backend_not_configured` and the UI\nrenders its empty state.",
+          "properties": {
+            "type": {
+              "const": "none",
               "type": "string"
             }
           },
@@ -832,6 +1135,36 @@
           "type": "object"
         }
       ]
+    },
+    "DeploymentRetentionSettings": {
+      "description": "Bounds on how much deployment history Rise keeps.\n\nThe two halves have deliberately different defaults. Capping a single\ndeployment's events discards only the middle of a flap it already summarises,\nso it is on. Deleting a deployment discards its event log *and* the\nenvironment-variable snapshot that makes it re-deployable, and no amount of\ncare makes that reversible — so it is off until an operator asks for it.",
+      "properties": {
+        "delete_aged_deployments": {
+          "default": false,
+          "description": "Delete finished deployments once they are older than\n`max_deployment_age_days`. Off by default: this is irreversible, and an\nupgrade must not start deleting history nobody asked it to.",
+          "type": "boolean"
+        },
+        "keep_primary_deployments_per_environment": {
+          "default": 10,
+          "description": "How many of each environment's most recent *finished* primary-group\ndeployments survive deletion regardless of age. These are what a\nrollback reaches for, so an environment that has not deployed in a long\ntime keeps a usable history rather than being emptied by the age rule.\n\nCounts finished deployments only. The active deployment and anything\nstill running are never deleted, so spending these slots on them would\nleave no rollback history at all.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "max_deployment_age_days": {
+          "default": 90,
+          "description": "How old a finished deployment must be before deletion considers it.\nOnly consulted when `delete_aged_deployments` is on.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events_per_deployment": {
+          "default": 1000,
+          "description": "Most events kept for one deployment. Its first event — the creation\nevent, which anchors the timeline — is always kept regardless.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "EncryptionSettings": {
       "description": "Encryption provider configuration",
@@ -1319,6 +1652,11 @@
     },
     "LokiLabels": {
       "properties": {
+        "container": {
+          "default": "container",
+          "description": "Loki stream label that carries the deployment's container name, used\nby the `?container=` filter and for per-line attribution. The bundled\nAlloy config writes the Kubernetes container name here, which is the\nRise container name (`app` for a single-container deployment).",
+          "type": "string"
+        },
         "deployment_id": {
           "default": "rise_deployment_id",
           "description": "Loki stream label that carries the Rise deployment id (e.g.\n\"20241205-1234\"). Together with `project`, this must uniquely\nidentify a deployment's log stream.",
@@ -1425,7 +1763,7 @@
       "properties": {
         "allowed_idp_groups": {
           "default": [],
-          "description": "IdP groups whose members get platform access",
+          "description": "IdP groups whose members get platform access. A user matches when they\nbelong to an IdP-managed team of that name (case-insensitive).",
           "items": {
             "type": "string"
           },
@@ -1560,6 +1898,14 @@
             "region": {
               "type": "string"
             },
+            "registry_host": {
+              "default": null,
+              "description": "Registry host images are pushed to and pulled from, as `host[:port]`\nwith no scheme or path. Empty uses\n`<account_id>.dkr.ecr.<region>.amazonaws.com`; set it for another\nECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "repo_prefix": {
               "default": "rise/",
               "description": "Literal prefix for ECR repository names (e.g., \"rise/\" → repos named \"rise/{project}\")",
@@ -1599,11 +1945,21 @@
               "default": "",
               "type": "string"
             },
+            "password": {
+              "default": "",
+              "description": "Optional static registry password. Intended for small trusted-user setups.",
+              "type": "string"
+            },
             "registry_url": {
               "type": "string"
             },
             "type": {
               "const": "oci-client-auth",
+              "type": "string"
+            },
+            "username": {
+              "default": "",
+              "description": "Optional static registry username. When set with `password`, Rise returns\nthe credentials to authorized clients instead of relying on prior docker login.",
               "type": "string"
             }
           },
@@ -1870,12 +2226,9 @@
             "null"
           ]
         },
-        "workload_token_max_ttl_seconds": {
-          "default": 900,
-          "description": "Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.\nRequests that specify a higher TTL are silently capped to this value.\nDefault: 900 (15 minutes).",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
+        "workload_token_rate_limit": {
+          "$ref": "#/$defs/WorkloadTokenRateLimitSettings",
+          "description": "Rate limiting for the workload identity token-exchange endpoint."
         }
       },
       "required": [
@@ -1906,6 +2259,40 @@
             "type": "string"
           },
           "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "WorkloadTokenRateLimitSettings": {
+      "description": "Rate limiting for the workload identity token-exchange endpoint\n(`POST /api/v1/identity/token`), kept apart from the OAuth limiter so login\ntraffic and token minting never share a budget.\n\nA valid bootstrap credential is 256 random bits naming one deployment, a\nbetter caller identity than an address: workloads behind one NAT gateway, or\nreaching Rise over an internal address with no proxy headers, would all look\nlike one client. So a request with a valid credential counts only against its\ndeployment's budget, and the per-IP budget counts only rejected credentials —\nwhich is what slows guessing without throttling every task behind a NAT.",
+      "properties": {
+        "per_deployment_max": {
+          "default": 500,
+          "description": "Maximum requests per deployment (valid credential) per window (default: 500)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_deployment_window_secs": {
+          "default": 60,
+          "description": "Window for the per-deployment limit in seconds (default: 60)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rejected_per_ip_max": {
+          "default": 50,
+          "description": "Maximum rejected credentials per client IP per window (default: 50)",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rejected_per_ip_window_secs": {
+          "default": 60,
+          "description": "Window for the rejected-credential limit in seconds (default: 60)",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
@@ -2082,6 +2469,16 @@
     "deployment_logs": {
       "$ref": "#/$defs/DeploymentLogsSettings"
     },
+    "deployment_retention": {
+      "$ref": "#/$defs/DeploymentRetentionSettings",
+      "default": {
+        "delete_aged_deployments": false,
+        "keep_primary_deployments_per_environment": 10,
+        "max_deployment_age_days": 90,
+        "max_events_per_deployment": 1000
+      },
+      "description": "Bounds the growth of deployment history. Omitting the section keeps the\nevent cap on and deletion of old deployments off."
+    },
     "encryption": {
       "anyOf": [
         {
@@ -2111,7 +2508,7 @@
           "type": "null"
         }
       ],
-      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or `local.yaml`) *replaces* it entirely. Operators\nwho want to add to the defaults must re-include them."
+      "description": "Curated catalog of stateless container images surfaced as one-click\n\"quickstart\" deploys in the UI. The catalog is layered: `default.yaml`\nships the built-in selection and any `quickstart.templates` list in a\nlater layer (run-mode or the local configuration layer) *replaces* it\nentirely. Operators who want to add to the defaults must re-include\nthem."
     },
     "registry": {
       "anyOf": [
@@ -2122,6 +2519,19 @@
           "type": "null"
         }
       ]
+    },
+    "reserved_project_names": {
+      "default": [
+        "rise",
+        "dex",
+        "registry",
+        "www"
+      ],
+      "description": "Project names that are reserved for control-plane hostnames and cannot\nbe used when creating a project. Later config layers replace this list\nas a whole. Default: [\"rise\", \"dex\", \"registry\", \"www\"].",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     },
     "resource_gc": {
       "anyOf": [

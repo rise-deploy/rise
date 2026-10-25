@@ -12,6 +12,7 @@ pub(crate) struct PgResourceRow {
     pub parent_uid: Option<Uuid>,
     pub name: String,
     pub discriminator: String,
+    pub labels: sqlx::types::Json<std::collections::BTreeMap<String, String>>,
     pub metadata: serde_json::Value,
     pub spec: serde_json::Value,
     pub status: serde_json::Value,
@@ -27,6 +28,7 @@ impl From<PgResourceRow> for ResourceRow {
     fn from(row: PgResourceRow) -> Self {
         Self {
             uid: row.uid,
+            labels: row.labels.0,
             api_version: row.api_version,
             kind: row.kind,
             parent_uid: row.parent_uid,
@@ -57,6 +59,7 @@ mod tests {
         let deletion_timestamp = Some(Utc.timestamp_opt(1_700_000_200, 0).unwrap());
         let uid = Uuid::from_u128(42);
         let db = PgResourceRow {
+            labels: Default::default(),
             uid,
             api_version: "example.dev/v1".into(),
             kind: "Widget".into(),

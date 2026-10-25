@@ -1,9 +1,9 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{bail, Context, Result};
-use comfy_table::{
-    modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Color, Table,
-};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Color, Table};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -12,9 +12,57 @@ use crate::config::Config;
 use crate::token_source::token_with_retry;
 
 // Re-export models from API module (always available)
-pub use crate::api::models::{Deployment, DeploymentStatus};
+pub use crate::api::models::{Deployment, DeploymentEvent, DeploymentStatus};
 // Multi-container request wire types (serialized into the create-deployment body).
 use crate::api::models::{ContainerSpec, RouteSpec};
+
+/// Stable, deliberately small payload emitted by `deploy --json` and
+/// `deployment list --json`.
+#[derive(Debug, Serialize, PartialEq)]
+struct DeploymentOutput {
+    deployment_id: String,
+    status: DeploymentStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+}
+
+impl From<&Deployment> for DeploymentOutput {
+    fn from(deployment: &Deployment) -> Self {
+        Self {
+            deployment_id: deployment.deployment_id.clone(),
+            status: deployment.status.clone(),
+            primary_url: deployment.primary_url.clone(),
+            error_message: deployment.error_message.clone(),
+        }
+    }
+}
+
+fn deployment_json(deployment: &Deployment) -> Result<String> {
+    serde_json::to_string_pretty(&DeploymentOutput::from(deployment))
+        .context("Failed to serialize deployment as JSON")
+}
+
+fn deployments_json(deployments: &[Deployment]) -> Result<String> {
+    let output: Vec<DeploymentOutput> = deployments.iter().map(DeploymentOutput::from).collect();
+    serde_json::to_string_pretty(&output).context("Failed to serialize deployments as JSON")
+}
+
+/// Output controls shared by commands that emit deployment JSON.
+#[derive(Clone, Copy)]
+pub struct DeploymentOutputOptions<'a> {
+    pub json: bool,
+    pub status_file: Option<&'a str>,
+}
+
+struct DeploymentContext<'a> {
+    http_client: &'a Client,
+    backend_url: &'a str,
+    provider: &'a crate::token_source::TokenProvider,
+    project_name: &'a str,
+    deployment_id: &'a str,
+}
 
 /// Convert the `[containers]` section of `rise.toml` into the typed request
 /// structs expected by `POST /deployments`. Returns `(None, [])` when the
@@ -163,7 +211,7 @@ pub async fn fetch_deployment(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch deployment")?;
 
@@ -184,6 +232,110 @@ pub async fn fetch_deployment(
     Ok(deployment)
 }
 
+/// Fetch the complete recorded event history for a deployment.
+///
+/// Events are read newest-first by the API and paged on the server's write
+/// order. The caller decides how to display them, so this helper preserves the
+/// API order and follows every page.
+pub async fn fetch_deployment_events(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project: &str,
+    deployment_id: &str,
+) -> Result<Vec<DeploymentEvent>> {
+    let base = format!(
+        "{}/api/v1/projects/{}/deployments/{}/events",
+        backend_url, project, deployment_id
+    );
+    let mut events = Vec::new();
+    let mut cursor = None;
+
+    loop {
+        let mut url = format!("{}?limit=500&min_severity=all", base);
+        if let Some(cursor) = cursor.as_deref() {
+            url.push_str("&cursor=");
+            url.push_str(&urlencoding::encode(cursor));
+        }
+
+        let response = http_client
+            .get(&url)
+            .bearer_auth(token)
+            .send_with_auth_hint(backend_url)
+            .await
+            .context("Failed to fetch deployment events")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            bail!(
+                "Failed to fetch deployment events ({}): {}",
+                status,
+                error_text
+            );
+        }
+
+        let page: crate::api::models::DeploymentEventPage = response
+            .json()
+            .await
+            .context("Failed to parse deployment events response")?;
+        events.extend(page.events);
+
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next);
+    }
+
+    Ok(events)
+}
+
+/// Fetch the newest page of a deployment's event history.
+///
+/// Follow mode uses this after its initial complete read. Re-reading one page
+/// keeps the polling path bounded while the reporter's event-id set prevents
+/// already printed events from appearing again.
+pub async fn fetch_latest_deployment_events(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project: &str,
+    deployment_id: &str,
+) -> Result<Vec<DeploymentEvent>> {
+    let url = format!(
+        "{}/api/v1/projects/{}/deployments/{}/events?limit=500&min_severity=all",
+        backend_url, project, deployment_id
+    );
+    let response = http_client
+        .get(&url)
+        .bearer_auth(token)
+        .send_with_auth_hint(backend_url)
+        .await
+        .context("Failed to fetch deployment events")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        bail!(
+            "Failed to fetch deployment events ({}): {}",
+            status,
+            error_text
+        );
+    }
+
+    let page: crate::api::models::DeploymentEventPage = response
+        .json()
+        .await
+        .context("Failed to parse deployment events response")?;
+    Ok(page.events)
+}
+
 /// List deployments for a project
 pub async fn list_deployments(
     http_client: &Client,
@@ -192,6 +344,7 @@ pub async fn list_deployments(
     project: &str,
     group: Option<&str>,
     limit: usize,
+    output: DeploymentOutputOptions<'_>,
 ) -> Result<()> {
     let token = crate::token_source::resolve_token_with_retry(http_client, config).await?;
 
@@ -214,7 +367,7 @@ pub async fn list_deployments(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to list deployments")?;
 
@@ -234,6 +387,21 @@ pub async fn list_deployments(
 
     // Limit results
     deployments.truncate(limit);
+
+    let deployments_json = if output.json || output.status_file.is_some() {
+        Some(deployments_json(&deployments)?)
+    } else {
+        None
+    };
+
+    if let (Some(path), Some(json)) = (output.status_file, deployments_json.as_deref()) {
+        write_json_status_file(path, json)?;
+    }
+
+    if output.json {
+        println!("{}", deployments_json.expect("JSON was serialized above"));
+        return Ok(());
+    }
 
     if deployments.is_empty() {
         println!("No deployments found for project '{}'", project);
@@ -257,8 +425,7 @@ pub async fn list_deployments(
     // Create table
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("DEPLOYMENT").add_attribute(Attribute::Bold),
             Cell::new("STATUS").add_attribute(Attribute::Bold),
@@ -387,6 +554,7 @@ pub async fn show_deployment(
             project,
             deployment_id,
             timeout_str,
+            false,
         )
         .await?;
 
@@ -458,7 +626,7 @@ pub async fn stop_deployments_by_group(
     let response = http_client
         .post(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to stop deployments")?;
 
@@ -690,38 +858,84 @@ async fn report_failed_status(
     }
 }
 
+/// Emit a minimal failure payload after a deployment has been created. The
+/// deployment ID and local error are always available; the API read adds the
+/// primary URL when the deployment record can be fetched.
+async fn emit_failed_deployment_output(
+    context: DeploymentContext<'_>,
+    json_output: bool,
+    status_file: Option<&str>,
+    error_message: &str,
+) {
+    if !json_output && status_file.is_none() {
+        return;
+    }
+
+    let primary_url = match try_token_or_log(context.provider).await {
+        Some(token) => match fetch_deployment(
+            context.http_client,
+            context.backend_url,
+            &token,
+            context.project_name,
+            context.deployment_id,
+        )
+        .await
+        {
+            Ok(deployment) => deployment.primary_url,
+            Err(error) => {
+                warn!(
+                    "Failed to fetch failed deployment for JSON output: {:?}",
+                    error
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    let output = DeploymentOutput {
+        deployment_id: context.deployment_id.to_string(),
+        status: DeploymentStatus::Failed,
+        primary_url,
+        error_message: Some(error_message.to_string()),
+    };
+    let json = match serde_json::to_string_pretty(&output) {
+        Ok(json) => json,
+        Err(error) => {
+            warn!("Failed to serialize failed deployment as JSON: {:?}", error);
+            return;
+        }
+    };
+
+    if let Some(path) = status_file {
+        if let Err(error) = write_json_status_file(path, &json) {
+            warn!("Failed to write deployment status file: {:?}", error);
+        }
+    }
+    if json_output {
+        println!("{}", json);
+    }
+}
+
 /// Fetch fresh deployment registry credentials, log in, and push an already
 /// local image. Used by `--separate-push` so short-lived registry credentials
 /// are minted immediately before the push rather than before a long build.
 async fn push_with_fresh_registry_credentials(
-    http_client: &Client,
-    backend_url: &str,
-    provider: &crate::token_source::TokenProvider,
+    context: DeploymentContext<'_>,
     container_cli: &str,
-    project_name: &str,
-    deployment_id: &str,
     image_tag: &str,
+    output: build::CommandOutput,
 ) -> Result<()> {
     let registry_credentials = fetch_deployment_registry_credentials(
-        http_client,
-        backend_url,
-        provider,
-        project_name,
-        deployment_id,
+        context.http_client,
+        context.backend_url,
+        context.provider,
+        context.project_name,
+        context.deployment_id,
     )
     .await?;
-    let token = token_with_retry(provider).await?;
-    login_to_registry(
-        http_client,
-        backend_url,
-        &token,
-        container_cli,
-        &registry_credentials,
-        project_name,
-        deployment_id,
-    )
-    .await?;
-    build::docker_push(container_cli, image_tag)
+    login_to_registry(container_cli, &registry_credentials, output).await?;
+    build::docker_push_with_output(container_cli, image_tag, output)
 }
 
 /// Fetch registry push credentials scoped to a specific deployment.
@@ -744,7 +958,7 @@ async fn fetch_deployment_registry_credentials(
     let response = http_client
         .get(&url)
         .bearer_auth(&token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch registry credentials")?;
 
@@ -784,7 +998,7 @@ async fn fetch_backend_platform_hint(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch platform capabilities")?;
 
@@ -869,6 +1083,10 @@ pub struct DeploymentOptions<'a> {
     pub cpu: Option<String>,
     /// Memory allocation (resolved from CLI flag > rise.toml > server default)
     pub memory: Option<String>,
+    /// Emit the completed deployment as JSON on stdout.
+    pub json_output: bool,
+    /// Write the completed deployment JSON to this file.
+    pub status_file: Option<String>,
 }
 
 pub async fn create_deployment(
@@ -906,6 +1124,11 @@ pub async fn create_deployment(
     // exchanged for that service account's short-lived Rise access token;
     // otherwise it is used as-is.
     let provider = crate::token_source::resolve_token_provider(http_client, config)?;
+    let command_output = if deploy_opts.json_output {
+        build::CommandOutput::Stderr
+    } else {
+        build::CommandOutput::Inherit
+    };
     debug!("Authenticating to backend using {}", provider.describe());
     let token = token_with_retry(&provider).await?;
 
@@ -1023,91 +1246,164 @@ pub async fn create_deployment(
         }
     });
 
-    if let Some(source_image) = &deploy_opts.image {
-        if deploy_opts.push_image {
-            // Push-image path: pull image locally, tag it, and push to Rise registry
+    let build_result: Result<()> = async {
+        if let Some(source_image) = &deploy_opts.image {
+            if deploy_opts.push_image {
+                // Push-image path: pull image locally, tag it, and push to Rise registry
+                info!(
+                    "Pulling and pushing image '{}' to Rise registry",
+                    source_image
+                );
+
+                // Determine container CLI from config/build args
+                let container_cli = match &deploy_opts.build_args.container_cli {
+                    Some(cli) => cli.clone(),
+                    None => config.get_container_cli().command().to_string(),
+                };
+
+                // Pull the source image for the configured platform.
+                let backend_platform =
+                    fetch_backend_platform_hint(http_client, backend_url, &token).await?;
+                let toml_platform = deploy_opts
+                    .toml_config
+                    .as_ref()
+                    .and_then(|c| c.build.as_ref())
+                    .and_then(|b| b.platform.as_deref());
+                let env = build::env_var_non_empty("RISE_PLATFORM");
+                let (platform, source) = build::resolve_platform(
+                    deploy_opts.build_args.platform.as_deref(),
+                    env.as_deref(),
+                    toml_platform,
+                    backend_platform,
+                );
+                log_platform_choice(&platform, source, "Pulling");
+                build::docker_pull_with_output(
+                    &container_cli,
+                    source_image,
+                    &platform,
+                    command_output,
+                )?;
+
+                // Tag it with the Rise registry image tag
+                build::docker_tag_with_output(
+                    &container_cli,
+                    source_image,
+                    &deployment_info.image_tag,
+                    command_output,
+                )?;
+
+                // Update status to Building (reusing existing state for push phase)
+                let token = token_with_retry(&provider).await?;
+                update_deployment_status(
+                    http_client,
+                    backend_url,
+                    &token,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    "Building",
+                    None,
+                )
+                .await?;
+
+                // Push to Rise registry
+                let push_result = if deploy_opts.build_args.separate_push {
+                    push_with_fresh_registry_credentials(
+                        DeploymentContext {
+                            http_client,
+                            backend_url,
+                            provider: &provider,
+                            project_name: deploy_opts.project_name,
+                            deployment_id: &deployment_info.deployment_id,
+                        },
+                        &container_cli,
+                        &deployment_info.image_tag,
+                        command_output,
+                    )
+                    .await
+                } else {
+                    let registry_credentials = fetch_deployment_registry_credentials(
+                        http_client,
+                        backend_url,
+                        &provider,
+                        deploy_opts.project_name,
+                        &deployment_info.deployment_id,
+                    )
+                    .await?;
+                    login_to_registry(&container_cli, &registry_credentials, command_output)
+                        .await?;
+                    build::docker_push_with_output(
+                        &container_cli,
+                        &deployment_info.image_tag,
+                        command_output,
+                    )
+                };
+                push_result?;
+
+                // Mark as pushed (controller will take over deployment)
+                let token = token_with_retry(&provider).await?;
+                update_deployment_status(
+                    http_client,
+                    backend_url,
+                    &token,
+                    deploy_opts.project_name,
+                    &deployment_info.deployment_id,
+                    "Pushed",
+                    None,
+                )
+                .await?;
+
+                info!(
+                    "✓ Successfully pushed {} to {}",
+                    source_image, deployment_info.image_tag
+                );
+            } else {
+                // Pre-built image path: Skip build/push, backend already marked as Pushed
+                info!("✓ Pre-built image deployment created");
+            }
+        } else if let Some(from_deployment) = &deploy_opts.from_deployment {
+            // Redeploy from existing deployment: Skip build/push, backend already marked as Pushed
             info!(
-                "Pulling and pushing image '{}' to Rise registry",
-                source_image
+                "✓ Deployment created from existing deployment '{}' with {} environment variables",
+                from_deployment,
+                if deploy_opts.use_source_env_vars {
+                    "source"
+                } else {
+                    "current project"
+                }
             );
-
-            // Determine container CLI from config/build args
-            let container_cli = match &deploy_opts.build_args.container_cli {
-                Some(cli) => cli.clone(),
-                None => config.get_container_cli().command().to_string(),
-            };
-
-            // Pull the source image for the configured platform.
-            let backend_platform =
-                fetch_backend_platform_hint(http_client, backend_url, &token).await?;
-            let toml_platform = deploy_opts
-                .toml_config
-                .as_ref()
-                .and_then(|c| c.build.as_ref())
-                .and_then(|b| b.platform.as_deref());
-            let env = build::env_var_non_empty("RISE_PLATFORM");
-            let (platform, source) = build::resolve_platform(
-                deploy_opts.build_args.platform.as_deref(),
-                env.as_deref(),
-                toml_platform,
-                backend_platform,
-            );
-            log_platform_choice(&platform, source, "Pulling");
-            if let Err(e) = build::docker_pull(&container_cli, source_image, &platform) {
-                report_failed_status(
-                    http_client,
-                    backend_url,
-                    &provider,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    &e.to_string(),
-                )
-                .await;
-                return Err(e);
-            }
-
-            // Tag it with the Rise registry image tag
-            if let Err(e) =
-                build::docker_tag(&container_cli, source_image, &deployment_info.image_tag)
-            {
-                report_failed_status(
-                    http_client,
-                    backend_url,
-                    &provider,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    &e.to_string(),
-                )
-                .await;
-                return Err(e);
-            }
-
-            // Update status to Building (reusing existing state for push phase)
-            let token = token_with_retry(&provider).await?;
-            update_deployment_status(
+        } else if deployment_info.container_images.is_some() {
+            // Multi-container build path. The backend returned the resolved
+            // image tag for every container; we build/push each one in turn
+            // using its own `[containers.X.build]` config. Pre-built containers
+            // (the ones whose rise.toml entry sets `image = "..."`) are
+            // skipped — the backend already persisted their tag verbatim.
+            build_and_push_multi_container(
                 http_client,
                 backend_url,
-                &token,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-                "Building",
-                None,
+                &provider,
+                config,
+                &deploy_opts,
+                &deployment_info,
             )
             .await?;
+        } else {
+            // Build from source path: Execute build and push.
+            //
+            // Fetch platform hint and credentials for the build-from-source path.
+            let backend_platform =
+                fetch_backend_platform_hint(http_client, backend_url, &token).await?;
+            let options = BuildOptions::from_build_args(
+                config,
+                deployment_info.image_tag.clone(),
+                deploy_opts.path.to_string(),
+                deploy_opts.build_args,
+                deploy_opts.toml_config.clone(),
+                backend_platform,
+            )
+            .with_output(command_output);
+            log_platform_choice(&options.platform, options.platform_source, "Building");
 
-            // Push to Rise registry
-            let push_result = if deploy_opts.build_args.separate_push {
-                push_with_fresh_registry_credentials(
-                    http_client,
-                    backend_url,
-                    &provider,
-                    &container_cli,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    &deployment_info.image_tag,
-                )
-                .await
-            } else {
+            if !deploy_opts.build_args.separate_push {
                 let registry_credentials = fetch_deployment_registry_credentials(
                     http_client,
                     backend_url,
@@ -1117,31 +1413,54 @@ pub async fn create_deployment(
                 )
                 .await?;
                 login_to_registry(
-                    http_client,
-                    backend_url,
-                    &token,
-                    &container_cli,
+                    options.container_cli.command(),
                     &registry_credentials,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
+                    command_output,
                 )
                 .await?;
-                build::docker_push(&container_cli, &deployment_info.image_tag)
-            };
-            if let Err(e) = push_result {
-                report_failed_status(
-                    http_client,
-                    backend_url,
-                    &provider,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    &e.to_string(),
-                )
-                .await;
-                return Err(e);
             }
 
-            // Mark as pushed (controller will take over deployment)
+            // Step 3: Update status to 'building'
+            let token = token_with_retry(&provider).await?;
+            update_deployment_status_with(
+                http_client,
+                backend_url,
+                &token,
+                deploy_opts.project_name,
+                &deployment_info.deployment_id,
+                "Building",
+                None,
+                detect_git_provenance(),
+            )
+            .await?;
+
+            // Step 4: Build image. In separate-push mode, the build phase only
+            // loads locally; the caller refreshes auth and pushes explicitly.
+            let options = options.with_push_mode(if deploy_opts.build_args.separate_push {
+                BuildPushMode::Deferred
+            } else {
+                BuildPushMode::Inline
+            });
+            let container_cli = options.container_cli.command().to_string();
+
+            build::build_image(options)?;
+            if deploy_opts.build_args.separate_push {
+                push_with_fresh_registry_credentials(
+                    DeploymentContext {
+                        http_client,
+                        backend_url,
+                        provider: &provider,
+                        project_name: deploy_opts.project_name,
+                        deployment_id: &deployment_info.deployment_id,
+                    },
+                    &container_cli,
+                    &deployment_info.image_tag,
+                    command_output,
+                )
+                .await?;
+            }
+
+            // Step 5: Mark as pushed (controller will take over deployment)
             let token = token_with_retry(&provider).await?;
             update_deployment_status(
                 http_client,
@@ -1156,168 +1475,110 @@ pub async fn create_deployment(
 
             info!(
                 "✓ Successfully pushed {} to {}",
-                source_image, deployment_info.image_tag
+                deploy_opts.project_name, deployment_info.image_tag
             );
-        } else {
-            // Pre-built image path: Skip build/push, backend already marked as Pushed
-            info!("✓ Pre-built image deployment created");
         }
-    } else if let Some(from_deployment) = &deploy_opts.from_deployment {
-        // Redeploy from existing deployment: Skip build/push, backend already marked as Pushed
-        info!(
-            "✓ Deployment created from existing deployment '{}' with {} environment variables",
-            from_deployment,
-            if deploy_opts.use_source_env_vars {
-                "source"
-            } else {
-                "current project"
-            }
-        );
-    } else if deployment_info.container_images.is_some() {
-        // Multi-container build path. The backend returned the resolved
-        // image tag for every container; we build/push each one in turn
-        // using its own `[containers.X.build]` config. Pre-built containers
-        // (the ones whose rise.toml entry sets `image = "..."`) are
-        // skipped — the backend already persisted their tag verbatim.
-        build_and_push_multi_container(
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = build_result {
+        let error_message = error.to_string();
+        report_failed_status(
             http_client,
             backend_url,
             &provider,
-            config,
-            &deploy_opts,
-            &deployment_info,
-        )
-        .await?;
-    } else {
-        // Build from source path: Execute build and push.
-        //
-        // Fetch platform hint and credentials for the build-from-source path.
-        let backend_platform =
-            fetch_backend_platform_hint(http_client, backend_url, &token).await?;
-        let options = BuildOptions::from_build_args(
-            config,
-            deployment_info.image_tag.clone(),
-            deploy_opts.path.to_string(),
-            deploy_opts.build_args,
-            deploy_opts.toml_config,
-            backend_platform,
-        );
-        log_platform_choice(&options.platform, options.platform_source, "Building");
-
-        if !deploy_opts.build_args.separate_push {
-            let registry_credentials = fetch_deployment_registry_credentials(
-                http_client,
-                backend_url,
-                &provider,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-            let token = token_with_retry(&provider).await?;
-            login_to_registry(
-                http_client,
-                backend_url,
-                &token,
-                options.container_cli.command(),
-                &registry_credentials,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-            )
-            .await?;
-        }
-
-        // Step 3: Update status to 'building'
-        let token = token_with_retry(&provider).await?;
-        update_deployment_status(
-            http_client,
-            backend_url,
-            &token,
             deploy_opts.project_name,
             &deployment_info.deployment_id,
-            "Building",
-            None,
+            &error_message,
         )
-        .await?;
-
-        // Step 4: Build image. In separate-push mode, the build phase only
-        // loads locally; the caller refreshes auth and pushes explicitly.
-        let options = options.with_push_mode(if deploy_opts.build_args.separate_push {
-            BuildPushMode::Deferred
-        } else {
-            BuildPushMode::Inline
-        });
-        let container_cli = options.container_cli.command().to_string();
-
-        if let Err(e) = build::build_image(options) {
-            report_failed_status(
+        .await;
+        emit_failed_deployment_output(
+            DeploymentContext {
                 http_client,
                 backend_url,
-                &provider,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-                &e.to_string(),
-            )
-            .await;
-            return Err(e);
-        }
-        if deploy_opts.build_args.separate_push {
-            if let Err(e) = push_with_fresh_registry_credentials(
-                http_client,
-                backend_url,
-                &provider,
-                &container_cli,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-                &deployment_info.image_tag,
-            )
-            .await
-            {
-                report_failed_status(
-                    http_client,
-                    backend_url,
-                    &provider,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    &e.to_string(),
-                )
-                .await;
-                return Err(e);
-            }
-        }
-
-        // Step 5: Mark as pushed (controller will take over deployment)
-        let token = token_with_retry(&provider).await?;
-        update_deployment_status(
-            http_client,
-            backend_url,
-            &token,
-            deploy_opts.project_name,
-            &deployment_info.deployment_id,
-            "Pushed",
-            None,
+                provider: &provider,
+                project_name: deploy_opts.project_name,
+                deployment_id: &deployment_info.deployment_id,
+            },
+            deploy_opts.json_output,
+            deploy_opts.status_file.as_deref(),
+            &error_message,
         )
-        .await?;
-
-        info!(
-            "✓ Successfully pushed {} to {}",
-            deploy_opts.project_name, deployment_info.image_tag
-        );
+        .await;
+        return Err(error);
     }
     info!("  Deployment ID: {}", deployment_info.deployment_id);
-    println!();
+
+    if !deploy_opts.json_output {
+        println!();
+    }
 
     // Step 7: Follow deployment until completion
-    show_deployment(
+    let final_deployment = super::follow_ui::follow_deployment_with_ui(
         http_client,
         backend_url,
         config,
         deploy_opts.project_name,
         &deployment_info.deployment_id,
-        true,  // follow
-        "10m", // timeout
+        "10m",
+        deploy_opts.json_output,
     )
     .await?;
 
+    let deployment_json = if deploy_opts.json_output || deploy_opts.status_file.is_some() {
+        Some(deployment_json(&final_deployment)?)
+    } else {
+        None
+    };
+
+    if let (Some(path), Some(json)) = (
+        deploy_opts.status_file.as_deref(),
+        deployment_json.as_deref(),
+    ) {
+        write_json_status_file(path, json)?;
+    }
+
+    if deploy_opts.json_output {
+        println!("{}", deployment_json.expect("JSON was serialized above"));
+    }
+
+    if final_deployment.status == DeploymentStatus::Failed {
+        if let Some(error) = final_deployment.error_message {
+            bail!("Deployment failed: {error}");
+        } else {
+            bail!("Deployment failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Write a complete JSON document without exposing a partially written file to
+/// readers such as CI jobs.
+pub(crate) fn write_json_status_file(path: &str, json: &str) -> Result<()> {
+    let path = Path::new(path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Status file path must name a valid UTF-8 file")?;
+    let temporary_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+
+    std::fs::write(&temporary_path, json)
+        .with_context(|| format!("Failed to write status file {}", path.display()))?;
+    if let Err(error) = std::fs::rename(&temporary_path, path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error)
+            .with_context(|| format!("Failed to replace status file {}", path.display()));
+    }
     Ok(())
 }
 /// Multi-container build path: builds every container with `[build]` set
@@ -1361,8 +1622,13 @@ async fn build_and_push_multi_container(
     // can't outlast a short-lived CI token. See #352.
     let token = token_with_retry(provider).await?;
     let backend_platform = fetch_backend_platform_hint(http_client, backend_url, &token).await?;
+    let command_output = if deploy_opts.json_output {
+        build::CommandOutput::Stderr
+    } else {
+        build::CommandOutput::Inherit
+    };
 
-    update_deployment_status(
+    update_deployment_status_with(
         http_client,
         backend_url,
         &token,
@@ -1370,6 +1636,7 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
         "Building",
         None,
+        detect_git_provenance(),
     )
     .await?;
 
@@ -1379,6 +1646,12 @@ async fn build_and_push_multi_container(
     // needless mint + login before every container.
     let min_remaining = registry_cred_min_remaining();
     let mut cached_creds: Option<TimedRegistryCredentials> = None;
+
+    // One entry per container, reported on the `Pushed` transition. A
+    // multi-container deployment builds every image inside a single `Building`
+    // state, so the transition timestamps only ever give the total — which
+    // image was slow is exactly what they cannot say.
+    let mut image_reports: Vec<serde_json::Value> = Vec::new();
 
     for container in &resolved.containers {
         let Some(image_tag) = container_images.get(&container.name) else {
@@ -1415,8 +1688,14 @@ async fn build_and_push_multi_container(
             BuildPushMode::Deferred
         } else {
             BuildPushMode::Inline
-        });
+        })
+        .with_output(command_output);
         let container_cli = options.container_cli.command().to_string();
+        // What the project asked for. `None` means the method was auto-detected
+        // from the build context, and the detected value is resolved inside
+        // `build_image` rather than surfaced here — so the attribute is omitted
+        // rather than guessed at.
+        let build_method = options.backend.clone();
 
         if !deploy_opts.build_args.separate_push {
             // Re-mint registry credentials only when the previous container's are
@@ -1440,17 +1719,7 @@ async fn build_and_push_multi_container(
                     &deployment_info.deployment_id,
                 )
                 .await?;
-                let token = token_with_retry(provider).await?;
-                login_to_registry(
-                    http_client,
-                    backend_url,
-                    &token,
-                    &container_cli,
-                    &fresh_creds,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                )
-                .await?;
+                login_to_registry(&container_cli, &fresh_creds, command_output).await?;
                 cached_creds = Some(TimedRegistryCredentials::new(fresh_creds, &container_cli));
             }
         }
@@ -1458,49 +1727,56 @@ async fn build_and_push_multi_container(
         log_platform_choice(&options.platform, options.platform_source, "Building");
         info!("→ Building container '{}' as {}", container.name, image_tag);
 
+        let build_started = Instant::now();
         if let Err(e) = build::build_image(options) {
             let msg = format!("Build of container '{}' failed: {}", container.name, e);
-            report_failed_status(
-                http_client,
-                backend_url,
-                provider,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
-                &msg,
-            )
-            .await;
-            return Err(e);
+            return Err(e).context(msg);
         }
+        let build_ms = build_started.elapsed().as_millis() as u64;
+
+        let mut push_ms: Option<u64> = None;
+        let push_started = Instant::now();
         if deploy_opts.build_args.separate_push {
             if let Err(e) = push_with_fresh_registry_credentials(
-                http_client,
-                backend_url,
-                provider,
+                DeploymentContext {
+                    http_client,
+                    backend_url,
+                    provider,
+                    project_name: deploy_opts.project_name,
+                    deployment_id: &deployment_info.deployment_id,
+                },
                 &container_cli,
-                deploy_opts.project_name,
-                &deployment_info.deployment_id,
                 image_tag,
+                command_output,
             )
             .await
             {
                 let msg = format!("Push of container '{}' failed: {}", container.name, e);
-                report_failed_status(
-                    http_client,
-                    backend_url,
-                    provider,
-                    deploy_opts.project_name,
-                    &deployment_info.deployment_id,
-                    &msg,
-                )
-                .await;
-                return Err(e);
+                return Err(e).context(msg);
             }
+            push_ms = Some(push_started.elapsed().as_millis() as u64);
         }
+
+        let mut report = serde_json::json!({
+            "container": container.name,
+            "image": image_tag,
+            "build_ms": build_ms,
+        });
+        if let Some(method) = &build_method {
+            report["build_method"] = serde_json::json!(method);
+        }
+        // Omitted, not null, when the push was folded into the build: an inline
+        // push has no separately observable duration, and a stored null reads
+        // as "measured, and the answer was nothing".
+        if let Some(push_ms) = push_ms {
+            report["push_ms"] = serde_json::json!(push_ms);
+        }
+        image_reports.push(report);
         info!("  ✓ Pushed container '{}'", container.name);
     }
 
     let token = token_with_retry(provider).await?;
-    update_deployment_status(
+    update_deployment_status_with(
         http_client,
         backend_url,
         &token,
@@ -1508,6 +1784,12 @@ async fn build_and_push_multi_container(
         &deployment_info.deployment_id,
         "Pushed",
         None,
+        (!image_reports.is_empty()).then(|| {
+            serde_json::json!({
+                "registry": deployment_info.credentials.registry_url,
+                "images": image_reports,
+            })
+        }),
     )
     .await?;
 
@@ -1518,15 +1800,11 @@ async fn build_and_push_multi_container(
     Ok(())
 }
 
-/// Login to the container registry, marking the deployment as Failed on error.
+/// Login to the container registry.
 async fn login_to_registry(
-    http_client: &Client,
-    backend_url: &str,
-    token: &str,
     container_cli: &str,
     credentials: &RegistryCredentials,
-    project_name: &str,
-    deployment_id: &str,
+    output: build::CommandOutput,
 ) -> Result<()> {
     let result = match credentials.auth_method {
         RegistryAuthMethod::LoginCredentials => {
@@ -1534,11 +1812,12 @@ async fn login_to_registry(
                 return Ok(()); // OCI client-auth: credentials managed by docker login
             }
             info!("Logging into registry");
-            build::docker_login(
+            build::docker_login_with_output(
                 container_cli,
                 &credentials.registry_url,
                 &credentials.username,
                 &credentials.password,
+                output,
             )
         }
         RegistryAuthMethod::RegistryToken => {
@@ -1555,20 +1834,7 @@ async fn login_to_registry(
         }
     };
 
-    if let Err(e) = result {
-        update_deployment_status(
-            http_client,
-            backend_url,
-            token,
-            project_name,
-            deployment_id,
-            "Failed",
-            Some(&e.to_string()),
-        )
-        .await?;
-        return Err(e);
-    }
-    Ok(())
+    result
 }
 
 /// Read an environment variable, returning `None` when it is unset or empty.
@@ -1717,6 +1983,53 @@ fn detect_ci_repository_url() -> Option<String> {
 ///
 /// Equivalent to the fetch URL reported by `git remote show origin`, but
 /// resolved offline via `git remote get-url origin`.
+/// Run a `git` command in the working directory, with a timeout.
+///
+/// Threaded and time-bounded for the same reason `detect_git_remote_url` is: a
+/// misconfigured credential helper or a filesystem-backed repository can block
+/// indefinitely, and reporting build provenance must never be able to hang a
+/// deploy.
+fn git_output(args: &'static [&'static str]) -> Option<String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::process::Command::new("git").args(args).output());
+    });
+
+    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// What the source tree was when the build started, or `None` outside a Git
+/// repository.
+///
+/// `dirty` is the part worth having: an image built from uncommitted changes is
+/// not reproducible from its revision, and that is exactly the thing someone
+/// tries to do when a deployment misbehaves.
+fn detect_git_provenance() -> Option<serde_json::Value> {
+    let revision = git_output(&["rev-parse", "HEAD"])?;
+    let mut provenance = serde_json::json!({ "git_revision": revision });
+
+    if let Some(branch) = git_output(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        // Detached HEAD reports the literal "HEAD", which names nothing.
+        if branch != "HEAD" {
+            provenance["git_branch"] = serde_json::json!(branch);
+        }
+    }
+    // `--porcelain` prints one line per changed path and nothing at all for a
+    // clean tree, so emptiness is the test.
+    if let Some(status) = git_output(&["status", "--porcelain"]) {
+        provenance["git_dirty"] = serde_json::json!(!status.is_empty());
+    }
+
+    Some(provenance)
+}
+
 fn detect_git_remote_url() -> Option<String> {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1918,7 +2231,7 @@ async fn call_create_deployment_api(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to create deployment")?;
 
@@ -1960,7 +2273,7 @@ async fn cancel_deployment(
         .patch(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to cancel deployment")?;
 
@@ -1985,6 +2298,37 @@ async fn update_deployment_status(
     status: &str,
     error_message: Option<&str>,
 ) -> Result<()> {
+    update_deployment_status_with(
+        http_client,
+        backend_url,
+        token,
+        project_name,
+        deployment_id,
+        status,
+        error_message,
+        None,
+    )
+    .await
+}
+
+/// Report a transition along with what was observed while making it.
+///
+/// The phases up to `Pushed` happen here, not in the backend, so this is the
+/// only place their detail exists — which build method ran, what was pushed
+/// where, how long each image took. A backend that does not understand
+/// `attributes` ignores them, and passing `None` is always valid, so nothing
+/// depends on the two sides being upgraded together.
+#[allow(clippy::too_many_arguments)]
+async fn update_deployment_status_with(
+    http_client: &Client,
+    backend_url: &str,
+    token: &str,
+    project_name: &str,
+    deployment_id: &str,
+    status: &str,
+    error_message: Option<&str>,
+    attributes: Option<serde_json::Value>,
+) -> Result<()> {
     let url = format!(
         "{}/api/v1/projects/{}/deployments/{}/status",
         backend_url, project_name, deployment_id
@@ -1997,13 +2341,17 @@ async fn update_deployment_status(
         payload["error_message"] = serde_json::json!(error);
     }
 
+    if let Some(attributes) = attributes {
+        payload["attributes"] = attributes;
+    }
+
     debug!("Updating deployment {} status to {}", deployment_id, status);
 
     let response = http_client
         .patch(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await;
 
     // Don't fail deployment if status update fails, just log it
@@ -2035,6 +2383,10 @@ pub struct GetLogsParams<'a> {
     /// but the CLI doesn't validate — the server returns no matches for
     /// unknown values.
     pub levels: &'a [String],
+    /// Restrict to these containers of the deployment (repeated `?container=`
+    /// on the wire). Empty = every container. The server rejects a name the
+    /// deployment doesn't declare.
+    pub containers: &'a [String],
 }
 
 /// Get logs from a deployment
@@ -2069,6 +2421,9 @@ pub async fn get_logs(
     for level in params.levels {
         query_params.push(format!("level={}", urlencoding::encode(level)));
     }
+    for container in params.containers {
+        query_params.push(format!("container={}", urlencoding::encode(container)));
+    }
 
     if !query_params.is_empty() {
         url.push('?');
@@ -2081,7 +2436,7 @@ pub async fn get_logs(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await?;
 
     // Check status
@@ -2135,10 +2490,9 @@ pub async fn get_logs(
                                         print_log_status(data);
                                     } else if event_type == "log" || event_type == "message" {
                                         // `log` events are JSON-wrapped:
-                                        // {"line": "...", "level": "..."}.
-                                        // Other event types (`backlog_complete`)
-                                        // are ignored — they're meta-events
-                                        // the CLI has no use for.
+                                        // {"id": "...", "line": "...", "level": "..."}.
+                                        // Pagination and status metadata is
+                                        // ignored by this CLI view.
                                         print_log_event(data);
                                     }
                                 }
@@ -2440,10 +2794,9 @@ impl LogStream {
                         && (self.event_type == "log" || self.event_type == "message")
                     {
                         // `log` events are JSON-wrapped:
-                        // {"line": "...", "level": "..."}. Yield both so
-                        // the follow UI can colour the line by level.
-                        // Other event types (status, backlog_complete) are
-                        // ignored by the streaming follow UI.
+                        // {"id": "...", "line": "...", "level": "..."}.
+                        // Yield the rendered line and level; pagination and
+                        // status metadata is ignored by the follow UI.
                         return Some(Ok(extract_log_event(data)));
                     }
                     continue;
@@ -2515,7 +2868,7 @@ pub(super) async fn open_log_stream(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .map_err(|e| LogStreamError::Other(anyhow::anyhow!("Failed to connect: {}", e)))?;
 
@@ -2549,8 +2902,9 @@ pub(super) async fn open_log_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_multi_container_payload, extract_log_event, normalize_git_url, token_with_retry,
-        ByteLineBuffer,
+        build_multi_container_payload, deployment_json, deployments_json, extract_log_event,
+        normalize_git_url, token_with_retry, write_json_status_file, ByteLineBuffer, Deployment,
+        DeploymentStatus,
     };
     use crate::token_source::{TokenProvider, TokenSource, TokenSourceError};
     use std::sync::{
@@ -2875,6 +3229,69 @@ mod tests {
         let (containers, routes) = build_multi_container_payload(Some(&config)).unwrap();
         assert!(containers.is_none());
         assert!(routes.is_empty());
+    }
+
+    #[test]
+    fn status_file_replacement_keeps_the_document_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("deployment.json");
+        let path = path.to_str().unwrap();
+
+        write_json_status_file(path, r#"{"status":"Healthy"}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            r#"{"status":"Healthy"}"#
+        );
+
+        write_json_status_file(path, r#"{"status":"Failed"}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            r#"{"status":"Failed"}"#
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn deployment_json_contains_only_the_minimal_ci_fields() {
+        let deployment = Deployment {
+            deployment_id: "dep-123".to_string(),
+            status: DeploymentStatus::Healthy,
+            primary_url: Some("https://dep.example.com".to_string()),
+            error_message: None,
+            ..Default::default()
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&deployment_json(&deployment).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "deployment_id": "dep-123",
+                "status": "Healthy",
+                "primary_url": "https://dep.example.com"
+            })
+        );
+    }
+
+    #[test]
+    fn deployments_json_includes_failure_details_without_unrelated_fields() {
+        let deployment = Deployment {
+            deployment_id: "dep-456".to_string(),
+            status: DeploymentStatus::Failed,
+            error_message: Some("image build failed".to_string()),
+            ..Default::default()
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_str(&deployments_json(&[deployment]).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([{
+                "deployment_id": "dep-456",
+                "status": "Failed",
+                "error_message": "image build failed"
+            }])
+        );
     }
 
     mod registry_credential_reuse {

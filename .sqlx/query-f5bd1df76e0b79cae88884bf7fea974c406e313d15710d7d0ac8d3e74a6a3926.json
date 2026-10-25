@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH ranked_primary AS (\n            -- Only deletable deployments are ranked. The active one and\n            -- anything still running are protected outright below, so letting\n            -- them occupy the kept slots would spend the budget on rows that\n            -- were never at risk and leave no rollback history at all.\n            SELECT\n                d.id,\n                row_number() OVER (\n                    PARTITION BY d.environment_id\n                    ORDER BY d.created_at DESC\n                ) AS rn\n            FROM deployments d\n            JOIN environments e ON e.id = d.environment_id\n            WHERE e.primary_deployment_group IS NOT NULL\n              AND d.deployment_group = e.primary_deployment_group\n              AND NOT d.is_active\n              AND is_terminal(d.status)\n        ),\n        doomed AS (\n            SELECT d.id\n            FROM deployments d\n            WHERE d.created_at < $1\n              AND NOT d.is_active\n              AND is_terminal(d.status)\n              AND NOT EXISTS (\n                  SELECT 1 FROM ranked_primary r\n                  WHERE r.id = d.id AND r.rn <= $2\n              )\n            -- Oldest first, so a bounded pass makes progress from the far end\n            -- rather than nibbling at whatever the planner happened to find.\n            ORDER BY d.created_at\n            LIMIT $3\n        )\n        DELETE FROM deployments d\n        USING doomed\n        WHERE d.id = doomed.id\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f5bd1df76e0b79cae88884bf7fea974c406e313d15710d7d0ac8d3e74a6a3926"
+}

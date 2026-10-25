@@ -92,6 +92,14 @@ fn group_routes_by_requirement<'a>(
 // Re-export constants used by webhook and other consumers
 pub const LABEL_MANAGED_BY: &str = "app.kubernetes.io/managed-by";
 pub const LABEL_PROJECT: &str = "rise.dev/project";
+/// The project's immutable identity, alongside the mutable `LABEL_PROJECT`
+/// name — same key (`project-uuid`) as the Docker/ECS backends'
+/// `rise_backend_core::labels::SUFFIX_PROJECT_UUID`, for one bookkeeping
+/// vocabulary across backends. Purely informational here: the `RiseProject`
+/// CRD's own identity is still name-derived (see `crd::ensure_rise_project`),
+/// so this label does not by itself make a rename safe the way it does for
+/// Docker/ECS's tag/label-based discovery.
+pub const LABEL_PROJECT_UUID: &str = "rise.dev/project-uuid";
 pub const LABEL_DEPLOYMENT_GROUP: &str = "rise.dev/deployment-group";
 pub const LABEL_DEPLOYMENT_ID: &str = "rise.dev/deployment-id";
 pub const LABEL_DEPLOYMENT_UUID: &str = "rise.dev/deployment-uuid";
@@ -309,10 +317,15 @@ impl ResourceBuilder {
         &self,
         project: &Project,
         deployment_group: &str,
+        environments: &[crate::db::models::Environment],
         custom_domains: &[CustomDomain],
     ) -> super::controller::DeploymentUrls {
-        self.url_builder
-            .compute_project_urls(project, deployment_group, custom_domains)
+        self.url_builder.compute_project_urls(
+            project,
+            deployment_group,
+            environments,
+            custom_domains,
+        )
     }
 
     // ── Labels ─────────────────────────────────────────────────────────
@@ -324,6 +337,9 @@ impl ResourceBuilder {
         let mut labels = BTreeMap::new();
         labels.insert(LABEL_MANAGED_BY.to_string(), "rise".to_string());
         labels.insert(LABEL_PROJECT.to_string(), project.name.clone());
+        // A UUID's hex-and-hyphens form is already a valid label value; no
+        // sanitization needed the way the user-supplied name/environment need.
+        labels.insert(LABEL_PROJECT_UUID.to_string(), project.id.to_string());
         if let Some(env) = environment_name {
             labels.insert(
                 LABEL_ENVIRONMENT.to_string(),
@@ -1945,7 +1961,7 @@ mod tests {
             created_by_id: uuid::Uuid::nil(),
             status: crate::db::models::DeploymentStatus::Healthy,
             deployment_group: "default".to_string(),
-            environment_id: None,
+            environment_id: uuid::Uuid::nil(),
             expires_at: None,
             termination_reason: None,
             completed_at: None,
@@ -2204,6 +2220,55 @@ mod tests {
     }
 
     #[test]
+    fn create_k8s_deployment_stamps_project_uuid_on_object_and_pod_template() {
+        // The project's immutable identity must be queryable at both the
+        // Deployment-object level and on the pods it creates (the label rides
+        // in the pod template), matching the Docker/ECS backends' bookkeeping
+        // vocabulary. See LABEL_PROJECT_UUID's doc comment: this is purely
+        // informational on K8s and does not by itself make a rename safe.
+        let builder = test_resource_builder();
+        let project = test_project();
+        let deployment = test_deployment();
+
+        let k8s_deployment = legacy_app_deployment(
+            &builder,
+            &project,
+            &deployment,
+            "demo",
+            "registry.example.test/rise/demo:20260502-000000",
+            8080,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let expected = project.id.to_string();
+        assert_eq!(
+            k8s_deployment
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LABEL_PROJECT_UUID)),
+            Some(&expected)
+        );
+        assert_eq!(
+            k8s_deployment
+                .spec
+                .as_ref()
+                .unwrap()
+                .template
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.labels.as_ref())
+                .and_then(|labels| labels.get(LABEL_PROJECT_UUID)),
+            Some(&expected)
+        );
+    }
+
+    #[test]
     fn create_k8s_deployment_omits_empty_env_and_env_from() {
         let builder = test_resource_builder();
         let project = test_project();
@@ -2433,6 +2498,7 @@ mod tests {
             max_cpu: None,
             min_memory: None,
             max_memory: None,
+            max_deployment_expiration: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2448,6 +2514,61 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn project_urls_exist_without_a_deployment() {
+        let builder = test_resource_builder();
+        let mut project = test_project();
+        project.status = crate::db::models::ProjectStatus::Stopped;
+        let urls = builder.compute_project_urls(&project, "default", &[], &[]);
+        assert_eq!(urls.default_url, "https://demo.example.test");
+        assert_eq!(urls.primary_url, urls.default_url);
+    }
+
+    #[test]
+    fn project_urls_select_domains_from_the_groups_environment() {
+        let builder = test_resource_builder();
+        let project = test_project();
+        let production = test_environment("production", true, "default");
+        let mut staging = test_environment("staging", false, "staging");
+        staging.id = uuid::Uuid::new_v4();
+        let mut staging_domain = test_custom_domain("staging.example.org", true);
+        staging_domain.environment_id = staging.id;
+        let production_domain = test_custom_domain("app.example.org", true);
+        let urls = builder.compute_project_urls(
+            &project,
+            "default",
+            &[production, staging],
+            &[staging_domain, production_domain],
+        );
+        assert_eq!(urls.primary_url, "https://app.example.org");
+        assert_eq!(urls.custom_domain_urls, vec!["https://app.example.org"]);
+    }
+
+    #[test]
+    fn project_urls_match_deployment_urls_for_the_same_environment() {
+        let mut builder = test_resource_builder();
+        builder.url_builder.environment_ingress_url_template =
+            Some("{project_name}-{environment}.example.test".to_string());
+        let project = test_project();
+        let environment = test_environment("staging", false, "staging");
+        let environments = vec![environment.clone()];
+        let mut deployment = test_deployment();
+        deployment.deployment_group = "staging".to_string();
+        deployment.environment_id = environment.id;
+        let before = builder.compute_deployment_urls(
+            &project,
+            &deployment,
+            Some(&environment),
+            &environments,
+            &[],
+        );
+        let after = builder.compute_project_urls(&project, "staging", &environments, &[]);
+        assert_eq!(after.primary_url, "https://demo-staging.example.test");
+        assert_eq!(after.default_url, before.default_url);
+        assert_eq!(after.primary_url, before.primary_url);
+        assert_eq!(after.all_urls, before.all_urls);
     }
 
     #[test]

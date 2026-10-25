@@ -6,6 +6,9 @@ pub struct AccessClassInfo {
     pub id: String,
     pub display_name: String,
     pub description: String,
+    /// Who may reach an app in this class (`None`, `Authenticated`, `Member`),
+    /// so clients can order classes and tell when a change widens access.
+    pub access_requirement: crate::server::settings::AccessRequirement,
 }
 
 /// Response for listing available access classes
@@ -72,6 +75,15 @@ pub struct Project {
     pub owner: Option<OwnerInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_deployment_status: Option<String>, // Status of the active deployment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_deployment_id: Option<String>,
+    /// Newest deployment in the production group. Differs from the active one
+    /// while a newer deploy is in flight, or after one failed and the active
+    /// deployment kept serving.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_deployment_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_deployment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_url: Option<String>, // Default URL from ingress template
     #[serde(skip_serializing_if = "Option::is_none")]

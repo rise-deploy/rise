@@ -12,18 +12,24 @@
 
 pub mod client;
 pub mod container_builder;
-pub mod diff;
-pub mod env;
 pub mod health;
 pub mod identity;
-pub mod labels;
-pub mod pod_status;
 pub mod reconciler;
-pub mod rolling;
-pub mod traefik_api;
 
-#[cfg(test)]
-mod test_helpers;
+// The runtime-agnostic reconcile machinery lives in `rise-backend-core`, and the
+// Traefik routing machinery in `rise-backend-traefik` — shared with the ECS
+// backend rather than duplicated. These re-exports keep every existing
+// `rise_backend_docker::{diff,env,labels,…}` path resolving unchanged.
+pub use rise_backend_core::{diff, env, naming, rolling};
+pub use rise_backend_traefik::{api as traefik_api, readiness, render as traefik_render};
+
+/// The label vocabulary, from both homes: bookkeeping labels are backend-agnostic
+/// (`rise-backend-core`), the Traefik routing labels belong to the Traefik-fronted
+/// backends (`rise-backend-traefik`).
+pub mod labels {
+    pub use rise_backend_core::labels::*;
+    pub use rise_backend_traefik::labels::*;
+}
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -73,11 +79,10 @@ impl DeploymentBackend for DockerBackend {
         deployment: &Deployment,
         project: &Project,
     ) -> Result<DeploymentUrls> {
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
@@ -95,11 +100,15 @@ impl DeploymentBackend for DockerBackend {
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
+        let environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
-        Ok(self
-            .url_builder
-            .compute_project_urls(project, deployment_group, &custom_domains))
+        Ok(self.url_builder.compute_project_urls(
+            project,
+            deployment_group,
+            &environments,
+            &custom_domains,
+        ))
     }
 
     async fn cleanup_environment(&self, project: &Project, environment_name: &str) -> Result<()> {

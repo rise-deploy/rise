@@ -241,7 +241,7 @@ The project uses GitHub Actions for CI:
 - **Helm lint**: Validate Helm charts
 - **Docker build**: Build and push images to GHCR
 - **Documentation**: Build and deploy to GitHub Pages
-- **Publish**: Publish to crates.io on version tags
+- **Release**: Build pre-built CLI archives and attach them to GitHub Releases
 
 All CI checks must pass before merging.
 

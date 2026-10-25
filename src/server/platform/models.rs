@@ -1,20 +1,40 @@
 use serde::Serialize;
 
+/// Normalize architecture names from runtime APIs to OCI platform names.
+///
+/// Docker normally reports Go's `GOARCH` values (already `amd64`, `arm64`,
+/// etc.), but compatible/remote daemons may expose kernel-style aliases.  Keep
+/// the capability stable so the CLI can safely prepend `linux/`.
+pub(crate) fn normalize_runtime_arch(raw: &str) -> Option<String> {
+    let arch = raw.trim().to_ascii_lowercase();
+    let normalized = match arch.as_str() {
+        "" => return None,
+        "x86_64" | "x86-64" => "amd64",
+        "aarch64" => "arm64",
+        "i386" | "i486" | "i586" | "i686" | "x86" => "386",
+        "armv7" | "armv7l" => "arm/v7",
+        "armv6" | "armv6l" => "arm/v6",
+        other => other,
+    };
+    Some(normalized.to_string())
+}
+
 /// Read-only description of the deployment platform's capabilities, surfaced to
 /// clients via `GET /api/v1/platform/capabilities`.
 ///
 /// The response body *is* the capability set — fields sit flat at the top
-/// level. The intent is to name the real cluster capabilities (architecture,
+/// level. The intent is to name the real runtime capabilities (architecture,
 /// whether pods may run as root) and let clients derive *consequences*
 /// themselves (e.g. "binding a privileged port `< 1024` will fail without
 /// `CAP_NET_BIND_SERVICE` or root"), rather than baking those consequences into
 /// per-resource config. New capabilities are added as additional fields.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PlatformCapabilities {
-    /// Container architecture the target cluster accepts (e.g. `amd64`,
-    /// `arm64`), taken from the controller's
-    /// `node_selector["kubernetes.io/arch"]`. Absent when the cluster is
-    /// unconstrained — clients then fall back to the host architecture.
+    /// Container architecture the target runtime accepts (e.g. `amd64`,
+    /// `arm64`). Kubernetes takes it from the controller's
+    /// `node_selector["kubernetes.io/arch"]`; Docker reads it from the
+    /// connected daemon. Absent when the runtime is unconstrained — clients
+    /// then fall back to the host architecture.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_arch: Option<String>,
     /// Whether deployed pods are allowed to run as the root user. Derived from
@@ -42,6 +62,17 @@ impl PlatformCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalizes_runtime_architectures_to_oci_names() {
+        assert_eq!(normalize_runtime_arch("amd64").as_deref(), Some("amd64"));
+        assert_eq!(normalize_runtime_arch("x86_64").as_deref(), Some("amd64"));
+        assert_eq!(normalize_runtime_arch("aarch64").as_deref(), Some("arm64"));
+        assert_eq!(normalize_runtime_arch("ARM64").as_deref(), Some("arm64"));
+        assert_eq!(normalize_runtime_arch("armv7l").as_deref(), Some("arm/v7"));
+        assert_eq!(normalize_runtime_arch("s390x").as_deref(), Some("s390x"));
+        assert_eq!(normalize_runtime_arch("  "), None);
+    }
 
     #[test]
     fn enforced_pod_security_disallows_root() {

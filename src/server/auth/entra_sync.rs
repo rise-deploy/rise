@@ -465,7 +465,10 @@ async fn sync_group(
     default_organization_uid: Uuid,
 ) -> Result<()> {
     // Find or create the team
-    let existing = teams::find_by_name(&mut **tx, &group.team_name)
+    // Locked for the rest of the transaction — see
+    // `teams::find_by_name_for_update`. The Entra sync's window is the whole
+    // multi-group transaction, so this is the wider of the two races.
+    let existing = teams::find_by_name_for_update(&mut **tx, &group.team_name)
         .await
         .context("Failed to look up team")?;
 
@@ -477,18 +480,26 @@ async fn sync_group(
                 .context("Failed to update team name")?;
         }
 
-        // Convert to IdP-managed if needed
+        // Convert to IdP-managed if needed, dropping every pre-existing
+        // membership rather than only the owners — see `remove_all_team_members`:
+        // a self-service team's surviving member row is a claim to whatever
+        // that group name confers, asserted by its creator rather than by the
+        // IdP. The sync re-adds the group's real members immediately below.
         if !team.idp_managed {
-            tracing::info!(
-                "Converting team '{}' to IdP-managed (Entra sync)",
-                group.team_name
-            );
+            let dropped = teams::remove_all_team_members(&mut **tx, team.id)
+                .await
+                .context("Failed to clear pre-existing team members")?;
+            if dropped > 0 {
+                tracing::warn!(
+                    team = %group.team_name,
+                    dropped_memberships = dropped,
+                    "Converting a self-service team to IdP-managed; dropping pre-existing \
+                     memberships the IdP never asserted"
+                );
+            }
             teams::set_idp_managed(&mut **tx, team.id, true)
                 .await
                 .context("Failed to set IdP-managed flag")?;
-            teams::remove_all_owners(&mut **tx, team.id)
-                .await
-                .context("Failed to remove owners on IdP takeover")?;
         }
 
         team.id

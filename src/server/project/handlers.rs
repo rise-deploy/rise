@@ -8,6 +8,7 @@ use super::models::{
 use crate::db::models::User;
 use crate::db::{projects, teams as db_teams, users as db_users};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::state::AppState;
 use axum::{
@@ -15,6 +16,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 use rise_backend_auth::PrincipalClaims;
 use uuid::Uuid;
 
@@ -36,7 +38,10 @@ pub fn validate_http_url(url: &str) -> Result<String, String> {
 /// (`<name>.<domain>`) and part of Kubernetes resource names, so it must be
 /// lowercase alphanumeric plus hyphens, start and end alphanumeric, contain no
 /// dots or spaces, and be at most 63 characters.
-pub fn validate_project_name(name: &str) -> Result<(), String> {
+pub fn validate_project_name(
+    name: &str,
+    reserved_project_names: &std::collections::HashSet<String>,
+) -> Result<(), String> {
     if name.is_empty() {
         return Err("must not be empty".to_string());
     }
@@ -58,6 +63,9 @@ pub fn validate_project_name(name: &str) -> Result<(), String> {
     if !starts_ok || !ends_ok {
         return Err("must start and end with a letter or digit".to_string());
     }
+    if reserved_project_names.contains(name) {
+        return Err("is reserved for a control-plane hostname".to_string());
+    }
     Ok(())
 }
 
@@ -74,58 +82,57 @@ pub async fn list_access_classes(
             id: id.clone(),
             display_name: class.display_name.clone(),
             description: class.description.clone(),
+            access_requirement: class.access_requirement.clone(),
         })
         .collect();
 
     Ok(Json(ListAccessClassesResponse { access_classes }))
 }
 
-/// Resolve user identifier (UUID or email) to user ID
-async fn resolve_user_identifier(
-    pool: &sqlx::PgPool,
+/// Resolve user identifier (UUID or email) to user ID.
+///
+/// Takes an executor rather than the pool so a caller that already holds a
+/// transaction resolves on *its* connection. Asking the pool for a second
+/// connection while holding one deadlocks the pool against itself once enough
+/// requests do it at once — and these resolvers are called once per entry in a
+/// caller-supplied `app_users` / `app_teams` list, so "enough" is not many.
+async fn resolve_user_identifier<'a, E>(
+    executor: E,
     identifier: &str,
-) -> Result<uuid::Uuid, ServerError> {
+) -> Result<uuid::Uuid, ServerError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     use crate::server::error::ServerErrorExt;
 
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        // Valid UUID - verify user exists
-        db_users::find_by_id(pool, uuid)
-            .await
-            .internal_err("Failed to lookup user")?
-            .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
-            .map(|u| u.id)
-    } else {
-        // Treat as email - look up user
-        db_users::find_by_email(pool, identifier)
-            .await
-            .internal_err("Failed to lookup user")?
-            .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
-            .map(|u| u.id)
-    }
+    let found = match uuid::Uuid::parse_str(identifier) {
+        Ok(uuid) => db_users::find_by_id(executor, uuid).await,
+        Err(_) => db_users::find_by_email(executor, identifier).await,
+    };
+    found
+        .internal_err("Failed to lookup user")?
+        .ok_or_else(|| ServerError::not_found(format!("User not found: {}", identifier)))
+        .map(|u| u.id)
 }
 
 /// Resolve team identifier (UUID or name) to team ID
-async fn resolve_team_identifier(
-    pool: &sqlx::PgPool,
+async fn resolve_team_identifier<'a, E>(
+    executor: E,
     identifier: &str,
-) -> Result<uuid::Uuid, ServerError> {
+) -> Result<uuid::Uuid, ServerError>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     use crate::server::error::ServerErrorExt;
 
-    if let Ok(uuid) = uuid::Uuid::parse_str(identifier) {
-        // Valid UUID - verify team exists
-        db_teams::find_by_id(pool, uuid)
-            .await
-            .internal_err("Failed to lookup team")?
-            .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
-            .map(|t| t.id)
-    } else {
-        // Treat as team name - look up team
-        db_teams::find_by_name(pool, identifier)
-            .await
-            .internal_err("Failed to lookup team")?
-            .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
-            .map(|t| t.id)
-    }
+    let found = match uuid::Uuid::parse_str(identifier) {
+        Ok(uuid) => db_teams::find_by_id(executor, uuid).await,
+        Err(_) => db_teams::find_by_name(executor, identifier).await,
+    };
+    found
+        .internal_err("Failed to lookup team")?
+        .ok_or_else(|| ServerError::not_found(format!("Team not found: {}", identifier)))
+        .map(|t| t.id)
 }
 
 pub async fn create_project(
@@ -135,7 +142,7 @@ pub async fn create_project(
 ) -> Result<Json<CreateProjectResponse>, ServerError> {
     let user = auth.user()?;
     // Validate the project name (becomes a subdomain + K8s resource names).
-    validate_project_name(&payload.name).map_err(|e| {
+    validate_project_name(&payload.name, &state.reserved_project_names).map_err(|e| {
         ServerError::bad_request(format!("Invalid project name '{}': {e}", payload.name))
     })?;
     // Validate access_class against configured access classes
@@ -184,7 +191,8 @@ pub async fn create_project(
                         .with_context("user_id", user.id.to_string())
                 })?;
 
-            if !is_member {
+            // Admins bypass the membership requirement, as on the other typed APIs.
+            if !is_member && !state.is_admin(user).await {
                 return Err(ServerError::forbidden("You are not a member of this team"));
             }
 
@@ -237,7 +245,7 @@ pub async fn create_project(
         if e.to_string().contains("duplicate key") || e.to_string().contains("unique constraint") {
             ServerError::new(
                 StatusCode::CONFLICT,
-                format!("Project '{}' already exists", &payload.name),
+                format!("Project '{}' already exists", payload.name),
             )
         } else {
             ServerError::internal_anyhow(e, "Failed to create project")
@@ -266,7 +274,7 @@ pub async fn create_project(
 
     // Add app users if provided
     for user_identifier in &payload.app_users {
-        let user_id = resolve_user_identifier(&state.db_pool, user_identifier).await?;
+        let user_id = resolve_user_identifier(&mut *tx, user_identifier).await?;
         crate::db::project_app_users::add_user(&mut *tx, project.id, user_id)
             .await
             .internal_err("Failed to add app user")?;
@@ -274,7 +282,7 @@ pub async fn create_project(
 
     // Add app teams if provided
     for team_identifier in &payload.app_teams {
-        let team_id = resolve_team_identifier(&state.db_pool, team_identifier).await?;
+        let team_id = resolve_team_identifier(&mut *tx, team_identifier).await?;
         crate::db::project_app_users::add_team(&mut *tx, project.id, team_id)
             .await
             .internal_err("Failed to add app team")?;
@@ -318,6 +326,7 @@ pub async fn create_project(
 pub async fn list_projects(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
 ) -> Result<Json<Vec<ApiProject>>, ServerError> {
     // A service-account access token is bound to a single project and carries the
     // principal, so it needs no user context: return just that project (or an
@@ -336,7 +345,7 @@ pub async fn list_projects(
 
     let user = auth.user()?;
     // Admins can see all projects, others only see projects they have access to
-    let projects = if state.is_admin(&user.email) {
+    let mut projects = if state.is_admin(user).await {
         projects::list(&state.db_pool, None)
             .await
             .internal_err("Failed to list projects")?
@@ -346,6 +355,11 @@ pub async fn list_projects(
             .internal_err("Failed to list projects")
             .map_err(|e| e.with_context("user_id", user.id.to_string()))?
     };
+    // A scoped session sees the projects it covers, an admin's included.
+    if let Some(scope) = &scope {
+        let list = Operation::new(Verb::List, Kind::Project);
+        scope.retain(&mut projects, list, |project| (project.name.clone(), None));
+    }
 
     let api_projects = projects_to_api(&state, projects).await?;
     Ok(Json(api_projects))
@@ -364,10 +378,12 @@ async fn projects_to_api(
             .await
             .internal_err("Failed to get active deployment info")?;
 
-    // Batch fetch active deployments to calculate URLs
+    // Batch fetch the public identifiers for active and latest deployment links
     let deployment_ids: Vec<Uuid> = active_deployment_info
         .values()
-        .filter_map(|info| info.as_ref().map(|i| i.id))
+        .flat_map(|info| [info.active.as_ref(), info.latest.as_ref()])
+        .flatten()
+        .map(|i| i.id)
         .collect();
 
     let deployments_map = if !deployment_ids.is_empty() {
@@ -398,37 +414,28 @@ async fn projects_to_api(
         std::collections::HashMap::new()
     };
 
-    // Calculate URLs for all projects
+    // Project URLs depend on configuration, not deployment lifecycle state.
     let mut api_projects = Vec::new();
     for project in projects {
-        let (active_deployment_status, default_url, primary_url, custom_domain_urls) =
-            if let Some(Some(info)) = active_deployment_info.get(&project.id) {
-                if let Some(deployment) = deployments_map.get(&info.id) {
-                    match state
-                        .deployment_backend
-                        .get_deployment_urls(deployment, &project)
-                        .await
-                    {
-                        Ok(urls) => (
-                            Some(info.status.to_string()),
-                            Some(urls.default_url),
-                            Some(urls.primary_url),
-                            urls.custom_domain_urls,
-                        ),
-                        Err(e) => {
-                            return Err(ServerError::internal_anyhow(
-                                e,
-                                "Failed to calculate deployment URLs",
-                            )
-                            .with_context("project_name", &project.name));
-                        }
-                    }
-                } else {
-                    (Some(info.status.to_string()), None, None, vec![])
-                }
-            } else {
-                (None, None, None, vec![])
-            };
+        let production = active_deployment_info.get(&project.id);
+        let active_info = production.and_then(|info| info.active.as_ref());
+        let latest_info = production.and_then(|info| info.latest.as_ref());
+        let active_deployment_status = active_info.map(|info| info.status.to_string());
+        let active_deployment_id = active_info
+            .and_then(|info| deployments_map.get(&info.id))
+            .map(|deployment| deployment.deployment_id.clone());
+        let latest_deployment_status = latest_info.map(|info| info.status.to_string());
+        let latest_deployment_id = latest_info
+            .and_then(|info| deployments_map.get(&info.id))
+            .map(|deployment| deployment.deployment_id.clone());
+        let urls = state
+            .deployment_backend
+            .get_project_urls(
+                &project,
+                crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
+            )
+            .await
+            .internal_err("Failed to calculate project URLs")?;
 
         let owner = if let Some(user_id) = project.owner_user_id {
             user_emails.get(&user_id).map(|email| {
@@ -457,9 +464,12 @@ async fn projects_to_api(
             access_class: project.access_class,
             owner,
             active_deployment_status,
-            default_url,
-            primary_url,
-            custom_domain_urls,
+            active_deployment_id,
+            latest_deployment_status,
+            latest_deployment_id,
+            default_url: Some(urls.default_url),
+            primary_url: Some(urls.primary_url),
+            custom_domain_urls: urls.custom_domain_urls,
             deployment_groups: None, // Not populated in list view for performance
             finalizers: vec![],      // Not populated in list view for performance
             app_users: vec![],       // Not populated in list view for performance
@@ -493,7 +503,7 @@ pub async fn list_team_projects(
     // the resolved team — otherwise we'd leak team existence by distinguishing
     // 200-empty from 404-not-found. Service-account access does not count,
     // matching the boundary intended for this endpoint.
-    if !state.is_admin(&user.email) {
+    if !state.is_admin(user).await {
         let is_member = db_teams::is_member(&state.db_pool, team_id, user.id)
             .await
             .internal_err("Failed to check team membership")?;
@@ -534,45 +544,31 @@ pub async fn get_project(
         )));
     }
 
-    // Calculate deployment URLs if there's an active deployment
-    let (default_url, primary_url, custom_domain_urls) =
-        match crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
-            .await
-        {
-            Ok(active_deployments) => {
-                // Find the active deployment in the default group
-                if let Some(deployment) = active_deployments.iter().find(|d| {
-                    d.deployment_group
-                        == crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP
-                }) {
-                    match state
-                        .deployment_backend
-                        .get_deployment_urls(deployment, &project)
-                        .await
-                    {
-                        Ok(urls) => (
-                            Some(urls.default_url),
-                            Some(urls.primary_url),
-                            urls.custom_domain_urls,
-                        ),
-                        Err(e) => {
-                            return Err(ServerError::internal_anyhow(
-                                e,
-                                "Failed to calculate URLs",
-                            ));
-                        }
-                    }
-                } else {
-                    (None, None, vec![])
-                }
-            }
-            Err(e) => {
-                return Err(ServerError::internal_anyhow(
-                    e,
-                    "Failed to get active deployments",
-                ));
-            }
-        };
+    let urls = state
+        .deployment_backend
+        .get_project_urls(
+            &project,
+            crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP,
+        )
+        .await
+        .internal_err("Failed to calculate project URLs")?;
+    let production_group = projects::production_deployment_group(&state.db_pool, project.id)
+        .await
+        .internal_err("Failed to get the production deployment group")?;
+    let active_deployment = crate::db::deployments::find_active_deployment_for_group(
+        &state.db_pool,
+        project.id,
+        &production_group,
+    )
+    .await
+    .internal_err("Failed to get active deployment")?;
+    let latest_deployment = crate::db::deployments::find_last_for_project_and_group(
+        &state.db_pool,
+        project.id,
+        &production_group,
+    )
+    .await
+    .internal_err("Failed to get latest deployment")?;
 
     // Resolve owner info
     let owner_info = resolve_owner_info(&state, &project)
@@ -580,9 +576,17 @@ pub async fn get_project(
         .map_err(|e| ServerError::internal(format!("Failed to resolve owner info: {}", e)))?;
 
     let mut api_project = convert_project(project.clone(), owner_info, &state);
-    api_project.default_url = default_url;
-    api_project.primary_url = primary_url;
-    api_project.custom_domain_urls = custom_domain_urls;
+    api_project.default_url = Some(urls.default_url);
+    api_project.primary_url = Some(urls.primary_url);
+    api_project.custom_domain_urls = urls.custom_domain_urls;
+    if let Some(deployment) = active_deployment {
+        api_project.active_deployment_id = Some(deployment.deployment_id);
+        api_project.active_deployment_status = Some(deployment.status.to_string());
+    }
+    if let Some(deployment) = latest_deployment {
+        api_project.latest_deployment_id = Some(deployment.deployment_id);
+        api_project.latest_deployment_status = Some(deployment.status.to_string());
+    }
 
     // When no source URL is explicitly configured, resolve one from deployment
     // metadata (active primary deployment, else most recent deployment).
@@ -692,7 +696,7 @@ pub async fn update_project(
                     .await
                     .internal_err("Failed to check team membership")?;
 
-                if !is_member {
+                if !is_member && !state.is_admin(user).await {
                     return Err(ServerError::forbidden(format!(
                         "You must be a member of team '{}' to transfer projects to it",
                         team.name
@@ -782,7 +786,7 @@ pub async fn update_project(
 
         // Add new app users
         for user_identifier in &app_users {
-            let user_id = resolve_user_identifier(&state.db_pool, user_identifier).await?;
+            let user_id = resolve_user_identifier(&mut *tx, user_identifier).await?;
 
             crate::db::project_app_users::add_user(&mut *tx, updated_project.id, user_id)
                 .await
@@ -815,7 +819,7 @@ pub async fn update_project(
 
         // Add new app teams
         for team_identifier in &app_teams {
-            let team_id = resolve_team_identifier(&state.db_pool, team_identifier).await?;
+            let team_id = resolve_team_identifier(&mut *tx, team_identifier).await?;
 
             crate::db::project_app_users::add_team(&mut *tx, updated_project.id, team_id)
                 .await
@@ -1188,10 +1192,13 @@ fn convert_project(
         access_class: project.access_class,
         owner,
         active_deployment_status: None, // Will be populated by caller if needed
-        default_url: None,              // Will be populated by caller
-        primary_url: None,              // Will be populated by caller
-        custom_domain_urls: vec![],     // Will be populated by caller
-        deployment_groups: None,        // Will be populated by caller if needed
+        latest_deployment_status: None,
+        latest_deployment_id: None,
+        active_deployment_id: None,
+        default_url: None,          // Will be populated by caller
+        primary_url: None,          // Will be populated by caller
+        custom_domain_urls: vec![], // Will be populated by caller
+        deployment_groups: None,    // Will be populated by caller if needed
         finalizers: project.finalizers.clone(),
         app_users: vec![], // Will be populated by caller if needed
         app_teams: vec![], // Will be populated by caller if needed
@@ -1217,7 +1224,7 @@ pub async fn ensure_project_access_or_admin(
     user: &User,
     project: &crate::db::models::Project,
 ) -> Result<(), ServerError> {
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(());
     }
 
@@ -1241,7 +1248,7 @@ pub async fn check_read_permission(
     user: &User,
 ) -> Result<bool, String> {
     // Admins have full access
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 
@@ -1258,7 +1265,7 @@ pub async fn check_write_permission(
     user: &User,
 ) -> Result<bool, String> {
     // Admins have full access
-    if state.is_admin(&user.email) {
+    if state.is_admin(user).await {
         return Ok(true);
     }
 
@@ -1272,15 +1279,27 @@ pub async fn check_write_permission(
 mod tests {
     use super::validate_project_name;
 
+    fn reserved_project_names() -> std::collections::HashSet<String> {
+        ["rise", "dex", "registry", "www"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn accepts_dns_label_names() {
+        let reserved = reserved_project_names();
         for ok in ["app", "my-app", "web1", "a", "a1-b2-c3"] {
-            assert!(validate_project_name(ok).is_ok(), "{ok} should be valid");
+            assert!(
+                validate_project_name(ok, &reserved).is_ok(),
+                "{ok} should be valid"
+            );
         }
     }
 
     #[test]
     fn rejects_non_dns_names() {
+        let reserved = reserved_project_names();
         for bad in [
             "",       // empty
             "My-App", // uppercase
@@ -1291,11 +1310,32 @@ mod tests {
             "app_1",  // underscore
         ] {
             assert!(
-                validate_project_name(bad).is_err(),
+                validate_project_name(bad, &reserved).is_err(),
                 "{bad:?} should be rejected"
             );
         }
         // Over 63 chars.
-        assert!(validate_project_name(&"a".repeat(64)).is_err());
+        assert!(validate_project_name(&"a".repeat(64), &reserved).is_err());
+    }
+
+    #[test]
+    fn rejects_reserved_control_plane_names() {
+        let reserved = reserved_project_names();
+
+        for name in ["rise", "dex", "registry", "www"] {
+            assert_eq!(
+                validate_project_name(name, &reserved),
+                Err("is reserved for a control-plane hostname".to_string()),
+                "{name} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_operator_configured_reserved_names() {
+        let reserved = ["grafana".to_string()].into_iter().collect();
+
+        assert!(validate_project_name("grafana", &reserved).is_err());
+        assert!(validate_project_name("rise", &reserved).is_ok());
     }
 }

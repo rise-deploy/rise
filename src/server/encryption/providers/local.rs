@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, Generate, KeyInit},
     Aes256Gcm, Nonce,
 };
 use anyhow::{bail, Context, Result};
@@ -39,7 +39,7 @@ impl LocalEncryptionProvider {
 impl EncryptionProvider for LocalEncryptionProvider {
     async fn encrypt(&self, plaintext: &str) -> Result<String> {
         // Generate random 12-byte nonce
-        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let nonce = Nonce::generate();
 
         // Encrypt the plaintext
         let ciphertext = self
@@ -67,12 +67,12 @@ impl EncryptionProvider for LocalEncryptionProvider {
         }
 
         let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).context("Invalid ciphertext: malformed nonce")?;
 
         // Decrypt
         let plaintext_bytes = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce, ciphertext)
             .map_err(|e| anyhow::anyhow!("Decryption failed: {}", e))?;
 
         // Convert to UTF-8 string

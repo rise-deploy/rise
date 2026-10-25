@@ -1,6 +1,7 @@
 use super::models::{CreateEnvironmentRequest, EnvironmentResponse, UpdateEnvironmentRequest};
 use crate::db::{environments as db_environments, projects};
 use crate::server::auth::context::AuthContext;
+use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::project::handlers::ensure_project_access_or_admin;
 use crate::server::state::AppState;
@@ -9,6 +10,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 
 /// Create a new environment for a project
 pub async fn create_environment(
@@ -31,6 +33,20 @@ pub async fn create_environment(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
+    let max_deployment_expiration = match payload.max_deployment_expiration.as_deref() {
+        Some(raw) => Some(
+            rise_backend_core::expiration::ExpirationDuration::parse(raw)
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Invalid max_deployment_expiration '{}': {}",
+                        raw, e
+                    ))
+                })?
+                .to_string(),
+        ),
+        None => None,
+    };
+
     let env = db_environments::create_with_flag_swap(
         &state.db_pool,
         project.id,
@@ -38,6 +54,7 @@ pub async fn create_environment(
         payload.primary_deployment_group.as_deref(),
         payload.is_production,
         &payload.color,
+        max_deployment_expiration.as_deref(),
     )
     .await
     .map_err(|e| {
@@ -78,10 +95,21 @@ pub async fn create_environment(
                 "Invalid environment color '{}'. Allowed colors: green, blue, yellow, red, purple, orange, gray.",
                 payload.color
             ))
+        } else if msg.contains("valid_max_deployment_expiration") {
+            ServerError::bad_request(format!(
+                "Invalid max_deployment_expiration '{}'. Must be a duration like '7d', '12h' or '30m'.",
+                payload.max_deployment_expiration.as_deref().unwrap_or("")
+            ))
         } else {
             ServerError::internal_anyhow(e, "Failed to create environment")
         }
     })?;
+
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
+    }
 
     tracing::info!(
         "Created environment '{}' for project '{}'",
@@ -96,6 +124,7 @@ pub async fn create_environment(
 pub async fn list_environments(
     State(state): State<AppState>,
     auth: AuthContext,
+    MaybeSessionScope(scope): MaybeSessionScope,
     Path(project_id_or_name): Path<String>,
 ) -> Result<Json<Vec<EnvironmentResponse>>, ServerError> {
     let project = if let Ok(uuid) = project_id_or_name.parse() {
@@ -112,9 +141,16 @@ pub async fn list_environments(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    let envs = db_environments::list_for_project(&state.db_pool, project.id)
+    let mut envs = db_environments::list_for_project(&state.db_pool, project.id)
         .await
         .internal_err("Failed to list environments")?;
+
+    // A scoped session sees the environments it covers.
+    if let Some(scope) = &scope {
+        let list = Operation::new(Verb::List, Kind::Environment);
+        scope.require_reach(list, &project.name)?;
+        envs.retain(|environment| scope.allows(list, &project.name, Some(&environment.name)));
+    }
 
     Ok(Json(envs.into_iter().map(|e| e.into()).collect()))
 }
@@ -174,11 +210,28 @@ pub async fn update_environment(
         .ok_or_else(|| ServerError::not_found(format!("Environment '{}' not found", env_name)))?;
 
     // Reject early if non-admin tries to set deployment constraints
-    if payload.deployment_constraints.is_some() && !state.is_admin(&user.email) {
+    if payload.deployment_constraints.is_some() && !state.is_admin(user).await {
         return Err(ServerError::forbidden(
             "Only administrators can update deployment constraints",
         ));
     }
+
+    // Canonicalize before storing, same as on create, so the CHECK constraint
+    // can never reject what this parser accepted.
+    let max_deployment_expiration = match &payload.max_deployment_expiration {
+        Some(Some(raw)) => Some(Some(
+            rise_backend_core::expiration::ExpirationDuration::parse(raw)
+                .map_err(|e| {
+                    ServerError::bad_request(format!(
+                        "Invalid max_deployment_expiration '{}': {}",
+                        raw, e
+                    ))
+                })?
+                .to_string(),
+        )),
+        Some(None) => Some(None),
+        None => None,
+    };
 
     let mut updated = db_environments::update(
         &state.db_pool,
@@ -191,6 +244,9 @@ pub async fn update_environment(
             .map(|o| o.as_deref()),
         payload.is_production,
         payload.color.as_deref(),
+        max_deployment_expiration
+            .as_ref()
+            .map(|o| o.as_deref()),
     )
     .await
     .map_err(|e| {
@@ -216,6 +272,8 @@ pub async fn update_environment(
             ServerError::bad_request("Invalid environment name. Must be lowercase alphanumeric with hyphens, no '--'.")
         } else if msg.contains("valid_environment_color") {
             ServerError::bad_request("Invalid environment color. Allowed colors: green, blue, yellow, red, purple, orange, gray.")
+        } else if msg.contains("valid_max_deployment_expiration") {
+            ServerError::bad_request("Invalid max_deployment_expiration. Must be a duration like '7d', '12h' or '30m'.")
         } else {
             ServerError::internal_anyhow(e, "Failed to update environment")
         }
@@ -292,6 +350,12 @@ pub async fn update_environment(
         .internal_err("Failed to update deployment constraints")?;
     }
 
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
+    }
+
     tracing::info!(
         "Updated environment '{}' in project '{}'",
         updated.name,
@@ -332,6 +396,22 @@ pub async fn delete_environment(
         ));
     }
 
+    // Deleting an environment deletes its deployments; running ones are
+    // stopped first, so their workloads are torn down by the controller.
+    let live = crate::db::deployments::count_live_for_environment(&state.db_pool, env.id)
+        .await
+        .internal_err("Failed to count the environment's deployments")?;
+    if live > 0 {
+        return Err(ServerError::conflict(format!(
+            "Environment '{}' has {} deployment{} that {} not stopped. Stop {} first; deleting the environment deletes its deployment history.",
+            env_name,
+            live,
+            if live == 1 { "" } else { "s" },
+            if live == 1 { "is" } else { "are" },
+            if live == 1 { "it" } else { "them" },
+        )));
+    }
+
     let deleted = db_environments::delete(&state.db_pool, env.id)
         .await
         .internal_err("Failed to delete environment")?;
@@ -341,6 +421,12 @@ pub async fn delete_environment(
             "Environment '{}' not found",
             env_name
         )));
+    }
+
+    // The project's status follows its production environment's primary
+    // group, which this change may have moved.
+    if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
+        tracing::warn!(project = %project.name, "Failed to recalculate project status: {:?}", e);
     }
 
     tracing::info!(

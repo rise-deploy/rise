@@ -58,11 +58,10 @@ impl DeploymentBackend for KubernetesBackend {
         project: &Project,
     ) -> Result<DeploymentUrls> {
         // Load environment info if the deployment has one
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
 
         // All envs are needed so `compute_deployment_urls` can suppress a DG URL
         // whose host would collide with another env's URL (see
@@ -86,11 +85,15 @@ impl DeploymentBackend for KubernetesBackend {
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
+        let environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
 
-        Ok(self
-            .resource_builder
-            .compute_project_urls(project, deployment_group, &custom_domains))
+        Ok(self.resource_builder.compute_project_urls(
+            project,
+            deployment_group,
+            &environments,
+            &custom_domains,
+        ))
     }
 
     async fn cleanup_environment(&self, project: &Project, _environment_name: &str) -> Result<()> {

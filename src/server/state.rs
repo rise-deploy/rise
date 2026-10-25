@@ -10,7 +10,7 @@ use crate::server::registry::{
 };
 use rise_backend_auth::RiseTokenSigner;
 
-use crate::server::auth::controller::ControllerIdentity;
+use crate::db::models::User;
 #[cfg(feature = "backend")]
 use crate::server::registry::{
     models::{EcrConfig, GitLabRegistryConfig, JfrogConfig, JfrogTokenProvider},
@@ -35,6 +35,21 @@ pub struct ControllerState {
     pub db_pool: PgPool,
     #[allow(dead_code)]
     pub encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    /// How much deployment history to keep. Carried here rather than read from
+    /// a global because the retention pass runs in a controller, and a
+    /// controller's inputs should be visible in the state it was handed.
+    pub deployment_retention: crate::server::settings::DeploymentRetentionSettings,
+}
+
+#[cfg(feature = "backend")]
+#[derive(Clone)]
+pub struct TraefikHttpProviderConfig {
+    pub native_provider: &'static str,
+    pub label_namespace: String,
+    pub controller_class: String,
+    pub entrypoint: String,
+    pub certresolver: Option<String>,
+    pub auth_backend_url: String,
 }
 
 /// Full state for HTTP server
@@ -55,30 +70,51 @@ pub struct AppState {
     pub registry_provider: Arc<dyn RegistryProvider>,
     pub oci_client: Arc<crate::server::oci::OciClient>,
     pub admin_users: Arc<Vec<String>>,
+    /// IdP groups whose members are admins (case-insensitive name match).
+    pub admin_idp_groups: Arc<Vec<String>>,
     /// Operator role allowlist (case-insensitive email match).
     pub operator_users: Arc<Vec<String>>,
-    /// Controller identities keyed by `id`. Consumed by future generic
-    /// resource endpoints; unused in PR3.
-    #[allow(dead_code)]
-    pub controllers: Arc<HashMap<String, ControllerIdentity>>,
-    /// Controller identities indexed by issuer URL for middleware lookup.
-    pub controllers_by_issuer: Arc<HashMap<String, Vec<ControllerIdentity>>>,
+    /// IdP groups whose members hold the Operator role.
+    pub operator_idp_groups: Arc<Vec<String>>,
     /// Generic-resource store used by the `/api/v1/resources` HTTP API and
     /// (later) by internal controllers wanting to reconcile against Rise state
     /// without a network round-trip.
     #[cfg(feature = "backend")]
     pub resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    /// The authorization choke point for the generic resource API (ADR-0001 §4,
+    /// §5). It holds the same Postgres store as `resource_store`, kept concrete
+    /// so an authorization-changing write can rebuild it over its own
+    /// `SERIALIZABLE` transaction.
+    #[cfg(feature = "backend")]
+    pub resource_authorizer: crate::server::authz::ResourceAuthorizer,
+    /// Resolves interactive logins and User sessions to live `User` resources
+    /// (ADR-0001 §1, §7), provisioning a User on a first login.
+    #[cfg(feature = "backend")]
+    pub user_logins: crate::server::auth::user_identity::UserLogins,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
     #[cfg(feature = "backend")]
     pub default_organization_uid: uuid::Uuid,
+    /// Configured name of the default Organization (`default_organization.name`
+    /// in settings). The generic resource API's policy-audit listing uses this
+    /// to downgrade that Organization's `OrganizationWithoutAdmin` finding to
+    /// `info`: it is administered by operators through the seeded
+    /// `system-admin` binding, not a per-organization admin (ADR-0001 audit
+    /// decision D4).
+    #[cfg(feature = "backend")]
+    pub default_organization_name: String,
     /// `controller_class_name` for the configured Kubernetes deployment
     /// controller. The webhook only reconciles projects whose Organization's
     /// `spec.deploymentControllerClass` matches this value. `None` when no
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
+    /// Dynamic public-routing configuration for Traefik-fronted runtimes.
+    /// The HTTP endpoint combines this static runtime configuration with the
+    /// active deployment and current project/domain rows on every request.
+    #[cfg(feature = "backend")]
+    pub traefik_http_provider: Option<TraefikHttpProviderConfig>,
     /// Short-TTL cache of the per-Org fields the webhook reads on every
     /// sync (`spec.deploymentControllerClass`, resolved namespace prefix).
     /// 30s TTL means a change to either propagates within roughly one
@@ -109,8 +145,13 @@ pub struct AppState {
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
     /// Rate limiter for OAuth endpoints (token, authorize, callback)
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
+    /// Rate limiter for the workload identity token-exchange endpoint.
+    pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
+    /// Project-name labels reserved for control-plane hosts. Normalized to
+    /// lowercase at startup because DNS hostnames are case-insensitive.
+    pub reserved_project_names: Arc<std::collections::HashSet<String>>,
     /// Browser-facing base URL used to build the login redirect when the
     /// `ingress_auth` handler runs in Traefik mode (`signin_redirect=1`).
     /// Sourced from the Docker controller's `auth_signin_url` (falling back to
@@ -129,6 +170,13 @@ pub struct AppState {
     /// ResourceBuilder for Metacontroller webhook (builds K8s resource specs)
     #[cfg(feature = "backend")]
     pub resource_builder: Option<Arc<crate::server::deployment::resource_builder::ResourceBuilder>>,
+    /// Native architecture accepted by the configured deployment runtime.
+    ///
+    /// Kubernetes derives this from its architecture node selector. Docker
+    /// derives it from the connected daemon (which may be remote), rather than
+    /// from the machine running the Rise process.
+    #[cfg(feature = "backend")]
+    pub runtime_arch: Option<String>,
     /// Kubernetes client for direct API calls (pod health checks, log streaming)
     #[cfg(feature = "backend")]
     pub kube_client: Option<kube::Client>,
@@ -335,13 +383,217 @@ async fn resolve_backend_ip(auth_backend_url: &str) -> Option<String> {
 /// `DockerBackend`, tests connectivity, and spawns the in-process
 /// `DockerReconciler`. Returns the backend plus the bollard client so the log
 /// backend can reuse it.
+/// Initialize the ECS deployment backend and spawn its reconcile loop.
+///
+/// Mirrors [`init_docker_backend`]: build the backend-agnostic URL resolver,
+/// connect the runtime client, verify reachability so a misconfiguration is a
+/// startup error rather than a silently idle loop, then spawn the leader-elected
+/// reconciler. Returns the backend plus the reconciler's join handle so
+/// `run_server` can await a graceful lease release on shutdown.
+#[cfg(feature = "backend")]
+#[allow(clippy::too_many_arguments)]
+async fn init_ecs_backend(
+    settings: &crate::server::settings::DeploymentControllerSettings,
+    // AWS account of the configured ECR registry, when the install uses one.
+    // Checked against the ECS credentials' own account at startup.
+    ecr_account_id: Option<&str>,
+    registry_provider: Arc<dyn RegistryProvider>,
+    encryption_provider: Option<Arc<dyn EncryptionProvider>>,
+    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    db_pool: PgPool,
+    store: Arc<dyn rise_backend_core::DeploymentStore>,
+    public_url: &str,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(
+    Arc<dyn DeploymentBackend>,
+    tokio::task::JoinHandle<()>,
+    crate::server::deployment::logs::EcsCloudWatchContext,
+)> {
+    use crate::server::settings::DeploymentControllerSettings;
+    use rise_backend_core::DeploymentUrlBuilder;
+    use rise_backend_ecs::reconciler::{EcsReconciler, ReconcilerConfig};
+    use rise_backend_ecs::{client as ecs_client, EcsBackend};
+
+    let DeploymentControllerSettings::Ecs {
+        region,
+        endpoint_url,
+        access_key_id,
+        secret_access_key,
+        cluster,
+        subnets,
+        security_groups,
+        assign_public_ip,
+        execution_role_arn,
+        task_role_arn,
+        repository_credentials_secret_arn,
+        log_group,
+        resource_prefix,
+        ssm_parameter_prefix,
+        ssm_kms_key_id,
+        cpu_architecture,
+        capacity,
+        production_ingress_url_template,
+        staging_ingress_url_template,
+        environment_ingress_url_template,
+        ingress_port,
+        ingress_schema,
+        access_classes,
+        auth_backend_url,
+        traefik_entrypoint,
+        traefik_certresolver,
+        traefik_api_url,
+        label_namespace,
+        controller_class_name,
+        reconcile_interval_secs,
+        health_probes,
+        identity_agent_image,
+        identity_exchange_url,
+        identity_token_ttl_seconds,
+        ..
+    } = settings
+    else {
+        anyhow::bail!("init_ecs_backend called with a non-ECS deployment controller");
+    };
+
+    let url_builder = Arc::new(DeploymentUrlBuilder {
+        production_ingress_url_template: production_ingress_url_template.clone(),
+        staging_ingress_url_template: staging_ingress_url_template.clone(),
+        environment_ingress_url_template: environment_ingress_url_template.clone(),
+        ingress_port: *ingress_port,
+        ingress_schema: ingress_schema.clone(),
+        registry_provider: registry_provider.clone(),
+    });
+
+    let aws_config = ecs_client::load(&ecs_client::AwsConfig {
+        region,
+        endpoint_url: endpoint_url.as_deref(),
+        access_key_id: access_key_id.as_deref(),
+        secret_access_key: secret_access_key.as_deref(),
+    })
+    .await;
+    let ecs = ecs_client::ecs(&aws_config);
+    let ssm = ecs_client::ssm(&aws_config);
+
+    let backend = EcsBackend::new(
+        ecs.clone(),
+        cluster.clone(),
+        url_builder.clone(),
+        store.clone(),
+    );
+    backend.test_connection().await?;
+    if let Some(account_id) = ecr_account_id {
+        rise_backend_ecs::verify_ecr_same_account(&ecs_client::sts(&aws_config), account_id)
+            .await?;
+    }
+    tracing::info!(cluster = %cluster, region = %region, "ECS deployment backend initialized");
+
+    let health_path = health_probes
+        .as_ref()
+        .map(|h| h.path.clone())
+        .unwrap_or_else(|| "/".to_string());
+
+    let access_requirements: HashMap<String, crate::server::settings::AccessRequirement> =
+        access_classes
+            .iter()
+            .filter_map(|(name, ac)| {
+                ac.as_ref()
+                    .map(|ac| (name.clone(), ac.access_requirement.clone()))
+            })
+            .collect();
+
+    // Fail CLOSED, exactly as the Docker backend does: without an
+    // `auth_backend_url` there is no forwardAuth middleware to stamp, so a
+    // project whose access class requires authentication would be served
+    // publicly. Refuse to start rather than serve it.
+    let offending = crate::server::settings::access_classes_missing_auth_backend_url(
+        access_classes,
+        auth_backend_url,
+    );
+    if !offending.is_empty() {
+        anyhow::bail!(
+            "ECS deployment backend: access class(es) [{}] require authentication \
+             (Authenticated/Member) but `deployment_controller.auth_backend_url` is empty. \
+             Traefik forwardAuth cannot be enforced, so those projects would be served \
+             publicly. Set `deployment_controller.auth_backend_url` to a URL reachable \
+             from inside the cluster (a Cloud Map name or internal load balancer — not \
+             the public URL), or change the access requirement to None.",
+            offending.join(", ")
+        );
+    }
+
+    if traefik_api_url.is_none() {
+        tracing::warn!(
+            "ECS deployment backend: `deployment_controller.traefik_api_url` is not set. \
+             Traefik's serverStatus is the authoritative readiness signal with no fallback, \
+             so any project that declares a `health_check` will never become Healthy."
+        );
+    }
+
+    tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
+
+    let reconciler = EcsReconciler::new(
+        ecs,
+        ssm,
+        store.clone(),
+        db_pool,
+        url_builder,
+        encryption_provider,
+        resource_store,
+        ReconcilerConfig {
+            cluster: cluster.clone(),
+            region: region.clone(),
+            subnets: subnets.clone(),
+            security_groups: security_groups.clone(),
+            assign_public_ip: *assign_public_ip,
+            execution_role_arn: execution_role_arn.clone(),
+            task_role_arn: task_role_arn.clone(),
+            repository_credentials_secret_arn: repository_credentials_secret_arn.clone(),
+            log_group: log_group.clone(),
+            resource_prefix: resource_prefix.clone(),
+            ssm_parameter_prefix: ssm_parameter_prefix.clone(),
+            ssm_kms_key_id: ssm_kms_key_id.clone(),
+            cpu_architecture: cpu_architecture.clone(),
+            capacity: rise_backend_ecs::capacity::Capacity::parse(capacity)?,
+            controller_class: controller_class_name.clone(),
+            label_namespace: label_namespace.clone(),
+            reconcile_interval_secs: *reconcile_interval_secs,
+            health_path,
+            public_url: public_url.to_string(),
+            auth_backend_url: auth_backend_url.clone(),
+            access_classes: access_requirements,
+            traefik_entrypoint: traefik_entrypoint.clone(),
+            traefik_certresolver: rise_backend_traefik::normalize_certresolver(
+                traefik_certresolver.clone(),
+            ),
+            traefik_api_url: traefik_api_url.clone(),
+            identity_agent_image: identity_agent_image.trim().to_string(),
+            identity_exchange_url: identity_exchange_url
+                .clone()
+                .unwrap_or_else(|| public_url.to_string()),
+            identity_token_ttl_seconds: *identity_token_ttl_seconds,
+        },
+    );
+    let reconciler_handle = reconciler.spawn(shutdown);
+
+    Ok((
+        Arc::new(backend) as Arc<dyn DeploymentBackend>,
+        reconciler_handle,
+        crate::server::deployment::logs::EcsCloudWatchContext {
+            sdk_config: aws_config,
+            region: region.clone(),
+            log_group: log_group.clone(),
+            resource_prefix: resource_prefix.clone(),
+        },
+    ))
+}
+
 #[cfg(feature = "backend")]
 #[allow(clippy::too_many_arguments)]
 async fn init_docker_backend(
     settings: &crate::server::settings::DeploymentControllerSettings,
     registry_provider: Arc<dyn RegistryProvider>,
     encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceApi>,
     jwt_signer: Arc<RiseTokenSigner>,
     db_pool: PgPool,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
@@ -438,7 +690,7 @@ async fn init_docker_backend(
     // Fail CLOSED: refuse to start if any non-`None` access class is configured
     // but forwardAuth cannot be wired because the internal backend URL is
     // missing. Otherwise such projects would be served publicly with no auth.
-    let offending = crate::server::settings::docker_access_classes_missing_auth_backend_url(
+    let offending = crate::server::settings::access_classes_missing_auth_backend_url(
         access_classes,
         auth_backend_url,
     );
@@ -519,10 +771,9 @@ async fn init_docker_backend(
             container_prefix: container_prefix.clone(),
             traefik_network: traefik_network.clone(),
             traefik_entrypoint: traefik_entrypoint.clone(),
-            traefik_certresolver:
-                crate::server::deployment::controller::docker::labels::normalize_certresolver(
-                    traefik_certresolver.clone(),
-                ),
+            traefik_certresolver: rise_backend_traefik::normalize_certresolver(
+                traefik_certresolver.clone(),
+            ),
             reconcile_interval_secs: *reconcile_interval_secs,
             health_path,
             public_url: public_url.to_string(),
@@ -550,17 +801,33 @@ async fn init_docker_backend(
 }
 
 impl AppState {
-    /// Check if a user is an admin (case-insensitive email match)
-    pub fn is_admin(&self, user_email: &str) -> bool {
-        crate::server::auth::admin::is_admin_user(&self.admin_users, user_email)
+    /// Check if a user is an admin.
+    ///
+    /// Granted by the `auth.admin_users` email allowlist or by membership in
+    /// one of the `auth.admin_idp_groups` IdP groups.
+    pub async fn is_admin(&self, user: &User) -> bool {
+        self.has_role(&self.admin_users, &self.admin_idp_groups, user)
+            .await
     }
 
-    /// Check if a user has the Operator role (case-insensitive email match).
+    /// Check if a user has the Operator role.
     ///
-    /// Operators are a separate role from admins. Use this for access checks
-    /// on generic-resource APIs once they're wired up.
-    pub fn is_operator(&self, user_email: &str) -> bool {
-        crate::server::auth::admin::is_operator_user(&self.operator_users, user_email)
+    /// Operators are a separate role from admins: admins do NOT implicitly
+    /// receive it. Granted by the `auth.operator_users` email allowlist or by
+    /// membership in one of the `auth.operator_idp_groups` IdP groups.
+    pub async fn is_operator(&self, user: &User) -> bool {
+        self.has_role(&self.operator_users, &self.operator_idp_groups, user)
+            .await
+    }
+
+    async fn has_role(
+        &self,
+        allowed_emails: &[String],
+        allowed_groups: &[String],
+        user: &User,
+    ) -> bool {
+        crate::server::auth::roles::has_role(&self.db_pool, allowed_emails, allowed_groups, user)
+            .await
     }
 
     /// Run database migrations
@@ -604,19 +871,24 @@ impl AppState {
         // store is cheap to construct (it caches compiled JSON schemas lazily),
         // so we instantiate it once and clone the Arc into every handler.
         #[cfg(feature = "backend")]
-        let resource_store: Arc<dyn rise_resource_api::ResourceStore> = Arc::new(
-            rise_resource_store_postgres::PgResourceStore::new(db_pool.clone()),
-        );
+        let pg_resource_store = Arc::new(rise_resource_store_postgres::PgResourceStore::new(
+            db_pool.clone(),
+        ));
+        #[cfg(feature = "backend")]
+        let resource_store: Arc<dyn rise_resource_api::ResourceStore> = pg_resource_store.clone();
 
         // Run default-Organization bootstrap. Must complete before
         // controllers begin processing typed projects, so we await it before
         // the rest of AppState comes up.
         #[cfg(feature = "backend")]
-        let bootstrap_outcome = crate::server::bootstrap::run(&db_pool, &resource_store, settings)
-            .await
-            .context("Default-Organization bootstrap failed")?;
+        let bootstrap_outcome =
+            crate::server::bootstrap::run(&db_pool, resource_store.as_ref(), settings)
+                .await
+                .context("Default-Organization bootstrap failed")?;
         #[cfg(feature = "backend")]
         let default_organization_uid = bootstrap_outcome.default_organization_uid;
+        #[cfg(feature = "backend")]
+        let default_organization_name = settings.default_organization.name.clone();
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -663,6 +935,7 @@ impl AppState {
                     auto_remove,
                     access_key_id,
                     secret_access_key,
+                    registry_host,
                 } => {
                     let ecr_config = EcrConfig {
                         region: region.clone(),
@@ -672,6 +945,7 @@ impl AppState {
                         auto_remove: *auto_remove,
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
+                        registry_host: registry_host.clone(),
                     };
                     let provider = EcrProvider::new(ecr_config)
                         .await
@@ -691,11 +965,15 @@ impl AppState {
                     registry_url,
                     namespace,
                     client_registry_url,
+                    username,
+                    password,
                 } => {
                     let oci_config = OciClientAuthConfig {
                         registry_url: registry_url.clone(),
                         namespace: namespace.clone(),
                         client_registry_url: client_registry_url.clone(),
+                        username: username.clone(),
+                        password: password.clone(),
                     };
                     let provider = OciClientAuthProvider::new(oci_config)
                         .context("Failed to initialize OCI client-auth registry provider")?;
@@ -873,27 +1151,43 @@ impl AppState {
         if !admin_users.is_empty() {
             tracing::info!("Configured {} admin user(s)", admin_users.len());
         }
+        let admin_idp_groups = Arc::new(settings.auth.admin_idp_groups.clone());
+        if !admin_idp_groups.is_empty() {
+            tracing::info!("Configured {} admin IdP group(s)", admin_idp_groups.len());
+        }
 
         // Store operator users list (separate role from admin)
         let operator_users = Arc::new(settings.auth.operator_users.clone());
         if !operator_users.is_empty() {
             tracing::info!("Configured {} operator user(s)", operator_users.len());
         }
-
-        // Validate and index configured controller identities
-        let controller_indexes =
-            crate::server::auth::controller::build_controller_indexes(&settings.auth.controllers)
-                .context("Failed to load controller identities from auth.controllers")?;
-        let controllers = Arc::new(controller_indexes.by_id);
-        let controllers_by_issuer = Arc::new(controller_indexes.by_issuer);
-        if !controllers.is_empty() {
-            let ids: Vec<&str> = controllers.keys().map(String::as_str).collect();
+        let operator_idp_groups = Arc::new(settings.auth.operator_idp_groups.clone());
+        if !operator_idp_groups.is_empty() {
             tracing::info!(
-                "Configured {} controller identity(ies): {:?}",
-                controllers.len(),
-                ids
+                "Configured {} operator IdP group(s)",
+                operator_idp_groups.len()
             );
         }
+
+        // The generic resource API's choke point. It carries the same operator
+        // selectors: operator standing is one subject in the authorization model
+        // (ADR-0001 §1), not a check in front of the API.
+        #[cfg(feature = "backend")]
+        let resource_authorizer = crate::server::authz::ResourceAuthorizer::new(
+            pg_resource_store.clone(),
+            db_pool.clone(),
+            crate::server::authz::OperatorSelectors {
+                users: operator_users.clone(),
+                idp_groups: operator_idp_groups.clone(),
+            },
+        );
+
+        #[cfg(feature = "backend")]
+        let user_logins = crate::server::auth::user_identity::UserLogins::new(
+            pg_resource_store.clone(),
+            db_pool.clone(),
+            &settings.auth.issuer,
+        )?;
 
         // Store auth settings for issuer comparison
         let auth_settings = Arc::new(settings.auth.clone());
@@ -923,6 +1217,13 @@ impl AppState {
         }
 
         let public_url = settings.server.public_url.clone();
+        let reserved_project_names = Arc::new(
+            settings
+                .reserved_project_names
+                .iter()
+                .map(|name| name.trim().to_ascii_lowercase())
+                .collect(),
+        );
         tracing::info!("Public URL: {}", public_url);
         if let Some(ref docs_dir) = settings.server.docs_dir {
             tracing::info!("Documentation directory: {}", docs_dir);
@@ -1112,9 +1413,72 @@ impl AppState {
                     *identity_token_ttl_seconds,
                     Some(controller_class_name.clone()),
                 )
+            } else if let Some(DeploymentControllerSettings::Ecs {
+                deployment_defaults,
+                deployment_constraints,
+                identity_token_ttl_seconds,
+                controller_class_name,
+                ..
+            }) = &settings.deployment_controller
+            {
+                // ECS mode: no K8s ResourceBuilder / kube client / webhook, but
+                // surface the deployment defaults/constraints/class so request
+                // validation behaves identically across backends. Missing this
+                // would silently reject every `replicas > 1` request (the
+                // platform default max is 1) and leave the controller class
+                // unset.
+                (
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(deployment_defaults.clone()),
+                    Some(deployment_constraints.clone()),
+                    *identity_token_ttl_seconds,
+                    Some(controller_class_name.clone()),
+                )
             } else {
                 (None, None, None, None, None, None, 3600, None)
             }
+        };
+
+        #[cfg(feature = "backend")]
+        let traefik_http_provider = match &settings.deployment_controller {
+            Some(crate::server::settings::DeploymentControllerSettings::Docker {
+                label_namespace,
+                controller_class_name,
+                traefik_entrypoint,
+                traefik_certresolver,
+                auth_backend_url,
+                ..
+            }) => Some(TraefikHttpProviderConfig {
+                native_provider: "docker",
+                label_namespace: label_namespace.clone(),
+                controller_class: controller_class_name.clone(),
+                entrypoint: traefik_entrypoint.clone(),
+                certresolver: rise_backend_traefik::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+                auth_backend_url: auth_backend_url.clone(),
+            }),
+            Some(crate::server::settings::DeploymentControllerSettings::Ecs {
+                label_namespace,
+                controller_class_name,
+                traefik_entrypoint,
+                traefik_certresolver,
+                auth_backend_url,
+                ..
+            }) => Some(TraefikHttpProviderConfig {
+                native_provider: "ecs",
+                label_namespace: label_namespace.clone(),
+                controller_class: controller_class_name.clone(),
+                entrypoint: traefik_entrypoint.clone(),
+                certresolver: rise_backend_traefik::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+                auth_backend_url: auth_backend_url.clone(),
+            }),
+            _ => None,
         };
 
         // Cooperative shutdown signal shared by extension reconciliation loops
@@ -1138,7 +1502,7 @@ impl AppState {
         // backend; Docker connects bollard, builds its own ResourceBuilder, and
         // spawns the in-process reconcile loop (under a leader election).
         #[cfg(feature = "backend")]
-        let (deployment_backend, docker_client, docker_reconciler_handle) = {
+        let (deployment_backend, docker_client, ecs_cloudwatch, reconciler_handle) = {
             use crate::server::settings::DeploymentControllerSettings;
             match &settings.deployment_controller {
                 Some(DeploymentControllerSettings::Kubernetes { .. }) => {
@@ -1150,6 +1514,7 @@ impl AppState {
                         .ok_or_else(|| anyhow::anyhow!("Kubernetes client not initialized"))?;
                     (
                         init_kubernetes_backend(rb, kc, deployment_store.clone()).await?,
+                        None,
                         None,
                         None,
                     )
@@ -1167,12 +1532,33 @@ impl AppState {
                         shutdown.clone(),
                     )
                     .await?;
-                    (backend, Some(docker), Some(reconciler_handle))
+                    (backend, Some(docker), None, Some(reconciler_handle))
+                }
+                Some(ecs_settings @ DeploymentControllerSettings::Ecs { .. }) => {
+                    let ecr_account_id = match &settings.registry {
+                        Some(crate::server::settings::RegistrySettings::Ecr {
+                            account_id, ..
+                        }) => Some(account_id.as_str()),
+                        _ => None,
+                    };
+                    let (backend, reconciler_handle, cloudwatch) = init_ecs_backend(
+                        ecs_settings,
+                        ecr_account_id,
+                        registry_provider.clone(),
+                        encryption_provider.clone(),
+                        resource_store.clone(),
+                        db_pool.clone(),
+                        deployment_store.clone(),
+                        &public_url,
+                        shutdown.clone(),
+                    )
+                    .await?;
+                    (backend, None, Some(cloudwatch), Some(reconciler_handle))
                 }
                 None => {
                     return Err(anyhow::anyhow!(
                         "Deployment controller not configured. Please add a deployment_controller \
-                         configuration block (type: kubernetes or type: docker)."
+                         configuration block (type: kubernetes, docker or ecs)."
                     ));
                 }
             }
@@ -1186,6 +1572,10 @@ impl AppState {
             Some(crate::server::settings::DeploymentControllerSettings::Docker {
                 label_namespace,
                 ..
+            })
+            | Some(crate::server::settings::DeploymentControllerSettings::Ecs {
+                label_namespace,
+                ..
             }) => Some(label_namespace.clone()),
             _ => None,
         };
@@ -1195,8 +1585,58 @@ impl AppState {
             webhook_kube_client.clone(),
             docker_client.clone(),
             docker_label_namespace.as_deref(),
+            ecs_cloudwatch,
         )
         .await?;
+
+        // Resolve the architecture from the deployment runtime itself. The
+        // Docker daemon may be remote, so the backend process's compile-time or
+        // host architecture is not authoritative.
+        #[cfg(feature = "backend")]
+        let runtime_arch = if let Some(resource_builder) = resource_builder.as_ref() {
+            resource_builder
+                .node_selector
+                .get("kubernetes.io/arch")
+                .and_then(|arch| crate::server::platform::models::normalize_runtime_arch(arch))
+        } else if let Some(docker) = docker_client.as_ref() {
+            let info = docker
+                .info()
+                .await
+                .context("Failed to query Docker daemon architecture")?;
+            let raw_arch = info
+                .architecture
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Docker daemon did not report its architecture"))?;
+            let arch = crate::server::platform::models::normalize_runtime_arch(raw_arch)
+                .ok_or_else(|| anyhow::anyhow!("Docker daemon reported an empty architecture"))?;
+            tracing::info!(runtime_arch = %arch, "Detected Docker daemon architecture");
+            Some(arch)
+        } else if let Some(crate::server::settings::DeploymentControllerSettings::Ecs {
+            cpu_architecture,
+            ..
+        }) = &settings.deployment_controller
+        {
+            // Fargate's architecture is chosen by configuration, not detected:
+            // the task definition declares it. Surfacing it here is what gives
+            // the CLI its `--platform` hint, so an ARM64 cluster doesn't receive
+            // silently-unrunnable amd64 images — which is exactly why an
+            // architecture that will not normalise must stop startup rather
+            // than quietly withdraw the hint. Settings canonicalise the value at
+            // load, so reaching the error means the two have drifted.
+            Some(
+                crate::server::platform::models::normalize_runtime_arch(cpu_architecture)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "ECS deployment backend: could not normalize \
+                             `deployment_controller.cpu_architecture` ({cpu_architecture:?}) to an \
+                             OCI platform name, so the CLI would build images with no platform \
+                             hint and Fargate could refuse to run them"
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
 
         // Initialize extension registry
         #[allow(unused_mut)]
@@ -1209,7 +1649,7 @@ impl AppState {
         // so its lease is released gracefully on shutdown.
         let mut extension_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         #[cfg(feature = "backend")]
-        if let Some(handle) = docker_reconciler_handle {
+        if let Some(handle) = reconciler_handle {
             extension_handles.push(handle);
         }
 
@@ -1466,6 +1906,11 @@ impl AppState {
                 .build(),
         );
 
+        let workload_token_rate_limiter =
+            Arc::new(crate::server::rate_limit::WorkloadTokenRateLimiter::new(
+                &settings.server.workload_token_rate_limit,
+            ));
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -1544,6 +1989,39 @@ impl AppState {
                 *ingress_port,
                 signin_base,
             )
+        } else if let Some(crate::server::settings::DeploymentControllerSettings::Ecs {
+            access_classes,
+            production_ingress_url_template,
+            staging_ingress_url_template,
+            environment_ingress_url_template,
+            ingress_schema,
+            ingress_port,
+            auth_signin_url,
+            ..
+        }) = &settings.deployment_controller
+        {
+            // Same shape as the Docker arm: ECS is also Traefik-fronted, so the
+            // handler's signin-redirect mode is engaged and needs a browser-facing
+            // base URL. Omitting this arm would leave `access_classes` EMPTY, and
+            // every project's access class would then fail API validation.
+            let filtered: std::collections::HashMap<_, _> = access_classes
+                .iter()
+                .filter_map(|(k, v)| v.as_ref().map(|ac| (k.clone(), ac.clone())))
+                .collect();
+            let signin_base = if auth_signin_url.trim().is_empty() {
+                public_url.clone()
+            } else {
+                auth_signin_url.clone()
+            };
+            (
+                Arc::new(filtered),
+                Some(production_ingress_url_template.clone()),
+                staging_ingress_url_template.clone(),
+                environment_ingress_url_template.clone(),
+                ingress_schema.clone(),
+                *ingress_port,
+                signin_base,
+            )
         } else {
             (
                 Arc::new(std::collections::HashMap::new()),
@@ -1566,15 +2044,23 @@ impl AppState {
             registry_provider,
             oci_client,
             admin_users,
+            admin_idp_groups,
             operator_users,
-            controllers,
-            controllers_by_issuer,
+            operator_idp_groups,
             #[cfg(feature = "backend")]
             resource_store,
             #[cfg(feature = "backend")]
+            resource_authorizer,
+            #[cfg(feature = "backend")]
+            user_logins,
+            #[cfg(feature = "backend")]
             default_organization_uid,
             #[cfg(feature = "backend")]
+            default_organization_name,
+            #[cfg(feature = "backend")]
             deployment_controller_class_name,
+            #[cfg(feature = "backend")]
+            traefik_http_provider,
             #[cfg(feature = "backend")]
             org_view_cache,
             auth_settings,
@@ -1591,7 +2077,9 @@ impl AppState {
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,
+            workload_token_rate_limiter,
             access_classes,
+            reserved_project_names,
             signin_base_url,
             production_ingress_url_template,
             staging_ingress_url_template,
@@ -1600,6 +2088,8 @@ impl AppState {
             ingress_port,
             #[cfg(feature = "backend")]
             resource_builder,
+            #[cfg(feature = "backend")]
+            runtime_arch,
             #[cfg(feature = "backend")]
             kube_client: webhook_kube_client,
             #[cfg(feature = "backend")]

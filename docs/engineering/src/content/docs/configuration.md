@@ -12,9 +12,12 @@ Configuration files are located in `config/` and loaded in this order:
 2. `{RISE_CONFIG_RUN_MODE}.yaml` - Environment-specific config (**required**)
    - `development.yaml` when `RISE_CONFIG_RUN_MODE=development`
    - `production.yaml` when `RISE_CONFIG_RUN_MODE=production`
-3. `local.yaml` - Local overrides (not checked into git, optional)
+3. The local configuration layer (optional):
+   - `RISE_LOCAL_CONFIG_YAML` when the environment variable is present
+   - `local.yaml` otherwise (not checked into git)
 
-Later files override earlier ones.
+Later layers override earlier ones. `RISE_LOCAL_CONFIG_YAML` is parsed as YAML
+and replaces the `local.yaml` source; Rise does not load both.
 
 In container deployments, `RISE_CONFIG_DIR` is typically `/etc/rise`.
 
@@ -89,6 +92,26 @@ database:
 ```
 
 **Note**: `DATABASE_URL` is also required at **compile time** for SQLX query verification. See the [Developer Guide](./developer-guide.md#database_url-at-compile-time) for details.
+
+## Reserved project names
+
+Project names become application host labels. To prevent an application route
+from shadowing a control-plane service, Rise rejects project creation when the
+name appears in the top-level `reserved_project_names` list. This applies to
+both Docker and Kubernetes deployment controllers.
+
+```yaml
+reserved_project_names:
+  - rise
+  - dex
+  - registry
+  - www
+  - grafana # topology-specific control-plane hostname
+```
+
+When omitted, the list defaults to `rise`, `dex`, `registry`, and `www`. Config
+arrays are replaced rather than merged, so an override that adds names must
+repeat the defaults it still needs to reserve.
 
 ## Examples
 
@@ -203,9 +226,13 @@ auth:
                                 # offline_access is omitted by default (the CLI
                                 # does not use refresh tokens, and some providers
                                 # such as Google reject it); add it here if needed.
+  idp_group_claim: "groups"     # ID-token claim containing group names (default shown)
+                                # Use "cognito:groups" for AWS Cognito.
+  idp_group_sync_prefixes: []   # Optional prefixes limiting groups mirrored as teams.
   admin_users: ["email@..."]    # Default-organization admin emails (array)
+  admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
-  controllers: []               # Trusted external controller identities (array, optional)
+  operator_idp_groups: ["..."]  # IdP groups whose members are Operators (array, optional)
   allow_team_creation: true     # Allow regular users to create teams (default: true)
                                 # When false, only admins can create teams
 ```
@@ -214,21 +241,44 @@ auth:
 - `admin_users`: Admins of the default organization. Admins do **not** implicitly receive the Operator role.
 - `operator_users`: Operators have full access to generic resource storage and built-in resource management. Operators do **not** implicitly receive platform (typed CLI/UI) access — list the email in `admin_users` or `platform_access.allowed_user_emails` separately if both are needed.
 
-**Controllers (`auth.controllers`):**
-Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. Controller endpoints are not yet available; this configuration takes effect when the generic resource API is introduced in a future release. Use a dedicated issuer or a dedicated audience per controller to keep identities unambiguous.
+Both roles can also be granted by IdP group, so the IdP stays the source of
+truth and adding an admin does not require a config change and a restart:
 
 ```yaml
 auth:
-  controllers:
-    - id: "controller.example.com/my-ctrl"  # DNS subdomain + optional /name suffix
-      issuer: "https://controller-idp.example.com"
-      claims:                                # required; wildcard match per claim
-        aud: "rise-controller"               # required; string or array JWT `aud` may match
-        sub: "my-controller-*"               # optional subject constraint
-        scope: "controller"
+  admin_idp_groups:
+    - "platform-admins"
+  operator_idp_groups:
+    - "platform-operators"
 ```
 
-`claims.aud` is required for every controller identity. Other constraints, including `sub`, are configured in `claims`. Controller endpoints require a token that matches one configured controller identity. Service-account endpoints still use project-scoped service-account claims; a token that matches a configured controller identity is rejected as a service-account token.
+A user holds the role if their email is on the allowlist **or** they are in one
+of the listed groups. Group names match case-insensitively. Users granted a role
+by group bypass `platform_access` exactly as email-listed users do.
+
+**How group membership is resolved.** Rise reads the ID-token claim configured
+by `auth.idp_group_claim` (default: `groups`) at login and mirrors it into
+IdP-managed teams (`sync_user_groups`, and the Entra active sync when enabled).
+For AWS Cognito, set `idp_group_claim: "cognito:groups"`. Those teams are what
+the group checks read. Login sync accepts only canonical team names containing
+lowercase ASCII letters, digits, and hyphens. Set `idp_group_sync_prefixes`
+(for example, `["rise-"]`) to mirror only matching groups; an empty list accepts
+every canonical name. The prefix filter does not apply to Entra active sync.
+Three consequences:
+
+- Only **IdP-managed** teams count. A team a user creates themselves never
+  grants a role, even if its name matches a configured group — otherwise
+  self-service team creation would be a path to admin.
+- Membership refreshes at login. Removing a user from a group in the IdP takes
+  effect on their next login (or on the next Entra active sync), not
+  immediately. Revoke access that must take effect at once in the IdP itself.
+- Invalid or prefix-excluded claim values never create teams. Existing
+  memberships outside the filtered claim are removed at the next login.
+
+The same resolution backs `platform_access.allowed_idp_groups`.
+
+**Controllers:**
+Controller identities are not configured here — they are `Controller` and `ControllerTrustPolicy` resources managed through the generic resource API. See [Authentication & Tokens — Controllers](/operator-docs/authentication/#controllers) for how to register one.
 
 **Team Creation Control:**
 - `allow_team_creation = true` (default): All authenticated users can create teams
@@ -254,7 +304,15 @@ account_id = "123456789012"
 repo_prefix = "rise/"
 push_role_arn = "arn:aws:iam::..."
 auto_remove = true
+# Optional: the registry host images are pushed to and deployed from, as
+# host[:port]. Defaults to <account_id>.dkr.ecr.<region>.amazonaws.com; set it
+# for another ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+# The ECR API endpoint itself follows the AWS SDK (`AWS_ENDPOINT_URL`).
+# registry_host = "123456789012.dkr.ecr.us-east-1.localhost:4566"
 ```
+
+On ECS (`config/ecs.yaml`) this is `RISE_ECR_REGISTRY_HOST`, which the
+`rise-ecs` module sets from `ecr_registry_host`.
 
 #### OCI Registry (Docker, Harbor, Quay)
 
@@ -263,7 +321,16 @@ auto_remove = true
 type = "oci-client-auth"
 registry_url = "registry.example.com"
 namespace = "rise-apps"
+# Optional: automatically authenticate trusted Rise users during deploy.
+username = "${RISE_REGISTRY_USERNAME}"
+password = "${RISE_REGISTRY_PASSWORD}"
 ```
+
+When `username` and `password` are omitted or empty, users must authenticate the
+container CLI themselves with `docker login`. When set, Rise returns these static
+credentials from the authenticated, deployment-scoped credentials endpoint and
+uses them for controller-side pulls. Anyone allowed to deploy can receive the
+credentials, so use this only where all Rise users are trusted.
 
 #### GitLab Container Registry
 
@@ -399,7 +466,8 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `production_ingress_url_template` — host template for production deployments.
 - `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
   templates for staging / per-environment deployments.
-- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_schema` — `http` or `https` (default `https`). The scheme browsers use to
+  reach apps; also used for sign-in redirects and `/.rise` callback URLs on app hosts.
 - `ingress_port?` — external port apps are served on (e.g. `80` locally).
 - `controller_class_name` — controller ownership class (default `default`).
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
@@ -516,6 +584,26 @@ Run with `RUST_LOG=debug` to see configuration loading details:
 RUST_LOG=debug cargo run --bin rise -- backend server
 ```
 
+### Log colour
+
+Logs are coloured by default, including with nothing attached to a terminal:
+whether that renders depends on what reads the stream. `kubectl logs` hands the
+bytes to a terminal that renders them, so a Kubernetes install keeps colour;
+the CloudWatch console prints them literally, so `modules/rise-ecs` sets
+`RISE_LOG_COLOR = "never"` on the control plane. Being non-terminal is what
+those two have in common, which is why Rise cannot decide it for you.
+
+| `RISE_LOG_COLOR` | Effect |
+|---|---|
+| unset (default) | Always colour |
+| `always` (`1`, `true`, `yes`) | Always colour |
+| `never` (`0`, `false`, `no`) | Never colour |
+| `auto` | Colour only a terminal — for a pipe or a file |
+
+`NO_COLOR` set to anything non-empty also disables colour
+([no-color.org](https://no-color.org)); an explicit `RISE_LOG_COLOR` of
+`always`/`never` wins over it.
+
 ## Debugging Authentication and Token Claims
 
 When a deploy or login is rejected with a permission or "claims do not match"
@@ -583,11 +671,11 @@ The `icon` field accepts either:
 ### Defaults and overrides
 
 Rise ships a `default.yaml` config layer with four curated templates. The
-config loader (`default.yaml` → `<run_mode>.yaml` → `local.yaml`) merges maps
+config loader (`default.yaml` → `<run_mode>.yaml` → local layer) merges maps
 but **replaces arrays**, so any `quickstart.templates` list in a later layer
 replaces the defaults entirely. To extend the shipped catalog, copy
-`/etc/rise/default.yaml`'s `quickstart.templates` into your override file and
-add to the list.
+`/etc/rise/default.yaml`'s `quickstart.templates` into your local layer and add
+to the list.
 
 ### Validation
 

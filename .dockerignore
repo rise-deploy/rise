@@ -4,6 +4,7 @@ book
 frontend/node_modules
 frontend/dist
 
+docs/node_modules
 docs/*/node_modules
 docs/*/dist
 docs/*/.astro

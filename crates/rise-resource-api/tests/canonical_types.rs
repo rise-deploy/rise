@@ -10,6 +10,7 @@ fn schema_accepts<T: schemars::JsonSchema>(value: &str) -> bool {
         .is_valid(&serde_json::json!(value))
 }
 
+/// ADR-0001 scenario 5
 #[test]
 fn subject_id_accepts_exactly_the_seven_canonical_forms() {
     let valid = [
@@ -65,22 +66,45 @@ fn subject_id_accepts_exactly_the_seven_canonical_forms() {
 
 #[test]
 fn subject_id_classifies_virtual_and_org_native_forms_exhaustively() {
+    // organization/name are what policy write-time resolution looks a subject
+    // up by, so they are pinned for every form including the virtual ones.
     let cases = [
-        ("user:u-01jz", false, false),
-        ("controller:deployment-controller", false, false),
-        ("group:acme-corp/platform", false, true),
-        ("serviceaccount:acme-corp/ci-bot", false, true),
-        ("org:acme-corp", true, false),
-        ("system:authenticated", true, false),
-        ("system:operators", true, false),
+        ("user:u-01jz", false, false, None, "u-01jz"),
+        (
+            "controller:deployment-controller",
+            false,
+            false,
+            None,
+            "deployment-controller",
+        ),
+        (
+            "group:acme-corp/platform",
+            false,
+            true,
+            Some("acme-corp"),
+            "platform",
+        ),
+        (
+            "serviceaccount:acme-corp/ci-bot",
+            false,
+            true,
+            Some("acme-corp"),
+            "ci-bot",
+        ),
+        ("org:acme-corp", true, false, Some("acme-corp"), "acme-corp"),
+        ("system:authenticated", true, false, None, "authenticated"),
+        ("system:operators", true, false, None, "operators"),
     ];
-    for (value, is_virtual, is_org_native) in cases {
+    for (value, is_virtual, is_org_native, organization, name) in cases {
         let subject: SubjectId = value.parse().unwrap();
         assert_eq!(subject.is_virtual(), is_virtual, "{value}");
         assert_eq!(subject.is_org_native(), is_org_native, "{value}");
+        assert_eq!(subject.organization(), organization, "{value}");
+        assert_eq!(subject.name(), name, "{value}");
     }
 }
 
+/// ADR-0001 scenario 5
 #[test]
 fn subject_ref_is_narrow_and_group_resolution_requires_an_org() {
     for value in ["user:u-01jz", "group:platform"] {
@@ -129,6 +153,8 @@ fn subject_ref_is_narrow_and_group_resolution_requires_an_org() {
     assert!(serde_json::from_str::<SubjectRef>("{}").is_err());
 }
 
+/// ADR-0001 scenario 1
+/// ADR-0001 scenario 2
 #[test]
 fn resource_kind_is_exact_qualified_and_route_versions_normalize() {
     for value in [
@@ -175,6 +201,7 @@ fn resource_kind_is_exact_qualified_and_route_versions_normalize() {
     assert!(serde_json::from_str::<ResourceKind>("[]").is_err());
 }
 
+/// ADR-0001 scenario 3
 #[test]
 fn scope_accepts_only_wildcard_or_qualified_kind_with_canonical_names() {
     for value in [

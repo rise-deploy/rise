@@ -17,6 +17,18 @@ use crate::models::{
     TerminationReason,
 };
 
+/// Result of [`DeploymentStore::mark_deployment_healthy_and_supersede`].
+#[derive(Debug, Clone)]
+pub struct SupersessionOutcome {
+    /// Whether the deployment was actually marked healthy. `false` means the
+    /// atomic write was rejected (the deployment had already moved to a
+    /// protected status) and nothing in the group was touched.
+    pub became_healthy: bool,
+    /// The previously-active deployment in the group, now `Terminating`, if
+    /// there was one.
+    pub superseded: Option<Deployment>,
+}
+
 /// Persistence operations the deployment controllers depend on.
 ///
 /// Method names and signatures mirror the `rise-deploy` `db` helpers they wrap,
@@ -72,12 +84,14 @@ pub trait DeploymentStore: Send + Sync {
         project_id: Uuid,
     ) -> Result<Vec<Deployment>>;
 
-    /// Find the active deployment for a project's deployment group, if any.
-    async fn find_active_deployment_for_project_and_group(
+    /// List a project's active deployments — at most one per deployment group
+    /// (unique partial index), and never a terminal one: the
+    /// `ensure_terminal_not_active` trigger clears `is_active` on every
+    /// transition to a terminal status.
+    async fn list_active_deployments_for_project(
         &self,
         project_id: Uuid,
-        group: &str,
-    ) -> Result<Option<Deployment>>;
+    ) -> Result<Vec<Deployment>>;
 
     /// List the non-terminal deployments in a project's deployment group.
     async fn find_non_terminal_deployments_for_project_and_group(
@@ -103,35 +117,121 @@ pub trait DeploymentStore: Send + Sync {
     ) -> Result<Deployment>;
 
     /// Mark a deployment failed with an error message.
-    async fn mark_deployment_failed(&self, id: Uuid, error_message: &str) -> Result<Deployment>;
+    ///
+    /// Guarded by the store's own transition validation: returns `None`
+    /// (no-op) rather than overwriting a status this write must not touch —
+    /// e.g. a deployment a concurrent request already moved on from.
+    /// Callers on a routine/opportunistic path should treat `None` as a
+    /// benign race and skip any follow-up (no error, no status recompute);
+    /// callers driven by an explicit user request should surface it as
+    /// "modified concurrently, please retry".
+    async fn mark_deployment_failed(
+        &self,
+        id: Uuid,
+        error_message: &str,
+    ) -> Result<Option<Deployment>>;
 
-    /// Transition a deployment into the cancelling state.
-    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Deployment>;
+    /// Transition a deployment into the cancelling state. See
+    /// `mark_deployment_failed` for the `None` contract.
+    async fn mark_deployment_cancelling(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment cancelled.
-    async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment cancelled. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_cancelled(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment stopped.
-    async fn mark_deployment_stopped(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment stopped. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_stopped(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment superseded.
-    async fn mark_deployment_superseded(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment superseded. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_superseded(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment expired.
-    async fn mark_deployment_expired(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment expired. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_expired(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment healthy.
-    async fn mark_deployment_healthy(&self, id: Uuid) -> Result<Deployment>;
+    /// Mark a deployment healthy. See `mark_deployment_failed` for the
+    /// `None` contract.
+    async fn mark_deployment_healthy(&self, id: Uuid) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment unhealthy with a reason.
-    async fn mark_deployment_unhealthy(&self, id: Uuid, reason: String) -> Result<Deployment>;
+    /// Mark a deployment unhealthy with a reason. See `mark_deployment_failed`
+    /// for the `None` contract.
+    async fn mark_deployment_unhealthy(
+        &self,
+        id: Uuid,
+        reason: String,
+    ) -> Result<Option<Deployment>>;
 
-    /// Mark a deployment terminating with a termination reason.
+    // --- container observations ---
+
+    /// Every replica of a deployment as the backend last saw it, for the
+    /// derivation to compare against.
+    async fn list_container_observations(
+        &self,
+        deployment_id: Uuid,
+    ) -> Result<Vec<crate::observation::ContainerObservation>>;
+
+    /// Replace the recorded observations and append the events they imply, in
+    /// one transaction — the events say what changed, the observations become
+    /// the baseline the next tick compares against, and a crash between the two
+    /// would either lose the events or write them twice.
+    ///
+    /// `observations` is the complete current set: replicas absent from it are
+    /// forgotten, which is how a scale-down or a replaced task leaves the
+    /// baseline as well as the timeline.
+    async fn record_container_observations(
+        &self,
+        deployment_id: Uuid,
+        source: crate::events::EventSource,
+        observations: &[crate::observation::ContainerObservation],
+        events: &[crate::observation::DerivedEvent],
+    ) -> Result<()>;
+
+    /// Forward backend-originated events into the deployment's log, skipping any
+    /// already recorded.
+    ///
+    /// Deduplicated on `dedupe_key`, because a backend re-reads the same window
+    /// on every tick: ECS returns roughly the last hour of service messages,
+    /// and a Kubernetes Event lives well beyond one sync. Re-reporting is the
+    /// normal case, not an error.
+    async fn forward_backend_events(
+        &self,
+        deployment_id: Uuid,
+        source: crate::events::EventSource,
+        events: &[crate::events::ForwardedEvent],
+    ) -> Result<u64>;
+
+    /// Mark a deployment terminating with a termination reason. See
+    /// `mark_deployment_failed` for the `None` contract.
+    ///
+    /// `superseded_by` names the replacement deployment (by its
+    /// `deployment_id`) and is only meaningful with
+    /// [`TerminationReason::Superseded`]. It is taken here because this is the
+    /// only point where the replacement is in scope.
     async fn mark_deployment_terminating(
         &self,
         id: Uuid,
         reason: TerminationReason,
-    ) -> Result<Deployment>;
+        superseded_by: Option<&str>,
+    ) -> Result<Option<Deployment>>;
+
+    /// Atomically mark a deployment healthy and, if some other deployment is
+    /// currently the group's active (`Healthy`) deployment, mark that one
+    /// `Terminating(Superseded)` in the same database transaction — so a
+    /// crash between the two writes can never leave both non-terminal.
+    ///
+    /// `became_healthy` is `false` (no row touched at all) when the
+    /// deployment had already moved to a status this write must not
+    /// overwrite (e.g. a concurrent stop request already moved it to
+    /// `Terminating`) — the caller should stop there: no hook, no straggler
+    /// cleanup, no activation.
+    async fn mark_deployment_healthy_and_supersede(
+        &self,
+        deployment_id: Uuid,
+        project_id: Uuid,
+        deployment_group: &str,
+    ) -> Result<SupersessionOutcome>;
 
     /// Mark a deployment as the single active deployment of its project group.
     async fn mark_deployment_as_active(

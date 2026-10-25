@@ -26,6 +26,29 @@ pub struct Claims {
     pub groups: Option<Vec<String>>,
 }
 
+impl Claims {
+    /// Deserialize validated ID-token claims while mapping the configured IdP
+    /// group claim onto Rise's internal `groups` field.
+    pub fn from_value_with_group_claim(
+        mut value: serde_json::Value,
+        group_claim: &str,
+    ) -> serde_json::Result<Self> {
+        if group_claim != "groups" {
+            if let Some(claims) = value.as_object_mut() {
+                let configured_groups = claims.remove(group_claim);
+                // Selecting a custom claim must not silently fall back to the
+                // provider's conventional `groups` claim.
+                claims.remove("groups");
+                if let Some(groups) = configured_groups {
+                    claims.insert("groups".to_string(), groups);
+                }
+            }
+        }
+
+        serde_json::from_value(value)
+    }
+}
+
 /// JWKS (JSON Web Key Set) response from OIDC provider
 #[derive(Debug, Deserialize)]
 struct JwksResponse {
@@ -306,6 +329,61 @@ mod tests {
         assert_eq!(claims.email, "test@example.com");
         assert_eq!(claims.iss, "https://issuer.example.com");
         assert_eq!(claims.aud, "my-client-id");
+    }
+
+    #[test]
+    fn test_claims_deserialization_with_custom_group_claim() {
+        let value = serde_json::json!({
+            "sub": "user123",
+            "email": "test@example.com",
+            "iss": "https://issuer.example.com",
+            "aud": "my-client-id",
+            "exp": 1234567890,
+            "iat": 1234567800,
+            "groups": ["wrong-group"],
+            "cognito:groups": ["developers", "operators"]
+        });
+
+        let claims = Claims::from_value_with_group_claim(value, "cognito:groups").unwrap();
+
+        assert_eq!(
+            claims.groups,
+            Some(vec!["developers".to_string(), "operators".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_claims_deserialization_with_default_group_claim() {
+        let value = serde_json::json!({
+            "sub": "user123",
+            "email": "test@example.com",
+            "iss": "https://issuer.example.com",
+            "aud": "my-client-id",
+            "exp": 1234567890,
+            "iat": 1234567800,
+            "groups": ["developers"]
+        });
+
+        let claims = Claims::from_value_with_group_claim(value, "groups").unwrap();
+
+        assert_eq!(claims.groups, Some(vec!["developers".to_string()]));
+    }
+
+    #[test]
+    fn test_custom_group_claim_does_not_fall_back_to_groups() {
+        let value = serde_json::json!({
+            "sub": "user123",
+            "email": "test@example.com",
+            "iss": "https://issuer.example.com",
+            "aud": "my-client-id",
+            "exp": 1234567890,
+            "iat": 1234567800,
+            "groups": ["wrong-group"]
+        });
+
+        let claims = Claims::from_value_with_group_claim(value, "cognito:groups").unwrap();
+
+        assert_eq!(claims.groups, None);
     }
 
     #[test]

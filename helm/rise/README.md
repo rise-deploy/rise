@@ -4,7 +4,7 @@ This Helm chart deploys the Rise application on Kubernetes, including the backen
 
 ## Prerequisites
 
-- Kubernetes 1.19+
+- Kubernetes 1.32+
 - Helm 3.0+
 - PostgreSQL database (can be deployed as a dependency or use external database)
 
@@ -39,6 +39,9 @@ config:
     client_secret: ""  # Provided via envFrom
     admin_users:
       - "admin@example.com"
+    # Alternatively (or additionally), grant the admin role by IdP group:
+    # admin_idp_groups:
+    #   - "platform-admins"
 
   registry:
     type: "oci-client-auth"
@@ -156,6 +159,7 @@ The following table lists the configurable parameters of the Rise chart and thei
 | `logs.loki.bearerTokenSecret.key` | Key inside the secret holding the token | `token` |
 | `logs.loki.labels.project` | Loki stream label that carries the Rise project name | `rise_project` |
 | `logs.loki.labels.deploymentId` | Loki stream label that carries the Rise deployment id | `rise_deployment_id` |
+| `logs.loki.labels.container` | Loki stream label that carries the deployment's container name | `container` |
 | `logs.alloy.enabled` | Install bundled Grafana Alloy subchart for Pod log shipping | `false` |
 
 When pointing Rise at an operator-managed Loki whose existing labels differ

@@ -1,12 +1,25 @@
+mod admission;
 pub mod builtin;
+mod lookup;
 pub mod pg_store;
+pub mod session;
 pub mod validation;
 
 mod discriminator;
 mod models;
 
 pub use builtin::{BuiltInRegistration, BuiltInRegistry};
+pub use lookup::{
+    ControllerCandidate, GroupMembershipFact, IdentityLookup, MembershipLookup, TrustPolicyFact,
+    TrustPolicyLookup, UserIdentityFact, CONTROLLER_CANDIDATES_BY_ISSUER_SQL,
+    CONTROLLER_ISSUER_EXISTS_SQL, CONTROLLER_TRUST_POLICIES_SQL, GROUPS_FOR_USER_SQL,
+    GROUP_TIES_BY_USER_NAME_SQL, SERVICE_ACCOUNT_TRUST_POLICIES_SQL,
+    USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL,
+};
 pub use pg_store::PgResourceStore;
+pub use session::{
+    is_serialization_failure, PgSession, PgSessionConnection, SerializableTransaction,
+};
 pub use validation::{JsonSchemaValidator, OrganizationValidator, ResourceDefinitionValidator};
 
 /// Run resource-store migrations in their own Postgres schema (`resource_store`),
@@ -33,17 +46,4 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::Mi
         .await?;
 
     sqlx::migrate!("./migrations").run(&mut conn).await
-}
-
-#[cfg(test)]
-mod migration_tests {
-    #[test]
-    fn concurrent_index_migration_is_non_transactional() {
-        let migrator = sqlx::migrate!("./migrations");
-        let migration = migrator
-            .iter()
-            .find(|migration| migration.version == 20260719000001)
-            .expect("owner-reference index migration exists");
-        assert!(migration.no_tx);
-    }
 }

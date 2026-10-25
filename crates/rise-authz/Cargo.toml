@@ -8,7 +8,13 @@ description = "Database-free authorization policy algebra for Rise"
 publish = false
 
 [dependencies]
+async-trait = { workspace = true }
 rise-resource-api = { path = "../rise-resource-api" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }

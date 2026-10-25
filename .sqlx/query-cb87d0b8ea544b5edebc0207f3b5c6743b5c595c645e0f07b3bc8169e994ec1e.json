@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM deployment_container_observations\n         WHERE deployment_id = $1 AND subject <> ALL($2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cb87d0b8ea544b5edebc0207f3b5c6743b5c595c645e0f07b3bc8169e994ec1e"
+}

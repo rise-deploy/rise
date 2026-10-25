@@ -1,0 +1,312 @@
+---
+title: "Amazon ECS"
+description: "Running Rise's deployment backend on Amazon ECS, on Fargate or your own EC2 capacity."
+---
+
+The ECS backend deploys apps as **ECS tasks** routed by **Traefik's ECS
+provider**. Rise's control plane talks to the ECS API and lets ECS place the
+workloads.
+
+On the default `capacity: fargate` there is no cluster to operate and no host to
+own — AWS schedules everything. Setting `capacity: ec2` places the same tasks on
+container instances you run, which is how Rise deploys into an ECS cluster you
+already have. Networking is `awsvpc` on both: readiness reads each task's own ENI
+address out of Traefik's `serverStatus`, so a `bridge`-networked cluster is not
+supported.
+
+The design, its rationale, and the two AWS behaviours it depends on (both
+verified against a real account) are recorded in
+[ADR-0005](/operator-docs/adr/0005-ecs-deployment-backend/).
+
+## How it maps
+
+| Rise concept | ECS / AWS |
+|---|---|
+| Install | one ECS cluster |
+| Deployment × container spec | one ECS **service** + a task-definition revision |
+| Replicas | the service's `desiredCount` |
+| Routing | Traefik router labels in the container definition's `dockerLabels` |
+| Secret env vars | SSM Parameter Store `SecureString`, injected by ECS at task start |
+| Bookkeeping | resource **tags** (`rise.dev/project`, …) — the only discovery mechanism |
+
+Two consequences are worth internalising before you operate it:
+
+- **A deployment's drift is applied with `UpdateService`.** ECS performs the
+  rolling replacement itself, so nothing is destroyed to change anything. A
+  cutover between deployments still overlaps two services behind one Traefik
+  service and drains via Traefik's health check, as on Docker.
+- **A retiring task can stay routable for up to the ECS provider's
+  `refreshSeconds` after it stops.** Traefik's ECS provider learns a task is
+  gone by polling, not by daemon event as on Docker, so there's a bounded
+  window where it may still send a request to a task that already received
+  `SIGTERM`. A project with a `health_check` is largely protected — Traefik's
+  own per-server probe drops a dead server independent of the poll. Lowering
+  `--providers.ecs.refreshSeconds` on whatever runs your Traefik (the shipped
+  [Terraform module](/operator-docs/ecs/terraform/) exposes it as
+  `traefik_refresh_seconds`) shrinks the window for everyone; if your app is
+  sensitive to it, keep it accepting connections for a few seconds into its
+  `SIGTERM` handler, and confirm the task's `stopTimeout` is long enough to
+  cover that — ECS sends `SIGKILL` once it elapses, whether or not your app
+  was still draining. See
+  [ADR-0005 D12](/operator-docs/adr/0005-ecs-deployment-backend/#d12-cutover-and-health-overlap-and-drain-traefik-authoritative-readiness)
+  for the full rationale.
+- **Task definitions are registered only when their content hash changes.**
+  `RegisterTaskDefinition` sustains one request per second, so a steady install
+  costs zero registrations.
+
+## Prerequisites
+
+- An ECS cluster, and subnets for the tasks' `awsvpc` ENIs. On
+  `capacity: fargate`, public subnets need `assign_public_ip: true` — a task must
+  reach ECR and CloudWatch to start at all, and a public subnet has no NAT
+  gateway. **On `capacity: ec2` that flag is unavailable**: ECS refuses it on that
+  capacity and an `awsvpc` task ENI on a container instance never receives a
+  public address, so the workload subnets need a NAT gateway (or VPC endpoints for
+  ECR, CloudWatch and SSM) instead. Setting both is refused at startup.
+- **On `capacity: fargate`, a raised Fargate on-demand vCPU quota.** A fresh
+  account gets **6**, and every task rounds up to at least 0.25 vCPU (Rise's
+  defaults resolve to 0.5). This is the single most common cause of tasks that
+  never leave `PROVISIONING`.
+- **On `capacity: ec2`, container instances with ENI trunking enabled.** Every
+  task takes its own ENI under `awsvpc`, and the per-instance attachment limit is
+  low — without trunking (the `awsvpcTrunking` account setting, on a supported
+  instance type) it is the ENI limit rather than CPU or memory that caps how many
+  tasks a host can run, and the cutover model transiently needs twice a
+  deployment's steady task count. Rise reconciles a cluster you bring; it does not
+  provision the instances, the Auto Scaling group, or a capacity provider.
+- A Traefik service in the cluster running the ECS provider with
+  `--providers.ecs.exposedByDefault=false` (it defaults to **true**, which would
+  give every task in the cluster a default router). If the cluster hosts more
+  than one Rise install, each also needs a distinct `controller_class_name` and
+  a `--providers.ecs.constraints` matching it — see
+  [Terraform](/operator-docs/ecs/terraform/).
+- `traefik_api_url` reachable from the control plane if any project uses a
+  `health_check` — Traefik's `serverStatus` is the authoritative readiness
+  signal with no fallback, so without it such a deployment never becomes
+  Healthy.
+
+The [Terraform modules](/operator-docs/ecs/terraform/) provision all of it —
+against a cluster and VPC they create, or ones you already run — and refuse the
+configurations the backend rejects at startup. Start there.
+
+`tests/e2e/bootstrap` and `tests/e2e/run` stand up a deliberately smaller shape
+for the end-to-end suite — public subnets, no load balancer, Postgres in a task,
+and every component per run under its own scope so several runs share one
+cluster. Useful to read, and the clearest worked example of the multi-install
+scoping above, but a test environment rather than a template.
+
+## IAM
+
+Two roles, kept separate because they are trusted differently.
+
+**Task execution role** — assumed by ECS itself, to pull images and resolve
+secrets:
+
+- `AmazonECSTaskExecutionRolePolicy` (ECR pull + CloudWatch Logs)
+- `ssm:GetParameters` and `kms:Decrypt` on `/{ssm_parameter_prefix}/*`
+- `secretsmanager:GetSecretValue` on `repository_credentials_secret_arn`, if set
+
+See [Container registry](#container-registry) for what the pull path needs in
+detail — it is the execution role that authenticates it, so a missing permission
+there surfaces as a task that cannot start rather than as an API error.
+
+**Control-plane role** — the identity Rise runs as:
+
+- `ecs:CreateService` / `UpdateService` / `DeleteService` / `DescribeServices` /
+  `DescribeTasks` / `TagResource`, on the cluster's services and tasks
+- `ecs:DescribeClusters` (the startup connectivity check), `ecs:ListServices`
+  and `ecs:ListTasks`
+- `ecs:RegisterTaskDefinition` — the one action that supports neither
+  resource-level permissions nor the `ecs:cluster` condition key
+- `ssm:PutParameter` / `DeleteParameter(s)` / `GetParametersByPath` /
+  `AddTagsToResource` on `/{ssm_parameter_prefix}/*`, plus `kms` on the CMK if
+  the parameters use one
+- `iam:PassRole` **scoped to exactly the execution and task roles above**, with
+  an `iam:PassedToService` condition of `ecs-tasks.amazonaws.com`
+
+That last scoping matters: an unscoped `iam:PassRole` would let anyone who can
+create a Rise deployment run a task as any role in the account.
+
+The control plane needs no `ec2` or `servicediscovery` access. Task addresses
+come from `DescribeTasks` attachment details rather than
+`DescribeNetworkInterfaces`, and Cloud Map registration for workloads is not
+implemented. Runtime-log reads require `logs:FilterLogEvents` and
+`logs:StartLiveTail` on the configured group; writes belong to the ECS task
+execution role.
+
+The control-plane role must also trust `ecs-tasks.amazonaws.com`: on ECS it *is*
+the task role Rise runs as, so without that trust the task cannot start.
+
+## Container registry
+
+ECS authenticates every image pull **itself**, using the task execution role,
+and it re-authenticates at every task start — scale-out, task replacement, AZ
+rebalance. Rise never mints a pull credential for this backend and never hands
+ECS one. That shapes which registries can work here:
+
+| `registry.type` | Supported | What it needs |
+|---|---|---|
+| `ecr` | ✅ recommended | `execution_role_arn`, in the **same AWS account** as the cluster |
+| `oci-client-auth`, anonymous | ✅ | the registry reachable from the task subnets |
+| `oci-client-auth` with credentials | ✅ | `repository_credentials_secret_arn` |
+| `gitlab`, `jfrog` | ❌ | nothing — see below |
+
+GitLab and JFrog issue short-lived scoped pull tokens that Rise refreshes on the
+puller's behalf; on Kubernetes it re-mints the pull Secret every six hours. ECS
+gives it no equivalent hook, so a deploy would succeed and then fail hours later
+when the token expired. Configuring one alongside the ECS controller is refused
+at startup rather than left to fail at 3am.
+
+### ECR
+
+Nothing extra is stored: the execution role *is* the credential.
+
+- **Execution role**: `AmazonECSTaskExecutionRolePolicy`, or explicitly
+  `ecr:GetAuthorizationToken` on `*` plus `ecr:BatchGetImage`,
+  `ecr:GetDownloadUrlForLayer` and `ecr:BatchCheckLayerAvailability` on
+  `arn:aws:ecr:{region}:{account}:repository/{repo_prefix}*`.
+- **Control-plane role**: `sts:AssumeRole` on `registry.push_role_arn` (the role
+  Rise assumes to mint the CLI's scoped push credentials), plus
+  `ecr:CreateRepository`, `ecr:DescribeRepositories`, `ecr:DeleteRepository` and
+  `ecr:TagResource` — repository lifecycle uses the control plane's own identity,
+  not the push role.
+- **Network path**: a task must reach ECR before it can start. Either a public IP
+  or a NAT gateway, or the `com.amazonaws.{region}.ecr.api` and
+  `com.amazonaws.{region}.ecr.dkr` interface endpoints **plus the S3 gateway
+  endpoint** — layer blobs come from S3, and a setup with only the two ECR
+  endpoints fails on the pull rather than on the API call.
+
+**The registry must live in the cluster's account.** Rise creates repositories
+with tags and image scanning only and writes no repository policy, which
+cross-account ECR requires; identity-based permissions on the execution role are
+not sufficient on their own. A mismatch is refused at startup, because it is
+otherwise invisible — `registry.account_id` only formats image references, so
+repositories would be created in one account while every deployment pointed at
+another.
+
+Repositories are provisioned by a background controller on a 10-second poll, not
+at project-create time. A create-then-deploy within that window mints
+credentials against a repository that does not exist yet.
+
+### A private registry that is not ECR
+
+Store the username and password in a Secrets Manager secret, set
+`repository_credentials_secret_arn` to its ARN, and grant the execution role
+`secretsmanager:GetSecretValue` on it (plus `kms:Decrypt` if the secret uses a
+customer-managed key). The ARN is stamped on every container definition as
+`repositoryCredentials`; ECS reads the secret at task start, so rotating the
+credentials inside it needs no redeploy.
+
+## Configuration
+
+`config/ecs.yaml` ships in the image and is selected with
+`RISE_CONFIG_RUN_MODE=ecs`. The settings specific to this backend:
+
+| Setting | Notes |
+|---|---|
+| `cluster`, `region` | which cluster to reconcile |
+| `subnets`, `security_groups` | accept a YAML list **or a comma-separated string**, so they can come straight from a Terraform output via an env var |
+| `assign_public_ip` | required on public subnets — **`capacity: fargate` only**; ECS refuses it on EC2 capacity, so the pair is rejected at startup |
+| `execution_role_arn`, `task_role_arn` | see IAM above; the execution role is also what pulls from ECR |
+| `repository_credentials_secret_arn` | Secrets Manager secret for a private non-ECR registry |
+| `log_group` | `awslogs` destination and CloudWatch runtime-log source; required by the shipped `deployment_logs.type: cloudwatch` configuration |
+| `ssm_parameter_prefix`, `ssm_kms_key_id` | where secret env vars live |
+| `cpu_architecture` | `X86_64` or `ARM64` — also the CLI's platform hint. Common spellings (`amd64`, `aarch64`, any case) are normalised; anything else is **refused at startup**, since defaulting would build images the tasks cannot execute |
+| `capacity` | `fargate` (default) or `ec2`. Also decides how `cpu`/`memory` are resolved — see the [feature matrix](/operator-docs/deployment-backends/). Anything else is **refused at startup**: quietly falling back to Fargate would bill an operator who asked for their own instances for serverless capacity. Changing it does **not** move running services (ECS cannot); the next deployment of each project picks it up, and until then the mismatch is logged per service |
+| `auth_backend_url` | **must be reachable from inside the cluster** (a Cloud Map name or internal load balancer), never the public URL |
+| `traefik_api_url` | required for projects using `health_check` |
+| `reconcile_interval_secs` | defaults to 30; ECS is a throttled API |
+
+:::caution[Set a customer-managed KMS key for secret isolation]
+`ssm_kms_key_id` is optional, but on a multi-tenant install it should be set.
+Without it, secret env vars are written as `SecureString`s under the
+AWS-managed `alias/aws/ssm` key, whose default policy lets **any** account
+principal permitted to call SSM decrypt them — so a broad `ReadOnlyAccess`-style
+role can read every project's secrets. A customer-managed key gates decryption
+behind an explicit `kms:Decrypt` grant (scoped by `kms:ViaService = ssm.*`),
+which is what makes "reading ECS reveals only a parameter name" hold.
+:::
+
+## Workload identity
+
+ECS offers no way to write a file into a running task, so every task Rise
+creates carries a small **identity sidecar**, `rise-identity-agent`, next to
+the app. It runs `rise identity agent` from the `rise-cli` image and writes the
+[workload identity](/docs/user-guide/workload-identity-tokens/) files onto a
+task volume the app mounts read-only at `/var/run/secrets/rise/identity`. The
+app container waits for it (`dependsOn … HEALTHY`), so the files exist before
+the app starts.
+
+- **The credential** is generated by the control plane and stored as an SSM
+  `SecureString` under the deployment's own path
+  (`/{ssm_parameter_prefix}/…/{deployment_id}/rise-identity/credential`), so the
+  execution role's existing grant covers it and it is deleted with the
+  deployment. Only the sidecar receives it.
+- **Tokens** for `[identity].audiences` are minted one per audience from the
+  token-exchange endpoint (`POST /api/v1/identity/token`) at
+  `identity_exchange_url` (default: the public URL), with a lifetime of
+  `identity_token_ttl_seconds`, and refreshed at half that. Tasks therefore need
+  a route to that URL; set `identity_exchange_url` to an internal address if
+  they have none. The endpoint budgets a valid credential per deployment
+  (`server.workload_token_rate_limit`, 500 requests a minute by default), not
+  per address, so tasks sharing a NAT gateway do not throttle each other. The
+  sidecar has ECS's full five-minute start period to write its files before
+  failed health checks count, so a brief throttle or control-plane restart
+  delays the app rather than failing the task.
+- **The image** is `rise-cli` — the CLI alone on a distroless base, published
+  beside the Rise image at the same tag — and `identity_agent_image` is
+  **required**, like the control plane's own image (`rise_cli_image_tag` or
+  `rise_cli_image_ref` in `rise-ecs`); normally set it to the same release. The
+  workload execution role pulls it with no registry credentials, so mirror it
+  somewhere that role can pull if GHCR is out of reach. The image is left out of
+  the task-definition hash: a new image reaches new deployments without rolling
+  running ones.
+- **Cost:** one extra, non-essential container per task (restarted in place if
+  it exits) with a 32 MiB memory reservation out of the task's size.
+
+The sidecar logs under `{resource_prefix}-identity/…` in the same log group, not
+in `rise deployment logs`. If a deployment with `[identity].audiences` never
+becomes healthy, look there first: the app does not start until the sidecar has
+fetched its tokens.
+
+## Not supported yet
+
+Each of these **fails closed at deploy time** with an error naming the reason
+and the alternatives, rather than deploying something that quietly does not
+work:
+
+- **Multi-container deployments** — cross-container discovery needs Cloud Map
+  registration, so `RISE_CONTAINER_HOST__*` would be absent.
+- **Interruptible capacity** (Fargate Spot, a Spot-backed Auto Scaling group
+  capacity provider) — the placement machinery is capacity-provider-shaped
+  already, but nothing selects one yet.
+
+## Troubleshooting
+
+**Tasks never leave `PROVISIONING`.** On `capacity: fargate`, almost always the
+Fargate vCPU quota. On `capacity: ec2` it is a placement failure — no container
+instance has the CPU, memory, or (most often) a free ENI. Either way, ECS says
+which in the service's own events, and Rise forwards them to the deployment
+timeline: `aws ecs describe-services --services … --query 'services[].events'`.
+
+**A deployment stays `Deploying` forever.** If the project sets a
+`health_check`, confirm `traefik_api_url` is reachable — readiness comes from
+Traefik's `serverStatus` with no fallback. The controller logs a warning at
+startup when the URL is unset.
+
+**The app is not routable.** Confirm Traefik's ECS provider is running against
+the right cluster and that `exposedByDefault` is `false`. Rise stamps
+`traefik.enable=true` itself; the routing configuration is in the container
+definition's `dockerLabels`, which is the only place the provider reads it.
+
+**`CannotPullContainerError` on every task.** The execution role is the whole
+pull credential on this backend. Check it has the ECR read actions above, that
+the task can reach ECR at all (public IP, NAT, or all three VPC endpoints), and
+— for a private non-ECR registry — that `repository_credentials_secret_arn` is
+set and readable by that role.
+
+**Memory is higher than requested.** Expected on `capacity: fargate` — see the
+CPU/memory row of the [feature matrix](/operator-docs/deployment-backends/).
+Fargate accepts only a fixed table of sizes and Rise rounds up, never down. The
+resolved size is logged at reconcile. On `capacity: ec2` there is no table, so
+the request is used exactly as written.

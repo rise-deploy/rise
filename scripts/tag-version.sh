@@ -2,6 +2,32 @@
 set -e
 
 CLAUDE="${CLAUDE:-claude}"
+CODEX="${CODEX:-codex}"
+RELEASE_NOTES_AI="${RELEASE_NOTES_AI:-auto}"
+
+select_release_notes_ai() {
+    case "$RELEASE_NOTES_AI" in
+        auto)
+            if command -v "$CLAUDE" &> /dev/null; then
+                RELEASE_NOTES_AI="claude"
+            elif command -v "$CODEX" &> /dev/null; then
+                RELEASE_NOTES_AI="codex"
+            else
+                return 1
+            fi
+            ;;
+        claude)
+            command -v "$CLAUDE" &> /dev/null || return 1
+            ;;
+        codex)
+            command -v "$CODEX" &> /dev/null || return 1
+            ;;
+        *)
+            echo "Error: --ai-cli must be one of: auto, claude, codex"
+            exit 1
+            ;;
+    esac
+}
 
 # Check prerequisites
 check_prerequisites() {
@@ -15,8 +41,12 @@ check_prerequisites() {
         missing+=("cargo")
     fi
 
-    if [ "$SKIP_AI_RELEASE_NOTES" = false ] && ! command -v "$CLAUDE" &> /dev/null; then
-        missing+=("claude (Claude CLI)")
+    if [ "$SKIP_AI_RELEASE_NOTES" = false ] && ! select_release_notes_ai; then
+        if [ "$RELEASE_NOTES_AI" = "auto" ]; then
+            missing+=("claude or codex (AI release notes CLI)")
+        else
+            missing+=("${RELEASE_NOTES_AI} CLI")
+        fi
     fi
 
     if [ ${#missing[@]} -gt 0 ]; then
@@ -27,7 +57,8 @@ check_prerequisites() {
         echo ""
         echo "Install missing tools:"
         if [ "$SKIP_AI_RELEASE_NOTES" = false ]; then
-            echo "  - claude: https://github.com/anthropics/anthropic-tools"
+            echo "  - claude: https://github.com/anthropics/claude-code"
+            echo "  - codex: https://github.com/openai/codex"
         fi
         exit 1
     fi
@@ -36,7 +67,7 @@ check_prerequisites() {
 # Parse arguments
 DRY_RUN=false
 SKIP_AI_RELEASE_NOTES=false
-CLAUDE_GUIDANCE=""
+AI_GUIDANCE=""
 VERSION=""
 COMMIT_RANGE=""
 
@@ -50,28 +81,44 @@ while [[ $# -gt 0 ]]; do
             SKIP_AI_RELEASE_NOTES=true
             shift
             ;;
-        --claude-guidance)
+        --ai-cli)
             if [ -z "${2:-}" ]; then
-                echo "Error: --claude-guidance requires a value"
+                echo "Error: --ai-cli requires a value"
                 exit 1
             fi
-            if [ -n "$CLAUDE_GUIDANCE" ]; then
-                CLAUDE_GUIDANCE="${CLAUDE_GUIDANCE}"$'\n'"${2}"
+            RELEASE_NOTES_AI="$2"
+            shift 2
+            ;;
+        --ai-cli=*)
+            RELEASE_NOTES_AI="${1#*=}"
+            if [ -z "$RELEASE_NOTES_AI" ]; then
+                echo "Error: --ai-cli requires a value"
+                exit 1
+            fi
+            shift
+            ;;
+        --ai-guidance|--claude-guidance)
+            if [ -z "${2:-}" ]; then
+                echo "Error: $1 requires a value"
+                exit 1
+            fi
+            if [ -n "$AI_GUIDANCE" ]; then
+                AI_GUIDANCE="${AI_GUIDANCE}"$'\n'"${2}"
             else
-                CLAUDE_GUIDANCE="$2"
+                AI_GUIDANCE="$2"
             fi
             shift 2
             ;;
-        --claude-guidance=*)
+        --ai-guidance=*|--claude-guidance=*)
             GUIDANCE_VALUE="${1#*=}"
             if [ -z "$GUIDANCE_VALUE" ]; then
-                echo "Error: --claude-guidance requires a value"
+                echo "Error: ${1%%=*} requires a value"
                 exit 1
             fi
-            if [ -n "$CLAUDE_GUIDANCE" ]; then
-                CLAUDE_GUIDANCE="${CLAUDE_GUIDANCE}"$'\n'"${GUIDANCE_VALUE}"
+            if [ -n "$AI_GUIDANCE" ]; then
+                AI_GUIDANCE="${AI_GUIDANCE}"$'\n'"${GUIDANCE_VALUE}"
             else
-                CLAUDE_GUIDANCE="$GUIDANCE_VALUE"
+                AI_GUIDANCE="$GUIDANCE_VALUE"
             fi
             shift
             ;;
@@ -88,14 +135,15 @@ done
 
 # Check if version argument is provided
 if [ -z "$VERSION" ]; then
-    echo "Usage: $0 [--dry-run] [--skip-ai-release-notes] [--claude-guidance <text>] <version> [commit-range]"
+    echo "Usage: $0 [--dry-run] [--skip-ai-release-notes] [--ai-cli <auto|claude|codex>] [--ai-guidance <text>] <version> [commit-range]"
     echo ""
     echo "Examples:"
     echo "  $0 0.1.4                    # Create release for version 0.1.4"
     echo "  $0 0.21.0-rc1               # Create prerelease for version 0.21.0-rc1"
     echo "  $0 --dry-run 0.1.4          # Preview release notes for next version"
-    echo "  $0 --dry-run --claude-guidance \"Emphasize Helm chart changes\" 0.1.4"
-    echo "  $0 --skip-ai-release-notes 0.1.4  # Tag without Claude-generated notes"
+    echo "  $0 --dry-run --ai-guidance \"Emphasize Helm chart changes\" 0.1.4"
+    echo "  $0 --dry-run --ai-cli codex 0.1.4  # Generate notes with Codex"
+    echo "  $0 --skip-ai-release-notes 0.1.4   # Tag without AI-generated notes"
     echo "  $0 --dry-run 0.1.4 v0.13.0..HEAD  # Preview notes for specific range"
     exit 1
 fi
@@ -159,7 +207,7 @@ fi
 # Get commit messages
 COMMITS=$(git log "${COMMIT_RANGE}" --pretty=format:"commit %h%n%B%n---" --no-merges)
 
-# Generate release notes with Claude analysis
+# Generate release notes with AI analysis
 echo "Generating release notes..."
 
 if [ -z "$COMMITS" ]; then
@@ -182,10 +230,10 @@ Be concise and user-focused. Use markdown formatting. Start with a brief overvie
 
 EOF
 
-    if [ -n "$CLAUDE_GUIDANCE" ]; then
+    if [ -n "$AI_GUIDANCE" ]; then
         cat >> "$TEMP_PROMPT" << EOF
 Additional guidance:
-${CLAUDE_GUIDANCE}
+${AI_GUIDANCE}
 
 EOF
     fi
@@ -195,17 +243,30 @@ Commits:
 ${COMMITS}
 EOF
 
-    # Call Claude CLI to generate summary (required unless --skip-ai-release-notes is set)
-    if ! RELEASE_SUMMARY=$("$CLAUDE" -p "$(cat "$TEMP_PROMPT")"); then
-        rm "$TEMP_PROMPT"
-        echo "Error: Failed to generate AI summary with Claude CLI."
-        echo "Use --skip-ai-release-notes to bypass AI note generation."
-        exit 1
+    # Call the selected AI CLI (required unless --skip-ai-release-notes is set).
+    if [ "$RELEASE_NOTES_AI" = "claude" ]; then
+        if ! RELEASE_SUMMARY=$("$CLAUDE" -p "$(cat "$TEMP_PROMPT")"); then
+            rm "$TEMP_PROMPT"
+            echo "Error: Failed to generate AI summary with Claude CLI."
+            echo "Use --skip-ai-release-notes to bypass AI note generation."
+            exit 1
+        fi
+    else
+        TEMP_RESPONSE=$(mktemp)
+        if ! "$CODEX" exec --ephemeral --sandbox read-only --color never \
+            --output-last-message "$TEMP_RESPONSE" - < "$TEMP_PROMPT" > /dev/null; then
+            rm "$TEMP_PROMPT" "$TEMP_RESPONSE"
+            echo "Error: Failed to generate AI summary with Codex CLI."
+            echo "Use --skip-ai-release-notes to bypass AI note generation."
+            exit 1
+        fi
+        RELEASE_SUMMARY=$(<"$TEMP_RESPONSE")
+        rm "$TEMP_RESPONSE"
     fi
     rm "$TEMP_PROMPT"
 
     if [ -z "${RELEASE_SUMMARY//[[:space:]]/}" ]; then
-        echo "Error: Claude returned empty release notes."
+        echo "Error: ${RELEASE_NOTES_AI} returned empty release notes."
         echo "Use --skip-ai-release-notes to bypass AI note generation."
         exit 1
     fi

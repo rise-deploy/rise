@@ -3,12 +3,14 @@
 //! Docker has no Metacontroller, so this loop replicates the webhook's
 //! responsibilities against the Docker daemon: status-machine transitions,
 //! desired-vs-actual container diffing, GC, HTTP health probing, supersession,
-//! and `controller_metadata` snapshots.
+//! and readiness verdicts.
 //!
 //! The diff itself ([`diff_desired_vs_actual`]) is a pure function so it can be
 //! unit-tested without a daemon.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -32,19 +34,19 @@ use super::diff::{
 use super::env::{hash_env, merge_container_env, pin_system_env};
 use super::health::{effective_health_path, probe_error_detail};
 use super::labels::{self, SUFFIX_ENV_HASH, SUFFIX_IMAGE, SUFFIX_MANAGED_BY};
-use super::pod_status::build_controller_metadata;
-use super::rolling::{filter_rolling_actions, replica_ready, service_names_for_spec, ReadyVerdict};
+use super::rolling::filter_rolling_actions;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
-use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::events::EventSource;
+use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
+use rise_backend_core::observation::{derive_events, ContainerObservation, ObservedState};
 use rise_backend_core::rise_system_env_vars;
 use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
-    DEPLOYING_TIMEOUT_MINUTES, PRE_PUSHED_TIMEOUT_MINUTES,
 };
-use rise_backend_core::state_machine;
 use rise_backend_core::DeploymentUrlBuilder;
 use rise_backend_core::EncryptionProvider;
 use rise_backend_core::RegistryProvider;
+use rise_backend_traefik::readiness::{replica_ready, service_names_for_spec, ReadyVerdict};
 
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
@@ -66,6 +68,29 @@ const MAX_REPLICAS: u32 = 50;
 /// fast path (zero DB cost) succeeds essentially always while heartbeats are
 /// healthy.
 const PER_PROJECT_MIN_VALIDITY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Image-pull failure with the daemon's useful stream message preserved.
+/// Bollard's `DockerStreamError` display text omits its `error` field, so a
+/// wrapper is required both for user-facing deployment errors and reliable
+/// terminal/retryable classification.
+#[derive(Debug)]
+struct ImagePullError {
+    image: String,
+    detail: String,
+    source: bollard::errors::Error,
+}
+
+impl fmt::Display for ImagePullError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Image pull failed for {}: {}", self.image, self.detail)
+    }
+}
+
+impl StdError for ImagePullError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// Route-aware adapter shared by desired-state and readiness reconciliation.
 /// Keeping this selection in one place prevents either path from accidentally
@@ -134,8 +159,8 @@ pub struct ReconcilerConfig {
     /// with embedded basic-auth userinfo. The reconciler reads the top-level
     /// `serverStatus` map from Traefik (falling back to a
     /// `loadBalancer.serverStatus` nesting for version tolerance) to learn
-    /// whether a container's server is actually in Traefik's rotation (UP) before
-    /// retiring the prior active deployment. Required for health-checked
+    /// whether a container's server is actually in Traefik's rotation (UP), and
+    /// whether HTTP-provider routers select the deployment service. Required for routed
     /// containers — `serverStatus` is the authoritative readiness signal with no
     /// fallback, so when this is `None` (unset) a health-checked deployment never
     /// becomes Healthy. See the `Docker` settings variant's `traefik_api_url`.
@@ -158,7 +183,7 @@ pub struct DockerReconciler {
     /// Resource store used to read each project's owning Organization so the
     /// reconciler only ever touches projects whose `deploymentControllerClass`
     /// matches `config.controller_class` (mirrors the K8s webhook).
-    resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+    resource_store: Arc<dyn rise_resource_api::ResourceApi>,
     /// HTTP client reused across health probes (built once, not per-probe).
     http_client: reqwest::Client,
     /// Traefik API client for the authoritative in-rotation signal. `None` when
@@ -211,7 +236,7 @@ impl DockerReconciler {
         url_builder: Arc<DeploymentUrlBuilder>,
         registry_provider: Arc<dyn RegistryProvider>,
         encryption_provider: Option<Arc<dyn EncryptionProvider>>,
-        resource_store: Arc<dyn rise_resource_api::ResourceStore>,
+        resource_store: Arc<dyn rise_resource_api::ResourceApi>,
         jwt_signer: Arc<RiseTokenSigner>,
         identity_token_ttl_seconds: u64,
         config: ReconcilerConfig,
@@ -233,7 +258,7 @@ impl DockerReconciler {
         let traefik_api = config
             .traefik_api_url
             .as_deref()
-            .and_then(super::traefik_api::TraefikApiClient::new);
+            .and_then(|url| super::traefik_api::TraefikApiClient::new(url, "docker"));
         Self {
             docker,
             store,
@@ -488,11 +513,19 @@ impl DockerReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
 
-        // 1. Status transitions (port of webhook::perform_status_transitions).
-        // Isolate per-deployment so one transient DB-write error can't abort the
-        // whole project tick — matching the desired-compute and health loops.
+        // 1. Status transitions. Isolate per-deployment so one transient
+        // DB-write error can't abort the whole project tick — matching the
+        // desired-compute and health loops. A deployment this moves to a
+        // terminal status needs no separate container cleanup here: it drops
+        // out of the desired set and is GC'd by the next diff pass.
         for deployment in &non_terminal {
-            if let Err(e) = self.perform_status_transition(project, deployment).await {
+            if let Err(e) = rise_backend_core::lifecycle::perform_status_transition(
+                self.store.as_ref(),
+                project,
+                deployment,
+            )
+            .await
+            {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     "Status transition failed: {:?}", e
@@ -605,9 +638,8 @@ impl DockerReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         // Memoize Traefik `serverStatus` per service for THIS reconcile pass:
-        // during a rollout a group has 2+ non-terminal deployments sharing one
-        // group-scoped service, so without this each `reconcile_health` would
-        // re-fetch the SAME serverStatus (up to 3s each). Populated once per
+        // Replicas and repeated checks can query the same deployment-scoped
+        // service, so cache each serverStatus response for this pass. Populated once per
         // service and reused across the group's deployments this tick.
         let mut server_status_cache: HashMap<String, Option<HashMap<String, bool>>> =
             HashMap::new();
@@ -616,7 +648,7 @@ impl DockerReconciler {
                 continue;
             }
             if let Err(e) = self
-                .reconcile_health(project, deployment, &mut server_status_cache)
+                .reconcile_health(project, deployment, &desired, &mut server_status_cache)
                 .await
             {
                 warn!(
@@ -626,140 +658,6 @@ impl DockerReconciler {
             }
         }
 
-        Ok(())
-    }
-
-    // ── Status transitions ─────────────────────────────────────────────
-
-    async fn perform_status_transition(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        match deployment.status {
-            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing => {
-                // The CLI drives these; only time them out.
-                let elapsed = Utc::now().signed_duration_since(deployment.created_at);
-                if elapsed > chrono::Duration::minutes(PRE_PUSHED_TIMEOUT_MINUTES) {
-                    let msg = format!(
-                        "Deployment timed out after {} minutes in {} state. \
-                         This usually indicates the CLI was interrupted during build/push.",
-                        PRE_PUSHED_TIMEOUT_MINUTES, deployment.status
-                    );
-                    warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                    self.store
-                        .mark_deployment_failed(deployment.id, &msg)
-                        .await?;
-                    self.store
-                        .update_project_calculated_status(project.id)
-                        .await?;
-                }
-            }
-            DeploymentStatus::Cancelling => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Cancelling deployment — marking as Cancelled"
-                );
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Terminating => {
-                self.complete_termination(project, deployment).await?;
-            }
-            DeploymentStatus::Pushed => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment image pushed, transitioning to Deploying"
-                );
-                self.store
-                    .update_deployment_status(deployment.id, DeploymentStatus::Deploying)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-            DeploymentStatus::Deploying => {
-                if let Some(started) = deployment.deploying_started_at {
-                    let elapsed = Utc::now().signed_duration_since(started);
-                    if elapsed > chrono::Duration::minutes(DEPLOYING_TIMEOUT_MINUTES) {
-                        let msg = format!(
-                            "Deployment timed out after {} seconds in Deploying state",
-                            elapsed.num_seconds()
-                        );
-                        warn!(deployment_id = %deployment.deployment_id, "{}", msg);
-                        self.store
-                            .mark_deployment_failed(deployment.id, &msg)
-                            .await?;
-                        self.store
-                            .update_project_calculated_status(project.id)
-                            .await?;
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        // Expiration applies to every non-terminal deployment.
-        if let Some(expires_at) = deployment.expires_at {
-            if Utc::now() > expires_at
-                && !matches!(
-                    deployment.status,
-                    DeploymentStatus::Terminating | DeploymentStatus::Cancelling
-                )
-            {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment has expired, marking as Terminating"
-                );
-                self.store
-                    .mark_deployment_terminating(deployment.id, TerminationReason::Expired)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Port of `webhook::complete_termination`.
-    async fn complete_termination(&self, project: &Project, deployment: &Deployment) -> Result<()> {
-        match deployment.termination_reason {
-            Some(TerminationReason::Superseded) => {
-                self.store.mark_deployment_superseded(deployment.id).await?;
-            }
-            Some(TerminationReason::UserStopped) => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-            Some(TerminationReason::Expired) => {
-                self.store.mark_deployment_expired(deployment.id).await?;
-            }
-            Some(TerminationReason::Failed) => {
-                self.store
-                    .mark_deployment_failed(
-                        deployment.id,
-                        deployment
-                            .error_message
-                            .as_deref()
-                            .unwrap_or("Deployment failed"),
-                    )
-                    .await?;
-            }
-            Some(TerminationReason::Cancelled) => {
-                self.store.mark_deployment_cancelled(deployment.id).await?;
-            }
-            None => {
-                self.store.mark_deployment_stopped(deployment.id).await?;
-            }
-        }
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
-        // The container itself is GC'd on the next diff pass (no longer in the
-        // desired set once the deployment is terminal).
         Ok(())
     }
 
@@ -793,11 +691,10 @@ impl DockerReconciler {
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Environment context.
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let env_name = environment.as_ref().map(|e| e.name.clone());
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
@@ -810,21 +707,12 @@ impl DockerReconciler {
             &all_environments,
             &custom_domains,
         );
-        let primary_hosts: Vec<String> = self
-            .url_builder
-            .primary_ingress_hosts(
-                project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|env| {
-                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &all_environments,
-            )
-            .into_iter()
-            .map(|h| h.host)
-            .collect();
+        let primary_hosts = self.url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            &all_environments,
+            &custom_domains,
+        );
 
         // Env vars: plain + decrypted secret (merged into plain — Docker has no
         // secret concept) + system env vars.
@@ -959,7 +847,7 @@ impl DockerReconciler {
                     access: r.access.clone(),
                 })
                 .collect();
-            // Every infra-bearing deployment normally joins the group-scoped
+            // Every infra-bearing deployment normally publishes its native-provider
             // Traefik service immediately. The exception is a container with an
             // unknown access class, or an auth-required effective route without
             // a forwardAuth backend: its routers fail closed, so desired
@@ -977,10 +865,11 @@ impl DockerReconciler {
 
             // Base container (replica 0). All replicas are clones of this with
             // only their `replica` index differing — same image/env/routes, so
-            // they share one Traefik service and one DNS alias, and the route-hash
+            // they share one deployment service and one DNS alias, and the route-hash
             // (which never depends on the replica) is computed once below.
             let mut base = DesiredContainer {
                 project: project.name.clone(),
+                project_uuid: project.id.to_string(),
                 access_class: project.access_class.clone(),
                 deployment_group: deployment.deployment_group.clone(),
                 deployment_id: deployment.deployment_id.clone(),
@@ -1047,20 +936,23 @@ impl DockerReconciler {
 
     // ── Actual containers + diff application ────────────────────────────
 
-    async fn list_actual_containers(&self, project: &Project) -> Result<Vec<ActualContainer>> {
-        use bollard::container::ListContainersOptions;
+    /// List this controller's containers carrying one extra label filter (a
+    /// `key=value` string), scoped to `managed-by=rise` and the configured
+    /// controller-class. Without the controller-class filter the GC pass
+    /// could remove containers another Rise controller owns on the same host.
+    ///
+    /// NOTE: containers carry the controller-class they were created under as
+    /// a label. Renaming an Organization's `deploymentControllerClass` (or
+    /// this controller's configured class) leaves previously-created
+    /// containers under the old class invisible to this filter — they are
+    /// neither reconciled nor GC'd and must be cleaned up manually.
+    async fn list_managed_containers(
+        &self,
+        extra_label_filter: String,
+    ) -> Result<Vec<ActualContainer>> {
+        use bollard::query_parameters::ListContainersOptions;
         let ns = &self.config.label_namespace;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        // Scope the listing to *this* controller's containers: managed-by=rise,
-        // the configured controller-class, and this project. Without the
-        // controller-class filter the GC pass could remove containers another
-        // Rise controller owns on the same host.
-        //
-        // NOTE: containers carry the controller-class they were created under as
-        // a label. Renaming an Organization's `deploymentControllerClass` (or
-        // this controller's configured class) leaves previously-created
-        // containers under the old class invisible to this filter — they are
-        // neither reconciled nor GC'd and must be cleaned up manually.
         filters.insert(
             "label".to_string(),
             vec![
@@ -1070,18 +962,14 @@ impl DockerReconciler {
                     labels::ns_key(ns, labels::SUFFIX_CONTROLLER_CLASS),
                     self.config.controller_class
                 ),
-                format!(
-                    "{}={}",
-                    labels::ns_key(ns, labels::SUFFIX_PROJECT),
-                    project.name
-                ),
+                extra_label_filter,
             ],
         );
         let summaries = self
             .docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await?;
@@ -1132,10 +1020,50 @@ impl DockerReconciler {
                     // Daemon-reported lifecycle state ("running", "exited",
                     // "created", "dead", …). Used by the diff to restart
                     // containers that exist but aren't running.
-                    state: s.state,
+                    state: s.state.map(|state| state.to_string()),
                 })
             })
             .collect())
+    }
+
+    /// Actual containers belonging to `project`.
+    ///
+    /// Queries by the project's UUID label — immutable, so it survives a
+    /// rename — and, for containers created before that label existed, falls
+    /// back to a second query by name. Without the fallback, a legacy
+    /// container that has never been recreated since upgrade would be
+    /// invisible to the UUID query and (if the project were then renamed)
+    /// would also miss a name-only query, leaving a fresh set created
+    /// alongside it and the original running forever unreconciled — the
+    /// bug this two-query scheme exists to close. The two result sets are
+    /// deduped by container id, since a container created after this
+    /// controller was upgraded carries both labels and would otherwise
+    /// appear from either query.
+    async fn list_actual_containers(&self, project: &Project) -> Result<Vec<ActualContainer>> {
+        let ns = &self.config.label_namespace;
+        let by_uuid = self
+            .list_managed_containers(format!(
+                "{}={}",
+                labels::ns_key(ns, labels::SUFFIX_PROJECT_UUID),
+                project.id
+            ))
+            .await?;
+        let by_name = self
+            .list_managed_containers(format!(
+                "{}={}",
+                labels::ns_key(ns, labels::SUFFIX_PROJECT),
+                project.name
+            ))
+            .await?;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::with_capacity(by_uuid.len() + by_name.len());
+        for container in by_uuid.into_iter().chain(by_name) {
+            if seen.insert(container.id.clone()) {
+                out.push(container);
+            }
+        }
+        Ok(out)
     }
 
     async fn apply_actions(
@@ -1147,6 +1075,10 @@ impl DockerReconciler {
         election: &LeaderElection,
     ) -> Result<()> {
         let builder_cfg = self.builder_cfg();
+        // A multi-container/replica deployment can have several Create actions
+        // in one tick. Once one action proves the image permanently unusable,
+        // skip its remaining actions while still reconciling other deployments.
+        let mut failed_deployment_uuids = HashSet::new();
         // Index desired containers by their stable IDENTITY tuple so an action
         // (which carries the identity, not the generation-ful name) can find the
         // desired container regardless of the `_g{n}` name suffix.
@@ -1182,6 +1114,9 @@ impl DockerReconciler {
                     generation,
                 } => {
                     if let Some(d) = by_identity.get(identity.as_str()) {
+                        if failed_deployment_uuids.contains(&d.deployment_uuid) {
+                            continue;
+                        }
                         // Stamp the resolved generation on a clone so the created
                         // container's name + `generation` label match the action.
                         let mut d = (*d).clone();
@@ -1192,11 +1127,45 @@ impl DockerReconciler {
                             .create_container(&d, &builder_cfg, false, identity)
                             .await
                         {
-                            error!(
-                                project = %project.name,
-                                container = %name,
-                                "Failed to create container: {:?}", e
-                            );
+                            if is_terminal_image_pull_error(&e) {
+                                let message =
+                                    format!("Failed to create container '{}': {}", d.container, e);
+                                error!(
+                                    project = %project.name,
+                                    deployment_id = %d.deployment_id,
+                                    container = %name,
+                                    error = %e,
+                                    "Terminal container creation failure; marking deployment Failed"
+                                );
+                                let deployment_uuid = Uuid::parse_str(&d.deployment_uuid)
+                                    .context("Desired container has an invalid deployment UUID")?;
+                                if self
+                                    .store
+                                    .mark_deployment_failed(deployment_uuid, &message)
+                                    .await
+                                    .context(
+                                        "Failed to persist terminal container creation failure",
+                                    )?
+                                    .is_some()
+                                {
+                                    self.store
+                                        .update_project_calculated_status(project.id)
+                                        .await
+                                        .context("Failed to update project status after container creation failure")?;
+                                    rise_backend_core::lifecycle::restore_traefik_predecessor_if_interrupted(
+                                        self.store.as_ref(),
+                                        deployment_uuid,
+                                    )
+                                    .await?;
+                                    failed_deployment_uuids.insert(d.deployment_uuid.clone());
+                                }
+                            } else {
+                                error!(
+                                    project = %project.name,
+                                    container = %name,
+                                    "Failed to create container; will retry: {:?}", e
+                                );
+                            }
                         }
                     }
                 }
@@ -1219,6 +1188,9 @@ impl DockerReconciler {
                     // confirm it started, then remove the old one — eliminating
                     // the outage window entirely.
                     if let Some(d) = by_identity.get(identity.as_str()) {
+                        if failed_deployment_uuids.contains(&d.deployment_uuid) {
+                            continue;
+                        }
                         // Stamp the resolved (bumped) generation on a clone so the
                         // replacement's name + `generation` label match the action.
                         let mut d = (*d).clone();
@@ -1290,7 +1262,7 @@ impl DockerReconciler {
         already_pulled: bool,
         identity: Option<&PreparedIdentity>,
     ) -> Result<()> {
-        use bollard::container::{CreateContainerOptions, StartContainerOptions};
+        use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
         let built = container_builder::build_container(desired, builder_cfg);
 
@@ -1303,8 +1275,8 @@ impl DockerReconciler {
         self.docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: built.name.clone(),
-                    platform: None,
+                    name: Some(built.name.clone()),
+                    ..Default::default()
                 }),
                 built.config,
             )
@@ -1328,7 +1300,7 @@ impl DockerReconciler {
         }
 
         self.docker
-            .start_container(&built.name, None::<StartContainerOptions<String>>)
+            .start_container(&built.name, None::<StartContainerOptions>)
             .await?;
 
         if let Some(identity) = identity {
@@ -1726,15 +1698,16 @@ impl DockerReconciler {
     /// Resolve a deployment's environment name (`None` for the no-environment
     /// case), shared by identity preparation and refresh.
     async fn resolve_environment_name(&self, deployment: &Deployment) -> Result<Option<String>> {
-        match deployment.environment_id {
-            Some(env_id) => Ok(self.store.find_environment(env_id).await?.map(|e| e.name)),
-            None => Ok(None),
-        }
+        Ok(self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?
+            .map(|e| e.name))
     }
 
     async fn pull_image(&self, image: &str) -> Result<()> {
         use bollard::auth::DockerCredentials;
-        use bollard::image::CreateImageOptions;
+        use bollard::query_parameters::CreateImageOptions;
 
         let creds = match self.registry_provider.get_pull_credentials().await {
             Ok((username, password)) if !username.is_empty() || !password.is_empty() => {
@@ -1756,12 +1729,20 @@ impl DockerReconciler {
         };
 
         let options = Some(CreateImageOptions {
-            from_image: image.to_string(),
+            from_image: Some(image.to_string()),
             ..Default::default()
         });
         let mut stream = self.docker.create_image(options, None, creds);
         while let Some(item) = stream.next().await {
-            item.map_err(|e| anyhow::anyhow!("Image pull failed for {}: {:?}", image, e))?;
+            if let Err(source) = item {
+                let detail = docker_error_detail(&source);
+                return Err(ImagePullError {
+                    image: image.to_string(),
+                    detail,
+                    source,
+                }
+                .into());
+            }
         }
         Ok(())
     }
@@ -1778,7 +1759,7 @@ impl DockerReconciler {
     /// failure still returns `Err`, so the Recreate guard keeps fencing a genuinely
     /// stuck remove.
     async fn remove_container(&self, id: &str) -> Result<()> {
-        use bollard::container::RemoveContainerOptions;
+        use bollard::query_parameters::RemoveContainerOptions;
         match self
             .docker
             .remove_container(
@@ -1805,51 +1786,6 @@ impl DockerReconciler {
 
     // ── Health → status ────────────────────────────────────────────────
 
-    /// Fetch and aggregate Traefik `serverStatus` across the service name(s) a
-    /// container's labels emit (one bare-base service for a single-route
-    /// container, per-route `{base}-{idx}` services for a multi-route one),
-    /// memoized per service for the reconcile pass via `cache`.
-    ///
-    /// Returns `Some(merged map)` if AT LEAST ONE queried service reported a
-    /// serverStatus (the per-route services share the same `http://{ip}:{port}`
-    /// servers, so merging them is safe and a server reported UP by any route's
-    /// health check counts as UP). `None` when there is no Traefik API, no
-    /// service names, or every queried service returned `None` (unreachable /
-    /// non-200 / no HC labels) — a health-checked container is then treated as
-    /// not-ready (no fallback) until Traefik reports its server.
-    async fn fetch_server_status_aggregated(
-        &self,
-        service_names: &[String],
-        cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
-    ) -> Option<HashMap<String, bool>> {
-        let client = self.traefik_api.as_ref()?;
-        let mut merged: HashMap<String, bool> = HashMap::new();
-        let mut any = false;
-        for service in service_names {
-            let status = match cache.get(service) {
-                Some(cached) => cached.clone(),
-                None => {
-                    let fetched = client.server_status(service).await;
-                    cache.insert(service.clone(), fetched.clone());
-                    fetched
-                }
-            };
-            if let Some(map) = status {
-                any = true;
-                for (server, up) in map {
-                    // A server is UP if ANY route's health check reports it UP.
-                    let entry = merged.entry(server).or_insert(false);
-                    *entry = *entry || up;
-                }
-            }
-        }
-        if any {
-            Some(merged)
-        } else {
-            None
-        }
-    }
-
     /// Resolve the deployment's primary ingress hosts — the same set
     /// `compute_desired_for_deployment` feeds into each route's `hosts`. Used by
     /// the readiness pass to decide whether the container emits a Traefik router
@@ -1859,34 +1795,21 @@ impl DockerReconciler {
         project: &Project,
         deployment: &Deployment,
     ) -> Result<Vec<String>> {
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-        Ok(self
-            .url_builder
-            .primary_ingress_hosts(
-                project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|env| {
-                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &all_environments,
-            )
-            .into_iter()
-            .map(|h| h.host)
-            .collect())
+        Ok(self.url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            &all_environments,
+            &custom_domains,
+        ))
     }
 
     async fn reconcile_health(
         &self,
         project: &Project,
         deployment: &Deployment,
+        desired: &[DesiredContainer],
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
     ) -> Result<()> {
         // Only probe states where health is meaningful.
@@ -1908,11 +1831,6 @@ impl DockerReconciler {
             .iter()
             .filter_map(|a| a.identity().map(|id| (id, a)))
             .collect();
-        // One pod entry per REPLICA container, in (spec, replica) order. Each
-        // carries the live container's REAL (generation-ful) name where present,
-        // else a replica-distinct stable fallback for a not-yet-created replica.
-        // Fed straight into `build_controller_metadata` (no re-derivation).
-        let mut pods: Vec<(String, Option<InspectedContainer>)> = Vec::new();
         // Every REPLICA of every spec must be ready for the deployment to be
         // healthy:
         //   - HTTP containers WITH a `health_check` are ready only once Traefik's
@@ -1923,6 +1841,8 @@ impl DockerReconciler {
         //   - workers (no port) must exist and be `running` on the daemon.
         // An empty spec set is never ready.
         let mut all_ready = !container_specs.is_empty();
+        // One entry per replica of every spec, in spec/replica order.
+        let mut observed: Vec<ContainerObservation> = Vec::new();
         // Per-container "why not ready" detail, surfaced into the Unhealthy status
         // reason (and logged) so an operator sees *what* was probed and *how* it
         // failed — not just a generic "health probe failing".
@@ -1962,14 +1882,20 @@ impl DockerReconciler {
             let service_names = service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
+                &deployment.deployment_id,
                 spec,
                 &route_specs,
                 &primary_hosts,
             );
             let has_health_path = effective_health_path(spec, &self.config.health_path).is_some();
-            let server_status = self
-                .fetch_server_status_aggregated(&service_names, server_status_cache)
-                .await;
+            let server_status = match self.traefik_api.as_ref() {
+                Some(client) => {
+                    client
+                        .aggregated_server_status(&service_names, server_status_cache)
+                        .await
+                }
+                None => None,
+            };
             // Surface the two ways a health-checked container has no Traefik
             // signal. Both leave it not-ready (serverStatus is required), but the
             // first is a persistent operator misconfiguration worth a louder log.
@@ -1999,6 +1925,13 @@ impl DockerReconciler {
                 } else {
                     spec.name.clone()
                 };
+                // The identity always carries the index, even at one replica.
+                // `label` is prose for a human reading a not-ready reason, and
+                // it drops the index when there is only one — reusing it here
+                // would rename replica 0 from `web` to `web[0]` the moment the
+                // container scaled up, which the derivation would read as one
+                // replica dying and two being born.
+                let subject = format!("{}[{}]", spec.name, replica);
                 let identity = identity_key(
                     &project.name,
                     &deployment.deployment_group,
@@ -2008,22 +1941,9 @@ impl DockerReconciler {
                 );
                 // Resolve this replica to its live container. When present,
                 // inspect by the actual generation-ful name; when absent (not yet
-                // created / mid-recreate), synthesize a replica-distinct pod name
-                // (the replica-free stable name + `_r{n}`) and skip the inspect.
+                // created / mid-recreate), there is nothing to inspect and the
+                // replica is definitively not ready.
                 let actual = actual_by_identity.get(&identity).copied();
-                let name = match actual {
-                    Some(a) => a.name.clone(),
-                    None => format!(
-                        "{}_r{replica}",
-                        container_builder::stable_identity_name(
-                            &self.config.container_prefix,
-                            &project.name,
-                            &deployment.deployment_group,
-                            &deployment.deployment_id,
-                            &spec.name,
-                        )
-                    ),
-                };
                 let inspected = match actual {
                     Some(a) => self.inspect_for_reconcile(&a.name, spec.port).await,
                     None => None,
@@ -2103,15 +2023,38 @@ impl DockerReconciler {
                         }
                     }
                 };
-                pods.push((name, inspected));
+                // The same inspection the verdict was taken from, kept rather
+                // than dropped. `label` is the subject: Docker stores the
+                // replica index in a label, so `web[0]` names the same slot
+                // across recreates.
+                observed.push(observe(
+                    &subject,
+                    &spec.name,
+                    replica,
+                    actual.map(|a| a.name.as_str()),
+                    inspected.as_ref(),
+                ));
+
                 if !ready {
                     all_ready = false;
-                    // Keep inspecting the remaining replicas so the pod_status
+                    // Keep inspecting the remaining replicas so the readiness
                     // snapshot stays complete; only the readiness verdict short-
                     // circuits below via `all_ready`.
                 }
             }
         }
+
+        // Compare against what the last tick saw and record both the difference
+        // and the new baseline. A failure here must not fail the health pass:
+        // the deployment's status is the reconciler's job, and its history is a
+        // record of that job, not a precondition for it.
+        if let Err(e) = self.record_observations(deployment, &observed).await {
+            warn!(
+                deployment_id = %deployment.deployment_id,
+                "Failed to record container observations: {:?}", e
+            );
+        }
+
         let is_ready = all_ready;
         // Human-readable rollup of the not-ready reasons for the status message.
         let unhealthy_reason = if not_ready_reasons.is_empty() {
@@ -2123,51 +2066,86 @@ impl DockerReconciler {
             )
         };
 
-        // Snapshot controller_metadata in a K8s-pod-status-shaped blob so the
-        // existing status APIs/UI render unchanged. Built from the per-replica
-        // inspections captured above (no second inspect).
-        let metadata = build_controller_metadata(&pods, &deployment.status, is_ready);
-        if let Err(e) = self
-            .store
-            .update_deployment_controller_metadata(deployment.id, &metadata)
-            .await
-        {
-            warn!(
-                deployment_id = %deployment.deployment_id,
-                "Failed to update controller metadata: {:?}", e
-            );
-        }
-
         match deployment.status {
             DeploymentStatus::Deploying if is_ready => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment is ready, marking as Healthy"
+                if !rise_backend_core::lifecycle::prepare_traefik_cutover(
+                    self.store.as_ref(),
+                    project,
+                    deployment,
+                )
+                .await?
+                {
+                    info!(deployment_id = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
+                    return Ok(());
+                }
+                let selected: Vec<DesiredContainer> = desired
+                    .iter()
+                    .filter(|container| container.deployment_uuid == deployment.id.to_string())
+                    .cloned()
+                    .collect();
+                let expected = rise_backend_traefik::dynamic::render_dynamic_config(
+                    &selected,
+                    &rise_backend_traefik::TraefikRenderConfig {
+                        label_namespace: &self.config.label_namespace,
+                        controller_class: &self.config.controller_class,
+                        traefik_entrypoint: &self.config.traefik_entrypoint,
+                        catalog_entrypoint: "rise-catalog",
+                        traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+                        network: Some(&self.config.traefik_network),
+                        auth_backend_url: &self.config.auth_backend_url,
+                        access_classes: &self.config.access_classes,
+                    },
+                    "docker",
                 );
-                self.handle_deployment_became_healthy(project, deployment)
-                    .await?;
+                if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
+                    warn!(deployment_id = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
+                    return Ok(());
+                }
+                if let Some(api) = self.traefik_api.as_ref() {
+                    if !api.dynamic_config_applied(&expected).await {
+                        debug!(deployment_id = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
+                        return Ok(());
+                    }
+                }
+                rise_backend_core::lifecycle::handle_deployment_became_healthy(
+                    self.store.as_ref(),
+                    None,
+                    project,
+                    deployment,
+                )
+                .await?;
             }
             DeploymentStatus::Healthy if !is_ready => {
                 warn!(
                     deployment_id = %deployment.deployment_id,
                     "Healthy deployment is now unhealthy: {unhealthy_reason}"
                 );
-                self.store
+                if self
+                    .store
                     .mark_deployment_unhealthy(deployment.id, unhealthy_reason)
-                    .await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                    .await?
+                    .is_some()
+                {
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             }
             DeploymentStatus::Unhealthy if is_ready => {
                 info!(
                     deployment_id = %deployment.deployment_id,
                     "Unhealthy deployment has recovered, marking as Healthy"
                 );
-                self.store.mark_deployment_healthy(deployment.id).await?;
-                self.store
-                    .update_project_calculated_status(project.id)
-                    .await?;
+                if self
+                    .store
+                    .mark_deployment_healthy(deployment.id)
+                    .await?
+                    .is_some()
+                {
+                    self.store
+                        .update_project_calculated_status(project.id)
+                        .await?;
+                }
             }
             _ => {}
         }
@@ -2300,11 +2278,27 @@ impl DockerReconciler {
     }
 
     /// Single `inspect_container` for the reconcile pass: returns an owned
-    /// snapshot reused by BOTH the health probe and the `pod_status` builder, so
+    /// snapshot reused by BOTH the health probe and the readiness verdict, so
     /// each container is inspected once per tick. `port` is the container's
     /// app port (if any), used to resolve the published loopback host port from
     /// the `network_settings.ports["{port}/tcp"]` mapping. Returns `None` when
     /// the container is missing / not yet created.
+    /// Load the previous observations, derive what changed, and store both.
+    async fn record_observations(
+        &self,
+        deployment: &Deployment,
+        observed: &[ContainerObservation],
+    ) -> anyhow::Result<()> {
+        let previous = self
+            .store
+            .list_container_observations(deployment.id)
+            .await?;
+        let events = derive_events(&previous, observed, chrono::Utc::now());
+        self.store
+            .record_container_observations(deployment.id, EventSource::Docker, observed, &events)
+            .await
+    }
+
     async fn inspect_for_reconcile(
         &self,
         container_name: &str,
@@ -2324,7 +2318,7 @@ impl DockerReconciler {
         let state = inspect.state.clone();
         // The bollard `ContainerStateStatusEnum` Displays as the lowercase API
         // string ("running", "exited", …), matching what we map on in the
-        // pod_status builder.
+        // readiness verdict.
         let status = state
             .as_ref()
             .and_then(|s| s.status.as_ref())
@@ -2381,63 +2375,6 @@ impl DockerReconciler {
             published_host_port,
         })
     }
-
-    /// Port of `webhook::handle_deployment_became_healthy`: mark healthy,
-    /// supersede the prior active deployment, mark this one active.
-    async fn handle_deployment_became_healthy(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<()> {
-        let active_in_group = self
-            .store
-            .find_active_deployment_for_project_and_group(project.id, &deployment.deployment_group)
-            .await?;
-
-        self.store.mark_deployment_healthy(deployment.id).await?;
-
-        if let Some(old_active) = active_in_group {
-            if old_active.id != deployment.id && !state_machine::is_terminal(&old_active.status) {
-                info!(
-                    "Deployment {} replacing {} in group '{}', marking old as Terminating",
-                    deployment.deployment_id, old_active.deployment_id, deployment.deployment_group
-                );
-                self.store
-                    .mark_deployment_terminating(old_active.id, TerminationReason::Superseded)
-                    .await?;
-            }
-        }
-
-        let others = self
-            .store
-            .find_non_terminal_deployments_for_project_and_group(
-                project.id,
-                &deployment.deployment_group,
-            )
-            .await?;
-        for other in others {
-            if other.id != deployment.id
-                && state_machine::is_active(&other.status)
-                && !state_machine::is_terminal(&other.status)
-            {
-                info!(
-                    "Cleaning up non-active deployment {} in group '{}', marking as Terminating",
-                    other.deployment_id, deployment.deployment_group
-                );
-                self.store
-                    .mark_deployment_terminating(other.id, TerminationReason::Superseded)
-                    .await?;
-            }
-        }
-
-        self.store
-            .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
-            .await?;
-        self.store
-            .update_project_calculated_status(project.id)
-            .await?;
-        Ok(())
-    }
 }
 
 /// Pure comparison of this controller's configured class against the
@@ -2453,6 +2390,41 @@ fn controller_class_matches(configured: &str, org_class: Option<&str>) -> bool {
         return true;
     }
     org_class == Some(configured)
+}
+
+/// Extract the daemon-provided detail that Bollard's Display implementation
+/// omits for stream errors.
+fn docker_error_detail(error: &bollard::errors::Error) -> String {
+    match error {
+        bollard::errors::Error::DockerStreamError { error } => error.clone(),
+        bollard::errors::Error::DockerResponseServerError { message, .. } => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Permanent image metadata/platform failures cannot recover on another
+/// reconcile tick. Authentication, transport, timeout, and daemon availability
+/// errors deliberately remain retryable because credentials or infrastructure
+/// may recover without creating a new deployment.
+fn is_terminal_image_pull_error(error: &anyhow::Error) -> bool {
+    let Some(pull_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ImagePullError>())
+    else {
+        return false;
+    };
+
+    let detail = pull_error.detail.to_ascii_lowercase();
+    [
+        "no matching manifest for",
+        "no match for platform in manifest",
+        "does not match the specified platform",
+        "manifest unknown",
+        "unsupported media type",
+        "invalid reference format",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
 }
 
 /// Resolve a spec's requested replica count to the actual number of containers
@@ -2557,8 +2529,183 @@ fn identity_refresh_entry_expired(
     now.signed_duration_since(last_refresh) >= chrono::Duration::seconds(ttl_seconds.max(1) as i64)
 }
 
+/// Project one Docker inspection onto the shared observation shape.
+///
+/// A replica with no live container is `pending`, not `unknown`: Docker only
+/// fails to resolve one when it has not been created yet or is mid-recreate,
+/// and both are "on the way", not "we cannot tell".
+fn observe(
+    subject: &str,
+    container: &str,
+    replica: u32,
+    instance: Option<&str>,
+    inspected: Option<&InspectedContainer>,
+) -> ContainerObservation {
+    let Some(i) = inspected else {
+        let mut o = ContainerObservation::new(subject, container, ObservedState::Pending);
+        o.replica = Some(replica);
+        return o;
+    };
+
+    // Docker's own vocabulary, mapped onto the states every runtime shares.
+    // `restarting` is Pending rather than Running: the process is down at this
+    // instant, and calling it Running would hide a crash loop entirely.
+    let state = match i.status.as_deref() {
+        Some("running") => ObservedState::Running,
+        Some("created") | Some("restarting") => ObservedState::Pending,
+        Some("exited") | Some("dead") => ObservedState::Exited,
+        _ if i.running => ObservedState::Running,
+        _ => ObservedState::Unknown,
+    };
+
+    ContainerObservation {
+        subject: subject.to_string(),
+        container: container.to_string(),
+        // The generation-bearing container name: a recreate changes it, which
+        // is the only signal that the slot was refilled.
+        instance: instance.map(str::to_string),
+        replica: Some(replica),
+        state,
+        started_at: parse_docker_time(i.started_at.as_deref()),
+        finished_at: parse_docker_time(i.finished_at.as_deref()),
+        // Docker reports `0` for a container that has not exited, so an exit
+        // code is only an exit code once there has been one. Carrying it while
+        // running would show every healthy replica as having exited cleanly.
+        exit_code: (state == ObservedState::Exited)
+            .then_some(i.exit_code)
+            .flatten(),
+        restart_count: i.restart_count,
+        health: i.health.clone(),
+        reason: i.error.clone(),
+        image: None,
+    }
+}
+
+/// Docker reports a zero timestamp for "never", which is not a time.
+fn parse_docker_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let raw = value?;
+    if raw.starts_with("0001-01-01") {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 #[cfg(test)]
 mod tests {
+
+    use rise_backend_core::observation::ObservedState;
+
+    fn inspected(status: &str, running: bool) -> InspectedContainer {
+        InspectedContainer {
+            status: Some(status.to_string()),
+            running,
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            restart_count: None,
+            health: None,
+            error: None,
+            ip: None,
+            published_host_port: None,
+        }
+    }
+
+    /// A replica Docker cannot resolve has not been created yet or is
+    /// mid-recreate. Both are "on the way" — calling it Unknown would make the
+    /// derivation refuse to reason about a perfectly ordinary rollout.
+    #[test]
+    fn a_replica_with_no_container_is_pending() {
+        let o = super::observe("web[0]", "web", 0, None, None);
+        assert_eq!(o.state, ObservedState::Pending);
+        assert_eq!(o.replica, Some(0));
+    }
+
+    /// `restarting` means the process is down at this instant. Reporting it as
+    /// Running would hide a crash loop completely.
+    #[test]
+    fn a_restarting_container_is_not_running() {
+        let o = super::observe(
+            "web[0]",
+            "web",
+            0,
+            Some("c_g1"),
+            Some(&inspected("restarting", false)),
+        );
+        assert_eq!(o.state, ObservedState::Pending);
+    }
+
+    #[test]
+    fn docker_states_map_onto_the_shared_vocabulary() {
+        for (status, expected) in [
+            ("running", ObservedState::Running),
+            ("created", ObservedState::Pending),
+            ("exited", ObservedState::Exited),
+            ("dead", ObservedState::Exited),
+        ] {
+            let o = super::observe(
+                "web[0]",
+                "web",
+                0,
+                Some("c_g1"),
+                Some(&inspected(status, status == "running")),
+            );
+            assert_eq!(o.state, expected, "{status}");
+        }
+    }
+
+    /// A status this build does not know must not be guessed at, unless the
+    /// daemon's own running flag settles it.
+    #[test]
+    fn an_unrecognised_status_falls_back_to_the_running_flag() {
+        let o = super::observe(
+            "web[0]",
+            "web",
+            0,
+            Some("c_g1"),
+            Some(&inspected("paused", true)),
+        );
+        assert_eq!(o.state, ObservedState::Running);
+        let o = super::observe(
+            "web[0]",
+            "web",
+            0,
+            Some("c_g1"),
+            Some(&inspected("paused", false)),
+        );
+        assert_eq!(o.state, ObservedState::Unknown);
+    }
+
+    /// Docker reports exit code 0 for a container that has not exited, so
+    /// carrying it while running would show every healthy replica as having
+    /// exited cleanly.
+    #[test]
+    fn a_running_container_reports_no_exit_code() {
+        let mut i = inspected("running", true);
+        i.exit_code = Some(0);
+        assert_eq!(
+            super::observe("web[0]", "web", 0, Some("c_g1"), Some(&i)).exit_code,
+            None
+        );
+
+        let mut gone = inspected("exited", false);
+        gone.exit_code = Some(137);
+        assert_eq!(
+            super::observe("web[0]", "web", 0, Some("c_g1"), Some(&gone)).exit_code,
+            Some(137),
+        );
+    }
+
+    /// Docker writes a zero timestamp for "never", which is not a time and must
+    /// not become one — a bogus `started_at` would date every derived event.
+    #[test]
+    fn dockers_zero_timestamp_is_not_a_time() {
+        assert_eq!(super::parse_docker_time(Some("0001-01-01T00:00:00Z")), None);
+        assert_eq!(super::parse_docker_time(Some("not a time")), None);
+        assert_eq!(super::parse_docker_time(None), None);
+        assert!(super::parse_docker_time(Some("2026-08-31T10:00:00Z")).is_some());
+    }
     use super::*;
 
     #[test]
@@ -2603,6 +2750,50 @@ mod tests {
                 message: "boom".to_string(),
             }
         ));
+    }
+
+    fn pull_error(detail: &str) -> anyhow::Error {
+        ImagePullError {
+            image: "registry.example/app:tag".to_string(),
+            detail: detail.to_string(),
+            source: bollard::errors::Error::DockerStreamError {
+                error: detail.to_string(),
+            },
+        }
+        .into()
+    }
+
+    #[test]
+    fn terminal_image_pull_errors_are_not_retried() {
+        for detail in [
+            "no matching manifest for linux/amd64 in the manifest list entries",
+            "manifest unknown: manifest unknown",
+            "unsupported media type application/example",
+            "invalid reference format",
+        ] {
+            assert!(
+                is_terminal_image_pull_error(&pull_error(detail)),
+                "expected terminal classification for {detail:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn transient_image_pull_errors_remain_retryable() {
+        for detail in [
+            "connection reset by peer",
+            "dial tcp: connection refused",
+            "unauthorized: authentication required",
+            "request timed out",
+        ] {
+            assert!(
+                !is_terminal_image_pull_error(&pull_error(detail)),
+                "expected retryable classification for {detail:?}"
+            );
+        }
+        assert!(!is_terminal_image_pull_error(&anyhow::anyhow!(
+            "container start failed"
+        )));
     }
 
     #[test]
@@ -2716,7 +2907,7 @@ mod tests {
 
     #[test]
     fn identity_targets_are_the_create_and_recreate_deployment_uuids() {
-        use crate::test_helpers::{desired, identity_of};
+        use rise_backend_core::test_helpers::{desired, identity_of};
 
         // A Create targeting the desired slot resolves to that deployment's UUID;
         // a Remove never needs identity material. Resolving through `desired`

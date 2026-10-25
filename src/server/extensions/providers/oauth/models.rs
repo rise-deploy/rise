@@ -15,6 +15,9 @@ pub struct OAuthExtensionSpec {
     /// DEPRECATED: Will be auto-migrated to client_secret_encrypted by the reconciler.
     /// Kept for deserialization only (existing DB records may still have this field).
     #[serde(default, skip_serializing)]
+    // Only reached from `main` (through the extension registry), which is not a
+    // dead-code root when the binary is built for tests.
+    #[cfg_attr(test, allow(dead_code))]
     pub client_secret_ref: Option<String>,
     /// Encrypted client secret stored directly in spec (preferred over client_secret_ref)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,8 +34,31 @@ pub struct OAuthExtensionSpec {
     /// If not provided, fetched from issuer_url's OIDC discovery document
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_endpoint: Option<String>,
-    /// OAuth scopes to request
+    /// How Rise authenticates to the upstream token endpoint
+    #[serde(default, skip_serializing_if = "TokenEndpointAuthMethod::is_default")]
+    pub token_endpoint_auth_method: TokenEndpointAuthMethod,
+    /// OAuth scopes to request. Empty for providers without scopes (e.g. Notion),
+    /// in which case the authorization request carries no `scope` parameter.
+    #[serde(default)]
     pub scopes: Vec<String>,
+}
+
+/// Client authentication at the upstream token endpoint (RFC 6749 §2.3.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenEndpointAuthMethod {
+    /// `client_id` and `client_secret` in the form body.
+    #[default]
+    ClientSecretPost,
+    /// `Authorization: Basic` header built from the form-urlencoded
+    /// `client_id` and `client_secret`; neither appears in the body.
+    ClientSecretBasic,
+}
+
+impl TokenEndpointAuthMethod {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Extension status - system-computed metadata

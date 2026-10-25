@@ -10,9 +10,11 @@ use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
 use rsa::traits::PublicKeyParts;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 use crate::claims::{
-    AccessClaims, PrincipalClaims, RiseClaims, WorkloadClaims, WorkloadSubjectInfo,
+    AccessClaims, ActorClaim, IdentityClaims, PrincipalClaims, RiseClaims, SessionClient,
+    WorkloadClaims, WorkloadSubjectInfo,
 };
 use crate::error::JwtSignerError;
 use crate::verify::RiseToken;
@@ -24,6 +26,61 @@ use crate::verify::RiseToken;
 /// [`RiseToken::Access`], and the legacy `verify_user_jwt` / `verify_jwt_skip_aud`
 /// adapters reject it. Session tokens carry the default `"JWT"` `typ`.
 pub const RISE_ACCESS_TYP: &str = "rise-access+jwt";
+
+/// JWT header `typ` for Rise identity tokens (ADR-0001 §7).
+///
+/// The discriminator that routes an HS256 token to [`RiseToken::Identity`].
+/// Matched exclusively, like [`RISE_ACCESS_TYP`].
+pub const RISE_IDENTITY_TYP: &str = "rise-identity+jwt";
+
+/// JWT header `typ` for Rise User session tokens (ADR-0001 §7).
+///
+/// A session carrying it names a `User` resource: `sub` is its canonical
+/// `user:<name>`, `rise_uid` its UID, and `rise_identity_uid` the
+/// `UserIdentity` whose login minted it; all three must still identify one
+/// live, active User and identity on every request. `rise_client` records
+/// whether it was issued to the browser or the CLI. Matched exclusively, like
+/// [`RISE_ACCESS_TYP`]; an HS256 token without it is a legacy session, which
+/// carries the IdP's `sub` and no `rise_uid`.
+pub const RISE_SESSION_TYP: &str = "rise-session+jwt";
+
+/// The Rise `User` resource a session token is issued for.
+#[derive(Debug, Clone)]
+pub struct SessionUser {
+    /// Canonical `user:<name>` subject.
+    pub subject: String,
+    /// The `User` resource's UID.
+    pub rise_uid: uuid::Uuid,
+    /// The `UserIdentity` the login resolved through.
+    pub identity_uid: uuid::Uuid,
+    /// The kind of client the session is issued to.
+    pub client: crate::SessionClient,
+    /// The session's ceiling (ADR-0006), already compiled and validated by
+    /// the caller. Only a CLI session may carry one.
+    pub authorization_details: Option<Vec<serde_json::Value>>,
+}
+
+/// What an identity token is minted for.
+///
+/// The signer stamps `iss`, `iat`/`exp`, and a random `jti`; everything
+/// identity-specific arrives here, already validated by the `/token` handler.
+pub struct IdentityTokenSpec<'a> {
+    /// Canonical subject of the target identity.
+    pub subject: &'a str,
+    /// The target resource's UID.
+    pub rise_uid: Uuid,
+    /// The `aud` claim: the Rise public URL for a token Rise's own API accepts,
+    /// or an external verifier's audience.
+    pub audience: &'a str,
+    /// Token lifetime in seconds (the caller clamps to the platform maximum).
+    pub ttl_secs: u64,
+    /// Canonical `rise.dev/rbac` authorization details, or `None` for the
+    /// target's full live policy.
+    pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// The delegation chain for delegated issuance; `None` for a workload
+    /// exchange.
+    pub act: Option<ActorClaim>,
+}
 
 /// JWT signer supporting both HS256 (symmetric) and RS256 (asymmetric) algorithms
 ///
@@ -279,16 +336,24 @@ impl RiseTokenSigner {
             exp,
             iss: self.issuer.clone(),
             aud: aud.to_string(),
+            rise_uid: None,
+            rise_identity_uid: None,
+            rise_client: None,
+            authorization_details: None,
         })
     }
 
-    /// Sign a new Rise JWT for user authentication (HS256)
+    /// Sign a Rise session token for a resolved `User` (HS256).
     ///
-    /// This JWT is used for authenticating users to Rise (both UI and CLI).
-    /// Uses HS256 symmetric encryption and sets aud to the Rise public URL.
+    /// This JWT authenticates users to Rise (UI and CLI). It carries the
+    /// header `typ` [`RISE_SESSION_TYP`], `sub` = the User's canonical subject,
+    /// `rise_uid` = its UID, `rise_identity_uid` = the minting `UserIdentity`,
+    /// and `aud` = the Rise public URL. `email` and
+    /// `name` still come from the IdP claims: the typed APIs key on the email.
     ///
     /// # Arguments
     /// * `idp_claims` - Claims from the IdP JWT (must contain at least "sub" and "email")
+    /// * `user` - The `User` resource the login resolved to
     /// * `groups` - The user's Rise team names, placed directly into the `groups` claim.
     ///   Callers resolve these (e.g. via the DB) and pass them in; the signer never
     ///   touches the database.
@@ -297,14 +362,26 @@ impl RiseTokenSigner {
     pub fn sign_user_jwt(
         &self,
         idp_claims: &serde_json::Value,
+        user: &SessionUser,
         groups: Option<Vec<String>>,
         rise_public_url: &str,
         expiry_override: Option<u64>,
     ) -> Result<String, JwtSignerError> {
-        let claims =
+        let mut claims =
             self.build_rise_claims(idp_claims, groups, rise_public_url, expiry_override)?;
+        claims.sub = user.subject.clone();
+        claims.rise_uid = Some(user.rise_uid);
+        claims.rise_identity_uid = Some(user.identity_uid);
+        claims.rise_client = Some(user.client);
+        if user.authorization_details.is_some() && user.client != crate::SessionClient::Cli {
+            return Err(JwtSignerError::InvalidClaims(
+                "only a CLI session may carry authorization_details".to_string(),
+            ));
+        }
+        claims.authorization_details = user.authorization_details.clone();
 
-        let header = Header::new(Algorithm::HS256);
+        let mut header = Header::new(Algorithm::HS256);
+        header.typ = Some(RISE_SESSION_TYP.to_string());
         let token = encode(&header, &claims, &self.hs256_encoding_key)?;
 
         Ok(token)
@@ -391,7 +468,7 @@ impl RiseTokenSigner {
     /// [`RiseToken::Access`] (and the session/ingress adapters reject it).
     ///
     /// # Arguments
-    /// * `sub` - stable principal id (`rise:sa:<id>`, `rise:ctrl:<id>`, ...)
+    /// * `sub` - stable principal id (`rise:sa:<id>`, `controller:<name>`, ...)
     /// * `principal` - the fully-resolved principal to embed
     /// * `aud` - the `aud` claim (the Rise public URL)
     /// * `ttl_secs` - token lifetime in seconds (caller clamps to the max TTL)
@@ -427,6 +504,54 @@ impl RiseTokenSigner {
         Ok((token, claims))
     }
 
+    /// Sign a Rise identity token (RS256) for a ServiceAccount or Controller
+    /// resource principal (ADR-0001 §7).
+    ///
+    /// Always asymmetric, whatever the audience: a token for Rise's own API and
+    /// one for an external verifier are the same kind, signed with the RS256
+    /// key the JWKS publishes, so any audience can verify it and Rise has one
+    /// verification path rather than two. The header carries the `kid` and the
+    /// [`RISE_IDENTITY_TYP`] `typ` that routes `verify_rise_jwt` to
+    /// [`RiseToken::Identity`]; every other adapter rejects it. A delegation
+    /// chain longer than [`crate::MAX_DELEGATION_DEPTH`] is refused here as well
+    /// as at the handler, so no signing path can produce a token the platform
+    /// limit forbids.
+    pub fn sign_identity_jwt(
+        &self,
+        spec: IdentityTokenSpec<'_>,
+    ) -> Result<(String, IdentityClaims), JwtSignerError> {
+        use rand::Rng;
+
+        if spec.act.as_ref().map_or(0, ActorClaim::depth) > crate::MAX_DELEGATION_DEPTH {
+            return Err(JwtSignerError::DelegationChainTooLong);
+        }
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+        let mut jti_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut jti_bytes);
+        let jti = BASE64URL.encode(jti_bytes);
+
+        let claims = IdentityClaims {
+            iss: self.issuer.clone(),
+            aud: spec.audience.to_string(),
+            sub: spec.subject.to_string(),
+            rise_uid: spec.rise_uid,
+            iat: now,
+            exp: now + spec.ttl_secs,
+            jti,
+            authorization_details: spec.authorization_details,
+            act: spec.act,
+        };
+
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.rs256_key_id.clone());
+        header.typ = Some(RISE_IDENTITY_TYP.to_string());
+        let token = encode(&header, &claims, &self.rs256_encoding_key)?;
+
+        Ok((token, claims))
+    }
+
     /// Verify and decode a Rise user JWT (HS256 only) with audience validation.
     ///
     /// Adapter over [`Self::verify_rise_jwt`] for the API authentication path:
@@ -446,25 +571,36 @@ impl RiseTokenSigner {
             // A correctly-signed HS256 session token with the wrong audience:
             // labeled distinctly as an audience mismatch (still rejected).
             RiseToken::Session(_) => Err(JwtSignerError::AudienceMismatch),
-            // An RS256 ingress token, or an exchanged access token — genuinely the
-            // wrong token kind on the user-login path, so reject as an alg error.
-            RiseToken::Ingress(_) | RiseToken::Access(_) => Err(JwtSignerError::SigningFailed(
-                jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
-            )),
+            // An RS256 ingress token, an exchanged access token, or a resource
+            // identity token — genuinely the wrong token kind on the user-login
+            // path, so reject as an alg error.
+            RiseToken::Ingress(_) | RiseToken::Access(_) | RiseToken::Identity(_) => {
+                Err(JwtSignerError::SigningFailed(
+                    jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
+                ))
+            }
         }
     }
 
     /// Verify and decode a Rise JWT without audience validation.
     ///
     /// Adapter over [`Self::verify_rise_jwt`] for the `ingress_auth` handler, which
-    /// accepts both HS256 (user session) and RS256 (app-scoped ingress) tokens and
-    /// does not check `aud`. Project access is validated separately via database
-    /// checks.
+    /// accepts both HS256 (web UI session) and RS256 (app-scoped ingress) tokens
+    /// and does not check `aud`. Project access is validated separately via
+    /// database checks.
     pub fn verify_jwt_skip_aud(&self, token: &str) -> Result<RiseClaims, JwtSignerError> {
         let claims = match self.verify_rise_jwt(token)? {
-            RiseToken::Session(claims) | RiseToken::Ingress(claims) => claims,
-            // An exchanged access token must never be honored on the ingress path.
-            RiseToken::Access(_) => {
+            RiseToken::Ingress(claims) => claims,
+            // The web UI's session doubles as the app cookie for an app served
+            // under Rise's own host. A CLI session is an API credential, never an
+            // app cookie, and one that doesn't say which client it was issued to
+            // is treated the same way.
+            RiseToken::Session(claims) if claims.rise_client == Some(SessionClient::Browser) => {
+                claims
+            }
+            // An exchanged access token or a resource identity token must never
+            // be honored on the ingress path.
+            RiseToken::Session(_) | RiseToken::Access(_) | RiseToken::Identity(_) => {
                 return Err(JwtSignerError::SigningFailed(
                     jsonwebtoken::errors::ErrorKind::InvalidAlgorithm.into(),
                 ))
@@ -472,12 +608,14 @@ impl RiseTokenSigner {
         };
 
         // Defense-in-depth (§4.1 ingress hardening): the `typ` discriminator above
-        // already routes a Rise access token to `RiseToken::Access`, but because
-        // `RiseClaims` intentionally does NOT use `deny_unknown_fields`, a token
-        // *without* the access `typ` that nonetheless carries a `principal` claim
-        // would deserialize cleanly as a session/ingress token (extra field
-        // ignored). Reject any such token outright so an access-shaped payload can
-        // never be accepted on the ingress path. The payload was just
+        // already routes a Rise access or identity token to its own variant, but
+        // because `RiseClaims` intentionally does NOT use `deny_unknown_fields`,
+        // a token *without* that `typ` that nonetheless carries a `principal`
+        // claim would deserialize cleanly as a session/ingress token (extra
+        // field ignored). Reject any such token outright so a principal-shaped
+        // payload can never be accepted on the ingress path. `rise_uid` needs
+        // no peek: `RiseClaims` reads it, and the verifier admits it only on a
+        // session token wearing `RISE_SESSION_TYP`. The payload was just
         // signature-verified, so this peek reads authenticated bytes.
         if rise_jwt_payload_has_principal(token) {
             return Err(JwtSignerError::SigningFailed(
@@ -490,9 +628,10 @@ impl RiseTokenSigner {
 }
 
 /// Whether a (already signature-verified) JWT's payload carries a top-level
-/// `principal` claim. Used to fail-close the ingress path against access-shaped
-/// tokens (§4.1). Returns `false` if the payload cannot be parsed (the caller has
-/// already verified the signature, so this only guards the claim shape).
+/// `principal` claim — the field that marks an access token. Used to
+/// fail-close the ingress path against principal-shaped tokens (§4.1). Returns `false` if the payload cannot be
+/// parsed (the caller has already verified the signature, so this only guards
+/// the claim shape).
 fn rise_jwt_payload_has_principal(token: &str) -> bool {
     let Some(payload_b64) = token.split('.').nth(1) else {
         return false;
@@ -613,5 +752,58 @@ pub(crate) mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    /// A chain built to an exact depth, outermost delegator first.
+    fn chain(depth: usize) -> ActorClaim {
+        let mut act: Option<Box<ActorClaim>> = None;
+        for level in 0..depth {
+            act = Some(Box::new(ActorClaim {
+                sub: format!("controller:c{level}"),
+                rise_uid: Uuid::new_v4(),
+                act,
+            }));
+        }
+        *act.expect("depth is at least 1")
+    }
+
+    /// ADR-0001 scenario 48
+    #[test]
+    fn sign_identity_jwt_refuses_a_chain_past_the_depth_limit() {
+        let signer = create_test_signer();
+
+        let at_limit = chain(crate::MAX_DELEGATION_DEPTH);
+        assert_eq!(at_limit.depth(), crate::MAX_DELEGATION_DEPTH);
+        let (token, _) = signer
+            .sign_identity_jwt(IdentityTokenSpec {
+                subject: "controller:k8s",
+                rise_uid: Uuid::new_v4(),
+                audience: "https://rise.test",
+                ttl_secs: 600,
+                authorization_details: None,
+                act: Some(at_limit),
+            })
+            .expect("a chain at the platform limit is accepted");
+        match signer.verify_rise_jwt(&token).unwrap() {
+            RiseToken::Identity(claims) => assert_eq!(
+                claims.delegation_depth(),
+                crate::MAX_DELEGATION_DEPTH,
+                "the verified token reports the same depth it was signed with"
+            ),
+            other => panic!("expected Identity, got {other:?}"),
+        }
+
+        let too_long = chain(crate::MAX_DELEGATION_DEPTH + 1);
+        let err = signer
+            .sign_identity_jwt(IdentityTokenSpec {
+                subject: "controller:k8s",
+                rise_uid: Uuid::new_v4(),
+                audience: "https://rise.test",
+                ttl_secs: 600,
+                authorization_details: None,
+                act: Some(too_long),
+            })
+            .unwrap_err();
+        assert!(matches!(err, JwtSignerError::DelegationChainTooLong));
     }
 }

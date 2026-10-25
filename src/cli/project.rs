@@ -2,9 +2,10 @@ use crate::api::project::{
     CreateProjectResponse, MeResponse, OwnerInfo, Project, ProjectErrorResponse, ProjectStatus,
     UpdateProjectResponse,
 };
+use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::Serialize;
 
@@ -19,7 +20,7 @@ async fn get_current_user(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to get current user")?;
 
@@ -156,7 +157,7 @@ pub async fn create_project(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send create project request")?;
 
@@ -213,7 +214,7 @@ pub async fn list_projects(http_client: &Client, backend_url: &str, config: &Con
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send list projects request")?;
 
@@ -228,8 +229,7 @@ pub async fn list_projects(http_client: &Client, backend_url: &str, config: &Con
         } else {
             let mut table = Table::new();
             table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
+                .load_style(UTF8_FULL.with_rounded_corners())
                 .set_header(vec![
                     Cell::new("NAME").add_attribute(Attribute::Bold),
                     Cell::new("STATUS").add_attribute(Attribute::Bold),
@@ -297,7 +297,7 @@ pub async fn show_project(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send get project request")?;
 
@@ -452,7 +452,7 @@ pub async fn update_project(
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send update project request")?;
 
@@ -510,7 +510,7 @@ pub async fn delete_project(
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send delete project request")?;
 
@@ -580,7 +580,7 @@ pub async fn add_app_user(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch project")?;
 
@@ -649,7 +649,7 @@ pub async fn add_app_user(
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to update project")?;
 
@@ -691,7 +691,7 @@ pub async fn remove_app_user(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch project")?;
 
@@ -760,7 +760,7 @@ pub async fn remove_app_user(
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to update project")?;
 
@@ -800,7 +800,7 @@ pub async fn list_app_users(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch project")?;
 
@@ -831,8 +831,7 @@ pub async fn list_app_users(
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("TYPE").add_attribute(Attribute::Bold),
             Cell::new("IDENTIFIER").add_attribute(Attribute::Bold),

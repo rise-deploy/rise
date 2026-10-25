@@ -546,6 +546,17 @@ impl ExchangingTokenSource {
         let body = response.text().await.map_err(|e| {
             TokenSourceError::retryable(format!("Failed to read token-exchange response body: {e}"))
         })?;
+        // Missing SA trust is reported as OAuth invalid_grant by the exchange endpoint.
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) || (status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .is_some_and(|body| body["error"] == "invalid_grant"))
+        {
+            crate::cli::auth_hint::log_service_account_hint(subject_token, &self.backend_url, None);
+        }
         parse_exchange_response(status, &body)
     }
 }
@@ -740,10 +751,10 @@ pub fn select_token_provider(
         Arc::new(StaticToken::new(token, "stored login token"))
     } else {
         // 5. Nothing.
-        return Err(TokenSourceError::NoSource(
-            "Not authenticated. Run 'rise login' first.".to_string(),
-        )
-        .into());
+        let message = format!(
+            "Not authenticated for backend '{backend_url}'. Run 'rise login --url {backend_url}' first."
+        );
+        return Err(TokenSourceError::NoSource(message).into());
     };
 
     // `RISE_IDENTITY` set → exchange the resolved token for that identity,

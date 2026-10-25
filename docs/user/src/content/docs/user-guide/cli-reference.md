@@ -8,7 +8,8 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 
 | Command | Alias | Subcommands | Details |
 |---------|-------|-------------|---------|
-| `rise login` | | | [Authentication](../authentication) |
+| `rise login` | | `--device`, `--scope`, `--full-access` | [Authentication](../authentication), [Restricting a Login](../authentication#restricting-a-login) |
+| `rise profile` | | `list` (`ls`), `use`, `remove` (`rm`) | [Login Profiles](../configuration#login-profiles) |
 | `rise deploy` | | | [Deployments](../deployments) |
 | `rise build` | | | [Building Images](../builds) |
 | `rise run` | | | [Local Development](../local-development) |
@@ -43,7 +44,8 @@ rise project show
 
 | Variable | Description |
 |----------|-------------|
-| `RISE_URL` | Default backend URL |
+| `RISE_URL` | Backend URL override; credentials are loaded for this URL. Takes priority over the project target and profile URL. |
+| `RISE_PROFILE` | Login profile to use, equivalent to the global `--profile` flag. See [Login Profiles](../configuration#login-profiles). |
 | `RISE_TOKEN` | Authentication token (skips interactive login) |
 | `RISE_TOKEN_COMMAND` | Shell command whose stdout is used as the bearer token. JWT output uses the embedded `exp` claim; opaque output uses `RISE_TOKEN_COMMAND_TTL` as its assumed lifetime. |
 | `RISE_TOKEN_COMMAND_TTL` | Assumed lifetime (seconds) for opaque tokens produced by `RISE_TOKEN_COMMAND`. The command is re-run after two thirds of this TTL has elapsed. JWT tokens ignore this setting and use their `exp` claim instead. Default: `600` (10 minutes). |
@@ -83,3 +85,5 @@ For token sources that can mint new tokens, the CLI refreshes proactively so lon
 ## Global Configuration
 
 CLI settings are stored in `~/.config/rise/config.json`, created on first `rise login`. See [Project Configuration](../configuration#global-cli-config) for details.
+
+Backend URLs can have named profile aliases (`--profile` / `RISE_PROFILE`, `rise profile list`/`use`/`remove`). See [Login Profiles](../configuration#login-profiles).

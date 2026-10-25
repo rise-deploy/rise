@@ -165,6 +165,10 @@ impl DockerBackend {
         c.current_dir(&self.repo_root)
             .env("RISE_IMAGE_REPOSITORY", &self.image_repository)
             .env("RISE_IMAGE_TAG", &self.image_tag)
+            // The CI bearer is the stack's admin; operator standing on top is
+            // what lets scenarios author resources through the generic
+            // resource API (the `resource-token-exchange` scenario needs it).
+            .env("RISE_OPERATOR_EMAIL", "admin@example.com")
             .args([
                 "compose",
                 "-f",
@@ -429,21 +433,7 @@ impl Backend for DockerBackend {
     }
 
     fn assert_ingress_auth_configured(&self, project: &str) -> Result<()> {
-        // Traefik forwardAuth: the controller stamps forwardauth + router-middleware
-        // labels on the app container (it can lag the Healthy mark, so poll).
-        let mut labels = String::new();
-        http::poll(
-            Duration::from_secs(60),
-            Duration::from_secs(2),
-            &format!("forwardAuth labels on {project}"),
-            || {
-                labels = self.app_container_labels(project)?;
-                Ok(labels.contains("forwardauth.address")
-                    && labels.contains(".routers.")
-                    && labels.contains(".middlewares"))
-            },
-        )
-        .with_context(|| format!("private app container missing forwardAuth labels:\n{labels}"))
+        super::assert_traefik_ingress_auth_configured(self, project)
     }
 
     fn app_container_envs(&self, project: &str) -> Result<Vec<String>> {
@@ -460,7 +450,23 @@ impl Backend for DockerBackend {
         for name in names.stdout.lines().filter(|l| !l.trim().is_empty()) {
             let mut c = Command::new("docker");
             c.args(["inspect", name.trim(), "--format", "{{json .Config.Env}}"]);
-            envs.push(cli::run_checked(c)?.stdout);
+            let inspected = cli::run(c)?;
+            if inspected.success() {
+                envs.push(inspected.stdout);
+                continue;
+            }
+            // Callers poll this during a rolling cutover, which is exactly when
+            // the retiring generation's containers are being removed — so a name
+            // `docker ps` just listed can be gone by the time `inspect` asks
+            // about it. That is the convergence the caller is waiting for, not a
+            // failure of it. Any other error still is one.
+            if !inspected.stderr.contains("No such object") {
+                anyhow::bail!(
+                    "docker inspect {name} failed (exit {:?}): {}",
+                    inspected.status,
+                    inspected.stderr.trim()
+                );
+            }
         }
         Ok(envs)
     }

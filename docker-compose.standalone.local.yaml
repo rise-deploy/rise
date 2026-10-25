@@ -5,9 +5,12 @@
 #   docker compose -f docker-compose.standalone.yaml \
 #                  -f docker-compose.standalone.local.yaml up -d
 #
+# To validate a tagged release candidate, set RISE_IMAGE_TAG to its exact GHCR
+# tag (the Git release tag without its leading `v`) before running this command.
+#
 # Effect: plain HTTP on *.rise.localhost, no TLS, no Let's Encrypt. This is what
-# the e2e (scripts/ci/e2e-docker.sh) and a quick local try use. No RISE_DOMAIN /
-# ACME_EMAIL needed.
+# the tests/e2e Docker backend harness and a quick local try use. No RISE_DOMAIN
+# / ACME_EMAIL needed.
 #
 #   * Traefik: single `web` (:80) entrypoint — NO websecure, NO ACME, NO HTTP->
 #     HTTPS redirect. The label-based routers in the base file that target the
@@ -27,11 +30,14 @@ services:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
+      - "--providers.http.endpoint=http://rise:3001/internal/traefik/config"
+      - "--providers.http.pollInterval=5s"
       # Keep Traefik's API enabled internally (:8080, NOT published) so the
       # backend's rolling serverStatus gate works in local/e2e too; the
       # command is replaced wholesale on override, so it must be re-added here.
       - "--api.insecure=true"
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.rise-catalog.address=127.0.0.1:8083"
     # Sequences are replaced (not merged) on override, so this drops 443. :8080
     # stays unpublished — the Traefik API is internal-only (rise_default).
     ports:
@@ -53,6 +59,8 @@ services:
       - "127.0.0.1:5000:5000"
 
   rise:
+    # Mirrors the base file's stable default while honoring an exact
+    # RISE_IMAGE_TAG override for CI/e2e and release-candidate validation.
     image: ${RISE_IMAGE_REPOSITORY:-ghcr.io/rise-deploy/rise}:${RISE_IMAGE_TAG:-0.23.0}
     # Re-publish the backend on loopback so the CLI/e2e reach the control plane
     # directly at http://rise.localhost:3000 (prod goes through Traefik instead).

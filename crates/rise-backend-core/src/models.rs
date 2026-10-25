@@ -76,6 +76,10 @@ pub struct Environment {
     pub max_cpu: Option<String>,
     pub min_memory: Option<String>,
     pub max_memory: Option<String>,
+    /// Caps `expires_at` of deployments created into a group other than
+    /// `primary_deployment_group` (or into any group, when unset). Canonical
+    /// `Nd|Nh|Nm`; `NULL` means no cap.
+    pub max_deployment_expiration: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -89,7 +93,7 @@ pub struct Deployment {
     pub created_by_id: Uuid,
     pub status: DeploymentStatus,
     pub deployment_group: String,
-    pub environment_id: Option<Uuid>,
+    pub environment_id: Uuid,
     pub expires_at: Option<DateTime<Utc>>,
     pub termination_reason: Option<TerminationReason>,
     pub completed_at: Option<DateTime<Utc>>,

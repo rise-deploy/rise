@@ -80,19 +80,22 @@ services:
   # Traefik labels the Rise controller stamps on each app container. Only used when
   # deployment_controller.type = "docker" (see config/development.yaml).
   traefik:
-    image: traefik:v3.7.5
+    image: traefik:v3.7.14
     container_name: rise-traefik
     restart: unless-stopped
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
       - "--providers.docker.network=rise_default"
+      - "--providers.http.endpoint=http://host.docker.internal:3001/internal/traefik/config"
+      - "--providers.http.pollInterval=5s"
       # File provider: routes /.rise/* on app hosts to the host-run Rise backend
       # (see dev/traefik/dynamic/rise-dotrise.yml). The backend isn't a container
       # here, so a Docker-provider label can't target it.
       - "--providers.file.directory=/etc/traefik/dynamic"
       - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
+      - "--entrypoints.rise-catalog.address=127.0.0.1:8083"
       - "--api.dashboard=true"
       - "--api.insecure=true"
     ports:
@@ -120,8 +123,11 @@ services:
   # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   vault:
     profiles: ["jfrog-vault"]
-    image: hashicorp/vault:1.21
+    image: hashicorp/vault:2.1
     container_name: rise-vault
+    # The image runs as the unprivileged `vault` user; the entrypoint installs
+    # curl with apk and writes into the plugin volume, both of which need root.
+    user: root
     restart: unless-stopped
     ports:
       - "8200:8200"
@@ -143,7 +149,7 @@ services:
   # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   jfrog:
     profiles: ["jfrog-vault"]
-    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.146.17
+    image: releases-docker.jfrog.io/jfrog/artifactory-jcr:7.161.26
     container_name: rise-jfrog
     restart: unless-stopped
     ports:

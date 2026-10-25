@@ -1,6 +1,7 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +48,7 @@ async fn lookup_users(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to lookup users")?;
 
@@ -79,7 +80,7 @@ async fn get_current_user(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to get current user")?;
 
@@ -171,7 +172,7 @@ pub async fn create_team(
         .post(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send create team request")?;
 
@@ -226,7 +227,7 @@ pub async fn list_teams(http_client: &Client, backend_url: &str, config: &Config
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send list teams request")?;
 
@@ -241,8 +242,7 @@ pub async fn list_teams(http_client: &Client, backend_url: &str, config: &Config
         } else {
             let mut table = Table::new();
             table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
+                .load_style(UTF8_FULL.with_rounded_corners())
                 .set_header(vec![
                     Cell::new("NAME").add_attribute(Attribute::Bold),
                     Cell::new("ID").add_attribute(Attribute::Bold),
@@ -293,7 +293,7 @@ pub async fn show_team(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send get team request")?;
 
@@ -318,8 +318,7 @@ pub async fn show_team(
         } else {
             let mut owners_table = Table::new();
             owners_table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
+                .load_style(UTF8_FULL.with_rounded_corners())
                 .set_header(vec![
                     Cell::new("EMAIL").add_attribute(Attribute::Bold),
                     Cell::new("ID").add_attribute(Attribute::Bold),
@@ -339,8 +338,7 @@ pub async fn show_team(
         } else {
             let mut members_table = Table::new();
             members_table
-                .load_preset(UTF8_FULL)
-                .apply_modifier(UTF8_ROUND_CORNERS)
+                .load_style(UTF8_FULL.with_rounded_corners())
                 .set_header(vec![
                     Cell::new("EMAIL").add_attribute(Attribute::Bold),
                     Cell::new("ID").add_attribute(Attribute::Bold),
@@ -404,7 +402,7 @@ pub async fn update_team(
     let get_response = http_client
         .get(&get_url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to get current team state")?;
 
@@ -478,7 +476,7 @@ pub async fn update_team(
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&request)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send update team request")?;
 
@@ -537,7 +535,7 @@ pub async fn delete_team(
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to send delete team request")?;
 

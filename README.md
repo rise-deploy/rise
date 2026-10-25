@@ -30,17 +30,18 @@ Rise simplifies container deployment by providing:
 - **Automatic OCI repository provisioning**: Push images to AWS ACR with secure temporary credentials without per-project infrastructure setup
 - **Service Accounts**: Workload identity for GitHub Actions, GitLab CI, etc. to deploy from CI/CD
 
-## Install CLI from crates.io
+## Install CLI
 
 ```bash
-# Install the CLI and backend from crates.io
-cargo install rise-deploy
+# Download the latest pre-built binary from GitHub Releases
+mise use -g github:rise-deploy/rise
 
 # Verify installation
 rise --version
 ```
 
-Note that this does not include server code unless you use `--features cli,server`.
+You can also download a binary directly from the
+[GitHub Releases](https://github.com/rise-deploy/rise/releases) page.
 
 ## Local Development
 
@@ -165,7 +166,7 @@ rise deploy
 
 **Prerequisites:**
 - [GitHub CLI (`gh`)](https://cli.github.com/) - authenticated via `gh auth login`
-- [Claude CLI](https://github.com/anthropics/anthropic-tools) - for AI-generated release notes (optional)
+- [Claude Code](https://github.com/anthropics/claude-code) or [Codex CLI](https://github.com/openai/codex) - for AI-generated release notes (optional)
 
 **Create a new release:**
 
@@ -173,14 +174,17 @@ rise deploy
 # Preview release notes
 ./scripts/tag-version.sh --dry-run 0.14.0
 
-# Preview release notes with extra Claude guidance
-./scripts/tag-version.sh --dry-run --claude-guidance "Emphasize operator-facing changes" 0.14.0
+# Preview release notes with extra AI guidance
+./scripts/tag-version.sh --dry-run --ai-guidance "Emphasize operator-facing changes" 0.14.0
+
+# Explicitly use Codex (otherwise Claude, then Codex, is auto-detected)
+./scripts/tag-version.sh --dry-run --ai-cli codex 0.14.0
 
 # Create and publish release
 ./scripts/tag-version.sh 0.14.0
 ```
 
-The script validates prerequisites, generates release notes, shows a plan, and after confirmation performs all git operations (commit, tag, push) and creates a GitHub release. CI then publishes to crates.io and builds Docker images.
+The script validates prerequisites, generates release notes, shows a plan, and after confirmation performs all git operations (commit, tag, push) and creates a GitHub release. CI then builds release binaries and Docker images.
 
 ## License
 

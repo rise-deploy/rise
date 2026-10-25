@@ -1,3 +1,4 @@
+pub mod auth_hint;
 #[cfg(feature = "backend")]
 pub mod backend;
 pub mod compose;
@@ -10,6 +11,7 @@ pub mod environment;
 pub mod extension;
 pub mod identity;
 pub mod login;
+pub mod profile;
 pub mod project;
 pub mod run;
 pub mod service_account;

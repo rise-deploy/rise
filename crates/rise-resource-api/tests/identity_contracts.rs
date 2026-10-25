@@ -63,6 +63,7 @@ fn user_and_user_identity_active_default_true_but_null_fails() {
     }
 }
 
+/// ADR-0001 scenario 9
 #[test]
 fn user_profile_is_optional_non_authoritative_and_closed() {
     let user: UserSpec = serde_json::from_value(json!({
@@ -110,7 +111,7 @@ fn external_identity_fields_are_required_and_canonical() {
     }
 
     assert!(serde_json::from_value::<UserIdentitySpec>(json!({
-        "issuer": "https://issuer.example/",
+        "issuer": "https://ISSUER.example",
         "subject": "subject"
     }))
     .is_err());
@@ -118,10 +119,16 @@ fn external_identity_fields_are_required_and_canonical() {
 
 #[test]
 fn issuers_are_canonical_urls() {
+    // The IdP's own `iss` spelling, with or without one trailing slash, is
+    // canonical: OIDC compares issuers as exact strings, and IdPs differ.
     for canonical in [
         "https://issuer.example",
+        "https://issuer.example/",
         "http://rise-dex:5556/dex",
+        "http://rise-dex:5556/dex/",
+        "https://tenant.auth0.example/",
         "https://127.0.0.1:8443",
+        "https://127.0.0.1:8443/",
     ] {
         let issuer = Issuer::new(canonical).unwrap();
         assert_eq!(issuer.as_str(), canonical);
@@ -134,10 +141,15 @@ fn issuers_are_canonical_urls() {
     for (noncanonical, canonical) in [
         (
             "https://ISSUER.example:443/a/../tenant///",
+            "https://issuer.example/tenant/",
+        ),
+        (
+            "https://ISSUER.example/tenant",
             "https://issuer.example/tenant",
         ),
-        ("http://rise-dex:5556/dex/", "http://rise-dex:5556/dex"),
-        ("https://127.0.0.1:8443/", "https://127.0.0.1:8443"),
+        ("https://issuer.example:443", "https://issuer.example"),
+        ("http://rise-dex:5556/dex//", "http://rise-dex:5556/dex/"),
+        ("https://127.0.0.1:8443//", "https://127.0.0.1:8443/"),
     ] {
         let error = Issuer::new(noncanonical).unwrap_err();
         assert_eq!(
@@ -197,6 +209,7 @@ fn external_subject_is_opaque_nonblank_and_bounded() {
     for invalid in [
         String::new(),
         " \t ".to_string(),
+        "subject\0suffix".to_string(),
         "x".repeat(MAX_EXTERNAL_SUBJECT_CHARS + 1),
     ] {
         assert!(ExternalSubject::new(invalid.clone()).is_err());
@@ -204,6 +217,7 @@ fn external_subject_is_opaque_nonblank_and_bounded() {
     }
 }
 
+/// ADR-0001 scenario 16
 #[test]
 fn membership_is_an_empty_name_bound_marker() {
     let membership: GroupMembershipSpec = serde_json::from_value(json!({})).unwrap();
@@ -284,6 +298,7 @@ fn marker_specs_are_closed_empty_objects() {
     assert_rejected::<ServiceAccountSpec>(json!({"issuer": "https://issuer.example"}));
 }
 
+/// ADR-0001 scenario 8
 #[test]
 fn identity_kind_definitions_capture_fixed_adr_placement() {
     let definitions: Vec<_> = IDENTITY_KIND_DEFINITIONS

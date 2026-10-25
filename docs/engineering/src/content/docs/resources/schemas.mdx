@@ -28,7 +28,7 @@ Standard metadata fields common to every resource. The fields `uid`, `revision`,
 
 ## Controller status map
 
-The shape of `status` for kinds that surface controller-owned status. Each entry under `controllers` is keyed by the controller's `identity_id` (a Kubernetes-style controller ID, e.g. `controller.example.com` or `controller.example.com/my-controller`).
+The shape of `status` for kinds that surface controller-owned status. Each entry under `controllers` is keyed by the calling Controller's resource name.
 
 <JsonSchema file="controller-status-map.schema.json" title="ControllerStatusMap" />
 
