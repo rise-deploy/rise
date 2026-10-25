@@ -78,6 +78,31 @@ rise environment update staging --max-expiration ""
 
 Setting `--production true` automatically transfers the flag from the environment that previously held it.
 
+### Promotion Source
+
+*Administrators only.* An environment can require that everything deployed to it was first deployed somewhere else:
+
+```bash
+rise environment update production --promote-from staging
+rise environment update production --promote-from ""     # clear
+```
+
+From then on, a deployment into `production` must be created from a deployment in `staging` — with [`rise promote`](../deployments#promoting-between-environments) — or from one already in `production` (redeploys and rollbacks keep working). Fresh builds, `--image` deploys and promotions from any other environment are refused with HTTP `403`, `error_code: "promotion_source_required"`. The rule covers the whole environment, preview groups included. Unscoped administrator sessions may bypass it (a warning is printed and recorded); service accounts and [scoped logins](../authentication#restricting-a-login) may not.
+
+Promotion sources can't form a cycle, and `rise environment list` shows them in a `PROMOTES FROM` column. Switch your pipelines to promotion **before** setting a source — see [CI/CD Setup](../ci-cd#promotion-based-pipeline).
+
+### Rollback Guard
+
+*Administrators only.* Lets Rise [roll back automatically](../deployments#automatic-rollback-rollback-guard) when the environment's live deployment stays unhealthy:
+
+```bash
+rise environment update production --rollback-guard true
+rise environment update production --rollback-guard-timeout 10m   # default 5m; 1m to 24h
+rise environment update production --rollback-guard false
+```
+
+`rise environment show` prints `Rollback Guard: on (after 5m unhealthy)`. Operators can disable the guard platform-wide, in which case this setting has no effect.
+
 ## Deleting Environments
 
 ```bash
@@ -90,6 +115,8 @@ You cannot delete the production environment. Transfer the production flag to an
 rise environment update staging --production true
 rise environment delete production
 ```
+
+An environment that is another environment's promotion source can't be deleted either (`409`); clear the dependent's source first (`rise environment update production --promote-from ""`).
 
 ## Deploying to Environments
 

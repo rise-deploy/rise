@@ -180,6 +180,24 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     });
     controller_handles.push(handle);
 
+    // Rollback Guard (ADR-0007); environments opt in individually.
+    #[cfg(feature = "backend")]
+    if settings.rollback_guard.enabled {
+        info!("Starting Rollback Guard controller");
+        let controller = deployment::rollback_guard::RollbackGuardController::new(
+            state.clone(),
+            settings.rollback_guard.clone(),
+        );
+        let shutdown = shutdown.clone();
+        controller_handles.push(tokio::spawn(async move {
+            if let Err(e) = controller.run(shutdown).await {
+                tracing::error!("Rollback Guard controller error: {:#}", e);
+            }
+        }));
+    } else {
+        info!("Rollback Guard disabled by rollback_guard.enabled");
+    }
+
     // Start ECR controller if ECR registry is configured (requires aws feature)
     #[cfg(feature = "backend")]
     if let Some(settings::RegistrySettings::Ecr { .. }) = &settings.registry {

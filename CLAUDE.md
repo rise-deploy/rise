@@ -176,6 +176,9 @@ cargo build --all-features     # Full build with CLI + backend
      - [x] Docker backend — single-host Docker daemon with Traefik routing
      - [x] Amazon ECS backend — Fargate services with Traefik's ECS provider,
        SSM-injected secret env, and Fargate task sizing (see ADR-0005)
+   - [x] Release promotion and guarded rollback (ADR-0007): one create-from-source
+     primitive (`deployment/promotion.rs`), admin-set promotion-source gate,
+     migration barriers, and the leader-elected Rollback Guard (`deployment/rollback_guard.rs`)
    - [x] Container registry integration: ECR, GitLab, JFrog, generic OCI basic-auth
    - [x] Encryption providers: Local AES-GCM and AWS KMS
    - [x] OCI client for image digest resolution
@@ -197,10 +200,10 @@ cargo build --all-features     # Full build with CLI + backend
 3. **CLI Implementation** (`--features cli`, default) ✅
    - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
    - [x] Scoped logins (`rise login --scope <project>[/<env>]=<preset>`): sessions narrowed to projects/environments, enforced on the typed API (ADR-0006)
-   - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
+   - [x] Project commands: `create`, `list`, `show`, `update`, `delete`, `migration-barrier` (`add`, `list`)
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
-   - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`
-   - [x] Environment commands: `create`, `list`, `show`, `update`, `delete`
+   - [x] Deployment commands: `create`, `promote` (also top-level `rise promote`), `list`, `show`, `stop`, `logs`
+   - [x] Environment commands: `create`, `list`, `show`, `update` (incl. admin-only promotion source and Rollback Guard), `delete`
    - [x] Environment variable management (`set`, `get`, `list`, `delete`, `import`, `export`)
    - [x] Custom domain management (`add`, `list`, `remove`)
    - [x] Extension management (`create`, `update`, `patch`, `list`, `show`, `delete`)

@@ -1,5 +1,5 @@
 use super::models::{CreateEnvironmentRequest, EnvironmentResponse, UpdateEnvironmentRequest};
-use crate::db::{environments as db_environments, projects};
+use crate::db::{environments as db_environments, models::Environment, projects};
 use crate::server::auth::context::AuthContext;
 use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::error::{ServerError, ServerErrorExt};
@@ -11,6 +11,87 @@ use axum::{
     Json,
 };
 use rise_backend_auth::session_scope::{Kind, Operation, Verb};
+use std::collections::HashMap;
+use uuid::Uuid;
+
+/// Bounds of `rollback_guard.unhealthy_timeout_seconds`, mirrored by the
+/// `environments_rollback_guard_timeout_range` CHECK constraint.
+const GUARD_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 60..=86400;
+
+fn validate_guard_timeout(seconds: u32) -> Result<i32, ServerError> {
+    if !GUARD_TIMEOUT_RANGE.contains(&seconds) {
+        return Err(ServerError::bad_request(format!(
+            "rollback_guard.unhealthy_timeout_seconds must be between {} and {} (got {seconds})",
+            GUARD_TIMEOUT_RANGE.start(),
+            GUARD_TIMEOUT_RANGE.end(),
+        )));
+    }
+    Ok(seconds as i32)
+}
+
+/// The cycle (`[target, source, …, target]`) that making `source` the
+/// promotion source of `target` would close. `sources` maps environment names
+/// to their promotion source's name; `target`'s own entry is replaced, so it
+/// is never followed.
+fn promotion_cycle(
+    target: &str,
+    source: &str,
+    sources: &HashMap<String, String>,
+) -> Option<Vec<String>> {
+    let mut path = vec![target.to_string()];
+    let mut current = source;
+    loop {
+        path.push(current.to_string());
+        if current == target {
+            return Some(path);
+        }
+        // A pre-existing cycle that does not pass through `target`.
+        if path[1..path.len() - 1].iter().any(|p| p == current) {
+            return None;
+        }
+        current = sources.get(current)?;
+    }
+}
+
+/// Resolve a requested promotion source for `env`; empty or `None` clears it.
+fn resolve_promotion_source(
+    env: &Environment,
+    requested: Option<&str>,
+    all: &[Environment],
+) -> Result<Option<Uuid>, ServerError> {
+    let Some(name) = requested.filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    let by_id = |id| all.iter().find(|e| e.id == id);
+    let source = all
+        .iter()
+        .find(|e| e.name == name)
+        .ok_or_else(|| ServerError::not_found(format!("Environment '{name}' not found")))?;
+    if source.id == env.id {
+        return Err(ServerError::bad_request(format!(
+            "Environment '{}' cannot be its own promotion source",
+            env.name
+        )));
+    }
+    let sources: HashMap<String, String> = all
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e.name.clone(),
+                by_id(e.promotion_source_environment_id?)?.name.clone(),
+            ))
+        })
+        .collect();
+    if let Some(cycle) = promotion_cycle(&env.name, &source.name, &sources) {
+        return Err(ServerError::bad_request(format!(
+            "Setting '{}' as the promotion source of '{}' would create a promotion cycle: {}",
+            source.name,
+            env.name,
+            cycle.join(" → ")
+        )));
+    }
+    Ok(Some(source.id))
+}
 
 /// Create a new environment for a project
 pub async fn create_environment(
@@ -141,18 +222,25 @@ pub async fn list_environments(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    let mut envs = db_environments::list_for_project(&state.db_pool, project.id)
+    let all = db_environments::list_for_project(&state.db_pool, project.id)
         .await
         .internal_err("Failed to list environments")?;
 
     // A scoped session sees the environments it covers.
+    let list = Operation::new(Verb::List, Kind::Environment);
     if let Some(scope) = &scope {
-        let list = Operation::new(Verb::List, Kind::Environment);
         scope.require_reach(list, &project.name)?;
-        envs.retain(|environment| scope.allows(list, &project.name, Some(&environment.name)));
     }
-
-    Ok(Json(envs.into_iter().map(|e| e.into()).collect()))
+    Ok(Json(
+        all.iter()
+            .filter(|e| {
+                scope
+                    .as_ref()
+                    .is_none_or(|s| s.allows(list, &project.name, Some(&e.name)))
+            })
+            .map(|e| EnvironmentResponse::with_names(e, &all))
+            .collect(),
+    ))
 }
 
 /// Get a specific environment by name
@@ -175,12 +263,15 @@ pub async fn get_environment(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    let env = db_environments::find_by_name(&state.db_pool, project.id, &env_name)
+    let all = db_environments::list_for_project(&state.db_pool, project.id)
         .await
-        .internal_err("Failed to get environment")?
+        .internal_err("Failed to list environments")?;
+    let env = all
+        .iter()
+        .find(|e| e.name == env_name)
         .ok_or_else(|| ServerError::not_found(format!("Environment '{}' not found", env_name)))?;
 
-    Ok(Json(env.into()))
+    Ok(Json(EnvironmentResponse::with_names(env, &all)))
 }
 
 /// Update an environment
@@ -215,6 +306,31 @@ pub async fn update_environment(
             "Only administrators can update deployment constraints",
         ));
     }
+    let changes_policy =
+        payload.promotion_source_environment.is_some() || payload.rollback_guard.is_some();
+    if changes_policy && !state.is_admin(user).await {
+        return Err(ServerError::forbidden(
+            "Only administrators can change the promotion source or the Rollback Guard",
+        ));
+    }
+
+    // Validate the policy before changing anything, so a rejected request
+    // leaves the environment as it was.
+    let promotion_source = match &payload.promotion_source_environment {
+        Some(requested) => {
+            let all = db_environments::list_for_project(&state.db_pool, project.id)
+                .await
+                .internal_err("Failed to list environments")?;
+            Some(resolve_promotion_source(&env, requested.as_deref(), &all)?)
+        }
+        None => None,
+    };
+    let guard_timeout = payload
+        .rollback_guard
+        .as_ref()
+        .and_then(|g| g.unhealthy_timeout_seconds)
+        .map(validate_guard_timeout)
+        .transpose()?;
 
     // Canonicalize before storing, same as on create, so the CHECK constraint
     // can never reject what this parser accepted.
@@ -350,6 +466,18 @@ pub async fn update_environment(
         .internal_err("Failed to update deployment constraints")?;
     }
 
+    if changes_policy {
+        updated = db_environments::update_promotion_policy(
+            &state.db_pool,
+            updated.id,
+            promotion_source,
+            payload.rollback_guard.as_ref().and_then(|g| g.enabled),
+            guard_timeout,
+        )
+        .await
+        .internal_err("Failed to update promotion policy")?;
+    }
+
     // The project's status follows its production environment's primary
     // group, which this change may have moved.
     if let Err(e) = projects::update_calculated_status(&state.db_pool, project.id).await {
@@ -362,7 +490,10 @@ pub async fn update_environment(
         project.name
     );
 
-    Ok(Json(updated.into()))
+    let all = db_environments::list_for_project(&state.db_pool, project.id)
+        .await
+        .internal_err("Failed to list environments")?;
+    Ok(Json(EnvironmentResponse::with_names(&updated, &all)))
 }
 
 /// Delete an environment
@@ -394,6 +525,23 @@ pub async fn delete_environment(
         return Err(ServerError::bad_request(
             "Cannot delete the production environment. Set another environment as production first.",
         ));
+    }
+
+    // A promotion source stays until the environments promoting from it
+    // name another one; deleting it would silently lift their gate.
+    let dependents = db_environments::list_promotion_dependents(&state.db_pool, env.id)
+        .await
+        .internal_err("Failed to list environments promoting from this one")?;
+    if let Some(first) = dependents.first() {
+        let names = dependents
+            .iter()
+            .map(|e| format!("'{}'", e.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ServerError::conflict(format!(
+            "Environment '{}' is the promotion source of {}. Clear it first: rise environment update {} --promote-from ''",
+            env_name, names, first.name
+        )));
     }
 
     // Deleting an environment deletes its deployments; running ones are
@@ -452,4 +600,44 @@ pub async fn delete_environment(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{promotion_cycle, validate_guard_timeout};
+    use std::collections::HashMap;
+
+    fn cycle(target: &str, source: &str, edges: &[(&str, &str)]) -> Option<String> {
+        let sources: HashMap<String, String> = edges
+            .iter()
+            .map(|(env, src)| (env.to_string(), src.to_string()))
+            .collect();
+        promotion_cycle(target, source, &sources).map(|c| c.join(" → "))
+    }
+
+    #[test]
+    fn promotion_cycles() {
+        let chain = [("staging", "dev"), ("production", "staging")];
+        assert_eq!(
+            cycle("production", "staging", &[("staging", "production")]).as_deref(),
+            Some("production → staging → production")
+        );
+        assert_eq!(
+            cycle("dev", "production", &chain).as_deref(),
+            Some("dev → production → staging → dev")
+        );
+        assert_eq!(cycle("qa", "production", &chain), None);
+        // production's current source is replaced, not followed.
+        assert_eq!(cycle("production", "dev", &chain), None);
+        // A pre-existing cycle elsewhere does not loop forever.
+        assert_eq!(cycle("c", "a", &[("a", "b"), ("b", "a")]), None);
+    }
+
+    #[test]
+    fn guard_timeout_bounds() {
+        assert!(validate_guard_timeout(59).is_err());
+        assert_eq!(validate_guard_timeout(60).unwrap(), 60);
+        assert_eq!(validate_guard_timeout(86400).unwrap(), 86400);
+        assert!(validate_guard_timeout(86401).is_err());
+    }
 }

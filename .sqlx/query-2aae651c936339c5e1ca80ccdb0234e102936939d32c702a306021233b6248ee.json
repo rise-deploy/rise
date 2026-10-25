@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            d.id,\n            e.rollback_guard_unhealthy_timeout_seconds AS timeout_seconds,\n            e.name AS environment_name,\n            p.name AS project_name\n        FROM deployments d\n        JOIN environments e ON e.id = d.environment_id\n        JOIN projects p ON p.id = d.project_id\n        WHERE e.rollback_guard_enabled\n          AND d.status = 'Unhealthy'\n          AND d.is_active\n          AND d.deployment_group = e.primary_deployment_group\n          AND d.unhealthy_since <= NOW() - make_interval(secs => e.rollback_guard_unhealthy_timeout_seconds)\n          AND NOT EXISTS (\n              SELECT 1 FROM deployments c WHERE c.rollback_guard_for_deployment_id = d.id\n          )\n          AND p.status NOT IN ('Deleting', 'Terminated')\n        ORDER BY d.unhealthy_since ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "deployments",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "timeout_seconds",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "rollback_guard_unhealthy_timeout_seconds"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "environment_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "environments",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "project_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "projects",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2aae651c936339c5e1ca80ccdb0234e102936939d32c702a306021233b6248ee"
+}

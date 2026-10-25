@@ -10,14 +10,16 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 |---------|-------|-------------|---------|
 | `rise login` | | `--device`, `--scope`, `--full-access` | [Authentication](../authentication), [Restricting a Login](../authentication#restricting-a-login) |
 | `rise profile` | | `list` (`ls`), `use`, `remove` (`rm`) | [Login Profiles](../configuration#login-profiles) |
-| `rise deploy` | | | [Deployments](../deployments) |
+| `rise deploy` | | `--from <id>`, `--force` | [Deployments](../deployments) |
+| `rise promote` | | `<deployment-id> -E <env>`, `--yes`, `--force`, `--no-config` | [Promoting Between Environments](../deployments#promoting-between-environments) |
 | `rise build` | | | [Building Images](../builds) |
 | `rise run` | | | [Local Development](../local-development) |
 | `rise compose` | | `up`, `down`, `ps`, `logs`, `generate` | [Local Development](../local-development#compose-stacks) |
 | `rise project` | `p` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Configuration](../configuration) |
 | `rise project app-user` | | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Authentication](../authentication#app-users) |
-| `rise deployment` | `d` | `create` (`c`), `list` (`ls`), `show` (`s`), `stop`, `logs` | [Deployments](../deployments) |
-| `rise environment` | `envs` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | [Environments](../environments) |
+| `rise project migration-barrier` | `mb` | `add` (`a`) `<version> --reason`, `list` (`ls`) | [Migration Compatibility Barriers](../deployments#migration-compatibility-barriers) |
+| `rise deployment` | `d` | `create` (`c`), `promote`, `list` (`ls`), `show` (`s`), `stop`, `logs` | [Deployments](../deployments) |
+| `rise environment` | `envs` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`: incl. `--promote-from`, `--rollback-guard`, `--rollback-guard-timeout`), `delete` (`rm`) | [Environments](../environments) |
 | `rise env` | `e` | `set` (`s`), `list` (`ls`), `get` (`g`), `delete` (`rm`), `import` (`i`), `show-deployment` | [Environment Variables](../environment-variables) |
 | `rise domain` | `dom` | `add` (`a`), `list` (`ls`), `remove` (`rm`) | [Custom Domains](../custom-domains) |
 | `rise team` | `t` | `create` (`c`), `list` (`ls`), `show` (`s`), `update` (`u`), `delete` (`rm`) | |
@@ -26,7 +28,9 @@ The Rise CLI (`rise`) provides commands for managing projects, deployments, team
 | `rise encrypt` | | | [OAuth Extensions](../oauth) |
 | `rise backend` | | `server`, `check-config`, `config-schema` | Operator commands (requires build with `--features backend`) |
 
-`rise deploy` is a shortcut for `rise deployment create`.
+`rise deploy` is a shortcut for `rise deployment create`, and `rise promote` for `rise deployment promote`.
+
+`rise deploy --force` and `rise promote --force` deploy even across a recorded migration barrier. `rise environment update --promote-from` and `--rollback-guard*` are administrator-only.
 
 ## Project Name Resolution
 

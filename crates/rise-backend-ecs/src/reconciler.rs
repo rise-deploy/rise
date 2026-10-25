@@ -2589,12 +2589,12 @@ impl EcsReconciler {
             DeploymentStatus::Deploying if all_ready => {
                 if !rise_backend_core::lifecycle::prepare_traefik_cutover(
                     self.store.as_ref(),
+                    Some(self),
                     project,
                     deployment,
                 )
                 .await?
                 {
-                    info!(deployment = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
                     return Ok(());
                 }
                 let expected = rise_backend_traefik::dynamic::render_dynamic_config(

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH upd AS (\n                UPDATE deployments\n                SET\n                    status = 'Terminating',\n                    termination_reason = 'Superseded',\n                    updated_at = NOW()\n                WHERE id = $1\n                  AND is_valid_transition(status, 'Terminating')\n                RETURNING id, status, termination_reason\n            )\n            INSERT INTO deployment_events (\n                deployment_id, occurred_at, kind, severity, source, attributes\n            )\n            SELECT\n                id, NOW(), 'status_changed', 'info', 'control-plane',\n                jsonb_build_object(\n                    'from', 'Healthy', 'to', status,\n                    'reason', termination_reason::text,\n                    'superseded_by', jsonb_build_object(\n                        'kind', 'deployment',\n                        'name', $2::text\n                    )\n                )\n            FROM upd\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2afcfda3d0973e283a5db88972404c4e0ad76f730721a3120663c6f9607264a2"
+}

@@ -1,4 +1,4 @@
-use super::handlers;
+use super::{handlers, migration_barriers};
 use crate::server::state::AppState;
 use axum::{
     routing::{delete, get, patch, post, put},
@@ -23,5 +23,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/projects/{id_or_name}/template-image",
             patch(handlers::update_project_template_image),
+        )
+        .route(
+            "/projects/{id_or_name}/migration-barriers",
+            get(migration_barriers::list_migration_barriers)
+                .post(migration_barriers::create_migration_barrier),
         )
 }

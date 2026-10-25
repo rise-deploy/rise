@@ -27,6 +27,10 @@ pub struct SupersessionOutcome {
     /// The previously-active deployment in the group, now `Terminating`, if
     /// there was one.
     pub superseded: Option<Deployment>,
+    /// A newer deployment that already serves (or is the group's active
+    /// one): this deployment was marked healthy and straight away
+    /// `Terminating(Superseded)`, nothing else touched. Do not activate it.
+    pub retired_by: Option<Deployment>,
 }
 
 /// Persistence operations the deployment controllers depend on.
@@ -226,6 +230,9 @@ pub trait DeploymentStore: Send + Sync {
     /// overwrite (e.g. a concurrent stop request already moved it to
     /// `Terminating`) — the caller should stop there: no hook, no straggler
     /// cleanup, no activation.
+    ///
+    /// Fenced by creation order: only an older predecessor is superseded (see
+    /// [`SupersessionOutcome::retired_by`]).
     async fn mark_deployment_healthy_and_supersede(
         &self,
         deployment_id: Uuid,

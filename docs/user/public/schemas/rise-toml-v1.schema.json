@@ -334,6 +334,15 @@
           },
           "type": "object"
         },
+        "migration_version": {
+          "description": "Database migration compatibility version of this code. Bump it whenever you add a\nmigration; record a barrier (`rise project migration-barrier add`) when that migration\nbreaks older code. Inherited by redeploys, rollbacks and promotions.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "name": {
           "description": "Project name",
           "type": "string"

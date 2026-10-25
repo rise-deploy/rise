@@ -191,8 +191,9 @@ class RiseAPI {
     // rollback). With `target.environment` it lands in that environment's
     // primary group instead (promote); the backend resolves the group.
     // `useSourceEnvVars` copies the source's variable snapshot; otherwise the
-    // target's current project variables are used.
-    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false, target = null) {
+    // target's current project variables are used (always, for a promotion).
+    // `opts.force_migration_barrier` retries across a recorded migration barrier.
+    async createDeploymentFrom(projectName, sourceDeploymentId, useSourceEnvVars = false, target = null, opts = {}) {
         let placement;
         if (target?.environment) {
             placement = { environment: target.environment };
@@ -211,6 +212,7 @@ class RiseAPI {
                 from_deployment: sourceDeploymentId,
                 use_source_env_vars: useSourceEnvVars,
                 ...placement,
+                ...(opts?.force_migration_barrier && { force_migration_barrier: true }),
             })
         });
     }
@@ -331,6 +333,13 @@ class RiseAPI {
 
     async getDeploymentEnvVars(projectName, deploymentId) {
         return this.request(`/projects/${projectName}/deployments/${deploymentId}/env`);
+    }
+
+    // Preview of a deployment created from `deploymentId` into `environment`
+    // (default: the source's own): gate, migration barriers, image, clamps.
+    async getDeploymentPlan(projectName, deploymentId, environment = null) {
+        const qs = environment ? `?environment=${encodeURIComponent(environment)}` : '';
+        return this.request(`/projects/${projectName}/deployments/${deploymentId}/plan${qs}`);
     }
 
     /**

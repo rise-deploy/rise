@@ -24,6 +24,11 @@ pub struct Settings {
     /// event cap on and deletion of old deployments off.
     #[serde(default)]
     pub deployment_retention: DeploymentRetentionSettings,
+    /// The Rollback Guard controller (ADR-0007): replaces an environment's
+    /// active deployment that stays `Unhealthy` past its timeout with its last
+    /// known good predecessor, in environments that opt in.
+    #[serde(default)]
+    pub rollback_guard: RollbackGuardSettings,
     #[serde(default)]
     pub encryption: Option<EncryptionSettings>,
     #[serde(default)]
@@ -116,6 +121,56 @@ fn default_max_deployment_age_days() -> u32 {
 
 fn default_keep_primary_deployments_per_environment() -> i64 {
     10
+}
+
+/// Operator settings for the Rollback Guard controller. `enabled: false` is a
+/// platform-wide kill switch, whatever an environment's own setting.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(default)]
+pub struct RollbackGuardSettings {
+    pub enabled: bool,
+    /// How often the controller looks for deployments to replace, in seconds.
+    pub poll_interval_seconds: u64,
+    /// Most replacements on their way up at once, platform-wide. Further
+    /// triggers are declined (`in_flight_limit`) until one settles.
+    pub max_in_flight: u32,
+    /// Fleet circuit breaker: when at least `fleet_unhealthy_min_count` active
+    /// deployments are `Unhealthy` and make up at least this fraction (in
+    /// `(0, 1]`) of the active Healthy/Unhealthy ones, the cause is taken to be
+    /// the platform's (e.g. a Traefik API outage) and every trigger is declined
+    /// (`platform_wide_unhealthy`).
+    pub fleet_unhealthy_ratio: f64,
+    /// See `fleet_unhealthy_ratio`.
+    pub fleet_unhealthy_min_count: u32,
+}
+
+impl Default for RollbackGuardSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_seconds: 10,
+            max_in_flight: 3,
+            fleet_unhealthy_ratio: 0.5,
+            fleet_unhealthy_min_count: 3,
+        }
+    }
+}
+
+impl RollbackGuardSettings {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.poll_interval_seconds == 0 {
+            return Err(ConfigError::Message(
+                "rollback_guard.poll_interval_seconds must be at least 1".to_string(),
+            ));
+        }
+        if !(self.fleet_unhealthy_ratio > 0.0 && self.fleet_unhealthy_ratio <= 1.0) {
+            return Err(ConfigError::Message(format!(
+                "rollback_guard.fleet_unhealthy_ratio must be in (0, 1], got {}",
+                self.fleet_unhealthy_ratio
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn default_reserved_project_names() -> Vec<String> {
@@ -2421,6 +2476,8 @@ impl Settings {
             }
         }
 
+        settings.rollback_guard.validate()?;
+
         // A password without a username would be silently treated by the CLI as
         // client-managed auth, while a username without a password would cause a
         // confusing login failure. Keep static registry auth explicitly paired.
@@ -3204,6 +3261,62 @@ auth:
             err.to_string().contains("identity_token_ttl_seconds"),
             "should name the replacement: {err}"
         );
+    }
+
+    fn settings_with(extra_yaml: &str) -> Result<Settings, ConfigError> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("development.yaml"),
+            format!(
+                r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+{extra_yaml}
+"#
+            ),
+        )
+        .unwrap();
+        Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+    }
+
+    #[test]
+    fn rollback_guard_settings_default_and_validate() {
+        let guard = settings_with("").unwrap().rollback_guard;
+        assert!(guard.enabled);
+        assert_eq!(guard.poll_interval_seconds, 10);
+        assert_eq!(guard.fleet_unhealthy_ratio, 0.5);
+
+        let guard = settings_with("rollback_guard:\n  enabled: false\n  max_in_flight: 1\n")
+            .unwrap()
+            .rollback_guard;
+        assert!(!guard.enabled);
+        assert_eq!(guard.max_in_flight, 1);
+        assert_eq!(
+            guard.poll_interval_seconds, 10,
+            "unset fields keep defaults"
+        );
+
+        for bad in [
+            "poll_interval_seconds: 0",
+            "fleet_unhealthy_ratio: 0",
+            "fleet_unhealthy_ratio: 1.5",
+            "fleet_unhealthy_ratio: -0.1",
+        ] {
+            let err = settings_with(&format!("rollback_guard:\n  {bad}\n")).expect_err(bad);
+            let field = bad.split(':').next().unwrap();
+            assert!(err.to_string().contains(field), "{err}");
+        }
     }
 
     #[test]

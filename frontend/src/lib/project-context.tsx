@@ -32,6 +32,13 @@ export interface Project {
     [key: string]: unknown;
 }
 
+export interface RollbackGuardConfig {
+    enabled: boolean;
+    unhealthy_timeout_seconds: number;
+}
+
+export type CreatedVia = 'deploy' | 'redeploy' | 'promote' | 'rollback_guard';
+
 export interface Environment {
     name: string;
     primary_deployment_group: string | null;
@@ -39,6 +46,9 @@ export interface Environment {
     color: string;
     max_deployment_expiration: string | null;
     deployment_constraints?: unknown;
+    /** Only deployments promoted from this environment (or redeploys within this one) may land here. */
+    promotion_source_environment?: string | null;
+    rollback_guard?: RollbackGuardConfig;
     created_at: string;
     updated_at: string;
 }
@@ -76,6 +86,15 @@ export interface Deployment {
     git_dirty?: boolean;
     /** The deployment this one was created from, if any. */
     source_deployment_id?: string;
+    created_via?: CreatedVia | string;
+    /** The immediate source of a promotion, in another environment. */
+    promoted_from_deployment_id?: string;
+    promoted_from_environment?: string;
+    /** `[project].migration_version` of the code, inherited along redeploys and promotions. */
+    migration_version?: number;
+    unhealthy_since?: string;
+    /** Set on a Rollback Guard replacement: the unhealthy deployment it replaces. */
+    rollback_guard_for_deployment_id?: string;
     created: string;
     updated: string;
     [key: string]: unknown;

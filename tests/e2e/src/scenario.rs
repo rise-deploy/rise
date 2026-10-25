@@ -13,6 +13,8 @@ use crate::dex;
 use crate::http;
 use crate::report;
 
+mod promotion_gate;
+
 pub enum Applicability {
     Run,
     Skip(&'static str),
@@ -37,6 +39,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
+        Box::new(promotion_gate::PromotionGate),
         Box::new(PersistentLogRetention),
         Box::new(HelmIdempotency),
         // Last: on Docker it recreates the backend with the identity overlay, so

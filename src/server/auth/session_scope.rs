@@ -197,6 +197,9 @@ fn classify(method: &Method, path: &str) -> Rule {
         ("PUT", "/projects/{id_or_name}") => OnProject(op(Update, Project)),
         ("DELETE", "/projects/{id_or_name}") => OnProject(op(Delete, Project)),
         ("PATCH", "/projects/{id_or_name}/template-image") => OnProject(op(Update, Project)),
+        // Recording a barrier only ever restricts rollbacks of the project.
+        ("GET", "/projects/{id_or_name}/migration-barriers") => OnProject(op(Get, Project)),
+        ("POST", "/projects/{id_or_name}/migration-barriers") => OnProject(op(Update, Project)),
 
         ("POST", "/projects/{project}/environments") => OnProject(op(Create, Environment)),
         ("GET", "/projects/{project}/environments/{name}") => OnEnvironment(op(Get, Environment)),
@@ -225,6 +228,9 @@ fn classify(method: &Method, path: &str) -> Rule {
         | ("GET", "/projects/{project_name}/deployments/{deployment_id}/logs/volume") => {
             OnDeployment(sub(Get, Deployment, Subresource::Logs))
         }
+        // Reads the source deployment and previews a create in the target
+        // `?environment=`: the handler checks both.
+        ("GET", "/projects/{project_name}/deployments/{deployment_id}/plan") => Handler,
         ("GET", "/projects/{project_name}/deployments/{deployment_id}/registry-credentials") => {
             OnDeployment(sub(Create, Deployment, Subresource::RegistryCredentials))
         }
@@ -605,6 +611,29 @@ pub(crate) mod tests {
             ))
         );
         assert_eq!(classify(&Method::POST, "/deployments"), Rule::Handler);
+    }
+
+    #[test]
+    fn promotion_routes_are_classified() {
+        assert_eq!(
+            classify(
+                &Method::GET,
+                "/projects/{project_name}/deployments/{deployment_id}/plan"
+            ),
+            Rule::Handler
+        );
+        assert_eq!(
+            classify(&Method::GET, "/projects/{id_or_name}/migration-barriers"),
+            Rule::OnProject(Operation::new(Verb::Get, Kind::Project))
+        );
+        assert_eq!(
+            classify(&Method::POST, "/projects/{id_or_name}/migration-barriers"),
+            Rule::OnProject(Operation::new(Verb::Update, Kind::Project))
+        );
+        assert_eq!(
+            classify(&Method::DELETE, "/projects/{id_or_name}/migration-barriers"),
+            Rule::FullAccess
+        );
     }
 
     #[test]

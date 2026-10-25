@@ -230,6 +230,24 @@ pub async fn handle_deployment_became_healthy(
         return Ok(());
     }
 
+    if let Some(newer) = outcome.retired_by {
+        // A newer deployment already serves: the store retired this one.
+        info!(
+            "Deployment {} became healthy after the newer {} in group '{}'; retiring it instead of activating it",
+            deployment.deployment_id, newer.deployment_id, deployment.deployment_group
+        );
+        if let Some(hook) = hook {
+            if let Err(e) = hook.on_superseded(project, deployment).await {
+                warn!(
+                    deployment_id = %deployment.deployment_id,
+                    "Post-supersession cleanup failed: {:?}", e
+                );
+            }
+        }
+        store.update_project_calculated_status(project.id).await?;
+        return Ok(());
+    }
+
     if let Some(old_active) = outcome.superseded {
         info!(
             "Deployment {} replacing {} in group '{}', marking old as Terminating",
@@ -253,6 +271,7 @@ pub async fn handle_deployment_became_healthy(
     // deployment currently sitting in `Unhealthy` (not covered by the atomic
     // write above, which only supersedes a `Healthy` predecessor) the next
     // time some deployment in the group becomes healthy.
+    // Only deployments created before this one are retired.
     let others = store
         .find_non_terminal_deployments_for_project_and_group(
             project.id,
@@ -261,6 +280,7 @@ pub async fn handle_deployment_became_healthy(
         .await?;
     for other in others {
         if other.id != deployment.id
+            && created_before(&other, deployment)
             && state_machine::is_active(&other.status)
             && !state_machine::is_terminal(&other.status)
         {
@@ -297,6 +317,12 @@ pub async fn handle_deployment_became_healthy(
     store.update_project_calculated_status(project.id).await?;
 
     Ok(())
+}
+
+/// Whether `a` was created before `b`, ties broken by id — the same
+/// `(created_at, id)` order the store's supersession fence uses.
+fn created_before(a: &Deployment, b: &Deployment) -> bool {
+    (a.created_at, a.id) < (b.created_at, b.id)
 }
 
 pub const TRAEFIK_PREDECESSOR_METADATA_KEY: &str = "traefik_predecessor_deployment_id";
@@ -363,8 +389,13 @@ pub async fn restore_traefik_predecessor_if_interrupted(
 /// Select a ready deployment as the desired Traefik target while leaving its
 /// predecessor healthy and intact. Returns `true` when the deployment was
 /// already selected and the caller may verify Traefik's applied router state.
+///
+/// A deployment never takes routing from a *newer* active one that is not on
+/// its way out: it is handed to [`handle_deployment_became_healthy`] instead,
+/// whose creation-order fence retires it (running `hook`).
 pub async fn prepare_traefik_cutover(
     store: &dyn DeploymentStore,
+    hook: Option<&dyn SupersededHook>,
     project: &Project,
     deployment: &Deployment,
 ) -> Result<bool> {
@@ -380,6 +411,22 @@ pub async fn prepare_traefik_cutover(
         .await?
         .into_iter()
         .find(|candidate| candidate.is_active && candidate.id != deployment.id);
+
+    if let Some(newer) = predecessor.as_ref().filter(|active| {
+        created_before(deployment, active)
+            && !matches!(
+                active.status,
+                DeploymentStatus::Terminating | DeploymentStatus::Cancelling
+            )
+    }) {
+        info!(
+            deployment = %deployment.deployment_id,
+            newer = %newer.deployment_id,
+            "Ready deployment is older than the group's active one; not cutting over"
+        );
+        handle_deployment_became_healthy(store, hook, project, deployment).await?;
+        return Ok(false);
+    }
 
     let mut metadata = deployment.controller_metadata.clone();
     let object = metadata.as_object_mut().ok_or_else(|| {
@@ -401,6 +448,10 @@ pub async fn prepare_traefik_cutover(
     store
         .mark_deployment_as_active(deployment.id, project.id, &deployment.deployment_group)
         .await?;
+    info!(
+        deployment = %deployment.deployment_id,
+        "Deployment selected as the desired Traefik target"
+    );
     Ok(false)
 }
 
@@ -464,6 +515,12 @@ mod tests {
             identity_audiences: serde_json::json!({}),
             containers: None,
             routes: None,
+            created_via: crate::models::CreatedVia::Deploy,
+            promoted_from_deployment_id: None,
+            promoted_from_environment_id: None,
+            migration_version: None,
+            unhealthy_since: None,
+            rollback_guard_for_deployment_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -471,6 +528,19 @@ mod tests {
 
     /// A minimal in-memory `DeploymentStore` recording every call, just
     /// enough to assert the transition logic without a database.
+    #[derive(Default)]
+    struct RecordingHook {
+        called_with: Mutex<Option<Uuid>>,
+    }
+
+    #[async_trait]
+    impl SupersededHook for RecordingHook {
+        async fn on_superseded(&self, _project: &Project, superseded: &Deployment) -> Result<()> {
+            *self.called_with.lock().unwrap() = Some(superseded.id);
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct FakeStore {
         calls: Mutex<Vec<String>>,
@@ -480,6 +550,10 @@ mod tests {
         /// `became_healthy: false` without touching `calls` — simulating a
         /// deployment that already moved to a protected status.
         reject_healthy: Mutex<bool>,
+        /// When set, `mark_deployment_healthy_and_supersede` reports the
+        /// deployment as retired by this newer one — simulating the store's
+        /// creation-order fence.
+        retired_by: Mutex<Option<Deployment>>,
     }
 
     #[async_trait]
@@ -568,10 +642,16 @@ mod tests {
         }
         async fn update_deployment_controller_metadata(
             &self,
-            _id: Uuid,
+            id: Uuid,
             _metadata: &serde_json::Value,
         ) -> Result<Deployment> {
-            unimplemented!()
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("update_metadata:{id}"));
+            let mut d = deployment(DeploymentStatus::Deploying);
+            d.id = id;
+            Ok(d)
         }
         async fn mark_deployment_failed(
             &self,
@@ -665,9 +745,22 @@ mod tests {
                 return Ok(SupersessionOutcome {
                     became_healthy: false,
                     superseded: None,
+                    retired_by: None,
                 });
             }
             self.calls.lock().unwrap().push("healthy".to_string());
+            if let Some(newer) = self.retired_by.lock().unwrap().clone() {
+                self.calls.lock().unwrap().push(format!(
+                    "terminating:{}:{:?}",
+                    deployment_id,
+                    TerminationReason::Superseded
+                ));
+                return Ok(SupersessionOutcome {
+                    became_healthy: true,
+                    superseded: None,
+                    retired_by: Some(newer),
+                });
+            }
             let superseded = self
                 .active_in_group
                 .lock()
@@ -685,15 +778,19 @@ mod tests {
             Ok(SupersessionOutcome {
                 became_healthy: true,
                 superseded,
+                retired_by: None,
             })
         }
         async fn mark_deployment_as_active(
             &self,
-            _deployment_id: Uuid,
+            deployment_id: Uuid,
             _project_id: Uuid,
             _deployment_group: &str,
         ) -> Result<()> {
-            self.calls.lock().unwrap().push("mark_active".to_string());
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("mark_active:{deployment_id}"));
             Ok(())
         }
         async fn set_identity_credential_hash(&self, _id: Uuid, _hash: &str) -> Result<()> {
@@ -849,26 +946,11 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.starts_with(&format!("terminating:{}", old_active.id))));
-        assert!(calls.contains(&"mark_active".to_string()));
+        assert!(calls.iter().any(|c| c.starts_with("mark_active")));
     }
 
     #[tokio::test]
     async fn the_superseded_hook_runs_after_the_old_deployment_is_marked_terminating() {
-        struct RecordingHook {
-            called_with: Mutex<Option<Uuid>>,
-        }
-        #[async_trait]
-        impl SupersededHook for RecordingHook {
-            async fn on_superseded(
-                &self,
-                _project: &Project,
-                superseded: &Deployment,
-            ) -> Result<()> {
-                *self.called_with.lock().unwrap() = Some(superseded.id);
-                Ok(())
-            }
-        }
-
         let store = FakeStore::default();
         let project = project();
         let new = deployment(DeploymentStatus::Deploying);
@@ -878,9 +960,7 @@ mod tests {
             (project.id, new.deployment_group.clone()),
             old_active.clone(),
         );
-        let hook = RecordingHook {
-            called_with: Mutex::new(None),
-        };
+        let hook = RecordingHook::default();
 
         handle_deployment_became_healthy(&store, Some(&hook), &project, &new)
             .await
@@ -931,6 +1011,7 @@ mod tests {
         let mut straggler = deployment(DeploymentStatus::Healthy);
         straggler.deployment_group = new.deployment_group.clone();
         straggler.is_active = false; // died before the write that flags it active
+        straggler.created_at = new.created_at - chrono::Duration::minutes(1);
 
         store.siblings_in_group.lock().unwrap().insert(
             (project.id, new.deployment_group.clone()),
@@ -949,21 +1030,6 @@ mod tests {
 
     #[tokio::test]
     async fn when_the_atomic_write_is_rejected_nothing_else_happens() {
-        struct RecordingHook {
-            called_with: Mutex<Option<Uuid>>,
-        }
-        #[async_trait]
-        impl SupersededHook for RecordingHook {
-            async fn on_superseded(
-                &self,
-                _project: &Project,
-                superseded: &Deployment,
-            ) -> Result<()> {
-                *self.called_with.lock().unwrap() = Some(superseded.id);
-                Ok(())
-            }
-        }
-
         let store = FakeStore::default();
         *store.reject_healthy.lock().unwrap() = true;
         let project = project();
@@ -975,9 +1041,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert((project.id, new.deployment_group.clone()), old_active);
-        let hook = RecordingHook {
-            called_with: Mutex::new(None),
-        };
+        let hook = RecordingHook::default();
 
         handle_deployment_became_healthy(&store, Some(&hook), &project, &new)
             .await
@@ -988,5 +1052,128 @@ mod tests {
             "a rejected atomic write must trigger no hook, no straggler cleanup, no activation"
         );
         assert_eq!(*hook.called_with.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn straggler_cleanup_never_retires_newer() {
+        let store = FakeStore::default();
+        let project = project();
+        let mut old = deployment(DeploymentStatus::Deploying);
+        old.created_at = Utc::now() - chrono::Duration::minutes(5);
+        let mut newer = deployment(DeploymentStatus::Unhealthy);
+        newer.deployment_group = old.deployment_group.clone();
+        let mut older = deployment(DeploymentStatus::Unhealthy);
+        older.deployment_group = old.deployment_group.clone();
+        older.created_at = old.created_at - chrono::Duration::minutes(5);
+
+        store.siblings_in_group.lock().unwrap().insert(
+            (project.id, old.deployment_group.clone()),
+            vec![newer.clone(), older.clone()],
+        );
+
+        handle_deployment_became_healthy(&store, None, &project, &old)
+            .await
+            .unwrap();
+
+        let calls = store.calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with(&format!("terminating:{}", newer.id))),
+            "a newer deployment must never be retired by an older one: {calls:?}"
+        );
+        assert!(calls
+            .iter()
+            .any(|c| c.starts_with(&format!("terminating:{}", older.id))));
+    }
+
+    #[tokio::test]
+    async fn retired_by_skips_activation_and_runs_hook() {
+        let store = FakeStore::default();
+        let project = project();
+        let mut old = deployment(DeploymentStatus::Deploying);
+        old.created_at = Utc::now() - chrono::Duration::minutes(5);
+        let mut newer = deployment(DeploymentStatus::Healthy);
+        newer.deployment_group = old.deployment_group.clone();
+        newer.is_active = true;
+        *store.retired_by.lock().unwrap() = Some(newer.clone());
+        // A sibling the straggler loop would otherwise retire.
+        let mut sibling = deployment(DeploymentStatus::Unhealthy);
+        sibling.created_at = old.created_at - chrono::Duration::minutes(5);
+        store.siblings_in_group.lock().unwrap().insert(
+            (project.id, old.deployment_group.clone()),
+            vec![sibling.clone(), newer.clone()],
+        );
+        let hook = RecordingHook::default();
+
+        handle_deployment_became_healthy(&store, Some(&hook), &project, &old)
+            .await
+            .unwrap();
+
+        let calls = store.calls.lock().unwrap();
+        assert!(!calls.iter().any(|c| c.starts_with("mark_active")));
+        assert!(!calls
+            .iter()
+            .any(|c| c.starts_with(&format!("terminating:{}", sibling.id))));
+        assert!(!calls
+            .iter()
+            .any(|c| c.starts_with(&format!("terminating:{}", newer.id))));
+        assert!(calls.contains(&"update_project_status".to_string()));
+        assert_eq!(*hook.called_with.lock().unwrap(), Some(old.id));
+    }
+
+    /// A ready deployment cuts over unless the group's active deployment is
+    /// newer and not on its way out; then it is retired instead.
+    #[tokio::test]
+    async fn traefik_cutover_respects_creation_order() {
+        for (ready_is_older, active_status, cuts_over) in [
+            (true, DeploymentStatus::Healthy, false),
+            (true, DeploymentStatus::Cancelling, true),
+            (false, DeploymentStatus::Healthy, true),
+        ] {
+            let store = FakeStore::default();
+            let project = project();
+            let mut ready = deployment(DeploymentStatus::Deploying);
+            ready.controller_metadata = serde_json::json!({});
+            let mut active = deployment(active_status.clone());
+            active.deployment_group = ready.deployment_group.clone();
+            active.is_active = true;
+            let five_minutes_ago = Utc::now() - chrono::Duration::minutes(5);
+            if ready_is_older {
+                ready.created_at = five_minutes_ago;
+            } else {
+                active.created_at = five_minutes_ago;
+            }
+            store.siblings_in_group.lock().unwrap().insert(
+                (project.id, ready.deployment_group.clone()),
+                vec![active.clone(), ready.clone()],
+            );
+            *store.retired_by.lock().unwrap() = Some(active.clone());
+
+            let selected = prepare_traefik_cutover(&store, None, &project, &ready)
+                .await
+                .unwrap();
+
+            assert!(!selected);
+            let calls = store.calls.lock().unwrap();
+            let case = format!("older={ready_is_older} active={active_status:?}: {calls:?}");
+            assert_eq!(
+                calls.contains(&format!("mark_active:{}", ready.id)),
+                cuts_over,
+                "{case}"
+            );
+            assert_eq!(
+                calls.contains(&format!("update_metadata:{}", ready.id)),
+                cuts_over,
+                "{case}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .any(|c| c.starts_with(&format!("terminating:{}", ready.id))),
+                !cuts_over,
+                "{case}"
+            );
+        }
     }
 }

@@ -2070,12 +2070,12 @@ impl DockerReconciler {
             DeploymentStatus::Deploying if is_ready => {
                 if !rise_backend_core::lifecycle::prepare_traefik_cutover(
                     self.store.as_ref(),
+                    None,
                     project,
                     deployment,
                 )
                 .await?
                 {
-                    info!(deployment_id = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
                     return Ok(());
                 }
                 let selected: Vec<DesiredContainer> = desired

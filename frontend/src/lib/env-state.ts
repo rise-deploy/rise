@@ -73,11 +73,20 @@ export function productionEnv(envs: Environment[]): Environment | null {
 
 /**
  * Environments a deployment in `from` can be promoted to: any other
- * environment with a primary group (a promote lands in that group). The
- * production environment is offered first, since that's the usual direction.
+ * environment with a primary group (a promote lands in that group), except
+ * those whose promotion source is a different environment. The production
+ * environment is offered first, since that's the usual direction.
  */
 export function promoteTargets(from: string, envs: Environment[]): Environment[] {
-    return sortEnvironments(envs).filter(e => e.name !== from && !!e.primary_deployment_group);
+    return promoteTargetsFlagged(from, envs).map(t => t.env);
+}
+
+/** Like {@link promoteTargets}; with `includeGated` (admins, who may bypass the gate) gated environments are kept and flagged. */
+export function promoteTargetsFlagged(from: string, envs: Environment[], includeGated = false): { env: Environment; gated: boolean }[] {
+    return sortEnvironments(envs)
+        .filter(e => e.name !== from && !!e.primary_deployment_group)
+        .map(env => ({ env, gated: !!env.promotion_source_environment && env.promotion_source_environment !== from }))
+        .filter(t => includeGated || !t.gated);
 }
 
 export const HEALTH_LABEL: Record<EnvHealth, string> = {
@@ -105,6 +114,16 @@ export function shortImage(image?: string): string {
     return last.length > 40 ? `${last.slice(0, 37)}…` : last;
 }
 
+/** The time part of a deployment ID, e.g. `101500` for `20261020-101500`. */
+export function shortDeploymentId(id: string): string {
+    return id.split('-').pop() || id;
+}
+
+/** How a deployment was created, for display; `null` for a plain deploy. */
+export function createdViaLabel(via?: string): string | null {
+    return ({ promote: 'Promotion', redeploy: 'Redeploy', rollback_guard: 'Rollback Guard (automatic)' } as Record<string, string>)[via ?? ''] ?? null;
+}
+
 /** The first 7 characters of a commit hash. */
 export function shortRevision(revision?: string): string {
     return revision ? revision.slice(0, 7) : '';
@@ -125,7 +144,14 @@ export function pullRequestLabel(url?: string): string | null {
 export function deploymentSource(d: Deployment): string {
     const pr = pullRequestLabel(d.pull_request_url);
     if (pr) return d.git_branch ? `${pr} · ${d.git_branch}` : pr;
-    if (d.source_deployment_id) return `Redeploy of ${d.source_deployment_id.split('-').pop()}`;
+    if (d.created_via === 'rollback_guard' && d.rollback_guard_for_deployment_id) {
+        return `Rollback Guard: replaced ${shortDeploymentId(d.rollback_guard_for_deployment_id)}`;
+    }
+    if (d.created_via === 'promote' && d.promoted_from_environment) {
+        const from = d.promoted_from_deployment_id ?? d.source_deployment_id;
+        return `Promoted from ${d.promoted_from_environment}${from ? ` (${shortDeploymentId(from)})` : ''}`;
+    }
+    if (d.source_deployment_id) return `Redeploy of ${shortDeploymentId(d.source_deployment_id)}`;
     if (d.git_revision) return `${d.git_branch ? `${d.git_branch}@` : ''}${shortRevision(d.git_revision)}`;
     return shortImage(d.image);
 }

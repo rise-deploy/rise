@@ -137,6 +137,27 @@ pub struct Deployment {
     /// rollback, promote), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_deployment_id: Option<String>,
+    /// How the deployment came to be: `deploy`, `redeploy`, `promote` or
+    /// `rollback_guard` (ADR-0007).
+    #[serde(default)]
+    pub created_via: String,
+    /// `deployment_id` of the deployment this one was promoted from (the
+    /// immediate source across environments).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from_deployment_id: Option<String>,
+    /// Environment of `promoted_from_deployment_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_from_environment: Option<String>,
+    /// `[project].migration_version` of the code this deployment runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_version: Option<i64>,
+    /// When the deployment last became `Unhealthy` (RFC3339); unset while healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unhealthy_since: Option<String>,
+    /// For a Rollback Guard replacement: `deployment_id` of the unhealthy
+    /// deployment it replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_guard_for_deployment_id: Option<String>,
     #[serde(default)]
     pub created: String,
     #[serde(default)]
@@ -244,6 +265,14 @@ pub struct CreateDeploymentRequest {
     /// path length descending for nginx longest-prefix-first semantics.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteSpec>,
+    /// `[project].migration_version` of the code being deployed. Only used
+    /// for fresh builds and `--image`; a deployment created from another one
+    /// inherits the source's.
+    #[serde(default)]
+    pub migration_version: Option<i64>,
+    /// Deploy even if the deployment crosses a recorded migration barrier.
+    #[serde(default)]
+    pub force_migration_barrier: bool,
 }
 
 // Response from creating a deployment
@@ -263,6 +292,20 @@ pub struct CreateDeploymentResponse {
     /// appear with the user-supplied value so the CLI can skip the push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_images: Option<std::collections::BTreeMap<String, String>>,
+    /// How the deployment was created (`deploy`, `redeploy`, `promote`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub created_via: String,
+    /// Things the caller should know: an administrator bypass of the
+    /// promotion gate, a forced migration barrier, an undeclared migration
+    /// version.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// Inherited resource values changed to fit the target environment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub adjustments: Vec<super::promotion::ResourceAdjustment>,
+    /// The digest-pinned image a promotion runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_image: Option<String>,
 }
 
 // Request to update deployment status

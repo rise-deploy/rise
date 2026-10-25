@@ -453,6 +453,26 @@ expiration_interval_secs = 60
 secret_refresh_interval_secs = 3600
 ```
 
+### Rollback Guard
+
+The [Rollback Guard](/docs/user-guide/deployments/#automatic-rollback-rollback-guard)
+(ADR-0007) runs as one leader-elected loop on every backend. Environments opt in
+individually (`rise environment update <env> --rollback-guard true`, admin-only);
+this block only controls the controller:
+
+```yaml
+rollback_guard:
+  enabled: true                # kill switch; false stops the controller entirely
+  poll_interval_seconds: 10    # how often unhealthy deployments are evaluated
+  max_in_flight: 3             # guard replacements open at once, platform-wide
+  fleet_unhealthy_ratio: 0.5   # platform-wide breaker: Unhealthy share of active deployments …
+  fleet_unhealthy_min_count: 3 # … and minimum Unhealthy count, both reached → decline the tick
+```
+
+The breaker exists because on Docker and ECS a Traefik API outage marks every
+health-checked deployment Unhealthy at once; the guard then declines with
+`platform_wide_unhealthy` rather than rolling everything back.
+
 ### Deployment Controller (Docker)
 
 As an alternative to the Kubernetes controller, the Docker controller deploys apps as

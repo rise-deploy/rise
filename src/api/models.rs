@@ -140,6 +140,22 @@ mod client_models {
         pub pull_request_url: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub git_repository_url: Option<String>,
+        /// `deploy`, `redeploy`, `promote` or `rollback_guard`; empty from
+        /// servers that predate ADR-0007.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub created_via: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub promoted_from_deployment_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub promoted_from_environment: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub migration_version: Option<i64>,
+        /// When the deployment last became `Unhealthy` (RFC3339).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub unhealthy_since: Option<String>,
+        /// The unhealthy deployment a Rollback Guard replacement replaces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rollback_guard_for_deployment_id: Option<String>,
         #[serde(default)]
         pub created: String,
         #[serde(default)]

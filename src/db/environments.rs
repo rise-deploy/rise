@@ -26,6 +26,8 @@ where
         RETURNING id, project_id, name, primary_deployment_group, is_production, color,
                  min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                  max_deployment_expiration,
+                 promotion_source_environment_id, rollback_guard_enabled,
+                 rollback_guard_unhealthy_timeout_seconds,
                  created_at, updated_at
         "#,
         project_id,
@@ -50,6 +52,8 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Env
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                max_deployment_expiration,
+               promotion_source_environment_id, rollback_guard_enabled,
+               rollback_guard_unhealthy_timeout_seconds,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1
@@ -78,6 +82,8 @@ pub async fn find_by_name(
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                max_deployment_expiration,
+               promotion_source_environment_id, rollback_guard_enabled,
+               rollback_guard_unhealthy_timeout_seconds,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1 AND name = $2
@@ -104,6 +110,8 @@ pub async fn find_by_primary_group(
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                max_deployment_expiration,
+               promotion_source_environment_id, rollback_guard_enabled,
+               rollback_guard_unhealthy_timeout_seconds,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1 AND primary_deployment_group = $2
@@ -127,6 +135,8 @@ pub async fn find_production(pool: &PgPool, project_id: Uuid) -> Result<Option<E
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                max_deployment_expiration,
+               promotion_source_environment_id, rollback_guard_enabled,
+               rollback_guard_unhealthy_timeout_seconds,
                created_at, updated_at
         FROM environments
         WHERE project_id = $1 AND is_production = true
@@ -148,6 +158,8 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Environment>> 
         SELECT id, project_id, name, primary_deployment_group, is_production, color,
                min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                max_deployment_expiration,
+               promotion_source_environment_id, rollback_guard_enabled,
+               rollback_guard_unhealthy_timeout_seconds,
                created_at, updated_at
         FROM environments
         WHERE id = $1
@@ -220,6 +232,8 @@ pub async fn update(
         RETURNING id, project_id, name, primary_deployment_group, is_production, color,
                  min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                  max_deployment_expiration,
+                 promotion_source_environment_id, rollback_guard_enabled,
+                 rollback_guard_unhealthy_timeout_seconds,
                  created_at, updated_at
         "#,
         id,
@@ -294,6 +308,8 @@ pub async fn update_deployment_constraints(
         RETURNING id, project_id, name, primary_deployment_group, is_production, color,
                  min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
                  max_deployment_expiration,
+                 promotion_source_environment_id, rollback_guard_enabled,
+                 rollback_guard_unhealthy_timeout_seconds,
                  created_at, updated_at
         "#,
         id,
@@ -309,6 +325,76 @@ pub async fn update_deployment_constraints(
     .context("Failed to update deployment constraints")?;
 
     Ok(env)
+}
+
+/// Update an environment's promotion source and Rollback Guard settings; `None`
+/// leaves a column alone (`Some(None)` clears the source). The database
+/// enforces a same-project, non-self source and a 60..=86400 s timeout;
+/// cycle detection is the caller's.
+pub async fn update_promotion_policy(
+    pool: &PgPool,
+    id: Uuid,
+    promotion_source: Option<Option<Uuid>>,
+    guard_enabled: Option<bool>,
+    guard_timeout_seconds: Option<i32>,
+) -> Result<Environment> {
+    let env = sqlx::query_as!(
+        Environment,
+        r#"
+        UPDATE environments
+        SET promotion_source_environment_id = CASE
+                WHEN $2 THEN $3 ELSE promotion_source_environment_id
+            END,
+            rollback_guard_enabled = COALESCE($4, rollback_guard_enabled),
+            rollback_guard_unhealthy_timeout_seconds =
+                COALESCE($5, rollback_guard_unhealthy_timeout_seconds),
+            updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, project_id, name, primary_deployment_group, is_production, color,
+                 min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+                 max_deployment_expiration,
+                 promotion_source_environment_id, rollback_guard_enabled,
+                 rollback_guard_unhealthy_timeout_seconds,
+                 created_at, updated_at
+        "#,
+        id,
+        promotion_source.is_some(),
+        promotion_source.flatten(),
+        guard_enabled,
+        guard_timeout_seconds
+    )
+    .fetch_one(pool)
+    .await
+    .context("Failed to update promotion policy")?;
+
+    Ok(env)
+}
+
+/// The environments that name `environment_id` as their promotion source.
+pub async fn list_promotion_dependents(
+    pool: &PgPool,
+    environment_id: Uuid,
+) -> Result<Vec<Environment>> {
+    let envs = sqlx::query_as!(
+        Environment,
+        r#"
+        SELECT id, project_id, name, primary_deployment_group, is_production, color,
+               min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
+               promotion_source_environment_id, rollback_guard_enabled,
+               rollback_guard_unhealthy_timeout_seconds,
+               created_at, updated_at
+        FROM environments
+        WHERE promotion_source_environment_id = $1
+        ORDER BY name ASC
+        "#,
+        environment_id
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list promotion dependents")?;
+
+    Ok(envs)
 }
 
 /// Delete an environment by ID.
@@ -784,6 +870,110 @@ mod tests {
         assert_eq!(envs[1].name, "dev");
         assert_eq!(envs[2].name, "staging");
 
+        Ok(())
+    }
+
+    async fn project_with_staging(pool: &PgPool, name: &str) -> Result<(Uuid, Uuid, Uuid)> {
+        let user = users::create(pool, &format!("{name}@example.com")).await?;
+        let project = projects::create(
+            pool,
+            name,
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await?;
+        let production = create_default_for_project(pool, project.id).await?;
+        let staging = create(
+            pool,
+            project.id,
+            "staging",
+            Some("staging"),
+            false,
+            "blue",
+            None,
+        )
+        .await?;
+        Ok((project.id, production.id, staging.id))
+    }
+
+    #[sqlx::test]
+    async fn promotion_policy_sets_leaves_and_clears(pool: PgPool) -> Result<()> {
+        let (_, production, staging) = project_with_staging(&pool, "policy-project").await?;
+
+        let env = find_by_id(&pool, production).await?.unwrap();
+        assert_eq!(env.promotion_source_environment_id, None);
+        assert!(!env.rollback_guard_enabled);
+        assert_eq!(env.rollback_guard_unhealthy_timeout_seconds, 300);
+
+        let env = update_promotion_policy(
+            &pool,
+            production,
+            Some(Some(staging)),
+            Some(true),
+            Some(600),
+        )
+        .await?;
+        assert_eq!(env.promotion_source_environment_id, Some(staging));
+        assert!(env.rollback_guard_enabled);
+        assert_eq!(env.rollback_guard_unhealthy_timeout_seconds, 600);
+
+        // `None` leaves everything as it is.
+        let env = update_promotion_policy(&pool, production, None, None, None).await?;
+        assert_eq!(env.promotion_source_environment_id, Some(staging));
+        assert!(env.rollback_guard_enabled);
+
+        let dependents = list_promotion_dependents(&pool, staging).await?;
+        assert_eq!(
+            dependents.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![production]
+        );
+
+        // `Some(None)` clears the source.
+        let env = update_promotion_policy(&pool, production, Some(None), Some(false), None).await?;
+        assert_eq!(env.promotion_source_environment_id, None);
+        assert!(!env.rollback_guard_enabled);
+        assert!(list_promotion_dependents(&pool, staging).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn promotion_policy_constraints(pool: PgPool) -> Result<()> {
+        let (_, production, staging) = project_with_staging(&pool, "policy-a").await?;
+        let (_, _, other_staging) = project_with_staging(&pool, "policy-b").await?;
+        let timeout_range = "environments_rollback_guard_timeout_range";
+        for (source, timeout, constraint) in [
+            (
+                Some(other_staging),
+                None,
+                "environments_promotion_source_fkey",
+            ),
+            (
+                Some(production),
+                None,
+                "environments_promotion_source_not_self",
+            ),
+            (None, Some(59), timeout_range),
+            (None, Some(86401), timeout_range),
+        ] {
+            let err = update_promotion_policy(&pool, production, source.map(Some), None, timeout)
+                .await
+                .unwrap_err();
+            assert!(format!("{err:?}").contains(constraint), "{err:?}");
+        }
+        for ok in [60, 86400] {
+            let env = update_promotion_policy(&pool, production, None, None, Some(ok)).await?;
+            assert_eq!(env.rollback_guard_unhealthy_timeout_seconds, ok);
+        }
+
+        // Deleting the source clears it.
+        update_promotion_policy(&pool, production, Some(Some(staging)), None, None).await?;
+        assert!(delete(&pool, staging).await?);
+        let env = find_by_id(&pool, production).await?.unwrap();
+        assert_eq!(env.promotion_source_environment_id, None);
         Ok(())
     }
 }

@@ -7,8 +7,8 @@ use uuid::Uuid;
 /// contract seam) and are re-exported here so the rest of the backend keeps using
 /// the familiar `crate::db::models::*` paths.
 pub use rise_backend_core::models::{
-    CustomDomain, Deployment, DeploymentEnvVar, DeploymentStatus, EnvVarSource, Environment,
-    Project, ProjectEnvVar, ProjectStatus, TerminationReason,
+    CreatedVia, CustomDomain, Deployment, DeploymentEnvVar, DeploymentStatus, EnvVarSource,
+    Environment, Project, ProjectEnvVar, ProjectStatus, TerminationReason,
 };
 
 /// User model - represents authenticated users from Dex

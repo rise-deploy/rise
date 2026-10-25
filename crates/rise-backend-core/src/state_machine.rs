@@ -182,6 +182,12 @@ mod tests {
             identity_audiences: serde_json::json!({}),
             containers: None,
             routes: None,
+            created_via: crate::models::CreatedVia::Deploy,
+            promoted_from_deployment_id: None,
+            promoted_from_environment_id: None,
+            migration_version: None,
+            unhealthy_since: None,
+            rollback_guard_for_deployment_id: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

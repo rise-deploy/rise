@@ -294,7 +294,10 @@ and secret handling remain kind-specific prerequisites.
   secret-bearing extensions wait for encrypted fields.
 - [ ] Migrate `Project` (Organization child) and `Environment` (Project
   child) as built-ins. Authorization ownership is `rise.dev/owner` plus policy;
-  lifecycle `metadata.ownerReferences` never grant access.
+  lifecycle `metadata.ownerReferences` never grant access. `Environment`
+  carries ADR-0007's promotion source and Rollback Guard settings, and this
+  migration unblocks ADR-0007 Phase 3 (`PromotionPolicy` as a Project-owned
+  resource).
 - [ ] Migrate `User`, `UserIdentity`, `Group`, and `GroupMembership`, mapping
   the existing Rise Team concept to `Group` while preserving stable generated
   User names and exact SSO mappings.
@@ -305,6 +308,10 @@ and secret handling remain kind-specific prerequisites.
 - [ ] Migrate `Deployment` as a Project child after pagination and Watch;
   controllers update it through registered `status` and `finalizers`
   subresources.
+  - Carry ADR-0007's columns: `created_via`, `promoted_from_deployment_id`,
+    `promoted_from_environment_id`, `migration_version`, `unhealthy_since` and
+    `rollback_guard_for_deployment_id` (plus its one-candidate uniqueness),
+    alongside the project's `migration_barriers` ledger.
 - [ ] Migrate env vars, custom domains, and project app users before dropping
   the remaining Project foreign-key fan-in.
 - [ ] Drop each typed table only after its resource-backed path has baked and

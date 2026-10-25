@@ -386,6 +386,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_migration_version_is_optional_and_non_negative() {
+        let parse = |extra: &str| {
+            toml::from_str::<ProjectBuildConfig>(&format!("[project]\nname = \"app\"\n{extra}"))
+        };
+        let project = parse("migration_version = 5").unwrap().project.unwrap();
+        assert_eq!(project.migration_version, Some(5));
+        let project = parse("").unwrap().project.unwrap();
+        assert_eq!(project.migration_version, None);
+        let rendered = toml::to_string(&project).unwrap();
+        assert!(
+            !rendered.contains("migration_version"),
+            "an undeclared version is not written back: {rendered}"
+        );
+        assert!(parse("migration_version = -1").is_err());
+    }
+
+    #[test]
     fn resolve_deploy_errors_when_route_targets_container_without_http_port() {
         // Construct in-memory (bypassing load_full_project_config's validator)
         // to confirm resolve_deploy itself rejects port-less route targets
@@ -718,6 +735,12 @@ pub struct ProjectConfig {
         schemars(extend("propertyNames" = { "not": { "pattern": "^RISE_" } }))
     )]
     pub env: BTreeMap<String, String>,
+
+    /// Database migration compatibility version of this code. Bump it whenever you add a
+    /// migration; record a barrier (`rise project migration-barrier add`) when that migration
+    /// breaks older code. Inherited by redeploys, rollbacks and promotions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_version: Option<u64>,
 }
 
 /// Build configuration options for a project

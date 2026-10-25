@@ -381,6 +381,10 @@ pub fn print_deployment_snapshot(deployment: &Deployment) {
         deployment.replicas, deployment.cpu, deployment.memory
     );
 
+    for line in provenance_lines(deployment) {
+        println!("   {}", line);
+    }
+
     // URL if available
     if let Some(ref url) = deployment.primary_url {
         println!("   URL:            {}", url);
@@ -390,6 +394,43 @@ pub fn print_deployment_snapshot(deployment: &Deployment) {
     if let Some(ref error) = deployment.error_message {
         println!("   \x1B[31mError:{} {}", ansi::RESET, error);
     }
+}
+
+/// How the deployment came to be (ADR-0007), padded to line up with the rest
+/// of the snapshot.
+pub(super) fn provenance_lines(d: &Deployment) -> Vec<String> {
+    let created_via = match d.created_via.as_str() {
+        "" | "deploy" => None,
+        "promote" => {
+            let from: Vec<&str> = [
+                d.promoted_from_deployment_id.as_deref(),
+                d.promoted_from_environment.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            Some(match from.as_slice() {
+                [] => "promote".to_string(),
+                parts => format!("promote (from {})", parts.join(" in ")),
+            })
+        }
+        "rollback_guard" => Some("Rollback Guard (automatic)".to_string()),
+        other => Some(other.to_string()),
+    };
+    [
+        created_via.map(|via| format!("Created via:    {via}")),
+        d.rollback_guard_for_deployment_id
+            .as_ref()
+            .map(|sick| format!("Rollback Guard replacement for: {sick}")),
+        d.migration_version
+            .map(|v| format!("Migration version: {v}")),
+        d.unhealthy_since
+            .as_ref()
+            .map(|since| format!("Unhealthy since: {since}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Fetch project info to get project URL
@@ -948,5 +989,44 @@ mod tests {
             serde_json::json!({ "type": "resource_adjusted" }),
         );
         assert_eq!(event_description(&backend), "Resources were rounded up");
+    }
+
+    #[test]
+    fn provenance_lines_describe_promotions_and_guard_replacements() {
+        let promoted = Deployment {
+            created_via: "promote".to_string(),
+            promoted_from_deployment_id: Some("20261020-101500".to_string()),
+            promoted_from_environment: Some("staging".to_string()),
+            migration_version: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(
+            provenance_lines(&promoted),
+            vec![
+                "Created via:    promote (from 20261020-101500 in staging)".to_string(),
+                "Migration version: 5".to_string(),
+            ]
+        );
+
+        let guard = Deployment {
+            created_via: "rollback_guard".to_string(),
+            rollback_guard_for_deployment_id: Some("20261021-080000".to_string()),
+            unhealthy_since: Some("2026-10-21T08:05:00Z".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            provenance_lines(&guard),
+            vec![
+                "Created via:    Rollback Guard (automatic)".to_string(),
+                "Rollback Guard replacement for: 20261021-080000".to_string(),
+                "Unhealthy since: 2026-10-21T08:05:00Z".to_string(),
+            ]
+        );
+
+        let fresh = Deployment {
+            created_via: "deploy".to_string(),
+            ..Default::default()
+        };
+        assert!(provenance_lines(&fresh).is_empty());
     }
 }

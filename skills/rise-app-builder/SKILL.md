@@ -212,6 +212,22 @@ Deploying from CI?
    rise deploy -E staging --group mr/$PR_ID --expire 7d  (preview)
 ```
 
+### CI/CD Pattern (promote what staging ran)
+
+```
+Ship the exact image that ran in staging?
+├─ rise deploy -E staging --status-file deployment.json      (main branch)
+├─ rise promote "$(jq -r .deployment_id deployment.json)" -E production --yes
+│    (manual / tagged job; --yes is required non-interactively)
+├─ Admin enforces it: rise environment update production --promote-from staging
+│    → direct `rise deploy -E production` then fails with 403 promotion_source_required
+├─ App with DB migrations: set [project].migration_version, bump per migration;
+│    record breaking ones: rise project migration-barrier add <v> --reason "..."
+│    → rollback/promotion across a barrier fails with 409 migration_barrier (--force overrides)
+└─ Optional (admin): rise environment update production --rollback-guard true
+     → auto-redeploys the last good deployment after sustained Unhealthy; needs a health_check
+```
+
 ### Multi-Container Quick-Start
 
 ```

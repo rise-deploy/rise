@@ -1100,6 +1100,29 @@ pub(crate) fn diff_env_vars(
     out
 }
 
+/// How a snapshot variable takes part in the env diff, by its `source`: the
+/// environment it is scoped to, and whether a deployment created from the
+/// snapshot into `target_env` carries it over. `None` for the system and
+/// extension variables Rise sets on every deployment.
+///
+/// `toml` and `cli` variables belong to the deployment's environment and are
+/// always carried; `toml:<env>` is carried only into `<env>`, the same rule
+/// `copy_config_env_vars_to_deployment` applies.
+fn snapshot_var_role<'a>(
+    source: &'a str,
+    deployment_env: Option<&'a str>,
+    target_env: Option<&str>,
+) -> Option<(Option<&'a str>, bool)> {
+    match source {
+        "global" => Some((None, false)),
+        "toml" | "cli" => Some((deployment_env, true)),
+        _ => match source.strip_prefix("toml:") {
+            Some(env) => Some((Some(env), target_env == Some(env))),
+            None => source.strip_prefix("env:").map(|env| (Some(env), false)),
+        },
+    }
+}
+
 /// A variable as stored, before deciding whether to decrypt it.
 struct RawVar {
     value: String,
@@ -1175,15 +1198,14 @@ pub async fn diff_deployment_env_vars(
     let mut before: BTreeMap<String, RawVar> = BTreeMap::new();
     let mut config: Vec<(String, RawVar)> = Vec::new();
     for var in snapshot {
-        let scope_env = match var.source.as_str() {
-            "global" => None,
-            "toml" | "cli" => deployment_env.clone(),
-            source => match source.strip_prefix("env:") {
-                Some(env) => Some(env.to_string()),
-                None => continue, // system and extension variables
-            },
+        let Some((scope, carried)) = snapshot_var_role(
+            &var.source,
+            deployment_env.as_deref(),
+            target_env.as_deref(),
+        ) else {
+            continue;
         };
-        if !visibility.lists(scope_env.as_deref()) {
+        if !visibility.lists(scope) {
             continue;
         }
         let raw = RawVar {
@@ -1191,9 +1213,9 @@ pub async fn diff_deployment_env_vars(
             is_secret: var.is_secret,
             is_protected: var.is_protected,
             source: var.source.clone(),
-            scope: scope_env,
+            scope: scope.map(str::to_string),
         };
-        if var.source == "toml" || var.source == "cli" {
+        if carried {
             config.push((
                 var.key.clone(),
                 RawVar {
@@ -1384,10 +1406,14 @@ mod diff_tests {
         let before = map(&[
             ("LOG_LEVEL", var(Some("info"), false, false, "global")),
             ("OLD", var(Some("x"), false, false, "toml")),
+            // A carried env-scoped rise.toml variable is compared under its source.
+            ("FEATURE", var(Some("off"), false, false, "toml:production")),
+            ("OTHER", var(Some("x"), false, false, "toml:staging")),
         ]);
         let after = map(&[
             ("LOG_LEVEL", var(Some("warn"), false, false, "global")),
             ("NEW", var(Some("y"), false, false, "env:staging")),
+            ("FEATURE", var(Some("off"), false, false, "toml:production")),
         ]);
         let changes = diff_env_vars(&before, &after);
         let level = changes.iter().find(|c| c.key == "LOG_LEVEL").unwrap();
@@ -1398,6 +1424,28 @@ mod diff_tests {
         );
         assert_eq!(change(&changes, "NEW"), EnvVarChange::Added);
         assert_eq!(change(&changes, "OLD"), EnvVarChange::Removed);
+        assert_eq!(change(&changes, "FEATURE"), EnvVarChange::Unchanged);
+        assert_eq!(change(&changes, "OTHER"), EnvVarChange::Removed);
+    }
+
+    #[test]
+    fn snapshot_roles_scope_and_carry_config_variables() {
+        let classify =
+            |source| super::snapshot_var_role(source, Some("staging"), Some("production"));
+        assert_eq!(classify("global"), Some((None, false)));
+        assert_eq!(classify("env:staging"), Some((Some("staging"), false)));
+        // Unscoped rise.toml and CLI variables follow the deployment.
+        assert_eq!(classify("toml"), Some((Some("staging"), true)));
+        assert_eq!(classify("cli"), Some((Some("staging"), true)));
+        // An environment-scoped rise.toml variable is carried only into its
+        // own environment.
+        assert_eq!(
+            classify("toml:production"),
+            Some((Some("production"), true))
+        );
+        assert_eq!(classify("toml:staging"), Some((Some("staging"), false)));
+        assert_eq!(classify("system"), None);
+        assert_eq!(classify("extension"), None);
     }
 
     #[test]

@@ -80,8 +80,47 @@ pub struct Environment {
     /// `primary_deployment_group` (or into any group, when unset). Canonical
     /// `Nd|Nh|Nm`; `NULL` means no cap.
     pub max_deployment_expiration: Option<String>,
+    /// The only environment deployments may be promoted from into this one
+    /// (ADR-0007). `None` admits deployments from anywhere, fresh builds included.
+    pub promotion_source_environment_id: Option<Uuid>,
+    /// Whether the Rollback Guard replaces a primary-group deployment that
+    /// stays `Unhealthy` for `rollback_guard_unhealthy_timeout_seconds`.
+    pub rollback_guard_enabled: bool,
+    pub rollback_guard_unhealthy_timeout_seconds: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// How a deployment came to be (ADR-0007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum CreatedVia {
+    /// A fresh build or a pre-built `--image`.
+    Deploy,
+    /// Created from another deployment in the same environment.
+    Redeploy,
+    /// Created from a deployment in another environment.
+    Promote,
+    /// An automatic Rollback Guard replacement of a sustained-`Unhealthy` deployment.
+    RollbackGuard,
+}
+
+impl CreatedVia {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Deploy => "deploy",
+            Self::Redeploy => "redeploy",
+            Self::Promote => "promote",
+            Self::RollbackGuard => "rollback_guard",
+        }
+    }
+}
+
+impl std::fmt::Display for CreatedVia {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Deployment model - represents application deployments
@@ -137,6 +176,20 @@ pub struct Deployment {
     /// Ingress route map (`Vec<RouteSpec>` as JSONB) or `None`. Always `None`
     /// when `containers` is `None`.
     pub routes: Option<serde_json::Value>,
+    /// How this deployment was created.
+    pub created_via: CreatedVia,
+    /// The deployment this one was promoted from (the immediate source, set
+    /// only when it crossed environments). The image origin stays
+    /// `rolled_back_from_deployment_id`.
+    pub promoted_from_deployment_id: Option<Uuid>,
+    pub promoted_from_environment_id: Option<Uuid>,
+    /// Migration compatibility version of the code (`[project].migration_version`),
+    /// inherited by every deployment created from another one. `None` = undeclared.
+    pub migration_version: Option<i64>,
+    /// When the deployment last moved into `Unhealthy`; cleared when it recovers to `Healthy`.
+    pub unhealthy_since: Option<DateTime<Utc>>,
+    /// Set only on a Rollback Guard replacement: the unhealthy deployment it replaces.
+    pub rollback_guard_for_deployment_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -245,6 +298,9 @@ pub enum EnvVarSource {
     Extension,
     /// From rise.toml configuration file
     Toml,
+    /// From rise.toml `[environments.<name>.env]`: scoped to that environment,
+    /// so it is carried only into deployments of the same environment.
+    TomlEnv(String),
     /// From CLI flags (--env, --secret-env, --protected-env, --env-file)
     Cli,
 }
@@ -258,6 +314,7 @@ impl EnvVarSource {
             Self::Env(name) => Cow::Owned(format!("env:{}", name)),
             Self::Extension => Cow::Borrowed("extension"),
             Self::Toml => Cow::Borrowed("toml"),
+            Self::TomlEnv(name) => Cow::Owned(format!("toml:{}", name)),
             Self::Cli => Cow::Borrowed("cli"),
         }
     }
@@ -271,13 +328,17 @@ impl EnvVarSource {
             "toml" => Some(Self::Toml),
             "cli" => Some(Self::Cli),
             _ => s
-                .strip_prefix("env:")
-                .map(|name| Self::Env(name.to_string())),
+                .strip_prefix("toml:")
+                .map(|name| Self::TomlEnv(name.to_string()))
+                .or_else(|| {
+                    s.strip_prefix("env:")
+                        .map(|name| Self::Env(name.to_string()))
+                }),
         }
     }
 
     /// Returns the set of source values that are allowed from client requests.
-    /// Server-managed sources (system, global, env:*, extension) are not accepted from clients.
+    /// Server-managed sources (system, global, env:*, toml:*, extension) are not accepted from clients.
     pub fn is_client_allowed(&self) -> bool {
         matches!(self, Self::Toml | Self::Cli)
     }
@@ -330,6 +391,7 @@ mod tests {
             EnvVarSource::Env("staging".to_string()),
             EnvVarSource::Extension,
             EnvVarSource::Toml,
+            EnvVarSource::TomlEnv("production".to_string()),
             EnvVarSource::Cli,
         ];
         for variant in &variants {
@@ -357,5 +419,22 @@ mod tests {
         assert!(!EnvVarSource::Global.is_client_allowed());
         assert!(!EnvVarSource::Env("prod".to_string()).is_client_allowed());
         assert!(!EnvVarSource::Extension.is_client_allowed());
+        assert!(!EnvVarSource::TomlEnv("prod".to_string()).is_client_allowed());
+    }
+
+    #[test]
+    fn stored_forms() {
+        assert_eq!(
+            EnvVarSource::TomlEnv("staging".to_string()).as_str(),
+            "toml:staging"
+        );
+        for v in [
+            CreatedVia::Deploy,
+            CreatedVia::Redeploy,
+            CreatedVia::Promote,
+            CreatedVia::RollbackGuard,
+        ] {
+            assert_eq!(serde_json::to_value(v).unwrap(), v.as_str());
+        }
     }
 }

@@ -343,6 +343,7 @@ FOO = "bar"
             project: Some(ProjectConfig {
                 name: "roundtrip-app".to_string(),
                 env: BTreeMap::from([("GLOBAL".to_string(), "val".to_string())]),
+                migration_version: None,
             }),
             build: None,
             deploy: None,

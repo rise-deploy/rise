@@ -2009,6 +2009,7 @@ a.r-btn { text-decoration: none; }
 .r-env-card-head .right { margin-left: auto; color: var(--text-muted); font-size: 12.5px; white-space: nowrap; }
 .r-env-card-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; flex: 1; }
 .r-env-url { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.r-env-promotes-from { font-size: 12px; }
 .r-live-block {
     all: unset;
     box-sizing: border-box;
@@ -2622,6 +2623,9 @@ a.r-link:hover, .r-link-btn:hover { text-underline-offset: 3px; }
 .r-var-change .key { white-space: nowrap; }
 .r-var-change .what { color: var(--text-muted); min-width: 0; overflow-wrap: anywhere; }
 .r-var-changes-note { margin: 0; font-size: 12.5px; color: var(--text-muted); }
+.r-plan li { padding: 6px 10px; border-top: 1px solid var(--border-faint); font-size: 12.5px; overflow-wrap: anywhere; }
+.r-plan li:first-child { border-top: none; }
+.r-barrier-list { margin: 4px 0; padding-left: 18px; }
 
 /* Keyboard focus for controls that draw no border of their own. */
 .r-icon-btn:focus-visible,

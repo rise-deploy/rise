@@ -30,6 +30,13 @@ View-only access to deployed apps.
 | `rise project app-user remove <identifier>` | `rm`, `del` | `user:email` or `team:name`; `[project]`, `--path` |
 | `rise project app-user list` | `ls`, `l` | `[project]`, `--path` |
 
+### Migration Barriers (`rise project migration-barrier` / `rise p mb`)
+
+| Command | Aliases | Key Flags |
+|---------|---------|-----------|
+| `rise project migration-barrier add <version>` | `a` | `--reason <text>` (required), `-p`, `--path`. Append-only; blocks moving an environment back across this version |
+| `rise project migration-barrier list` | `ls`, `l` | `-p`, `--path` |
+
 ## Teams (`rise team` / `rise t`)
 
 | Command | Aliases | Key Flags |
@@ -50,7 +57,8 @@ View-only access to deployed apps.
 | `[path]` | App directory (default: `.`) |
 | `-i`, `--image <ref>` | Pre-built image (skips build). Required with `--image`: `--http-port` |
 | `--from <timestamp>` | Reuse image from existing deployment (e.g. `20240101-120000`) |
-| `--use-source-env-vars` | With `--from`: copy env vars from source deployment |
+| `--use-source-env-vars` | With `--from`: copy env vars from source deployment (system/extension vars are always regenerated; refused across environments) |
+| `--force` | Deploy even if it crosses a recorded migration barrier |
 | `-g`, `--group <name>` | Deployment group (e.g. `default`, `mr/27`) |
 | `-E`, `--environment <name>` | Target environment (resolved from group if omitted) |
 | `--expire <duration>` | Auto-cleanup after period (e.g. `7d`, `2h`, `30m`) |
@@ -69,13 +77,33 @@ View-only access to deployed apps.
 
 Plus all `BuildArgs` flags (see Build section below).
 
+Every `--from` prints a plan and variable diff first. Into another environment it is a promotion (like `rise promote`, except the local `[project.env]`/`[deploy]` still apply, validated rather than clamped).
+
+## Promote (`rise promote` / `rise deployment promote`)
+
+Ships an existing deployment's image (digest-pinned, no rebuild) into another environment.
+
+| Flag | Description |
+|------|-------------|
+| `<deployment-id>` | Source deployment (required; never auto-resolved) |
+| `-p`, `--project <name>` | Project name (optional if rise.toml has `[project]`) |
+| `-E`, `--target-environment <name>` | Target environment (default: the production environment) |
+| `-y`, `--yes` | Skip confirmation (required in CI / non-interactive) |
+| `--force` | Promote even across a recorded migration barrier |
+| `--no-config` | Ignore local `rise.toml` (`[environments.<target>]` env and deploy settings) |
+| `--replicas`, `--cpu`, `--memory` | Explicit sizing in the target (inherited values are clamped to the target's limits) |
+| `--json`, `--status-file <path>` | As for `rise deploy` |
+
+Errors: `403 promotion_source_required` (target only accepts promotions from another environment), `409 migration_barrier` (retry with `--force` only if the schema is compatible).
+
 ### Deployment Management (`rise deployment` / `rise d`)
 
 | Command | Aliases | Key Flags |
 |---------|---------|-----------|
 | `rise deployment create` | `c`, `new` | Same as `rise deploy` |
+| `rise deployment promote <id>` | — | Same as `rise promote` |
 | `rise deployment list` | `ls`, `l` | `-p`, `--path`, `-g/--group`, `-l/--limit` (default 10) |
-| `rise deployment show <id>` | `s` | `-p`, `--path`, `-f/--follow`, `--timeout` (default `5m`) |
+| `rise deployment show <id>` | `s` | `-p`, `--path`, `-f/--follow`, `--timeout` (default `5m`), `--json` |
 | `rise deployment stop` | — | `-p`, `--path`, `-g/--group` (required) |
 | `rise deployment logs <id>` | — | `-p`, `--path`, `-f/--follow`, `--tail <n>`, `--timestamps`, `--since <dur>`, `--level <lvl>` (repeatable) |
 
@@ -130,7 +158,7 @@ Build and run a container locally for development.
 | `rise environment create <name>` | `c`, `new` | `-p`, `--path`, `-g/--group`, `--production`, `--color` (default: green), `--max-expiration <duration>` |
 | `rise environment list` | `ls`, `l` | `-p`, `--path` |
 | `rise environment show <name>` | `s` | `-p`, `--path` |
-| `rise environment update <name>` | `u`, `edit` | `-p`, `--path`, `--rename <new>`, `-g/--group`, `--production [bool]`, `--color`, `--max-expiration <duration>` (empty string clears) |
+| `rise environment update <name>` | `u`, `edit` | `-p`, `--path`, `--rename <new>`, `-g/--group`, `--production [bool]`, `--color`, `--max-expiration <duration>` (empty string clears), admin-only: `--promote-from <env>` (empty clears), `--rollback-guard <bool>`, `--rollback-guard-timeout <duration>` |
 | `rise environment delete <name>` | `del`, `rm` | `-p`, `--path` |
 
 Valid colors: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray`.
