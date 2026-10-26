@@ -1,9 +1,9 @@
 [package]
 name = "rise-backend-core"
 version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/rise-deploy/rise"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "Shared deployment-backend contracts for Rise (models, traits, URL/quantity helpers)"
 publish = false
 

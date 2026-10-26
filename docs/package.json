@@ -1,5 +1,6 @@
 {
   "name": "docs",
+  "license": "MIT OR Apache-2.0",
   "private": true,
   "workspaces": [
     "user",
