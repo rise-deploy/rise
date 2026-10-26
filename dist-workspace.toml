@@ -12,3 +12,7 @@ ci = "github"
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
+# The CLI links no BSL code, so its archives carry only the MIT and Apache-2.0
+# texts. Automatic inclusion would also pick up LICENSE-BSL from the repo root.
+auto-includes = false
+include = ["README.md", "LICENSE-MIT", "LICENSE-APACHE"]

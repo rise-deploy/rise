@@ -122,6 +122,11 @@ RUN apt-get update && apt-get install -y \
 # Copy the compiled binary from the builder stage
 COPY --from=builder /usr/local/bin/rise /usr/local/bin/rise
 
+# The server binary links the BUSL-1.1 Kubernetes and ECS backends alongside the
+# MIT OR Apache-2.0 core, so the image carries all three license texts.
+COPY LICENSE-MIT LICENSE-APACHE LICENSE-BSL LICENSING.md /usr/share/doc/rise/
+LABEL org.opencontainers.image.licenses="(MIT OR Apache-2.0) AND BUSL-1.1"
+
 # Copy the configuration files
 COPY config /etc/rise
 
@@ -151,6 +156,10 @@ ENTRYPOINT ["/usr/local/bin/rise"]
 FROM gcr.io/distroless/cc-debian13 AS rise-cli
 
 COPY --from=cli-builder /usr/local/bin/rise /usr/local/bin/rise
+
+# The CLI links no BSL code.
+COPY LICENSE-MIT LICENSE-APACHE /usr/share/doc/rise/
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 ENTRYPOINT ["/usr/local/bin/rise"]
 
@@ -216,6 +225,10 @@ RUN /root/.local/bin/mise exec -- pack version && \
 
 # Copy the rise CLI binary (last to maximize layer caching)
 COPY --from=builder /usr/local/bin/rise /usr/local/bin/rise
+
+# Same server binary as the `rise` stage, so the same three license texts.
+COPY LICENSE-MIT LICENSE-APACHE LICENSE-BSL LICENSING.md /usr/share/doc/rise/
+LABEL org.opencontainers.image.licenses="(MIT OR Apache-2.0) AND BUSL-1.1"
 
 # Set the entrypoint
 ENTRYPOINT []

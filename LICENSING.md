@@ -1,0 +1,75 @@
+# Licensing
+
+Rise is split across two licenses. The core platform, the CLI and the
+single-node Docker backend are permissively licensed and always will be. The
+Kubernetes and Amazon ECS backends — the machinery for running Rise across a
+fleet — are licensed under the Business Source License 1.1 and convert to the
+permissive license four years after each release.
+
+## The map
+
+| Path | License |
+|---|---|
+| `src/` (the `rise-deploy` crate, CLI and server core) | MIT OR Apache-2.0 ¹ |
+| `crates/rise-deployment-spec` | MIT OR Apache-2.0 |
+| `crates/rise-backend-auth` | MIT OR Apache-2.0 |
+| `crates/rise-backend-core` | MIT OR Apache-2.0 |
+| `crates/rise-backend-traefik` | MIT OR Apache-2.0 |
+| `crates/rise-backend-docker` | MIT OR Apache-2.0 |
+| `crates/rise-authz` | MIT OR Apache-2.0 |
+| `crates/rise-resource-api` | MIT OR Apache-2.0 |
+| `crates/rise-resource-store-postgres` | MIT OR Apache-2.0 |
+| `crates/rise-runtime-sync` | MIT OR Apache-2.0 |
+| `frontend/`, `docs/`, `example/`, `tests/` | MIT OR Apache-2.0 |
+| `modules/rise-aws`, `modules/rise-ecs` | MIT OR Apache-2.0 |
+| **`crates/rise-backend-kubernetes`** | **BUSL-1.1** |
+| **`crates/rise-backend-ecs`** | **BUSL-1.1** |
+| **`helm/rise`** | **BUSL-1.1** |
+
+¹ The `rise-deploy` source is permissive, but its `backend` feature links both
+BSL crates: that feature builds the server, so a server binary or image always
+contains BSL code. No other crate may depend on a BSL crate;
+`mise run license:boundary:check` enforces this in CI.
+
+Full texts: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE),
+[LICENSE-BSL](LICENSE-BSL).
+
+## What this means in practice
+
+**The `rise` CLI is entirely MIT/Apache-2.0.** Released CLI binaries are built
+with default features and link no backend code at all, so the CLI release
+archives and the `rise-cli` image carry no BSL terms. The server images
+(`rise`, `rise-builder`) do, and ship all three license texts under
+`/usr/share/doc/rise/`.
+
+**The Docker backend is free forever.** Running Rise on a single Docker host —
+the whole path from `rise deploy` through the reconciler to Traefik routing —
+touches no BSL-licensed code.
+
+**The server image contains every backend.** It is built with `--all-features`,
+so the Kubernetes and ECS backends are compiled in. The Additional Use Grant
+explicitly permits production use of it with neither of those controllers
+enabled, so a Docker-backend operator is in the clear.
+License scanners read the dependency tree rather than your configuration,
+though, and will report the server image as BUSL-1.1 regardless.
+
+**Using the Kubernetes or ECS backend in production requires a commercial
+license**, unless you are a non-profit entity. Development, testing and
+evaluation are free, as are copying, modifying and redistributing the code.
+For a commercial license, contact
+[niklas@rosenstein.email](mailto:niklas@rosenstein.email).
+
+**Everything converts.** Each release of the BSL code becomes MIT OR Apache-2.0
+four years after it is published. The restriction is on the newest code, never
+on all of it.
+
+## Contributing
+
+Contributions are accepted under the license of the path they touch: BSL-1.1
+for the paths marked above, MIT OR Apache-2.0 for everything else. See
+[CONTRIBUTING.md](CONTRIBUTING.md) — a `Signed-off-by` line (DCO) is required.
+
+Contributions made before the DCO requirement was introduced were submitted
+under the repository's prior inbound=outbound clause, which licensed them as
+MIT OR Apache-2.0. This relicensing does not change the terms under which
+those earlier contributions were given.

@@ -31,6 +31,20 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **The Kubernetes and ECS backends are now licensed under BUSL-1.1.** *Action
+  required* for Kubernetes and ECS operators. The Kubernetes and Amazon ECS
+  backends and the Helm chart move from `MIT OR Apache-2.0` to the Business
+  Source License 1.1. Each release converts back to `MIT OR Apache-2.0` four
+  years after it is published. The CLI, the server core, the Docker backend
+  and the Terraform modules stay `MIT OR Apache-2.0`. Running the Kubernetes
+  or ECS backend in production from this release on requires a commercial
+  license (contact niklas@rosenstein.email); non-profits, and development,
+  testing and evaluation, do not. The license explicitly permits production
+  use of the server image with neither controller enabled, but license
+  scanners will still report the image as BUSL-1.1. Nothing changes at
+  runtime. See
+  [`LICENSING.md`](https://github.com/rise-deploy/rise/blob/develop/LICENSING.md).
+
 - **Kubernetes 1.32 is the minimum supported version.** *Breaking.* Rise's
   Kubernetes client now targets the 1.32 API, and the Helm chart declares
   `kubeVersion: ">=1.32.0-0"`, so `helm install`/`helm upgrade` fails on older

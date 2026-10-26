@@ -34,6 +34,22 @@ jobs:
 # Stage 0 · Prepare
 # ==========================================================================
 
+  dco:
+    name: DCO sign-off
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check every commit is signed off
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: scripts/check-dco.sh "$BASE" "$HEAD"
+
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
@@ -177,6 +193,11 @@ jobs:
       # Licenses and sources only -- cargo-audit above owns advisories.
       - name: Check dependency licenses
         run: cargo deny check licenses sources
+
+      # cargo-deny ignores first-party crates, so the BSL boundary between them
+      # is checked separately.
+      - name: Check the BSL license boundary
+        run: python3 scripts/check-license-boundary.py
 
   rise-e2e-quality:
     name: Quality / rise-e2e harness
