@@ -10,7 +10,7 @@ permissive license four years after each release.
 
 | Path | License |
 |---|---|
-| `src/` (the `rise-deploy` crate, CLI and server core) | MIT OR Apache-2.0 |
+| `src/` (the `rise-deploy` crate, CLI and server core) | MIT OR Apache-2.0 ¹ |
 | `crates/rise-deployment-spec` | MIT OR Apache-2.0 |
 | `crates/rise-backend-auth` | MIT OR Apache-2.0 |
 | `crates/rise-backend-core` | MIT OR Apache-2.0 |
@@ -26,14 +26,21 @@ permissive license four years after each release.
 | **`crates/rise-backend-ecs`** | **BUSL-1.1** |
 | **`helm/rise`** | **BUSL-1.1** |
 
+¹ The `rise-deploy` source is permissive, but its `backend` feature links both
+BSL crates: that feature builds the server, so a server binary or image always
+contains BSL code. No other crate may depend on a BSL crate;
+`mise run license:boundary:check` enforces this in CI.
+
 Full texts: [LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE),
 [LICENSE-BSL](LICENSE-BSL).
 
 ## What this means in practice
 
 **The `rise` CLI is entirely MIT/Apache-2.0.** Released CLI binaries are built
-with default features and link no backend code at all, so nothing you download
-from a release carries BSL terms.
+with default features and link no backend code at all, so the CLI release
+archives and the `rise-cli` image carry no BSL terms. The server images
+(`rise`, `rise-builder`) do, and ship all three license texts under
+`/usr/share/doc/rise/`.
 
 **The Docker backend is free forever.** Running Rise on a single Docker host —
 the whole path from `rise deploy` through the reconciler to Traefik routing —

@@ -90,6 +90,10 @@ run = [
 description = "Check dependency licenses and sources against deny.toml."
 run = "cargo deny check licenses sources"
 
+[tasks."license:boundary:check"]
+description = "Verify no permissively licensed crate depends on a BUSL-1.1 crate (see LICENSING.md)."
+run = "python3 scripts/check-license-boundary.py"
+
 [tasks."sqlx:check"]
 description = "Check that all SQLX queries are valid."
 # Build the dependencies first: `sqlx prepare` collects the queries of every
@@ -141,6 +145,7 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
 mise deny
+mise license:boundary:check
 mise resource:schema:check
 mise adr:conformance:check
 helm lint helm/rise

@@ -246,12 +246,15 @@ map.
 
 Two rules follow from this and are easy to violate by accident:
 
-- **Nothing permissive may depend on a BSL crate.** `rise-backend-traefik` is
-  shared with Docker, so ECS-aware code in it (the `@ecs` provider name) stays
-  permissive; likewise `sanitize_ecs_name`, `EventSource::Ecs` and
-  `AccessClass` in `rise-backend-core`. When a
-  shared type starts to look backend-specific, keep it shared and narrow the
-  seam instead of moving it.
+- **Nothing permissive may depend on a BSL crate**, with one deliberate
+  exception: `rise-deploy`'s `backend` feature links both BSL crates, because
+  it builds the server. `mise run license:boundary:check` (run by CI and
+  `mise run lint`) enforces the rule for every other crate.
+  `rise-backend-traefik` is shared with Docker, so ECS-aware code in it (the
+  `@ecs` provider name) stays permissive; likewise `sanitize_ecs_name`,
+  `EventSource::Ecs` and `AccessClass` in `rise-backend-core`. When a shared
+  type starts to look backend-specific, keep it shared and narrow the seam
+  instead of moving it.
 - **New crates inherit the permissive license** via `license.workspace = true`.
   A BSL crate states `license = "BUSL-1.1"` literally and carries a `LICENSE`
   copy. `tests/e2e` is a separate workspace and inherits nothing.

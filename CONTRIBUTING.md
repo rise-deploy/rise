@@ -32,7 +32,7 @@ See [LICENSING.md](LICENSING.md) for the full map and the reasoning.
 
 ## Before you open a pull request
 
-Format and lint — CI rejects unformatted code:
+At minimum, format, lint and test:
 
 ```bash
 cargo fmt --all
@@ -40,27 +40,11 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features        # needs `mise run db:migrate` once
 ```
 
-If you touched `tests/e2e`, it is a **separate workspace** that `--all` does not
-reach:
-
-```bash
-cargo fmt --manifest-path tests/e2e/Cargo.toml
-cargo clippy --manifest-path tests/e2e/Cargo.toml --all-targets -- -D warnings
-```
-
-Several artifacts are generated and checked for drift in CI. Regenerate and
-commit the result when you change their source:
-
-| Changed | Run |
-|---|---|
-| SQLX queries in `rise-deploy` | `mise run sqlx:prepare` |
-| `src/server/settings.rs` | `mise run config:schema:generate` |
-| `crates/rise-deployment-spec/src/project_config.rs` | `mise run rise-toml:schema:generate` |
-| `crates/rise-resource-api/` | `mise run resource:schema:generate` |
-| The `RiseProject` CRD structs | `mise run crd:generate` |
-| `Cargo.toml` / `Cargo.lock` | `cargo audit` |
-
-`mise run lint` runs the CI-equivalent sweep.
+What else to run depends on what you changed: `tests/e2e` is a separate
+workspace, several generated files are checked for drift, and dependency
+changes go through `cargo audit` and `cargo deny`. The full list lives in one
+place, [CLAUDE.md § Before Commit & Push](CLAUDE.md#before-commit--push);
+`mise run lint` runs most of the CI sweep.
 
 ## Branching
 

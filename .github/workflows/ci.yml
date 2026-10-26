@@ -194,6 +194,11 @@ jobs:
       - name: Check dependency licenses
         run: cargo deny check licenses sources
 
+      # cargo-deny ignores first-party crates, so the BSL boundary between them
+      # is checked separately.
+      - name: Check the BSL license boundary
+        run: python3 scripts/check-license-boundary.py
+
   rise-e2e-quality:
     name: Quality / rise-e2e harness
     runs-on: ubuntu-latest
