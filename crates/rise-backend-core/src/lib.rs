@@ -34,6 +34,7 @@ pub mod models;
 pub mod naming;
 pub mod observation;
 pub mod organization;
+pub mod project_routing;
 pub mod providers;
 pub mod quantity;
 pub mod rolling;
