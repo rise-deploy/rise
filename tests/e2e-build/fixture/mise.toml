@@ -1,0 +1,6 @@
+# Pins the Python that Railpack installs for this fixture. Unpinned, Railpack
+# takes the newest 3.13 patch release, which can land before a precompiled
+# build of it exists and fail every Railpack case. The pack (Heroku) cases
+# ignore this file and keep their own default.
+[tools]
+python = "3.13.17"
