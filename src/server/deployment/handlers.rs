@@ -2185,11 +2185,7 @@ async fn perform_status_update(
                 .get_deployment_urls(&updated_deployment, project)
                 .await
             {
-                Ok(urls) => (
-                    Some(urls.primary_url),
-                    urls.custom_domain_urls,
-                    urls.all_urls,
-                ),
+                Ok(urls) => (urls.primary_url, urls.custom_domain_urls, urls.all_urls),
                 Err(e) => {
                     error!(
                         "Failed to calculate URLs for deployment {}: {}",
@@ -2517,7 +2513,7 @@ pub async fn list_deployments(
                 .await
             {
                 Ok(urls) => DeploymentUrls {
-                    primary_url: Some(urls.primary_url),
+                    primary_url: urls.primary_url,
                     custom_domain_urls: urls.custom_domain_urls,
                     all_urls: urls.all_urls,
                 },
@@ -2800,11 +2796,7 @@ pub async fn stop_deployment(
         .get_deployment_urls(&updated_deployment, &project)
         .await
     {
-        Ok(urls) => (
-            Some(urls.primary_url),
-            urls.custom_domain_urls,
-            urls.all_urls,
-        ),
+        Ok(urls) => (urls.primary_url, urls.custom_domain_urls, urls.all_urls),
         Err(e) => {
             error!(
                 "Failed to calculate URLs for deployment {}: {}",
@@ -2894,11 +2886,7 @@ pub async fn get_deployment_by_project(
                 .get_deployment_urls(&deployment, &project)
                 .await
             {
-                Ok(urls) => (
-                    Some(urls.primary_url),
-                    urls.custom_domain_urls,
-                    urls.all_urls,
-                ),
+                Ok(urls) => (urls.primary_url, urls.custom_domain_urls, urls.all_urls),
                 Err(e) => {
                     error!(
                         "Failed to calculate URLs for deployment {}: {}",

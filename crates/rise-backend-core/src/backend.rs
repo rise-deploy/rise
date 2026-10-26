@@ -8,10 +8,14 @@ use crate::models::{Deployment, Project};
 /// URLs where a deployment can be accessed
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeploymentUrls {
-    /// Default URL based on ingress template configuration
+    /// Default URL based on ingress template configuration. It names the
+    /// group's template host whether or not the group is routed there; see
+    /// `all_urls` for where it actually answers.
     pub default_url: String,
-    /// Primary URL - the starred custom domain if one exists, otherwise the default URL
-    pub primary_url: String,
+    /// Primary URL: the starred custom domain, else the environment URL, else
+    /// the first routed URL. `None` when the deployment's group has no public
+    /// host at all, so it is not reachable.
+    pub primary_url: Option<String>,
     /// Additional URLs for custom domains
     pub custom_domain_urls: Vec<String>,
     /// Full ordered list of every URL the deployment is reachable at — deployment-group

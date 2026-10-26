@@ -324,7 +324,7 @@ mod tests {
     fn test_rise_system_env_vars_default_group() {
         let urls = DeploymentUrls {
             default_url: "https://myapp.rise.dev".to_string(),
-            primary_url: "https://myapp.rise.dev".to_string(),
+            primary_url: Some("https://myapp.rise.dev".to_string()),
             custom_domain_urls: vec![],
             all_urls: vec!["https://myapp.rise.dev".to_string()],
         };
@@ -340,10 +340,26 @@ mod tests {
     }
 
     #[test]
+    fn test_rise_system_env_vars_unrouted_group_advertises_no_url() {
+        let urls = DeploymentUrls {
+            default_url: "https://myapp.rise.dev".to_string(),
+            primary_url: None,
+            custom_domain_urls: vec![],
+            all_urls: vec![],
+        };
+
+        let vars = rise_system_env_vars("https://rise.dev", "default", &urls, None);
+
+        let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+        assert!(!map.contains_key("RISE_APP_URL"));
+        assert_eq!(map["RISE_APP_URLS"], "[]");
+    }
+
+    #[test]
     fn test_rise_system_env_vars_custom_group_with_domains() {
         let urls = DeploymentUrls {
             default_url: "https://myapp-mr--42.rise.dev".to_string(),
-            primary_url: "https://custom.example.com".to_string(),
+            primary_url: Some("https://custom.example.com".to_string()),
             custom_domain_urls: vec!["https://custom.example.com".to_string()],
             all_urls: vec![
                 "https://myapp-mr--42.rise.dev".to_string(),

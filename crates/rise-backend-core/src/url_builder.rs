@@ -319,7 +319,8 @@ impl DeploymentUrlBuilder {
     /// `primary_deployment_group` is this group, and only that environment's
     /// valid custom domains — the same per-group scoping as the Kubernetes
     /// webhook, so a production custom domain never lands on a preview group's
-    /// router. Unlike Kubernetes, there is no fallback host when none applies.
+    /// router. A group with no deployment-group or environment host gets no
+    /// hosts and is not routed, on every backend.
     pub fn public_hosts_for_group(
         &self,
         project: &Project,
@@ -446,15 +447,6 @@ impl DeploymentUrlBuilder {
         let domains_for_env =
             self.valid_domains_for_environment(environment_for_group, custom_domains);
 
-        let starred = domains_for_env.iter().find(|d| d.is_primary);
-        let primary_url = if let Some(starred) = starred {
-            self.host_to_url(&starred.domain)
-        } else {
-            environment_url
-                .clone()
-                .unwrap_or_else(|| default_url.clone())
-        };
-
         let custom_domain_urls: Vec<String> = domains_for_env
             .iter()
             .map(|d| self.host_to_url(&d.domain))
@@ -481,6 +473,13 @@ impl DeploymentUrlBuilder {
                 all_urls.push(url.clone());
             }
         }
+
+        let primary_url = domains_for_env
+            .iter()
+            .find(|d| d.is_primary)
+            .map(|starred| self.host_to_url(&starred.domain))
+            .or(environment_url)
+            .or_else(|| all_urls.first().cloned());
 
         DeploymentUrls {
             default_url,
