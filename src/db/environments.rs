@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -64,6 +66,39 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Env
     .context("Failed to list environments for project")?;
 
     Ok(envs)
+}
+
+/// List the environments of several projects in one query, keyed by project.
+/// Each project's list keeps [`list_for_project`]'s order.
+pub async fn list_for_projects(
+    pool: &PgPool,
+    project_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<Environment>>> {
+    let envs = sqlx::query_as!(
+        Environment,
+        r#"
+        SELECT id, project_id, name, primary_deployment_group, is_production, color,
+               min_replicas, max_replicas, min_cpu, max_cpu, min_memory, max_memory,
+               max_deployment_expiration,
+               created_at, updated_at
+        FROM environments
+        WHERE project_id = ANY($1)
+        ORDER BY
+            project_id,
+            is_production DESC,
+            name ASC
+        "#,
+        project_ids
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to list environments for projects")?;
+
+    let mut map: HashMap<Uuid, Vec<Environment>> = HashMap::new();
+    for env in envs {
+        map.entry(env.project_id).or_default().push(env);
+    }
+    Ok(map)
 }
 
 /// Find an environment by name within a project
@@ -404,6 +439,50 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, env.id);
 
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_list_for_projects_groups_by_project(pool: PgPool) -> Result<()> {
+        let user = users::create(&pool, "env-batch@example.com").await?;
+        let mut project_ids = Vec::new();
+        for name in ["env-batch-a", "env-batch-b", "env-batch-empty"] {
+            let project = projects::create(
+                &pool,
+                name,
+                ProjectStatus::Stopped,
+                "public".to_string(),
+                Some(user.id),
+                None,
+                None,
+            )
+            .await?;
+            project_ids.push(project.id);
+        }
+        for project_id in &project_ids[..2] {
+            create_default_for_project(&pool, *project_id).await?;
+            create(
+                &pool,
+                *project_id,
+                "alpha",
+                Some("alpha"),
+                false,
+                "blue",
+                None,
+            )
+            .await?;
+        }
+
+        let by_project = list_for_projects(&pool, &project_ids).await?;
+        for project_id in &project_ids[..2] {
+            let ids = |envs: &[Environment]| envs.iter().map(|env| env.id).collect::<Vec<_>>();
+            assert_eq!(
+                ids(&by_project[project_id]),
+                ids(&list_for_project(&pool, *project_id).await?),
+                "batch keeps the per-project order (production first)"
+            );
+        }
+        assert!(!by_project.contains_key(&project_ids[2]));
         Ok(())
     }
 
