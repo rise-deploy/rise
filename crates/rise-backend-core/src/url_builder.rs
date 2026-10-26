@@ -7,6 +7,7 @@
 //! one of these and delegates its URL/image methods to it, and the Docker
 //! controller holds one directly.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use tracing::warn;
 use crate::backend::DeploymentUrls;
 use crate::custom_domain::validate_custom_domain;
 use crate::group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
+use crate::host_template::synthesized_staging_template;
 use crate::models::{CustomDomain, Deployment, Environment, Project};
 use crate::providers::{ImageTagType, RegistryProvider};
 
@@ -79,38 +81,38 @@ impl DeploymentUrlBuilder {
         if deployment_group == DEFAULT_DEPLOYMENT_GROUP {
             self.production_ingress_url_template
                 .replace("{project_name}", &project.name)
-        } else if let Some(ref staging_template) = self.staging_ingress_url_template {
-            staging_template
-                .replace("{project_name}", &project.name)
-                .replace(
-                    "{deployment_group}",
-                    &Self::escaped_group_name(deployment_group),
-                )
         } else {
-            let base_url = self
-                .production_ingress_url_template
-                .replace("{project_name}", &project.name);
-            if let Some(dot_pos) = base_url.find('.') {
-                format!(
-                    "{}-{}{}",
-                    &base_url[..dot_pos],
-                    Self::escaped_group_name(deployment_group),
-                    &base_url[dot_pos..]
-                )
-            } else {
-                format!(
-                    "{}-{}",
-                    base_url,
-                    Self::escaped_group_name(deployment_group)
-                )
-            }
+            self.render_staging_template(project, deployment_group)
         }
+    }
+
+    /// The template a deployment group's own host is rendered from: the
+    /// configured `staging_ingress_url_template`, else the production
+    /// template with `{project_name}--{deployment_group}` in place of
+    /// `{project_name}` (`{project_name}.apps.example.com` →
+    /// `{project_name}--{deployment_group}.apps.example.com`).
+    pub fn effective_staging_template(&self) -> Cow<'_, str> {
+        match &self.staging_ingress_url_template {
+            Some(template) => Cow::Borrowed(template),
+            None => Cow::Owned(synthesized_staging_template(
+                &self.production_ingress_url_template,
+            )),
+        }
+    }
+
+    fn render_staging_template(&self, project: &Project, deployment_group: &str) -> String {
+        self.effective_staging_template()
+            .replace("{project_name}", &project.name)
+            .replace(
+                "{deployment_group}",
+                &Self::escaped_group_name(deployment_group),
+            )
     }
 
     /// Resolve the deployment-group-specific host (the staging-template form).
     ///
     /// Always returns the templated DG host when `staging_ingress_url_template` is set,
-    /// even for the "default" group (yielding e.g. `myapp-default.preview.example.com`).
+    /// even for the "default" group (yielding e.g. `default--myapp.preview.example.com`).
     /// When no staging template is configured, returns the synthesized form for
     /// non-default groups only — for the default group it returns `None` to avoid
     /// colliding with the project's production hostname.
@@ -119,33 +121,10 @@ impl DeploymentUrlBuilder {
         project: &Project,
         deployment_group: &str,
     ) -> Option<String> {
-        if let Some(ref staging_template) = self.staging_ingress_url_template {
-            Some(
-                staging_template
-                    .replace("{project_name}", &project.name)
-                    .replace(
-                        "{deployment_group}",
-                        &Self::escaped_group_name(deployment_group),
-                    ),
-            )
-        } else if deployment_group != DEFAULT_DEPLOYMENT_GROUP {
-            let base_url = self
-                .production_ingress_url_template
-                .replace("{project_name}", &project.name);
-            Some(if let Some(dot_pos) = base_url.find('.') {
-                format!(
-                    "{}-{}{}",
-                    &base_url[..dot_pos],
-                    Self::escaped_group_name(deployment_group),
-                    &base_url[dot_pos..]
-                )
-            } else {
-                format!(
-                    "{}-{}",
-                    base_url,
-                    Self::escaped_group_name(deployment_group)
-                )
-            })
+        if self.staging_ingress_url_template.is_some()
+            || deployment_group != DEFAULT_DEPLOYMENT_GROUP
+        {
+            Some(self.render_staging_template(project, deployment_group))
         } else {
             None
         }
@@ -534,7 +513,7 @@ mod tests {
         assert_eq!(
             builder.public_hosts_for_group(&project, "default", &environments, &domains),
             vec![
-                "docs-app-default.preview.example.test",
+                "docs-app--default.preview.example.test",
                 "docs-app.example.test",
                 "docs.customer.com",
             ]
@@ -542,14 +521,14 @@ mod tests {
         assert_eq!(
             builder.public_hosts_for_group(&project, "main", &environments, &domains),
             vec![
-                "docs-app-main.preview.example.test",
-                "docs-app-staging.example.test",
+                "docs-app--main.preview.example.test",
+                "docs-app--staging.example.test",
                 "staging.customer.com",
             ]
         );
         assert_eq!(
             builder.public_hosts_for_group(&project, "pr/123", &environments, &domains),
-            vec!["docs-app-pr--123.preview.example.test"]
+            vec!["docs-app--pr--123.preview.example.test"]
         );
     }
 }

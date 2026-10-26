@@ -1182,10 +1182,12 @@ pub enum DeploymentControllerSettings {
 
         /// Ingress URL template for staging (non-default) deployment groups
         /// Supports both subdomain and sub-path routing:
-        ///   Subdomain: "{project_name}-{deployment_group}.preview.rise.dev"
+        ///   Subdomain: "{deployment_group}--{project_name}.preview.rise.dev"
         ///   Sub-path: "rise.dev/{project_name}/{deployment_group}"
-        /// Must contain both {project_name} and {deployment_group} placeholders
-        /// If not set, falls back to inserting "-{deployment_group}" before first dot
+        /// Must join {project_name} and {deployment_group} with "--" (see the
+        /// Configuration docs for the full rule)
+        /// If not set, {project_name} in the production template becomes
+        /// "{project_name}--{deployment_group}"
         #[serde(default)]
         staging_ingress_url_template: Option<String>,
 
@@ -1195,7 +1197,8 @@ pub enum DeploymentControllerSettings {
         /// Supports both subdomain and sub-path routing:
         ///   Subdomain: "{environment}--{project_name}.apps.rise.dev"
         ///   Sub-path: "rise.dev/{project_name}/{environment}"
-        /// Must contain both {project_name} and {environment} placeholders
+        /// Must join {project_name} and {environment} with "--", on the same side
+        /// as the staging template
         /// If not set, environment-specific URLs are not generated.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
@@ -1400,12 +1403,12 @@ pub enum DeploymentControllerSettings {
         production_ingress_url_template: String,
 
         /// Ingress URL template for staging (non-default) deployment groups.
-        /// Must contain both `{project_name}` and `{deployment_group}`.
+        /// Must join `{project_name}` and `{deployment_group}` with `--`.
         #[serde(default)]
         staging_ingress_url_template: Option<String>,
 
         /// Ingress URL template for named environments.
-        /// Must contain both `{project_name}` and `{environment}`.
+        /// Must join `{project_name}` and `{environment}` with `--`.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
 
@@ -1697,12 +1700,12 @@ pub enum DeploymentControllerSettings {
         production_ingress_url_template: String,
 
         /// Ingress URL template for staging (non-default) deployment groups.
-        /// Must contain both `{project_name}` and `{deployment_group}`.
+        /// Must join `{project_name}` and `{deployment_group}` with `--`.
         #[serde(default)]
         staging_ingress_url_template: Option<String>,
 
         /// Ingress URL template for named environments.
-        /// Must contain both `{project_name}` and `{environment}`.
+        /// Must join `{project_name}` and `{environment}` with `--`.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
 
@@ -2379,6 +2382,13 @@ impl Settings {
                 )?;
             }
 
+            #[cfg(feature = "backend")]
+            Self::validate_host_templates(
+                production_ingress_url_template,
+                staging_ingress_url_template.as_deref(),
+                environment_ingress_url_template.as_deref(),
+            )?;
+
             Self::validate_extra_service_token_audiences(extra_service_token_audiences)?;
 
             // Filter out null access classes (used to remove inherited entries)
@@ -2465,6 +2475,13 @@ impl Settings {
                     "{environment}",
                 )?;
             }
+
+            #[cfg(feature = "backend")]
+            Self::validate_host_templates(
+                production_ingress_url_template,
+                staging_ingress_url_template.as_deref(),
+                environment_ingress_url_template.as_deref(),
+            )?;
         }
 
         // Validate the ECS deployment controller variant with the same contract
@@ -2524,6 +2541,13 @@ impl Settings {
                     "{environment}",
                 )?;
             }
+
+            #[cfg(feature = "backend")]
+            Self::validate_host_templates(
+                production_ingress_url_template,
+                staging_ingress_url_template.as_deref(),
+                environment_ingress_url_template.as_deref(),
+            )?;
 
             if cluster.trim().is_empty() {
                 return Err(ConfigError::Message(
@@ -2671,6 +2695,18 @@ impl Settings {
     }
 
     /// Validate that a format string contains the required placeholder
+    /// Refuse ingress templates that would let one project's preview host
+    /// equal another project's (see `rise_backend_core::host_template`).
+    #[cfg(feature = "backend")]
+    fn validate_host_templates(
+        production: &str,
+        staging: Option<&str>,
+        environment: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        rise_backend_core::host_template::check_ingress_templates(production, staging, environment)
+            .map_err(|reason| ConfigError::Message(format!("deployment_controller: {reason}")))
+    }
+
     fn validate_format_string(
         format_str: &str,
         field_name: &str,

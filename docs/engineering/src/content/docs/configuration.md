@@ -513,6 +513,31 @@ deployment_controller:
 The configuration schema is regenerated via `mise run config:schema:generate`, and CI
 verifies it is up to date on every PR.
 
+## Ingress hostname templates
+
+Every deployment controller takes three host templates. Rise refuses to start
+unless they keep each project's hosts its own:
+
+- `production_ingress_url_template` contains `{project_name}` and no `--`,
+  e.g. `{project_name}.apps.example.com`.
+- `staging_ingress_url_template` joins `{project_name}` and
+  `{deployment_group}` with exactly `--` and contains no other `--`.
+  `{project_name}` must start or end its DNS label: a `.` or the template's
+  start/end on its other side. E.g. `{deployment_group}--{project_name}.apps.example.com`
+  or `{project_name}--{deployment_group}.preview.example.com`.
+- `environment_ingress_url_template` follows the same rule with
+  `{environment}`, with `{project_name}` on the same side of the `--` as in
+  the staging template.
+
+Without a staging template, `{project_name}` in the production template
+becomes `{project_name}--{deployment_group}`, and that derived template must
+pass the same rule.
+
+Project and environment names cannot contain `--`, so the project can always
+be read back from a host. With a single hyphen (`{project_name}-{deployment_group}`)
+project `a` with group `b-c` and project `a-b` with group `c` would share
+`a-b-c`.
+
 ## Validation
 
 The backend validates configuration on startup:

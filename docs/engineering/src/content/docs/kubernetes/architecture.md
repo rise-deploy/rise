@@ -47,7 +47,7 @@ Each deployment group gets its own Service and Ingress with a unique URL:
 | Group | URL Pattern | Example (Subdomain) | Example (Sub-path) |
 |-------|-------------|---------------------|-------------------|
 | `default` | `production_ingress_url_template` | `my-app.apps.rise.local` | `rise.local/my-app` |
-| Custom groups | `staging_ingress_url_template` | `my-app-mr--26.preview.rise.local` | `rise.local/my-app/mr--26` |
+| Custom groups | `staging_ingress_url_template` | `my-app--mr--26.preview.rise.local` | `rise.local/my-app/mr--26` |
 
 **Environments and URL routing**: [Environments](../../user-guide/environments) layer on top of deployment groups to control which URL template applies. The environment marked as **production** determines which deployments receive the production URL (via `production_ingress_url_template`). All other deployments — regardless of their group name — use the staging URL template. Custom domains also attach to production environment deployments only. See [user-guide/environments](../../user-guide/environments) for how to create and configure environments.
 
@@ -57,7 +57,7 @@ Rise supports two Ingress routing modes configured globally via URL templates.
 
 **Subdomain Routing** (recommended for production):
 - Production: `{project_name}.apps.rise.local`
-- Staging: `{project_name}-{deployment_group}.preview.rise.local`
+- Staging: `{project_name}--{deployment_group}.preview.rise.local`
 - Each project gets a unique subdomain
 - Ingress path: `/` (Prefix type)
 - No path rewriting needed

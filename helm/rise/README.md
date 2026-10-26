@@ -51,7 +51,7 @@ config:
   kubernetes:
     ingress_class: "nginx"
     production_ingress_url_template: "{project_name}.apps.example.com"
-    staging_ingress_url_template: "{project_name}-{deployment_group}.preview.example.com"
+    staging_ingress_url_template: "{project_name}--{deployment_group}.preview.example.com"
     auth_backend_url: "http://rise.default.svc.cluster.local:3000"
     auth_signin_url: "https://rise.example.com"
 

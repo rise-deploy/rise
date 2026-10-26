@@ -31,6 +31,27 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Preview hostnames join the project with `--`.** *Breaking.* The staging and
+  environment templates must now join `{project_name}` to
+  `{deployment_group}` / `{environment}` with exactly `--`, and the backend
+  refuses to start otherwise (full rule:
+  [Ingress hostname templates](/operator-docs/configuration/#ingress-hostname-templates)).
+  A single hyphen let one project's preview host equal another's: project `a`
+  with group `b-c` and project `a-b` with group `c` shared `a-b-c`.
+  - The `config/production.yaml` and Helm CI defaults change from
+    `{project_name}-{deployment_group}` / `{project_name}-{environment}` to
+    `{project_name}--{deployment_group}` / `{project_name}--{environment}`.
+    Override `RISE_STAGING_INGRESS_URL_TEMPLATE` /
+    `RISE_ENVIRONMENT_INGRESS_URL_TEMPLATE` accordingly if you set them.
+  - Without a staging template, a group's host is now
+    `<project>--<group>.<domain>` instead of `<project>-<group>.<domain>`.
+  - Preview and environment URLs change accordingly; production URLs and
+    custom domains do not.
+  - New project names may not contain `--`. Existing ones keep working, but
+    can still collide: find them with
+    `SELECT name FROM projects WHERE name LIKE '%--%';`. Docker and ECS
+    route a host claimed by two projects to the older one only.
+
 - **The Kubernetes and ECS backends are now licensed under BUSL-1.1.** *Action
   required* for Kubernetes and ECS operators. The Kubernetes and Amazon ECS
   backends and the Helm chart move from `MIT OR Apache-2.0` to the Business

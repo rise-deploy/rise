@@ -574,8 +574,16 @@ async fn build_traefik_dynamic_config(
         access_classes: &access_requirements,
     };
 
+    // Oldest project first, so `withhold_shared_hosts` lets an existing
+    // project keep a host a newer one also renders.
     let mut targets = Vec::new();
-    for project in state.deployment_store.list_projects(None).await? {
+    for project in state
+        .deployment_store
+        .list_projects(None)
+        .await?
+        .into_iter()
+        .rev()
+    {
         let deployments = state
             .deployment_store
             .list_active_deployments_for_project(project.id)
@@ -612,7 +620,7 @@ async fn build_traefik_dynamic_config(
     }
 
     Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
-        targets,
+        rise_backend_traefik::dynamic::withhold_shared_hosts(targets),
         &render_config,
         provider.native_provider,
     ))

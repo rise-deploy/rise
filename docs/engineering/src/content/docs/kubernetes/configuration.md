@@ -18,7 +18,7 @@ kubernetes:
 
   # Optional: Ingress URL template for staging (non-default) deployment groups
   # Must contain both {project_name} and {deployment_group} placeholders
-  staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
+  staging_ingress_url_template: "{project_name}--{deployment_group}.preview.rise.local"
 
   # Or for sub-path routing:
   # production_ingress_url_template: "rise.local/{project_name}"
