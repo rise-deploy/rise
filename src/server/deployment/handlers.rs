@@ -1021,43 +1021,6 @@ fn resolve_resource_check_inputs<'a>(
     }
 }
 
-/// Validate that the K8s resource names a deployment will generate stay within
-/// Kubernetes limits. The per-container Service name `<group>-<container>` must
-/// be a DNS-1035 label (≤ 63 chars) — the binding constraint, since the
-/// deployment group and container name share that budget. The per-container
-/// Deployment name `<project>-<deployment_id>-<container>` must be a DNS-1123
-/// subdomain (≤ 253 chars). Metacontroller surfaces no apply error for an
-/// over-limit name back to the deployment, so we reject at request time.
-#[cfg(feature = "backend")]
-fn validate_container_resource_names(
-    project_name: &str,
-    deployment_group: &str,
-    deployment_id: &str,
-    container_names: &[&str],
-) -> Result<(), ServerError> {
-    use crate::server::deployment::resource_builder::ResourceBuilder;
-    let group = ResourceBuilder::escaped_group_name(deployment_group);
-    for name in container_names {
-        let service_name = format!("{group}-{name}");
-        if service_name.len() > 63 {
-            return Err(ServerError::bad_request(format!(
-                "Container '{name}' would produce Service name '{service_name}' ({} chars), \
-                 over Kubernetes' 63-character limit. Shorten the deployment group or the container name.",
-                service_name.len()
-            )));
-        }
-        let deployment_name = format!("{project_name}-{deployment_id}-{name}");
-        if deployment_name.len() > 253 {
-            return Err(ServerError::bad_request(format!(
-                "Container '{name}' would produce Deployment name '{deployment_name}' ({} chars), \
-                 over Kubernetes' 253-character limit. Shorten the project or container name.",
-                deployment_name.len()
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(feature = "backend")]
 fn validate_resource_constraints(
     state: &AppState,
@@ -1353,22 +1316,25 @@ pub async fn create_deployment(
     let deployment_id = generate_deployment_id();
     debug!("Generated deployment ID: {}", deployment_id);
 
-    // Reject deployments whose generated K8s resource names would exceed K8s
-    // limits. The deployment group and container name share the 63-char
-    // Service-name budget, and the group is only known now — so this can't be
-    // validated at rise.toml parse time. Single-container uses the implicit `app`.
+    // Reject deployments whose generated runtime resource names would exceed
+    // the backend's limits. The deployment group is only known now, so this
+    // can't be validated at rise.toml parse time. Single-container uses the
+    // implicit `app`.
     #[cfg(feature = "backend")]
     {
         let container_names: Vec<&str> = match payload.containers.as_deref() {
             Some(specs) => specs.iter().map(|s| s.name.as_str()).collect(),
             None => vec![crate::rise_toml::DEFAULT_CONTAINER_NAME],
         };
-        validate_container_resource_names(
-            &payload.project,
-            &resolved_group,
-            &deployment_id,
-            &container_names,
-        )?;
+        state
+            .deployment_backend
+            .validate_container_names(
+                &payload.project,
+                &resolved_group,
+                &deployment_id,
+                &container_names,
+            )
+            .map_err(ServerError::bad_request)?;
     }
 
     // Resolve effective http_port:
@@ -3761,9 +3727,9 @@ fn default_log_count_step_seconds() -> i64 {
 mod tests {
     use super::{
         check_log_containers, normalize_env_override_is_protected, resolve_resource_check_inputs,
-        validate_container_resource_names, validate_env_override, validate_env_override_key,
-        validate_identity_audiences, validate_log_stream_query, validate_reported_attributes,
-        LogStreamParams, MAX_REPORTED_ATTRIBUTES_BYTES,
+        validate_env_override, validate_env_override_key, validate_identity_audiences,
+        validate_log_stream_query, validate_reported_attributes, LogStreamParams,
+        MAX_REPORTED_ATTRIBUTES_BYTES,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
@@ -3885,38 +3851,6 @@ mod tests {
         let (total, per) = resolve_resource_check_inputs(Some(&[]), 4, "500m", "256Mi");
         assert_eq!(total, 4);
         assert_eq!(per, vec![("500m", "256Mi")]);
-    }
-
-    #[test]
-    fn container_resource_names_accepts_normal_names() {
-        validate_container_resource_names(
-            "my-app",
-            "default",
-            "20260101-000000",
-            &["app", "api", "worker"],
-        )
-        .expect("normal names should be accepted");
-    }
-
-    #[test]
-    fn container_resource_names_rejects_overlong_service_name() {
-        // The deployment group and container name share the 63-char Service-name
-        // budget. A long group + container overflows it.
-        let long_group = "g".repeat(60);
-        let err =
-            validate_container_resource_names("proj", &long_group, "20260101-000000", &["api"])
-                .unwrap_err();
-        assert!(err.message.contains("63-character"), "got: {}", err.message);
-    }
-
-    #[test]
-    fn container_resource_names_single_container_app_is_checked() {
-        // Single-container deployments also emit a suffixed Service `<group>-app`.
-        let long_group = "g".repeat(61);
-        let err =
-            validate_container_resource_names("proj", &long_group, "20260101-000000", &["app"])
-                .unwrap_err();
-        assert!(err.message.contains("63-character"), "got: {}", err.message);
     }
 
     #[test]

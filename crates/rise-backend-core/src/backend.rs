@@ -95,6 +95,28 @@ pub trait DeploymentBackend: Send + Sync {
         Ok(())
     }
 
+    /// Reject, at request time, container names that would produce runtime
+    /// resource names this backend cannot represent.
+    ///
+    /// `Err` carries a user-facing message and is surfaced as a 400. The limits
+    /// are per-backend — a name that is fine on one runtime may be too long on
+    /// another — so the default accepts everything and each backend narrows it.
+    fn validate_container_names(
+        &self,
+        project_name: &str,
+        deployment_group: &str,
+        deployment_id: &str,
+        container_names: &[&str],
+    ) -> Result<(), String> {
+        let _ = (
+            project_name,
+            deployment_group,
+            deployment_id,
+            container_names,
+        );
+        Ok(())
+    }
+
     /// Static facts about the runtime, surfaced by the platform capabilities
     /// endpoint so clients can adapt (e.g. build for the right architecture).
     fn capabilities(&self) -> BackendCapabilities {
