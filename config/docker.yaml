@@ -125,7 +125,7 @@ deployment_controller:
   traefik_entrypoint: "${RISE_TRAEFIK_ENTRYPOINT:-web}"
   # Optional certresolver. Empty (local) => no TLS labels; prod sets `le`. An
   # empty/whitespace value is normalized to None by the controller (see
-  # normalize_certresolver in src/server/deployment/controller/docker/labels.rs).
+  # normalize_certresolver in crates/rise-backend-traefik/src/labels.rs).
   traefik_certresolver: "${RISE_CERTRESOLVER:-}"
   production_ingress_url_template: "{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"
   staging_ingress_url_template: "{deployment_group}--{project_name}.${RISE_INGRESS_DOMAIN:-rise.localhost}"

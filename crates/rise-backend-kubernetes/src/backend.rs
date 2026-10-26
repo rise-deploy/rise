@@ -18,7 +18,7 @@ use std::sync::Arc;
 ///
 /// Provides log streaming, URL computation, and environment cleanup.
 /// Reconciliation/health checks/termination are handled by the Metacontroller
-/// sync webhook (`src/server/deployment/webhook.rs`).
+/// sync webhook (`crate::webhook`).
 pub struct KubernetesBackend {
     kube_client: kube::Client,
     resource_builder: Arc<ResourceBuilder>,
