@@ -43,7 +43,7 @@ whole HTTP API including `/api/v1/resources`; the project, ECR, resource-GC,
 workload-identity-refresh and Entra-sync loops, each `tokio::spawn`ed in
 `src/server/mod.rs` under a `rise-runtime-sync` leader election; the Docker
 reconciler (`src/server/state.rs`) under the same; and the Metacontroller
-sync/finalize webhook (`src/server/deployment/webhook.rs`).
+sync/finalize webhook (`crates/rise-backend-kubernetes/src/webhook.rs`).
 
 One detail matters to the ordering below: the Kubernetes reconcile *loop* is
 already out of process — Metacontroller runs as its own Deployment and calls
