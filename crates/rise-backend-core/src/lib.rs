@@ -29,6 +29,7 @@ pub mod health_path;
 pub mod identity;
 pub mod labels;
 pub mod lifecycle;
+pub mod log_once;
 pub mod logs;
 pub mod models;
 pub mod naming;
