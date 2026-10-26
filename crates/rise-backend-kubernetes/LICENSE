@@ -21,15 +21,17 @@ Licensed Work:        The Rise Kubernetes and Amazon ECS deployment backends.
                       under MIT OR Apache-2.0 and is not subject to this
                       License. See LICENSING.md.
 
-Additional Use Grant: Non-profit entities may make production use of the
-                      Licensed Work without limitation. Any other production
-                      use of the Licensed Work requires a commercial license
-                      from the Licensor; contact niklas@rosenstein.email.
+Additional Use Grant: You may make production use of the Licensed Work as
+                      part of a Rise distribution in which neither the
+                      Kubernetes nor the Amazon ECS deployment controller
+                      is enabled.
 
-                      Use of a Rise distribution that includes the Licensed
-                      Work is not use of the Licensed Work for the purposes
-                      of this License where neither the Kubernetes nor the
-                      Amazon ECS deployment controller is enabled.
+                      Non-profit entities may make production use of the
+                      Licensed Work without limitation.
+
+                      For any other production use, a commercial license
+                      is available from the Licensor; contact
+                      niklas@rosenstein.email.
 
 Change Date:          Four years from the date the Licensed Work is published.
 

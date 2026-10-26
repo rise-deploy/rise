@@ -47,9 +47,9 @@ the whole path from `rise deploy` through the reconciler to Traefik routing —
 touches no BSL-licensed code.
 
 **The server image contains every backend.** It is built with `--all-features`,
-so the Kubernetes and ECS backends are compiled in. Running it with neither of
-those controllers enabled is explicitly *not* use of the Licensed Work, so a
-Docker-backend operator is in the clear.
+so the Kubernetes and ECS backends are compiled in. The Additional Use Grant
+explicitly permits production use of it with neither of those controllers
+enabled, so a Docker-backend operator is in the clear.
 License scanners read the dependency tree rather than your configuration,
 though, and will report the server image as BUSL-1.1 regardless.
 

@@ -39,9 +39,10 @@ Merged to `develop`:
   and the Terraform modules stay `MIT OR Apache-2.0`. Running the Kubernetes
   or ECS backend in production from this release on requires a commercial
   license (contact niklas@rosenstein.email); non-profits, and development,
-  testing and evaluation, do not. Running the server image with neither
-  controller enabled is not use of the BSL code, but license scanners will
-  still report the image as BUSL-1.1. Nothing changes at runtime. See
+  testing and evaluation, do not. The license explicitly permits production
+  use of the server image with neither controller enabled, but license
+  scanners will still report the image as BUSL-1.1. Nothing changes at
+  runtime. See
   [`LICENSING.md`](https://github.com/rise-deploy/rise/blob/develop/LICENSING.md).
 
 - **Kubernetes 1.32 is the minimum supported version.** *Breaking.* Rise's
