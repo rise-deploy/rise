@@ -28,7 +28,7 @@ pub struct CreateDeploymentParams<'a> {
     pub image_digest: Option<&'a str>,
     pub rolled_back_from_deployment_id: Option<Uuid>,
     pub deployment_group: &'a str,
-    pub environment_id: Option<Uuid>,
+    pub environment_id: Uuid,
     pub expires_at: Option<DateTime<Utc>>,
     pub http_port: i32,
     pub is_active: bool,
@@ -53,6 +53,10 @@ pub struct CreateDeploymentParams<'a> {
     /// Ingress route map (`Vec<RouteSpec>` as JSONB) or `None`. Always `None`
     /// when `containers` is `None`.
     pub routes: Option<&'a serde_json::Value>,
+    /// Present when the environment's `max_deployment_expiration` capped
+    /// `expires_at`. Recorded on the creation event so the timeline shows the
+    /// cap alongside what was actually asked for.
+    pub expiration_cap: Option<&'a rise_backend_core::expiration::ExpirationCap>,
 }
 
 /// List deployments for a project
@@ -387,7 +391,14 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
                     END,
                     'rolled_back_from', ins.rolled_back_from_deployment_id,
                     'job_url', ins.job_url,
-                    'pull_request_url', ins.pull_request_url
+                    'pull_request_url', ins.pull_request_url,
+                    -- The deployment's expiration, and — only when the
+                    -- environment's max_deployment_expiration capped it —
+                    -- what was actually requested and what capped it.
+                    'expires_at', ins.expires_at,
+                    'requested_expires_at', $23::timestamptz,
+                    'max_deployment_expiration', $24::text,
+                    'expiration_limited_by', $25::text
             )) AS attrs) detail
         )
         SELECT
@@ -435,6 +446,11 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             .containers
             .and_then(|c| c.get("items"))
             .is_some_and(serde_json::Value::is_array),
+        params.expiration_cap.and_then(|c| c.requested_expires_at),
+        params
+            .expiration_cap
+            .map(|c| c.max_deployment_expiration.as_str()),
+        params.expiration_cap.map(|c| c.environment.as_str()),
     )
     .fetch_one(pool)
     .await
@@ -1474,84 +1490,138 @@ pub async fn find_last_for_project_and_group(
     Ok(deployment)
 }
 
-/// List deployments for a project with optional group filter
-pub async fn list_for_project_and_group(
+/// Narrows a project's deployment list. Every field left `None` matches all.
+#[derive(Debug, Default, Clone)]
+pub struct DeploymentListFilter<'a> {
+    pub group: Option<&'a str>,
+    /// `true`: only deployments currently serving their group; `false`: only the rest.
+    pub active: Option<bool>,
+    pub environment_id: Option<Uuid>,
+    /// Status names, as stored (e.g. `Failed`).
+    pub statuses: Option<Vec<String>>,
+    /// Case-insensitive substring of the deployment ID, the image, the
+    /// deployment group, or the creator's email.
+    pub search: Option<&'a str>,
+    /// Restricts the list to these environments (a scoped session).
+    pub allowed_environments: Option<Vec<Uuid>>,
+}
+
+/// Largest page [`list_for_project_filtered`] returns.
+pub const MAX_LIST_LIMIT: i64 = 200;
+
+/// List a project's deployments, newest first, filtered and paged. Returns the
+/// page and the number of deployments matching the filter across all pages.
+pub async fn list_for_project_filtered(
     pool: &PgPool,
     project_id: Uuid,
-    group: Option<&str>,
+    filter: &DeploymentListFilter<'_>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<Vec<Deployment>> {
-    let limit_value = limit.unwrap_or(10);
-    let offset_value = offset.unwrap_or(0);
+) -> Result<(Vec<Deployment>, i64)> {
+    let allowed_ids = filter.allowed_environments.as_deref();
+    let statuses = filter.statuses.as_deref();
+    let limit = limit.unwrap_or(10).clamp(1, MAX_LIST_LIMIT);
+    let offset = offset.unwrap_or(0).max(0);
 
-    let deployments = if let Some(g) = group {
-        sqlx::query_as!(
-            Deployment,
-            r#"
-            SELECT
-                id, deployment_id, project_id, created_by_id,
-                status as "status: DeploymentStatus",
-                deployment_group, environment_id, expires_at,
-                termination_reason as "termination_reason: _",
-                completed_at, error_message, build_logs,
-                controller_metadata as "controller_metadata: serde_json::Value",
-                image, image_digest, rolled_back_from_deployment_id,
-                http_port, needs_reconcile, is_active,
-                deploying_started_at,
-                first_healthy_at, job_url, pull_request_url, git_repository_url,
-                replicas, cpu, memory,
-                created_at, updated_at, identity_credential_hash,
-                identity_audiences as "identity_audiences: serde_json::Value",
-                containers as "containers: serde_json::Value",
-                routes as "routes: serde_json::Value"
-            FROM deployments
-            WHERE project_id = $1 AND deployment_group = $2
-            ORDER BY created_at DESC
-            LIMIT $3 OFFSET $4
-            "#,
-            project_id,
-            g,
-            limit_value,
-            offset_value
-        )
-        .fetch_all(pool)
-        .await?
-    } else {
-        // No group filter - return all for project with pagination
-        sqlx::query_as!(
-            Deployment,
-            r#"
-            SELECT
-                id, deployment_id, project_id, created_by_id,
-                status as "status: DeploymentStatus",
-                deployment_group, environment_id, expires_at,
-                termination_reason as "termination_reason: _",
-                completed_at, error_message, build_logs,
-                controller_metadata as "controller_metadata: serde_json::Value",
-                image, image_digest, rolled_back_from_deployment_id,
-                http_port, needs_reconcile, is_active,
-                deploying_started_at,
-                first_healthy_at, job_url, pull_request_url, git_repository_url,
-                replicas, cpu, memory,
-                created_at, updated_at, identity_credential_hash,
-                identity_audiences as "identity_audiences: serde_json::Value",
-                containers as "containers: serde_json::Value",
-                routes as "routes: serde_json::Value"
-            FROM deployments
-            WHERE project_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2 OFFSET $3
-            "#,
-            project_id,
-            limit_value,
-            offset_value
-        )
-        .fetch_all(pool)
-        .await?
-    };
+    let deployments = sqlx::query_as!(
+        Deployment,
+        r#"
+        SELECT
+            d.id, d.deployment_id, d.project_id, d.created_by_id,
+            d.status as "status: DeploymentStatus",
+            d.deployment_group, d.environment_id, d.expires_at,
+            d.termination_reason as "termination_reason: _",
+            d.completed_at, d.error_message, d.build_logs,
+            d.controller_metadata as "controller_metadata: serde_json::Value",
+            d.image, d.image_digest, d.rolled_back_from_deployment_id,
+            d.http_port, d.needs_reconcile, d.is_active,
+            d.deploying_started_at,
+            d.first_healthy_at, d.job_url, d.pull_request_url, d.git_repository_url,
+            d.replicas, d.cpu, d.memory,
+            d.created_at, d.updated_at, d.identity_credential_hash,
+            d.identity_audiences as "identity_audiences: serde_json::Value",
+            d.containers as "containers: serde_json::Value",
+            d.routes as "routes: serde_json::Value"
+        FROM deployments d
+        WHERE d.project_id = $1
+          AND ($2::text IS NULL OR d.deployment_group = $2)
+          AND ($3::bool IS NULL OR d.is_active = $3)
+          AND ($4::uuid IS NULL OR d.environment_id = $4)
+          AND ($5::text[] IS NULL OR d.status = ANY($5))
+          AND ($6::text IS NULL
+               OR strpos(lower(d.deployment_id), lower($6)) > 0
+               OR strpos(lower(COALESCE(d.image, '')), lower($6)) > 0
+               OR strpos(lower(d.deployment_group), lower($6)) > 0
+               OR EXISTS (SELECT 1 FROM users u
+                          WHERE u.id = d.created_by_id
+                            AND strpos(lower(u.email), lower($6)) > 0))
+          AND ($7::uuid[] IS NULL OR d.environment_id = ANY($7))
+        ORDER BY d.created_at DESC
+        LIMIT $8 OFFSET $9
+        "#,
+        project_id,
+        filter.group,
+        filter.active,
+        filter.environment_id,
+        statuses,
+        filter.search,
+        allowed_ids,
+        limit,
+        offset
+    )
+    .fetch_all(pool)
+    .await?;
 
-    Ok(deployments)
+    let total = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!"
+        FROM deployments d
+        WHERE d.project_id = $1
+          AND ($2::text IS NULL OR d.deployment_group = $2)
+          AND ($3::bool IS NULL OR d.is_active = $3)
+          AND ($4::uuid IS NULL OR d.environment_id = $4)
+          AND ($5::text[] IS NULL OR d.status = ANY($5))
+          AND ($6::text IS NULL
+               OR strpos(lower(d.deployment_id), lower($6)) > 0
+               OR strpos(lower(COALESCE(d.image, '')), lower($6)) > 0
+               OR strpos(lower(d.deployment_group), lower($6)) > 0
+               OR EXISTS (SELECT 1 FROM users u
+                          WHERE u.id = d.created_by_id
+                            AND strpos(lower(u.email), lower($6)) > 0))
+          AND ($7::uuid[] IS NULL OR d.environment_id = ANY($7))
+        "#,
+        project_id,
+        filter.group,
+        filter.active,
+        filter.environment_id,
+        statuses,
+        filter.search,
+        allowed_ids
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok((deployments, total))
+}
+
+/// How many of an environment's deployments are not yet in a terminal state.
+/// Deleting an environment deletes its deployments, so it waits until none
+/// are still running.
+pub async fn count_live_for_environment(pool: &PgPool, environment_id: Uuid) -> Result<i64> {
+    let count = sqlx::query_scalar!(
+        r#"
+        SELECT COUNT(*) AS "count!"
+        FROM deployments
+        WHERE environment_id = $1
+          AND status NOT IN ('Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired')
+        "#,
+        environment_id
+    )
+    .fetch_one(pool)
+    .await
+    .context("Failed to count the environment's live deployments")?;
+
+    Ok(count)
 }
 
 /// Get all active deployment groups for a project
@@ -1644,14 +1714,25 @@ pub async fn mark_as_active(
     .await?;
 
     // Then mark the target deployment as active
-    sqlx::query!(
+    let updated = sqlx::query!(
         "UPDATE deployments
          SET is_active = TRUE, updated_at = NOW()
-         WHERE id = $1",
-        deployment_id
+         WHERE id = $1
+           AND project_id = $2
+           AND deployment_group = $3
+           AND NOT is_terminal(status)",
+        deployment_id,
+        project_id,
+        deployment_group,
     )
     .execute(&mut *tx)
     .await?;
+
+    if updated.rows_affected() != 1 {
+        anyhow::bail!(
+            "deployment {deployment_id} is not a non-terminal member of project {project_id} group '{deployment_group}'"
+        );
+    }
 
     tx.commit().await?;
 
@@ -1900,13 +1981,15 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let env = crate::db::environments::test_environment_id(pool, project).await;
         sqlx::query_scalar(
-            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status)
-             VALUES ('20260830-000001', $1, $2, $3) RETURNING id",
+            "INSERT INTO deployments (deployment_id, project_id, created_by_id, status, environment_id)
+             VALUES ('20260830-000001', $1, $2, $3, $4) RETURNING id",
         )
         .bind(project)
         .bind(user)
         .bind(status)
+        .bind(env)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -1939,7 +2022,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -1952,6 +2036,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: Some(&containers),
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2015,6 +2100,110 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn creation_event_records_expiration_cap_only_when_applied(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let requested_expires_at = chrono::Utc::now() + chrono::Duration::days(30);
+        let capped_expires_at = chrono::Utc::now() + chrono::Duration::days(7);
+        let cap = rise_backend_core::expiration::ExpirationCap {
+            requested_expires_at: Some(requested_expires_at),
+            max_deployment_expiration: "7d".to_string(),
+            environment: "staging".to_string(),
+        };
+
+        let capped = create(
+            &pool,
+            CreateDeploymentParams {
+                deployment_id: "20260830-000010",
+                project_id,
+                created_by_id: user_id,
+                status: DeploymentStatus::Pending,
+                image: Some("registry.test/app:v1"),
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: "mr/123",
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
+                expires_at: Some(capped_expires_at),
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 1,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
+                expiration_cap: Some(&cap),
+            },
+        )
+        .await
+        .unwrap();
+
+        let capped_attrs: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(capped.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_close(&capped_attrs["expires_at"], capped_expires_at);
+        assert_close(&capped_attrs["requested_expires_at"], requested_expires_at);
+        assert_eq!(capped_attrs["max_deployment_expiration"], "7d");
+        assert_eq!(capped_attrs["expiration_limited_by"], "staging");
+
+        let uncapped = create(
+            &pool,
+            CreateDeploymentParams {
+                deployment_id: "20260830-000011",
+                project_id,
+                created_by_id: user_id,
+                status: DeploymentStatus::Pending,
+                image: Some("registry.test/app:v1"),
+                image_digest: None,
+                rolled_back_from_deployment_id: None,
+                deployment_group: "default",
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
+                expires_at: Some(requested_expires_at),
+                http_port: 8080,
+                is_active: false,
+                job_url: None,
+                pull_request_url: None,
+                git_repository_url: None,
+                replicas: 1,
+                cpu: "500m",
+                memory: "256Mi",
+                identity_audiences: serde_json::json!({}),
+                containers: None,
+                routes: None,
+                expiration_cap: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let uncapped_attrs: serde_json::Value =
+            sqlx::query_scalar("SELECT attributes FROM deployment_events WHERE deployment_id = $1")
+                .bind(uncapped.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_close(&uncapped_attrs["expires_at"], requested_expires_at);
+        for absent in [
+            "requested_expires_at",
+            "max_deployment_expiration",
+            "expiration_limited_by",
+        ] {
+            assert!(
+                uncapped_attrs.get(absent).is_none(),
+                "{absent} is only recorded when the environment's max_deployment_expiration \
+                 actually capped expires_at",
+            );
+        }
+    }
+
     /// The creation event describes the write it rides along with, so nothing
     /// about assembling it may be able to fail that write. A `containers` value
     /// this does not recognise costs the event one attribute, not the
@@ -2043,7 +2232,8 @@ mod tests {
                     image_digest: None,
                     rolled_back_from_deployment_id: None,
                     deployment_group: "default",
-                    environment_id: None,
+                    environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                        .await,
                     expires_at: None,
                     http_port: 8080,
                     is_active: false,
@@ -2056,6 +2246,7 @@ mod tests {
                     identity_audiences: serde_json::json!({}),
                     containers: Some(&containers),
                     routes: None,
+                    expiration_cap: None,
                 },
             )
             .await
@@ -2216,6 +2407,390 @@ mod tests {
         assert!(
             !keys.contains(&"superseded_by".to_string()),
             "no successor key at all, not a null one: {keys:?}",
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_for_project_filtered_narrows_by_group_and_active(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        for (deployment_id, group, is_active) in [
+            ("20260930-000001", "default", false),
+            ("20260930-000002", "default", true),
+            ("20260930-000003", "preview", true),
+            ("20260930-000004", "preview", false),
+        ] {
+            let environment = crate::db::environments::test_environment_id(&pool, project_id).await;
+            sqlx::query(
+                "INSERT INTO deployments
+                     (deployment_id, project_id, created_by_id, status, deployment_group,
+                      is_active, environment_id)
+                 VALUES ($1, $2, $3, 'Healthy', $4, $5, $6)",
+            )
+            .bind(deployment_id)
+            .bind(project_id)
+            .bind(user_id)
+            .bind(group)
+            .bind(is_active)
+            .bind(environment)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let ids = |rows: Vec<Deployment>| {
+            let mut ids: Vec<String> = rows.into_iter().map(|d| d.deployment_id).collect();
+            ids.sort();
+            ids
+        };
+        let pool = &pool;
+        let list = |group, active| async move {
+            let filter = DeploymentListFilter {
+                group,
+                active,
+                ..Default::default()
+            };
+            list_for_project_filtered(pool, project_id, &filter, Some(100), None)
+                .await
+                .map(|(rows, _)| rows)
+        };
+
+        assert_eq!(ids(list(None, None).await.unwrap()).len(), 4);
+        assert_eq!(
+            ids(list(None, Some(true)).await.unwrap()),
+            ["20260930-000002", "20260930-000003"],
+        );
+        assert_eq!(
+            ids(list(Some("preview"), Some(false)).await.unwrap()),
+            ["20260930-000004"],
+        );
+        assert_eq!(
+            ids(list(Some("default"), None).await.unwrap()),
+            ["20260930-000001", "20260930-000002"],
+        );
+    }
+
+    async fn seed_environment(
+        pool: &PgPool,
+        project_id: Uuid,
+        name: &str,
+        group: &str,
+        is_production: bool,
+    ) -> Uuid {
+        sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO environments (project_id, name, primary_deployment_group, is_production)
+             VALUES ($1, $2, $3, $4) RETURNING id",
+        )
+        .bind(project_id)
+        .bind(name)
+        .bind(group)
+        .bind(is_production)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn list_for_project_filtered_narrows_by_environment_status_and_search(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let production = seed_environment(&pool, project_id, "production", "default", true).await;
+        let staging = seed_environment(&pool, project_id, "staging", "staging", false).await;
+        for (deployment_id, environment, status, image) in [
+            (
+                "20261001-000001",
+                Some(production),
+                "Healthy",
+                "registry/app:abc123",
+            ),
+            (
+                "20261001-000002",
+                Some(production),
+                "Failed",
+                "registry/app:def456",
+            ),
+            (
+                "20261001-000003",
+                Some(staging),
+                "Failed",
+                "registry/app:abc999",
+            ),
+            (
+                "20261001-000004",
+                Some(production),
+                "Stopped",
+                "registry/other:zzz",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO deployments
+                     (deployment_id, project_id, created_by_id, status, deployment_group,
+                      environment_id, image)
+                 VALUES ($1, $2, $3, $4, 'default', $5, $6)",
+            )
+            .bind(deployment_id)
+            .bind(project_id)
+            .bind(user_id)
+            .bind(status)
+            .bind(environment)
+            .bind(image)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let pool = &pool;
+        let list = |filter: DeploymentListFilter<'static>, limit| async move {
+            let (rows, total) =
+                list_for_project_filtered(pool, project_id, &filter, Some(limit), None)
+                    .await
+                    .unwrap();
+            let mut ids: Vec<String> = rows.into_iter().map(|d| d.deployment_id).collect();
+            ids.sort();
+            (ids, total)
+        };
+
+        let (ids, total) = list(
+            DeploymentListFilter {
+                environment_id: Some(production),
+                ..Default::default()
+            },
+            100,
+        )
+        .await;
+        assert_eq!(
+            ids,
+            ["20261001-000001", "20261001-000002", "20261001-000004"]
+        );
+        assert_eq!(total, 3);
+
+        let (ids, _) = list(
+            DeploymentListFilter {
+                statuses: Some(vec!["Failed".into()]),
+                ..Default::default()
+            },
+            100,
+        )
+        .await;
+        assert_eq!(ids, ["20261001-000002", "20261001-000003"]);
+
+        // Search matches the image, case-insensitively.
+        let (ids, _) = list(
+            DeploymentListFilter {
+                search: Some("ABC"),
+                ..Default::default()
+            },
+            100,
+        )
+        .await;
+        assert_eq!(ids, ["20261001-000001", "20261001-000003"]);
+
+        // The total counts every match, not just the page.
+        let (ids, total) = list(DeploymentListFilter::default(), 1).await;
+        assert_eq!(ids.len(), 1);
+        assert_eq!(total, 4);
+
+        // A scoped session reaching only staging sees nothing else, and the
+        // total agrees with what it can see.
+        let (ids, total) = list(
+            DeploymentListFilter {
+                allowed_environments: Some(vec![staging]),
+                ..Default::default()
+            },
+            100,
+        )
+        .await;
+        assert_eq!(ids, ["20261001-000003"]);
+        assert_eq!(total, 1);
+    }
+
+    /// Deleting an environment takes its deployments with it, so the handler
+    /// waits until none are running; the count is what it checks.
+    #[sqlx::test]
+    async fn an_environment_deletes_with_its_deployments_once_none_are_live(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let staging = seed_environment(&pool, project_id, "staging", "staging", false).await;
+        let deployment = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261025-000001",
+            "staging",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        sqlx::query("UPDATE deployments SET environment_id = $1 WHERE id = $2")
+            .bind(staging)
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_live_for_environment(&pool, staging).await.unwrap(), 1);
+
+        sqlx::query("UPDATE deployments SET status = 'Stopped' WHERE id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count_live_for_environment(&pool, staging).await.unwrap(), 0);
+
+        assert!(crate::db::environments::delete(&pool, staging)
+            .await
+            .unwrap());
+        assert!(find_by_id(&pool, deployment.id).await.unwrap().is_none());
+    }
+
+    #[sqlx::test]
+    async fn provenance_batch_inherits_git_state_through_source_deployments(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        let built = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261002-000001",
+            "default",
+            DeploymentStatus::Superseded,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO deployment_events
+                 (deployment_id, occurred_at, kind, severity, source, attributes)
+             VALUES ($1, NOW(), 'status_changed', 'info', 'cli', $2)",
+        )
+        .bind(built.id)
+        .bind(serde_json::json!({
+            "from": "Pending", "to": "Building",
+            "git_revision": "0123abcd", "git_branch": "main", "git_dirty": true
+        }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Two generations of redeploys: neither was built, both inherit.
+        let mut parent = built.id;
+        let mut redeploys = Vec::new();
+        for deployment_id in ["20261002-000002", "20261002-000003"] {
+            let id = sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO deployments
+                     (deployment_id, project_id, created_by_id, status, deployment_group,
+                      rolled_back_from_deployment_id, environment_id)
+                 VALUES ($1, $2, $3, 'Healthy', 'default', $4, $5) RETURNING id",
+            )
+            .bind(deployment_id)
+            .bind(project_id)
+            .bind(user_id)
+            .bind(parent)
+            .bind(built.environment_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            redeploys.push(id);
+            parent = id;
+        }
+        let unrelated = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261002-000004",
+            "default",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+
+        let map = crate::db::deployment_events::provenance_batch(
+            &pool,
+            &[built.id, redeploys[0], redeploys[1], unrelated.id],
+        )
+        .await
+        .unwrap();
+
+        let built_provenance = &map[&built.id];
+        assert_eq!(built_provenance.git_revision.as_deref(), Some("0123abcd"));
+        assert_eq!(built_provenance.git_branch.as_deref(), Some("main"));
+        assert_eq!(built_provenance.git_dirty, Some(true));
+        assert_eq!(built_provenance.source_deployment_id, None);
+
+        let second = &map[&redeploys[1]];
+        assert_eq!(second.git_revision.as_deref(), Some("0123abcd"));
+        assert_eq!(
+            second.source_deployment_id.as_deref(),
+            Some("20261002-000002")
+        );
+
+        assert!(!map.contains_key(&unrelated.id));
+    }
+
+    /// Project status follows the production environment's primary group, not
+    /// the `default` group.
+    #[sqlx::test]
+    async fn project_status_follows_the_production_group(pool: PgPool) {
+        let (project_id, user_id) = seed_project_and_user(&pool).await;
+        seed_environment(&pool, project_id, "production", "live", true).await;
+
+        // `default` serves something healthy, but production does not.
+        let default_active = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261003-000001",
+            "default",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        mark_as_active(&pool, default_active.id, project_id, "default")
+            .await
+            .unwrap();
+        seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261003-000002",
+            "live",
+            DeploymentStatus::Failed,
+        )
+        .await;
+
+        let project = crate::db::projects::update_calculated_status(&pool, project_id)
+            .await
+            .unwrap();
+        assert_eq!(project.status, crate::db::models::ProjectStatus::Stopped);
+
+        // Once production serves a healthy deployment, the project runs; a
+        // newer failed deploy shows as the latest without taking it down.
+        let live = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261003-000003",
+            "live",
+            DeploymentStatus::Healthy,
+        )
+        .await;
+        mark_as_active(&pool, live.id, project_id, "live")
+            .await
+            .unwrap();
+        let failed = seed_deployment(
+            &pool,
+            project_id,
+            user_id,
+            "20261003-000004",
+            "live",
+            DeploymentStatus::Failed,
+        )
+        .await;
+
+        let project = crate::db::projects::update_calculated_status(&pool, project_id)
+            .await
+            .unwrap();
+        assert_eq!(project.status, crate::db::models::ProjectStatus::Running);
+
+        let info = crate::db::projects::get_active_deployment_info_batch(&pool, &[project_id])
+            .await
+            .unwrap();
+        let info = &info[&project_id];
+        assert_eq!(info.active.as_ref().map(|a| a.id), Some(live.id));
+        assert_eq!(info.latest.as_ref().map(|l| l.id), Some(failed.id));
+        assert_eq!(
+            info.latest.as_ref().map(|l| l.status.clone()),
+            Some(DeploymentStatus::Failed)
         );
     }
 
@@ -2603,7 +3178,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -2616,6 +3192,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2693,7 +3270,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -2706,6 +3284,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2769,7 +3348,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: "default",
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(&pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -2782,6 +3362,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await
@@ -2808,6 +3389,26 @@ mod tests {
         assert!(result.is_none());
         let current = find_by_id(&pool, deployment.id).await.unwrap().unwrap();
         assert_eq!(current.status, DeploymentStatus::Terminating);
+    }
+
+    /// Compare a jsonb-stored timestamp against the `DateTime<Utc>` it was
+    /// written from. Postgres truncates `timestamptz` to microsecond
+    /// precision, so an exact string match against chrono's (sub-microsecond)
+    /// `to_rfc3339()` would be brittle; a sub-millisecond tolerance is not.
+    fn assert_close(actual: &serde_json::Value, expected: chrono::DateTime<chrono::Utc>) {
+        let actual = actual
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .unwrap_or_else(|| panic!("expected an RFC3339 timestamp, got {actual:?}"))
+            .with_timezone(&chrono::Utc);
+        let diff = (actual - expected)
+            .num_microseconds()
+            .unwrap_or(i64::MAX)
+            .abs();
+        assert!(
+            diff < 1000,
+            "expected {expected} and stored {actual} to be within 1ms, differed by {diff}us",
+        );
     }
 
     async fn seed_project_and_user(pool: &PgPool) -> (Uuid, Uuid) {
@@ -2854,7 +3455,8 @@ mod tests {
                 image_digest: None,
                 rolled_back_from_deployment_id: None,
                 deployment_group: group,
-                environment_id: None,
+                environment_id: crate::db::environments::test_environment_id(pool, project_id)
+                    .await,
                 expires_at: None,
                 http_port: 8080,
                 is_active: false,
@@ -2867,6 +3469,7 @@ mod tests {
                 identity_audiences: serde_json::json!({}),
                 containers: None,
                 routes: None,
+                expiration_cap: None,
             },
         )
         .await

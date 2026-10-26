@@ -1,6 +1,7 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use crate::config::Config;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,7 +66,7 @@ pub async fn create_extension(
             extension_type: extension_type.to_string(),
             spec,
         })
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to create extension")?;
 
@@ -115,7 +116,7 @@ pub async fn update_extension(project: &str, extension: &str, spec: Value) -> Re
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&UpdateExtensionRequest { spec })
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to update extension")?;
 
@@ -165,7 +166,7 @@ pub async fn patch_extension(project: &str, extension: &str, spec: Value) -> Res
         .patch(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&UpdateExtensionRequest { spec })
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to patch extension")?;
 
@@ -211,7 +212,7 @@ pub async fn list_extensions(project: &str) -> Result<()> {
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to list extensions")?;
 
@@ -240,8 +241,7 @@ pub async fn list_extensions(project: &str) -> Result<()> {
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("NAME").add_attribute(Attribute::Bold),
             Cell::new("TYPE").add_attribute(Attribute::Bold),
@@ -278,7 +278,7 @@ pub async fn show_extension(project: &str, extension: &str) -> Result<()> {
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to get extension")?;
 
@@ -326,7 +326,7 @@ pub async fn delete_extension(project: &str, extension: &str) -> Result<()> {
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(&backend_url)
         .await
         .context("Failed to delete extension")?;
 

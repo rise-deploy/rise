@@ -233,7 +233,6 @@ auth:
   admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
   operator_idp_groups: ["..."]  # IdP groups whose members are Operators (array, optional)
-  controllers: []               # Trusted external controller identities (array, optional)
   allow_team_creation: true     # Allow regular users to create teams (default: true)
                                 # When false, only admins can create teams
 ```
@@ -278,21 +277,8 @@ Three consequences:
 
 The same resolution backs `platform_access.allowed_idp_groups`.
 
-**Controllers (`auth.controllers`):**
-Trusted external controllers authenticate to Rise with OIDC JWTs. Each entry registers a `ControllerIdentity` that controller endpoints use to validate incoming tokens. Controller endpoints are not yet available; this configuration takes effect when the generic resource API is introduced in a future release. Use a dedicated issuer or a dedicated audience per controller to keep identities unambiguous.
-
-```yaml
-auth:
-  controllers:
-    - id: "controller.example.com/my-ctrl"  # DNS subdomain + optional /name suffix
-      issuer: "https://controller-idp.example.com"
-      claims:                                # required; wildcard match per claim
-        aud: "rise-controller"               # required; string or array JWT `aud` may match
-        sub: "my-controller-*"               # optional subject constraint
-        scope: "controller"
-```
-
-`claims.aud` is required for every controller identity. Other constraints, including `sub`, are configured in `claims`. Controller endpoints require a token that matches one configured controller identity. Service-account endpoints still use project-scoped service-account claims; a token that matches a configured controller identity is rejected as a service-account token.
+**Controllers:**
+Controller identities are not configured here — they are `Controller` and `ControllerTrustPolicy` resources managed through the generic resource API. See [Authentication & Tokens — Controllers](/operator-docs/authentication/#controllers) for how to register one.
 
 **Team Creation Control:**
 - `allow_team_creation = true` (default): All authenticated users can create teams
@@ -318,7 +304,15 @@ account_id = "123456789012"
 repo_prefix = "rise/"
 push_role_arn = "arn:aws:iam::..."
 auto_remove = true
+# Optional: the registry host images are pushed to and deployed from, as
+# host[:port]. Defaults to <account_id>.dkr.ecr.<region>.amazonaws.com; set it
+# for another ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+# The ECR API endpoint itself follows the AWS SDK (`AWS_ENDPOINT_URL`).
+# registry_host = "123456789012.dkr.ecr.us-east-1.localhost:4566"
 ```
+
+On ECS (`config/ecs.yaml`) this is `RISE_ECR_REGISTRY_HOST`, which the
+`rise-ecs` module sets from `ecr_registry_host`.
 
 #### OCI Registry (Docker, Harbor, Quay)
 
@@ -472,7 +466,8 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `production_ingress_url_template` — host template for production deployments.
 - `staging_ingress_url_template?` / `environment_ingress_url_template?` — host
   templates for staging / per-environment deployments.
-- `ingress_schema` — `http` or `https` (default `https`).
+- `ingress_schema` — `http` or `https` (default `https`). The scheme browsers use to
+  reach apps; also used for sign-in redirects and `/.rise` callback URLs on app hosts.
 - `ingress_port?` — external port apps are served on (e.g. `80` locally).
 - `controller_class_name` — controller ownership class (default `default`).
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).

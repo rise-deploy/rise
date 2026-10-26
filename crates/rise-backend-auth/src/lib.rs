@@ -13,21 +13,24 @@
 mod claims;
 mod error;
 mod matchers;
+pub mod session_scope;
 mod signer;
 mod verify;
 mod workload;
 
 pub use claims::{
-    AccessClaims, ExternalClaims, PrincipalClaims, RiseClaims, Scope, WorkloadClaims,
-    WorkloadSubjectInfo,
+    AccessClaims, ActorClaim, ExternalClaims, IdentityClaims, PrincipalClaims, RiseClaims, Scope,
+    SessionClient, WorkloadClaims, WorkloadSubjectInfo, MAX_DELEGATION_DEPTH,
 };
 pub use error::{AuthError, JwtSignerError};
 pub use matchers::{
-    audience_matches, build_controller_indexes, match_controller_identity,
-    matches_wildcard_pattern, validate_controller_id, validate_custom_claims, validate_oidc_issuer,
-    ControllerIdentity, ControllerIndexes, ControllerMatch,
+    audience_matches, match_trust_candidates, matches_wildcard_pattern, validate_custom_claims,
+    validate_oidc_issuer, TrustCandidate, TrustMatch,
 };
-pub use signer::{compute_key_id, RiseTokenSigner, RISE_ACCESS_TYP};
+pub use signer::{
+    compute_key_id, IdentityTokenSpec, RiseTokenSigner, SessionUser, RISE_ACCESS_TYP,
+    RISE_IDENTITY_TYP, RISE_SESSION_TYP,
+};
 pub use verify::{verify_external_jwt, JwksKeySource, RiseToken};
 pub use workload::{
     generate_bootstrap_credential, sha256_hex, sign_audience_tokens, workload_subject,

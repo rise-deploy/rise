@@ -1,7 +1,9 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +31,34 @@ struct SetEnvVarRequest {
     is_protected: bool,
 }
 
+/// Return a supplied value or prompt for one when it is omitted.
+pub fn resolve_env_value(value: Option<&str>, is_secret: bool) -> Result<String> {
+    if let Some(value) = value {
+        return Ok(value.to_string());
+    }
+
+    if is_secret {
+        return rpassword::prompt_password("Value: ")
+            .context("Failed to read environment variable value");
+    }
+
+    read_plain_env_value(&mut std::io::stdin().lock(), &mut std::io::stderr())
+}
+
+fn read_plain_env_value(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<String> {
+    write!(writer, "Value: ").context("Failed to write environment variable prompt")?;
+    writer
+        .flush()
+        .context("Failed to write environment variable prompt")?;
+
+    let mut value = String::new();
+    reader
+        .read_line(&mut value)
+        .context("Failed to read environment variable value")?;
+    value.truncate(value.trim_end_matches(['\r', '\n']).len());
+    Ok(value)
+}
+
 /// Build a URL with an optional `?environment=` query parameter
 fn env_url(backend_url: &str, project: &str, suffix: &str, environment: Option<&str>) -> String {
     let base = format!("{}/api/v1/projects/{}/env{}", backend_url, project, suffix);
@@ -52,7 +82,7 @@ async fn fetch_env_vars_response(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch environment variables")?;
 
@@ -101,7 +131,7 @@ pub async fn fetch_preview_env_vars(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to fetch preview environment variables")?;
 
@@ -162,7 +192,7 @@ pub async fn set_env(
         .put(&url)
         .header("Authorization", format!("Bearer {}", token))
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to set environment variable")?;
 
@@ -230,9 +260,7 @@ pub async fn list_env(
             .any(|v| v.environment.is_some());
 
     let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS);
+    table.load_style(UTF8_FULL.with_rounded_corners());
 
     if show_env_col {
         table.set_header(vec![
@@ -304,8 +332,9 @@ pub async fn get_env(
     if env_var.is_secret && env_var.is_protected {
         anyhow::bail!(
             "Cannot retrieve value: '{}' is a protected secret.\n\
-             To make it unprotected, update it with: rise env set {} <value> --secret --protected=false",
-            key, key
+             To make it retrievable, update it with: rise env set {} <value> --secret",
+            key,
+            key
         );
     }
 
@@ -321,7 +350,7 @@ pub async fn get_env(
         let response = http_client
             .get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .send()
+            .send_with_auth_hint(backend_url)
             .await
             .context("Failed to get environment variable value")?;
 
@@ -372,7 +401,7 @@ pub async fn unset_env(
     let response = http_client
         .delete(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to delete environment variable")?;
 
@@ -556,7 +585,7 @@ pub async fn list_deployment_env(
     let response = http_client
         .get(&url)
         .header("Authorization", format!("Bearer {}", token))
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to list deployment environment variables")?;
 
@@ -588,8 +617,7 @@ pub async fn list_deployment_env(
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("KEY").add_attribute(Attribute::Bold),
             Cell::new("VALUE").add_attribute(Attribute::Bold),
@@ -617,10 +645,29 @@ pub async fn list_deployment_env(
     Ok(())
 }
 
-/// Export environment variables in dotfile format (KEY=value per line).
+/// Quote a value as a POSIX shell single-quoted string.
+fn shell_quote(value: &str) -> anyhow::Result<String> {
+    if value.contains('\0') {
+        anyhow::bail!("Environment variable values cannot contain NUL bytes")
+    }
+
+    Ok(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+/// Check whether a key can be exported by a POSIX-compatible shell.
+fn is_shell_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(
+        chars.next(),
+        Some(c) if c.is_ascii_alphabetic() || c == '_'
+    ) && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Export environment variables as shell commands (`export KEY='value'`).
 ///
-/// Output goes to stdout for clean piping (`rise env export > .env` or
-/// `eval $(rise env export)`). Warnings about protected secrets go to stderr.
+/// Output goes to stdout for clean piping (`eval "$(rise env export)"` or
+/// `rise env export > .env.rise && source .env.rise`). Warnings about protected
+/// secrets go to stderr.
 pub async fn export_env(
     http_client: &Client,
     backend_url: &str,
@@ -638,6 +685,16 @@ pub async fn export_env(
     )
     .await?;
 
+    for (key, value) in &loadable_vars {
+        if !is_shell_identifier(key) {
+            anyhow::bail!(
+                "Cannot export environment variable '{}': the key is not a valid shell identifier",
+                key
+            );
+        }
+        shell_quote(value)?;
+    }
+
     if !protected_keys.is_empty() {
         eprintln!(
             "warning: {} protected secret{} excluded (cannot be exported):",
@@ -650,7 +707,7 @@ pub async fn export_env(
     }
 
     for (key, value) in &loadable_vars {
-        println!("{}={}", key, value);
+        println!("export {}={}", key, shell_quote(value)?);
     }
 
     Ok(())
@@ -658,7 +715,59 @@ pub async fn export_env(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_env_file, parse_env_string};
+    use super::{
+        is_shell_identifier, parse_env_file, parse_env_string, read_plain_env_value,
+        resolve_env_value, shell_quote,
+    };
+
+    #[test]
+    fn supplied_env_value_does_not_prompt() {
+        assert_eq!(
+            resolve_env_value(Some("  value  "), false).unwrap(),
+            "  value  "
+        );
+    }
+
+    #[test]
+    fn plain_env_prompt_removes_only_the_line_ending() {
+        let mut input = &b"  value  \r\n"[..];
+        let mut output = Vec::new();
+
+        assert_eq!(
+            read_plain_env_value(&mut input, &mut output).unwrap(),
+            "  value  "
+        );
+        assert_eq!(output, b"Value: ");
+    }
+
+    #[test]
+    fn shell_quote_preserves_shell_significant_values() {
+        assert_eq!(shell_quote("").unwrap(), "''");
+        assert_eq!(shell_quote("hello world").unwrap(), "'hello world'");
+        assert_eq!(shell_quote("it's").unwrap(), "'it'\\''s'");
+        assert_eq!(
+            shell_quote("line one\nline two").unwrap(),
+            "'line one\nline two'"
+        );
+        assert_eq!(
+            shell_quote("$(touch /tmp/pwned); *.txt").unwrap(),
+            "'$(touch /tmp/pwned); *.txt'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_rejects_nul_bytes() {
+        assert!(shell_quote("before\0after").is_err());
+    }
+
+    #[test]
+    fn shell_identifier_requires_portable_variable_name() {
+        assert!(is_shell_identifier("FOO_2"));
+        assert!(is_shell_identifier("_private"));
+        assert!(!is_shell_identifier("2FOO"));
+        assert!(!is_shell_identifier("foo.bar"));
+        assert!(!is_shell_identifier("foo-bar"));
+    }
 
     #[test]
     fn parse_env_string_rejects_empty_keys() {

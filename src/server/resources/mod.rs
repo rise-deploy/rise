@@ -13,3 +13,4 @@ mod organization;
 pub mod path;
 pub mod routes;
 pub mod schemas;
+pub mod token;

@@ -1,20 +1,81 @@
 use rise_resource_api::{
     Effect, KindMatcher, PolicyStatement, Scope, SubjectId, SubresourceMatcher, VerbMatcher,
 };
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use crate::engine::{AuthorizationError, ResourceTree};
 
+/// The RFC 9396 `type` of every Rise authorization-detail entry (ADR-0001 §7).
+pub const RBAC_DETAIL_TYPE: &str = "rise.dev/rbac";
+
 /// One `rise.dev/rbac` authorization-detail permission (ADR-0001 §7).
 ///
 /// The grammar is a Role statement's without an effect: a ceiling only ever
-/// removes authority, so every entry is implicitly an Allow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// removes authority, so every entry is implicitly an Allow. The serialized
+/// form is the wire shape of one `permissions` element; the matchers reject an
+/// empty axis, a non-`*` wildcard, and duplicates exactly as a Role does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapPermission {
     pub verbs: VerbMatcher,
     pub kinds: KindMatcher,
     /// Omission covers the main resource only, exactly as in a Role statement.
+    /// An explicit `null` is rejected rather than read as omission.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
     pub subresources: Option<SubresourceMatcher>,
+}
+
+fn deserialize_optional_non_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// The wire shape of one `authorization_details` entry.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationDetail {
+    #[serde(rename = "type")]
+    detail_type: String,
+    scope: Scope,
+    permissions: Vec<CapPermission>,
+}
+
+impl TryFrom<AuthorizationDetail> for CapEntry {
+    type Error = String;
+
+    fn try_from(detail: AuthorizationDetail) -> Result<Self, Self::Error> {
+        if detail.detail_type != RBAC_DETAIL_TYPE {
+            return Err(format!(
+                "authorization detail type must be '{RBAC_DETAIL_TYPE}', got '{}'",
+                detail.detail_type
+            ));
+        }
+        if detail.permissions.is_empty() {
+            return Err("authorization detail permissions must not be empty".into());
+        }
+        Ok(Self {
+            scope: detail.scope,
+            permissions: detail.permissions,
+        })
+    }
+}
+
+impl From<CapEntry> for AuthorizationDetail {
+    fn from(entry: CapEntry) -> Self {
+        Self {
+            detail_type: RBAC_DETAIL_TYPE.to_owned(),
+            scope: entry.scope,
+            permissions: entry.permissions,
+        }
+    }
 }
 
 impl CapPermission {
@@ -30,7 +91,11 @@ impl CapPermission {
 
 /// One authorization-detail entry: a single qualified Scope and the permissions
 /// the token retains within it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes as an RFC 9396 entry of type [`RBAC_DETAIL_TYPE`]; deserializing
+/// rejects any other type and an empty permission list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AuthorizationDetail", into = "AuthorizationDetail")]
 pub struct CapEntry {
     pub scope: Scope,
     pub permissions: Vec<CapPermission>,
@@ -49,6 +114,53 @@ pub enum AuthorizationCap {
 }
 
 impl AuthorizationCap {
+    /// Parse a credential's `authorization_details` claim, or a `/token`
+    /// request's narrowing, into a ceiling (ADR-0001 §7).
+    ///
+    /// `None` is the omitted claim and means the full live policy. A present
+    /// value must be a non-empty array of well-formed `rise.dev/rbac` entries:
+    /// an empty array, a non-array, an unknown type, or a malformed entry is an
+    /// error rather than a fallback to full access, and the caller treats that
+    /// error as an invalid credential.
+    pub fn from_details(details: Option<&[serde_json::Value]>) -> Result<Self, AuthorizationError> {
+        let Some(details) = details else {
+            return Ok(Self::Unrestricted);
+        };
+        if details.is_empty() {
+            return Err(AuthorizationError::invalid_input(
+                "authorization_details must not be an empty list",
+            ));
+        }
+        details
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                serde_json::from_value::<CapEntry>(entry.clone()).map_err(|error| {
+                    AuthorizationError::invalid_input(format!(
+                        "authorization_details[{index}] is invalid: {error}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self::Restricted)
+    }
+
+    /// The canonical claim value for this ceiling: `None` for an unrestricted
+    /// credential, otherwise the entries in wire form.
+    pub fn to_details(&self) -> Option<Vec<serde_json::Value>> {
+        match self {
+            Self::Unrestricted => None,
+            Self::Restricted(entries) => Some(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::to_value(entry).expect("a CapEntry serializes to JSON")
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
     /// The ceiling that applies to one resource: the union of every entry whose
     /// Scope covers it. `None` means unrestricted.
     pub(crate) fn ceiling_for(&self, target: &ResourceTree) -> Option<Vec<PolicyStatement>> {

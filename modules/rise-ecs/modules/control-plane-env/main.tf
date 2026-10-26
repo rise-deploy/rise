@@ -55,7 +55,15 @@ locals {
 
       RISE_MAX_REPLICAS  = tostring(var.max_replicas)
       RISE_REGISTRY_TYPE = var.registry.type
+
+      RISE_ECS_IDENTITY_AGENT_IMAGE = var.identity_agent_image
     },
+    var.identity_token_ttl_seconds != null ? {
+      RISE_IDENTITY_TOKEN_TTL_SECONDS = tostring(var.identity_token_ttl_seconds)
+    } : {},
+    var.identity_exchange_url != null ? {
+      RISE_ECS_IDENTITY_EXCHANGE_URL = var.identity_exchange_url
+    } : {},
     var.repository_credentials_secret_arn != null ? {
       RISE_ECS_REPOSITORY_CREDENTIALS_SECRET_ARN = var.repository_credentials_secret_arn
     } : {},
@@ -64,6 +72,9 @@ locals {
       RISE_ECR_PUSH_ROLE_ARN = var.registry.push_role_arn
       RISE_ECR_REPO_PREFIX   = var.registry.repo_prefix
       RISE_ECR_AUTO_REMOVE   = tostring(var.registry.auto_remove)
+    } : {},
+    var.registry.type == "ecr" && var.registry.registry_host != null ? {
+      RISE_ECR_REGISTRY_HOST = var.registry.registry_host
     } : {},
     var.registry.type == "oci-client-auth" ? {
       RISE_REGISTRY_URL       = var.registry.registry_url

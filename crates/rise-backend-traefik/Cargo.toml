@@ -21,4 +21,5 @@ url = { workspace = true }
 urlencoding = "2.1"
 
 [dev-dependencies]
+rise-backend-core = { path = "../rise-backend-core", features = ["test-helpers"] }
 tokio = { workspace = true }

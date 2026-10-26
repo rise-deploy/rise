@@ -11,7 +11,6 @@ use crate::server::registry::{
 use rise_backend_auth::RiseTokenSigner;
 
 use crate::db::models::User;
-use crate::server::auth::controller::ControllerIdentity;
 #[cfg(feature = "backend")]
 use crate::server::registry::{
     models::{EcrConfig, GitLabRegistryConfig, JfrogConfig, JfrogTokenProvider},
@@ -42,6 +41,17 @@ pub struct ControllerState {
     pub deployment_retention: crate::server::settings::DeploymentRetentionSettings,
 }
 
+#[cfg(feature = "backend")]
+#[derive(Clone)]
+pub struct TraefikHttpProviderConfig {
+    pub native_provider: &'static str,
+    pub label_namespace: String,
+    pub controller_class: String,
+    pub entrypoint: String,
+    pub certresolver: Option<String>,
+    pub auth_backend_url: String,
+}
+
 /// Full state for HTTP server
 #[derive(Clone)]
 pub struct AppState {
@@ -66,12 +76,6 @@ pub struct AppState {
     pub operator_users: Arc<Vec<String>>,
     /// IdP groups whose members hold the Operator role.
     pub operator_idp_groups: Arc<Vec<String>>,
-    /// Controller identities keyed by `id`. Consumed by future generic
-    /// resource endpoints; unused in PR3.
-    #[allow(dead_code)]
-    pub controllers: Arc<HashMap<String, ControllerIdentity>>,
-    /// Controller identities indexed by issuer URL for middleware lookup.
-    pub controllers_by_issuer: Arc<HashMap<String, Vec<ControllerIdentity>>>,
     /// Generic-resource store used by the `/api/v1/resources` HTTP API and
     /// (later) by internal controllers wanting to reconcile against Rise state
     /// without a network round-trip.
@@ -83,17 +87,34 @@ pub struct AppState {
     /// `SERIALIZABLE` transaction.
     #[cfg(feature = "backend")]
     pub resource_authorizer: crate::server::authz::ResourceAuthorizer,
+    /// Resolves interactive logins and User sessions to live `User` resources
+    /// (ADR-0001 §1, §7), provisioning a User on a first login.
+    #[cfg(feature = "backend")]
+    pub user_logins: crate::server::auth::user_identity::UserLogins,
     /// Resource UID of the default Organization. Populated by the bootstrap
     /// pass at startup; typed APIs use this to stamp newly created
     /// users/teams/projects with the configured default Organization.
     #[cfg(feature = "backend")]
     pub default_organization_uid: uuid::Uuid,
+    /// Configured name of the default Organization (`default_organization.name`
+    /// in settings). The generic resource API's policy-audit listing uses this
+    /// to downgrade that Organization's `OrganizationWithoutAdmin` finding to
+    /// `info`: it is administered by operators through the seeded
+    /// `system-admin` binding, not a per-organization admin (ADR-0001 audit
+    /// decision D4).
+    #[cfg(feature = "backend")]
+    pub default_organization_name: String,
     /// `controller_class_name` for the configured Kubernetes deployment
     /// controller. The webhook only reconciles projects whose Organization's
     /// `spec.deploymentControllerClass` matches this value. `None` when no
     /// Kubernetes deployment controller is configured.
     #[cfg(feature = "backend")]
     pub deployment_controller_class_name: Option<String>,
+    /// Dynamic public-routing configuration for Traefik-fronted runtimes.
+    /// The HTTP endpoint combines this static runtime configuration with the
+    /// active deployment and current project/domain rows on every request.
+    #[cfg(feature = "backend")]
+    pub traefik_http_provider: Option<TraefikHttpProviderConfig>,
     /// Per-Organization reads (controller class, namespace prefix) for the
     /// deployment backends, cached behind a short TTL.
     #[cfg(feature = "backend")]
@@ -119,6 +140,8 @@ pub struct AppState {
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
     /// Rate limiter for OAuth endpoints (token, authorize, callback)
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
+    /// Rate limiter for the workload identity token-exchange endpoint.
+    pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
     /// Project-name labels reserved for control-plane hosts. Normalized to
@@ -401,6 +424,7 @@ async fn init_ecs_backend(
         ssm_parameter_prefix,
         ssm_kms_key_id,
         cpu_architecture,
+        capacity,
         production_ingress_url_template,
         staging_ingress_url_template,
         environment_ingress_url_template,
@@ -415,6 +439,9 @@ async fn init_ecs_backend(
         controller_class_name,
         reconcile_interval_secs,
         health_probes,
+        identity_agent_image,
+        identity_exchange_url,
+        identity_token_ttl_seconds,
         ..
     } = settings
     else {
@@ -495,6 +522,8 @@ async fn init_ecs_backend(
         );
     }
 
+    tracing::info!(image = %identity_agent_image, "ECS workload-identity sidecar image");
+
     let reconciler = EcsReconciler::new(
         ecs,
         ssm,
@@ -517,6 +546,7 @@ async fn init_ecs_backend(
             ssm_parameter_prefix: ssm_parameter_prefix.clone(),
             ssm_kms_key_id: ssm_kms_key_id.clone(),
             cpu_architecture: cpu_architecture.clone(),
+            capacity: rise_backend_ecs::capacity::Capacity::parse(capacity)?,
             controller_class: controller_class_name.clone(),
             label_namespace: label_namespace.clone(),
             reconcile_interval_secs: *reconcile_interval_secs,
@@ -529,6 +559,11 @@ async fn init_ecs_backend(
                 traefik_certresolver.clone(),
             ),
             traefik_api_url: traefik_api_url.clone(),
+            identity_agent_image: identity_agent_image.trim().to_string(),
+            identity_exchange_url: identity_exchange_url
+                .clone()
+                .unwrap_or_else(|| public_url.to_string()),
+            identity_token_ttl_seconds: *identity_token_ttl_seconds,
         },
     );
     let reconciler_handle = reconciler.spawn(shutdown);
@@ -845,6 +880,8 @@ impl AppState {
                 .context("Default-Organization bootstrap failed")?;
         #[cfg(feature = "backend")]
         let default_organization_uid = bootstrap_outcome.default_organization_uid;
+        #[cfg(feature = "backend")]
+        let default_organization_name = settings.default_organization.name.clone();
 
         // Initialize JWT validator (JWKS is fetched on-demand)
         let jwt_validator = Arc::new(JwtValidator::new(settings.server.ssrf.clone()));
@@ -891,6 +928,7 @@ impl AppState {
                     auto_remove,
                     access_key_id,
                     secret_access_key,
+                    registry_host,
                 } => {
                     let ecr_config = EcrConfig {
                         region: region.clone(),
@@ -900,6 +938,7 @@ impl AppState {
                         auto_remove: *auto_remove,
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
+                        registry_host: registry_host.clone(),
                     };
                     let provider = EcrProvider::new(ecr_config)
                         .await
@@ -1136,20 +1175,12 @@ impl AppState {
             },
         );
 
-        // Validate and index configured controller identities
-        let controller_indexes =
-            crate::server::auth::controller::build_controller_indexes(&settings.auth.controllers)
-                .context("Failed to load controller identities from auth.controllers")?;
-        let controllers = Arc::new(controller_indexes.by_id);
-        let controllers_by_issuer = Arc::new(controller_indexes.by_issuer);
-        if !controllers.is_empty() {
-            let ids: Vec<&str> = controllers.keys().map(String::as_str).collect();
-            tracing::info!(
-                "Configured {} controller identity(ies): {:?}",
-                controllers.len(),
-                ids
-            );
-        }
+        #[cfg(feature = "backend")]
+        let user_logins = crate::server::auth::user_identity::UserLogins::new(
+            pg_resource_store.clone(),
+            db_pool.clone(),
+            &settings.auth.issuer,
+        )?;
 
         // Store auth settings for issuer comparison
         let auth_settings = Arc::new(settings.auth.clone());
@@ -1402,6 +1433,45 @@ impl AppState {
             } else {
                 (None, None, None, None, None, None, 3600, None)
             }
+        };
+
+        #[cfg(feature = "backend")]
+        let traefik_http_provider = match &settings.deployment_controller {
+            Some(crate::server::settings::DeploymentControllerSettings::Docker {
+                label_namespace,
+                controller_class_name,
+                traefik_entrypoint,
+                traefik_certresolver,
+                auth_backend_url,
+                ..
+            }) => Some(TraefikHttpProviderConfig {
+                native_provider: "docker",
+                label_namespace: label_namespace.clone(),
+                controller_class: controller_class_name.clone(),
+                entrypoint: traefik_entrypoint.clone(),
+                certresolver: rise_backend_traefik::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+                auth_backend_url: auth_backend_url.clone(),
+            }),
+            Some(crate::server::settings::DeploymentControllerSettings::Ecs {
+                label_namespace,
+                controller_class_name,
+                traefik_entrypoint,
+                traefik_certresolver,
+                auth_backend_url,
+                ..
+            }) => Some(TraefikHttpProviderConfig {
+                native_provider: "ecs",
+                label_namespace: label_namespace.clone(),
+                controller_class: controller_class_name.clone(),
+                entrypoint: traefik_entrypoint.clone(),
+                certresolver: rise_backend_traefik::normalize_certresolver(
+                    traefik_certresolver.clone(),
+                ),
+                auth_backend_url: auth_backend_url.clone(),
+            }),
+            _ => None,
         };
 
         // Cooperative shutdown signal shared by extension reconciliation loops
@@ -1848,6 +1918,11 @@ impl AppState {
             _ => None,
         };
 
+        let workload_token_rate_limiter =
+            Arc::new(crate::server::rate_limit::WorkloadTokenRateLimiter::new(
+                &settings.server.workload_token_rate_limit,
+            ));
+
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
         let oauth_rate_limiter = Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(rl));
@@ -1984,16 +2059,20 @@ impl AppState {
             admin_idp_groups,
             operator_users,
             operator_idp_groups,
-            controllers,
-            controllers_by_issuer,
             #[cfg(feature = "backend")]
             resource_store,
             #[cfg(feature = "backend")]
             resource_authorizer,
             #[cfg(feature = "backend")]
+            user_logins,
+            #[cfg(feature = "backend")]
             default_organization_uid,
             #[cfg(feature = "backend")]
+            default_organization_name,
+            #[cfg(feature = "backend")]
             deployment_controller_class_name,
+            #[cfg(feature = "backend")]
+            traefik_http_provider,
             #[cfg(feature = "backend")]
             org_view,
             auth_settings,
@@ -2010,6 +2089,7 @@ impl AppState {
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,
+            workload_token_rate_limiter,
             access_classes,
             reserved_project_names,
             signin_base_url,

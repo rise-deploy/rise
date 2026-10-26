@@ -29,6 +29,8 @@ fn selector(key: &str, value: Option<&str>) -> LabelSelector {
     }
 }
 
+/// ADR-0001 scenario 1
+/// ADR-0001 scenario 2
 #[test]
 fn qualified_kind_matching_is_version_independent() {
     let exact = statement(json!({
@@ -50,6 +52,7 @@ fn qualified_kind_matching_is_version_independent() {
     assert_eq!(v1, v2);
 }
 
+/// ADR-0001 scenario 1
 #[test]
 fn group_and_global_kind_wildcards_have_distinct_reach() {
     let group = statement(json!({
@@ -65,6 +68,8 @@ fn group_and_global_kind_wildcards_have_distinct_reach() {
     assert_eq!(evaluate([&global], &beta), Decision::Allow);
 }
 
+/// ADR-0001 scenario 49
+/// ADR-0001 scenario 50
 #[test]
 fn main_and_subresource_permissions_are_disjoint() {
     let main = statement(json!({
@@ -91,6 +96,7 @@ fn main_and_subresource_permissions_are_disjoint() {
     assert_eq!(evaluate([&status_only], &token_request), Decision::Deny);
 }
 
+/// ADR-0001 scenario 11
 #[test]
 fn union_defaults_to_deny_and_matching_deny_wins() {
     let allow = statement(json!({
@@ -107,6 +113,7 @@ fn union_defaults_to_deny_and_matching_deny_wins() {
     assert_eq!(evaluate([&allow, &deny], &update), Decision::Deny);
 }
 
+/// ADR-0001 scenario 5
 #[test]
 fn subject_substitution_uses_the_closed_subject_ref_grammar() {
     assert_eq!(
@@ -143,6 +150,8 @@ fn subject_substitution_uses_the_closed_subject_ref_grammar() {
     .is_err());
 }
 
+/// ADR-0001 scenario 15
+/// ADR-0001 scenario 20
 #[test]
 fn wildcard_replacement_uses_authored_identity_and_preserves_deny_provenance() {
     let wildcard_allow = statement(json!({
@@ -184,6 +193,7 @@ fn wildcard_replacement_uses_authored_identity_and_preserves_deny_provenance() {
     assert_eq!(retained.tier, BindingTier::Platform);
 }
 
+/// ADR-0001 scenario 20
 #[test]
 fn literals_templates_and_different_selector_keys_do_not_collide() {
     let allow = statement(json!({"effect":"Allow", "kinds":"*", "verbs":"*"}));
@@ -222,6 +232,7 @@ fn literals_templates_and_different_selector_keys_do_not_collide() {
     );
 }
 
+/// ADR-0001 scenario 31
 #[test]
 fn deny_aware_subset_detects_removed_denies_as_new_authority() {
     let allow_all = statement(json!({"effect":"Allow", "kinds":"*", "verbs":"*"}));
@@ -237,6 +248,7 @@ fn deny_aware_subset_detects_removed_denies_as_new_authority() {
     assert!(newly_allowed_is_subset(&before, &after, &[allow_delete]));
 }
 
+/// ADR-0001 scenario 31
 #[test]
 fn scoped_binding_deletion_checks_authority_exposed_by_removed_deny() {
     let allow_all = statement(json!({"effect":"Allow", "kinds":"*", "verbs":"*"}));
@@ -267,6 +279,7 @@ fn scoped_binding_deletion_checks_authority_exposed_by_removed_deny() {
     ));
 }
 
+/// ADR-0001 scenario 32
 #[test]
 fn subset_is_exact_across_kind_and_subresource_partitions() {
     let exact = statement(json!({
@@ -333,6 +346,7 @@ fn policy_subset_is_transitive_across_representative_matchers() {
     }
 }
 
+/// ADR-0001 scenario 32
 #[test]
 fn domain_containment_uses_the_fail_closed_selector_lattice() {
     let scope: Scope = "rise.dev/Organization/acme".parse().unwrap();
@@ -363,6 +377,7 @@ fn domain_containment_uses_the_fail_closed_selector_lattice() {
     assert!(!domain_covers(&exists, &other_key));
 }
 
+/// ADR-0001 scenario 32
 #[test]
 fn registry_resolved_scope_ancestry_can_cover_descendants() {
     let organization = PolicyDomain {
@@ -391,6 +406,7 @@ fn registry_resolved_scope_ancestry_can_cover_descendants() {
     ));
 }
 
+/// ADR-0001 scenario 32
 #[test]
 fn narrow_domain_cannot_justify_a_broader_grant() {
     let allow = statement(json!({"effect":"Allow", "kinds":"*", "verbs":"*"}));

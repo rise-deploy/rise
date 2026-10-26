@@ -11,10 +11,13 @@
 //! requests: tightening a cap or narrowing a Role takes effect on the next
 //! request, with nothing carried in a token.
 
+mod audit;
 mod bindings;
 mod gate;
 mod membership;
 mod principal;
+#[cfg(test)]
+mod session_ceiling_vectors;
 mod tree;
 
 use std::collections::HashMap;
@@ -32,6 +35,10 @@ use crate::policy::{
     BindingTier, Decision, PermissionTuple,
 };
 
+pub use audit::{
+    AuditFinding, AuditReport, AuditScanned, AuditScope, FindingCategory, FindingSubject, Severity,
+    Shadow,
+};
 pub use bindings::{BindingKind, BindingProvenance, RoleReference};
 pub use gate::{
     AuthorizationChange, BindingChange, BindingState, GateDomain, GateOutcome, GateRejection,
@@ -39,7 +46,9 @@ pub use gate::{
     RoleBodyChange,
 };
 pub use membership::{MembershipResolver, PrincipalMembership};
-pub use principal::{AuthenticatedPrincipal, AuthorizationCap, CapEntry, CapPermission};
+pub use principal::{
+    AuthenticatedPrincipal, AuthorizationCap, CapEntry, CapPermission, RBAC_DETAIL_TYPE,
+};
 pub use tree::{ResourceNode, ResourceTree};
 
 use bindings::{load_organization_bindings, load_platform_bindings, BindingFact};
@@ -110,6 +119,9 @@ pub enum InertReason {
     /// `subjectMembership: ResourceOrganization` excluded the resolved subject
     /// from this resource's organization.
     ResourceOrganization,
+    /// The binding's `roleRef` names no live Role/PlatformRole, so it resolved
+    /// to zero statements before subject matching even ran.
+    DanglingRoleRef,
 }
 
 /// A binding that applies to the caller by scope, selector, and subject, but
@@ -535,6 +547,14 @@ impl AuthorizationEngine {
                 });
                 continue;
             }
+            if !binding.role_resolved {
+                inert.push(InertBinding {
+                    provenance: binding.provenance.clone(),
+                    tier: binding.tier.clone(),
+                    reason: InertReason::DanglingRoleRef,
+                });
+                continue;
+            }
 
             applicable.push(ApplicableBinding {
                 provenance: binding.provenance.clone(),
@@ -798,7 +818,7 @@ fn universal_allow() -> Vec<PolicyStatement> {
 /// reference. A label-selected binding can therefore never confer admin
 /// standing, which is what keeps admin access independent of any
 /// access-driving label an orphaned resource might carry.
-fn qualifies_as_org_admin(binding: &BindingFact, organization: &str) -> bool {
+pub(crate) fn qualifies_as_org_admin(binding: &BindingFact, organization: &str) -> bool {
     binding.selector.is_none()
         && binding.provenance.role.kind == RoleRefKind::PlatformRole
         && binding.provenance.role.name == ORG_ADMIN_PLATFORM_ROLE

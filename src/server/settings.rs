@@ -391,11 +391,9 @@ pub struct ServerSettings {
     #[serde(default)]
     pub oauth_rate_limit: OAuthRateLimitSettings,
 
-    /// Maximum TTL in seconds for workload identity tokens issued via the token-exchange endpoint.
-    /// Requests that specify a higher TTL are silently capped to this value.
-    /// Default: 900 (15 minutes).
-    #[serde(default = "default_workload_token_max_ttl_seconds")]
-    pub workload_token_max_ttl_seconds: u64,
+    /// Rate limiting for the workload identity token-exchange endpoint.
+    #[serde(default)]
+    pub workload_token_rate_limit: WorkloadTokenRateLimitSettings,
 
     /// Lifetime in seconds of Rise access tokens minted by the auth
     /// token-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an
@@ -444,6 +442,55 @@ pub struct OAuthRateLimitSettings {
     /// Window in seconds for the global limit (default: 60)
     #[serde(default = "default_oauth_global_window_secs")]
     pub global_window_secs: u64,
+}
+
+/// Rate limiting for the workload identity token-exchange endpoint
+/// (`POST /api/v1/identity/token`), kept apart from the OAuth limiter so login
+/// traffic and token minting never share a budget.
+///
+/// A valid bootstrap credential is 256 random bits naming one deployment, a
+/// better caller identity than an address: workloads behind one NAT gateway, or
+/// reaching Rise over an internal address with no proxy headers, would all look
+/// like one client. So a request with a valid credential counts only against its
+/// deployment's budget, and the per-IP budget counts only rejected credentials —
+/// which is what slows guessing without throttling every task behind a NAT.
+#[derive(Debug, Deserialize, Clone, JsonSchema)]
+pub struct WorkloadTokenRateLimitSettings {
+    /// Maximum requests per deployment (valid credential) per window (default: 500)
+    #[serde(default = "default_workload_token_per_deployment_max")]
+    pub per_deployment_max: u32,
+    /// Window for the per-deployment limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub per_deployment_window_secs: u64,
+    /// Maximum rejected credentials per client IP per window (default: 50)
+    #[serde(default = "default_workload_token_rejected_per_ip_max")]
+    pub rejected_per_ip_max: u32,
+    /// Window for the rejected-credential limit in seconds (default: 60)
+    #[serde(default = "default_workload_token_window_secs")]
+    pub rejected_per_ip_window_secs: u64,
+}
+
+impl Default for WorkloadTokenRateLimitSettings {
+    fn default() -> Self {
+        Self {
+            per_deployment_max: default_workload_token_per_deployment_max(),
+            per_deployment_window_secs: default_workload_token_window_secs(),
+            rejected_per_ip_max: default_workload_token_rejected_per_ip_max(),
+            rejected_per_ip_window_secs: default_workload_token_window_secs(),
+        }
+    }
+}
+
+fn default_workload_token_per_deployment_max() -> u32 {
+    500
+}
+
+fn default_workload_token_rejected_per_ip_max() -> u32 {
+    50
+}
+
+fn default_workload_token_window_secs() -> u64 {
+    60
 }
 
 impl Default for OAuthRateLimitSettings {
@@ -595,10 +642,6 @@ fn default_jwt_expiry_seconds() -> u64 {
     86400 // 24 hours
 }
 
-fn default_workload_token_max_ttl_seconds() -> u64 {
-    900 // 15 minutes
-}
-
 fn default_auth_token_max_ttl_seconds() -> u64 {
     600 // 10 minutes
 }
@@ -710,11 +753,6 @@ pub struct AuthSettings {
     /// as `admin_idp_groups`.
     #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub operator_idp_groups: Vec<String>,
-    /// Trusted external controller identities. Each entry binds a stable
-    /// controller ID to an OIDC issuer plus required claim constraints.
-    /// Used by generic-resource controller endpoints.
-    #[serde(default)]
-    pub controllers: Vec<crate::server::auth::controller::ControllerIdentity>,
     /// Platform access control configuration
     #[serde(default)]
     pub platform_access: PlatformAccessConfig,
@@ -893,6 +931,31 @@ fn default_ssm_parameter_prefix() -> String {
 #[cfg(feature = "backend")]
 fn default_cpu_architecture() -> String {
     "X86_64".to_string()
+}
+
+/// Fargate: an install that never sets the key keeps behaving exactly as it did
+/// before the key existed.
+#[cfg(feature = "backend")]
+fn default_ecs_capacity() -> String {
+    "FARGATE".to_string()
+}
+
+/// Canonicalise the configured ECS capacity at load.
+///
+/// Rejecting here rather than defaulting: an unrecognised capacity has no safe
+/// fallback. Quietly using Fargate would bill an operator who asked for their own
+/// container instances for serverless capacity they did not want, and passing the
+/// string through would surface as an AWS error on every deploy instead of once
+/// at startup.
+#[cfg(feature = "backend")]
+fn deserialize_ecs_capacity<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    rise_backend_ecs::capacity::canonical(&raw)
+        .map(str::to_string)
+        .map_err(|e| serde::de::Error::custom(format!("deployment_controller.{e}")))
 }
 
 /// Canonicalise the configured Fargate CPU architecture at load, so everything
@@ -1282,9 +1345,10 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens auto-minted by the controller
-        /// and mounted into deployment pods. The controller re-mints tokens when they
-        /// are older than half this value. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those auto-minted by
+        /// the controller and mounted into deployment pods (re-minted once older
+        /// than half this value), and the cap on tokens from the token-exchange
+        /// endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1316,9 +1380,10 @@ pub enum DeploymentControllerSettings {
 
     /// Docker deployment controller.
     ///
-    /// Deploys app containers to a single Docker host and lets Traefik's Docker
-    /// provider route to them via container labels Rise stamps. No Kubernetes,
-    /// no Metacontroller — reconciliation runs in-process (see
+    /// Deploys app containers to a single Docker host. Traefik's Docker provider
+    /// discovers deployment services from labels, while its HTTP provider reads
+    /// the active public routes from Rise. No Kubernetes, no Metacontroller —
+    /// reconciliation runs in-process (see
     /// `controller::docker::DockerReconciler`).
     #[cfg(feature = "backend")]
     Docker {
@@ -1348,7 +1413,7 @@ pub enum DeploymentControllerSettings {
         /// identifier (e.g. "public", "private"). Mirrors the Kubernetes variant
         /// so the typed project API can validate a project's access class. For
         /// access classes whose `access_requirement` is `Authenticated`/`Member`,
-        /// the Docker controller stamps Traefik forwardAuth middleware labels
+        /// the HTTP-provider configuration includes a Traefik forwardAuth middleware
         /// (requires `auth_backend_url` to be set). A permissive "public" class
         /// is provided by default; operators may override.
         /// Use `null` in YAML to remove an inherited access class.
@@ -1470,8 +1535,9 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens minted for
-        /// deployments. Default: 3600 (1 hour).
+        /// Lifetime in seconds of workload identity tokens: those minted into
+        /// the `[identity]` token files, and the cap on tokens from the
+        /// token-exchange endpoint. Default: 3600 (1 hour).
         #[serde(default = "default_identity_token_ttl_seconds")]
         identity_token_ttl_seconds: u64,
 
@@ -1497,8 +1563,8 @@ pub enum DeploymentControllerSettings {
         /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
         /// or `http://localhost:8090` for a host-run dev backend). Read to learn
         /// per-server health status (the top-level `serverStatus` map) from
-        /// Traefik so the old deployment is retired only once the new servers are
-        /// actually in Traefik's rotation. Optional basic-auth may be embedded in
+        /// Traefik so a deployment is finalized only once its native service is
+        /// ready and the HTTP-provider routers select it. Optional basic-auth may be embedded in
         /// the URL (userinfo). **Required for projects that set a `health_check`**:
         /// Traefik's `serverStatus` is the authoritative readiness signal (no
         /// fallback), so without a reachable API a health-checked deployment never
@@ -1510,9 +1576,10 @@ pub enum DeploymentControllerSettings {
 
     /// Amazon ECS deployment controller (Fargate launch type).
     ///
-    /// Deploys each container spec as its own ECS service and lets Traefik's ECS
-    /// provider route to the tasks via labels Rise stamps on the container
-    /// definition. No Kubernetes, no Metacontroller — reconciliation runs
+    /// Deploys each container spec as its own ECS service. Traefik's ECS provider
+    /// discovers deployment services from container-definition labels, while its
+    /// HTTP provider reads active public routes from Rise. No Kubernetes, no
+    /// Metacontroller — reconciliation runs
     /// in-process (see `rise_backend_ecs::reconciler::EcsReconciler`).
     ///
     /// See ADR-0005 for the design and its deliberate v1 limitations.
@@ -1610,6 +1677,21 @@ pub enum DeploymentControllerSettings {
         )]
         cpu_architecture: String,
 
+        /// Which ECS capacity carries the workload services: `fargate` (AWS
+        /// schedules the tasks) or `ec2` (they are placed on the cluster's own
+        /// container instances).
+        ///
+        /// Networking is `awsvpc` either way — readiness keys Traefik's
+        /// `serverStatus` on each task's own ENI address — so `subnets` stays
+        /// required. On `ec2`, enable ENI trunking on the container instances or
+        /// the per-instance attachment limit becomes the real ceiling on how many
+        /// tasks a host can run.
+        #[serde(
+            default = "default_ecs_capacity",
+            deserialize_with = "deserialize_ecs_capacity"
+        )]
+        capacity: String,
+
         /// Ingress URL template for the production (default) deployment group.
         /// Same semantics as the other backends. Must contain `{project_name}`.
         production_ingress_url_template: String,
@@ -1633,8 +1715,8 @@ pub enum DeploymentControllerSettings {
         ingress_schema: String,
 
         /// Access classes defining ingress authentication levels. For classes
-        /// whose `access_requirement` is `Authenticated`/`Member` the controller
-        /// stamps Traefik forwardAuth labels, which requires `auth_backend_url`;
+        /// whose `access_requirement` is `Authenticated`/`Member` the HTTP-provider
+        /// configuration includes Traefik forwardAuth, which requires `auth_backend_url`;
         /// the backend refuses to start otherwise rather than serve those
         /// projects publicly with no auth enforced.
         #[serde(default = "default_ecs_access_classes")]
@@ -1696,11 +1778,31 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         health_probes: Option<HealthProbeConfig>,
 
-        /// Lifetime in seconds of workload identity tokens. Accepted for
-        /// forward-compatibility; ECS v1 does not deliver identity material and
-        /// rejects deployments that request it.
-        #[serde(default = "default_identity_token_ttl_seconds")]
+        /// Lifetime in seconds of workload identity tokens: the `[identity]`
+        /// token files, which the identity sidecar in each task refreshes at half
+        /// this, and the cap on tokens from the token-exchange endpoint.
+        #[serde(
+            default = "default_identity_token_ttl_seconds",
+            deserialize_with = "deserialize_u64_flexible"
+        )]
+        #[schemars(with = "u64")]
         identity_token_ttl_seconds: u64,
+
+        /// The `rise-cli` image the workload-identity sidecar in every task
+        /// runs (`rise identity agent`), normally the same release as this
+        /// server. Required, like the server's own image: nothing infers it.
+        /// The workload execution role must be able to pull it. Changing it
+        /// affects new deployments only: running services keep the sidecar they
+        /// started with.
+        #[serde(default)]
+        identity_agent_image: String,
+
+        /// Base URL at which the identity sidecar reaches the Rise API to fetch
+        /// `[identity]` tokens. Defaults to the server `public_url` — the URL
+        /// the workload itself uses for `rise identity token`. Set it to an
+        /// internal address when tasks have no route to the public one.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        identity_exchange_url: Option<String>,
     },
 }
 
@@ -1736,6 +1838,13 @@ pub enum RegistrySettings {
         #[serde(default)]
         #[allow(dead_code)]
         secret_access_key: Option<String>,
+        /// Registry host images are pushed to and pulled from, as `host[:port]`
+        /// with no scheme or path. Empty uses
+        /// `<account_id>.dkr.ecr.<region>.amazonaws.com`; set it for another
+        /// ECR endpoint (FIPS, dual-stack) or an ECR-compatible emulator.
+        #[serde(default)]
+        #[allow(dead_code)]
+        registry_host: Option<String>,
     },
     #[serde(rename = "oci-client-auth")]
     OciClientAuth {
@@ -2073,6 +2182,23 @@ impl Settings {
         })
         .map_err(|e| ConfigError::Message(format!("Failed to deserialize settings: {}", e)))?;
 
+        // A removed key that capped token lifetimes must not be silently
+        // ignored: an operator who set it chose a shorter lifetime, and ignoring
+        // it would lengthen every exchanged token behind their back.
+        if unused_fields
+            .iter()
+            .any(|f| f == "server.workload_token_max_ttl_seconds")
+        {
+            return Err(ConfigError::Message(
+                "server.workload_token_max_ttl_seconds has been removed. Workload identity \
+                 tokens from the token-exchange endpoint are now capped by \
+                 deployment_controller.identity_token_ttl_seconds, the same lifetime as the \
+                 auto-minted [identity] token files. Remove the key and set \
+                 identity_token_ttl_seconds to the lifetime you want."
+                    .to_string(),
+            ));
+        }
+
         // Warn about unused fields
         for field in &unused_fields {
             tracing::warn!("Unknown configuration field in backend config: {}", field);
@@ -2167,9 +2293,18 @@ impl Settings {
             account_id,
             push_role_arn,
             repo_prefix,
+            registry_host,
             ..
         }) = &settings.registry
         {
+            if let Some(host) = registry_host.as_deref().filter(|h| !h.is_empty()) {
+                if host.contains("://") || host.contains('/') || host.trim() != host {
+                    return Err(ConfigError::Message(format!(
+                        "registry.registry_host must be a bare host[:port], with no scheme \
+                         or path, got {host:?}"
+                    )));
+                }
+            }
             if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
                 return Err(ConfigError::Message(format!(
                     "registry.account_id must be a 12-digit AWS account ID, got {account_id:?}"
@@ -2345,8 +2480,11 @@ impl Settings {
             ref cluster,
             ref subnets,
             ref security_groups,
+            assign_public_ip,
+            ref capacity,
             ref execution_role_arn,
             ref repository_credentials_secret_arn,
+            ref identity_agent_image,
             ..
         }) = settings.deployment_controller
         {
@@ -2393,6 +2531,19 @@ impl Settings {
                 ));
             }
 
+            // Every task runs the identity sidecar, so without an image no task
+            // can start. Required rather than inferred: a guessed image may
+            // predate the agent.
+            if identity_agent_image.trim().is_empty() {
+                return Err(ConfigError::Message(
+                    "deployment_controller.identity_agent_image (RISE_ECS_IDENTITY_AGENT_IMAGE) \
+                     must name the rise-cli image the workload-identity sidecar runs, \
+                     normally the same release as this server, e.g. \
+                     ghcr.io/rise-deploy/rise-cli:<version>"
+                        .to_string(),
+                ));
+            }
+
             // A task with no subnet cannot be placed at all, and ECS's own error
             // for it arrives only on the first CreateService — long after startup.
             if subnets.is_empty() {
@@ -2416,6 +2567,21 @@ impl Settings {
                     security_groups.len(),
                     MAX_SECURITY_GROUPS_PER_AWSVPC
                 )));
+            }
+            // ECS refuses `assignPublicIp` outright on the EC2 launch type
+            // ("Assign public IP is not supported for this launch type"), so this
+            // pair would fail every CreateService rather than degrade. An
+            // `awsvpc` task ENI on a container instance never gets a public
+            // address; egress is the subnet's job there.
+            if capacity == "EC2" && assign_public_ip {
+                return Err(ConfigError::Message(
+                    "deployment_controller.assign_public_ip is true, but ECS does not \
+                     support assigning a public IP on the EC2 capacity: an awsvpc task \
+                     ENI on a container instance never receives one. Give the workload \
+                     subnets a NAT gateway (or VPC endpoints for ECR, CloudWatch and \
+                     SSM) and set assign_public_ip to false."
+                        .to_string(),
+                ));
             }
             // ECS authenticates every image pull itself, at every task start —
             // scale-out, task replacement, AZ rebalance. It never receives a
@@ -2851,6 +3017,41 @@ unknown_top_level: "also unknown"
             result.is_ok(),
             "Config should load despite unknown fields: {:?}",
             result.err()
+        );
+    }
+
+    /// Removing the exchanged-token cap must not silently lengthen tokens for an
+    /// operator who had set it: the key fails startup with its replacement.
+    #[test]
+    fn the_removed_exchange_ttl_cap_fails_startup_instead_of_being_ignored() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("development.yaml"),
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "http://localhost:3000"
+  jwt_signing_secret: "test-secret-key-for-testing-123456"
+  workload_token_max_ttl_seconds: 300
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+"#,
+        )
+        .unwrap();
+
+        let err =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "development", &|_| None)
+                .expect_err("the removed key must be refused");
+        assert!(
+            err.to_string().contains("identity_token_ttl_seconds"),
+            "should name the replacement: {err}"
         );
     }
 
@@ -3381,6 +3582,10 @@ auth:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "subnet-abc,subnet-def");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
@@ -3491,6 +3696,19 @@ server:
         assert_eq!(settings.server.port, 3000);
     }
 
+    /// Every task runs the identity sidecar; with no image, none can start.
+    #[test]
+    fn ecs_config_without_an_identity_agent_image_is_rejected_at_load() {
+        let mut env = ecs_base_env();
+        env.remove("RISE_ECS_IDENTITY_AGENT_IMAGE");
+
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        assert!(
+            err.to_string().contains("identity_agent_image"),
+            "should name the missing setting: {err}"
+        );
+    }
+
     #[test]
     fn ecs_config_without_subnets_is_rejected_at_load() {
         // A task with no subnet cannot be placed at all, and ECS only says so on
@@ -3498,6 +3716,10 @@ server:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "");
         env.insert("RISE_ECS_SECURITY_GROUPS", "");
 
@@ -3555,6 +3777,10 @@ server:
         let mut env = std::collections::HashMap::new();
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("RISE_ECS_CLUSTER", "rise-e2e");
+        env.insert(
+            "RISE_ECS_IDENTITY_AGENT_IMAGE",
+            "ghcr.io/rise-deploy/rise-cli:test",
+        );
         env.insert("RISE_ECS_SUBNETS", "subnet-abc");
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
@@ -3581,6 +3807,7 @@ server:
         let Some(RegistrySettings::Ecr {
             account_id,
             repo_prefix,
+            registry_host,
             ..
         }) = settings.registry
         else {
@@ -3588,6 +3815,50 @@ server:
         };
         assert_eq!(account_id, "123456789012");
         assert_eq!(repo_prefix, "rise/");
+        // Unset means the regional endpoint; the provider treats empty as unset.
+        assert!(registry_host.unwrap_or_default().is_empty());
+    }
+
+    fn ecs_ecr_env() -> std::collections::HashMap<&'static str, &'static str> {
+        let mut env = ecs_base_env();
+        env.insert("RISE_REGISTRY_TYPE", "ecr");
+        env.insert("RISE_ECR_ACCOUNT_ID", "123456789012");
+        env.insert(
+            "RISE_ECR_PUSH_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-push",
+        );
+        env.insert(
+            "RISE_ECS_EXECUTION_ROLE_ARN",
+            "arn:aws:iam::123456789012:role/rise-exec",
+        );
+        env
+    }
+
+    #[test]
+    fn the_ecr_registry_host_can_be_overridden_from_the_environment() {
+        let mut env = ecs_ecr_env();
+        env.insert(
+            "RISE_ECR_REGISTRY_HOST",
+            "123456789012.dkr.ecr.us-east-1.localhost:4566",
+        );
+        let settings = load_shipped_ecs_config(&env).expect("a host:port must load");
+        let Some(RegistrySettings::Ecr { registry_host, .. }) = settings.registry else {
+            panic!("expected the ECR registry");
+        };
+        assert_eq!(
+            registry_host.as_deref(),
+            Some("123456789012.dkr.ecr.us-east-1.localhost:4566")
+        );
+    }
+
+    #[test]
+    fn an_ecr_registry_host_with_a_scheme_or_path_is_rejected() {
+        for bad in ["https://registry.example.com", "registry.example.com/rise"] {
+            let mut env = ecs_ecr_env();
+            env.insert("RISE_ECR_REGISTRY_HOST", bad);
+            let err = load_shipped_ecs_config(&env).expect_err(bad);
+            assert!(err.to_string().contains("registry_host"), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -3615,6 +3886,67 @@ server:
             err.to_string().contains("X86_64 or ARM64"),
             "should name the valid values: {err}"
         );
+    }
+
+    #[test]
+    fn capacity_defaults_to_fargate_and_ec2_is_accepted() {
+        // The key is new, so every install that predates it must keep placing
+        // tasks exactly where it did before.
+        let settings = load_shipped_ecs_config(&ecs_base_env()).expect("shipped config loads");
+        let Some(DeploymentControllerSettings::Ecs { capacity, .. }) =
+            settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(capacity, "FARGATE");
+
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "ec2");
+        let settings = load_shipped_ecs_config(&env).expect("ec2 must be accepted");
+        let Some(DeploymentControllerSettings::Ecs {
+            capacity, subnets, ..
+        }) = settings.deployment_controller
+        else {
+            panic!("expected the ECS controller");
+        };
+        assert_eq!(capacity, "EC2");
+        // Both capacities run on awsvpc, so the subnets stay load-bearing --
+        // they are what the tasks' ENIs attach to either way.
+        assert!(!subnets.is_empty());
+    }
+
+    #[test]
+    fn a_public_ip_on_ec2_capacity_is_rejected_at_load() {
+        // ECS refuses `assignPublicIp` on the EC2 launch type outright, so this
+        // pair would fail every CreateService. Catching it at startup beats an
+        // InvalidParameterException on the first deploy.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "ec2");
+        env.insert("RISE_ECS_ASSIGN_PUBLIC_IP", "true");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("assign_public_ip"), "{msg}");
+        assert!(msg.contains("NAT gateway"), "should name the fix: {msg}");
+
+        // The same flag is exactly how a public-subnet Fargate install works.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_ASSIGN_PUBLIC_IP", "true");
+        load_shipped_ecs_config(&env).expect("public IP on Fargate is supported");
+    }
+
+    #[test]
+    fn an_unknown_capacity_is_rejected_at_load() {
+        // Defaulting would bill an operator who asked for their own container
+        // instances for serverless capacity they never wanted.
+        let mut env = ecs_base_env();
+        env.insert("RISE_ECS_CAPACITY", "spot");
+        let err = load_shipped_ecs_config(&env).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fargate"),
+            "should name the valid values: {msg}"
+        );
+        assert!(msg.contains("ec2"), "should name the valid values: {msg}");
     }
 
     #[test]

@@ -101,6 +101,11 @@ variable "ecr_push_role_arn" {
   description = "modules/rise-aws `push_role_arn`. Required when registry_type is \"ecr\"."
   type        = string
   default     = null
+
+  validation {
+    condition     = var.registry_type != "ecr" || var.ecr_push_role_arn != null
+    error_message = "registry_type \"ecr\" requires ecr_push_role_arn (modules/rise-aws `push_role_arn`)."
+  }
 }
 
 variable "ecr_repo_prefix" {
@@ -118,6 +123,21 @@ variable "ecr_auto_remove" {
   description = "Delete a project's ECR repository when the project is deleted."
   type        = bool
   default     = false
+}
+
+variable "ecr_registry_host" {
+  description = <<-EOT
+    Registry host Rise pushes to and deploys from, as host[:port]. Null uses
+    <account>.dkr.ecr.<region>.amazonaws.com; set it for another ECR endpoint
+    (FIPS, dual-stack) or an ECR-compatible emulator.
+  EOT
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ecr_registry_host == null || can(regex("^[^/:]+(:[0-9]+)?$", var.ecr_registry_host))
+    error_message = "ecr_registry_host must be a bare host[:port], with no scheme or path."
+  }
 }
 
 variable "oci_registry_url" {
@@ -174,6 +194,11 @@ variable "vpc" {
     condition     = var.vpc == null || length(coalesce(try(var.vpc.private_subnet_ids, null), [])) <= 16
     error_message = "At most 16 private subnets: an awsvpc network configuration accepts no more, and the backend rejects the config at startup."
   }
+
+  validation {
+    condition     = var.vpc == null || length(try(var.vpc.public_subnet_ids, [])) > 0
+    error_message = "The edge load balancer needs public subnets. Provide vpc.public_subnet_ids, or let the module create the VPC."
+  }
 }
 
 variable "vpc_cidr" {
@@ -208,6 +233,11 @@ variable "nat_gateway_mode" {
   validation {
     condition     = contains(["single", "per_az", "none"], var.nat_gateway_mode)
     error_message = "nat_gateway_mode must be one of: single, per_az, none."
+  }
+
+  validation {
+    condition     = !local.acme_enabled || var.nat_gateway_mode != "none"
+    error_message = "ACME needs internet egress: nat_gateway_mode \"none\" cannot reach Let's Encrypt. Use a NAT gateway, or edge_mode \"alb-acm\"."
   }
 }
 
@@ -330,12 +360,22 @@ variable "edge_mode" {
     condition     = contains(["nlb-traefik-acme", "alb-acm"], var.edge_mode)
     error_message = "edge_mode must be \"nlb-traefik-acme\" or \"alb-acm\"."
   }
+
+  validation {
+    condition     = var.edge_mode != "alb-acm" || var.acm_certificate_arn != null
+    error_message = "edge_mode \"alb-acm\" requires acm_certificate_arn."
+  }
 }
 
 variable "acme_email" {
   description = "Registration address for Let's Encrypt. Required when edge_mode is \"nlb-traefik-acme\"."
   type        = string
   default     = null
+
+  validation {
+    condition     = !local.acme_enabled || var.acme_email != null
+    error_message = "edge_mode \"nlb-traefik-acme\" requires acme_email for Let's Encrypt registration."
+  }
 }
 
 variable "acm_certificate_arn" {
@@ -356,10 +396,20 @@ variable "traefik_refresh_seconds" {
   default     = 15
 }
 
-variable "route53_zone_id" {
-  description = "Route 53 zone to create the apex and wildcard alias records in. Leave null to manage DNS yourself."
-  type        = string
-  default     = null
+variable "route53_zone" {
+  description = <<-EOT
+    Route 53 zone to create the apex and wildcard alias records in. Pass the
+    zone itself -- `aws_route53_zone.this` or `data.aws_route53_zone.this` --
+    or `{ zone_id = "Z..." }`. Leave null to manage DNS yourself.
+
+    An object rather than a bare ID so that a zone created in the same apply
+    works: the module decides how many records to write at plan time, and
+    whether an object is null is known then even while its zone_id is not.
+  EOT
+  type = object({
+    zone_id = string
+  })
+  default = null
 }
 
 # -----------------------------------------------------------------------------
@@ -428,8 +478,41 @@ variable "rise_image_ref" {
   default     = null
 
   validation {
+    condition     = (var.rise_image_ref == null) != (var.rise_image_tag == null)
+    error_message = "Set exactly one of rise_image_ref or rise_image_tag."
+  }
+
+  validation {
     condition     = var.rise_image_ref == null || strcontains(var.rise_image_ref, "@sha256:")
     error_message = "rise_image_ref must be an OCI digest reference containing @sha256:."
+  }
+}
+
+variable "rise_cli_image" {
+  description = "Rise CLI image repository: the workload-identity sidecar every workload task runs. The workload execution role pulls it with no registry credentials."
+  type        = string
+  default     = "ghcr.io/rise-deploy/rise-cli"
+}
+
+variable "rise_cli_image_tag" {
+  description = "CLI image tag, normally the same release as the control plane. Set this or rise_cli_image_ref, but not both."
+  type        = string
+  default     = null
+}
+
+variable "rise_cli_image_ref" {
+  description = "Complete immutable CLI image reference, such as ghcr.io/rise-deploy/rise-cli@sha256:…. Set this or rise_cli_image_tag, but not both."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = (var.rise_cli_image_ref == null) != (var.rise_cli_image_tag == null)
+    error_message = "Set exactly one of rise_cli_image_ref or rise_cli_image_tag."
+  }
+
+  validation {
+    condition     = var.rise_cli_image_ref == null || strcontains(var.rise_cli_image_ref, "@sha256:")
+    error_message = "rise_cli_image_ref must be an OCI digest reference containing @sha256:."
   }
 }
 
@@ -459,6 +542,43 @@ variable "control_plane_local_config_secret_arn" {
   default     = null
 }
 
+variable "control_plane_secret_environment" {
+  description = <<-EOT
+    Additional Secrets Manager values to inject into the Rise control-plane
+    container, keyed by environment-variable name. Each value must be a full
+    Secrets Manager secret ARN, optionally followed by the three ECS selector
+    segments for JSON key, version stage and version id.
+
+    The module exposes each base secret ARN through
+    secret_arns_for_execution_role. Names reserved for the module's built-in
+    secrets cannot be overridden.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition = length(setintersection(
+      toset(keys(var.control_plane_secret_environment)),
+      toset([
+        "DATABASE_URL",
+        "RISE_JWT_SIGNING_SECRET",
+        "RISE_ENCRYPTION_KEY",
+        "OIDC_CLIENT_SECRET",
+        "RISE_LOCAL_CONFIG_YAML",
+      ]),
+    )) == 0
+    error_message = "control_plane_secret_environment cannot override DATABASE_URL, RISE_JWT_SIGNING_SECRET, RISE_ENCRYPTION_KEY, OIDC_CLIENT_SECRET or RISE_LOCAL_CONFIG_YAML."
+  }
+
+  validation {
+    condition = alltrue([
+      for value_from in values(var.control_plane_secret_environment) :
+      can(regex("^arn:[^:]+:secretsmanager:[^:]+:[0-9]{12}:secret:[^:]+(?::[^:]*:[^:]*:[^:]*)?$", value_from))
+    ])
+    error_message = "control_plane_secret_environment values must be full Secrets Manager secret ARNs, optionally followed by ECS JSON-key, version-stage and version-id selectors."
+  }
+}
+
 variable "rise_desired_count" {
   description = "Control-plane replicas. Safe above 1: the reconcile loop is leader-elected through rise-runtime-sync."
   type        = number
@@ -466,7 +586,7 @@ variable "rise_desired_count" {
 }
 
 variable "cpu_architecture" {
-  description = "Fargate CPU architecture for the control plane and for deployed workloads."
+  description = "CPU architecture for the control plane and for deployed workloads."
   type        = string
   default     = "X86_64"
 
@@ -572,6 +692,11 @@ variable "oidc_issuer" {
   description = "OIDC issuer URL. Required unless deploy_dex is true."
   type        = string
   default     = null
+
+  validation {
+    condition     = var.deploy_dex || var.oidc_issuer != null
+    error_message = "Set oidc_issuer to an existing identity provider, or deploy_dex = true for a self-contained demo."
+  }
 }
 
 variable "oidc_client_id" {
@@ -585,6 +710,11 @@ variable "oidc_client_secret" {
   type        = string
   default     = null
   sensitive   = true
+
+  validation {
+    condition     = var.deploy_dex || var.oidc_client_secret != null
+    error_message = "oidc_client_secret is required when deploy_dex = false; without it the module would store the well-known default 'rise-backend-secret' as the OIDC client secret."
+  }
 }
 
 variable "deploy_dex" {
@@ -661,4 +791,16 @@ variable "traefik_constraints" {
   EOT
   type        = string
   default     = ""
+}
+
+variable "identity_exchange_url" {
+  description = "Base URL at which the identity sidecar reaches the Rise API. Null uses the public URL, which workloads reach through the edge; set an internal address only if the apps security group can reach it."
+  type        = string
+  default     = null
+}
+
+variable "identity_token_ttl_seconds" {
+  description = "Lifetime of the auto-minted [identity] workload tokens. The identity sidecar in each task refreshes them at half this. Null keeps Rise's default (3600)."
+  type        = number
+  default     = null
 }

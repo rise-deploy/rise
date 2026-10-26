@@ -1,6 +1,6 @@
 // Docker/Dockerfile builds
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info, warn};
@@ -8,7 +8,6 @@ use tracing::{debug, info, warn};
 use super::dockerfile_ssl::{
     preprocess_dockerfile_for_ssl, SslCertContext, SSL_CERT_BUILD_CONTEXT,
 };
-use super::registry::docker_push;
 use super::BuildPushMode;
 
 /// Configure buildx output flags (`--push` / `--load`) on a command.
@@ -62,6 +61,7 @@ pub(crate) struct DockerBuildOptions<'a> {
     pub build_contexts: &'a std::collections::HashMap<String, String>,
     pub no_cache: bool,
     pub platform: &'a str,
+    pub output: super::CommandOutput,
 }
 
 /// Build image using Docker or Podman with a Dockerfile
@@ -234,9 +234,11 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
 
     debug!("Executing command: {:?}", cmd);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute {} build", options.container_cli))?;
+    let status = super::run_command(
+        cmd,
+        &format!("Failed to execute {} build", options.container_cli),
+        options.output,
+    )?;
 
     // Note: SslCertContext cleanup is automatic via RAII when it goes out of scope
 
@@ -249,7 +251,11 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
     }
 
     if needs_fallback_push {
-        docker_push(options.container_cli, options.image_tag)?;
+        super::registry::docker_push_with_output(
+            options.container_cli,
+            options.image_tag,
+            options.output,
+        )?;
     }
 
     Ok(())

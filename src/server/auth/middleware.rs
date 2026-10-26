@@ -1,17 +1,22 @@
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose, Engine as _};
 use jsonwebtoken::decode_header;
 use serde::Deserialize;
 
 use crate::db::{service_accounts, users, User};
-use crate::server::auth::context::VerifiedExternalToken;
+use crate::server::auth::context::{SessionDetails, VerifiedExternalToken};
 use crate::server::auth::cookie_helpers;
+use crate::server::auth::identity::{resolve_identity, ResourcePrincipal};
+use crate::server::auth::session_scope::SessionScope;
+use crate::server::auth::user_identity::TokenStanding;
+use crate::server::error::ServerError;
 use crate::server::state::AppState;
+use rise_backend_auth::session_scope::SessionCeiling;
 use rise_backend_auth::{is_rise_issued_jwt, AccessClaims, PrincipalClaims, RiseToken};
 
 /// Extract Bearer token from Authorization header
@@ -138,6 +143,62 @@ pub async fn auth_middleware(
                     return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
                 }
 
+                // Every session is re-checked on every request (ADR-0001 §7).
+                // One naming a `User` resource re-resolves its User and
+                // minting identity: an inactive, deleted, or recreated User
+                // ends all of its sessions, and an inactive or deleted identity
+                // the sessions it minted. A legacy session carries the IdP's
+                // `sub` instead and is checked through that identity's
+                // mapping; it keeps the typed APIs until it expires, and the
+                // resource API refuses it. A store failure is a server error,
+                // never a logout.
+                let uids = claims.rise_uid.zip(claims.rise_identity_uid);
+                match state.user_logins.check_token(&claims.sub, uids).await {
+                    Ok(TokenStanding::Active(principal)) => {
+                        if let (Some(principal), Some((_, identity_uid))) = (principal, uids) {
+                            req.extensions_mut().insert(principal);
+                            req.extensions_mut().insert(SessionDetails {
+                                identity_uid,
+                                name: claims.name.clone(),
+                                issued_at: claims.iat,
+                                client: claims.rise_client,
+                            });
+                        }
+                    }
+                    Ok(TokenStanding::Rejected(rejection)) => {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            rise_uid = ?claims.rise_uid,
+                            "Auth middleware: session rejected: {rejection}"
+                        );
+                        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            sub = %claims.sub,
+                            "Auth middleware: failed to re-resolve the session's User: {error:?}"
+                        );
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Database error".to_string(),
+                        ));
+                    }
+                }
+
+                // A scoped session (ADR-0006) carries its ceiling; one that
+                // doesn't parse is an invalid credential, never full access.
+                if let Some(details) = &claims.authorization_details {
+                    let ceiling = SessionCeiling::parse(details).map_err(|e| {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            "Auth middleware: session ceiling rejected: {e}"
+                        );
+                        (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
+                    })?;
+                    req.extensions_mut()
+                        .insert(SessionScope::new(ceiling, &state.default_organization_name));
+                }
+
                 let email = &claims.email;
                 tracing::debug!("Rise session JWT validated for user");
 
@@ -173,6 +234,29 @@ pub async fn auth_middleware(
                 );
                 req.extensions_mut().insert(claims);
             }
+            RiseToken::Identity(claims) => {
+                // Identity token — `aud` must be the Rise public URL, and the
+                // `(sub, rise_uid)` pair must still name one live resource
+                // (ADR-0001 §7). Every rejection is the same 401: which check
+                // failed is a fact about a resource the caller may not read.
+                let principal =
+                    resolve_identity(state.resource_store.as_ref(), &claims, &state.public_url)
+                        .await
+                        .map_err(|rejection| {
+                            tracing::warn!(
+                                sub = %claims.sub,
+                                rise_uid = %claims.rise_uid,
+                                jti = %claims.jti,
+                                "Auth middleware: identity token rejected: {rejection}"
+                            );
+                            (StatusCode::UNAUTHORIZED, "Invalid token".to_string())
+                        })?;
+                tracing::debug!(
+                    subject = %principal.subject,
+                    "Auth middleware: Rise identity token accepted"
+                );
+                req.extensions_mut().insert(principal);
+            }
             RiseToken::Ingress(_) => {
                 // RS256 ingress tokens are for deployed-app ingress auth only.
                 tracing::warn!("Auth middleware: ingress token rejected on the API path");
@@ -201,11 +285,21 @@ pub async fn auth_middleware(
             issuer
         );
 
-        // Lightweight guard: skip JWKS fetch if neither a controller nor any SA
-        // uses this issuer. Controller issuers are in static config (O(1));
-        // SA issuers require a DB round-trip and are only checked when the
-        // issuer isn't already a known controller issuer.
-        if !state.controllers_by_issuer.contains_key(&issuer) {
+        // Lightweight guard: skip JWKS fetch unless a live controller trust
+        // policy or a known SA uses this issuer. The controller check is a
+        // single indexed query; the SA check is only run when it doesn't
+        // already answer yes.
+        let is_controller_issuer =
+            crate::server::auth::controller::controller_issuer_exists(&state.db_pool, &issuer)
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to check controller issuer existence: {:#}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Database error".to_string(),
+                    )
+                })?;
+        if !is_controller_issuer {
             let sa_issuer_exists = service_accounts::issuer_exists(&state.db_pool, &issuer)
                 .await
                 .map_err(|e| {
@@ -314,6 +408,25 @@ pub async fn optional_auth_middleware(
                             if let Ok(rise_claims) =
                                 state.jwt_signer.verify_user_jwt(&token, &state.public_url)
                             {
+                                // A token whose User or identity no longer
+                                // resolves is no authentication at all; nor,
+                                // for this best-effort layer, is one the store
+                                // could not check.
+                                let uids = rise_claims.rise_uid.zip(rise_claims.rise_identity_uid);
+                                match state.user_logins.check_token(&rise_claims.sub, uids).await {
+                                    Ok(TokenStanding::Active(principal)) => {
+                                        if let Some(principal) = principal {
+                                            req.extensions_mut().insert(principal);
+                                        }
+                                    }
+                                    Ok(TokenStanding::Rejected(_)) => return next.run(req).await,
+                                    Err(error) => {
+                                        tracing::error!(
+                                            "Optional auth: failed to re-resolve the session's User: {error:?}"
+                                        );
+                                        return next.run(req).await;
+                                    }
+                                }
                                 let email = &rise_claims.email;
                                 // Mirror the strict auth path: never create a user
                                 // row without the matching default-Org membership.
@@ -338,6 +451,9 @@ pub async fn optional_auth_middleware(
     // Continue regardless of authentication status
     next.run(req).await
 }
+
+/// `error_code` of the 403 a user without platform access receives.
+pub const PLATFORM_ACCESS_DENIED: &str = "platform_access_denied";
 
 /// Platform access middleware - blocks non-platform users from API endpoints
 ///
@@ -378,6 +494,14 @@ pub async fn platform_access_middleware(
                 ));
             }
         }
+    }
+
+    // Resource principals carry no platform-access notion: what they reach is
+    // exactly what stored policy grants them (ADR-0001 §4), and the generic
+    // resource API is the only surface that accepts them.
+    if req.extensions().get::<ResourcePrincipal>().is_some() {
+        tracing::debug!("Skipping platform access check for identity token (resource principal)");
+        return Ok(next.run(req).await);
     }
 
     // Extract user from extensions (injected by auth_middleware for Rise JWTs)
@@ -421,22 +545,125 @@ pub async fn platform_access_middleware(
             path = %req.uri().path(),
             "Platform access denied for non-platform user"
         );
-        return Err((
-            StatusCode::FORBIDDEN,
+        // A JSON body with a stable code, so clients can tell "no platform
+        // access at all" apart from an ordinary permission error on one
+        // resource (both are 403).
+        return Ok(ServerError::forbidden(
             "You do not have access to Rise platform features. \
              Your account is configured for application access only. \
-             Please contact your administrator if you need platform access."
-                .to_string(),
-        ));
+             Please contact your administrator if you need platform access.",
+        )
+        .with_error_code(PLATFORM_ACCESS_DENIED)
+        .expected()
+        .into_response());
     }
 
     Ok(next.run(req).await)
+}
+
+/// Whether a request may reach its handler without a credential.
+///
+/// Exactly one shape qualifies: a `POST` to a path ending in `/token` that
+/// carries neither a bearer nor a session cookie. That is a workload token
+/// exchange, whose credential is the external assertion in the body (ADR-0001
+/// §7): the `/token` subresource authenticates it against the target's trust
+/// policies itself. The predicate is purely syntactic — it does not know
+/// whether the path really is a registered token route — so a request it lets
+/// through that turns out to be anything else is refused by the handler, which
+/// requires a principal for every other operation.
+pub fn is_unauthenticated_token_exchange(req: &Request) -> bool {
+    req.method() == Method::POST
+        && req.uri().path().trim_end_matches('/').ends_with("/token")
+        && extract_bearer_token(req.headers()).is_none()
+        && extract_rise_jwt_from_cookie(req.headers()).is_none()
+}
+
+/// [`auth_middleware`] for the generic resource API: identical, except that an
+/// unauthenticated workload token exchange passes through to its handler.
+pub async fn resource_auth_middleware(
+    state: State<AppState>,
+    headers: HeaderMap,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    if is_unauthenticated_token_exchange(&req) {
+        return Ok(next.run(req).await);
+    }
+    auth_middleware(state, headers, req, next).await
+}
+
+/// [`platform_access_middleware`] for the generic resource API, with the same
+/// pass-through as [`resource_auth_middleware`].
+pub async fn resource_platform_access_middleware(
+    state: State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    if is_unauthenticated_token_exchange(&req) {
+        return Ok(next.run(req).await);
+    }
+    platform_access_middleware(state, req, next).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn request(method: Method, path: &str, authorization: Option<&str>) -> Request {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(value) = authorization {
+            builder = builder.header("Authorization", value);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn unauthenticated_token_exchange_is_a_credential_less_post_to_token() {
+        let path = "/resources/rise.dev/v1alpha1/serviceaccounts/acme/ci/token";
+        assert!(is_unauthenticated_token_exchange(&request(
+            Method::POST,
+            path,
+            None
+        )));
+        assert!(is_unauthenticated_token_exchange(&request(
+            Method::POST,
+            &format!("{path}/"),
+            None
+        )));
+        // A credential means the ordinary middleware decides.
+        assert!(!is_unauthenticated_token_exchange(&request(
+            Method::POST,
+            path,
+            Some("Bearer x")
+        )));
+        let mut with_cookie = request(Method::POST, path, None);
+        with_cookie
+            .headers_mut()
+            .insert("Cookie", HeaderValue::from_static("rise_jwt=abc"));
+        assert!(!is_unauthenticated_token_exchange(&with_cookie));
+        // Other methods and other paths never pass through.
+        assert!(!is_unauthenticated_token_exchange(&request(
+            Method::GET,
+            path,
+            None
+        )));
+        assert!(!is_unauthenticated_token_exchange(&request(
+            Method::PUT,
+            path,
+            None
+        )));
+        assert!(!is_unauthenticated_token_exchange(&request(
+            Method::POST,
+            "/resources/rise.dev/v1alpha1/serviceaccounts/acme/ci/status",
+            None
+        )));
+        assert!(!is_unauthenticated_token_exchange(&request(
+            Method::POST,
+            "/resources/rise.dev/v1alpha1/serviceaccounts/acme",
+            None
+        )));
+    }
 
     #[test]
     fn test_extract_bearer_token_valid() {

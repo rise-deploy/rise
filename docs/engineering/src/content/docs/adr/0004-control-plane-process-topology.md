@@ -56,8 +56,9 @@ through any resource API.
 Schema ownership is real, not aspirational:
 
 - `resource_store` belongs to `rise-resource-store-postgres`, which owns its
-  migrations and SQLX offline cache. `runtime_sync` belongs to
-  `rise-runtime-sync` on the same terms.
+  migrations; its queries are runtime-checked, so it has no SQLX offline cache.
+  `runtime_sync` belongs to `rise-runtime-sync`, which owns its migrations and
+  SQLX offline cache.
 - No `rise-deploy` production query reaches into `resource_store`; `grep -rn
   resource_store src/db/*.rs` is empty. One test fixture writes it directly
   (`src/server/resources/gc.rs:741`, under `#[cfg(test)]`).
@@ -90,10 +91,11 @@ async fn operator_update_status(&self, uid: Uuid, operator: &str, …);
 async fn operator_update_finalizers(&self, uid: Uuid, operator: &str, …);
 ```
 
-The trust boundary above them is already correct — handlers pass
-`controller.0.identity_id` from the authenticated Controller
-(`src/server/resources/handlers.rs:1820`) and `authz.subject()` from the
-authorization choke point (`:1879`). The defect is expressive, not exploitable: the
+The trust boundary above them is now uniform — a Controller is an ordinary
+RBAC principal, so both the controller and operator pairs take their string
+identity from the same source, `authz.subject()` in `update_once`
+(`src/server/resources/handlers.rs`), after the same `(update, Kind,
+status|finalizers)` decision. The defect is expressive, not exploitable: the
 trait cannot say where identity comes from, so it cannot be the contract a
 remote client codes against. Others — `try_collect`, `list_pending_collection`,
 `resolve_path`, `ancestors`, `resolve_collection*`,
@@ -239,10 +241,17 @@ ever be issued by a remote client.
 | `list_deletion_blockers` | Implementation of a served subresource (`handlers.rs:772`) — the route is remotable, the primitive is not |
 | `operator_update_status`, `operator_update_finalizers` | Same shape: the route is served today (`handlers.rs:1879`, taking `authz.subject()`), and only the identity-bypassing primitive is internal. The route converges on `status`/`finalizers` under RBAC; the primitive dissolves |
 
-The four `controller_id` / `operator` parameters disappear when ADR-0001's
-choke point lands — `ROADMAP.md` §1 already commits to removing
-`ResourceDefinition.allowedStatusControllerIds` and authorizing `status` and
-`finalizers` through RBAC alone.
+`ResourceDefinition.allowedStatusControllerIds` is gone and `status` and
+`finalizers` are authorized through RBAC alone, closing the identity-source
+half of this defect. The four `controller_id` / `operator` parameters
+themselves have not disappeared — the controller and operator slots still
+differ in store-side semantics (a controller may only touch its own
+`status.controllers[<name>]` entry and `<name>`-prefixed finalizers; an
+operator write carries no such ownership restriction) — so
+`update_controller_*` and `operator_update_*` remain two pairs rather than
+one. Whether that distinction still earns its keep now that both take an
+authorized subject is open; collapsing it is unstarted work, not a promise
+this ADR makes on its own.
 
 Only code that runs *inside* the apiserver may name `ResourceStore`: the
 resource handlers, the GC worker, the authorization engine (which needs

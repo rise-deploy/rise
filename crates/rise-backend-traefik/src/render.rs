@@ -1,6 +1,6 @@
-//! Rendering a [`DesiredContainer`] into the Traefik dynamic-configuration label
-//! set, plus the fail-closed predicate that decides whether a container may
-//! advertise a router at all.
+//! Rendering a [`DesiredContainer`] into deployment-scoped native-provider
+//! service labels, plus the fail-closed predicate that decides whether a
+//! container may participate in public routing.
 //!
 //! Shared by every backend that fronts workloads with Traefik. The label keys are
 //! provider-agnostic; only [`TraefikRenderConfig::network`] differs (the Docker
@@ -14,18 +14,7 @@ use rise_deployment_spec::AccessRequirement;
 use rise_backend_core::desired::DesiredContainer;
 use rise_backend_core::effective_access_requirement;
 
-use crate::labels::{self, ForwardAuth, TraefikRoute};
-
-/// Per-route forwardAuth outcome for a single Traefik router.
-enum RouteForwardAuth {
-    /// No auth requirement — emit the router with no forwardAuth middleware.
-    Open,
-    /// Auth required and wired — attach forwardAuth pointing at this address.
-    Gated(String),
-    /// Auth required but no `auth_backend_url` to wire it — withhold this router
-    /// (fail closed) rather than expose an unauthenticated public route.
-    Withheld,
-}
+use crate::labels;
 
 /// Default Traefik health-check interval (Go duration `10s`) when the
 /// `health_check` spec sets no `period_seconds`.
@@ -39,7 +28,7 @@ const DEFAULT_HEALTHCHECK_INTERVAL_SECS: i32 = 10;
 /// that could mark a slow-but-healthy endpoint DOWN on Docker but UP on K8s).
 const DEFAULT_HEALTHCHECK_TIMEOUT_SECS: i32 = 5;
 
-use crate::naming::{group_service_base, group_service_name};
+use crate::naming::{deployment_service_base, group_service_name};
 
 /// Static configuration the Traefik label renderer needs, independent of any one
 /// runtime. Backends build this from their own richer config struct.
@@ -47,6 +36,9 @@ pub struct TraefikRenderConfig<'a> {
     pub label_namespace: &'a str,
     pub controller_class: &'a str,
     pub traefik_entrypoint: &'a str,
+    /// Loopback-only entrypoint used to materialize native-provider services
+    /// without allowing the provider to synthesize a public default router.
+    pub catalog_entrypoint: &'a str,
     pub traefik_certresolver: Option<&'a str>,
     /// Value for `traefik.docker.network`. `Some` for the Docker provider;
     /// **`None` for the ECS provider**, which resolves task ENIs itself and
@@ -86,11 +78,9 @@ pub fn routes_withheld<'a>(
 /// Render the full Traefik label map for a desired container.
 ///
 /// Empty when the container is not routable, has no port (worker), or has no
-/// host to route. Every infra-bearing deployment of a group is routable — the
-/// old active and the new Deploying deployment both advertise a router on the
-/// shared `Host(...)` rule and join the one group-scoped Traefik service, and
-/// Traefik's per-server health check drains the old servers as the new ones come
-/// up (the rolling overlap). `routable` is `false` only when the router is
+/// host to route. Each infra-bearing deployment publishes a deployment-scoped
+/// native-provider service for the HTTP provider to select. `routable` is
+/// `false` only when the router is
 /// withheld (unknown access class, or auth required without an
 /// `auth_backend_url`), so a misconfigured deployment never advertises an
 /// unauthenticated router.
@@ -114,8 +104,8 @@ pub fn render_traefik_labels_for(
     // missing/removed class must NOT silently become public (mirroring the K8s
     // path, which errors on an unknown class). Route overrides cannot weaken a
     // missing class, so suppress every router rather than inventing a default.
-    let requirement = match cfg.access_classes.get(&desired.access_class) {
-        Some(req) => req.clone(),
+    match cfg.access_classes.get(&desired.access_class) {
+        Some(_) => {}
         None => {
             tracing::error!(
                 project = %desired.project,
@@ -125,30 +115,7 @@ pub fn render_traefik_labels_for(
             );
             return out;
         }
-    };
-    // Per-route effective requirement decides that router's forwardAuth. The
-    // address stamps `&access=<req>` so the shared `ingress_auth` handler enforces
-    // exactly this route group's requirement (never re-matching the request path).
-    // `signin_redirect=1` puts the handler in Traefik mode (302 to login on
-    // unauthenticated). A `None` route gets no middleware (open); an auth route on
-    // a project whose `auth_backend_url` is empty is withheld per-route below.
-    let route_forward_auth = |route_requirement: &AccessRequirement| -> RouteForwardAuth {
-        match route_requirement {
-            AccessRequirement::None => RouteForwardAuth::Open,
-            AccessRequirement::Authenticated | AccessRequirement::Member => {
-                if cfg.auth_backend_url.trim().is_empty() {
-                    RouteForwardAuth::Withheld
-                } else {
-                    RouteForwardAuth::Gated(format!(
-                        "{}/api/v1/auth/ingress?project={}&access={}&signin_redirect=1",
-                        cfg.auth_backend_url.trim().trim_end_matches('/'),
-                        urlencoding::encode(&desired.project),
-                        route_requirement.as_query_param(),
-                    ))
-                }
-            }
-        }
-    };
+    }
 
     // FAIL CLOSED: an unknown access class or an auth-required route without a
     // forwardAuth address must expose nothing. Stamping a router in either state
@@ -181,64 +148,46 @@ pub fn render_traefik_labels_for(
         let bl = b.path_prefix.as_deref().unwrap_or("/").len();
         bl.cmp(&al)
     });
-    // GROUP-scoped router/service base name — deployment-id-FREE, shared with
-    // the reconciler's `serverStatus` lookup via [`group_service_base`] so the
-    // two can't drift. Distinct per-route service names (`{base}-{idx}` when
+    // Deployment-scoped service names keep old and incoming server pools
+    // independent. Distinct per-route service names (`{base}-{idx}` when
     // there is more than one route) keep multiple path prefixes from colliding;
     // [`group_service_name`] is the single source for that derivation.
     let route_count = routes.len();
-    let base = group_service_base(
+    let base = deployment_service_base(
         &desired.project,
         &desired.deployment_group,
+        &desired.deployment_id,
         &desired.container,
     );
     for (idx, route) in routes.iter().enumerate() {
         if route.hosts.is_empty() {
             continue;
         }
-        // Effective requirement: the route's `access` override, else the
-        // project's (already failed-closed to Member on an unknown class).
-        let route_requirement = route.access.clone().unwrap_or_else(|| requirement.clone());
-        let forward_auth_address = match route_forward_auth(&route_requirement) {
-            RouteForwardAuth::Open => None,
-            RouteForwardAuth::Gated(address) => Some(address),
-            // Unreachable: the pre-loop scan above withholds the whole container
-            // if any route is Withheld. Fail closed defensively regardless.
-            RouteForwardAuth::Withheld => continue,
-        };
         let router_name = group_service_name(&base, idx, route_count);
-        let traefik = labels::render_traefik_labels(&TraefikRoute {
-            router_name: &router_name,
-            hosts: &route.hosts,
-            path_prefix: route.path_prefix.as_deref(),
-            port,
-            entrypoint: cfg.traefik_entrypoint,
-            network: cfg.network,
-            certresolver: cfg.traefik_certresolver,
-            forward_auth: forward_auth_address.as_deref().map(|address| ForwardAuth {
-                address,
-                auth_response_headers: "X-Auth-Request-Email,X-Auth-Request-User",
-            }),
-        });
-        out.extend(traefik);
-
-        // Explicit longest-prefix-first router priority (parity with nginx's
-        // implicit longest-match). Traefik would otherwise fall back to implicit
-        // rule-LENGTH priority, which conflates host-rule length with path
-        // specificity; deriving the priority from the route's path-prefix length
-        // makes a more-specific prefix (`/api/v1`) deterministically outrank a
-        // shorter/host-only one (`/`). The `+1` keeps even a host-only (empty/`/`)
-        // route at a positive, non-zero priority.
-        let path_len = route
-            .path_prefix
-            .as_deref()
-            .filter(|p| !p.is_empty() && *p != "/")
-            .map(str::len)
-            .unwrap_or(0);
+        // Native providers automatically create a public default router when a
+        // service has no router labels. Define an explicit catalog router on a
+        // loopback-only entrypoint so the provider still owns server discovery
+        // while the HTTP provider owns every public route.
+        out.insert("traefik.enable".to_string(), "true".to_string());
         out.insert(
-            format!("traefik.http.routers.{router_name}.priority"),
-            (path_len + 1).to_string(),
+            format!("traefik.http.routers.{router_name}-catalog.rule"),
+            "PathPrefix(`/`)".to_string(),
         );
+        out.insert(
+            format!("traefik.http.routers.{router_name}-catalog.entrypoints"),
+            cfg.catalog_entrypoint.to_string(),
+        );
+        out.insert(
+            format!("traefik.http.routers.{router_name}-catalog.service"),
+            router_name.clone(),
+        );
+        out.insert(
+            format!("traefik.http.services.{router_name}.loadbalancer.server.port"),
+            port.to_string(),
+        );
+        if let Some(network) = cfg.network {
+            out.insert("traefik.docker.network".to_string(), network.to_string());
+        }
 
         // Traefik load-balancer health-check labels — emitted when this container
         // has an effective health path (a `health_check` is configured). A
@@ -276,9 +225,9 @@ pub fn render_traefik_labels_for(
 }
 
 /// Compute the `route-hash` recreate signature for a desired container without
-/// building the full create spec. Used by the reconciler's diff so a routing
-/// transition (a deployment becoming or ceasing to be active) OR a change in
-/// whether the app port is published to a loopback host port forces a recreate.
+/// building the full create spec. Used by the reconciler's diff so a native
+/// routing-label change or a change in whether the app port is published to a
+/// loopback host port forces a recreate.
 /// Must stay consistent with the hash stamped by [`build_container`].
 ///
 /// `publish_port` folds the Docker backend's `publish_app_ports` binding into the

@@ -51,9 +51,7 @@ impl BuiltInRegistration {
     /// `ResourceStore::resolve_collection*`.
     ///
     /// Built-ins serve exactly one api_version, so `storage`, `served`, and
-    /// `declared` collapse to the same single-element list. `allowed_status_controller_ids`
-    /// is empty by default; controller ownership for built-ins lands in a
-    /// later PR (see the `ROADMAP.md` Phase B work).
+    /// `declared` collapse to the same single-element list.
     pub fn collection_info(&self) -> CollectionInfo {
         CollectionInfo {
             api_version: self.api_version.to_string(),
@@ -63,7 +61,6 @@ impl BuiltInRegistration {
             kind: self.kind.to_string(),
             parent: self.parent.clone(),
             spec_validator: self.spec_validator.clone(),
-            allowed_status_controller_ids: Vec::new(),
         }
     }
 
@@ -315,7 +312,6 @@ mod tests {
         assert_eq!(info.declared_api_versions, vec![API_VERSION_V1ALPHA1]);
         assert_eq!(info.storage_api_version, API_VERSION_V1ALPHA1);
         // Controller ownership for built-ins is deferred (see roadmap PR B2+).
-        assert!(info.allowed_status_controller_ids.is_empty());
     }
 
     #[test]

@@ -2,10 +2,8 @@
 //! cutover path to learn whether a container's server is actually in Traefik's
 //! load-balancer rotation.
 //!
-//! Every deployment of a group registers its replica containers as servers of
-//! ONE shared Traefik load-balancer service
-//! (`{service}@docker`, where `{service}` is the group-scoped
-//! `sanitize_router_name({project}-{group}-{container})`). When a `health_check`
+//! Every deployment registers its replicas in a deployment-scoped native-provider
+//! load-balancer service. When a `health_check`
 //! is configured, Traefik runs a per-server health check and exposes the result
 //! as a top-level `serverStatus` map of server URL
 //! (`http://{ip}:{port}`) → `"UP"`/`"DOWN"` (sibling of `loadBalancer` in the
@@ -108,6 +106,39 @@ impl TraefikApiClient {
             }
         };
         parse_server_status(&body)
+    }
+
+    /// Service selected by an HTTP-provider router, including its provider
+    /// suffix (for example `app-deadbeef@ecs`).
+    pub async fn http_router_service(&self, router: &str) -> Option<String> {
+        let url = format!("{}/api/http/routers/{}@http", self.base_url, router);
+        let mut req = self.http.get(&url);
+        if let Some((user, pass)) = &self.basic_auth {
+            req = req.basic_auth(user, Some(pass));
+        }
+        let response = req.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        #[derive(Deserialize)]
+        struct RouterPayload {
+            service: String,
+        }
+        response
+            .json::<RouterPayload>()
+            .await
+            .ok()
+            .map(|body| body.service)
+    }
+
+    /// Whether every expected HTTP-provider router selects its declared service.
+    pub async fn dynamic_config_applied(&self, config: &crate::dynamic::DynamicConfig) -> bool {
+        for (name, router) in &config.http.routers {
+            if self.http_router_service(name).await.as_deref() != Some(router.service.as_str()) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Merge `serverStatus` across a container's route services with OR

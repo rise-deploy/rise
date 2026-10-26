@@ -13,7 +13,9 @@ use uuid::Uuid;
 /// leaks via `{:?}` (e.g. in logs or panic messages).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RiseClaims {
-    /// User ID from IdP
+    /// The subject. On a session token ([`crate::RISE_SESSION_TYP`]) this is
+    /// the canonical `user:<name>` of the Rise `User` resource; on an ingress
+    /// token and a legacy session it is the upstream IdP's `sub`.
     pub sub: String,
     /// User email
     pub email: String,
@@ -32,6 +34,40 @@ pub struct RiseClaims {
     pub iss: String,
     /// Audience (Rise UI URL or project URL)
     pub aud: String,
+    /// The UID of the `User` resource `sub` names (ADR-0001 §7). Present
+    /// exactly on a session token carrying [`crate::RISE_SESSION_TYP`]; the
+    /// verifier rejects it on any other shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_uid: Option<uuid::Uuid>,
+    /// The UID of the `UserIdentity` whose login minted this session. Present
+    /// exactly when `rise_uid` is: deactivating or deleting that identity ends
+    /// the sessions it minted, and only those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_identity_uid: Option<uuid::Uuid>,
+    /// Which kind of client the session was issued to. Only ever on a session
+    /// token carrying [`crate::RISE_SESSION_TYP`]; absent on sessions minted
+    /// before the claim existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rise_client: Option<SessionClient>,
+    /// The session's Allow ceiling (ADR-0006): `rise.dev/rbac` entries in
+    /// ADR-0001 §7's wire format. Only ever on a CLI session; absent means the
+    /// user's full live access. The verifier checks only where it may appear;
+    /// the server parses and enforces the entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<Vec<serde_json::Value>>,
+}
+
+/// The kind of client a Rise session was issued to.
+///
+/// Signed into the session so it cannot be changed by presenting the token
+/// differently (a CLI token sent as a `Cookie` is still a CLI session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionClient {
+    /// The web UI, signed in through the browser login.
+    Browser,
+    /// The CLI, signed in through the PKCE code flow or the device flow.
+    Cli,
 }
 
 impl std::fmt::Debug for RiseClaims {
@@ -45,6 +81,10 @@ impl std::fmt::Debug for RiseClaims {
             .field("exp", &self.exp)
             .field("iss", &self.iss)
             .field("aud", &self.aud)
+            .field("rise_uid", &self.rise_uid)
+            .field("rise_identity_uid", &self.rise_identity_uid)
+            .field("rise_client", &self.rise_client)
+            .field("authorization_details", &self.authorization_details)
             .finish()
     }
 }
@@ -100,8 +140,14 @@ pub enum PrincipalClaims {
     },
     /// A trusted controller identity.
     Controller {
-        /// The matched controller's stable identity id.
-        identity_id: String,
+        /// The Controller resource's canonical name (also the subject
+        /// `controller:<name>` names, and the writer key stored under
+        /// `status.controllers`).
+        name: String,
+        /// The Controller resource's UID. Plays the `rise_uid` role ADR-0001
+        /// describes for other identities: a recreated same-name Controller
+        /// gets a fresh uid, invalidating tokens minted for the old one.
+        uid: Uuid,
     },
 }
 
@@ -130,9 +176,10 @@ impl std::fmt::Debug for PrincipalClaims {
                 .field("allowed_environment_ids", allowed_environment_ids)
                 .field("scopes", scopes)
                 .finish(),
-            PrincipalClaims::Controller { identity_id } => f
+            PrincipalClaims::Controller { name, uid } => f
                 .debug_struct("Controller")
-                .field("identity_id", identity_id)
+                .field("name", name)
+                .field("uid", uid)
                 .finish(),
         }
     }
@@ -155,7 +202,7 @@ pub struct AccessClaims {
     pub iss: String,
     /// Audience (Rise public URL) — verified by the middleware like a session token.
     pub aud: String,
-    /// Stable principal id: `rise:sa:<sa_id>`, `rise:ctrl:<id>`, or a user uuid.
+    /// Stable principal id: `rise:sa:<sa_id>`, `controller:<name>`, or a user uuid.
     pub sub: String,
     /// Issued at timestamp.
     pub iat: u64,
@@ -165,6 +212,92 @@ pub struct AccessClaims {
     pub jti: String,
     /// The resolved principal.
     pub principal: PrincipalClaims,
+}
+
+/// The longest delegation chain an identity token may record (ADR-0001 §7).
+///
+/// Counted in `act` entries: a workload-exchanged token has none; a token
+/// minted by that workload for another target has one; and so on. A request
+/// whose result would exceed this is refused rather than silently truncated,
+/// so the audit chain a token carries is always complete.
+pub const MAX_DELEGATION_DEPTH: usize = 4;
+
+/// One delegator in an identity token's `act` chain (RFC 8693 §4.1).
+///
+/// The nested shape records every principal that minted a token along the way,
+/// outermost first: `act` names the caller that requested this token, and its
+/// own `act` names whoever minted the credential *that* caller presented.
+/// Actor data is audit provenance only; it never grants access.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActorClaim {
+    /// The delegator's canonical subject (`user:<name>`,
+    /// `serviceaccount:<org>/<name>`, or `controller:<name>`).
+    pub sub: String,
+    /// The delegator's resource UID at issuance time.
+    pub rise_uid: Uuid,
+    /// The delegator's own delegator, if it was itself acting on a delegated
+    /// token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActorClaim>>,
+}
+
+impl ActorClaim {
+    /// How many delegators this chain records, this entry included.
+    pub fn depth(&self) -> usize {
+        1 + self.act.as_ref().map_or(0, |inner| inner.depth())
+    }
+}
+
+/// Claims for a Rise-issued **identity token** (HS256) — the credential of a
+/// ServiceAccount or Controller *resource* principal (ADR-0001 §7).
+///
+/// Minted only by a target's `/token` subresource, either from an external
+/// workload assertion matched against that target's trust policies or by a
+/// Rise principal holding `(create, <kind>, token)` on it. Consumed only by
+/// Rise's own middleware, which re-resolves `(sub, rise_uid)` to a live resource
+/// on every request: the token carries identity and an optional ceiling, never
+/// a snapshot of grants.
+///
+/// Kept structurally separate from [`AccessClaims`] (which encodes a resolved
+/// typed-table principal) and from [`RiseClaims`] so none of the three can be
+/// honored on another's path.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityClaims {
+    /// Issuer (Rise public URL).
+    pub iss: String,
+    /// Audience (Rise public URL) — verified by the middleware like a session token.
+    pub aud: String,
+    /// The principal's canonical subject: `serviceaccount:<org>/<name>` or
+    /// `controller:<name>`.
+    pub sub: String,
+    /// The principal's resource UID at issuance. Authentication requires `sub`
+    /// and `rise_uid` to identify the same live resource, so a token issued for
+    /// a deleted-and-recreated name fails even though the name resolves again.
+    pub rise_uid: Uuid,
+    /// Issued at timestamp.
+    pub iat: u64,
+    /// Expiration timestamp.
+    pub exp: u64,
+    /// Audit id.
+    pub jti: String,
+    /// RFC 9396 authorization details forming a signed Allow ceiling (ADR-0001
+    /// §7). Absent means the target's full live policy; present is parsed by
+    /// the authorization engine on every request and fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_details: Option<Vec<serde_json::Value>>,
+    /// The delegation chain, when this token was minted through delegated
+    /// issuance rather than workload exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub act: Option<ActorClaim>,
+}
+
+impl IdentityClaims {
+    /// The number of delegators recorded in the `act` chain.
+    pub fn delegation_depth(&self) -> usize {
+        self.act.as_ref().map_or(0, ActorClaim::depth)
+    }
 }
 
 /// Subject info for workload identity JWT claims.

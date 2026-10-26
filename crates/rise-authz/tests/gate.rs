@@ -1,9 +1,10 @@
 //! ADR-0001 §5/§6.6 write-time grant gate, against fakes.
 //!
 //! Covers the appendix's grant-gate and ownership scenarios that are decidable
-//! without a database: 29–32, 34, and 39–43. Scenario 33 (serializable with
-//! revocation) is a property of the transaction the gate runs inside, not of the
-//! gate, and lands with the choke point that opens one.
+//! without a database: 26, 28–32, 34, 39–43, and 53. Scenario 33 (serializable
+//! with revocation) is a property of the transaction the gate runs inside, not
+//! of the gate, and is covered by the Tier 2 conformance tests that open one
+//! (`src/server/resources/handlers/conformance.rs`).
 
 mod support;
 
@@ -161,6 +162,8 @@ fn missing_verbs(outcome: &GateOutcome) -> Vec<String> {
 /// The denied tuple appears in neither effective policy, so it is never
 /// delegated — and the appointment is not blocked by a cap the writer shares
 /// with the appointee.
+/// ADR-0001 scenario 26
+/// ADR-0001 scenario 29
 #[tokio::test]
 async fn capped_admin_may_appoint_an_equally_capped_admin() {
     let mut builder = StoreBuilder::new();
@@ -215,6 +218,7 @@ async fn capped_admin_may_appoint_an_equally_capped_admin() {
 
 /// The same appointment is refused when the writer's own authority is narrower
 /// than what admin standing confers.
+/// ADR-0001 scenario 26
 #[tokio::test]
 async fn a_narrow_writer_cannot_appoint_an_admin() {
     let mut builder = StoreBuilder::new();
@@ -266,6 +270,7 @@ async fn a_narrow_writer_cannot_appoint_an_admin() {
 // -----------------------------------------------------------------------------
 
 /// Widening an unbound Role creates no authority, so it needs none.
+/// ADR-0001 scenario 30
 #[tokio::test]
 async fn widening_an_unbound_role_is_ungated() {
     let mut builder = StoreBuilder::new();
@@ -297,6 +302,7 @@ async fn widening_an_unbound_role_is_ungated() {
 
 /// Widening a *bound* Role is gated once per recipient and domain its bindings
 /// deliver it to.
+/// ADR-0001 scenario 30
 #[tokio::test]
 async fn widening_a_bound_role_is_gated_per_binding() {
     let mut builder = StoreBuilder::new();
@@ -367,6 +373,7 @@ async fn widening_a_bound_role_is_gated_per_binding() {
 // Scenario 31 — deleting a Deny is a grant
 // -----------------------------------------------------------------------------
 
+/// ADR-0001 scenario 31
 #[tokio::test]
 async fn deleting_a_deny_binding_is_gated_as_a_grant() {
     let mut builder = StoreBuilder::new();
@@ -441,6 +448,7 @@ async fn deleting_a_deny_binding_is_gated_as_a_grant() {
 // -----------------------------------------------------------------------------
 
 /// Authority over one Project cannot justify a grant across the Organization.
+/// ADR-0001 scenario 32
 #[tokio::test]
 async fn narrow_scope_cannot_justify_a_broader_grant() {
     let mut builder = StoreBuilder::new();
@@ -515,6 +523,7 @@ async fn narrow_scope_cannot_justify_a_broader_grant() {
 
 /// A Project-scoped writer covers a grant on a resource *below* that Project:
 /// containment follows the registered parent chain, not string equality.
+/// ADR-0001 scenario 32
 #[tokio::test]
 async fn scope_containment_follows_the_registered_parent_chain() {
     let mut builder = StoreBuilder::new();
@@ -728,6 +737,7 @@ async fn a_deny_scoped_to_an_unregistered_kind_still_limits_the_writer() {
 
 /// A new credential path to a User makes that User's whole policy reachable,
 /// Group-derived authority included.
+/// ADR-0001 scenario 34
 #[tokio::test]
 async fn creating_an_identity_mapping_requires_the_targets_whole_policy() {
     let mut builder = StoreBuilder::new();
@@ -819,6 +829,7 @@ async fn an_operator_passes_every_gate() {
 // GroupMembership
 // -----------------------------------------------------------------------------
 
+/// ADR-0001 scenario 28
 #[tokio::test]
 async fn adding_a_group_membership_delegates_the_groups_authority() {
     let mut builder = StoreBuilder::new();
@@ -1052,6 +1063,7 @@ async fn an_org_admin_cannot_manage_another_organizations_group() {
 
 /// A writer whose credential withholds a verb cannot delegate it, even though
 /// their live RBAC policy allows it.
+/// ADR-0001 scenario 53
 #[tokio::test]
 async fn a_credential_ceiling_limits_what_a_writer_may_delegate() {
     let mut builder = StoreBuilder::new();
@@ -1156,6 +1168,8 @@ fn tree(store: &FakeStore, chain: &[Uuid]) -> ResourceTree {
 
 /// Scenario 41 — an editor cannot redirect ownership to their own Group, even
 /// though the resource never loses access.
+///
+/// ADR-0001 scenario 41
 #[tokio::test]
 async fn an_unauthorized_owner_redirect_is_refused() {
     let mut builder = StoreBuilder::new();
@@ -1239,6 +1253,8 @@ async fn the_current_owner_may_transfer_ownership() {
 /// This is §6.6's named trap: dropping a label reads as `victim → absent` if you
 /// diff the resource's own stored value, and as `victim → the writer's group` if
 /// you diff the *effective* value. Only the second sees the escalation.
+///
+/// ADR-0001 scenario 40
 #[tokio::test]
 async fn removing_an_owner_label_is_gated_across_the_inheriting_subtree() {
     let mut builder = StoreBuilder::new();
@@ -1515,6 +1531,8 @@ async fn restating_an_inherited_value_is_ungated() {
 
 /// Scenario 42 — the creation exception covers a creator naming themselves or a
 /// same-org Group they belong to, and nothing else.
+///
+/// ADR-0001 scenario 42
 #[tokio::test]
 async fn the_creation_exception_is_narrow_and_org_clamped() {
     let mut builder = StoreBuilder::new();
@@ -1607,6 +1625,8 @@ async fn the_creation_exception_does_not_survive_into_an_update() {
 /// Scenario 43 — org-admin standing derives from a scope-only binding, so no
 /// ownership-label write can reach it. The gate treats an admin's relabel as
 /// trivially covered because their access is label-independent.
+///
+/// ADR-0001 scenario 43
 #[tokio::test]
 async fn admin_access_is_independent_of_ownership_labels() {
     let mut builder = StoreBuilder::new();

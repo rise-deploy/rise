@@ -1,17 +1,15 @@
 //! HTTP handlers for the generic resource API.
 //!
-//! Every user-authenticated path is authorized through the choke point in
-//! `crate::server::authz` — one `(verb, ResourceKind, subresource?)` decision
-//! per resource, evaluated against that resource's own ancestry and effective
-//! labels (ADR-0001 §4), plus the write-time grant gate on any change that
-//! delegates authority (§5). Operators reach everything because the seeded
-//! `system-admin` binding says so, not because of a check in front of the API.
-//!
-//! The controller-specific status/finalizer endpoints are the exception: they
-//! authenticate via the `AnyAuth` extractor and remain gated to controllers
-//! listed in the collection's `allowed_status_controller_ids` (default-deny on
-//! an empty list). Controllers become ordinary principals — and that allowlist
-//! goes away — when Controller identity resources go live.
+//! Every authenticated path — User or Controller alike — is authorized
+//! through the choke point in `crate::server::authz` — one
+//! `(verb, ResourceKind, subresource?)` decision per resource, evaluated
+//! against that resource's own ancestry and effective labels (ADR-0001 §4),
+//! plus the write-time grant gate on any change that delegates authority
+//! (§5). Operators reach everything because the seeded `system-admin`
+//! binding says so, not because of a check in front of the API. A Controller
+//! reaches its `status` and `finalizers` subresources the same way: through
+//! ordinary `PlatformRoleBinding`s naming its `controller:<name>` subject,
+//! never through a per-collection allowlist.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,8 +25,10 @@ use rise_authz::engine::{ListCandidate, ListDecision, ResourceTree};
 use rise_resource_api::NoOpValidator;
 use rise_resource_api::{
     CollectionInfo, CreateResourceParams, CreateResourceRequest, DeleteOutcome, PathSegment,
-    ResourceRow, ResourceStore, SubresourceName, UpdateResourceParams, UpdateResourceRequest, Verb,
-    CASCADE_DELETION_FINALIZER, MAX_PARENT_CHAIN_DEPTH,
+    ResourceRow, ResourceStore, RoleRefKind, StoreError, SubresourceName, UpdateResourceParams,
+    UpdateResourceRequest, Verb, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER,
+    MAX_PARENT_CHAIN_DEPTH, ORGANIZATION_KIND, ORG_ADMIN_PLATFORM_ROLE, PLATFORM_ROLE_BINDING_KIND,
+    ROLE_BINDING_KIND,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,12 +41,17 @@ use super::models::{
 use super::path::{
     parse_resource_path, parse_uid_token, CollectionRef, RawResourcePath, Subresource, UID_PREFIX,
 };
-use crate::server::auth::context::{AnyAuth, AuthContext};
+use super::token::{self, TokenService};
+#[cfg(test)]
+use crate::server::auth::context::AuthContext;
+use crate::server::auth::context::{AnyAuth, MaybeAuth};
+#[cfg(test)]
 use crate::server::auth::controller::ControllerAuthContext;
 use crate::server::authz::{
-    change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
-    label_changes, node_for, node_for_new, project_list_item, AuthorizationChangeSet,
-    AuthorizationContext, ReadGranularity, ResourceAuthorizer,
+    authorization_error_to_server_error, change_for_create, change_for_delete,
+    change_for_scheduled_deletion, change_for_update, label_changes, node_for, node_for_new,
+    project_list_item, AuthorizationChangeSet, AuthorizationContext, ReadGranularity,
+    ResourceAuthorizer,
 };
 use crate::server::error::ServerError;
 use crate::server::state::AppState;
@@ -70,6 +75,14 @@ pub(crate) struct ResourceApiCtx {
     /// and the row it authorizes are the same ones the write commits.
     store: Arc<dyn ResourceStore>,
     authz: ResourceAuthorizer,
+    /// What the `token` subresource needs: the signer, the JWKS source for
+    /// external assertions, the trust-policy lookup, and the platform limits.
+    tokens: Arc<TokenService>,
+    /// The bootstrapped default Organization's name, so the policy-audit
+    /// listing can downgrade its `OrganizationWithoutAdmin` finding to `info`
+    /// (operators administer it through the seeded `system-admin` binding,
+    /// not a per-organization admin — see decision D4 in the audit plan).
+    default_organization_name: String,
 }
 
 impl ResourceApiCtx {
@@ -77,6 +90,15 @@ impl ResourceApiCtx {
         Self {
             store: state.resource_store.clone(),
             authz: state.resource_authorizer.clone(),
+            tokens: Arc::new(TokenService::new(
+                state.jwt_signer.clone(),
+                state.jwt_validator.clone(),
+                rise_resource_store_postgres::TrustPolicyLookup::new(state.db_pool.clone()),
+                state.public_url.clone(),
+                state.server_settings.auth_token_max_ttl_seconds,
+                Some(state.oauth_rate_limiter.clone()),
+            )),
+            default_organization_name: state.default_organization_name.clone(),
         }
     }
 }
@@ -107,9 +129,9 @@ fn response_resource(
 // Path resolution
 // -----------------------------------------------------------------------------
 
-struct ResolvedCollection {
+pub(super) struct ResolvedCollection {
     collection: String,
-    info: CollectionInfo,
+    pub(super) info: CollectionInfo,
 }
 
 async fn resolve_collection(
@@ -259,34 +281,6 @@ async fn resolve_parent_chain(
     Ok(chain)
 }
 
-/// Authorize a controller token for status/finalizer writes against a
-/// collection. The collection's `allowed_status_controller_ids` is the gate;
-/// an empty list is default-deny. Built-in collections currently carry an
-/// empty list, so controllers cannot write their status until a future phase
-/// wires controller ownership for built-ins.
-fn enforce_controller_allowed(
-    info: &CollectionInfo,
-    collection: &str,
-    controller_id: &str,
-) -> Result<(), ServerError> {
-    if info
-        .allowed_status_controller_ids
-        .iter()
-        .any(|id| id == controller_id)
-    {
-        return Ok(());
-    }
-    tracing::warn!(
-        controller_id = %controller_id,
-        kind = %info.kind,
-        "Controller status/finalizer write denied — controller not in collection's allowed_status_controller_ids"
-    );
-    Err(ServerError::forbidden(format!(
-        "controller '{controller_id}' is not authorized to write status or finalizers \
-         for collection '{collection}'"
-    )))
-}
-
 fn assert_body_matches(
     info: &CollectionInfo,
     body_api_version: &str,
@@ -316,13 +310,29 @@ fn assert_body_matches(
 // Query types
 // -----------------------------------------------------------------------------
 
-/// Query parameters for `GET .../pending-deletion`.
+/// Query parameters for the sole-segment diagnostics paths: `pending-deletion`
+/// and `policy-audit`. One type serves both because they are dispatched from
+/// the same `GET` handler and axum extracts one `Query` per route.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingDeletionQuery {
-    /// Maximum number of tombstoned resources to return (default 100).
+    /// Maximum number of tombstoned resources or findings to return.
+    /// `pending-deletion` defaults to 100; `policy-audit` defaults to 200 and
+    /// clamps to 1..=1000.
     #[serde(default)]
     pub limit: Option<i64>,
+    /// `policy-audit` only: scope the audit to one Organization by name.
+    /// `None` audits every live Organization.
+    #[serde(default)]
+    pub organization: Option<String>,
+    /// `explain` only: the verb to explain the caller's own access for.
+    /// Required; a missing or unrecognized value is a 400.
+    #[serde(default)]
+    pub verb: Option<String>,
+    /// `explain` only: the subresource to explain access to, instead of the
+    /// main resource.
+    #[serde(default)]
+    pub subresource: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,11 +361,266 @@ struct DeletionBlockerResponse {
 }
 
 // -----------------------------------------------------------------------------
+// Policy-audit and explain wire types
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyAuditResponse {
+    findings: Vec<AuditFindingResponse>,
+    /// Findings on resources the caller may not `list`. Counted, never named —
+    /// the same disclosure shape `deletion-blockers` uses — so a partial view
+    /// never reads as "nothing to see here".
+    hidden_findings: usize,
+    truncated: bool,
+    scanned: AuditScannedResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditScannedResponse {
+    organizations: Vec<String>,
+    platform_bindings: usize,
+    organization_bindings: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuditFindingResponse {
+    severity: &'static str,
+    category: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadowed_by: Option<&'static str>,
+    subject: FindingSubjectResponse,
+    related: Vec<FindingSubjectResponse>,
+    detail: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FindingSubjectResponse {
+    uid: Uuid,
+    kind: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+}
+
+fn finding_subject_response(
+    subject: &rise_authz::engine::FindingSubject,
+) -> FindingSubjectResponse {
+    FindingSubjectResponse {
+        uid: subject.uid,
+        kind: subject.kind.clone(),
+        name: subject.name.clone(),
+        organization: subject.organization.clone(),
+    }
+}
+
+fn finding_category_name(category: &rise_authz::engine::FindingCategory) -> &'static str {
+    use rise_authz::engine::FindingCategory::*;
+    match category {
+        DanglingRoleRef => "danglingRoleRef",
+        StaleSubject => "staleSubject",
+        StaleScope => "staleScope",
+        StaleMembership => "staleMembership",
+        NoOpMembershipConstraint => "noOpMembershipConstraint",
+        RecipientBoundaryNoOp => "recipientBoundaryNoOp",
+        InertOwnerLabel => "inertOwnerLabel",
+        SelectorMatchesNothing => "selectorMatchesNothing",
+        ShadowedAllow { .. } => "shadowedAllow",
+        OrganizationWithoutAdmin => "organizationWithoutAdmin",
+        NonQualifyingOrgAdminReference => "nonQualifyingOrgAdminReference",
+    }
+}
+
+fn shadowed_by_name(category: &rise_authz::engine::FindingCategory) -> Option<&'static str> {
+    match category {
+        rise_authz::engine::FindingCategory::ShadowedAllow { by } => Some(match by {
+            rise_authz::engine::Shadow::Deny => "deny",
+            rise_authz::engine::Shadow::Replacement => "replacement",
+        }),
+        _ => None,
+    }
+}
+
+/// Project one engine finding to its wire shape. `severity_override` is how
+/// the handler downgrades `OrganizationWithoutAdmin` on the default
+/// Organization to `info` (decision D4) without the engine — which has no
+/// notion of "the default one" — knowing about it.
+fn audit_finding_response(
+    finding: rise_authz::engine::AuditFinding,
+    severity_override: Option<&'static str>,
+) -> AuditFindingResponse {
+    let severity = severity_override.unwrap_or(match finding.severity {
+        rise_authz::engine::Severity::Info => "info",
+        rise_authz::engine::Severity::Warning => "warning",
+    });
+    let category = finding_category_name(&finding.category);
+    let shadowed_by = shadowed_by_name(&finding.category);
+    AuditFindingResponse {
+        severity,
+        category,
+        shadowed_by,
+        subject: finding_subject_response(&finding.subject),
+        related: finding
+            .related
+            .iter()
+            .map(finding_subject_response)
+            .collect(),
+        detail: finding.detail,
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExplainResponse {
+    decision: &'static str,
+    operator_override: bool,
+    ceiling_admits: bool,
+    contributions: Vec<ContributionResponse>,
+    inert: Vec<InertBindingResponse>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContributionResponse {
+    binding: BindingRefResponse,
+    tier: serde_json::Value,
+    statement: serde_json::Value,
+    retention: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InertBindingResponse {
+    binding: BindingRefResponse,
+    tier: serde_json::Value,
+    reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BindingRefResponse {
+    uid: Uuid,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    role: RoleRefResponse,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RoleRefResponse {
+    kind: &'static str,
+    name: String,
+}
+
+/// `BindingTier` serializes as `"platform"` or `{"organization": "acme"}`
+/// rather than through a derived enum shape: it lives in `rise-authz`'s
+/// Tier-0 `policy` module, which derives no serde impls at all (this crate
+/// draws that boundary — see the `rise-authz` row in `CLAUDE.md`).
+fn tier_value(tier: &rise_authz::policy::BindingTier) -> serde_json::Value {
+    match tier {
+        rise_authz::policy::BindingTier::Platform => serde_json::json!("platform"),
+        rise_authz::policy::BindingTier::Organization(organization) => {
+            serde_json::json!({ "organization": organization })
+        }
+    }
+}
+
+fn retention_name(retention: rise_authz::engine::Retention) -> &'static str {
+    use rise_authz::engine::{DenyExemption, Retention::*};
+    match retention {
+        Retained => "retained",
+        SupersededAllow => "supersededAllow",
+        ExemptDeny(DenyExemption::Operator) => "exemptDeny:operator",
+        ExemptDeny(DenyExemption::OrganizationAdmin) => "exemptDeny:organizationAdmin",
+    }
+}
+
+fn inert_reason_name(reason: rise_authz::engine::InertReason) -> &'static str {
+    use rise_authz::engine::InertReason::*;
+    match reason {
+        UnresolvedSubject => "unresolvedSubject",
+        RecipientBoundary => "recipientBoundary",
+        ResourceOrganization => "resourceOrganization",
+        DanglingRoleRef => "danglingRoleRef",
+    }
+}
+
+fn decision_name(decision: rise_authz::policy::Decision) -> &'static str {
+    match decision {
+        rise_authz::policy::Decision::Allow => "allow",
+        rise_authz::policy::Decision::Deny => "deny",
+    }
+}
+
+fn binding_ref_response(provenance: &rise_authz::engine::BindingProvenance) -> BindingRefResponse {
+    let role_kind = match provenance.role.kind {
+        RoleRefKind::Role => "Role",
+        RoleRefKind::PlatformRole => "PlatformRole",
+    };
+    BindingRefResponse {
+        uid: provenance.uid,
+        kind: match provenance.kind {
+            rise_authz::engine::BindingKind::RoleBinding => "RoleBinding",
+            rise_authz::engine::BindingKind::PlatformRoleBinding => "PlatformRoleBinding",
+        },
+        name: provenance.name.clone(),
+        role: RoleRefResponse {
+            kind: role_kind,
+            name: provenance.role.name.clone(),
+        },
+    }
+}
+
+/// Project the engine's `Explanation` to its wire shape. The only fallible
+/// part is a `PolicyStatement` that somehow fails to serialize, which would
+/// be a bug in a type that otherwise always round-trips through JSON.
+fn explain_response(
+    explanation: rise_authz::engine::Explanation,
+) -> Result<ExplainResponse, ServerError> {
+    let contributions = explanation
+        .contributions
+        .into_iter()
+        .map(|contribution| {
+            Ok(ContributionResponse {
+                binding: binding_ref_response(&contribution.provenance),
+                tier: tier_value(&contribution.tier),
+                statement: serde_json::to_value(&contribution.statement).map_err(|error| {
+                    ServerError::internal(format!(
+                        "policy statement could not be serialized for an explain response: {error}"
+                    ))
+                })?,
+                retention: retention_name(contribution.retention),
+            })
+        })
+        .collect::<Result<Vec<_>, ServerError>>()?;
+    let inert = explanation
+        .inert
+        .into_iter()
+        .map(|inert| InertBindingResponse {
+            binding: binding_ref_response(&inert.provenance),
+            tier: tier_value(&inert.tier),
+            reason: inert_reason_name(inert.reason),
+        })
+        .collect();
+    Ok(ExplainResponse {
+        decision: decision_name(explanation.decision),
+        operator_override: explanation.operator_override,
+        ceiling_admits: explanation.ceiling_admits,
+        contributions,
+        inert,
+    })
+}
+
+// -----------------------------------------------------------------------------
 // Store-aware path classification
 // -----------------------------------------------------------------------------
 
 /// How to resolve the leaf resource row of an item/subresource path.
-enum LeafRef {
+pub(super) enum LeafRef {
     /// Named form: `D` ancestor name segments plus the leaf name.
     Named {
         ancestor_segs: Vec<PathSegment>,
@@ -366,9 +631,11 @@ enum LeafRef {
 }
 
 /// A resource path classified against the leaf kind's parent-chain depth.
-enum ResolvedPath {
+pub(super) enum ResolvedPath {
     /// `pending-deletion`: resources tombstoned and awaiting GC.
     PendingDeletion,
+    /// `policy-audit`: install-wide policy diagnostics.
+    PolicyAudit,
     /// A collection listing — `D` ancestor name segments, no leaf.
     List {
         resolved: ResolvedCollection,
@@ -414,12 +681,13 @@ fn segment_count_error(resolved: &ResolvedCollection, depth: usize, got: usize) 
 /// then either short-circuits the `uid:` form (a UID is globally unique, so the
 /// ancestor chain is irrelevant — no parent-chain walk) or walks the parent
 /// chain to learn `D` and classifies the named segments against it.
-async fn classify_path(
+pub(super) async fn classify_path(
     store: &Arc<dyn ResourceStore>,
     raw: RawResourcePath,
 ) -> Result<ResolvedPath, ServerError> {
     let (collection, segments) = match raw {
         RawResourcePath::PendingDeletion => return Ok(ResolvedPath::PendingDeletion),
+        RawResourcePath::PolicyAudit => return Ok(ResolvedPath::PolicyAudit),
         RawResourcePath::Collection {
             collection,
             segments,
@@ -548,7 +816,7 @@ async fn resolve_parent_row(
 /// leaf is missing, an ancestor is missing, the row is of another kind, the
 /// version is not declared — and each of those is itself a fact about a
 /// resource the caller may hold nothing on. One body, every time.
-async fn resolve_leaf(
+pub(super) async fn resolve_leaf(
     store: &Arc<dyn ResourceStore>,
     resolved: &ResolvedCollection,
     leaf: &LeafRef,
@@ -583,7 +851,7 @@ fn mask_not_found(error: ServerError) -> ServerError {
 pub async fn dispatch_get(
     State(state): State<AppState>,
     Path(raw): Path<String>,
-    auth: AuthContext,
+    auth: AnyAuth,
     Query(q): Query<PendingDeletionQuery>,
 ) -> Result<Response, ServerError> {
     dispatch_get_inner(&ResourceApiCtx::from_state(&state), raw, auth, q).await
@@ -592,7 +860,7 @@ pub async fn dispatch_get(
 async fn dispatch_get_inner(
     ctx: &ResourceApiCtx,
     raw: String,
-    auth: AuthContext,
+    auth: AnyAuth,
     q: PendingDeletionQuery,
 ) -> Result<Response, ServerError> {
     let raw_path = parse_resource_path(&raw)?;
@@ -649,6 +917,74 @@ async fn dispatch_get_inner(
                 "resource.pending_deletion_listed"
             );
             Ok(Json(serde_json::json!({ "items": items })).into_response())
+        }
+        ResolvedPath::PolicyAudit => {
+            let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+            let scope = rise_authz::engine::AuditScope {
+                organization: q.organization.clone(),
+                max_findings: limit as usize,
+            };
+            let report = authz.policy_audit(&scope).await?;
+            // Every finding names a resource (a binding, a Role, an
+            // Organization, ...); it is included only when the caller may
+            // `list` that resource, exactly as `pending-deletion` filters its
+            // rows. A finding whose subject's ancestry cannot be resolved is
+            // skipped and logged rather than failing the whole listing.
+            let mut findings = Vec::new();
+            let mut hidden = 0usize;
+            for finding in report.findings {
+                let target = match authz.tree(finding.subject.uid).await {
+                    Ok(target) => target,
+                    Err(error) => {
+                        tracing::warn!(
+                            uid = %finding.subject.uid,
+                            kind = %finding.subject.kind,
+                            "Skipping a policy-audit finding whose subject's ancestry could \
+                             not be resolved: {}",
+                            error.message
+                        );
+                        continue;
+                    }
+                };
+                if !authz.allows(&target, Verb::List, None).await? {
+                    hidden += 1;
+                    continue;
+                }
+                // The engine has no notion of "the default Organization" — it
+                // is a deployment setting, not a policy fact — so the
+                // downgrade happens here (decision D4): the default
+                // Organization is administered by operators through the
+                // seeded `system-admin` binding, and having no per-org admin
+                // binding of its own is expected, not a gap to close.
+                let severity_override = matches!(
+                    finding.category,
+                    rise_authz::engine::FindingCategory::OrganizationWithoutAdmin
+                ) && finding.subject.name == ctx.default_organization_name;
+                findings.push(audit_finding_response(
+                    finding,
+                    severity_override.then_some("info"),
+                ));
+            }
+            tracing::info!(
+                target: "rise::audit",
+                actor = %authz.actor(),
+                organization = ?scope.organization,
+                shown = findings.len(),
+                hidden,
+                truncated = report.truncated,
+                "resource.policy_audited"
+            );
+            Ok(Json(PolicyAuditResponse {
+                findings,
+                hidden_findings: hidden,
+                truncated: report.truncated,
+                scanned: AuditScannedResponse {
+                    organizations: report.scanned.organizations,
+                    platform_bindings: report.scanned.platform_bindings,
+                    organization_bindings: report.scanned.organization_bindings,
+                },
+            })
+            .into_response())
         }
         ResolvedPath::List {
             resolved,
@@ -840,9 +1176,47 @@ async fn dispatch_get_inner(
             })
             .into_response())
         }
+        ResolvedPath::Subresource {
+            resolved,
+            leaf,
+            subresource: Subresource::Explain,
+        } => {
+            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
+            let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
+            authz
+                .require_visible(
+                    &target,
+                    Verb::Get,
+                    Some(&subresource_name(Subresource::Explain)?),
+                )
+                .await?;
+            let verb = parse_verb(q.verb.as_deref().ok_or_else(|| {
+                ServerError::bad_request("explain requires a 'verb' query parameter")
+            })?)?;
+            let subresource = q
+                .subresource
+                .as_deref()
+                .map(|name| {
+                    name.parse::<SubresourceName>().map_err(|error| {
+                        ServerError::bad_request(format!("invalid subresource '{name}': {error}"))
+                    })
+                })
+                .transpose()?;
+            let explanation = authz.explain(&target, verb, subresource.as_ref()).await?;
+            tracing::info!(
+                target: "rise::audit",
+                actor = %authz.actor(),
+                uid = %row.uid,
+                verb = %verb_wire_name(verb),
+                subresource = subresource.as_ref().map(|s| s.as_ref()),
+                decision = %decision_name(explanation.decision),
+                "resource.explained"
+            );
+            Ok(Json(explain_response(explanation)?).into_response())
+        }
         ResolvedPath::Subresource { .. } => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
-            "GET is only supported for the deletion-blockers subresource",
+            "GET is only supported for the deletion-blockers and explain subresources",
         )),
     }
 }
@@ -850,16 +1224,65 @@ async fn dispatch_get_inner(
 pub async fn dispatch_post(
     State(state): State<AppState>,
     Path(raw): Path<String>,
-    auth: AuthContext,
+    auth: MaybeAuth,
+    headers: axum::http::HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ServerError> {
-    dispatch_post_inner(&ResourceApiCtx::from_state(&state), raw, auth, body).await
+    let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+    dispatch_post_any(
+        &ResourceApiCtx::from_state(&state),
+        raw,
+        auth,
+        body,
+        &client_ip,
+    )
+    .await
+}
+
+/// POST, before the credential question is settled.
+///
+/// The `token` subresource is the one route that may be reached without a
+/// Rise credential, and — credential or not — the one POST that is not a
+/// serializable write: it persists nothing (ADR-0001 §2). Both of its modes are
+/// dispatched here; everything else is the ordinary create path.
+async fn dispatch_post_any(
+    ctx: &ResourceApiCtx,
+    raw: String,
+    auth: MaybeAuth,
+    body: serde_json::Value,
+    client_ip: &str,
+) -> Result<Response, ServerError> {
+    let raw_path = parse_resource_path(&raw)?;
+    let Some(auth) = auth.0 else {
+        return token::dispatch_unauthenticated(&ctx.store, &ctx.tokens, raw_path, body, client_ip)
+            .await;
+    };
+    if token::may_be_token_route(&raw_path) {
+        if let ResolvedPath::Subresource {
+            resolved,
+            leaf,
+            subresource: Subresource::Token,
+        } = classify_path(&ctx.store, raw_path).await?
+        {
+            return token::delegated_issuance(
+                &ctx.authz,
+                &ctx.store,
+                &ctx.tokens,
+                &auth,
+                &resolved,
+                &leaf,
+                body,
+            )
+            .await;
+        }
+    }
+    dispatch_post_inner(ctx, raw, auth, body).await
 }
 
 async fn dispatch_post_inner(
     ctx: &ResourceApiCtx,
     raw: String,
-    auth: AuthContext,
+    auth: AnyAuth,
     body: serde_json::Value,
 ) -> Result<Response, ServerError> {
     // Parsed once up front: a malformed path is a 400 regardless of who is
@@ -897,9 +1320,7 @@ async fn create_once(
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             // The parent is resolved inside, after the body-only validation:
             // reaching a 400 at all is itself an answer about the parent.
-            let (status, resource) =
-                create_resource(ctx, authz, &resolved, &ancestor_segs, body).await?;
-            Ok((status, resource).into_response())
+            create_resource(ctx, authz, &resolved, &ancestor_segs, body).await
         }
         _ => Err(ServerError::new(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -927,18 +1348,9 @@ async fn dispatch_put_inner(
     // before any authentication or store work, matching the other handlers.
     parse_resource_path(&raw)?;
 
-    // A controller token writes only through the status/finalizer subresources,
-    // authorized by the collection's controller allowlist rather than by RBAC: a
-    // Controller is not a principal until its identity resource exists, so there
-    // is nothing for the engine to evaluate.
-    let user_auth = match &auth {
-        AnyAuth::User(auth_ctx) => auth_ctx.clone(),
-        AnyAuth::Controller(_) => return dispatch_put_controller(ctx, raw, auth, body).await,
-    };
-
     let mut attempt = 1;
     loop {
-        let write = ctx.authz.begin_write(&user_auth, attempt).await?;
+        let write = ctx.authz.begin_write(&auth, attempt).await?;
         let outcome = match update_once(ctx, write.context(), &raw, body.clone()).await {
             Ok(response) => write.commit().await.map(|()| response),
             Err(error) => Err(error),
@@ -963,8 +1375,7 @@ async fn update_once(
             let body: UpdateResourceRequest = serde_json::from_value(body)
                 .map_err(|e| ServerError::bad_request(format!("invalid request body: {e}")))?;
             let row = resolve_leaf(authz.store(), &resolved, &leaf).await?;
-            let resp = update_resource(ctx, authz, &resolved, &row, &leaf, body).await?;
-            Ok(resp.into_response())
+            update_resource(ctx, authz, &resolved, &row, &leaf, body).await
         }
         ResolvedPath::Subresource {
             resolved,
@@ -983,9 +1394,8 @@ async fn update_once(
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
                         })?;
-                    let resp =
-                        apply_user_status(authz, &row, body, &resolved.info.api_version, &target)
-                            .await?;
+                    let resp = apply_status(authz, &row, body, &resolved.info.api_version, &target)
+                        .await?;
                     Ok(resp.into_response())
                 }
                 Subresource::Finalizers => {
@@ -996,20 +1406,20 @@ async fn update_once(
                         serde_json::from_value(body).map_err(|e| {
                             ServerError::bad_request(format!("invalid request body: {e}"))
                         })?;
-                    let resp = apply_user_finalizers(
-                        authz,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                        &target,
-                    )
-                    .await?;
+                    let resp =
+                        apply_finalizers(authz, &row, body, &resolved.info.api_version, &target)
+                            .await?;
                     Ok(resp.into_response())
                 }
                 Subresource::DeletionBlockers => Err(ServerError::new(
                     StatusCode::METHOD_NOT_ALLOWED,
                     "deletion-blockers is a read-only subresource",
                 )),
+                Subresource::Explain => Err(ServerError::new(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "explain is a read-only subresource",
+                )),
+                Subresource::Token => Err(token_is_create_only()),
             }
         }
         _ => Err(ServerError::new(
@@ -1019,90 +1429,19 @@ async fn update_once(
     }
 }
 
-/// The controller-token half of `PUT`: status and finalizer writes gated by the
-/// collection's `allowed_status_controller_ids`.
-async fn dispatch_put_controller(
-    ctx: &ResourceApiCtx,
-    raw: String,
-    auth: AnyAuth,
-    body: serde_json::Value,
-) -> Result<Response, ServerError> {
-    let AnyAuth::Controller(controller) = auth else {
-        return Err(ServerError::unauthorized("Not authenticated"));
-    };
-    let raw_path = parse_resource_path(&raw)?;
-    // `classify_path` performs store I/O (resolving the collection) before the
-    // controller token is rejected for item-level paths. This means a controller
-    // token can observe whether a collection (ResourceDefinition) exists. This
-    // is acceptable: controllers can already probe collection existence via GET
-    // requests to listing paths, so the information is not meaningfully secret.
-    match classify_path(&ctx.store, raw_path).await? {
-        ResolvedPath::Item { .. } => Err(ServerError::forbidden(
-            "controller tokens cannot update resource items",
-        )),
-        ResolvedPath::Subresource {
-            resolved,
-            leaf,
-            subresource,
-        } => {
-            // The allowlist decides before the row is resolved: a controller
-            // that is not on it must not learn whether the item it named
-            // exists. Collection existence it can already observe (see above),
-            // and that is the whole of what it learns here.
-            enforce_controller_allowed(
-                &resolved.info,
-                &resolved.collection,
-                &controller.0.identity_id,
-            )?;
-            let row = resolve_leaf(&ctx.store, &resolved, &leaf).await?;
-            match subresource {
-                Subresource::Status => {
-                    let body: ControllerStatusUpdate =
-                        serde_json::from_value(body).map_err(|e| {
-                            ServerError::bad_request(format!("invalid request body: {e}"))
-                        })?;
-                    let resp = apply_controller_status(
-                        ctx,
-                        &controller,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                    )
-                    .await?;
-                    Ok(resp.into_response())
-                }
-                Subresource::Finalizers => {
-                    let body: ControllerFinalizerUpdate =
-                        serde_json::from_value(body).map_err(|e| {
-                            ServerError::bad_request(format!("invalid request body: {e}"))
-                        })?;
-                    let resp = apply_controller_finalizers(
-                        ctx,
-                        &controller,
-                        &row,
-                        body,
-                        &resolved.info.api_version,
-                    )
-                    .await?;
-                    Ok(resp.into_response())
-                }
-                Subresource::DeletionBlockers => Err(ServerError::new(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "deletion-blockers is a read-only subresource",
-                )),
-            }
-        }
-        _ => Err(ServerError::new(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "PUT is only valid for item and subresource paths",
-        )),
-    }
+/// `token` accepts `create` and nothing else (ADR-0001 §2): a Role may hold a
+/// broader wildcard, but only an operation the registered route serves can be
+/// authorized, and this one serves only POST.
+fn token_is_create_only() -> ServerError {
+    ServerError::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "token is a create-only subresource: POST to it",
+    )
 }
-
 pub async fn dispatch_delete(
     State(state): State<AppState>,
     Path(raw): Path<String>,
-    auth: AuthContext,
+    auth: AnyAuth,
 ) -> Result<Response, ServerError> {
     dispatch_delete_inner(&ResourceApiCtx::from_state(&state), raw, auth).await
 }
@@ -1110,7 +1449,7 @@ pub async fn dispatch_delete(
 async fn dispatch_delete_inner(
     ctx: &ResourceApiCtx,
     raw: String,
-    auth: AuthContext,
+    auth: AnyAuth,
 ) -> Result<Response, ServerError> {
     parse_resource_path(&raw)?;
     let mut attempt = 1;
@@ -1254,10 +1593,79 @@ fn read_granularity(readable: bool) -> ReadGranularity {
     }
 }
 
+/// After a successful create or update of a `RoleBinding`/`PlatformRoleBinding`,
+/// attach one `Warning` header per write-time policy-audit finding scoped to
+/// the row just written (ADR-0001 §5: diagnostics never reject a write).
+///
+/// The audit runs on the same transaction-scoped store the write just used, so
+/// it sees the row exactly as written, before commit. A diagnostic failure is
+/// logged and treated as no findings — it must never hold the response the
+/// caller already earned hostage. A *store* failure is different: an error
+/// raised by a statement inside a PostgreSQL transaction aborts that
+/// transaction, after which `COMMIT` silently rolls back instead of failing.
+/// Swallowing it would report a write that never persisted, so it propagates
+/// — as retryable when it is a serialization conflict, so the write loop
+/// replays the whole attempt — and the caller learns the truth.
+async fn attach_binding_write_warnings(
+    authz: &AuthorizationContext,
+    row: &ResourceRow,
+    response: &mut Response,
+) -> Result<(), ServerError> {
+    if row.kind != ROLE_BINDING_KIND && row.kind != PLATFORM_ROLE_BINDING_KIND {
+        return Ok(());
+    }
+    let findings = match authz.audit_binding(row.uid).await {
+        Ok(findings) => findings,
+        Err(error @ rise_authz::engine::AuthorizationError::Store(_)) => {
+            return Err(authorization_error_to_server_error(error));
+        }
+        Err(error) => {
+            tracing::warn!(
+                uid = %row.uid,
+                kind = %row.kind,
+                "policy audit after a binding write failed; continuing without warnings: {error:?}"
+            );
+            return Ok(());
+        }
+    };
+    // RFC 7234's warn-code/warn-agent/warn-text form, as Kubernetes admission
+    // warnings use: `299 - "<text>"`. One header per finding, so a client that
+    // only reads the first still sees the single most actionable one — the
+    // detectors run in a fixed order (rows 1, 2, 3, 5, 6, 8, 12).
+    for finding in findings {
+        let text = finding.detail.replace(['\r', '\n'], " ").replace('"', "'");
+        if let Ok(value) = axum::http::HeaderValue::from_str(&format!("299 - \"{text}\"")) {
+            response
+                .headers_mut()
+                .append(axum::http::header::WARNING, value);
+        }
+    }
+    Ok(())
+}
+
 fn subresource_name(subresource: Subresource) -> Result<SubresourceName, ServerError> {
     subresource.keyword().parse().map_err(|error| {
         ServerError::internal(format!("subresource keyword is not a valid name: {error}"))
     })
+}
+
+/// Parse the `explain` subresource's required `verb` query parameter.
+///
+/// `Verb` derives `Deserialize` for the lowercase wire vocabulary policy
+/// statements use, so a plain string is round-tripped through one JSON value
+/// rather than hand-rolling a second parser for the same six names.
+fn parse_verb(raw: &str) -> Result<Verb, ServerError> {
+    serde_json::from_value(serde_json::Value::String(raw.to_owned())).map_err(|_| {
+        ServerError::bad_request(format!(
+            "invalid verb '{raw}'; expected one of get, list, create, update, delete, use"
+        ))
+    })
+}
+
+/// The lowercase wire name for a verb, for the `resource.explained` audit
+/// record — the same vocabulary `parse_verb` accepts and policy statements use.
+fn verb_wire_name(verb: Verb) -> String {
+    format!("{verb:?}").to_ascii_lowercase()
 }
 
 /// Authorize the owner references a write newly attaches.
@@ -1375,37 +1783,6 @@ async fn owner_is_live(authz: &AuthorizationContext, uid: Uuid) -> Result<bool, 
         .is_some_and(|row| row.deletion_timestamp.is_none()))
 }
 
-/// `allowedStatusControllerIds` is an authorization decision, and the only one
-/// the grant gate cannot express.
-///
-/// Every id on a `ResourceDefinition`'s list grants that controller `status` and
-/// `finalizers` writes over every resource of the kind, in every organization —
-/// but a controller is not a subject the engine can evaluate until its identity
-/// resource exists, so there is no binding to diff and no recipient to compare a
-/// writer against. Until then, changing the list stays operator authority:
-/// otherwise an ordinary `update` on a `ResourceDefinition` would confer
-/// authority no `RoleBinding` granted and no gate ever weighed. The allowlist
-/// goes away entirely once Controller identities are live (`ROADMAP.md` §1).
-fn require_operator_for_controller_allowlist(
-    authz: &AuthorizationContext,
-    before: &serde_json::Value,
-    after: &serde_json::Value,
-) -> Result<(), ServerError> {
-    let ids = |spec: &serde_json::Value| -> Vec<serde_json::Value> {
-        spec.get("allowedStatusControllerIds")
-            .and_then(|value| value.as_array())
-            .cloned()
-            .unwrap_or_default()
-    };
-    if ids(before) == ids(after) || authz.is_operator() {
-        return Ok(());
-    }
-    Err(ServerError::forbidden(
-        "changing allowedStatusControllerIds requires operator standing: it grants \
-         controllers status and finalizer writes outside the authorization model",
-    ))
-}
-
 /// Run the grant gate over every authorization-changing effect of one write.
 ///
 /// The caller has already established ordinary write authority; this is the
@@ -1436,7 +1813,7 @@ async fn create_resource(
     resolved: &ResolvedCollection,
     ancestor_segs: &[PathSegment],
     body: CreateResourceRequest,
-) -> Result<(StatusCode, Json<serde_json::Value>), ServerError> {
+) -> Result<Response, ServerError> {
     // Everything down to `require_create` reads only the request and the
     // collection registry, never the parent — deliberately, because *reaching*
     // one of these answers is itself a fact about the parent. A 400 for a
@@ -1475,6 +1852,24 @@ async fn create_resource(
         )));
     }
 
+    // `bootstrap` reads only the request too: whether it is even meaningful
+    // here, and whether the admin it names is shaped like one, are both facts
+    // about the request alone, not about anything already stored.
+    if let Some(bootstrap) = &body.bootstrap {
+        if resolved.info.kind != ORGANIZATION_KIND || body.api_version != API_VERSION_V1ALPHA1 {
+            return Err(ServerError::bad_request(
+                "bootstrap is only supported when creating a rise.dev/v1alpha1 Organization",
+            ));
+        }
+        if bootstrap.admin.kind() != "user" {
+            return Err(ServerError::bad_request(format!(
+                "bootstrap.admin must be a 'user:<name>' subject, got '{}'",
+                bootstrap.admin
+            )));
+        }
+    }
+    let bootstrap = body.bootstrap.clone();
+
     // A create is authorized against the resource it would produce, labels
     // included: nothing in evaluation distinguishes a resource that exists from
     // one being written (ADR-0001 §4).
@@ -1500,10 +1895,8 @@ async fn create_resource(
     let annotations: BTreeMap<String, String> = body.metadata.annotations.clone();
     let spec = serde_json::to_value(&body.spec)
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
+    token::reject_rise_issuer_in_trust_policy(&ctx.tokens, &resolved.info, &spec)?;
 
-    if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
-        require_operator_for_controller_allowlist(authz, &serde_json::Value::Null, &spec)?;
-    }
     authorize_owner_references(authz, None, &[], &body.metadata.owner_references).await?;
 
     let mut changes = change_for_create(
@@ -1558,14 +1951,106 @@ async fn create_resource(
 
     audit_write(authz, &row, "resource.created", None);
     let _ = ctx;
+
+    if let Some(bootstrap) = bootstrap {
+        bootstrap_org_admin(authz, &row, &bootstrap.admin).await?;
+    }
+
     // Projected like every other write: a `create` grant is not a read grant,
     // and the stored row carries more than the caller sent — the server-assigned
     // UID, and for a policy kind the contextual normalization admission applied
     // to the spec.
-    Ok((
-        StatusCode::CREATED,
-        Json(write_response(authz, &row, &resolved.info.api_version, &target).await?),
-    ))
+    let body = write_response(authz, &row, &resolved.info.api_version, &target).await?;
+    let mut response = (StatusCode::CREATED, Json(body)).into_response();
+    attach_binding_write_warnings(authz, &row, &mut response).await?;
+    Ok(response)
+}
+
+/// Bootstrap a new Organization's first administrator, in the same
+/// transaction as the Organization create.
+///
+/// Builds an exact org-root, scope-only `RoleBinding` naming
+/// `PlatformRole/org-admin` for `admin` (ADR-0001 §5's structural admin
+/// predicate) and runs it through the same authorization pipeline an ordinary
+/// `RoleBinding` create would: `require_create`, the grant gate, admission,
+/// and the audit trail. A refusal or a validation failure (the admin names no
+/// live User, or `org-admin` has been deleted) propagates out of
+/// `create_resource` and rolls the whole attempt back — the Organization is
+/// never left without the admin the caller asked to bootstrap alongside it.
+async fn bootstrap_org_admin(
+    authz: &AuthorizationContext,
+    org: &ResourceRow,
+    admin: &rise_resource_api::SubjectId,
+) -> Result<(), ServerError> {
+    let binding_collection = authz
+        .store()
+        .resolve_collection_by_kind(rise_resource_api::API_GROUP, ROLE_BINDING_KIND)
+        .await
+        .map_err(store_error_to_server_error)?
+        .ok_or_else(|| {
+            ServerError::internal("RoleBinding collection is not registered".to_owned())
+        })?;
+
+    let binding_name = format!("org-admin-{}", admin.name());
+    let spec = serde_json::json!({
+        "subject": admin.to_string(),
+        "scope": format!("rise.dev/Organization/{}", org.name),
+        "roleRef": { "kind": "PlatformRole", "name": ORG_ADMIN_PLATFORM_ROLE },
+    });
+
+    let leaf = node_for_new(
+        &binding_collection.storage_api_version,
+        ROLE_BINDING_KIND,
+        &binding_name,
+        &BTreeMap::new(),
+    )?;
+    let org_tree = authz.tree(org.uid).await.map_err(mask_not_found)?;
+    let target = ResourceTree::with_leaf(org_tree.nodes(), leaf);
+    authz.require_create(&target, Some(&org_tree)).await?;
+
+    let changes = change_for_create(
+        authz,
+        &binding_collection.storage_api_version,
+        ROLE_BINDING_KIND,
+        &binding_name,
+        Some(org),
+        &spec,
+    )
+    .await?;
+    run_gate(authz, changes).await?;
+
+    let params = CreateResourceParams {
+        labels: BTreeMap::new(),
+        api_version: binding_collection.storage_api_version.clone(),
+        kind: ROLE_BINDING_KIND.to_string(),
+        name: binding_name,
+        parent_uid: Some(org.uid),
+        annotations: BTreeMap::new(),
+        finalizers: Vec::new(),
+        owner_references: Vec::new(),
+        spec,
+        validator: Some(binding_collection.spec_validator.clone()),
+    };
+    let binding_row = authz
+        .store()
+        .create(params)
+        .await
+        .map_err(|error| match error {
+            // Admission resolves the `user:` subject and the `PlatformRole/org-admin`
+            // reference against live rows; either missing means the request asked
+            // to bootstrap an admin that cannot exist yet. That is a fact about the
+            // request, not a malformed body, so it is reported as 422 rather than
+            // folded into the ordinary 400 a validation failure gets elsewhere —
+            // and because this is not committed, the Organization itself never
+            // persists either.
+            StoreError::Validation(message) => {
+                ServerError::new(StatusCode::UNPROCESSABLE_ENTITY, message)
+            }
+            other => store_error_to_server_error(other),
+        })?;
+
+    audit_write(authz, &binding_row, "resource.created", None);
+    Ok(())
 }
 
 async fn update_resource(
@@ -1575,7 +2060,7 @@ async fn update_resource(
     row: &ResourceRow,
     leaf: &LeafRef,
     body: UpdateResourceRequest,
-) -> Result<Json<serde_json::Value>, ServerError> {
+) -> Result<Response, ServerError> {
     // Authorization first, before a single word of the body is inspected.
     //
     // Everything below this line answers a question about the *stored* row —
@@ -1661,9 +2146,6 @@ async fn update_resource(
     let spec = serde_json::to_value(&body.spec)
         .map_err(|e| ServerError::bad_request(format!("invalid spec: {e}")))?;
 
-    if resolved.info.kind == rise_resource_api::RESOURCE_DEFINITION_KIND {
-        require_operator_for_controller_allowlist(authz, &row.spec, &spec)?;
-    }
     authorize_owner_references(
         authz,
         Some(&target),
@@ -1723,9 +2205,10 @@ async fn update_resource(
     // The written labels are the resource's own after this update, so the
     // response reports the value the next request will evaluate against.
     let updated_target = authz.tree(updated.uid).await.map_err(mask_not_found)?;
-    Ok(Json(
-        write_response(authz, &updated, &resolved.info.api_version, &updated_target).await?,
-    ))
+    let body = write_response(authz, &updated, &resolved.info.api_version, &updated_target).await?;
+    let mut response = Json(body).into_response();
+    attach_binding_write_warnings(authz, &updated, &mut response).await?;
+    Ok(response)
 }
 
 async fn delete_resource(
@@ -1811,101 +2294,78 @@ async fn delete_resource(
     }
 }
 
-async fn apply_controller_status(
-    ctx: &ResourceApiCtx,
-    controller: &ControllerAuthContext,
-    row: &ResourceRow,
-    body: ControllerStatusUpdate,
-    response_api_version: &str,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
-    let updated = ctx
-        .store
-        .update_controller_status(row.uid, &controller.0.identity_id, body.status)
-        .await
-        .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %controller.0.identity_id,
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.controller_status_updated"
-    );
-    Ok(Json(response_resource(&updated, response_api_version)?))
-}
-
-async fn apply_controller_finalizers(
-    ctx: &ResourceApiCtx,
-    controller: &ControllerAuthContext,
-    row: &ResourceRow,
-    body: ControllerFinalizerUpdate,
-    response_api_version: &str,
-) -> Result<Json<rise_resource_api::Resource>, ServerError> {
-    let updated = ctx
-        .store
-        .update_controller_finalizers(row.uid, &controller.0.identity_id, &body.add, &body.remove)
-        .await
-        .map_err(store_error_to_server_error)?;
-    tracing::info!(
-        target: "rise::audit",
-        actor = %controller.0.identity_id,
-        uid = %row.uid,
-        api_version = %row.api_version,
-        kind = %row.kind,
-        name = %row.name,
-        "resource.controller_finalizers_updated"
-    );
-    Ok(Json(response_resource(&updated, response_api_version)?))
-}
-
-/// A user's `status` write, authorized by `(update, Kind, status)`.
+/// A `status` write, authorized by `(update, Kind, status)`.
 ///
-/// The value lands in the writer-keyed slot the store reserves for non-
-/// controller writers, so a controller's own slot is never overwritten by a
-/// human edit. That slot is still named for the operator tier it was introduced
-/// for; ADR-0002's subresource execution model owns the field separation and is
-/// where the naming is settled, not here.
-async fn apply_user_status(
+/// A Controller subject writes its own `status.controllers[<name>]` slot (the
+/// store enforces that a controller can only ever touch its own slot); every
+/// other subject writes the shared writer-keyed slot `operator_update_status`
+/// reserves — `status.controllers["operator:<subject>"]` (e.g.
+/// `operator:user:<uid>`), keyed on the caller's stable subject, never its
+/// email, since the slot is stored inside the resource document and served to
+/// every reader of it, which makes it product data rather than an audit
+/// record (ADR-0001 §1). That slot is still named for the operator tier it
+/// was introduced for; ADR-0002's subresource execution model owns the field
+/// separation and is where the naming is settled, not here.
+async fn apply_status(
     authz: &AuthorizationContext,
     row: &ResourceRow,
     body: ControllerStatusUpdate,
     response_api_version: &str,
     target: &ResourceTree,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    // Keyed on the caller's stable subject, never their email: the slot is
-    // stored inside the resource document and served to every reader of it,
-    // which makes it product data rather than an audit record (ADR-0001 §1 —
-    // user identity is not email).
-    let updated = authz
-        .store()
-        .operator_update_status(row.uid, authz.subject().as_ref(), body.status)
-        .await
-        .map_err(store_error_to_server_error)?;
-    audit_write(authz, row, "resource.user_status_updated", None);
+    let subject = authz.subject();
+    let (updated, event) = if subject.kind() == "controller" {
+        let updated = authz
+            .store()
+            .update_controller_status(row.uid, subject.name(), body.status)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.controller_status_updated")
+    } else {
+        let updated = authz
+            .store()
+            .operator_update_status(row.uid, subject.as_ref(), body.status)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.user_status_updated")
+    };
+    audit_write(authz, row, event, None);
     Ok(Json(
         write_response(authz, &updated, response_api_version, target).await?,
     ))
 }
 
-/// A user's `finalizers` write, authorized by `(update, Kind, finalizers)`.
+/// A `finalizers` write, authorized by `(update, Kind, finalizers)`.
 ///
-/// Finalizer keys in the reserved `system.rise.dev/*` namespace stay refused by
-/// the store: those are lifecycle bookkeeping the garbage collector owns, and no
-/// RBAC grant makes them writable.
-async fn apply_user_finalizers(
+/// A Controller subject may only add or remove finalizers it owns (the store
+/// enforces `<name>` or `<name>/<reason>`); finalizer keys in the reserved
+/// `system.rise.dev/*` namespace stay refused for every subject, since those
+/// are lifecycle bookkeeping the garbage collector owns and no RBAC grant
+/// makes them writable.
+async fn apply_finalizers(
     authz: &AuthorizationContext,
     row: &ResourceRow,
     body: ControllerFinalizerUpdate,
     response_api_version: &str,
     target: &ResourceTree,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let updated = authz
-        .store()
-        .operator_update_finalizers(row.uid, authz.subject().as_ref(), &body.add, &body.remove)
-        .await
-        .map_err(store_error_to_server_error)?;
-    audit_write(authz, row, "resource.user_finalizers_updated", None);
+    let subject = authz.subject();
+    let (updated, event) = if subject.kind() == "controller" {
+        let updated = authz
+            .store()
+            .update_controller_finalizers(row.uid, subject.name(), &body.add, &body.remove)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.controller_finalizers_updated")
+    } else {
+        let updated = authz
+            .store()
+            .operator_update_finalizers(row.uid, subject.as_ref(), &body.add, &body.remove)
+            .await
+            .map_err(store_error_to_server_error)?;
+        (updated, "resource.user_finalizers_updated")
+    };
+    audit_write(authz, row, event, None);
     Ok(Json(
         write_response(authz, &updated, response_api_version, target).await?,
     ))
@@ -1925,7 +2385,6 @@ mod tests {
             kind: "Organization".into(),
             parent: None,
             spec_validator: std::sync::Arc::new(NoOpValidator),
-            allowed_status_controller_ids: vec![],
         };
 
         // Matching apiVersion and kind must be accepted.
@@ -1936,42 +2395,6 @@ mod tests {
 
         // Wrong kind.
         assert!(assert_body_matches(&info, "rise.dev/v1alpha1", "Widget",).is_err());
-    }
-
-    fn collection_info(allowed: Vec<String>) -> CollectionInfo {
-        CollectionInfo {
-            api_version: "example.dev/v1".into(),
-            storage_api_version: "example.dev/v1".into(),
-            served_api_versions: vec!["example.dev/v1".into()],
-            declared_api_versions: vec!["example.dev/v1".into()],
-            kind: "Widget".into(),
-            parent: None,
-            spec_validator: std::sync::Arc::new(NoOpValidator),
-            allowed_status_controller_ids: allowed,
-        }
-    }
-
-    #[test]
-    fn enforce_controller_allowed_permits_listed_controller() {
-        let info = collection_info(vec!["controller.example.com".into()]);
-        assert!(enforce_controller_allowed(&info, "widgets", "controller.example.com").is_ok());
-    }
-
-    #[test]
-    fn enforce_controller_allowed_rejects_unlisted_controller() {
-        let info = collection_info(vec!["controller.example.com".into()]);
-        let err = enforce_controller_allowed(&info, "widgets", "other.example.com").unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        assert!(err.message.contains("not authorized"));
-    }
-
-    #[test]
-    fn enforce_controller_allowed_default_denies_empty_allowlist() {
-        // Built-in collections carry an empty allowlist — default-deny.
-        let info = collection_info(vec![]);
-        let err =
-            enforce_controller_allowed(&info, "widgets", "controller.example.com").unwrap_err();
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -2019,6 +2442,11 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod conformance;
+#[cfg(test)]
+mod test_support;
+
 /// DB-backed tests that drive the generic resource API through the
 /// `dispatch_*_inner` functions — the same code path the four Axum handlers
 /// run, minus only the `State`/`Path`/`Query`/`Json` extraction.
@@ -2031,274 +2459,10 @@ mod tests {
 /// auth tiers, versioning and error mapping end to end against Postgres.
 #[cfg(test)]
 mod dispatch_tests {
+    use super::test_support::*;
     use super::*;
-    use crate::db::models::User;
     use rise_resource_api::RESOURCE_DEFINITION_KIND;
-    use rise_resource_store_postgres::PgResourceStore;
-    use serde_json::{json, Value};
-
-    const OPERATOR: &str = "operator@example.com";
-    const PLAIN_USER: &str = "plain-user@example.com";
-
-    /// Build a `ResourceApiCtx` over a real `PgResourceStore`, with `OPERATOR`
-    /// on the operator email allowlist. The resource store schema is layered on
-    /// top of the root migrations `#[sqlx::test]` already ran, and the baseline
-    /// policy is seeded exactly as startup seeds it — without it an operator
-    /// would still reach everything (the evaluator hardcodes that), but nothing
-    /// else in the model would be present to reason about.
-    async fn ctx(pool: sqlx::PgPool) -> ResourceApiCtx {
-        ctx_with_operators(pool, vec![OPERATOR.into()], vec![]).await
-    }
-
-    async fn ctx_with_operators(
-        pool: sqlx::PgPool,
-        operator_users: Vec<String>,
-        operator_idp_groups: Vec<String>,
-    ) -> ResourceApiCtx {
-        rise_resource_store_postgres::run_migrations(&pool)
-            .await
-            .expect("resource store migrations");
-        let pg_store = Arc::new(PgResourceStore::new(pool.clone()));
-        let store: Arc<dyn ResourceStore> = pg_store.clone();
-        crate::server::policy_seed::run(store.as_ref())
-            .await
-            .expect("seed baseline policy");
-        ResourceApiCtx {
-            store,
-            authz: ResourceAuthorizer::new(
-                pg_store,
-                pool,
-                crate::server::authz::OperatorSelectors {
-                    users: Arc::new(operator_users),
-                    idp_groups: Arc::new(operator_idp_groups),
-                },
-            ),
-        }
-    }
-
-    /// A `User`-backed `AuthContext`. `User` rows do not need to exist in the
-    /// DB — the resource API authorizes purely on the email allowlists.
-    fn auth(email: &str) -> AuthContext {
-        AuthContext::User(User {
-            id: Uuid::new_v4(),
-            email: email.to_string(),
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-        })
-    }
-
-    /// An `AnyAuth` carrying a user token (operator).
-    fn any_user(email: &str) -> AnyAuth {
-        AnyAuth::User(auth(email))
-    }
-
-    /// An `AnyAuth` carrying a controller token with the given controller id.
-    fn any_controller(id: &str) -> AnyAuth {
-        AnyAuth::Controller(ControllerAuthContext(
-            crate::server::auth::controller::VerifiedControllerToken {
-                identity_id: id.to_string(),
-                issuer: "https://issuer.example.com".into(),
-                claims: json!({}),
-            },
-        ))
-    }
-
-    /// Read a `Response` into `(status, json_body)`.
-    async fn read(resp: Response) -> (StatusCode, Value) {
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("response body");
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        (status, body)
-    }
-
-    /// Register a root-scoped `widgets` collection (group `example.dev`) served
-    /// at both `v1` and `v2`, with `v1` as the storage version. `allowed`
-    /// becomes the collection's `allowedStatusControllerIds`.
-    async fn register_widget_rd(ctx: &ResourceApiCtx, allowed: &[&str]) {
-        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
-        let spec = json!({
-            "group": "example.dev",
-            "kind": "Widget",
-            "plural": "widgets",
-            "versions": [
-                {"name": "v1", "served": true, "storage": true},
-                {"name": "v2", "served": true, "storage": false},
-            ],
-            "allowedStatusControllerIds": allowed,
-        });
-        ctx.store
-            .register_resource_definition(CreateResourceParams {
-                labels: Default::default(),
-                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
-                kind: RESOURCE_DEFINITION_KIND.to_string(),
-                name: "widgets.example.dev".to_string(),
-                parent_uid: None,
-                annotations: BTreeMap::new(),
-                finalizers: vec![],
-                owner_references: vec![],
-                spec,
-                validator: None,
-            })
-            .await
-            .expect("register widgets RD");
-    }
-
-    /// Register an Organization-scoped `gadgets` collection whose declared
-    /// parent is the built-in `rise.dev/v1alpha1` `Organization` (depth 1).
-    /// `allowed` becomes the collection's `allowedStatusControllerIds`.
-    async fn register_gadget_rd(ctx: &ResourceApiCtx, allowed: &[&str]) {
-        let allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
-        let spec = json!({
-            "group": "example.dev",
-            "kind": "Gadget",
-            "plural": "gadgets",
-            "parent": {"apiVersion": "rise.dev/v1alpha1", "kind": "Organization"},
-            "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": allowed,
-        });
-        ctx.store
-            .register_resource_definition(CreateResourceParams {
-                labels: Default::default(),
-                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
-                kind: RESOURCE_DEFINITION_KIND.to_string(),
-                name: "gadgets.example.dev".to_string(),
-                parent_uid: None,
-                annotations: BTreeMap::new(),
-                finalizers: vec![],
-                owner_references: vec![],
-                spec,
-                validator: None,
-            })
-            .await
-            .expect("register gadgets RD");
-    }
-
-    /// Register a `gizmos` collection whose declared parent is the `Gadget`
-    /// collection — a depth-2 chain (`Gizmo` → `Gadget` → `Organization`).
-    async fn register_gizmo_rd(ctx: &ResourceApiCtx) {
-        let spec = json!({
-            "group": "example.dev",
-            "kind": "Gizmo",
-            "plural": "gizmos",
-            "parent": {"apiVersion": "example.dev/v1", "kind": "Gadget"},
-            "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": [],
-        });
-        ctx.store
-            .register_resource_definition(CreateResourceParams {
-                labels: Default::default(),
-                api_version: rise_resource_api::API_VERSION_V1ALPHA1.to_string(),
-                kind: RESOURCE_DEFINITION_KIND.to_string(),
-                name: "gizmos.example.dev".to_string(),
-                parent_uid: None,
-                annotations: BTreeMap::new(),
-                finalizers: vec![],
-                owner_references: vec![],
-                spec,
-                validator: None,
-            })
-            .await
-            .expect("register gizmos RD");
-    }
-
-    /// POST `body` to `path`, asserting a 201, and return the created JSON.
-    async fn create_at(ctx: &ResourceApiCtx, path: &str, body: Value) -> Value {
-        let resp = dispatch_post_inner(ctx, path.to_string(), auth(OPERATOR), body)
-            .await
-            .expect("create resource");
-        let (status, created) = read(resp).await;
-        assert_eq!(status, StatusCode::CREATED, "unexpected create status");
-        created
-    }
-
-    /// Parse `metadata.uid` from a resource JSON body.
-    fn uid_of(resource: &Value) -> Uuid {
-        resource["metadata"]["uid"]
-            .as_str()
-            .expect("uid")
-            .parse()
-            .expect("parse uid")
-    }
-
-    /// Create an Organization through the generic API.
-    async fn create_org(ctx: &ResourceApiCtx, name: &str) {
-        create_at(
-            ctx,
-            "rise.dev/v1alpha1/organizations",
-            json!({
-                "apiVersion": "rise.dev/v1alpha1",
-                "kind": "Organization",
-                "metadata": {"name": name},
-                "spec": {"displayName": name},
-            }),
-        )
-        .await;
-    }
-
-    /// Grant every authenticated caller `statements`, platform-wide.
-    ///
-    /// One `PlatformRole` plus one `PlatformRoleBinding` on
-    /// `system:authenticated` at wildcard scope — the only shape that reaches an
-    /// ordinary principal today, since a binding naming a `user:` subject needs
-    /// a `User` resource and those go live with identity resolution.
-    async fn grant_authenticated(ctx: &ResourceApiCtx, name: &str, statements: Value) {
-        create_at(
-            ctx,
-            "rise.dev/v1alpha1/platformroles",
-            json!({
-                "apiVersion": "rise.dev/v1alpha1",
-                "kind": "PlatformRole",
-                "metadata": {"name": name},
-                "spec": {"statements": statements},
-            }),
-        )
-        .await;
-        create_at(
-            ctx,
-            "rise.dev/v1alpha1/platformrolebindings",
-            json!({
-                "apiVersion": "rise.dev/v1alpha1",
-                "kind": "PlatformRoleBinding",
-                "metadata": {"name": name},
-                "spec": {
-                    "subject": "system:authenticated",
-                    "roleRef": {"kind": "PlatformRole", "name": name},
-                },
-            }),
-        )
-        .await;
-    }
-
-    /// JSON body for creating a widget at the given served apiVersion.
-    fn widget_body(api_version: &str, name: &str) -> Value {
-        json!({
-            "apiVersion": api_version,
-            "kind": "Widget",
-            "metadata": {"name": name},
-            "spec": {"size": "large"},
-        })
-    }
-
-    /// POST a widget and return the created resource JSON.
-    async fn create_widget(ctx: &ResourceApiCtx, api_version: &str, name: &str) -> Value {
-        let resp = dispatch_post_inner(
-            ctx,
-            "example.dev/v1/widgets".to_string(),
-            auth(OPERATOR),
-            widget_body(api_version, name),
-        )
-        .await
-        .expect("create widget");
-        let (status, body) = read(resp).await;
-        assert_eq!(status, StatusCode::CREATED, "unexpected create status");
-        body
-    }
+    use serde_json::json;
 
     // -------------------------------------------------------------------------
     // Labels
@@ -2307,7 +2471,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn labels_round_trip_through_the_http_surface(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let resp = dispatch_post_inner(
             &ctx,
@@ -2351,7 +2515,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/labeled".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2398,12 +2562,14 @@ mod dispatch_tests {
     // Authorization: what stored policy grants, per resource
     // -------------------------------------------------------------------------
 
+    /// ADR-0001 scenario 38
+    ///
     /// A caller with no applicable `list` grant gets a masked-empty collection,
     /// not a 403 that would confirm the scope is populated (ADR-0001 §4).
     #[sqlx::test]
     async fn list_without_a_grant_is_masked_empty(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
 
         let resp = dispatch_get_inner(
@@ -2419,13 +2585,15 @@ mod dispatch_tests {
         assert_eq!(body["items"].as_array().expect("items").len(), 0);
     }
 
+    /// ADR-0001 scenario 38
+    ///
     /// An item the caller holds no `get` on answers exactly as a name that does
     /// not exist does. A 403 here would hand back, one name at a time, every
     /// name the masked listing above it withholds.
     #[sqlx::test]
     async fn item_without_a_grant_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
 
         let refused = dispatch_get_inner(
@@ -2474,7 +2642,7 @@ mod dispatch_tests {
         let wrong_kind = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/one".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Bogus",
@@ -2509,7 +2677,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_stored_finalizer_is_not_reported_to_a_caller_who_cannot_read_it(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_at(
             &ctx,
             "example.dev/v1/widgets",
@@ -2527,7 +2695,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2548,7 +2716,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_create_under_an_invisible_parent_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         let body = json!({
             "apiVersion": "example.dev/v1",
@@ -2614,7 +2782,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_readable_item_refuses_a_write_by_name(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let widget = create_widget(&ctx, "example.dev/v1", "one").await;
         grant_authenticated(
             &ctx,
@@ -2630,7 +2798,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/one".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2652,7 +2820,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn write_without_a_grant_is_refused(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let err = dispatch_post_inner(
             &ctx,
@@ -2678,14 +2846,16 @@ mod dispatch_tests {
         assert_eq!(body["items"].as_array().expect("items").len(), 0);
     }
 
+    /// ADR-0001 scenario 37
+    /// ADR-0001 scenario 38
+    ///
     /// `list` without `get` returns the allowlisted projection: `apiVersion`,
     /// `kind`, and the documented `metadata` fields — never `spec` (ADR-0001
-    /// §4, scenario 37). Adding `get` expands the same item to the full stored
-    /// object (scenario 38).
+    /// §4). Adding `get` expands the same item to the full stored object.
     #[sqlx::test]
     async fn list_grant_projects_metadata_and_get_expands_it(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "one").await;
         grant_authenticated(
             &ctx,
@@ -2748,7 +2918,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn effective_labels_resolve_through_the_ancestor_chain(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_at(
             &ctx,
             "rise.dev/v1alpha1/organizations",
@@ -2814,15 +2984,17 @@ mod dispatch_tests {
     // Subresource boundaries a main write must not cross
     // -------------------------------------------------------------------------
 
-    /// ADR-0001 §2: main writes preserve finalizers, and only
-    /// `(update, Kind, finalizers)` may change them. Permissions never flow
-    /// implicitly between the main resource and a subresource, so plain
-    /// `update` — which every editor holds — must not be able to clear a
-    /// finalizer another controller is holding a deletion with.
+    /// ADR-0001 scenario 56
+    ///
+    /// Main writes preserve finalizers, and only `(update, Kind, finalizers)`
+    /// may change them. Permissions never flow implicitly between the main
+    /// resource and a subresource, so plain `update` — which every editor
+    /// holds — must not be able to clear a finalizer another controller is
+    /// holding a deletion with.
     #[sqlx::test]
     async fn a_main_write_cannot_change_finalizers(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         let created = create_widget(&ctx, "example.dev/v1", "held").await;
         let uid = uid_of(&created);
         ctx.store
@@ -2850,7 +3022,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2872,7 +3044,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -2889,6 +3061,8 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// ADR-0001 scenario 56
+    ///
     /// A reserved `system.rise.dev/*` finalizer is lifecycle bookkeeping the
     /// store owns. Planting one through a create would make the resource
     /// undeletable through every route the API offers — the `finalizers`
@@ -2896,7 +3070,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_create_cannot_plant_a_reserved_finalizer(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let err = dispatch_post_inner(
             &ctx,
@@ -2918,13 +3092,15 @@ mod dispatch_tests {
         assert!(err.message.contains("reserved"), "{}", err.message);
     }
 
+    /// ADR-0001 scenario 55
+    ///
     /// A write verb is not a read grant (ADR-0001 §2). A caller who may set
     /// `status` has not been given the `spec`, so the response comes back at the
     /// granularity they may read.
     #[sqlx::test]
     async fn a_status_write_does_not_return_the_spec(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
         grant_authenticated(
             &ctx,
@@ -2941,7 +3117,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -2959,67 +3135,13 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
         .expect("operator status write");
         let (_, body) = read(resp).await;
         assert_eq!(body["spec"]["size"], "large");
-    }
-
-    /// `allowedStatusControllerIds` grants controllers status and finalizer
-    /// writes outside the authorization model, so changing it stays operator
-    /// authority until Controller identities make it expressible as policy.
-    #[sqlx::test]
-    async fn changing_the_controller_allowlist_requires_an_operator(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        grant_authenticated(
-            &ctx,
-            "rd-editor",
-            json!([{
-                "effect": "Allow",
-                "kinds": ["rise.dev/ResourceDefinition"],
-                "verbs": ["get", "list", "update"],
-            }]),
-        )
-        .await;
-
-        let fetched = dispatch_get_inner(
-            &ctx,
-            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            auth(OPERATOR),
-            PendingDeletionQuery::default(),
-        )
-        .await
-        .expect("read the RD");
-        let (_, fetched) = read(fetched).await;
-        let mut spec = fetched["spec"].clone();
-        spec["allowedStatusControllerIds"] = json!(["ci.example.com"]);
-
-        let err = dispatch_put_inner(
-            &ctx,
-            "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            any_user(PLAIN_USER),
-            json!({
-                "apiVersion": "rise.dev/v1alpha1",
-                "kind": "ResourceDefinition",
-                "metadata": {
-                    "name": "widgets.example.dev",
-                    "revision": fetched["metadata"]["revision"],
-                },
-                "spec": spec,
-            }),
-        )
-        .await
-        .expect_err("only an operator may widen the controller allowlist");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
-        assert!(
-            err.message.contains("allowedStatusControllerIds"),
-            "{}",
-            err.message
-        );
     }
 
     // -------------------------------------------------------------------------
@@ -3035,7 +3157,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn attaching_an_owner_reference_needs_delete_on_the_dependent(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         let victim = create_widget(&ctx, "example.dev/v1", "victim").await;
         // The caller may edit widgets and use the owner, but may not delete.
@@ -3053,7 +3175,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/victim".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3081,7 +3203,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn attaching_an_owner_reference_needs_use_on_the_owner(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         // Everything except `use` on the owner.
         grant_authenticated(
@@ -3156,7 +3278,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn detaching_an_owner_reference_needs_use_on_the_owner(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         let owner_reference = json!({
             "apiVersion": "example.dev/v1",
@@ -3190,7 +3312,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3213,7 +3335,7 @@ mod dispatch_tests {
         let missing = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3238,7 +3360,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3261,7 +3383,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn holding_an_owner_open_needs_delete_on_it(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         // Everything except `delete`.
         grant_authenticated(
@@ -3338,7 +3460,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn detaching_from_a_deleted_owner_is_ungated(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = create_widget(&ctx, "example.dev/v1", "owner").await;
         let dependent = create_at(
             &ctx,
@@ -3389,7 +3511,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/dependent".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3413,7 +3535,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn deletion_blockers_are_filtered_per_item(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
             &ctx,
@@ -3470,13 +3592,15 @@ mod dispatch_tests {
     // The write-time grant gate
     // -------------------------------------------------------------------------
 
+    /// ADR-0001 scenario 42
+    ///
     /// §6.6's creation exception: a genuinely new resource may name its creator
     /// as owner without the general gate, because there is no prior owner to
     /// displace and nothing is delegated to anyone else.
     #[sqlx::test]
     async fn creation_may_label_a_new_resource_for_its_creator(pool: sqlx::PgPool) {
         let ctx = ctx(pool.clone()).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_authenticated(
             &ctx,
             "widget-author",
@@ -3488,7 +3612,7 @@ mod dispatch_tests {
         )
         .await;
         let caller = auth(PLAIN_USER);
-        let subject = format!("user:{}", caller.user().unwrap().id);
+        let subject = caller.user_subject();
 
         let resp = dispatch_post_inner(
             &ctx,
@@ -3518,14 +3642,16 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// Scenario 41: an editor who would not hold the resulting grant cannot
-    /// relabel ownership — to themselves or to anyone else. The refusal is the
-    /// gate's and happens before the store resolves the named subject, so it is
+    /// ADR-0001 scenario 41
+    ///
+    /// An editor who would not hold the resulting grant cannot relabel
+    /// ownership — to themselves or to anyone else. The refusal is the gate's
+    /// and happens before the store resolves the named subject, so it is
     /// not an existence oracle for that subject either.
     #[sqlx::test]
     async fn relabelling_ownership_without_holding_it_is_refused(pool: sqlx::PgPool) {
         let ctx = ctx(pool.clone()).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // An editor: they may write the resource, but hold none of the
         // `resource-owner` set that owning it would confer (no `delete`).
         grant_authenticated(
@@ -3539,7 +3665,7 @@ mod dispatch_tests {
         )
         .await;
         let caller = auth(PLAIN_USER);
-        let subject = format!("user:{}", caller.user().unwrap().id);
+        let subject = caller.user_subject();
 
         // Unowned, so the editor's access does not arrive through the label.
         let resp = dispatch_post_inner(
@@ -3556,7 +3682,7 @@ mod dispatch_tests {
             let err = dispatch_put_inner(
                 &ctx,
                 "example.dev/v1/widgets/unowned".to_string(),
-                AnyAuth::User(caller.clone()),
+                caller.clone(),
                 json!({
                     "apiVersion": "example.dev/v1",
                     "kind": "Widget",
@@ -3592,6 +3718,8 @@ mod dispatch_tests {
         assert!(body["metadata"].get("labels").is_none());
     }
 
+    /// ADR-0001 scenario 41
+    ///
     /// The other half of §6.6: the resource's *current* owner may hand ownership
     /// on, even though their own access arrives through the very label they are
     /// replacing. The writer's side of the comparison is pinned to the old
@@ -3599,7 +3727,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn an_owner_may_transfer_ownership(pool: sqlx::PgPool) {
         let ctx = ctx(pool.clone()).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_authenticated(
             &ctx,
             "widget-author",
@@ -3611,7 +3739,7 @@ mod dispatch_tests {
         )
         .await;
         let caller = auth(PLAIN_USER);
-        let subject = format!("user:{}", caller.user().unwrap().id);
+        let subject = caller.user_subject();
 
         let resp = dispatch_post_inner(
             &ctx,
@@ -3633,7 +3761,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/mine".to_string(),
-            AnyAuth::User(caller),
+            caller,
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -3655,13 +3783,15 @@ mod dispatch_tests {
         );
     }
 
+    /// ADR-0001 scenario 31
+    ///
     /// A writer who may create bindings still cannot hand out more than they
     /// hold: the delta the binding would confer is compared against their own
     /// effective policy over the same domain (ADR-0001 §5).
     #[sqlx::test]
     async fn grant_gate_refuses_delegating_authority_the_writer_lacks(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // The caller may author platform bindings, and may list Widgets. That is
         // the whole of their authority.
         grant_authenticated(&ctx, "binding-author", json!([{
@@ -3719,7 +3849,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn attaching_a_policy_row_to_an_owner_is_gated_as_a_delete(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // A platform Deny nobody may lift, capping every authenticated caller.
         create_at(
             &ctx,
@@ -3778,7 +3908,7 @@ mod dispatch_tests {
         let scheduled = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/platformrolebindings/the-cap".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "PlatformRoleBinding",
@@ -3815,13 +3945,270 @@ mod dispatch_tests {
         );
     }
 
+    /// ADR-0001 scenario 21
+    ///
+    /// An operator bootstrapping an Organization gets both rows atomically: the
+    /// Organization, and an exact org-root, scope-only `RoleBinding` naming
+    /// `PlatformRole/org-admin` for the requested admin — the structural shape
+    /// that confers org-admin standing (ADR-0001 §5).
+    #[sqlx::test]
+    async fn bootstrap_admin_creates_org_and_binding_atomically(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        let (admin_subject, admin_auth) = create_user_principal(&ctx).await;
+
+        let created = create_at(
+            &ctx,
+            "rise.dev/v1alpha1/organizations",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Organization",
+                "metadata": {"name": "acme"},
+                "spec": {"displayName": "Acme"},
+                "bootstrap": {"admin": admin_subject},
+            }),
+        )
+        .await;
+        assert_eq!(created["metadata"]["name"], "acme");
+        let org_uid = uid_of(&created);
+
+        let admin_name = admin_subject.strip_prefix("user:").expect("user subject");
+        let binding_name = format!("org-admin-{admin_name}");
+        let (status, binding) = read(
+            dispatch_get_inner(
+                &ctx,
+                format!("rise.dev/v1alpha1/rolebindings/acme/{binding_name}"),
+                auth(OPERATOR),
+                PendingDeletionQuery::default(),
+            )
+            .await
+            .expect("bootstrapped binding must exist"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(binding["spec"]["subject"], admin_subject);
+        assert_eq!(binding["spec"]["scope"], "rise.dev/Organization/acme");
+        assert!(binding["spec"]["labelSelector"].is_null());
+        assert_eq!(binding["spec"]["roleRef"]["kind"], "PlatformRole");
+        assert_eq!(binding["spec"]["roleRef"]["name"], "org-admin");
+
+        // Admin standing, asserted the way ADR-0001 §5 defines it: the
+        // bootstrapped user's own effective policy, computed by the engine
+        // through the ordinary evaluation path, already covers the org-admin
+        // baseline on a fresh resource under the org — no pre-existing Group
+        // or second grant required.
+        let admin_ctx = ctx
+            .authz
+            .read_context(&admin_auth)
+            .await
+            .expect("admin read context");
+        let org_tree = admin_ctx.tree(org_uid).await.expect("org tree");
+        let probe = node_for_new("example.dev/v1", "Widget", "probe", &BTreeMap::new())
+            .expect("probe node");
+        let target = ResourceTree::with_leaf(org_tree.nodes(), probe);
+        assert!(
+            admin_ctx
+                .allows(&target, Verb::Create, None)
+                .await
+                .expect("allows"),
+            "the bootstrapped admin should already hold the org-admin baseline"
+        );
+    }
+
+    /// ADR-0001 scenario 21
+    ///
+    /// `bootstrap.admin` naming no live User fails admission inside the same
+    /// transaction as the Organization create, so the Organization itself
+    /// never persists either.
+    #[sqlx::test]
+    async fn bootstrap_admin_missing_user_yields_422_and_no_organization(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+
+        let err = dispatch_post_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Organization",
+                "metadata": {"name": "acme"},
+                "spec": {"displayName": "Acme"},
+                "bootstrap": {"admin": "user:ghost"},
+            }),
+        )
+        .await
+        .expect_err("bootstrap admin must resolve to a live User");
+        assert_eq!(
+            err.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            err.message
+        );
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await;
+        assert_eq!(
+            resp.expect_err("the Organization must not have been persisted")
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// ADR-0001 scenario 21
+    ///
+    /// `bootstrap` is an Organization-only feature; naming it on any other
+    /// kind is rejected before anything is written.
+    #[sqlx::test]
+    async fn bootstrap_on_a_non_organization_kind_is_400(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx).await;
+        let (admin_subject, _admin_auth) = create_user_principal(&ctx).await;
+
+        let err = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "example.dev/v1",
+                "kind": "Widget",
+                "metadata": {"name": "my-widget"},
+                "spec": {"size": "large"},
+                "bootstrap": {"admin": admin_subject},
+            }),
+        )
+        .await
+        .expect_err("bootstrap is Organization-only");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/my-widget".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await;
+        assert_eq!(
+            resp.expect_err("the Widget must not have been persisted")
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// ADR-0001 scenario 21
+    ///
+    /// A caller who may create both an Organization and a RoleBinding, but
+    /// holds nothing like the org-admin baseline, still cannot bootstrap one
+    /// in: the grant gate refuses to let the binding delegate authority the
+    /// writer does not hold, and the whole attempt — Organization included —
+    /// rolls back with it.
+    #[sqlx::test]
+    async fn bootstrap_admin_is_gated_like_any_other_binding(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        let (admin_subject, _admin_auth) = create_user_principal(&ctx).await;
+
+        // Ordinary authority to create an Organization and a RoleBinding under
+        // it — nothing close to the org-admin baseline those confer.
+        grant_authenticated(
+            &ctx,
+            "org-creator",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization", "rise.dev/RoleBinding"],
+                "verbs": ["get", "list", "create"],
+            }]),
+        )
+        .await;
+
+        let err = dispatch_post_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations".to_string(),
+            auth(PLAIN_USER),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Organization",
+                "metadata": {"name": "acme"},
+                "spec": {"displayName": "Acme"},
+                "bootstrap": {"admin": admin_subject},
+            }),
+        )
+        .await
+        .expect_err("the gate must refuse the escalation");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(
+            err.message
+                .contains("would grant authority you do not hold"),
+            "unexpected message: {}",
+            err.message
+        );
+
+        // Nothing was stored — the refusal rolled the whole attempt back.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await;
+        assert_eq!(
+            resp.expect_err("the Organization must not have been persisted")
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// ADR-0001 scenario 21
+    ///
+    /// A name conflict on the Organization itself is reported before the
+    /// admin binding is ever attempted, and leaves the existing Organization
+    /// (and its lack of a second binding) untouched.
+    #[sqlx::test]
+    async fn bootstrap_admin_name_conflict_on_organization_yields_409(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        let (admin_subject, _admin_auth) = create_user_principal(&ctx).await;
+
+        let err = dispatch_post_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Organization",
+                "metadata": {"name": "acme"},
+                "spec": {"displayName": "Acme, again"},
+                "bootstrap": {"admin": admin_subject},
+            }),
+        )
+        .await
+        .expect_err("the name is already taken");
+        assert_eq!(err.status, StatusCode::CONFLICT, "{}", err.message);
+
+        let admin_name = admin_subject.strip_prefix("user:").expect("user subject");
+        let resp = dispatch_get_inner(
+            &ctx,
+            format!("rise.dev/v1alpha1/rolebindings/acme/org-admin-{admin_name}"),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await;
+        assert_eq!(
+            resp.expect_err("no binding is created when the Organization create fails")
+                .status,
+            StatusCode::NOT_FOUND
+        );
+    }
+
     /// Deleting an Organization tombstones every Role and RoleBinding beneath
     /// it, and a tombstoned binding stops applying at once. So the delete is a
     /// delete of the whole org policy tier and is diffed as one.
     #[sqlx::test]
     async fn deleting_an_organization_is_gated_on_the_policy_it_would_take(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
             &ctx,
@@ -3894,6 +4281,8 @@ mod dispatch_tests {
         assert!(resp.status().is_success(), "{:?}", resp.status());
     }
 
+    /// ADR-0001 scenario 16
+    ///
     /// A `User` create is an activation: ADR-0001 §1 binds memberships and
     /// `user:` subjects to the *name*, so recreating a name stale policy still
     /// refers to makes that policy reachable again. Gating only the
@@ -3996,6 +4385,8 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 
+    /// ADR-0001 scenario 17
+    ///
     /// The activation gate has to measure the name's *Group ties*, not just the
     /// bindings that name it directly. A `GroupMembership` is a name-bound
     /// marker that outlives the User, so at the moment of the gate the row it
@@ -4005,7 +4396,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn activation_is_gated_on_the_names_group_ties(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
             &ctx,
@@ -4075,7 +4466,7 @@ mod dispatch_tests {
         let deactivated = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/users/ghost".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
@@ -4107,7 +4498,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/users/ghost".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
@@ -4126,7 +4517,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/users/ghost".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": "User",
@@ -4142,12 +4533,14 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// ADR-0001 scenario 30
+    ///
     /// The same writer may delegate authority they *do* hold: the delta is a
     /// subset of their own effective policy, so the gate passes.
     #[sqlx::test]
     async fn grant_gate_permits_delegating_authority_the_writer_holds(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         grant_authenticated(&ctx, "binding-author", json!([{
             "effect": "Allow",
             "kinds": ["rise.dev/PlatformRoleBinding", "rise.dev/PlatformRole", "example.dev/Widget"],
@@ -4203,12 +4596,12 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn operator_path_allows_operator_by_idp_group(pool: sqlx::PgPool) {
         let ctx = ctx_with_operators(pool.clone(), vec![], vec!["platform-operators".into()]).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let user = crate::db::users::create(&pool, "grouped@example.com")
             .await
             .unwrap();
-        let auth_ctx = AuthContext::User(user.clone());
+        let auth_ctx = AnyAuth::User(AuthContext::User(user.clone(), Some(test_user_principal())));
 
         // Same-named team that the IdP did not create grants nothing.
         let self_made = crate::db::teams::create(&pool, "platform-operators")
@@ -4281,7 +4674,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn operator_path_allows_operator(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let resp = dispatch_get_inner(
             &ctx,
@@ -4304,7 +4697,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn status_subresource_rejects_a_user_holding_neither_grant(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         // Holding neither the subresource grant nor `get` on the resource, the
@@ -4312,7 +4705,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -4323,7 +4716,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/finalizers".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"add": ["x/y"], "remove": []}),
         )
         .await
@@ -4345,7 +4738,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -4361,14 +4754,14 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn status_subresource_allows_operator_user(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         // An operator user can write status and finalizers without a controller token.
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -4378,7 +4771,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/finalizers".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({"add": ["some.controller/cleanup"], "remove": []}),
         )
         .await
@@ -4386,62 +4779,253 @@ mod dispatch_tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A Controller granted `update` on the `status` and `finalizers`
+    /// subresources writes its own `status.controllers[<name>]` slot and its
+    /// own `<name>/<reason>`-prefixed finalizers — exactly the RBAC decision
+    /// an equivalent User grant would produce, with no allowlist involved.
     #[sqlx::test]
-    async fn status_subresource_allows_listed_controller(pool: sqlx::PgPool) {
+    async fn bound_controller_can_write_status_and_finalizers(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([
+                {"effect": "Allow", "kinds": ["example.dev/Widget"], "verbs": ["get"]},
+                {
+                    "effect": "Allow",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["update"],
+                    "subresources": ["status", "finalizers"],
+                },
+            ]),
+        )
+        .await;
 
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1/status".to_string(),
-            any_controller("controller.example.com"),
+            any_controller("reconciler"),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
-        .expect("listed controller status write");
+        .expect("bound controller status write");
         assert_eq!(resp.status(), StatusCode::OK);
+        let (_, body) = read(resp).await;
+        assert_eq!(
+            body["status"]["controllers"]["reconciler"]["phase"],
+            "Ready"
+        );
+
+        let resp = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_controller("reconciler"),
+            json!({"add": ["reconciler/cleanup"], "remove": []}),
+        )
+        .await
+        .expect("bound controller finalizer write");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (_, body) = read(resp).await;
+        assert_eq!(
+            body["metadata"]["finalizers"],
+            json!(["reconciler/cleanup"])
+        );
+
+        // Finalizers naming another controller's ownership prefix are refused
+        // regardless of the RBAC grant — the store enforces the token itself.
+        let err = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_controller("reconciler"),
+            json!({"add": ["someone-else/cleanup"], "remove": []}),
+        )
+        .await
+        .expect_err("a controller cannot claim another controller's finalizer prefix");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
+    /// A Controller with no binding at all is masked exactly like an
+    /// ungranted User: the same 404, for both a real and an imaginary item —
+    /// there is no allowlist-specific refusal any more.
     #[sqlx::test]
-    async fn status_subresource_rejects_unlisted_controller_with_403(pool: sqlx::PgPool) {
+    async fn unbound_controller_is_masked_like_any_other_ungranted_principal(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        // Allowlist contains a different controller id.
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
+        register_widget_rd(&ctx).await;
+        create_widget(&ctx, "example.dev/v1", "real").await;
+
+        let present = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/real/status".to_string(),
+            any_controller("watcher"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("an unbound controller is refused");
+        let absent = dispatch_put_inner(
+            &ctx,
+            "example.dev/v1/widgets/imaginary/status".to_string(),
+            any_controller("watcher"),
+            json!({"status": {"phase": "Ready"}}),
+        )
+        .await
+        .expect_err("an unbound controller is refused");
+        assert_eq!(present.status, StatusCode::NOT_FOUND, "{}", present.message);
+        assert_eq!(present.status, absent.status);
+        assert_eq!(present.message, absent.message);
+    }
+
+    /// A Controller visible on the main resource (`get`) but not granted the
+    /// `finalizers` subresource gets the ordinary named refusal, not the mask:
+    /// it already knows the resource exists.
+    #[sqlx::test]
+    async fn controller_without_finalizer_grant_gets_named_403(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([
+                {"effect": "Allow", "kinds": ["example.dev/Widget"], "verbs": ["get"]},
+                {
+                    "effect": "Allow",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["update"],
+                    "subresources": ["status"],
+                },
+            ]),
+        )
+        .await;
 
         let err = dispatch_put_inner(
             &ctx,
-            "example.dev/v1/widgets/w1/status".to_string(),
-            any_controller("other.example.com"),
-            json!({"status": {"phase": "Ready"}}),
+            "example.dev/v1/widgets/w1/finalizers".to_string(),
+            any_controller("reconciler"),
+            json!({"add": ["reconciler/cleanup"], "remove": []}),
         )
         .await
-        .expect_err("unlisted controller must be rejected");
+        .expect_err("status grant does not extend to finalizers");
         assert_eq!(err.status, StatusCode::FORBIDDEN);
     }
 
+    /// A Controller is an ordinary principal on every verb, not just
+    /// status/finalizers: granted create/get/list/update/delete, it can POST,
+    /// PUT a full item, and DELETE — none of that is hard-coded to 403 for a
+    /// controller token any more.
     #[sqlx::test]
-    async fn item_update_rejects_controller_token_with_403(pool: sqlx::PgPool) {
+    async fn controller_with_full_grant_can_create_update_delete_items(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        create_widget(&ctx, "example.dev/v1", "w1").await;
+        register_widget_rd(&ctx).await;
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["create", "get", "list", "update", "delete"],
+            }]),
+        )
+        .await;
 
-        // A controller token must not be able to PUT a full item.
-        let err = dispatch_put_inner(
+        let resp = dispatch_post_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            any_controller("reconciler"),
+            widget_body("example.dev/v1", "w1"),
+        )
+        .await
+        .expect("controller with create grant can POST");
+        let (status, created) = read(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
-            any_controller("controller.example.com"),
+            any_controller("reconciler"),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
-                "metadata": {"name": "w1", "revision": 1},
-                "spec": {"size": "small"},
+                "metadata": {"name": "w1", "revision": created["metadata"]["revision"]},
+                "spec": {"size": "large"},
             }),
         )
         .await
-        .expect_err("controller token must not update items");
-        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        .expect("controller with update grant can PUT an item");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = dispatch_delete_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1".to_string(),
+            any_controller("reconciler"),
+        )
+        .await
+        .expect("controller with delete grant can DELETE");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// GET and LIST evaluate a Controller through the same choke point as any
+    /// other principal: without a grant the item is masked and the collection
+    /// lists empty; with one, both succeed.
+    #[sqlx::test]
+    async fn controller_get_and_list_honor_rbac(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx).await;
+        create_widget(&ctx, "example.dev/v1", "w1").await;
+
+        let err = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect_err("an ungranted controller cannot GET the item");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("list is never refused outright");
+        let (_, body) = read(resp).await;
+        assert_eq!(body["items"].as_array().expect("items").len(), 0);
+
+        grant_controller(
+            &ctx,
+            "watcher",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["get", "list"],
+            }]),
+        )
+        .await;
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets/w1".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a granted controller can GET the item");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "example.dev/v1/widgets".to_string(),
+            any_controller("watcher"),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a granted controller can LIST");
+        let (_, body) = read(resp).await;
+        assert_eq!(body["items"].as_array().expect("items").len(), 1);
     }
 
     // -------------------------------------------------------------------------
@@ -4451,13 +5035,13 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn wrong_method_on_collection_yields_405(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // PUT is not valid for a collection path.
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({}),
         )
         .await
@@ -4474,7 +5058,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn get_on_subresource_yields_405(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         let err = dispatch_get_inner(
@@ -4491,7 +5075,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn post_on_item_yields_405(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "w1").await;
 
         // POST is only valid for collection paths.
@@ -4550,7 +5134,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn item_not_found_yields_404(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // Collection exists, item does not.
         let err = dispatch_get_inner(
             &ctx,
@@ -4570,7 +5154,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn resource_created_via_v1_listed_via_v2_keeps_requested_version(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // Create through the v1 served version.
         let created = create_widget(&ctx, "example.dev/v1", "w1").await;
@@ -4611,7 +5195,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn create_via_undefined_version_yields_404(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         // The `widgets` plural exists but `v3` is not a version it declares. An
         // undefined (or unserved) version is not addressable — 404, as
         // Kubernetes returns for an unserved apiVersion.
@@ -4630,7 +5214,7 @@ mod dispatch_tests {
     async fn write_to_non_storage_version_yields_422(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         // `register_widget_rd` registers v1 as storage, v2 as served non-storage.
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // POST to the non-storage served version v2 must be rejected with 422.
         let err = dispatch_post_inner(
@@ -4664,7 +5248,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v2/widgets/w1".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v2",
                 "kind": "Widget",
@@ -4684,7 +5268,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn duplicate_name_create_yields_409(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "dup").await;
 
         // Creating a second widget with the same name in the same scope.
@@ -4706,7 +5290,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn stale_revision_update_yields_409(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let created = create_widget(&ctx, "example.dev/v1", "w1").await;
         let revision = created["metadata"]["revision"].as_i64().unwrap();
 
@@ -4722,7 +5306,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             update(revision),
         )
         .await
@@ -4733,7 +5317,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/w1".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             update(revision),
         )
         .await
@@ -4753,7 +5337,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_listing_under_a_missing_ancestor_is_masked_empty(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
 
         // `gadgets` is Organization-scoped (depth 1). The ancestor *type* is
         // derived from the ResourceDefinition graph and cannot be mistyped in
@@ -4804,7 +5388,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn excess_segments_for_root_collection_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // `widgets` is root-scoped (depth 0): a path may carry at most an item
         // name plus a subresource keyword. More name segments than that is a
@@ -4827,7 +5411,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn create_get_update_delete_lifecycle(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // Create.
         let created = create_widget(&ctx, "example.dev/v1", "lifecycle").await;
@@ -4851,7 +5435,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/lifecycle".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "example.dev/v1",
                 "kind": "Widget",
@@ -5121,7 +5705,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn create_with_mismatched_kind_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let err = dispatch_post_inner(
             &ctx,
@@ -5146,7 +5730,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn pending_deletion_lists_tombstoned_resources(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         let created = create_widget(&ctx, "example.dev/v1", "w1").await;
         let uid: Uuid = created["metadata"]["uid"]
@@ -5202,7 +5786,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn deletion_blockers_reports_blocking_relationships(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         let owner = ctx
             .store
             .create(CreateResourceParams {
@@ -5272,6 +5856,434 @@ mod dispatch_tests {
         assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
     }
 
+    // -------------------------------------------------------------------------
+    // Policy audit
+    // -------------------------------------------------------------------------
+
+    /// A binding whose Role existed at creation and was since removed is the
+    /// shape admission accepts (ADR-0001 §6.7) and evaluation treats as zero
+    /// statements; the audit reports it. The listing filters findings the same
+    /// way `pending-deletion` filters rows: per finding, on `list`.
+    #[sqlx::test]
+    async fn policy_audit_filters_findings_by_list_and_counts_hidden(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx).await;
+        // A live `rise.dev/owner` setter, so the seeded `resource-owner`
+        // binding's selector matches something — otherwise every fresh
+        // install would carry its own `selectorMatchesNothing` finding and
+        // this test's exact-count assertions below would be noise-dependent.
+        // Root-scoped, so it produces no `inertOwnerLabel` finding of its own
+        // (the seeded binding's `ResourceOrganization` clamp has nothing to
+        // compare a root-scoped resource's organization against).
+        create_widget_with_owner_label(&ctx, "owned").await;
+
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "temp-role"},
+                "spec": {"statements": []},
+            }),
+        )
+        .await;
+        let binding = create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "dangling"},
+                "spec": {
+                    "subject": "system:authenticated",
+                    "roleRef": {"kind": "PlatformRole", "name": "temp-role"},
+                },
+            }),
+        )
+        .await;
+        let binding_uid = uid_of(&binding);
+        dispatch_delete_inner(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles/temp-role".to_string(),
+            auth(OPERATOR),
+        )
+        .await
+        .expect("an operator may delete a Role out from under a binding that names it");
+
+        // An operator sees the finding.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("policy audit");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = body["findings"].as_array().expect("findings array");
+        assert_eq!(findings.len(), 1, "{body}");
+        assert_eq!(findings[0]["category"], "danglingRoleRef");
+        assert_eq!(findings[0]["severity"], "warning");
+        assert_eq!(findings[0]["subject"]["uid"], binding_uid.to_string());
+        assert_eq!(body["hiddenFindings"], 0);
+        assert_eq!(body["truncated"], false);
+        // No Organization exists in this fixture, but the platform tier was
+        // scanned: the block is what tells "healthy" apart from "skipped".
+        assert_eq!(
+            body["scanned"]["organizations"].as_array().unwrap().len(),
+            0
+        );
+        assert!(body["scanned"]["platformBindings"].as_u64().unwrap() >= 1);
+
+        // A caller granted `list` only on a different kind sees nothing, but
+        // the hidden count says something was withheld — never a bare 403
+        // that would confirm something is there.
+        grant_authenticated(
+            &ctx,
+            "widget-lister",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Widget"],
+                "verbs": ["list"],
+            }]),
+        )
+        .await;
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a listing is never a 403");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["findings"].as_array().expect("findings array").len(),
+            0
+        );
+        assert_eq!(body["hiddenFindings"], 1);
+    }
+
+    /// `limit` bounds the findings returned and `truncated` says whether more
+    /// existed than the cap allowed through.
+    #[sqlx::test]
+    async fn policy_audit_limit_and_truncated(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        register_widget_rd(&ctx).await;
+        // Silence the seeded `resource-owner` binding's own
+        // `selectorMatchesNothing` finding — see the comment in
+        // `policy_audit_filters_findings_by_list_and_counts_hidden` — so the
+        // two dangling-role-ref findings below are the only ones counted.
+        create_widget_with_owner_label(&ctx, "owned").await;
+        for n in 0..2 {
+            let role_name = format!("temp-role-{n}");
+            create_at(
+                &ctx,
+                "rise.dev/v1alpha1/platformroles",
+                json!({
+                    "apiVersion": "rise.dev/v1alpha1",
+                    "kind": "PlatformRole",
+                    "metadata": {"name": role_name.clone()},
+                    "spec": {"statements": []},
+                }),
+            )
+            .await;
+            create_at(
+                &ctx,
+                "rise.dev/v1alpha1/platformrolebindings",
+                json!({
+                    "apiVersion": "rise.dev/v1alpha1",
+                    "kind": "PlatformRoleBinding",
+                    "metadata": {"name": format!("dangling-{n}")},
+                    "spec": {
+                        "subject": "system:authenticated",
+                        "roleRef": {"kind": "PlatformRole", "name": role_name.clone()},
+                    },
+                }),
+            )
+            .await;
+            dispatch_delete_inner(
+                &ctx,
+                format!("rise.dev/v1alpha1/platformroles/{role_name}"),
+                auth(OPERATOR),
+            )
+            .await
+            .expect("delete the role out from under its binding");
+        }
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("policy audit");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["findings"].as_array().expect("findings array").len(),
+            1
+        );
+        assert_eq!(body["truncated"], true);
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("policy audit");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["findings"].as_array().expect("findings array").len(),
+            2
+        );
+        assert_eq!(body["truncated"], false);
+    }
+
+    /// The default Organization is administered by operators through the
+    /// seeded `system-admin` binding, not a per-organization admin (decision
+    /// D4) — its `OrganizationWithoutAdmin` finding is real, but demoted to
+    /// `info` rather than `warning`.
+    #[sqlx::test]
+    async fn policy_audit_downgrades_the_default_organizations_missing_admin_to_info(
+        pool: sqlx::PgPool,
+    ) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, DEFAULT_ORGANIZATION).await;
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("policy audit");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = body["findings"].as_array().expect("findings array");
+        let default_org_finding = findings
+            .iter()
+            .find(|finding| finding["category"] == "organizationWithoutAdmin")
+            .expect("the default Organization has no admin binding of its own");
+        assert_eq!(default_org_finding["severity"], "info");
+        assert_eq!(default_org_finding["subject"]["name"], DEFAULT_ORGANIZATION);
+    }
+
+    // -------------------------------------------------------------------------
+    // Explain subresource
+    // -------------------------------------------------------------------------
+
+    /// The subresource is its own grant, refused rather than answered by
+    /// `(get, Kind)` alone; an org admin explaining their own access sees the
+    /// org-cap Deny recorded but exempted, and the admin grant deciding
+    /// (mirrors `explain_reports_ignored_denies_with_their_provenance` in
+    /// `crates/rise-authz/tests/engine.rs`, through the HTTP handlers).
+    #[sqlx::test]
+    async fn explain_requires_its_own_grant_and_reports_the_org_admins_exempted_deny(
+        pool: sqlx::PgPool,
+    ) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/roles/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Role",
+                "metadata": {"name": "org-cap"},
+                "spec": {"statements": [{
+                    "effect": "Deny",
+                    "kinds": ["rise.dev/Organization"],
+                    "verbs": ["delete"],
+                }]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/rolebindings/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "org-cap"},
+                "spec": {
+                    "subject": "system:authenticated",
+                    "scope": "rise.dev/Organization/acme",
+                    "roleRef": {"kind": "Role", "name": "org-cap"},
+                },
+            }),
+        )
+        .await;
+
+        // A reader who may see the Organization but was not granted `explain`
+        // is refused, not masked — the subresource is a separate grant.
+        grant_authenticated(
+            &ctx,
+            "org-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+        let err = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/explain".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery {
+                verb: Some("delete".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the subresource is its own grant");
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+        assert!(err.message.contains("explain"), "{}", err.message);
+
+        // An org admin explaining their own access: the admin binding decides,
+        // and the cap Deny is recorded but exempted. A `user:` subject must
+        // identify a live User resource named for the principal's own subject
+        // — the typed session's `user.id`, which is also what the
+        // authorization snapshot names as this caller's subject.
+        let alice = auth("alice@example.com");
+        let alice_name = alice.user_principal().unwrap().name.clone();
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/users",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "User",
+                "metadata": {"name": alice_name.clone()},
+                "spec": {},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/rolebindings/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "admin"},
+                "spec": {
+                    "subject": format!("user:{alice_name}"),
+                    "scope": "rise.dev/Organization/acme",
+                    "roleRef": {"kind": "PlatformRole", "name": "org-admin"},
+                },
+            }),
+        )
+        .await;
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/explain".to_string(),
+            alice,
+            PendingDeletionQuery {
+                verb: Some("delete".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("an org admin may explain their own access");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["decision"], "allow");
+        assert_eq!(body["operatorOverride"], false);
+        let contributions = body["contributions"]
+            .as_array()
+            .expect("contributions array");
+        assert!(
+            contributions.iter().any(
+                |c| c["retention"] == "retained" && c["binding"]["role"]["name"] == "org-admin"
+            ),
+            "{body}"
+        );
+        assert!(
+            contributions
+                .iter()
+                .any(|c| c["retention"] == "exemptDeny:organizationAdmin"
+                    && c["binding"]["role"]["name"] == "org-cap"),
+            "{body}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Write-time policy-audit warnings
+    // -------------------------------------------------------------------------
+
+    /// A create of a `PlatformRoleBinding` whose `subjectMembership:
+    /// ResourceOrganization` can never bite (its subject already carries its
+    /// own organization) still succeeds, and carries the no-op finding as a
+    /// `Warning` response header — diagnostics never reject a write
+    /// (ADR-0001 §5).
+    #[sqlx::test]
+    async fn creating_a_no_op_platform_binding_returns_a_warning_header(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/groups/acme",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Group",
+                "metadata": {"name": "platform"},
+                "spec": {},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "warn-role"},
+                "spec": {"statements": []},
+            }),
+        )
+        .await;
+
+        let resp = dispatch_post_inner(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings".to_string(),
+            auth(OPERATOR),
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "no-op-binding"},
+                "spec": {
+                    "subject": "group:acme/platform",
+                    "subjectMembership": "ResourceOrganization",
+                    "roleRef": {"kind": "PlatformRole", "name": "warn-role"},
+                },
+            }),
+        )
+        .await
+        .expect("the write succeeds despite the no-op shape");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let warnings: Vec<&axum::http::HeaderValue> = resp
+            .headers()
+            .get_all(axum::http::header::WARNING)
+            .iter()
+            .collect();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let text = warnings[0].to_str().expect("ascii warning header");
+        assert!(text.starts_with("299 - \""), "{text}");
+        assert!(text.contains("can never bite"), "{text}");
+    }
+
     /// A malformed body under a parent the caller cannot read is masked too.
     /// The body checks read nothing but the request and the collection
     /// registry — but *reaching* one of them is itself an answer about the
@@ -5279,7 +6291,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_malformed_create_under_an_invisible_parent_is_masked(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         let bogus = json!({
             "apiVersion": "example.dev/v1",
@@ -5354,7 +6366,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn a_writer_without_get_has_finalizers_preserved_not_reported(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_at(
             &ctx,
             "example.dev/v1/widgets",
@@ -5389,7 +6401,7 @@ mod dispatch_tests {
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             write("held"),
         )
         .await
@@ -5421,7 +6433,7 @@ mod dispatch_tests {
         let err = dispatch_put_inner(
             &ctx,
             "example.dev/v1/widgets/held".to_string(),
-            any_user(PLAIN_USER),
+            auth(PLAIN_USER),
             write("held"),
         )
         .await
@@ -5461,36 +6473,6 @@ mod dispatch_tests {
         assert!(err.message.contains("deletion-blockers"), "{}", err.message);
     }
 
-    /// A controller that is not on the collection's allowlist must not learn
-    /// whether the item it named exists. The allowlist decides before the row
-    /// is resolved.
-    #[sqlx::test]
-    async fn an_unlisted_controller_cannot_probe_item_existence(pool: sqlx::PgPool) {
-        let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &["controller.example.com"]).await;
-        create_widget(&ctx, "example.dev/v1", "real").await;
-
-        let present = dispatch_put_inner(
-            &ctx,
-            "example.dev/v1/widgets/real/status".to_string(),
-            any_controller("other.example.com"),
-            json!({"status": {"phase": "Ready"}}),
-        )
-        .await
-        .expect_err("an unlisted controller is refused");
-        let absent = dispatch_put_inner(
-            &ctx,
-            "example.dev/v1/widgets/imaginary/status".to_string(),
-            any_controller("other.example.com"),
-            json!({"status": {"phase": "Ready"}}),
-        )
-        .await
-        .expect_err("an unlisted controller is refused");
-        assert_eq!(present.status, StatusCode::FORBIDDEN, "{}", present.message);
-        assert_eq!(present.status, absent.status);
-        assert_eq!(present.message, absent.message);
-    }
-
     // -------------------------------------------------------------------------
     // Version-independent lookup
     // -------------------------------------------------------------------------
@@ -5510,7 +6492,6 @@ mod dispatch_tests {
                 {"name": "v1", "served": false, "storage": true},
                 {"name": "v2", "served": true, "storage": false},
             ],
-            "allowedStatusControllerIds": [],
         });
         ctx.store
             .register_resource_definition(CreateResourceParams {
@@ -5583,7 +6564,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn depth_1_chain_classifies_list_item_subresource(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &["controller.example.com"]).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
 
         // Create a gadget under acme — POST to the depth-1 list path.
@@ -5627,10 +6608,21 @@ mod dispatch_tests {
         assert_eq!(body["metadata"]["name"], "g1");
 
         // Subresource — D + 2 segments, controller-authenticated status write.
+        grant_controller(
+            &ctx,
+            "reconciler",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["example.dev/Gadget"],
+                "verbs": ["update"],
+                "subresources": ["status"],
+            }]),
+        )
+        .await;
         let resp = dispatch_put_inner(
             &ctx,
             "example.dev/v1/gadgets/acme/g1/status".to_string(),
-            any_controller("controller.example.com"),
+            any_controller("reconciler"),
             json!({"status": {"phase": "Ready"}}),
         )
         .await
@@ -5641,7 +6633,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn depth_2_chain_resolves_list_and_item(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
         register_gizmo_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         create_at(
@@ -5691,8 +6683,8 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn uid_form_resolves_nested_resource_without_ancestors(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
+        register_gadget_rd(&ctx).await;
         create_org(&ctx, "acme").await;
         let gadget = create_at(
             &ctx,
@@ -5731,7 +6723,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn uid_token_mid_chain_yields_400(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_gadget_rd(&ctx, &[]).await;
+        register_gadget_rd(&ctx).await;
 
         // A `uid:` token is valid only as the sole identifier segment; following
         // an ancestor name it is a 400 — and the parent-chain walk is not even
@@ -5750,7 +6742,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn leaf_resource_named_status_resolves_as_item(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
         create_widget(&ctx, "example.dev/v1", "status").await;
 
         // `widgets` is depth 0, so `widgets/status` is D + 1 segments: the
@@ -5778,7 +6770,7 @@ mod dispatch_tests {
     #[sqlx::test]
     async fn update_resource_definition_via_put(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
-        register_widget_rd(&ctx, &[]).await;
+        register_widget_rd(&ctx).await;
 
         // Step 1: GET the RD through the HTTP layer to obtain its current revision.
         let resp = dispatch_get_inner(
@@ -5804,12 +6796,11 @@ mod dispatch_tests {
                 {"name": "v2", "served": true, "storage": false},
                 {"name": "v3", "served": true, "storage": false},
             ],
-            "allowedStatusControllerIds": [],
         });
         let resp = dispatch_put_inner(
             &ctx,
             "rise.dev/v1alpha1/resourcedefinitions/widgets.example.dev".to_string(),
-            any_user(OPERATOR),
+            auth(OPERATOR),
             json!({
                 "apiVersion": "rise.dev/v1alpha1",
                 "kind": RESOURCE_DEFINITION_KIND,
@@ -5831,5 +6822,802 @@ mod dispatch_tests {
             .as_array()
             .expect("versions array");
         assert_eq!(versions.len(), 3, "expected 3 versions after update");
+    }
+
+    // -------------------------------------------------------------------------
+    // The token subresource (ADR-0001 §7)
+    // -------------------------------------------------------------------------
+
+    use crate::server::auth::identity::{resolve_identity, IdentityRejection};
+
+    /// ADR-0001 scenario 44
+    ///
+    /// An external assertion presented to a ServiceAccount's `/token` considers
+    /// only that target's live trust policies and, on one match, mints a token
+    /// naming exactly its subject and UID — no RBAC token-create check applies
+    /// to workload exchange.
+    #[sqlx::test]
+    async fn workload_exchange_mints_a_target_bound_identity_token(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        let sa = create_service_account(&ctx, "acme", "ci").await;
+        trust_service_account(
+            &ctx,
+            "acme",
+            "ci",
+            "github",
+            token::tests::ISSUER,
+            json!({"aud": "rise", "sub": "repo:acme/*"}),
+        )
+        .await;
+
+        let assertion = token::tests::assertion(json!({"aud": "rise", "sub": CI_CLAIMS}));
+        let resp = exchange(&ctx, SA_TOKEN, exchange_body(&assertion))
+            .await
+            .expect("exchange succeeds");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["expires_in"], 600);
+        let claims = decode(&ctx, &body);
+        assert_eq!(claims.sub, "serviceaccount:acme/ci");
+        assert_eq!(claims.rise_uid, uid_of(&sa));
+        assert_eq!(claims.aud, token::tests::RISE_URL);
+        assert!(
+            claims.act.is_none(),
+            "a workload exchange records no delegator"
+        );
+        assert!(claims.authorization_details.is_none());
+
+        // `aud` may be an array (RFC 7519 §4.1.3), and the UID form addresses
+        // the same target.
+        let assertion =
+            token::tests::assertion(json!({"aud": ["other", "rise"], "sub": CI_CLAIMS}));
+        let resp = exchange(
+            &ctx,
+            &format!(
+                "rise.dev/v1alpha1/serviceaccounts/uid:{}/token",
+                uid_of(&sa)
+            ),
+            exchange_body(&assertion),
+        )
+        .await
+        .expect("exchange by uid succeeds");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(decode(&ctx, &body).sub, "serviceaccount:acme/ci");
+
+        // A Controller is root-scoped and exchanges the same way.
+        let controller = create_controller(&ctx, "k8s").await;
+        trust_controller(
+            &ctx,
+            "k8s",
+            "cluster",
+            token::tests::ISSUER,
+            json!({"aud": "rise-controller", "sub": "system:serviceaccount:rise:k8s"}),
+        )
+        .await;
+        let assertion = token::tests::assertion(
+            json!({"aud": "rise-controller", "sub": "system:serviceaccount:rise:k8s"}),
+        );
+        let resp = exchange(
+            &ctx,
+            "rise.dev/v1alpha1/controllers/k8s/token",
+            exchange_body(&assertion),
+        )
+        .await
+        .expect("controller exchange succeeds");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = decode(&ctx, &body);
+        assert_eq!(claims.sub, "controller:k8s");
+        assert_eq!(claims.rise_uid, uid_of(&controller));
+    }
+
+    /// ADR-0001 scenario 45
+    /// ADR-0001 scenario 47
+    ///
+    /// After the route is entered, every failure is the same 401 body, and
+    /// only a registered token route is entered at all; mixing an external
+    /// assertion with a Rise credential is a malformed request, not an
+    /// authentication failure.
+    #[sqlx::test]
+    async fn workload_exchange_failures_are_one_coarse_401(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        let sa = create_service_account(&ctx, "acme", "ci").await;
+        create_service_account(&ctx, "acme", "unpoliced").await;
+        create_service_account(&ctx, "acme", "ambiguous").await;
+        trust_service_account(
+            &ctx,
+            "acme",
+            "ci",
+            "github",
+            token::tests::ISSUER,
+            json!({"aud": "rise", "sub": CI_CLAIMS}),
+        )
+        .await;
+        trust_service_account(
+            &ctx,
+            "acme",
+            "ci",
+            "elsewhere",
+            "https://other.example.com",
+            json!({"aud": "rise"}),
+        )
+        .await;
+        for name in ["one", "two"] {
+            trust_service_account(
+                &ctx,
+                "acme",
+                "ambiguous",
+                name,
+                token::tests::ISSUER,
+                json!({"aud": "rise"}),
+            )
+            .await;
+        }
+        let good = token::tests::assertion(json!({"aud": "rise", "sub": CI_CLAIMS}));
+
+        let coarse = |label: &'static str, err: ServerError| {
+            assert_eq!(
+                err.status,
+                StatusCode::UNAUTHORIZED,
+                "{label}: {}",
+                err.message
+            );
+            assert_eq!(err.message, token::WORKLOAD_EXCHANGE_REJECTED, "{label}");
+        };
+        let sa_path = |name: &str| format!("rise.dev/v1alpha1/serviceaccounts/acme/{name}/token");
+
+        // Absent target.
+        coarse(
+            "missing target",
+            exchange(&ctx, &sa_path("ghost"), exchange_body(&good))
+                .await
+                .unwrap_err(),
+        );
+        // A UID that resolves to another kind.
+        let org_uid = ctx
+            .store
+            .get_by_name("rise.dev/v1alpha1", "Organization", "acme", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .uid;
+        coarse(
+            "wrong kind by uid",
+            exchange(
+                &ctx,
+                &format!("rise.dev/v1alpha1/serviceaccounts/uid:{org_uid}/token"),
+                exchange_body(&good),
+            )
+            .await
+            .unwrap_err(),
+        );
+        // No trust policy for this issuer.
+        coarse(
+            "no policy",
+            exchange(&ctx, &sa_path("unpoliced"), exchange_body(&good))
+                .await
+                .unwrap_err(),
+        );
+        // Claim mismatch.
+        let wrong_sub = token::tests::assertion(json!({"aud": "rise", "sub": "repo:beta/app"}));
+        coarse(
+            "claim mismatch",
+            exchange(&ctx, &sa_path("ci"), exchange_body(&wrong_sub))
+                .await
+                .unwrap_err(),
+        );
+        // Two matching policies.
+        coarse(
+            "ambiguous",
+            exchange(&ctx, &sa_path("ambiguous"), exchange_body(&good))
+                .await
+                .unwrap_err(),
+        );
+        // A policy exists for the issuer but its keys do not verify.
+        let unverifiable = token::tests::assertion_from(
+            "https://other.example.com",
+            json!({"aud": "rise", "sub": CI_CLAIMS}),
+        );
+        coarse(
+            "unverifiable",
+            exchange(&ctx, &sa_path("ci"), exchange_body(&unverifiable))
+                .await
+                .unwrap_err(),
+        );
+        // Rise's own issuer is never an external source.
+        let rise_issued = token::tests::assertion_from(
+            token::tests::RISE_URL,
+            json!({"aud": "rise", "sub": CI_CLAIMS}),
+        );
+        coarse(
+            "rise-issued",
+            exchange(&ctx, &sa_path("ci"), exchange_body(&rise_issued))
+                .await
+                .unwrap_err(),
+        );
+        // Not a JWT at all.
+        coarse(
+            "malformed",
+            exchange(&ctx, &sa_path("ci"), exchange_body("not-a-jwt"))
+                .await
+                .unwrap_err(),
+        );
+        // A draining target.
+        ctx.store.delete(uid_of(&sa)).await.expect("tombstone ci");
+        coarse(
+            "draining target",
+            exchange(&ctx, &sa_path("ci"), exchange_body(&good))
+                .await
+                .unwrap_err(),
+        );
+
+        // A kind that does not register `token` has no such route: the ordinary
+        // 404, before any authentication.
+        let err = exchange(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/token",
+            exchange_body(&good),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+        assert!(err.message.contains("no such route"), "{}", err.message);
+        // Any other credential-less request is simply unauthenticated —
+        // including one that reaches the same answer for an unknown collection.
+        for path in [
+            "rise.dev/v1alpha1/serviceaccounts/acme",
+            "rise.dev/v1alpha1/serviceaccounts/acme/ci/status",
+            "example.dev/v1/nothing/here/token",
+        ] {
+            let err = exchange(&ctx, path, exchange_body(&good))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.status,
+                StatusCode::UNAUTHORIZED,
+                "{path}: {}",
+                err.message
+            );
+            assert_ne!(err.message, token::WORKLOAD_EXCHANGE_REJECTED, "{path}");
+        }
+        // No assertion and no credential is no credential.
+        let err = exchange(&ctx, &sa_path("ci"), json!({})).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        // An assertion alongside a Rise credential is a malformed request, not
+        // an authentication failure (scenario 47).
+        let err = post_as(&ctx, &sa_path("ci"), auth(OPERATOR), exchange_body(&good))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+    }
+
+    /// ADR-0001 scenario 46
+    /// ADR-0001 scenario 48
+    /// ADR-0001 scenario 57
+    ///
+    /// Delegated issuance is RBAC only, needs `create` on the `token`
+    /// subresource of the exact target — `get` on the parent, `create` on the
+    /// main resource, and `get` on the subresource each grant nothing here —
+    /// and records the caller as the chain's delegator.
+    #[sqlx::test]
+    async fn delegated_issuance_requires_create_on_the_token_subresource(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        let sa = create_service_account(&ctx, "acme", "ci").await;
+        // No trust policy at all: delegated issuance never consults them.
+
+        let operator = auth(OPERATOR);
+        let operator_id = operator.user_principal().unwrap().clone();
+        let resp = post_as(&ctx, SA_TOKEN, operator, json!({}))
+            .await
+            .expect("an operator holds every subresource");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = decode(&ctx, &body);
+        assert_eq!(claims.sub, "serviceaccount:acme/ci");
+        assert_eq!(claims.rise_uid, uid_of(&sa));
+        let act = claims.act.expect("a delegated token records its delegator");
+        assert_eq!(act.sub, operator_id.subject().to_string());
+        assert_eq!(act.rise_uid, operator_id.uid);
+        assert!(act.act.is_none());
+
+        // A caller with no grant may not learn the target exists.
+        let err = post_as(&ctx, SA_TOKEN, auth(PLAIN_USER), json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+
+        // `get` on the parent, `create` on the main resource, and `get` on the
+        // subresource each grant nothing here.
+        grant_authenticated(
+            &ctx,
+            "not-enough",
+            json!([
+                {"effect": "Allow", "kinds": ["rise.dev/ServiceAccount"], "verbs": ["get", "create"]},
+                {"effect": "Allow", "kinds": ["rise.dev/ServiceAccount"], "verbs": ["get"], "subresources": ["token"]},
+            ]),
+        )
+        .await;
+        let err = post_as(&ctx, SA_TOKEN, auth(PLAIN_USER), json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{}", err.message);
+
+        // `(create, rise.dev/ServiceAccount, token)` is the grant.
+        grant_authenticated(
+            &ctx,
+            "token-minter",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/ServiceAccount"],
+                "verbs": ["create"],
+                "subresources": ["token"],
+            }]),
+        )
+        .await;
+        let resp = post_as(&ctx, SA_TOKEN, auth(PLAIN_USER), json!({}))
+            .await
+            .expect("the token grant suffices");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(decode(&ctx, &body).sub, "serviceaccount:acme/ci");
+
+        // The grant is on ServiceAccount, so a Controller target is still
+        // refused — masked, since the caller holds no `get` on Controllers.
+        create_controller(&ctx, "k8s").await;
+        let err = post_as(
+            &ctx,
+            "rise.dev/v1alpha1/controllers/k8s/token",
+            auth(PLAIN_USER),
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+
+        // A kind without the subresource has no route, whoever asks.
+        let err = post_as(
+            &ctx,
+            "rise.dev/v1alpha1/organizations/acme/token",
+            auth(OPERATOR),
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+        assert!(err.message.contains("no such route"), "{}", err.message);
+    }
+
+    /// ADR-0001 scenario 7
+    /// ADR-0001 scenario 54
+    ///
+    /// A minted token is a principal of the generic API, exercises the
+    /// target's live policy on every request rather than a snapshot, and dies
+    /// with the target's UID: a recreated name reactivates its policy but
+    /// never revives a token minted for the retired incarnation.
+    #[sqlx::test]
+    async fn a_minted_token_authenticates_as_the_target_until_its_uid_dies(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        let sa = create_service_account(&ctx, "acme", "ci").await;
+        let resp = post_as(&ctx, SA_TOKEN, auth(OPERATOR), json!({}))
+            .await
+            .expect("mint");
+        let (_, body) = read(resp).await;
+        let as_ci = identity_auth(&ctx, &body).await;
+        let AnyAuth::User(inner) = &as_ci else {
+            panic!("an identity token is an AuthContext principal");
+        };
+        assert!(inner.is_service_account());
+        assert!(inner.user().is_err(), "a resource principal is not a User");
+
+        // With no grant, the identity reaches nothing — not even itself.
+        let err = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/serviceaccounts/acme/ci".to_string(),
+            as_ci.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+
+        // A live grant to the identity delivers on the next request: nothing
+        // is snapshotted in the token.
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "self-reader"},
+                "spec": {"statements": [
+                    {"effect": "Allow", "kinds": ["rise.dev/ServiceAccount"], "verbs": ["get"]}
+                ]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "ci-reads-itself"},
+                "spec": {
+                    "subject": "serviceaccount:acme/ci",
+                    "scope": "rise.dev/ServiceAccount/acme/ci",
+                    "roleRef": {"kind": "PlatformRole", "name": "self-reader"},
+                },
+            }),
+        )
+        .await;
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/serviceaccounts/acme/ci".to_string(),
+            as_ci.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("the live grant reaches the token holder");
+        let (status, read_back) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read_back["metadata"]["uid"], sa["metadata"]["uid"]);
+
+        // Group ties and operator standing belong to Users alone, so the
+        // identity is neither an operator nor affiliated by group.
+        let read_ctx = ctx.authz.read_context(&as_ci).await.unwrap();
+        assert!(!read_ctx.is_operator());
+        assert_eq!(read_ctx.subject().to_string(), "serviceaccount:acme/ci");
+        assert_eq!(read_ctx.actor(), "serviceaccount:acme/ci");
+
+        // Delete and recreate the same name: the name-bound binding delivers to
+        // the replacement, but every token for the old UID fails immediately.
+        ctx.store.delete(uid_of(&sa)).await.expect("delete ci");
+        let claims = decode(&ctx, &body);
+        assert!(matches!(
+            resolve_identity(ctx.store.as_ref(), &claims, token::tests::RISE_URL).await,
+            Err(IdentityRejection::NoLiveResource)
+        ));
+        // A tombstone, if the delete left one, has to be collected before the
+        // name is free again.
+        let _ = ctx.store.try_collect(uid_of(&sa)).await;
+        let replacement = create_service_account(&ctx, "acme", "ci").await;
+        assert_ne!(uid_of(&replacement), uid_of(&sa));
+        assert!(matches!(
+            resolve_identity(ctx.store.as_ref(), &claims, token::tests::RISE_URL).await,
+            Err(IdentityRejection::NoLiveResource)
+        ));
+    }
+
+    /// ADR-0001 scenario 48
+    ///
+    /// A minted identity may mint the next only through its own live
+    /// token-create grant, and the chain records every delegator.
+    #[sqlx::test]
+    async fn delegation_chains_only_across_explicit_grants(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        create_service_account(&ctx, "acme", "ci").await;
+        create_controller(&ctx, "k8s").await;
+
+        let operator = auth(OPERATOR);
+        let operator_id = operator.user_principal().unwrap().clone();
+        let resp = post_as(
+            &ctx,
+            "rise.dev/v1alpha1/controllers/k8s/token",
+            operator,
+            json!({}),
+        )
+        .await
+        .expect("operator mints for the controller");
+        let (_, controller_token) = read(resp).await;
+        let as_k8s = identity_auth(&ctx, &controller_token).await;
+
+        // The controller holds no token-create on the ServiceAccount.
+        let err = post_as(&ctx, SA_TOKEN, as_k8s.clone(), json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+
+        // A Controller is org-agnostic, so its grant on an org-contained target
+        // arrives through a PlatformRoleBinding (ADR-0001 §7).
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "sa-token-minter"},
+                "spec": {"statements": [{
+                    "effect": "Allow",
+                    "kinds": ["rise.dev/ServiceAccount"],
+                    "verbs": ["create"],
+                    "subresources": ["token"],
+                }]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "k8s-mints-ci"},
+                "spec": {
+                    "subject": "controller:k8s",
+                    "scope": "rise.dev/Organization/acme",
+                    "roleRef": {"kind": "PlatformRole", "name": "sa-token-minter"},
+                },
+            }),
+        )
+        .await;
+        let resp = post_as(&ctx, SA_TOKEN, as_k8s, json!({}))
+            .await
+            .expect("the controller now holds token-create on the ServiceAccount");
+        let (status, sa_token) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{sa_token}");
+        let claims = decode(&ctx, &sa_token);
+        assert_eq!(claims.sub, "serviceaccount:acme/ci");
+        assert_eq!(claims.delegation_depth(), 2);
+        let act = claims.act.expect("act");
+        assert_eq!(act.sub, "controller:k8s");
+        let inner = act.act.expect("the controller's own delegator");
+        assert_eq!(inner.sub, operator_id.subject().to_string());
+        assert!(inner.act.is_none());
+
+        // Actor data never grants: the ServiceAccount token holds only what the
+        // ServiceAccount holds, which is nothing here.
+        let as_ci = identity_auth(&ctx, &sa_token).await;
+        let err = post_as(
+            &ctx,
+            "rise.dev/v1alpha1/controllers/k8s/token",
+            as_ci,
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+    }
+
+    /// ADR-0001 scenario 52
+    /// ADR-0001 scenario 53
+    ///
+    /// `authorization_details` narrow the issued token, the ceiling applies
+    /// on every request — main-resource `get`, `list` and item projection
+    /// alike — and a malformed set is refused rather than falling back to
+    /// full policy.
+    #[sqlx::test]
+    async fn authorization_details_narrow_the_issued_token(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        create_org(&ctx, "beta").await;
+        create_service_account(&ctx, "acme", "ci").await;
+        // The identity may read every ServiceAccount, live.
+        grant_authenticated(
+            &ctx,
+            "sa-reader",
+            json!([{"effect": "Allow", "kinds": ["rise.dev/ServiceAccount"], "verbs": ["get", "list"]}]),
+        )
+        .await;
+        create_service_account(&ctx, "beta", "deploy").await;
+
+        let details = json!([{
+            "type": "rise.dev/rbac",
+            "scope": "rise.dev/Organization/acme",
+            "permissions": [{"verbs": ["get"], "kinds": ["rise.dev/ServiceAccount"]}],
+        }]);
+        let resp = post_as(
+            &ctx,
+            SA_TOKEN,
+            auth(OPERATOR),
+            json!({"authorization_details": details, "expires_in": 60}),
+        )
+        .await
+        .expect("mint a narrowed token");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["expires_in"], 60);
+        let claims = decode(&ctx, &body);
+        assert_eq!(
+            claims.authorization_details.as_ref().map(|d| json!(d)),
+            Some(details),
+            "the token carries the canonical detail set"
+        );
+        let capped = identity_auth(&ctx, &body).await;
+
+        // Inside the ceiling, the live grant delivers.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/serviceaccounts/acme/ci".to_string(),
+            capped.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("get inside the ceiling");
+        assert_eq!(read(resp).await.0, StatusCode::OK);
+        // Outside it, live RBAC is denied — and masked, as any denial is.
+        let err = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/serviceaccounts/beta/deploy".to_string(),
+            capped.clone(),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND, "{}", err.message);
+        // `list` is outside the ceiling too, so the listing is masked empty.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "rise.dev/v1alpha1/serviceaccounts/acme".to_string(),
+            capped,
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a list outside the ceiling is empty");
+        let (status, listing) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listing["items"].as_array().map(Vec::len), Some(0));
+
+        // A malformed detail set is a bad request, never a fallback.
+        for details in [json!([]), json!({}), json!([{"type": "rise.dev/rbac"}])] {
+            let err = post_as(
+                &ctx,
+                SA_TOKEN,
+                auth(OPERATOR),
+                json!({"authorization_details": details}),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+        }
+        // And a token whose stored claim is malformed fails authentication.
+        let mut claims = decode(&ctx, &body);
+        claims.authorization_details = Some(vec![]);
+        assert!(matches!(
+            resolve_identity(ctx.store.as_ref(), &claims, token::tests::RISE_URL).await,
+            Err(IdentityRejection::Cap(_))
+        ));
+    }
+
+    /// An `audience` mints the same token for another verifier: Rise's own API
+    /// refuses it, and a ceiling cannot be combined with it.
+    #[sqlx::test]
+    async fn an_audience_bound_token_is_for_that_verifier_only(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        let sa = create_service_account(&ctx, "acme", "ci").await;
+
+        let resp = post_as(
+            &ctx,
+            SA_TOKEN,
+            auth(OPERATOR),
+            json!({"audience": "https://vault.example.com"}),
+        )
+        .await
+        .expect("mint for an external audience");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = decode(&ctx, &body);
+        assert_eq!(claims.aud, "https://vault.example.com");
+        assert_eq!(claims.sub, "serviceaccount:acme/ci");
+        assert_eq!(claims.rise_uid, uid_of(&sa));
+        assert!(matches!(
+            resolve_identity(ctx.store.as_ref(), &claims, token::tests::RISE_URL).await,
+            Err(IdentityRejection::Audience(_))
+        ));
+
+        // The audience defaults to Rise, and an explicit Rise audience is the
+        // same thing.
+        let resp = post_as(
+            &ctx,
+            SA_TOKEN,
+            auth(OPERATOR),
+            json!({"audience": token::tests::RISE_URL}),
+        )
+        .await
+        .expect("mint for Rise explicitly");
+        let (_, body) = read(resp).await;
+        assert!(resolve_identity(
+            ctx.store.as_ref(),
+            &decode(&ctx, &body),
+            token::tests::RISE_URL
+        )
+        .await
+        .is_ok());
+
+        // A ceiling is meaningless to another verifier, so the pair is refused
+        // before anything about the target is consulted.
+        let err = post_as(
+            &ctx,
+            SA_TOKEN,
+            auth(OPERATOR),
+            json!({
+                "audience": "https://vault.example.com",
+                "authorization_details": [{
+                    "type": "rise.dev/rbac",
+                    "scope": "rise.dev/Organization/acme",
+                    "permissions": [{"verbs": ["get"], "kinds": ["rise.dev/ServiceAccount"]}],
+                }],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+        let err = post_as(&ctx, SA_TOKEN, auth(OPERATOR), json!({"audience": "  "}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+    }
+
+    /// ADR-0001 scenario 47
+    /// ADR-0001 scenario 57
+    ///
+    /// `token` is create-only — PUT, GET, and a Controller's own credential
+    /// each answer 405 — and a trust policy may never name Rise's own issuer.
+    #[sqlx::test]
+    async fn token_is_create_only_and_rise_is_never_an_external_issuer(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, "acme").await;
+        create_service_account(&ctx, "acme", "ci").await;
+
+        let err = dispatch_put_inner(&ctx, SA_TOKEN.to_string(), auth(OPERATOR), json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{}",
+            err.message
+        );
+        let err = dispatch_put_inner(
+            &ctx,
+            SA_TOKEN.to_string(),
+            any_controller("reconciler"),
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{}",
+            err.message
+        );
+        let err = dispatch_get_inner(
+            &ctx,
+            SA_TOKEN.to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{}",
+            err.message
+        );
+
+        let err = post_as(
+            &ctx,
+            "rise.dev/v1alpha1/serviceaccounttrustpolicies/acme/ci",
+            auth(OPERATOR),
+            trust_policy_body(
+                "ServiceAccountTrustPolicy",
+                "self",
+                token::tests::RISE_URL,
+                json!({"aud": "rise"}),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+        assert!(err.message.contains("Rise's own issuer"), "{}", err.message);
     }
 }

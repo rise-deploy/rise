@@ -202,7 +202,7 @@ impl DockerLogBackend {
         use crate::server::deployment::controller::docker::labels::{
             self, SUFFIX_CONTAINER, SUFFIX_DEPLOYMENT_ID, SUFFIX_MANAGED_BY, SUFFIX_PROJECT,
         };
-        use bollard::container::ListContainersOptions;
+        use bollard::query_parameters::ListContainersOptions;
         use std::collections::HashMap as StdHashMap;
 
         let ns = &self.label_namespace;
@@ -223,7 +223,7 @@ impl DockerLogBackend {
             .docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await?;
@@ -231,7 +231,7 @@ impl DockerLogBackend {
         // Docker ANDs repeated `label` filters, so the container filter — an
         // OR over names — is applied here rather than in the daemon query.
         let container_key = labels::ns_key(ns, SUFFIX_CONTAINER);
-        let container_name = |summary: &bollard::secret::ContainerSummary| {
+        let container_name = |summary: &bollard::models::ContainerSummary| {
             summary
                 .labels
                 .as_ref()
@@ -251,7 +251,7 @@ impl DockerLogBackend {
         // deployment mid-recreate leads with what is actually serving.
         let (running, stopped): (Vec<_>, Vec<_>) = candidates
             .into_iter()
-            .partition(|c| c.state.as_deref() == Some("running"));
+            .partition(|c| c.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING));
         Ok(running
             .into_iter()
             .chain(stopped)
@@ -287,7 +287,7 @@ impl RuntimeLogBackend for DockerLogBackend {
         project: &Project,
         query: LogQuery,
     ) -> Result<LogEventStream> {
-        use bollard::container::LogsOptions;
+        use bollard::query_parameters::LogsOptions;
 
         if matches!(
             deployment.status,
@@ -336,15 +336,17 @@ impl RuntimeLogBackend for DockerLogBackend {
             .map(|s| Utc::now().timestamp() - s)
             .or_else(|| query.start_time.map(|t| t.timestamp()).filter(|t| *t > 0))
             .unwrap_or(0);
+        // The Docker API takes 32-bit epoch seconds; saturate rather than wrap.
+        let since = i32::try_from(since).unwrap_or(i32::MAX);
 
-        let options = LogsOptions::<String> {
+        let options = LogsOptions {
             follow: query.follow && is_followable_status(&deployment.status),
             stdout: true,
             stderr: true,
             since,
             until: query
                 .end_time
-                .map(|end| end.timestamp().saturating_add(1))
+                .map(|end| i32::try_from(end.timestamp().saturating_add(1)).unwrap_or(i32::MAX))
                 .unwrap_or_default(),
             // Event timestamps provide both range enforcement and identity,
             // even when the caller does not render them.

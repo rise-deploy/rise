@@ -45,6 +45,10 @@ pub struct BindingProvenance {
     pub uid: Uuid,
     pub kind: BindingKind,
     pub role: RoleReference,
+    /// The binding's own resource name, so an audit finding can identify it
+    /// without a second lookup. `None` for a binding the grant gate simulates
+    /// from a request rather than loads from a stored row.
+    pub name: Option<String>,
 }
 
 /// One live binding with its `roleRef` already resolved to policy statements.
@@ -61,6 +65,14 @@ pub struct BindingFact {
     pub scope: rise_resource_api::Scope,
     pub selector: Option<rise_resource_api::LabelSelector>,
     pub statements: Vec<PolicyStatement>,
+    /// Whether `roleRef` resolved to a live Role/PlatformRole body.
+    ///
+    /// `false` always pairs with empty `statements` — evaluation treats a
+    /// dangling reference as contributing nothing either way — but the audit
+    /// needs to tell a dangling reference apart from a resolved Role whose
+    /// body happens to hold zero statements, which is `true` with the same
+    /// empty list.
+    pub role_resolved: bool,
 }
 
 /// Root-parented `PlatformRoleBinding`s, which are the complete platform tier.
@@ -74,7 +86,7 @@ pub(crate) async fn load_platform_bindings(
     let mut bindings = Vec::new();
     for row in rows.iter().filter(|row| is_live(row)) {
         let spec: LocallyNormalizedPlatformRoleBindingSpec = parse_spec(row)?;
-        let statements = roles
+        let resolved = roles
             .resolve(
                 store,
                 RoleRefKind::PlatformRole,
@@ -82,6 +94,7 @@ pub(crate) async fn load_platform_bindings(
                 None,
             )
             .await?;
+        let role_resolved = resolved.is_some();
         bindings.push(BindingFact {
             provenance: BindingProvenance {
                 uid: row.uid,
@@ -90,13 +103,15 @@ pub(crate) async fn load_platform_bindings(
                     kind: RoleRefKind::PlatformRole,
                     name: spec.role_ref().name.clone(),
                 },
+                name: Some(row.name.clone()),
             },
             tier: BindingTier::Platform,
             subject: spec.subject().clone(),
             subject_membership: spec.subject_membership(),
             scope: spec.scope().clone(),
             selector: spec.label_selector().cloned(),
-            statements,
+            statements: resolved.unwrap_or_default(),
+            role_resolved,
         });
     }
     Ok(bindings)
@@ -133,9 +148,10 @@ pub(crate) async fn load_organization_bindings(
             RoleRefKind::Role => Some(org_row.uid),
             RoleRefKind::PlatformRole => None,
         };
-        let statements = roles
+        let resolved = roles
             .resolve(store, role_ref.kind, role_ref.name.as_str(), role_parent)
             .await?;
+        let role_resolved = resolved.is_some();
         bindings.push(BindingFact {
             provenance: BindingProvenance {
                 uid: row.uid,
@@ -144,6 +160,7 @@ pub(crate) async fn load_organization_bindings(
                     kind: role_ref.kind,
                     name: role_ref.name.clone(),
                 },
+                name: Some(row.name.clone()),
             },
             tier: BindingTier::Organization(organization.to_owned()),
             subject: spec.subject().clone(),
@@ -152,11 +169,16 @@ pub(crate) async fn load_organization_bindings(
             subject_membership: SubjectMembership::Any,
             scope: spec.scope().clone(),
             selector: spec.label_selector().cloned(),
-            statements,
+            statements: resolved.unwrap_or_default(),
+            role_resolved,
         });
     }
     Ok(bindings)
 }
+
+/// A cached resolution: `None` for a dangling reference, `Some` for a resolved
+/// Role's statements (possibly empty).
+type ResolvedRole = Option<Vec<PolicyStatement>>;
 
 /// Role bodies resolved during one load.
 ///
@@ -165,39 +187,45 @@ pub(crate) async fn load_organization_bindings(
 /// answer for another's the moment this cache outlives a single org's load.
 #[derive(Default)]
 struct RoleCache {
-    statements: HashMap<(&'static str, Option<Uuid>, String), Vec<PolicyStatement>>,
+    statements: HashMap<(&'static str, Option<Uuid>, String), ResolvedRole>,
 }
 
 impl RoleCache {
+    /// Resolve a `roleRef` to its live statements.
+    ///
+    /// `None` marks a dangling reference — no live Role/PlatformRole at that
+    /// placement — distinctly from a resolved Role whose body happens to have
+    /// zero statements, which is `Some(vec![])`. Evaluation folds both into
+    /// "contributes nothing"; the audit needs to tell them apart.
     async fn resolve(
         &mut self,
         store: &dyn ResourceStore,
         kind: RoleRefKind,
         name: &str,
         parent_uid: Option<Uuid>,
-    ) -> Result<Vec<PolicyStatement>, AuthorizationError> {
+    ) -> Result<ResolvedRole, AuthorizationError> {
         let stored_kind = match kind {
             RoleRefKind::Role => ROLE_KIND,
             RoleRefKind::PlatformRole => PLATFORM_ROLE_KIND,
         };
         let key = (stored_kind, parent_uid, name.to_owned());
-        if let Some(statements) = self.statements.get(&key) {
-            return Ok(statements.clone());
+        if let Some(resolved) = self.statements.get(&key) {
+            return Ok(resolved.clone());
         }
-        let statements = match store
+        let resolved = match store
             .get_by_name(API_VERSION_V1ALPHA1, stored_kind, name, parent_uid)
             .await?
             .filter(is_live)
         {
-            Some(row) => parse_spec::<RoleSpec>(&row)?.statements,
-            None => Vec::new(),
+            Some(row) => Some(parse_spec::<RoleSpec>(&row)?.statements),
+            None => None,
         };
-        self.statements.insert(key, statements.clone());
-        Ok(statements)
+        self.statements.insert(key, resolved.clone());
+        Ok(resolved)
     }
 }
 
-fn is_live(row: &ResourceRow) -> bool {
+pub(crate) fn is_live(row: &ResourceRow) -> bool {
     row.deletion_timestamp.is_none()
 }
 

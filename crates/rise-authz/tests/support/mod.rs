@@ -19,8 +19,8 @@ use rise_authz::engine::{
 };
 use rise_resource_api::{
     CollectionInfo, CreateResourceParams, DeleteOutcome, DeletionBlockerReport, NoOpValidator,
-    PathSegment, ResourceApi, ResourceParentRef, ResourceRow, ResourceStore, StoreError, SubjectId,
-    UpdateResourceParams, API_VERSION_V1ALPHA1,
+    PathSegment, PathWalk, ResourceApi, ResourceParentRef, ResourceRow, ResourceStore, StoreError,
+    SubjectId, UpdateResourceParams, API_VERSION_V1ALPHA1,
 };
 use uuid::Uuid;
 
@@ -302,6 +302,23 @@ impl ResourceStore for FakeStore {
         }
         Ok(descendants)
     }
+    /// Live rows carrying `key`, oldest-first (build order) and capped at
+    /// `limit` — mirroring the Postgres `created_at, uid` ordering closely
+    /// enough for tests, since fixture rows are built in ascending order.
+    async fn list_label_setters(
+        &self,
+        key: &rise_resource_api::LabelKey,
+        limit: i64,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(self
+            .rows
+            .iter()
+            .filter(|row| row.deletion_timestamp.is_none())
+            .filter(|row| row.labels.contains_key(key.as_ref()))
+            .take(limit.max(0) as usize)
+            .cloned()
+            .collect())
+    }
     async fn try_collect(&self, _: Uuid) -> Result<DeleteOutcome, StoreError> {
         unimplemented!("authorization never writes")
     }
@@ -311,8 +328,22 @@ impl ResourceStore for FakeStore {
     async fn list_deletion_blockers(&self, _: Uuid) -> Result<DeletionBlockerReport, StoreError> {
         unimplemented!("unused by the engine")
     }
-    async fn resolve_path(&self, _: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
-        unimplemented!("unused by the engine")
+    async fn resolve_path(&self, segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
+        let mut walk = PathWalk::new(segments)?;
+        while let Some((segment, parent)) = walk.pending() {
+            let row = match segment {
+                PathSegment::Name { kind, name, .. } => self
+                    .rows
+                    .iter()
+                    .find(|row| row.kind == *kind && row.name == *name && row.parent_uid == parent)
+                    .cloned(),
+                PathSegment::Uid { uid, .. } => {
+                    self.rows.iter().find(|row| row.uid == *uid).cloned()
+                }
+            };
+            walk.advance(row)?;
+        }
+        Ok(walk.finish())
     }
     async fn operator_update_status(
         &self,
@@ -364,7 +395,6 @@ impl ResourceStore for FakeStore {
                 kind: parent.clone(),
             }),
             spec_validator: Arc::new(NoOpValidator),
-            allowed_status_controller_ids: Vec::new(),
         }))
     }
     async fn register_resource_definition(

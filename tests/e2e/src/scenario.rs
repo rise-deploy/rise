@@ -31,6 +31,9 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(PublicDeploy),
         Box::new(RegistryBuildPushPull),
         Box::new(SaTokenExchange),
+        Box::new(ResourceTokenExchange),
+        Box::new(DeviceLogin),
+        Box::new(ScopedDeviceLogin),
         Box::new(PrivateIngressAuth),
         Box::new(RouteAccessOverride),
         Box::new(HealthRollingCutover),
@@ -52,7 +55,17 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
     let mut skipped = 0u32;
     let mut failed: Vec<&'static str> = Vec::new();
 
+    // `RISE_E2E_SCENARIOS=a,b` runs only those scenario ids, for local runs.
+    let only: Option<Vec<String>> = std::env::var("RISE_E2E_SCENARIOS")
+        .ok()
+        .map(|ids| ids.split(',').map(|id| id.trim().to_string()).collect());
     for s in all() {
+        if only
+            .as_ref()
+            .is_some_and(|ids| !ids.iter().any(|id| id == s.id()))
+        {
+            continue;
+        }
         match s.applies_to(b) {
             Applicability::Skip(reason) => {
                 skipped += 1;
@@ -61,8 +74,14 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
             Applicability::Run => {
                 report::note(&format!("RUN  {}", s.id()));
                 let start = std::time::Instant::now();
+                let before = project_names(b);
                 let result = s.run(b);
                 let took = report::human(start.elapsed());
+                // Pass or fail, the scenario's apps must not hold capacity the
+                // next one needs.
+                if let Err(e) = before.and_then(|before| reclaim(b, &before)) {
+                    report::note(&format!("     cleanup after {} failed: {e:#}", s.id()));
+                }
                 match result {
                     Ok(()) => {
                         passed += 1;
@@ -85,6 +104,75 @@ pub fn run_all(b: &dyn Backend) -> Result<()> {
     ));
     anyhow::ensure!(failed.is_empty(), "scenarios failed: {failed:?}");
     Ok(())
+}
+
+/// Every project the admin CI bearer can see (an admin sees all of them).
+fn project_names(b: &dyn Backend) -> Result<std::collections::BTreeSet<String>> {
+    let resp = b.api_get("/api/v1/projects")?;
+    anyhow::ensure!(
+        resp.status == 200,
+        "list projects returned {}:\n{}",
+        resp.status,
+        resp.body
+    );
+    let projects: Vec<serde_json::Value> =
+        serde_json::from_str(&resp.body).context("parse project list")?;
+    Ok(projects
+        .iter()
+        .filter_map(|p| p["name"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Stop every deployment group of the projects created since `before`, and
+/// wait for their workloads to go. Minikube runs the whole suite on one small
+/// node, where a few idle app pods left behind keep a later deploy from
+/// scheduling. On ECS, Fargate has no shared node to free, so the stop is not
+/// waited on.
+fn reclaim(b: &dyn Backend, before: &std::collections::BTreeSet<String>) -> Result<()> {
+    for project in project_names(b)?.difference(before) {
+        let groups = b.api_get(&format!("/api/v1/projects/{project}/deployment-groups"))?;
+        anyhow::ensure!(
+            groups.status == 200,
+            "list deployment groups of {project} returned {}:\n{}",
+            groups.status,
+            groups.body
+        );
+        let groups: Vec<String> =
+            serde_json::from_str(&groups.body).context("parse deployment groups")?;
+        for group in groups {
+            // Group names are `[a-z0-9/-]`: `/` is the one character to escape.
+            let query = group.replace('/', "%2F");
+            let resp = b.api_post(
+                &format!("/api/v1/projects/{project}/deployments/stop?group={query}"),
+                &serde_json::json!({}),
+            )?;
+            anyhow::ensure!(
+                resp.status == 200,
+                "stop {project} group {group} returned {}:\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+        if b.kind() != BackendKind::Ecs {
+            b.wait_workload_removed(project)?;
+        }
+    }
+    Ok(())
+}
+
+/// The cookie a signed-in visitor sends to a private app: the web UI's session,
+/// from a real sign-in through Dex (only a browser session opens an app).
+/// `None` on ECS, whose Dex serves only the password grant; the scenario notes
+/// that it skips the signed-in check there.
+fn visitor_cookie(b: &dyn Backend) -> Result<Option<String>> {
+    if b.kind() == BackendKind::Ecs {
+        report::note("     ECS: signed-in app access not checked (Dex has no browser sign-in)");
+        return Ok(None);
+    }
+    let dexep = b.dex().context("backend exposes no reachable Dex")?;
+    let session = crate::login::browser_login(b.api_base(), dexep, "admin@example.com", "password")
+        .context("sign in through the web UI's Dex sign-in")?;
+    Ok(Some(format!("rise_jwt={session}")))
 }
 
 /// Unique-enough project name per run (DNS-safe), so a stale stack can't collide.
@@ -404,6 +492,767 @@ impl Scenario for SaTokenExchange {
     }
 }
 
+// ---- (c'') device login confirmed on Rise's /device page -------------------
+
+/// `rise login --device` end to end, with Rise as the device authorization
+/// server: the approving browser session comes from a real Dex sign-in through
+/// the web UI's flow, and the device session it yields names the same `User`
+/// and `UserIdentity`. CLI sessions, the device session included, may not
+/// approve, so no CLI session can mint its own successor.
+struct DeviceLogin;
+
+impl Scenario for DeviceLogin {
+    fn id(&self) -> &'static str {
+        "device-login"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            BackendKind::Docker | BackendKind::Minikube => Applicability::Run,
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack's Dex serves only the password grant, not a browser sign-in",
+            ),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        use crate::device_login;
+
+        let api = b.api_base();
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let session = crate::login::browser_login(api, dexep, "admin@example.com", "password")
+            .context("sign the approver in through the web UI's Dex sign-in")?;
+
+        // Approve: the CLI's poll turns into a session for the approver.
+        let started = device_login::start(api)?;
+        anyhow::ensure!(
+            started
+                .verification_uri_complete
+                .ends_with(&format!("/device?user_code={}", started.user_code)),
+            "verification URI is not Rise's /device page: {}",
+            started.verification_uri_complete
+        );
+        let pending = device_login::poll(api, &started.device_code)?;
+        anyhow::ensure!(
+            pending.as_ref().err().map(String::as_str) == Some("authorization_pending"),
+            "expected authorization_pending before approval, got {pending:?}"
+        );
+        let request = device_login::lookup(api, &session, &started.user_code)?;
+        anyhow::ensure!(
+            request["reauth_required"] == false && request["client_name"] == "rise-e2e",
+            "unexpected device lookup for a fresh session:\n{request}"
+        );
+        device_login::decide(api, &session, &started.user_code, true)?;
+        let token = device_login::poll(api, &started.device_code)?
+            .map_err(|error| anyhow::anyhow!("expected a token after approval, got {error}"))?;
+
+        let (approver, device) = (
+            device_login::claims(&session)?,
+            device_login::claims(&token)?,
+        );
+        for claim in ["sub", "rise_uid", "rise_identity_uid"] {
+            anyhow::ensure!(
+                !approver[claim].is_null() && approver[claim] == device[claim],
+                "device session {claim} {} differs from the approver's {}",
+                device[claim],
+                approver[claim]
+            );
+        }
+        let me = http::get_auth(&format!("{api}/api/v1/users/me"), &token)?;
+        anyhow::ensure!(
+            me.status == 200 && me.body.contains("admin@example.com"),
+            "device session was not accepted by /users/me ({}):\n{}",
+            me.status,
+            me.body
+        );
+        // Neither the device session nor a `rise login` session may approve.
+        let cli = crate::login::login(api, dexep, "admin@example.com", "password")
+            .context("log in through the CLI's PKCE flow")?;
+        let next = device_login::start(api)?;
+        for (label, bearer) in [("device", &token), ("CLI", &cli)] {
+            let resp = http::post_json(
+                &format!("{api}/api/v1/auth/device/approve"),
+                Some(bearer),
+                &serde_json::json!({"user_code": next.user_code}),
+            )?;
+            anyhow::ensure!(
+                resp.status == 401,
+                "a {label} session approved a device login ({}):\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
+        let reused = device_login::poll(api, &started.device_code)?;
+        anyhow::ensure!(
+            reused.as_ref().err().map(String::as_str) == Some("expired_token"),
+            "a redeemed device code must not yield a second session, got {reused:?}"
+        );
+
+        // Deny: the CLI is told so.
+        let denied = device_login::start(api)?;
+        device_login::decide(api, &session, &denied.user_code, false)?;
+        let answer = device_login::poll(api, &denied.device_code)?;
+        anyhow::ensure!(
+            answer.as_ref().err().map(String::as_str) == Some("access_denied"),
+            "expected access_denied after denial, got {answer:?}"
+        );
+        Ok(())
+    }
+}
+
+// ---- (c''') a device login scoped to one environment (ADR-0006) -----------
+
+/// `rise login --device` asking for, and granted, deploy access to one
+/// environment of one project. The session it yields sees that project, that
+/// environment and its deployments, deploys there through the real CLI — and
+/// nothing else: not the project's other environment or its deployments, not
+/// another project, nothing project- or install-wide, not the resource API.
+/// The approver is an admin, so the ceiling, not ownership, is what holds.
+/// A second login shows the approver decides: deploy was asked, read granted.
+struct ScopedDeviceLogin;
+
+impl ScopedDeviceLogin {
+    fn deploy(
+        b: &dyn Backend,
+        project: &str,
+        environment: &str,
+        app: &SampleApp,
+        auth: Option<CliAuth<'_>>,
+    ) -> Result<CliOutput> {
+        b.rise_cli(
+            &[
+                "deploy",
+                "--project",
+                project,
+                "--environment",
+                environment,
+                "--image",
+                app.image,
+                "--http-port",
+                app.http_port,
+                "--replicas",
+                "1",
+            ],
+            auth,
+        )
+    }
+
+    /// `(deployment_id, environment)` of every deployment `bearer` may list.
+    fn deployments(api: &str, project: &str, bearer: &str) -> Result<Vec<(String, String)>> {
+        let resp = http::get_auth(
+            &format!("{api}/api/v1/projects/{project}/deployments"),
+            bearer,
+        )?;
+        anyhow::ensure!(
+            resp.status == 200,
+            "listing deployments returned {}:\n{}",
+            resp.status,
+            resp.body
+        );
+        let list: Vec<serde_json::Value> = serde_json::from_str(&resp.body)?;
+        Ok(list
+            .iter()
+            .map(|d| {
+                (
+                    d["deployment_id"].as_str().unwrap_or_default().to_string(),
+                    d["environment"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect())
+    }
+
+    fn names(body: &str) -> Result<Vec<String>> {
+        let list: Vec<serde_json::Value> = serde_json::from_str(body)?;
+        Ok(list
+            .iter()
+            .filter_map(|item| item["name"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// Log in with `rise login --device` asking for `requested`, approved as
+    /// `granted`; returns the session.
+    fn device_session(
+        api: &str,
+        approver: &str,
+        requested: &serde_json::Value,
+        granted: &serde_json::Value,
+    ) -> Result<String> {
+        use crate::device_login;
+        let started = device_login::start_with(api, Some(requested))?;
+        let shown = device_login::lookup(api, approver, &started.user_code)?;
+        anyhow::ensure!(
+            &shown["requested_access"] == requested,
+            "the approval page shows {} instead of the request {requested}",
+            shown["requested_access"]
+        );
+        device_login::approve_with(api, approver, &started.user_code, granted)?;
+        device_login::poll(api, &started.device_code)?
+            .map_err(|error| anyhow::anyhow!("expected a token after approval, got {error}"))
+    }
+}
+
+impl Scenario for ScopedDeviceLogin {
+    fn id(&self) -> &'static str {
+        "scoped-device-login"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            BackendKind::Docker | BackendKind::Minikube => Applicability::Run,
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack's Dex serves only the password grant, not a browser sign-in",
+            ),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let api = b.api_base();
+        let app = b.sample_app();
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let approver = crate::login::browser_login(api, dexep, "admin@example.com", "password")
+            .context("sign the approver in through the web UI's Dex sign-in")?;
+
+        // With full access: a project with a staging environment and a
+        // production deployment, and a second project.
+        let project = unique("e2e-scope");
+        let other = unique("e2e-scope-other");
+        create_public_project(b, &project)?;
+        create_public_project(b, &other)?;
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "environment",
+                    "create",
+                    "staging",
+                    "-p",
+                    &project,
+                    "--group",
+                    "staging",
+                ],
+                None,
+            )?,
+            "environment create",
+        )?;
+        // A project-wide secret and a staging one, both retrievable.
+        for (key, value, environment) in [
+            ("E2E_GLOBAL_SECRET", "global-value", None),
+            ("E2E_STAGING_SECRET", "staging-value", Some("staging")),
+        ] {
+            let mut args = vec!["env", "set", "-p", &project, "--secret", key, value];
+            if let Some(environment) = environment {
+                args.extend(["-E", environment]);
+            }
+            expect_ok(b.rise_cli(&args, None)?, "env set")?;
+        }
+        expect_ok(
+            Self::deploy(b, &project, "production", &app, None)?,
+            "production deploy",
+        )?;
+
+        // The agent asks to deploy to staging; the approver grants just that.
+        let requested = serde_json::json!({
+            "kind": "restricted",
+            "grants": [{"project": project, "environment": "staging", "preset": "deploy"}],
+        });
+        let token = Self::device_session(api, &approver, &requested, &requested)?;
+        let claims = crate::device_login::claims(&token)?;
+        anyhow::ensure!(
+            claims["authorization_details"].is_array(),
+            "the scoped session carries no ceiling:\n{claims}"
+        );
+        let me = http::get_auth(&format!("{api}/api/v1/users/me"), &token)?;
+        let me: serde_json::Value = serde_json::from_str(&me.body)
+            .with_context(|| format!("parse /users/me ({}): {}", me.status, me.body))?;
+        anyhow::ensure!(
+            me["access"] == requested,
+            "/users/me reports {} instead of the granted {requested}",
+            me["access"]
+        );
+
+        // It deploys to staging through the real CLI, and not to production.
+        let scoped = || CliAuth {
+            token: &token,
+            identity: None,
+        };
+        expect_ok(
+            Self::deploy(b, &project, "staging", &app, Some(scoped()))?,
+            "scoped staging deploy",
+        )?;
+        let refused = Self::deploy(b, &project, "production", &app, Some(scoped()))?;
+        anyhow::ensure!(
+            !refused.success() && refused.combined().contains("does not cover"),
+            "a staging-scoped session deployed to production:\n{}",
+            refused.combined()
+        );
+
+        // It sees its project, its environment, and staging's deployments.
+        let all = Self::deployments(api, &project, b.ci_bearer())?;
+        let in_env = |env: &str| {
+            all.iter()
+                .find(|(_, e)| e == env)
+                .map(|(id, _)| id.clone())
+                .with_context(|| format!("no {env} deployment in {all:?}"))
+        };
+        let (staging_id, production_id) = (in_env("staging")?, in_env("production")?);
+        let visible = Self::deployments(api, &project, &token)?;
+        anyhow::ensure!(
+            !visible.is_empty() && visible.iter().all(|(_, env)| env == "staging"),
+            "the scoped session lists {visible:?}, expected only staging deployments"
+        );
+        let projects = http::get_auth(&format!("{api}/api/v1/projects"), &token)?;
+        anyhow::ensure!(
+            Self::names(&projects.body)? == vec![project.clone()],
+            "the scoped session lists projects {}",
+            projects.body
+        );
+        let environments = http::get_auth(
+            &format!("{api}/api/v1/projects/{project}/environments"),
+            &token,
+        )?;
+        anyhow::ensure!(
+            Self::names(&environments.body)? == vec!["staging".to_string()],
+            "the scoped session lists environments {}",
+            environments.body
+        );
+        for path in [
+            format!("/projects/{project}"),
+            format!("/projects/{project}/environments/staging"),
+            format!("/projects/{project}/deployments/{staging_id}"),
+            format!("/projects/{project}/deployments/{staging_id}/logs?follow=false"),
+        ] {
+            let resp = http::get_auth(&format!("{api}/api/v1{path}"), &token)?;
+            anyhow::ensure!(
+                resp.status == 200,
+                "GET {path} as the scoped session returned {}:\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
+        // Nothing else: production, the other project, anything project- or
+        // install-wide, and the resource API.
+        let get = |path: String| http::get_auth(&format!("{api}/api/v1{path}"), &token);
+        let send = |method: reqwest::Method, path: String, body: serde_json::Value| {
+            http::send_json(method, &format!("{api}/api/v1{path}"), &token, &body)
+        };
+
+        // Staging's variables come back without the project-wide ones mixed
+        // in, and without secret values: `deploy` doesn't include `secrets`.
+        for path in [
+            format!("/projects/{project}/env?environment=staging&include_unprotected_values=true"),
+            format!("/projects/{project}/env/preview?environment=staging"),
+        ] {
+            let resp = get(path.clone())?;
+            anyhow::ensure!(
+                resp.status == 200,
+                "GET {path}: {}\n{}",
+                resp.status,
+                resp.body
+            );
+            anyhow::ensure!(
+                resp.body.contains("E2E_STAGING_SECRET")
+                    && !resp.body.contains("E2E_GLOBAL_SECRET")
+                    && !resp.body.contains("-value"),
+                "GET {path} leaked beyond staging's masked variables:\n{}",
+                resp.body
+            );
+        }
+        let denied = [
+            ("GET other project", get(format!("/projects/{other}"))?),
+            (
+                "decrypt a staging deployment's env",
+                get(format!(
+                    "/projects/{project}/deployments/{staging_id}/env?include_unprotected_values=true"
+                ))?,
+            ),
+            (
+                "GET production",
+                get(format!("/projects/{project}/environments/production"))?,
+            ),
+            (
+                "GET production deployment",
+                get(format!("/projects/{project}/deployments/{production_id}"))?,
+            ),
+            (
+                "GET production logs",
+                get(format!(
+                    "/projects/{project}/deployments/{production_id}/logs?follow=false"
+                ))?,
+            ),
+            (
+                "stop production deployment",
+                send(
+                    reqwest::Method::POST,
+                    format!("/projects/{project}/deployments/{production_id}/stop"),
+                    serde_json::json!({}),
+                )?,
+            ),
+            (
+                "retarget staging",
+                send(
+                    reqwest::Method::PATCH,
+                    format!("/projects/{project}/environments/staging"),
+                    serde_json::json!({"primary_deployment_group": "default"}),
+                )?,
+            ),
+            (
+                "set a project-wide env var",
+                send(
+                    reqwest::Method::PUT,
+                    format!("/projects/{project}/env/E2E_SCOPE"),
+                    serde_json::json!({"value": "x", "is_secret": false}),
+                )?,
+            ),
+            (
+                "update the project",
+                send(
+                    reqwest::Method::PUT,
+                    format!("/projects/{project}"),
+                    serde_json::json!({"access_class": "private"}),
+                )?,
+            ),
+            (
+                "create a project",
+                send(
+                    reqwest::Method::POST,
+                    "/projects".to_string(),
+                    serde_json::json!({"name": unique("e2e-scope-new"), "access_class": "public"}),
+                )?,
+            ),
+            ("list teams", get("/teams".to_string())?),
+            (
+                "the resource API",
+                get("/resources/rise.dev/v1alpha1/ServiceAccount".to_string())?,
+            ),
+        ];
+        for (what, resp) in denied {
+            anyhow::ensure!(
+                resp.status == 403,
+                "{what} as the scoped session returned {} (expected 403):\n{}",
+                resp.status,
+                resp.body
+            );
+        }
+
+        // The approver decides: the agent asks to deploy, the approver grants
+        // read. The session reads staging and can't deploy there.
+        let read = serde_json::json!({
+            "kind": "restricted",
+            "grants": [{"project": project, "environment": "staging", "preset": "read"}],
+        });
+        let read_token = Self::device_session(api, &approver, &requested, &read)?;
+        let read_only = Self::deployments(api, &project, &read_token)?;
+        anyhow::ensure!(
+            read_only.iter().all(|(_, env)| env == "staging"),
+            "the read session lists {read_only:?}"
+        );
+        let refused = Self::deploy(
+            b,
+            &project,
+            "staging",
+            &app,
+            Some(CliAuth {
+                token: &read_token,
+                identity: None,
+            }),
+        )?;
+        anyhow::ensure!(
+            !refused.success() && refused.combined().contains("does not cover"),
+            "a session granted read deployed anyway:\n{}",
+            refused.combined()
+        );
+
+        Ok(())
+    }
+}
+
+// ---- (c') resource-API token exchange at the /token subresource -------------
+
+struct ResourceTokenExchange;
+
+impl ResourceTokenExchange {
+    const RESOURCES: &'static str = "/api/v1/resources/rise.dev/v1alpha1";
+    const TOKEN_EXCHANGE_GRANT: &'static str = "urn:ietf:params:oauth:grant-type:token-exchange";
+    const JWT_TOKEN_TYPE: &'static str = "urn:ietf:params:oauth:token-type:jwt";
+
+    /// A Rise session for the stack's operator (`admin@example.com`), from a
+    /// real login: Rise's PKCE code flow against Dex, driven headlessly. That
+    /// login resolves to the operator's `User` resource, which is what the
+    /// resource API authorizes; the offline-minted CI bearer names none.
+    fn operator_session(b: &dyn Backend, dexep: &dex::DexEndpoint) -> Result<String> {
+        crate::login::login(b.api_base(), dexep, "admin@example.com", "password")
+            .context("log the operator in through Dex")
+    }
+
+    /// POST a resource as the operator and assert `201`.
+    fn create(
+        b: &dyn Backend,
+        operator: &str,
+        collection: &str,
+        body: serde_json::Value,
+    ) -> Result<()> {
+        let resp = b.api_post_as(
+            &format!("{}/{collection}", Self::RESOURCES),
+            Some(operator),
+            &body,
+        )?;
+        anyhow::ensure!(
+            resp.status == 201,
+            "create {collection} {} returned {}:\n{}",
+            body["metadata"]["name"],
+            resp.status,
+            resp.body
+        );
+        Ok(())
+    }
+
+    fn exchange_body(assertion: &str) -> serde_json::Value {
+        serde_json::json!({
+            "grant_type": Self::TOKEN_EXCHANGE_GRANT,
+            "subject_token": assertion,
+            "subject_token_type": Self::JWT_TOKEN_TYPE,
+        })
+    }
+}
+
+impl Scenario for ResourceTokenExchange {
+    fn id(&self) -> &'static str {
+        "resource-token-exchange"
+    }
+
+    fn applies_to(&self, b: &dyn Backend) -> Applicability {
+        match b.kind() {
+            BackendKind::Docker | BackendKind::Minikube => Applicability::Run,
+            BackendKind::Ecs => Applicability::Skip(
+                "the ECS stack grants no operator, which authoring resources needs",
+            ),
+        }
+    }
+
+    fn run(&self, b: &dyn Backend) -> Result<()> {
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let org = unique("e2e-org");
+        let sa_path = format!("serviceaccounts/{org}/ci");
+        let token_path = format!("{}/{sa_path}/token", Self::RESOURCES);
+        let operator = Self::operator_session(b, dexep)?;
+
+        // As the operator: an Organization, a ServiceAccount beneath it, and one
+        // trust policy accepting the Dex id_token the password grant mints.
+        Self::create(
+            b,
+            &operator,
+            "organizations",
+            serde_json::json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "Organization",
+                "metadata": {"name": org},
+                "spec": {"displayName": org},
+            }),
+        )?;
+        Self::create(
+            b,
+            &operator,
+            &format!("serviceaccounts/{org}"),
+            serde_json::json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": "ci"},
+                "spec": {},
+            }),
+        )?;
+        Self::create(
+            b,
+            &operator,
+            &format!("serviceaccounttrustpolicies/{org}/ci"),
+            serde_json::json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "ServiceAccountTrustPolicy",
+                "metadata": {"name": "dex"},
+                "spec": {
+                    "issuer": dexep.issuer,
+                    // `aud` is the Dex client id the id_token is minted for.
+                    "claims": {"aud": "rise-backend", "email": "user@example.com"},
+                },
+            }),
+        )?;
+
+        // The proof: a real Dex id_token for the federated user, presented with
+        // no Rise credential at the target's own /token route.
+        let oidc = dex::mint_password_token(dexep, "user@example.com", "password")
+            .context("mint Dex OIDC token (password grant)")?;
+        let minted = b.api_post_as(&token_path, None, &Self::exchange_body(&oidc))?;
+        anyhow::ensure!(
+            minted.status == 200,
+            "workload exchange returned {}:\n{}",
+            minted.status,
+            minted.body
+        );
+        let minted: serde_json::Value =
+            serde_json::from_str(&minted.body).context("parse token response")?;
+        let identity = minted["access_token"]
+            .as_str()
+            .context("no access_token in token response")?
+            .to_string();
+        anyhow::ensure!(
+            minted["token_type"] == serde_json::json!("Bearer"),
+            "unexpected token_type:\n{minted}"
+        );
+        eprintln!(
+            "[e2e] resource-token-exchange: minted an identity token for serviceaccount:{org}/ci"
+        );
+
+        // The identity holds nothing yet: reading its own resource is masked.
+        let masked = b.api_get_as(&format!("{}/{sa_path}", Self::RESOURCES), &identity)?;
+        anyhow::ensure!(
+            masked.status == 404,
+            "an ungranted identity must be masked (404), got {}:\n{}",
+            masked.status,
+            masked.body
+        );
+
+        // A live grant delivers on the next request — nothing is snapshotted in
+        // the token.
+        Self::create(
+            b,
+            &operator,
+            "platformroles",
+            serde_json::json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": format!("{org}-sa-reader")},
+                "spec": {"statements": [
+                    {"effect": "Allow", "kinds": ["rise.dev/ServiceAccount"], "verbs": ["get"]}
+                ]},
+            }),
+        )?;
+        Self::create(
+            b,
+            &operator,
+            "platformrolebindings",
+            serde_json::json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": format!("{org}-ci-reads-itself")},
+                "spec": {
+                    "subject": format!("serviceaccount:{org}/ci"),
+                    "scope": format!("rise.dev/Organization/{org}"),
+                    "roleRef": {"kind": "PlatformRole", "name": format!("{org}-sa-reader")},
+                },
+            }),
+        )?;
+        let read = b.api_get_as(&format!("{}/{sa_path}", Self::RESOURCES), &identity)?;
+        anyhow::ensure!(
+            read.status == 200,
+            "granted identity could not read its resource: {}:\n{}",
+            read.status,
+            read.body
+        );
+        let read: serde_json::Value =
+            serde_json::from_str(&read.body).context("parse ServiceAccount")?;
+        anyhow::ensure!(
+            read["metadata"]["name"] == serde_json::json!("ci"),
+            "unexpected resource read back:\n{read}"
+        );
+
+        // Negatives, both the same coarse 401: claims no policy accepts, and a
+        // target that does not exist.
+        let other = dex::mint_password_token(dexep, "admin@example.com", "password")
+            .context("mint Dex OIDC token for another user")?;
+        let mismatch = b.api_post_as(&token_path, None, &Self::exchange_body(&other))?;
+        let ghost = b.api_post_as(
+            &format!("{}/serviceaccounts/{org}/ghost/token", Self::RESOURCES),
+            None,
+            &Self::exchange_body(&oidc),
+        )?;
+        anyhow::ensure!(
+            mismatch.status == 401 && ghost.status == 401,
+            "expected 401 for a claim mismatch and an absent target, got {} and {}:\n{}\n{}",
+            mismatch.status,
+            ghost.status,
+            mismatch.body,
+            ghost.body
+        );
+        anyhow::ensure!(
+            mismatch.body == ghost.body,
+            "workload-exchange failures must be indistinguishable:\n{}\n{}",
+            mismatch.body,
+            ghost.body
+        );
+
+        // Delegated issuance: the operator holds token-create on everything and
+        // mints without any assertion.
+        let delegated = b.api_post_as(&token_path, Some(&operator), &serde_json::json!({}))?;
+        anyhow::ensure!(
+            delegated.status == 200,
+            "delegated issuance returned {}:\n{}",
+            delegated.status,
+            delegated.body
+        );
+
+        // An audience-bound token: what an external verifier does with it is
+        // check the RS256 signature against Rise's published JWKS and its own
+        // audience. Rise's API refuses it.
+        let audience = "https://vault.example.com";
+        let external = b.api_post_as(
+            &token_path,
+            Some(&operator),
+            &serde_json::json!({"audience": audience}),
+        )?;
+        anyhow::ensure!(
+            external.status == 200,
+            "audience-bound issuance returned {}:\n{}",
+            external.status,
+            external.body
+        );
+        let external: serde_json::Value =
+            serde_json::from_str(&external.body).context("parse audience-bound token")?;
+        let external = external["access_token"]
+            .as_str()
+            .context("no access_token in audience-bound response")?;
+        let jwks = http::get(&format!("{}/api/v1/auth/jwks", b.api_base()), None)?;
+        anyhow::ensure!(jwks.status == 200, "JWKS returned {}", jwks.status);
+        let jwks: serde_json::Value = serde_json::from_str(&jwks.body).context("parse JWKS")?;
+        let header = jsonwebtoken::decode_header(external).context("decode token header")?;
+        let key = jwks["keys"]
+            .as_array()
+            .context("JWKS has no keys")?
+            .iter()
+            .find(|key| key["kid"].as_str() == header.kid.as_deref())
+            .context("the token's kid is not in the published JWKS")?;
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_components(
+            key["n"].as_str().context("JWKS key has no n")?,
+            key["e"].as_str().context("JWKS key has no e")?,
+        )
+        .context("build decoding key from JWKS")?;
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_audience(&[audience]);
+        validation.validate_exp = true;
+        let verified =
+            jsonwebtoken::decode::<serde_json::Value>(external, &decoding_key, &validation)
+                .context("the audience-bound token must verify against the JWKS")?;
+        anyhow::ensure!(
+            verified.claims["sub"] == serde_json::json!(format!("serviceaccount:{org}/ci")),
+            "unexpected subject on the audience-bound token:\n{}",
+            verified.claims
+        );
+        let refused = b.api_get_as(&format!("{}/{sa_path}", Self::RESOURCES), external)?;
+        anyhow::ensure!(
+            refused.status == 401,
+            "Rise's API must refuse a token for another audience, got {}:\n{}",
+            refused.status,
+            refused.body
+        );
+
+        // Tidy up: the Organization cascades over everything beneath it.
+        let _ = http::delete_auth(
+            &format!("{}{}/organizations/{org}", b.api_base(), Self::RESOURCES),
+            &operator,
+        );
+        Ok(())
+    }
+}
+
 // ---- (d) persistent runtime-log retention ---------------------------------
 
 struct PersistentLogRetention;
@@ -560,7 +1409,7 @@ impl Scenario for HelmIdempotency {
     }
 }
 
-// ---- (b) workload identity (jfrog-vault registry mode only) ----------------
+// ---- (b) workload identity (every backend with a source-build registry) ----
 
 struct WorkloadIdentity;
 
@@ -571,7 +1420,8 @@ impl Scenario for WorkloadIdentity {
 
     fn applies_to(&self, b: &dyn Backend) -> Applicability {
         // Builds the fixture from source, which needs a registry the runtime can
-        // pull from: the host docker daemon (Docker) or minikube's jfrog-vault mode.
+        // pull from: the host docker daemon (Docker), ECR (ECS), or minikube's
+        // jfrog-vault mode.
         if b.supports_source_build() {
             Applicability::Run
         } else {
@@ -585,6 +1435,28 @@ impl Scenario for WorkloadIdentity {
         b.prepare_workload_identity()?;
         let project = unique("e2e-id");
         create_public_project(b, &project)?;
+        b.wait_registry_ready(&project)?;
+        // Where the fixture sends its own requests to Rise, when workloads cannot
+        // route to the public URL. Set before the deploy, which snapshots env.
+        // Not `RISE_`-prefixed: that namespace is reserved for Rise-injected
+        // variables, and the API refuses to store user keys in it.
+        if let Some(api_url) = b.workload_api_url()? {
+            expect_ok(
+                b.rise_cli(
+                    &[
+                        "env",
+                        "set",
+                        "-p",
+                        &project,
+                        "E2E_RISE_API_URL",
+                        &api_url,
+                        "--plain",
+                    ],
+                    None,
+                )?,
+                "point the identity fixture at the in-cluster Rise API",
+            )?;
+        }
         // Build & deploy the identity fixture from source (needs the docker socket).
         expect_ok(
             b.rise_cli_build(
@@ -672,15 +1544,18 @@ impl Scenario for WorkloadIdentity {
             resp.body
         );
 
-        // The controller re-mints the file token in place at half its (short) TTL
-        // (identity_token_ttl_seconds in values-ci). Assert this in two stages so a
-        // failure pinpoints *where* it broke:
+        // The file token is re-minted in place at half its (short) TTL
+        // (identity_token_ttl_seconds in values-ci, the Docker overlay, and the ECS
+        // run stack) — by the controller on Kubernetes and Docker, by the identity
+        // sidecar on ECS. Assert this in two stages so a failure pinpoints *where*
+        // it broke:
         //   1. the controller re-mints at the source it writes (the K8s Secret) —
         //      deterministic, independent of in-pod mount propagation;
         //   2. the pod's mounted file then reflects the new token — exercising the
         //      Kubernetes secret-volume propagation deployed apps depend on.
         // On a backend with no source distinct from the mounted file (Docker
-        // bind-mounts the controller's file directly), stage 1 is a no-op
+        // bind-mounts the controller's file directly; ECS's sidecar writes the
+        // shared volume the app mounts), stage 1 is a no-op
         // (`minted_token_jti` → None) and stage 2 alone proves re-minting.
         let first_jti = id["file_token"]["claims"]["jti"]
             .as_str()
@@ -769,10 +1644,9 @@ impl Scenario for PrivateIngressAuth {
 
     fn applies_to(&self, _b: &dyn Backend) -> Applicability {
         // The ingress-auth contract — block unauthenticated, allow authenticated —
-        // holds on every backend; only the wiring + reach differ, behind the trait
-        // (Traefik forwardAuth labels on docker and ECS; nginx auth annotations on
-        // K8s). Runs on ECS because the e2e stack puts the Rise control plane in
-        // the cluster, so Traefik can actually reach it for the subrequest.
+        // holds on every backend; only the wiring + reach differ behind the trait.
+        // The ECS e2e stack puts the Rise control plane in the cluster, so Traefik
+        // can reach it for the forwardAuth subrequest.
         Applicability::Run
     }
 
@@ -796,7 +1670,7 @@ impl Scenario for PrivateIngressAuth {
         deploy_image(b, &project, &app)?;
         b.wait_healthy(&project)?;
 
-        // Per-backend wiring check (Traefik forwardAuth labels / nginx annotations).
+        // Per-backend wiring check (Traefik HTTP-provider router / nginx annotations).
         b.assert_ingress_auth_configured(&project)?;
 
         // Unauthenticated → 302 to the project's signin page. Poll the ingress until
@@ -826,11 +1700,32 @@ impl Scenario for PrivateIngressAuth {
             "redirect not to the project's signin page: {location}"
         );
 
-        // Authenticated (rise_jwt cookie) is allowed straight through to the app.
-        // Do NOT follow redirects: a rejected cookie answers 302 -> signin (which
-        // itself serves 200), so following would let an auth regression pass the
-        // status check. A 200 here therefore means the ingress let us through.
-        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        // Only the web UI's session opens an app. Rise sessions that aren't
+        // one (the CI bearer names no client; a CLI login is an API
+        // credential) are sent to sign in like an anonymous visitor.
+        let mut refused = vec![("the CI bearer", b.ci_bearer().to_string())];
+        if b.kind() != BackendKind::Ecs {
+            let dexep = b.dex().context("backend exposes no reachable Dex")?;
+            let cli = crate::login::login(b.api_base(), dexep, "admin@example.com", "password")
+                .context("log in through the CLI's code flow")?;
+            refused.push(("a CLI session", cli));
+        }
+        for (what, token) in refused {
+            let resp = b.ingress_get(&project, "/", false, Some(&format!("rise_jwt={token}")))?;
+            anyhow::ensure!(
+                resp.status == 302,
+                "{what} opened a private app (status {})",
+                resp.status
+            );
+        }
+
+        // A signed-in visitor is allowed straight through to the app. Do NOT
+        // follow redirects: a rejected cookie answers 302 -> signin (which
+        // itself serves 200), so following would let an auth regression pass
+        // the status check. A 200 here therefore means the ingress let us in.
+        let Some(cookie) = visitor_cookie(b)? else {
+            return Ok(());
+        };
         let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
         anyhow::ensure!(
             authed.status == 200,
@@ -845,6 +1740,62 @@ impl Scenario for PrivateIngressAuth {
                 authed.body
             );
         }
+
+        // An app's token opens that app and no other: apps receive their
+        // visitors' tokens, so one app could otherwise replay them against
+        // another. The other app needn't be deployed for its sign-in to mint a
+        // token. ECS's Dex serves no browser sign-in.
+        if b.kind() == BackendKind::Ecs {
+            return Ok(());
+        }
+        let dexep = b.dex().context("backend exposes no reachable Dex")?;
+        let sign_in = |project: &str| {
+            crate::login::app_login(
+                b.api_base(),
+                dexep,
+                project,
+                "admin@example.com",
+                "password",
+            )
+            .with_context(|| format!("sign a visitor in to {project}"))
+        };
+        let other = unique("e2e-priv-other");
+        expect_ok(
+            b.rise_cli(
+                &[
+                    "project",
+                    "create",
+                    &other,
+                    "--access-class",
+                    "private",
+                    "--no-rise-toml",
+                ],
+                None,
+            )?,
+            "project create",
+        )?;
+        let own = b.ingress_get(
+            &project,
+            "/",
+            false,
+            Some(&format!("rise_jwt={}", sign_in(&project)?)),
+        )?;
+        anyhow::ensure!(
+            own.status == 200,
+            "the app's own token was refused (status {})",
+            own.status
+        );
+        let replayed = b.ingress_get(
+            &project,
+            "/",
+            false,
+            Some(&format!("rise_jwt={}", sign_in(&other)?)),
+        )?;
+        anyhow::ensure!(
+            replayed.status == 302,
+            "another app's token opened this app (status {})",
+            replayed.status
+        );
         Ok(())
     }
 }
@@ -951,17 +1902,29 @@ impl Scenario for RouteAccessOverride {
 
         // The exact public route must bypass the gate. The sample app may return
         // 404 for `/public`; the contract under test is that the ingress forwards
-        // it instead of producing an auth response.
-        let public = b.ingress_get(&project, "/public", false, None)?;
+        // it instead of producing an auth response. On Kubernetes the public
+        // route is a separate Ingress that nginx can load after the private one;
+        // until then `/public` falls through to the gated `/` prefix, so poll.
+        let mut public_status = 0;
+        for _ in 0..45 {
+            if let Ok(r) = b.ingress_get(&project, "/public", false, None) {
+                public_status = r.status;
+                if !matches!(public_status, 302 | 401 | 403) {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
         anyhow::ensure!(
-            !matches!(public.status, 302 | 401 | 403),
-            "expected the exact `access = \"public\"` route to bypass auth, got {}",
-            public.status
+            !matches!(public_status, 0 | 302 | 401 | 403),
+            "expected the exact `access = \"public\"` route to bypass auth, got {public_status}"
         );
 
         // An authenticated request to the inherited root route passes the gate
         // and reaches the sample app's known-good `/` path.
-        let cookie = format!("rise_jwt={}", b.ci_bearer());
+        let Some(cookie) = visitor_cookie(b)? else {
+            return Ok(());
+        };
         let authed = b.ingress_get(&project, "/", false, Some(&cookie))?;
         anyhow::ensure!(
             authed.status == 200,
@@ -1055,17 +2018,23 @@ impl Scenario for HealthRollingCutover {
             })
             .context("no traefik service label on the app container")?
             .to_string();
-        // Drift guard: readable base + an injective 16-hex suffix.
+        // Drift guard: a readable base, an injective group hash, and a
+        // deployment hash that keeps the incoming and outgoing pools distinct.
         let base = sanitize_router_name(&format!("{project}-default-app"));
         let suffix = svc
             .strip_prefix(&format!("{base}-"))
             .with_context(|| format!("service '{svc}' does not start with '{base}-'"))?;
+        let (group_hash, deployment_hash) = suffix
+            .split_once('-')
+            .with_context(|| format!("service '{svc}' has no deployment hash"))?;
         anyhow::ensure!(
-            suffix.len() == 16
-                && suffix
+            group_hash.len() == 16
+                && deployment_hash.len() == 12
+                && group_hash
                     .chars()
+                    .chain(deployment_hash.chars())
                     .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
-            "service '{svc}' suffix is not 16 lowercase hex chars"
+            "service '{svc}' does not have 16-hex group and 12-hex deployment hashes"
         );
 
         // The serverStatus gate signal must exist and be correctly shaped (Traefik

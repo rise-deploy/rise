@@ -3,7 +3,7 @@
 //! invocation, app reach, teardown). Shared behaviour (e.g. wait-for-healthy)
 //! lives as default methods.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 
 use crate::cli::CliOutput;
@@ -112,7 +112,8 @@ pub trait Backend {
 
     /// Whether this backend can build & deploy an app from source
     /// (`deploy --backend docker:build`) — i.e. it has a registry the runtime can
-    /// pull from. Only minikube's jfrog-vault mode does, in the harness.
+    /// pull from: the host daemon (Docker), ECR (ECS), or minikube's jfrog-vault
+    /// mode.
     fn supports_source_build(&self) -> bool {
         false
     }
@@ -124,7 +125,33 @@ pub trait Backend {
 
     /// Authenticated GET against the Rise API (`path` starts with `/`).
     fn api_get(&self, path: &str) -> Result<HttpResponse> {
-        crate::http::get_auth(&format!("{}{}", self.api_base(), path), self.ci_bearer())
+        self.api_get_as(path, self.ci_bearer())
+    }
+
+    /// GET against the Rise API with an explicit bearer — for exercising a token
+    /// the scenario itself obtained.
+    fn api_get_as(&self, path: &str, bearer: &str) -> Result<HttpResponse> {
+        crate::http::get_auth(&format!("{}{}", self.api_base(), path), bearer)
+    }
+
+    /// Authenticated JSON POST against the Rise API, as the admin CI bearer.
+    fn api_post(&self, path: &str, body: &serde_json::Value) -> Result<HttpResponse> {
+        self.api_post_as(path, Some(self.ci_bearer()), body)
+    }
+
+    /// Authenticated DELETE against the Rise API, as the admin CI bearer.
+    fn api_delete(&self, path: &str) -> Result<HttpResponse> {
+        crate::http::delete_auth(&format!("{}{}", self.api_base(), path), self.ci_bearer())
+    }
+
+    /// JSON POST against the Rise API with an explicit bearer, or none at all.
+    fn api_post_as(
+        &self,
+        path: &str,
+        bearer: Option<&str>,
+        body: &serde_json::Value,
+    ) -> Result<HttpResponse> {
+        crate::http::post_json(&format!("{}{}", self.api_base(), path), bearer, body)
     }
 
     /// Poll the deployments API until the project's latest deployment reports
@@ -185,8 +212,7 @@ pub trait Backend {
         cookie: Option<&str>,
     ) -> Result<crate::http::Resp>;
 
-    /// Assert the backend wired ingress-level auth for a private (Member) project:
-    /// Traefik forwardAuth labels on docker, nginx auth annotations on minikube.
+    /// Assert the backend wired ingress-level auth for a private (Member) project.
     fn assert_ingress_auth_configured(&self, project: &str) -> Result<()>;
 
     /// Each running app container's `Config.Env` as a JSON-array string — to
@@ -196,6 +222,15 @@ pub trait Backend {
             "app_container_envs is not supported by the {} backend",
             self.name()
         )
+    }
+
+    /// Base URL a deployed workload must use to call the Rise API, when it
+    /// differs from the public URL (`RISE_ISSUER`) a production workload would
+    /// use. `None` where the public URL is reachable from workloads. ECS
+    /// returns the in-VPC address: its edge admits only the harness's own
+    /// address, so a task cannot route to the public one.
+    fn workload_api_url(&self) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Backend-specific preparation before the workload-identity scenario (e.g.
@@ -252,6 +287,54 @@ pub trait Backend {
     /// (the failing command's own output rarely explains, e.g., why a pod won't
     /// start). Best-effort and silent on success; no-op by default.
     fn dump_diagnostics(&self) {}
+}
+
+/// Assert that Traefik's active HTTP-provider router applies forwardAuth and
+/// selects a service owned by the backend's native discovery provider.
+fn assert_traefik_ingress_auth_configured(backend: &dyn Backend, project: &str) -> Result<()> {
+    let mut last = String::new();
+    let expected_service_suffix = format!("@{}", backend.traefik_provider());
+    let expected_host = backend.app_host(project);
+    crate::http::poll(
+        Duration::from_secs(60),
+        Duration::from_secs(2),
+        &format!("Traefik HTTP-provider forwardAuth router on {project}"),
+        || {
+            let response = backend.traefik_api("/api/http/routers")?;
+            last = response.body.clone();
+            if response.status != 200 {
+                return Ok(false);
+            }
+            let value: serde_json::Value =
+                serde_json::from_str(&response.body).unwrap_or(serde_json::Value::Null);
+            Ok(value.as_array().is_some_and(|routers| {
+                routers.iter().any(|router| {
+                    router["provider"].as_str() == Some("http")
+                        && router["name"].as_str().is_some_and(|name| {
+                            name.starts_with(&format!("{project}-")) && name.ends_with("@http")
+                        })
+                        && router["rule"]
+                            .as_str()
+                            .is_some_and(|rule| rule.contains(&expected_host))
+                        && router["service"]
+                            .as_str()
+                            .is_some_and(|service| service.ends_with(&expected_service_suffix))
+                        && router["middlewares"].as_array().is_some_and(|middlewares| {
+                            middlewares.iter().any(|middleware| {
+                                middleware
+                                    .as_str()
+                                    .is_some_and(|name| name.ends_with("-auth@http"))
+                            })
+                        })
+                })
+            }))
+        },
+    )
+    .with_context(|| {
+        format!(
+            "Traefik has no active HTTP-provider forwardAuth router for {project}; last saw:\n{last}"
+        )
+    })
 }
 
 /// The latest deployment's `status` string for a project, via the deployments API.

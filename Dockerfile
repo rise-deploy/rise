@@ -1,7 +1,7 @@
 # Stage 1: Use official cargo-chef image as base.
 # RUST_VERSION is the single source of truth for the build toolchain; keep it in
 # lockstep with .github/workflows/ci.yml (env.RUST_VERSION) and mise.toml.
-ARG RUST_VERSION=1.95
+ARG RUST_VERSION=1.97
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION} AS chef
 WORKDIR /usr/src
 
@@ -63,8 +63,7 @@ COPY --from=planner /usr/src/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/target,sharing=locked \
-    cargo chef cook --release --all-features --recipe-path recipe.json && \
-    date +%s%N > target/.rise-cargo-chef-generation
+    cargo chef cook --release --all-features --recipe-path recipe.json
 
 # Copy project files
 COPY Cargo.toml Cargo.lock ./
@@ -80,14 +79,33 @@ COPY scripts/refresh-cargo-source-mtimes.sh ./scripts/refresh-cargo-source-mtime
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/target,sharing=locked \
-    scripts/refresh-cargo-source-mtimes.sh \
-        target/.rise-source-checksums \
-        /tmp/rise-source-checksums \
-        target/.rise-cargo-chef-generation \
-        target/.rise-built-cargo-chef-generation && \
+    scripts/refresh-cargo-source-mtimes.sh && \
     SQLX_OFFLINE=true cargo build --release --all-features --bin rise && \
-    cp /tmp/rise-source-checksums target/.rise-source-checksums && \
-    cp target/.rise-cargo-chef-generation target/.rise-built-cargo-chef-generation && \
+    cp target/release/rise /usr/local/bin/rise
+
+# Stage 3b: Build the CLI-only binary for the rise-cli image. Its own target
+# cache: a different feature set must not churn the server build's artifacts.
+FROM chef AS cli-builder
+
+COPY --from=planner /usr/src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=rise-cli-target,target=/usr/src/target,sharing=locked \
+    cargo chef cook --release --no-default-features --features cli --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY src ./src
+COPY migrations ./migrations
+COPY static ./static
+COPY .sqlx ./.sqlx
+COPY scripts/refresh-cargo-source-mtimes.sh ./scripts/refresh-cargo-source-mtimes.sh
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=rise-cli-target,target=/usr/src/target,sharing=locked \
+    scripts/refresh-cargo-source-mtimes.sh && \
+    SQLX_OFFLINE=true cargo build --release --no-default-features --features cli --bin rise && \
     cp target/release/rise /usr/local/bin/rise
 
 # Stage 4: Create the final, smaller image (match builder's Debian version)
@@ -123,6 +141,17 @@ ENV RISE_DOCS_DIR=/var/rise/docs
 EXPOSE 3000
 
 # Set the entrypoint
+ENTRYPOINT ["/usr/local/bin/rise"]
+
+# Stage 4b: The CLI alone, as small as it can be. It exists for the ECS
+# workload-identity sidecar (`rise identity agent`), which Fargate pulls on every
+# task start with no image cache, and for running `rise` in a workload. The CLI
+# links only glibc, so distroless/cc suffices: no shell, no package manager. It
+# runs as root because it writes to a task volume ECS creates root-owned.
+FROM gcr.io/distroless/cc-debian13 AS rise-cli
+
+COPY --from=cli-builder /usr/local/bin/rise /usr/local/bin/rise
+
 ENTRYPOINT ["/usr/local/bin/rise"]
 
 # Stage 5: Create the builder image with additional build tools

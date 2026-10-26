@@ -27,6 +27,7 @@ mod membership;
 mod projection;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rise_authz::engine::{
     AuthenticatedPrincipal, AuthorizationCap, AuthorizationEngine, AuthorizationError,
@@ -41,8 +42,7 @@ use rise_resource_store_postgres::{PgResourceStore, PgSession, SerializableTrans
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::db::models::User;
-use crate::server::auth::context::AuthContext;
+use crate::server::auth::context::{AnyAuth, AuthContext};
 use crate::server::error::ServerError;
 use crate::server::resources::error_map::{store_error_to_server_error, RESOURCE_NOT_FOUND};
 
@@ -50,7 +50,7 @@ pub use change::{
     change_for_create, change_for_delete, change_for_scheduled_deletion, change_for_update,
     label_changes, AuthorizationChangeSet,
 };
-pub use membership::{OperatorSelectors, RiseMembershipResolver};
+pub use membership::{OperatorSelectors, ResolvedUser, RiseMembershipResolver};
 pub use projection::{project_list_item, ReadGranularity};
 
 /// How many times a serializable write is replayed before the caller is told to
@@ -58,10 +58,21 @@ pub use projection::{project_list_item, ReadGranularity};
 ///
 /// ADR-0001 §5 requires the retry to be bounded, not unbounded: a write that
 /// keeps losing is contending with something, and turning that into an
-/// unbounded loop hides the contention behind latency. Three attempts absorb the
-/// ordinary case — one concurrent policy write — while a persistently losing
-/// request surfaces as a 503 the caller can see.
-const MAX_SERIALIZATION_ATTEMPTS: u32 = 3;
+/// unbounded loop hides the contention behind latency. Five attempts, spaced by
+/// [`REPLAY_BACKOFF_BASE`], absorb a burst of concurrent policy writes within
+/// about 750 ms of waiting, while a persistently losing request surfaces as a
+/// 503 the caller can see.
+const MAX_SERIALIZATION_ATTEMPTS: u32 = 5;
+
+/// The ceiling of the random wait before the first replay; it doubles on each
+/// further replay.
+///
+/// The write that lost is usually aborted while the one it lost to is still in
+/// flight. Replaying at once overlaps that rival again, and PostgreSQL can
+/// abort the replay on the same conflict — or abort the rival, whose own replay
+/// then overlaps this one. Waiting first lets the rival commit, so the replay
+/// reads settled facts.
+const REPLAY_BACKOFF_BASE: Duration = Duration::from_millis(50);
 
 /// Builds authorization contexts for requests, over the pool or over one
 /// serializable transaction.
@@ -83,45 +94,92 @@ impl ResourceAuthorizer {
 
     /// The principal behind a credential.
     ///
-    /// Only a Rise-authenticated User reaches the generic resource API today.
-    /// Workload principals authenticate through the exchange endpoint and are
-    /// bound to a Project, which is a typed concept the generic API does not
-    /// share; ADR-0001 §7's target-bound `/token` route is what makes them
-    /// principals here, and it is not built yet.
+    /// Three credentials reach the generic resource API, and the engine
+    /// evaluates all of them identically from here on: a Rise-authenticated
+    /// User; a Controller resolved from a JWT matched against its trust
+    /// policies; and an identity token for a ServiceAccount or Controller
+    /// resource minted by that resource's `/token` subresource (ADR-0001 §7).
+    /// Only a User carries a `User` row, so the second element is `None` for
+    /// the others and the third is the actor string audit records use.
     ///
-    /// The subject is the User's stable identity as this install expresses it:
-    /// the typed `users` row's UID, which is also the credential's `rise_uid`.
-    /// ADR-0001 §1's generated `User` resource name replaces it when identity
-    /// resources go live; both are opaque, immutable, and never the email.
-    fn principal(auth: &AuthContext) -> Result<(AuthenticatedPrincipal, User), ServerError> {
-        let user = auth.user()?.clone();
-        let subject: SubjectId = format!("user:{}", user.id).parse().map_err(|error| {
-            ServerError::internal(format!("principal is not a valid subject: {error}"))
-        })?;
-        let principal =
-            // Unrestricted: authorization details (§7) are not issued yet, so no
-            // credential carries a ceiling. When they are, the parsed cap
-            // arrives here and every decision below intersects with it, with no
-            // other change.
-            AuthenticatedPrincipal::new(subject, user.id, AuthorizationCap::Unrestricted)
+    /// A User's subject is the canonical `user:<name>` of the live `User`
+    /// resource its session names, and its UID that resource's — the session's
+    /// `rise_uid`, already re-resolved by the auth middleware (ADR-0001 §7).
+    /// A legacy session names no User resource and is refused here: it cannot
+    /// be tied to one without a fresh login. A Controller's or identity
+    /// token's subject and UID are already its resource's, and an identity
+    /// token's ceiling travels with it: every decision below intersects with
+    /// that cap.
+    ///
+    /// The typed-table service accounts of the transitional exchange endpoint
+    /// do not reach this API: they are bound to a Project, which is a typed
+    /// concept the generic API does not share.
+    fn principal(
+        auth: &AnyAuth,
+    ) -> Result<(AuthenticatedPrincipal, Option<ResolvedUser>, String), ServerError> {
+        match auth {
+            AnyAuth::User(AuthContext::Identity(identity)) => {
+                let principal = AuthenticatedPrincipal::new(
+                    identity.subject.clone(),
+                    identity.uid,
+                    identity.cap.clone(),
+                )
                 .map_err(authorization_error_to_server_error)?;
-        Ok((principal, user))
+                Ok((principal, None, identity.subject.to_string()))
+            }
+            AnyAuth::User(auth_ctx) => {
+                let typed = auth_ctx.user()?.clone();
+                let resource = auth_ctx.user_principal().cloned().ok_or_else(|| {
+                    ServerError::unauthorized(
+                        "This session predates Rise user identities; log in again to use \
+                         the resource API",
+                    )
+                })?;
+                let subject = resource.subject();
+                // Unrestricted: a session token carries no authorization details.
+                let principal = AuthenticatedPrincipal::new(
+                    subject.clone(),
+                    resource.uid,
+                    AuthorizationCap::Unrestricted,
+                )
+                .map_err(authorization_error_to_server_error)?;
+                Ok((
+                    principal,
+                    Some(ResolvedUser { typed, resource }),
+                    subject.to_string(),
+                ))
+            }
+            AnyAuth::Controller(controller) => {
+                let subject: SubjectId = format!("controller:{}", controller.0.name)
+                    .parse()
+                    .map_err(|error| {
+                        ServerError::internal(format!("principal is not a valid subject: {error}"))
+                    })?;
+                let actor = subject.to_string();
+                let principal = AuthenticatedPrincipal::new(
+                    subject,
+                    controller.0.uid,
+                    AuthorizationCap::Unrestricted,
+                )
+                .map_err(authorization_error_to_server_error)?;
+                Ok((principal, None, actor))
+            }
+        }
     }
 
     /// A read-path context. Facts are read through the pool at the default
     /// isolation: a read decides against current facts and commits nothing.
-    pub async fn read_context(
-        &self,
-        auth: &AuthContext,
-    ) -> Result<AuthorizationContext, ServerError> {
-        let (principal, user) = Self::principal(auth)?;
-        self.context(principal, user, self.store.session()).await
+    pub async fn read_context(&self, auth: &AnyAuth) -> Result<AuthorizationContext, ServerError> {
+        let (principal, user, actor) = Self::principal(auth)?;
+        self.context(principal, user, actor, self.store.session())
+            .await
     }
 
     async fn context(
         &self,
         principal: AuthenticatedPrincipal,
-        user: User,
+        user: Option<ResolvedUser>,
+        actor: String,
         session: PgSession,
     ) -> Result<AuthorizationContext, ServerError> {
         let store: Arc<dyn ResourceStore> = Arc::new(self.store.in_session(session.clone()));
@@ -131,7 +189,7 @@ impl ResourceAuthorizer {
                 session.clone(),
                 store.clone(),
                 self.operators.clone(),
-                user.clone(),
+                user,
             )),
         );
         let snapshot = engine
@@ -143,7 +201,7 @@ impl ResourceAuthorizer {
             snapshot,
             store,
             session,
-            actor: user.email,
+            actor,
             attempt: 1,
             deferred_audit: Mutex::new(Vec::new()),
         })
@@ -163,19 +221,28 @@ impl ResourceAuthorizer {
     /// inline (a comparison happened, whatever the transaction goes on to do),
     /// so a replayed write emits the line more than once and an unmarked
     /// duplicate would read as two separate attempts to delegate.
+    ///
+    /// A replay (`attempt > 1`) first waits a random, growing interval — see
+    /// [`REPLAY_BACKOFF_BASE`]. The lost attempt is already dropped by then, so
+    /// the wait holds no connection and no locks.
     pub async fn begin_write(
         &self,
-        auth: &AuthContext,
+        auth: &AnyAuth,
         attempt: u32,
     ) -> Result<WriteAttempt, ServerError> {
         // Resolved before the transaction opens: a credential this API does not
         // accept should not cost one, and on a retry loop it would cost one per
         // attempt.
-        let (principal, user) = Self::principal(auth)?;
+        let (principal, user, actor) = Self::principal(auth)?;
+        if attempt > 1 {
+            tokio::time::sleep(replay_backoff(attempt)).await;
+        }
         let transaction = SerializableTransaction::begin(&self.pool)
             .await
             .map_err(store_error_to_server_error)?;
-        let mut context = self.context(principal, user, transaction.session()).await?;
+        let mut context = self
+            .context(principal, user, actor, transaction.session())
+            .await?;
         context.attempt = attempt;
         Ok(WriteAttempt {
             transaction,
@@ -198,6 +265,17 @@ impl ResourceAuthorizer {
         }
         retry
     }
+}
+
+/// How long replay `attempt` (2 or later) waits before opening its transaction.
+fn replay_backoff(attempt: u32) -> Duration {
+    use rand::RngExt;
+
+    let ceiling =
+        REPLAY_BACKOFF_BASE.saturating_mul(2u32.saturating_pow(attempt.saturating_sub(2)));
+    // Equal jitter: always some pause, so a replay never restarts in lockstep
+    // with its rival, and spread enough that the two rarely pick the same one.
+    rand::rng().random_range(ceiling / 2..=ceiling)
 }
 
 /// One attempt at a serializable write: the transaction, and the authorization
@@ -273,8 +351,9 @@ impl AuthorizationContext {
         &self.session
     }
 
-    /// The caller's email, for audit records. Not an identity: policy never
-    /// matches on it (ADR-0001 §1).
+    /// The caller's email, or a Controller's `controller:<name>` subject, for
+    /// audit records. Not an identity: policy never matches on it
+    /// (ADR-0001 §1).
     pub fn actor(&self) -> &str {
         &self.actor
     }
@@ -456,6 +535,53 @@ impl AuthorizationContext {
             }
         }
         self.require(target, Verb::Create, None).await
+    }
+
+    /// The caller's own access explanation for one tuple on `target`: every
+    /// collected statement bearing on it, with its retention, plus every
+    /// binding that matched but contributed nothing (`rise-authz::engine::audit`
+    /// and the `explain` subresource in `resources/handlers.rs`).
+    pub async fn explain(
+        &self,
+        target: &ResourceTree,
+        verb: Verb,
+        subresource: Option<&SubresourceName>,
+    ) -> Result<rise_authz::engine::Explanation, ServerError> {
+        let tuple = PermissionTuple {
+            verb,
+            kind: target.leaf().kind.clone(),
+            subresource: subresource.cloned(),
+        };
+        self.engine
+            .explain(&self.snapshot, target, &tuple)
+            .await
+            .map_err(authorization_error_to_server_error)
+    }
+
+    /// Run the install-wide policy audit (`rise-authz::engine::audit`) over
+    /// this context's store. No principal is involved — the audit evaluates
+    /// nothing and decides nothing, it only reports shapes admission accepted
+    /// that grant nothing durable.
+    pub async fn policy_audit(
+        &self,
+        scope: &rise_authz::engine::AuditScope,
+    ) -> Result<rise_authz::engine::AuditReport, ServerError> {
+        self.engine
+            .audit(scope)
+            .await
+            .map_err(authorization_error_to_server_error)
+    }
+
+    /// Write-time diagnostics for one binding row, scoped to `uid` alone
+    /// (ADR-0001 §5: diagnostics never reject a write). Errors are the
+    /// caller's to decide whether to surface — a write-time warning must never
+    /// fail the write it rides along with, so this returns the engine's own
+    /// error rather than a `ServerError`.
+    pub async fn audit_binding(
+        &self,
+        uid: Uuid,
+    ) -> Result<Vec<rise_authz::engine::AuditFinding>, AuthorizationError> {
+        self.engine.audit_binding(uid).await
     }
 
     /// Per-item `list`/`get` granularity for a collection (ADR-0001 §4).
@@ -714,6 +840,16 @@ mod tests {
     use super::*;
     use rise_authz::policy::PermissionTuple;
     use rise_resource_api::BindingSubject;
+
+    #[test]
+    fn a_replay_waits_a_jittered_interval_that_doubles_per_attempt() {
+        for _ in 0..100 {
+            let second = replay_backoff(2);
+            assert!(REPLAY_BACKOFF_BASE / 2 <= second && second <= REPLAY_BACKOFF_BASE);
+            let third = replay_backoff(3);
+            assert!(REPLAY_BACKOFF_BASE <= third && third <= REPLAY_BACKOFF_BASE * 2);
+        }
+    }
 
     fn tuple(verb: Verb, kind: &str, subresource: Option<&str>) -> PermissionTuple {
         PermissionTuple {

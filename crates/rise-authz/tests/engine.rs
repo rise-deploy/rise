@@ -79,6 +79,7 @@ fn engine(store: Arc<FakeStore>, memberships: Arc<FakeMemberships>) -> Authoriza
     AuthorizationEngine::new(store as Arc<dyn ResourceStore>, memberships)
 }
 
+/// ADR-0001 scenario 11
 #[tokio::test]
 async fn allows_union_and_a_retained_deny_wins() {
     let mut builder = StoreBuilder::new();
@@ -146,6 +147,7 @@ async fn allows_union_and_a_retained_deny_wins() {
     }
 }
 
+/// ADR-0001 scenario 12
 #[tokio::test]
 async fn a_platform_deny_reaches_an_org_admin() {
     let mut builder = StoreBuilder::new();
@@ -193,6 +195,7 @@ async fn a_platform_deny_reaches_an_org_admin() {
     );
 }
 
+/// ADR-0001 scenario 13
 #[tokio::test]
 async fn an_org_deny_exempts_that_orgs_admins_only() {
     let mut builder = StoreBuilder::new();
@@ -270,6 +273,7 @@ async fn an_org_deny_exempts_that_orgs_admins_only() {
     );
 }
 
+/// ADR-0001 scenario 14
 #[tokio::test]
 async fn an_operator_ignores_every_deny() {
     let mut builder = StoreBuilder::new();
@@ -320,6 +324,7 @@ async fn an_operator_ignores_every_deny() {
     )));
 }
 
+/// ADR-0001 scenario 15
 #[tokio::test]
 async fn wildcard_replacement_drops_allows_and_keeps_denies() {
     let mut builder = StoreBuilder::new();
@@ -392,6 +397,7 @@ async fn wildcard_replacement_drops_allows_and_keeps_denies() {
     assert_eq!(deny.tier, rise_authz::policy::BindingTier::Platform);
 }
 
+/// ADR-0001 scenario 16
 #[tokio::test]
 async fn group_expansion_is_live() {
     let mut builder = StoreBuilder::new();
@@ -424,6 +430,7 @@ async fn group_expansion_is_live() {
     assert_eq!(decide(&former, &snapshot, app, &get).await, Decision::Deny);
 }
 
+/// ADR-0001 scenario 17
 #[tokio::test]
 async fn an_org_binding_needs_a_live_group_tie() {
     let mut builder = StoreBuilder::new();
@@ -472,6 +479,8 @@ async fn an_org_binding_needs_a_live_group_tie() {
     assert_eq!(decide(&member, &snapshot, app, &get).await, Decision::Allow);
 }
 
+/// ADR-0001 scenario 17
+/// ADR-0001 scenario 21
 #[tokio::test]
 async fn a_direct_org_admin_binding_bootstraps_affiliation() {
     let mut builder = StoreBuilder::new();
@@ -498,6 +507,7 @@ async fn a_direct_org_admin_binding_bootstraps_affiliation() {
     );
 }
 
+/// ADR-0001 scenario 22
 #[tokio::test]
 async fn a_group_targeted_admin_binding_needs_no_special_name() {
     let mut builder = StoreBuilder::new();
@@ -546,6 +556,7 @@ async fn a_group_targeted_admin_binding_needs_no_special_name() {
         .is_organization_admin());
 }
 
+/// ADR-0001 scenario 24
 #[tokio::test]
 async fn a_foreign_group_cannot_be_promoted_to_org_admin() {
     let mut builder = StoreBuilder::new();
@@ -650,6 +661,8 @@ async fn membership_facts_outside_the_seam_contract_fail_closed() {
 /// live database only by direct write, restore, or an install predating that
 /// check. The evaluator is the layer that has to stay correct anyway: it is
 /// what makes the boundary a guarantee rather than a write-path convention.
+///
+/// ADR-0001 scenario 19
 #[tokio::test]
 async fn a_foreign_subject_is_inert_and_reported() {
     let mut builder = StoreBuilder::new();
@@ -688,6 +701,7 @@ async fn a_foreign_subject_is_inert_and_reported() {
     );
 }
 
+/// ADR-0001 scenario 17
 #[tokio::test]
 async fn resource_organization_clamps_users_and_excludes_controllers() {
     let mut builder = StoreBuilder::new();
@@ -782,6 +796,7 @@ async fn resource_organization_clamps_users_and_excludes_controllers() {
     );
 }
 
+/// ADR-0001 scenario 18
 #[tokio::test]
 async fn an_absolute_org_subject_reaches_a_root_resource() {
     let mut builder = StoreBuilder::new();
@@ -828,6 +843,7 @@ async fn an_absolute_org_subject_reaches_a_root_resource() {
     );
 }
 
+/// ADR-0001 scenario 39
 #[tokio::test]
 async fn ownership_resolves_nearest_wins_through_effective_labels() {
     let mut builder = StoreBuilder::new();
@@ -905,6 +921,7 @@ async fn ownership_resolves_nearest_wins_through_effective_labels() {
     );
 }
 
+/// ADR-0001 scenario 20
 #[tokio::test]
 async fn literal_and_templated_subjects_never_collide() {
     let mut builder = StoreBuilder::new();
@@ -972,6 +989,7 @@ async fn literal_and_templated_subjects_never_collide() {
     );
 }
 
+/// ADR-0001 scenario 20
 #[tokio::test]
 async fn a_value_narrowed_selector_replaces_only_matching_resources() {
     let mut builder = StoreBuilder::new();
@@ -1050,6 +1068,8 @@ async fn a_value_narrowed_selector_replaces_only_matching_resources() {
     );
 }
 
+/// ADR-0001 scenario 37
+/// ADR-0001 scenario 38
 #[tokio::test]
 async fn collections_are_filtered_per_item_with_independent_read_granularity() {
     let mut builder = StoreBuilder::new();
@@ -1156,6 +1176,7 @@ async fn collections_are_filtered_per_item_with_independent_read_granularity() {
     assert!(!foreign_decisions[0].listable && !foreign_decisions[0].readable);
 }
 
+/// ADR-0001 scenario 53
 #[tokio::test]
 async fn a_token_ceiling_narrows_every_caller_including_operators() {
     let mut builder = StoreBuilder::new();
@@ -1337,6 +1358,15 @@ async fn tombstoned_bindings_and_dangling_role_refs_contribute_nothing() {
         policy.contributions().is_empty(),
         "a dangling reference resolves to no statements rather than an error"
     );
+    assert_eq!(
+        policy.inert_bindings().len(),
+        1,
+        "only the live, dangling binding is reported; the tombstoned one is never loaded"
+    );
+    assert_eq!(
+        policy.inert_bindings()[0].reason,
+        InertReason::DanglingRoleRef
+    );
 }
 
 #[tokio::test]
@@ -1364,6 +1394,7 @@ async fn corrupt_stored_policy_fails_the_request() {
     ));
 }
 
+/// ADR-0001 scenario 23
 #[tokio::test]
 async fn one_user_may_administer_several_organizations_independently() {
     let mut builder = StoreBuilder::new();
@@ -1658,5 +1689,678 @@ async fn an_org_binding_replaces_the_platform_ownership_default_for_its_own_org(
         .await,
         Decision::Allow,
         "replacement is confined to the organization that authored the override"
+    );
+}
+
+/// ADR-0001 §7, scenarios 49–52: the `authorization_details` claim parses into
+/// the same ceiling the engine evaluates, and every malformed shape fails
+/// closed instead of falling back to full policy.
+///
+/// ADR-0001 scenario 49
+/// ADR-0001 scenario 50
+/// ADR-0001 scenario 51
+/// ADR-0001 scenario 52
+#[tokio::test]
+async fn authorization_details_parse_into_a_ceiling_and_fail_closed() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let app = builder.resource(PROJECT, "app", Some(acme));
+    let deployment = builder.resource(DEPLOYMENT, "foo", Some(app));
+    let catalog = builder.resource(PROJECT, "catalog", Some(acme));
+    let other_deployment = builder.resource(DEPLOYMENT, "bar", Some(catalog));
+    let store = builder.build();
+
+    // Omitted details are the full live policy.
+    assert_eq!(
+        AuthorizationCap::from_details(None).unwrap(),
+        AuthorizationCap::Unrestricted
+    );
+
+    // Two entries at different Scopes union without a Cartesian product
+    // (scenario 51); a main-resource detail excludes subresources (49); a
+    // subresource detail is separate from the main resource (50).
+    let details = vec![
+        json!({
+            "type": "rise.dev/rbac",
+            "scope": "rise.dev/Project/acme/app",
+            "permissions": [{ "verbs": ["get", "list"], "kinds": ["rise.dev/Deployment"] }]
+        }),
+        json!({
+            "type": "rise.dev/rbac",
+            "scope": "rise.dev/Project/acme/catalog",
+            "permissions": [{
+                "verbs": ["get"],
+                "kinds": ["rise.dev/Deployment"],
+                "subresources": ["status"]
+            }]
+        }),
+    ];
+    let cap = AuthorizationCap::from_details(Some(&details)).unwrap();
+    assert_eq!(
+        cap.to_details().as_deref(),
+        Some(details.as_slice()),
+        "a parsed ceiling round-trips to its canonical wire form"
+    );
+
+    let capped =
+        AuthenticatedPrincipal::new("user:u-root".parse().unwrap(), Uuid::new_v4(), cap).unwrap();
+    let engine = engine(store.clone(), FakeMemberships::operator());
+    let snapshot = engine.snapshot(capped).await.unwrap();
+    let status = |verb| PermissionTuple {
+        verb,
+        kind: "rise.dev/Deployment".parse().unwrap(),
+        subresource: Some("status".parse().unwrap()),
+    };
+
+    let app_target = engine.resource_tree(deployment).await.unwrap();
+    let app_policy = engine
+        .effective_policy(&snapshot, &app_target)
+        .await
+        .unwrap();
+    assert_eq!(
+        app_policy.decide(&tuple(Verb::Get, "rise.dev/Deployment")),
+        Decision::Allow
+    );
+    assert_eq!(
+        app_policy.decide(&status(Verb::Get)),
+        Decision::Deny,
+        "a main-resource detail omits every subresource"
+    );
+
+    let catalog_target = engine.resource_tree(other_deployment).await.unwrap();
+    let catalog_policy = engine
+        .effective_policy(&snapshot, &catalog_target)
+        .await
+        .unwrap();
+    assert_eq!(catalog_policy.decide(&status(Verb::Get)), Decision::Allow);
+    assert_eq!(
+        catalog_policy.decide(&tuple(Verb::Get, "rise.dev/Deployment")),
+        Decision::Deny,
+        "a subresource detail never reaches the main resource"
+    );
+    assert_eq!(
+        catalog_policy.decide(&tuple(Verb::List, "rise.dev/Deployment")),
+        Decision::Deny,
+        "entries union by their own Scope, never across Scopes"
+    );
+
+    // Scenario 52: malformed details fail token validation.
+    let permission = json!({ "verbs": ["get"], "kinds": ["rise.dev/Deployment"] });
+    let rejected: Vec<serde_json::Value> = vec![
+        // A present empty detail set.
+        json!([]),
+        // Unknown type.
+        json!([{ "type": "rise.dev/other", "scope": "rise.dev/Project/acme/app", "permissions": [permission] }]),
+        // Missing type.
+        json!([{ "scope": "rise.dev/Project/acme/app", "permissions": [permission] }]),
+        // Empty permissions.
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [] }]),
+        // Empty axes.
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [{ "verbs": [], "kinds": ["rise.dev/Deployment"] }] }]),
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [{ "verbs": ["get"], "kinds": [] }] }]),
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [{ "verbs": ["get"], "kinds": ["rise.dev/Deployment"], "subresources": [] }] }]),
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [{ "verbs": ["get"], "kinds": ["rise.dev/Deployment"], "subresources": null }] }]),
+        // Unqualified kind and Scope; empty Scope.
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [{ "verbs": ["get"], "kinds": ["Deployment"] }] }]),
+        json!([{ "type": "rise.dev/rbac", "scope": "Project/acme/app", "permissions": [permission] }]),
+        json!([{ "type": "rise.dev/rbac", "scope": "", "permissions": [permission] }]),
+        // Malformed entries.
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [permission], "extra": 1 }]),
+        json!(["not-an-object"]),
+        json!([{ "type": "rise.dev/rbac", "scope": "rise.dev/Project/acme/app", "permissions": [{ "verbs": ["get"], "kinds": ["rise.dev/Deployment"], "effect": "Allow" }] }]),
+    ];
+    for details in rejected {
+        let entries = details.as_array().expect("test details are arrays");
+        assert!(
+            AuthorizationCap::from_details(Some(entries)).is_err(),
+            "{details} must fail closed"
+        );
+    }
+}
+
+/// ADR-0001 scenario 23
+/// ADR-0001 scenario 13
+#[tokio::test]
+async fn a_multi_org_admin_ignores_each_orgs_denies_only_there_and_respects_each_ceiling() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let acme_app = builder.resource(PROJECT, "app", Some(acme));
+    let beta = builder.resource(ORGANIZATION, "beta", None);
+    let beta_app = builder.resource(PROJECT, "app", Some(beta));
+    builder.role(PLATFORM_ROLE, ORG_ADMIN_PLATFORM_ROLE, None, allow_all());
+    for (org, parent) in [("acme", acme), ("beta", beta)] {
+        builder.binding(
+            ROLE_BINDING,
+            "admin",
+            Some(parent),
+            org_admin_binding("user:u-alice", org),
+        );
+    }
+    // acme's own Deny, bound directly to alice — exempted for acme's own admin.
+    builder.role(
+        ROLE,
+        "no-delete",
+        Some(acme),
+        json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["delete"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "acme-cap",
+        Some(acme),
+        json!({
+            "subject": "user:u-alice",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": "no-delete" }
+        }),
+    );
+    // beta's own Deny, bound to every beta member — also exempted for beta's
+    // own admin, but not for an ordinary beta member.
+    builder.role(
+        ROLE,
+        "no-update",
+        Some(beta),
+        json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["update"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "beta-cap",
+        Some(beta),
+        json!({
+            "subject": "system:authenticated",
+            "scope": "rise.dev/Organization/beta",
+            "roleRef": { "kind": "Role", "name": "no-update" }
+        }),
+    );
+    // Distinct platform ceilings per org — these bind no admin exemption at all.
+    builder.role(
+        PLATFORM_ROLE,
+        "acme-ceiling",
+        None,
+        json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["update"] }]),
+    );
+    builder.binding(
+        PLATFORM_ROLE_BINDING,
+        "acme-ceiling",
+        None,
+        json!({
+            "subject": "system:authenticated",
+            "subjectMembership": "Any",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "PlatformRole", "name": "acme-ceiling" }
+        }),
+    );
+    builder.role(
+        PLATFORM_ROLE,
+        "beta-ceiling",
+        None,
+        json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["delete"] }]),
+    );
+    builder.binding(
+        PLATFORM_ROLE_BINDING,
+        "beta-ceiling",
+        None,
+        json!({
+            "subject": "system:authenticated",
+            "subjectMembership": "Any",
+            "scope": "rise.dev/Organization/beta",
+            "roleRef": { "kind": "PlatformRole", "name": "beta-ceiling" }
+        }),
+    );
+    // An ordinary beta member, unrelated to acme.
+    builder.role(
+        ROLE,
+        "rw",
+        Some(beta),
+        json!([{ "effect": "Allow", "kinds": ["rise.dev/Project"], "verbs": ["get", "update", "delete"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "devs-rw",
+        Some(beta),
+        json!({
+            "subject": "group:beta/devs",
+            "scope": "rise.dev/Organization/beta",
+            "roleRef": { "kind": "Role", "name": "rw" }
+        }),
+    );
+    let store = builder.build();
+
+    let delete = tuple(Verb::Delete, "rise.dev/Project");
+    let update = tuple(Verb::Update, "rise.dev/Project");
+    let get = tuple(Verb::Get, "rise.dev/Project");
+
+    let alice_engine = engine(store.clone(), FakeMemberships::none());
+    let alice = snapshot_for(&alice_engine, "user:u-alice").await;
+    assert_eq!(
+        decide(&alice_engine, &alice, acme_app, &delete).await,
+        Decision::Allow,
+        "acme's own Deny does not cap acme's admin"
+    );
+    assert_eq!(
+        decide(&alice_engine, &alice, acme_app, &update).await,
+        Decision::Deny,
+        "acme's platform ceiling reaches its admin"
+    );
+    assert_eq!(
+        decide(&alice_engine, &alice, beta_app, &update).await,
+        Decision::Allow,
+        "beta's own Deny does not cap beta's admin"
+    );
+    assert_eq!(
+        decide(&alice_engine, &alice, beta_app, &delete).await,
+        Decision::Deny,
+        "beta's platform ceiling reaches its admin"
+    );
+
+    let bob_engine = engine(store, FakeMemberships::groups(&["group:beta/devs"]));
+    let bob = snapshot_for(&bob_engine, "user:u-bob").await;
+    assert_eq!(
+        decide(&bob_engine, &bob, beta_app, &get).await,
+        Decision::Allow
+    );
+    assert_eq!(
+        decide(&bob_engine, &bob, beta_app, &update).await,
+        Decision::Deny,
+        "beta's own Deny caps an ordinary beta member"
+    );
+    assert_eq!(
+        decide(&bob_engine, &bob, beta_app, &delete).await,
+        Decision::Deny,
+        "beta's platform ceiling caps an ordinary beta member too"
+    );
+    assert_eq!(
+        decide(&bob_engine, &bob, acme_app, &get).await,
+        Decision::Deny,
+        "no tie to acme at all"
+    );
+}
+
+/// ADR-0001 scenario 24
+#[tokio::test]
+async fn the_org_admin_predicate_is_structural() {
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let app = builder.resource(PROJECT, "app", Some(acme));
+    builder.role(PLATFORM_ROLE, ORG_ADMIN_PLATFORM_ROLE, None, allow_all());
+    builder.role(PLATFORM_ROLE, "not-org-admin", None, allow_all());
+    builder.role(ROLE, ORG_ADMIN_PLATFORM_ROLE, Some(acme), allow_all());
+    builder.role(
+        ROLE,
+        "no-delete",
+        Some(acme),
+        json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["delete"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "no-delete-cap",
+        Some(acme),
+        json!({
+            "subject": "system:authenticated",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": "no-delete" }
+        }),
+    );
+    builder.role(
+        ROLE,
+        "viewer",
+        Some(acme),
+        json!([{ "effect": "Allow", "kinds": ["rise.dev/Project"], "verbs": ["get"] }]),
+    );
+    builder.binding(
+        ROLE_BINDING,
+        "devs-viewer",
+        Some(acme),
+        json!({
+            "subject": "group:acme/devs",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": "viewer" }
+        }),
+    );
+    // (a) a qualifying reference, but scoped to a descendant rather than the org.
+    builder.binding(
+        ROLE_BINDING,
+        "descendant-scope",
+        Some(acme),
+        json!({
+            "subject": "user:u-alice",
+            "scope": "rise.dev/Project/acme/app",
+            "roleRef": { "kind": "PlatformRole", "name": ORG_ADMIN_PLATFORM_ROLE }
+        }),
+    );
+    // (b) exact org scope and reference, but label-selected.
+    builder.binding(
+        ROLE_BINDING,
+        "label-selected",
+        Some(acme),
+        json!({
+            "subject": "user:u-alice",
+            "scope": "rise.dev/Organization/acme",
+            "labelSelector": { "key": "rise.dev/squad", "value": "platform" },
+            "roleRef": { "kind": "PlatformRole", "name": ORG_ADMIN_PLATFORM_ROLE }
+        }),
+    );
+    // (c) exact org scope, but referencing the org-level Role of the same name.
+    builder.binding(
+        ROLE_BINDING,
+        "wrong-role-kind",
+        Some(acme),
+        json!({
+            "subject": "user:u-alice",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "Role", "name": ORG_ADMIN_PLATFORM_ROLE }
+        }),
+    );
+    // (d) exact org scope and PlatformRole reference, but the wrong Role.
+    builder.binding(
+        ROLE_BINDING,
+        "wrong-role-name",
+        Some(acme),
+        json!({
+            "subject": "user:u-alice",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "PlatformRole", "name": "not-org-admin" }
+        }),
+    );
+    // (e) the exact roleRef, but at the wrong tier: a root PlatformRoleBinding
+    // rather than an org RoleBinding.
+    builder.binding(
+        PLATFORM_ROLE_BINDING,
+        "wrong-tier",
+        None,
+        json!({
+            "subject": "user:u-alice",
+            "subjectMembership": "Any",
+            "scope": "rise.dev/Organization/acme",
+            "roleRef": { "kind": "PlatformRole", "name": ORG_ADMIN_PLATFORM_ROLE }
+        }),
+    );
+    let store = builder.build();
+    let engine = engine(store, FakeMemberships::groups(&["group:acme/devs"]));
+    let snapshot = snapshot_for(&engine, "user:u-alice").await;
+    let target = engine.resource_tree(app).await.unwrap();
+    let policy = engine.effective_policy(&snapshot, &target).await.unwrap();
+
+    assert!(
+        !policy.is_organization_admin(),
+        "none of the near-miss bindings satisfies the exact structural predicate"
+    );
+    assert_eq!(
+        policy.decide(&tuple(Verb::Delete, "rise.dev/Project")),
+        Decision::Deny,
+        "the org cap still applies to a non-admin"
+    );
+    assert_eq!(
+        policy.decide(&tuple(Verb::Update, "rise.dev/Project")),
+        Decision::Allow,
+        "the descendant-scoped binding still grants ordinary authority"
+    );
+    assert_eq!(
+        policy.decide(&tuple(Verb::Get, "rise.dev/Project")),
+        Decision::Allow
+    );
+}
+
+/// ADR-0001 scenario 16
+/// ADR-0001 scenario 27
+/// ADR-0001 scenario 35
+#[tokio::test]
+async fn losing_the_last_group_tie_ends_org_governance() {
+    fn common(builder: &mut StoreBuilder, acme: Uuid) {
+        builder.role(PLATFORM_ROLE, ORG_ADMIN_PLATFORM_ROLE, None, allow_all());
+        builder.role(
+            ROLE,
+            "no-delete",
+            Some(acme),
+            json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["delete"] }]),
+        );
+        builder.binding(
+            ROLE_BINDING,
+            "no-delete-cap",
+            Some(acme),
+            json!({
+                "subject": "system:authenticated",
+                "scope": "rise.dev/Organization/acme",
+                "roleRef": { "kind": "Role", "name": "no-delete" }
+            }),
+        );
+        // A resource-org-clamped platform Allow: it tests the caller's actual
+        // membership in the resource's organization.
+        builder.role(
+            PLATFORM_ROLE,
+            "ro-get",
+            None,
+            json!([{ "effect": "Allow", "kinds": ["rise.dev/Project"], "verbs": ["get"] }]),
+        );
+        builder.binding(
+            PLATFORM_ROLE_BINDING,
+            "ro-get",
+            None,
+            json!({
+                "subject": "system:authenticated",
+                "subjectMembership": "ResourceOrganization",
+                "scope": "*",
+                "roleRef": { "kind": "PlatformRole", "name": "ro-get" }
+            }),
+        );
+        // An unconstrained platform Allow: it survives leaving the org entirely.
+        builder.role(
+            PLATFORM_ROLE,
+            "any-list",
+            None,
+            json!([{ "effect": "Allow", "kinds": ["rise.dev/Project"], "verbs": ["list"] }]),
+        );
+        builder.binding(
+            PLATFORM_ROLE_BINDING,
+            "any-list",
+            None,
+            json!({
+                "subject": "user:u-alice",
+                "subjectMembership": "Any",
+                "scope": "*",
+                "roleRef": { "kind": "PlatformRole", "name": "any-list" }
+            }),
+        );
+        // A platform Deny scoped to acme but unclamped: it caps whoever is
+        // subject to it independent of their own org standing.
+        builder.role(
+            PLATFORM_ROLE,
+            "no-create",
+            None,
+            json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["create"] }]),
+        );
+        builder.binding(
+            PLATFORM_ROLE_BINDING,
+            "no-create",
+            None,
+            json!({
+                "subject": "system:authenticated",
+                "subjectMembership": "Any",
+                "scope": "rise.dev/Organization/acme",
+                "roleRef": { "kind": "PlatformRole", "name": "no-create" }
+            }),
+        );
+    }
+
+    let get = tuple(Verb::Get, "rise.dev/Project");
+    let list = tuple(Verb::List, "rise.dev/Project");
+    let delete = tuple(Verb::Delete, "rise.dev/Project");
+    let create = tuple(Verb::Create, "rise.dev/Project");
+
+    // Group-bound admin: the Group tie is what carries acme membership.
+    let mut builder = StoreBuilder::new();
+    let acme = builder.resource(ORGANIZATION, "acme", None);
+    let app = builder.resource(PROJECT, "app", Some(acme));
+    common(&mut builder, acme);
+    builder.binding(
+        ROLE_BINDING,
+        "admins",
+        Some(acme),
+        org_admin_binding("group:acme/devs", "acme"),
+    );
+    let store = builder.build();
+
+    let member = engine(store.clone(), FakeMemberships::groups(&["group:acme/devs"]));
+    let snapshot = snapshot_for(&member, "user:u-alice").await;
+    let target = member.resource_tree(app).await.unwrap();
+    let policy = member.effective_policy(&snapshot, &target).await.unwrap();
+    assert!(policy.is_organization_admin());
+    assert_eq!(policy.decide(&delete), Decision::Allow);
+    assert_eq!(policy.decide(&create), Decision::Deny);
+    assert_eq!(policy.decide(&get), Decision::Allow);
+    assert_eq!(policy.decide(&list), Decision::Allow);
+
+    let former = engine(store, FakeMemberships::none());
+    let snapshot = snapshot_for(&former, "user:u-alice").await;
+    let target = former.resource_tree(app).await.unwrap();
+    let policy = former.effective_policy(&snapshot, &target).await.unwrap();
+    assert!(!policy.is_organization_admin());
+    assert_eq!(
+        policy.decide(&delete),
+        Decision::Deny,
+        "the org cap applies again"
+    );
+    assert_eq!(
+        policy.decide(&get),
+        Decision::Deny,
+        "the ResourceOrganization-constrained Allow stops matching outside the org"
+    );
+    assert_eq!(
+        policy.decide(&list),
+        Decision::Allow,
+        "the unconstrained platform Allow survives"
+    );
+    assert_eq!(
+        policy.decide(&create),
+        Decision::Deny,
+        "the platform Deny still applies regardless of org standing"
+    );
+
+    // Direct-admin variant: no Group is ever involved, so tombstoning the sole
+    // admin binding drops org membership entirely — same four answers as Former.
+    let mut direct_builder = StoreBuilder::new();
+    let direct_acme = direct_builder.resource(ORGANIZATION, "acme", None);
+    let direct_app = direct_builder.resource(PROJECT, "app", Some(direct_acme));
+    common(&mut direct_builder, direct_acme);
+    let admin_uid = direct_builder.binding(
+        ROLE_BINDING,
+        "direct-admin",
+        Some(direct_acme),
+        org_admin_binding("user:u-alice", "acme"),
+    );
+    direct_builder.tombstone(admin_uid);
+    let direct_store = direct_builder.build();
+    let direct_engine = engine(direct_store, FakeMemberships::none());
+    let snapshot = snapshot_for(&direct_engine, "user:u-alice").await;
+    let target = direct_engine.resource_tree(direct_app).await.unwrap();
+    let policy = direct_engine
+        .effective_policy(&snapshot, &target)
+        .await
+        .unwrap();
+    assert!(!policy.is_organization_admin());
+    assert_eq!(policy.decide(&delete), Decision::Deny);
+    assert_eq!(policy.decide(&get), Decision::Deny);
+    assert_eq!(policy.decide(&list), Decision::Allow);
+    assert_eq!(policy.decide(&create), Decision::Deny);
+}
+
+/// ADR-0001 scenario 25
+#[tokio::test]
+async fn editing_the_org_admin_baseline_moves_every_org_and_never_substitutes_for_a_ceiling() {
+    fn build(role_statements: serde_json::Value, ceiling: bool) -> (Arc<FakeStore>, Uuid, Uuid) {
+        let mut builder = StoreBuilder::new();
+        let acme = builder.resource(ORGANIZATION, "acme", None);
+        let acme_app = builder.resource(PROJECT, "app", Some(acme));
+        let beta = builder.resource(ORGANIZATION, "beta", None);
+        let beta_app = builder.resource(PROJECT, "app", Some(beta));
+        builder.role(
+            PLATFORM_ROLE,
+            ORG_ADMIN_PLATFORM_ROLE,
+            None,
+            role_statements,
+        );
+        for (org, parent) in [("acme", acme), ("beta", beta)] {
+            builder.binding(
+                ROLE_BINDING,
+                "admin",
+                Some(parent),
+                org_admin_binding("user:u-alice", org),
+            );
+        }
+        if ceiling {
+            builder.role(
+                PLATFORM_ROLE,
+                "acme-ceiling",
+                None,
+                json!([{ "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["update"] }]),
+            );
+            builder.binding(
+                PLATFORM_ROLE_BINDING,
+                "acme-ceiling",
+                None,
+                json!({
+                    "subject": "system:authenticated",
+                    "subjectMembership": "Any",
+                    "scope": "rise.dev/Organization/acme",
+                    "roleRef": { "kind": "PlatformRole", "name": "acme-ceiling" }
+                }),
+            );
+        }
+        (builder.build(), acme_app, beta_app)
+    }
+
+    let delete = tuple(Verb::Delete, "rise.dev/Project");
+    let update = tuple(Verb::Update, "rise.dev/Project");
+
+    let (store, acme_app, beta_app) = build(allow_all(), false);
+    let baseline = engine(store, FakeMemberships::none());
+    let snapshot = snapshot_for(&baseline, "user:u-alice").await;
+    assert_eq!(
+        decide(&baseline, &snapshot, acme_app, &delete).await,
+        Decision::Allow
+    );
+    assert_eq!(
+        decide(&baseline, &snapshot, beta_app, &delete).await,
+        Decision::Allow
+    );
+
+    let narrowed = json!([
+        { "effect": "Allow", "kinds": "*", "verbs": ["get", "list", "create", "update", "use"] },
+        { "effect": "Allow", "kinds": "*", "verbs": "*", "subresources": "*" },
+        { "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["update"] }
+    ]);
+    let (store, acme_app, beta_app) = build(narrowed.clone(), false);
+    let narrow = engine(store, FakeMemberships::none());
+    let snapshot = snapshot_for(&narrow, "user:u-alice").await;
+    assert_eq!(
+        decide(&narrow, &snapshot, acme_app, &delete).await,
+        Decision::Deny,
+        "editing the baseline moves every org: delete is no longer granted anywhere"
+    );
+    assert_eq!(
+        decide(&narrow, &snapshot, beta_app, &delete).await,
+        Decision::Deny
+    );
+    assert_eq!(
+        decide(&narrow, &snapshot, acme_app, &update).await,
+        Decision::Allow,
+        "the Role's own Deny arrives through the org tier and is exempted for its admin"
+    );
+    assert_eq!(
+        decide(&narrow, &snapshot, beta_app, &update).await,
+        Decision::Allow
+    );
+
+    let (store, acme_app, beta_app) = build(narrowed, true);
+    let capped = engine(store, FakeMemberships::none());
+    let snapshot = snapshot_for(&capped, "user:u-alice").await;
+    assert_eq!(
+        decide(&capped, &snapshot, acme_app, &update).await,
+        Decision::Deny,
+        "a platform ceiling reaches the admin, unlike the Role's own Deny"
+    );
+    assert_eq!(
+        decide(&capped, &snapshot, beta_app, &update).await,
+        Decision::Allow,
+        "the ceiling is scoped to acme only"
     );
 }

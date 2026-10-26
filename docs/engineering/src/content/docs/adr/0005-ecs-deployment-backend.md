@@ -41,12 +41,38 @@ execution role, and Cloud Map registration is part of the unimplemented D10 — 
 those grants are omitted rather than reserved, with tests asserting they stay
 out.
 
+D2 has since been widened. Workloads run on **either Fargate or EC2 container
+instances**, chosen by a `capacity` setting; `awsvpc` remains fixed, and the
+readiness path that depends on it is unchanged. EC2 capacity is bring-your-own —
+`modules/rise-ecs` provisions no Auto Scaling group or capacity provider, and the
+control plane itself still runs on Fargate. The same change closed a gap the
+service diff had from the start: it compared only the task-definition hash and
+the desired count, so a change to `subnets`, `security_groups` or
+`assign_public_ip` was never detected on a running service. Those are now
+compared against what `DescribeServices` reports — read from the API rather than
+from a Rise tag, because a tag would be absent on every existing service and make
+the whole fleet look drifted on the first tick after an upgrade. Capacity itself
+is reported but never applied in place: ECS restricts which transitions
+`UpdateService` performs, and the next deployment carries the change for free.
+
+Interruptible capacity is **not** shipped. The placement code is already
+capacity-provider-shaped (a `Capacity::Provider` variant renders a
+`capacityProviderStrategy`), but nothing selects one; see D2 for the two
+decisions recorded ahead of that work. Real EC2 verification is manual — the e2e
+harness provisions Fargate only, so what it asserts about this change is that the
+default path is byte-for-byte unchanged.
+
+CloudWatch logs (D11) have since shipped, and so has workload identity (D8), as
+amended below: every task carries an identity sidecar, the credential is minted
+by the control plane into SSM, and the sidecar mints the deployment's token
+files through the existing exchange endpoint, now capped by the same
+`identity_token_ttl_seconds` as the token files on every backend.
+
 Deliberately deferred, each **failing closed**: the deployment is marked Failed
 on its first reconcile, carrying the reason as its failure message rather than
-running half-working or timing out with a generic one. The features: workload identity (D8), Cloud Map
-cross-container discovery (D10), CloudWatch logs (D11), and ALB-*native* routing
-(D5) — distinct from the ALB+ACM *edge*, which `modules/rise-ecs` implements as
-a documented opt-in.
+running half-working or timing out with a generic one. The features: Cloud Map
+cross-container discovery (D10) and ALB-*native* routing (D5) — distinct from
+the ALB+ACM *edge*, which `modules/rise-ecs` implements as a documented opt-in.
 
 This ADR records how Rise's public feature surface maps onto Amazon ECS and the
 surrounding AWS services. The design-gating facts it depended on — Cloud Map shared
@@ -116,16 +142,43 @@ client exists.
 **Not decided here:** whether ECS reconciliation eventually moves out of process.
 It follows whatever the external-controller work decides for Docker.
 
-### D2. Fargate first; `awsvpc` networking
+### D2. Configurable capacity; `awsvpc` networking always
 
-The backend targets **Fargate** launch type on `awsvpc` networking. EC2 capacity
-providers are a later, additive option (a `capacity_provider` setting), not a
-day-one variant.
+The backend runs workloads on either **Fargate** (the default) or the cluster's
+own **EC2 container instances**, selected by a `capacity` setting. Both run on
+**`awsvpc` networking**, which is not configurable.
 
-Consequences accepted: per-task ENIs (subnet IP consumption scales with replica
-count), task start latency measured in tens of seconds rather than the Docker
-backend's seconds, no privileged containers, no host bind mounts, and CPU/memory
-restricted to Fargate's discrete size table (see D9).
+`awsvpc` is the load-bearing half of this decision. Readiness is a lookup of
+`http://{task-ip}:{port}` in Traefik's `serverStatus`, and that IP is the task's
+own ENI address from `DescribeTasks` attachment details. A `bridge`-networked
+cluster would register the container instance's address and a dynamic host port
+instead, which the controller cannot construct without `ec2:DescribeInstances` —
+a grant this ADR's own permission narrowing removed, with a Terraform test
+asserting it stays out. So capacity is a knob and networking is not.
+
+Interruptible capacity (`FARGATE_SPOT`, or a Spot-backed Auto Scaling group
+capacity provider) is the next step and is why capacity is modelled as an enum
+that renders to *either* a `launchType` *or* a `capacityProviderStrategy` —
+ECS rejects a `CreateService` carrying both. Two decisions are recorded ahead of
+that work:
+
+- It will be a **per-container `rise.toml` knob**, not a mutable project
+  setting. `rise.toml` is deployment-scoped, so a change is fixed at deploy time
+  and arrives as a new service rather than as drift on a running one — which
+  matters because ECS restricts the capacity transitions `UpdateService` will
+  perform in place.
+- It will be named **generically** (interruptible/preemptible), not "spot".
+  Kubernetes can express the same intent with a spot node pool via nodeSelector
+  and tolerations; Docker cannot, and documents it as a limitation. Keeping an
+  AWS term out of the cross-backend `rise.toml` schema is cheaper to decide now
+  than to rename later.
+
+Consequences accepted: per-task ENIs on both capacities (subnet IP consumption
+scales with replica count, and on EC2 the per-instance ENI attachment limit caps
+tasks per host unless trunking is enabled), task start latency measured in tens
+of seconds rather than the Docker backend's seconds, no privileged containers,
+and no host bind mounts. CPU/memory is restricted to Fargate's discrete size
+table on Fargate capacity only (see D9).
 
 ### D3. Object mapping
 
@@ -412,23 +465,121 @@ Rise's workload identity contract is a set of files at fixed in-container paths:
 Kubernetes mounts a Secret to produce them; Docker uploads them through the
 daemon's archive API and re-mints in place. ECS has neither a Secret volume nor a
 "write a file into a running container" API, so the files are produced **inside
-the task**:
+the task**, by a sidecar.
 
-- A task-scoped volume is mounted at `/var/run/secrets/rise/identity` in both
-  the app container and a small **identity sidecar** (the Rise image, running an
-  identity-agent subcommand), with the app container declaring `dependsOn` the
-  sidecar's `HEALTHY`/`START` condition so the files exist before the app runs.
-- The sidecar receives the deployment's **bootstrap credential** through the same
-  ECS `secrets` mechanism as D7, exchanges it at Rise's token-exchange endpoint
-  for the per-audience tokens, writes the files, and re-mints before expiry using
-  the shared `refresh_due_after_secs`/`remint_after_secs` helpers.
+**The credential is universal, not opt-in.** Kubernetes and Docker deliver the
+`credential` file to *every* deployment, whether or not it declares
+`[identity].audiences`, and `rise identity token` reads it. ECS therefore runs
+the sidecar in every task, not only in tasks that want pre-minted tokens.
 
-Consequences: the credential is generated by the control plane (not recovered
-from a running container as on Docker, which has no ECS analogue), the token TTL
-policy stays in `rise-backend-core`, and the in-container contract a workload
-reads is byte-identical across all three backends. Cost: one extra container per
-task (memory overhead against the task's Fargate size) and a new
-`rise` subcommand that must be tested standalone.
+**The task definition.**
+
+- A task-scoped volume (`volumes: [{name: "rise-identity"}]`, no host path — a
+  Fargate ephemeral bind mount, and a daemon-managed volume on EC2 capacity) is
+  mounted at `/var/run/secrets/rise/identity`: read-write in the sidecar,
+  **read-only** in the app.
+- The sidecar, `rise-identity-agent`, runs the `rise-cli` image (`rise identity
+  agent`). It is the only container that receives the bootstrap credential,
+  injected through ECS `secrets` from a per-deployment SSM `SecureString` (D7's
+  mechanism, at `…/{deployment_id}/rise-identity/credential`), so the credential
+  never appears in the app's environment or in `DescribeTaskDefinition`.
+- The app container declares `dependsOn: [{containerName: "rise-identity-agent",
+  condition: "HEALTHY"}]`. The sidecar's health check (`rise identity agent
+  --check`) passes once the files are written, so they exist before the app's
+  process starts — the ordering Docker gets by uploading before
+  `start_container`.
+- The sidecar is **non-essential with an ECS restart policy**: a crash restarts
+  it in place instead of replacing the app's task. It carries no Traefik labels
+  (Traefik runs with `exposedByDefault=false`), a 32 MiB memory reservation out
+  of the task's size (sizing is unchanged — the Fargate rounding in D9 already
+  dwarfs it), and logs under a separate stream prefix
+  (`{resource_prefix}-identity/…`) so `rise deployment logs` shows only the app,
+  as on the other backends.
+
+**The credential is generated by the control plane, before the task exists.**
+Docker recovers the credential by reading it back from a running container,
+which has no ECS analogue. The ECS reconciler instead generates it when it
+first provisions the deployment's service, in this order: write the SSM
+parameter, persist its hash (`identity_credential_hash`, the value the
+token-exchange endpoint authenticates against), then register the task
+definition and create the service. A crash between steps leaves no service
+holding an unpersisted credential, so the next tick regenerates it safely. Once
+the hash is persisted the parameter is never rewritten, and it is deleted with
+the deployment's other parameters when the service is retired.
+
+A deployment that was **already running** without a credential (anything
+deployed to ECS before this shipped) gets the sidecar too, on the first tick
+after the upgrade: the reconciler provisions its credential and registers a new
+revision, and ECS rolls it once. That rolls every ECS service in the install
+once, accepted in exchange for one code path — every task carries the sidecar,
+with no deployment-age exception to reason about.
+
+**Tokens come from the existing exchange endpoint, under one lifetime cap.**
+The sidecar mints each token file with `POST /api/v1/identity/token` — the
+endpoint `rise identity token` uses — once per declared audience, asking for
+`identity_token_ttl_seconds`. The controller hands it the `[identity].audiences`
+map (filename → audience) as plain environment: it is the deployment's own
+`rise.toml`, not a secret, and cannot change within a deployment. It refreshes
+at half the lifetime the endpoint reports, the policy every backend follows,
+with up to 20 % random jitter so a deployment's tasks do not refresh — or
+retry — in lockstep.
+
+The endpoint's rate limiting keys on the caller the credential proves, not on
+its address. Every sidecar in an install may share one address — a NAT gateway,
+or no proxy headers at all over an internal URL — so a per-IP budget would
+throttle the whole install as one client. The endpoint therefore has its own
+limiter, apart from the OAuth one: a valid credential counts against its
+deployment's budget only, and the per-IP budget counts only credentials that
+match nothing, which is what slows guessing. And because a throttled or
+restarting control plane at task start must not fail the task, the sidecar's
+health check uses ECS's longest start period (300 s): failed checks inside it do
+not count, while the first passing one still releases the app at once.
+
+That makes `identity_token_ttl_seconds` the **single cap on every workload
+identity token**: the lifetime of the token files on all three backends, and
+the maximum (and default) lifetime of a token from the exchange endpoint. The
+endpoint previously had a separate, shorter cap; with one cap an exchanged
+token can live exactly as long as the file tokens a workload can already read,
+and no longer, and the ECS files cannot drift from the other backends'. The
+claims match too: the endpoint signs with the same subject information and key
+as the controllers' `sign_audience_tokens`. A dedicated "mint my declared
+audiences" endpoint was considered and dropped — it would have been a second
+public token surface for a saving of one call per extra audience per refresh.
+
+The sidecar reaches that endpoint at `identity_exchange_url` (default: the
+server's public URL — the same URL the workload itself uses for `rise identity
+token`). Set it to an internal address when tasks have no route to the public
+one.
+
+**The agent image.** `rise-cli`: the CLI alone on a distroless base, about
+16 MB compressed against the full Rise image's 68 MB. Fargate keeps no image
+cache between tasks, so the sidecar is pulled on every task start, and often
+through a NAT gateway that bills per GB. It is published beside the Rise image
+at the same tag. `identity_agent_image` is **required**, exactly like the
+control plane's own image: nothing infers it, since a guessed image may predate
+the agent and a sidecar that cannot run stops every task it is in. The image is
+**excluded from the task-definition content hash**: including it would roll
+every ECS service in the install on every Rise upgrade. New
+deployments pick up the new agent; running ones keep theirs, which is why the
+agent's protocol must stay backwards compatible with newer servers.
+
+**Consequences.** Refresh moves into the task: the ECS controller runs no
+refresh loop, unlike Docker's re-upload pass and Kubernetes' leader-elected
+resync. Revocation is unchanged — the endpoint refuses a deployment that should
+not have infrastructure, so a stopped deployment's sidecar can no longer mint.
+The in-container contract a workload reads is byte-identical across all three
+backends. Costs: one extra container per task (2 of the 10 allowed), a 32 MiB
+reservation, and an agent image the workload execution role must be able to
+pull.
+
+**Rejected alternatives.** The controller writing files over ECS Exec (needs SSM
+agent sessions and `enableExecuteCommand` on every task, and an audit trail
+full of it); per-deployment EFS access points written by the controller (the
+closest analogue to a Kubernetes Secret volume, but credentials at rest on NFS
+and per-deployment access-point churn); and replacing the credential with the
+task's IAM role (IAM identifies a role, not a deployment, unless every
+deployment gets its own role — open question 5 — and the `credential` file must
+exist regardless).
 
 ### D9. CPU and memory: rounded up to the Fargate size table
 
@@ -445,6 +596,14 @@ an error naming the nearest valid size — not silently clamped.
 
 Rounding up is billing-visible, so the resolved size is surfaced on the
 deployment (and in the CLI's deploy output) rather than hidden.
+
+**This applies to Fargate capacity only.** EC2 capacity (D2) declares arbitrary
+task-level CPU and memory, bounded by what a container instance has rather than
+by a table, so the request is carried through exactly as written and nothing is
+flagged as rounded. Rounding there would be actively wrong: it would inflate the
+task against real instance capacity and fail placement for a request that would
+have fitted. The `deployment_constraints` check is unchanged — it runs in the
+API handler, before any capacity is consulted.
 
 ### D10. Cross-container discovery via Cloud Map
 

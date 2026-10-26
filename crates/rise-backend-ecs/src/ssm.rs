@@ -71,6 +71,25 @@ pub fn deployment_path_prefix(
     format!("/{prefix}/{project}/{group}/{deployment_id}")
 }
 
+/// The parameter holding one deployment's workload-identity bootstrap
+/// credential (ADR-0005 D8).
+///
+/// Nested one level below the deployment's secrets, so it can never collide
+/// with a secret env var -- those are single segments -- while still sitting
+/// under [`deployment_path_prefix`]: it is deleted with the rest of the
+/// deployment, and covered by the same `ssm:GetParameters` grant.
+pub fn identity_credential_parameter(
+    prefix: &str,
+    project: &str,
+    deployment_group: &str,
+    deployment_id: &str,
+) -> String {
+    format!(
+        "{}/rise-identity/credential",
+        deployment_path_prefix(prefix, project, deployment_group, deployment_id)
+    )
+}
+
 /// Whether an environment variable name is usable as an SSM path segment.
 ///
 /// SSM parameter names allow `a-zA-Z0-9_.-` per segment; a `/` would silently
@@ -141,6 +160,24 @@ mod tests {
             !other.starts_with(&prefix),
             "the delete prefix must not reach a sibling deployment"
         );
+    }
+
+    #[test]
+    fn the_identity_credential_lives_inside_its_deployment_but_apart_from_secrets() {
+        let credential = identity_credential_parameter("rise", "myapp", "mr/1", "20260101-120000");
+        assert_eq!(
+            credential,
+            "/rise/myapp/mr--1/20260101-120000/rise-identity/credential"
+        );
+        // Deleted with the deployment's secrets...
+        assert!(credential.starts_with(&deployment_path_prefix(
+            "rise",
+            "myapp",
+            "mr/1",
+            "20260101-120000"
+        )));
+        // ...and unreachable by any secret env var, which is one segment.
+        assert!(!is_safe_parameter_segment("rise-identity/credential"));
     }
 
     #[test]

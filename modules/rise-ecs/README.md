@@ -8,6 +8,11 @@ control-plane store, and ECR for images.
 
 It pairs with [`rise-aws`](../rise-aws), which owns the IAM. Apply that first.
 
+Rise and Traefik run through the shared [`runtime`](modules/runtime) submodule,
+which owns their task definitions, ECS services, Cloud Map registrations, and
+routing configuration. This module supplies production infrastructure around
+that runtime. The ECS E2E workspace uses the same runtime with per-run fixtures.
+
 ## Usage
 
 ```hcl
@@ -38,6 +43,10 @@ module "rise_ecs" {
   log_group_name = "/rise"
   rise_image_tag = "0.23.0"
   admin_email    = "ops@example.com"
+
+  # The workload-identity sidecar in every workload task. Required, like the
+  # control plane's image; normally the same release.
+  rise_cli_image_tag = "0.23.0"
   acme_email     = "ops@example.com"
 
   controller_role_arn      = module.rise_aws.role_arn
@@ -53,14 +62,33 @@ module "rise_ecs" {
 }
 ```
 
+CI applies this pairing, re-plans it, checks the IAM grants against it and
+destroys it on every pull request, against an AWS emulator — see the
+[AWS install suite](../../tests/e2e/README.md#aws-install-suite).
+
 `rise_image_ref` accepts a digest-pinned public image directly, for example
 `ghcr.io/rise-deploy/rise@sha256:…`. Set exactly one of `rise_image_ref` and
-`rise_image_tag`.
+`rise_image_tag`, and likewise one of `rise_cli_image_ref` and
+`rise_cli_image_tag` for the `rise-cli` image the identity sidecar runs.
 
 Then create the DNS records from the `dns_records_required` output, or pass
-`route53_zone_id` and let the module make them. **The wildcard is required**:
+`route53_zone` and let the module make them. **The wildcard is required**:
 projects are served at `<project>.<domain>`, and groups and environments add
 another label.
+
+`route53_zone` takes the zone itself, so a zone created in the same
+configuration works in a single apply:
+
+```hcl
+resource "aws_route53_zone" "rise" {
+  name = "rise.example.com"
+}
+
+module "rise_ecs" {
+  # ...
+  route53_zone = aws_route53_zone.rise   # or data.aws_route53_zone.x, or { zone_id = "Z..." }
+}
+```
 
 ## New cluster, or one you already run
 
@@ -177,6 +205,28 @@ module "rise_ecs" {
 }
 ```
 
+Use `control_plane_secret_environment` for credentials referenced through Rise
+configuration expansion. Keys are control-plane environment-variable names;
+values are full Secrets Manager ARNs in the format ECS accepts, including the
+optional JSON-key, version-stage and version-id selectors. The five built-in
+names—those four plus `RISE_LOCAL_CONFIG_YAML`—are reserved.
+
+```hcl
+module "rise_ecs" {
+  # ...
+  control_plane_secret_environment = {
+    SNOWFLAKE_OAUTH_PRIVATE_KEY = "${aws_secretsmanager_secret.snowflake_oauth.arn}:private_key::"
+  }
+}
+```
+
+The corresponding YAML can use `${SNOWFLAKE_OAUTH_PRIVATE_KEY}`. ECS resolves
+the selected secret value before Rise starts, and Rise expands the environment
+reference while loading its configuration. `rise_task_secrets` retains the
+complete `valueFrom` reference. `secret_arns_for_execution_role` strips any ECS
+selectors to the base secret ARN and deduplicates additional references to the
+same secret for IAM.
+
 **Generated source values remain in Terraform state.** The database password,
 JWT signing key and encryption key are outputs of persistent `random` resources;
 an OIDC client secret supplied as an ordinary Terraform input can also reach the
@@ -201,7 +251,12 @@ failing closed at deploy time rather than half-working:
   `<name>-dex`. This keeps multiple installs distinct when they bring the same
   Cloud Map namespace.
 - **Workload identity tokens.** There is no way to write files into a running
-  Fargate task; a sidecar on a shared volume is the intended mechanism.
+  ECS task; a sidecar on a shared volume is the intended mechanism.
+- **EC2 capacity.** The cluster this module creates is Fargate-only, and the
+  control plane, Traefik and Dex always run on Fargate. The backend's
+  `capacity: ec2` setting is for a cluster you **bring** — it places workload
+  tasks on container instances you already run, and this module provisions no
+  Auto Scaling group, launch template, or capacity provider for them.
 
 ## Teardown
 
@@ -214,12 +269,27 @@ apply collides on the still-scheduled secret names).
 
 ## Layout
 
-`rise-aws` is a single `main.tf`; this module has roughly six times the resource
-count, so it is split by concern: `network.tf`, `security-groups.tf`,
-`cluster.tf`, `secrets.tf`, `database.tf`, `edge.tf`, `traefik.tf`, `rise.tf`,
-`dex.tf`. Every create-or-bring decision resolves in `locals.tf` and nowhere
-else — no resource refers to a counted resource directly, which is what keeps
-the two topologies from forking the module.
+`main.tf`, `runtime.tf` and `locals.tf` compose the install. The top level owns
+public inputs, installation-wide validation, configuration and outputs. Child
+modules receive typed dependencies and inherit the caller's providers.
 
-`tests/` holds `terraform test` suites covering both topologies and each
-guardrail. Run them with `mise run terraform:check`.
+| Child module | Responsibility |
+|---|---|
+| [`network`](modules/network) | VPC, subnets, routing, NAT and VPC endpoints |
+| [`cluster`](modules/cluster) | ECS cluster, private DNS namespace and logging |
+| [`security`](modules/security) | Service security groups and communication rules |
+| [`ingress`](modules/ingress) | Load balancer, listeners, target groups, DNS, ACME storage and Traefik IAM |
+| [`database`](modules/database) | PostgreSQL, credentials and database URL secret |
+| [`secrets`](modules/secrets) | Signing key, encryption key and OIDC secret |
+| [`dex`](modules/dex) | Optional demo identity provider |
+| [`runtime`](modules/runtime) | Rise and Traefik task definitions, services and discovery |
+| [`control-plane-env`](modules/control-plane-env) | Backend environment and routing labels |
+
+The security module keeps communication rules together. Network outputs expose
+VPC and subnet identities independently of endpoint creation, so security groups
+and endpoints can be composed without a dependency cycle. Ingress and secret
+outputs carry the readiness dependencies required before ECS starts tasks.
+
+`tests/` covers the public interface and installation guardrails; child tests
+cover component behavior. Run `mise run terraform:check` for formatting,
+validation, unit tests and isolated state-upgrade checks.

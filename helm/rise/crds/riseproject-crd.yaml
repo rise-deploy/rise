@@ -5,7 +5,6 @@ metadata:
 spec:
   group: rise.dev
   names:
-    categories: []
     kind: RiseProject
     plural: riseprojects
     shortNames:
@@ -13,8 +12,7 @@ spec:
     singular: riseproject
   scope: Cluster
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for RiseProjectSpec via `CustomResource`

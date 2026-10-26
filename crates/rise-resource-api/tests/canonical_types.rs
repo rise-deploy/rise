@@ -10,6 +10,7 @@ fn schema_accepts<T: schemars::JsonSchema>(value: &str) -> bool {
         .is_valid(&serde_json::json!(value))
 }
 
+/// ADR-0001 scenario 5
 #[test]
 fn subject_id_accepts_exactly_the_seven_canonical_forms() {
     let valid = [
@@ -103,6 +104,7 @@ fn subject_id_classifies_virtual_and_org_native_forms_exhaustively() {
     }
 }
 
+/// ADR-0001 scenario 5
 #[test]
 fn subject_ref_is_narrow_and_group_resolution_requires_an_org() {
     for value in ["user:u-01jz", "group:platform"] {
@@ -151,6 +153,8 @@ fn subject_ref_is_narrow_and_group_resolution_requires_an_org() {
     assert!(serde_json::from_str::<SubjectRef>("{}").is_err());
 }
 
+/// ADR-0001 scenario 1
+/// ADR-0001 scenario 2
 #[test]
 fn resource_kind_is_exact_qualified_and_route_versions_normalize() {
     for value in [
@@ -197,6 +201,7 @@ fn resource_kind_is_exact_qualified_and_route_versions_normalize() {
     assert!(serde_json::from_str::<ResourceKind>("[]").is_err());
 }
 
+/// ADR-0001 scenario 3
 #[test]
 fn scope_accepts_only_wildcard_or_qualified_kind_with_canonical_names() {
     for value in [

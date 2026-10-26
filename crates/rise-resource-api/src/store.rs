@@ -6,7 +6,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::{OwnerReference, ResourceParentRef, ResourceRow, ValidationError};
+use crate::{LabelKey, OwnerReference, ResourceParentRef, ResourceRow, ValidationError};
 
 /// Reserved finalizer prefix for store-managed finalizers. Controllers cannot
 /// add or remove finalizers in this namespace.
@@ -170,6 +170,112 @@ pub enum PathSegment {
     },
 }
 
+/// The store-independent half of [`ResourceStore::resolve_path`].
+///
+/// Resolving a path is one lookup per segment plus the rules that turn those
+/// lookups into a chain, and only the lookup is store-specific. This walk owns
+/// the rules, so every implementation agrees on them by construction:
+///
+/// - the first segment resolves under the root (`parent` is `None`), each
+///   later one under the row the previous segment produced;
+/// - a `Name` segment is looked up by kind, name, and that parent;
+/// - a `Uid` segment is looked up by UID alone, then verified against the
+///   expected kind and API versions ([`StoreError::KindMismatch`]) and against
+///   the walk's current parent ([`StoreError::ParentNotFound`]), so a UID
+///   from another subtree cannot be spliced into a path;
+/// - a missing leaf is [`StoreError::NotFound`], a missing ancestor is
+///   [`StoreError::ParentNotFound`], and no segments at all is
+///   [`StoreError::EmptyPath`].
+///
+/// A store drives it as a loop: ask [`PathWalk::pending`] what to look up,
+/// fetch that one row however it likes, and hand the answer to
+/// [`PathWalk::advance`]. Tombstoned rows pass through like any other;
+/// interpreting a deletion timestamp is the caller's job.
+///
+/// ```
+/// # use rise_resource_api::{PathSegment, PathWalk, ResourceRow, StoreError};
+/// # fn fetch(_: &PathSegment, _: Option<uuid::Uuid>) -> Option<ResourceRow> { None }
+/// # fn resolve(segments: &[PathSegment]) -> Result<Vec<ResourceRow>, StoreError> {
+/// let mut walk = PathWalk::new(segments)?;
+/// while let Some((segment, parent)) = walk.pending() {
+///     let row = fetch(segment, parent);
+///     walk.advance(row)?;
+/// }
+/// Ok(walk.finish())
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct PathWalk<'a> {
+    segments: &'a [PathSegment],
+    chain: Vec<ResourceRow>,
+}
+
+impl<'a> PathWalk<'a> {
+    /// Start a walk. An empty path is refused here, before any lookup.
+    pub fn new(segments: &'a [PathSegment]) -> Result<Self, StoreError> {
+        if segments.is_empty() {
+            return Err(StoreError::EmptyPath);
+        }
+        Ok(Self {
+            segments,
+            chain: Vec::with_capacity(segments.len()),
+        })
+    }
+
+    /// The parent the next lookup runs under: the last resolved row, or the
+    /// root before the first.
+    fn parent(&self) -> Option<Uuid> {
+        self.chain.last().map(|row| row.uid)
+    }
+
+    /// The next segment to look up and the parent to look it up under, or
+    /// `None` once every segment has resolved.
+    pub fn pending(&self) -> Option<(&'a PathSegment, Option<Uuid>)> {
+        self.segments
+            .get(self.chain.len())
+            .map(|segment| (segment, self.parent()))
+    }
+
+    /// Record the answer to the pending lookup, applying the chain rules.
+    ///
+    /// Calling this with nothing pending is a caller bug and panics, the same
+    /// way indexing past the end would.
+    pub fn advance(&mut self, row: Option<ResourceRow>) -> Result<(), StoreError> {
+        let (segment, parent) = self
+            .pending()
+            .expect("advance called after every segment resolved");
+        let Some(row) = row else {
+            return Err(if self.chain.len() + 1 == self.segments.len() {
+                StoreError::NotFound
+            } else {
+                StoreError::ParentNotFound
+            });
+        };
+        if let PathSegment::Uid {
+            api_versions, kind, ..
+        } = segment
+        {
+            if row.kind != *kind || !api_versions.contains(&row.api_version) {
+                return Err(StoreError::KindMismatch {
+                    expected: format!("kind {kind} in one of {api_versions:?}"),
+                    got: format!("{}/{}", row.api_version, row.kind),
+                });
+            }
+            if row.parent_uid != parent {
+                return Err(StoreError::ParentNotFound);
+            }
+        }
+        self.chain.push(row);
+        Ok(())
+    }
+
+    /// The resolved chain, root-first. Meaningful once [`Self::pending`] is
+    /// `None`; a walk abandoned early returns what it resolved so far.
+    pub fn finish(self) -> Vec<ResourceRow> {
+        self.chain
+    }
+}
+
 pub enum DeleteOutcome {
     Deleted,
     MarkedForDeletion(Box<ResourceRow>),
@@ -226,7 +332,6 @@ pub struct CollectionInfo {
     pub kind: String,
     pub parent: Option<ResourceParentRef>,
     pub spec_validator: Arc<dyn SpecValidator>,
-    pub allowed_status_controller_ids: Vec<String>,
 }
 
 /// The remotable half of the resource contract (ADR-0004 §3): the operations a
@@ -284,15 +389,20 @@ pub trait ResourceApi: Send + Sync {
     /// retain the owner. A resource without blocking dependents or finalizers is
     /// deleted immediately.
     async fn delete(&self, uid: Uuid) -> Result<DeleteOutcome, StoreError>;
-    /// Merge one allowed controller's value under `status.controllers`.
+    /// Merge the calling Controller's value under
+    /// `status.controllers[<controller_id>]`. `controller_id` is the
+    /// authorized Controller subject's resource name, not a config-declared
+    /// identity — access to this method is an ordinary RBAC decision made
+    /// before it is called.
     async fn update_controller_status(
         &self,
         uid: Uuid,
         controller_id: &str,
         status_value: serde_json::Value,
     ) -> Result<ResourceRow, StoreError>;
-    /// Atomically add/remove finalizers owned by an allowed controller while
+    /// Atomically add/remove finalizers owned by the calling Controller while
     /// rejecting the reserved system namespace and other controllers' keys.
+    /// `controller_id` is the authorized Controller subject's resource name.
     async fn update_controller_finalizers(
         &self,
         uid: Uuid,
@@ -359,6 +469,23 @@ pub trait ResourceStore: ResourceApi {
         uid: Uuid,
         label_key: &str,
     ) -> Result<Vec<ResourceRow>, StoreError>;
+    /// Live rows whose own `labels` carry `key`, of any kind, ordered oldest
+    /// first, capped at `limit`.
+    ///
+    /// The complement of [`Self::label_inheriting_descendants`]: that walks
+    /// one resource's subtree for what inherits a value, this finds every
+    /// resource in the store that sets a key itself — the seed set the audit's
+    /// label-backed detectors need to reason about who `rise.dev/owner` names,
+    /// or whether a `labelSelector` can ever match anything, without a subtree
+    /// walk from every binding's scope. `limit` keeps a single call bounded
+    /// regardless of install size; a result of exactly `limit` rows means the
+    /// answer may be incomplete and the caller should treat it as such rather
+    /// than assume it has seen every setter.
+    async fn list_label_setters(
+        &self,
+        key: &LabelKey,
+        limit: i64,
+    ) -> Result<Vec<ResourceRow>, StoreError>;
     /// Force-update status as an operator, storing the value under
     /// `status.controllers.operator:<operator>`.
     async fn operator_update_status(
@@ -411,4 +538,131 @@ pub trait ResourceStore: ResourceApi {
         uid: Uuid,
         params: UpdateResourceParams,
     ) -> Result<ResourceRow, StoreError>;
+}
+
+#[cfg(test)]
+mod path_walk_tests {
+    use super::*;
+
+    fn row(kind: &str, name: &str, parent_uid: Option<Uuid>) -> ResourceRow {
+        let now = Utc::now();
+        ResourceRow {
+            uid: Uuid::new_v4(),
+            api_version: "rise.dev/v1alpha1".to_owned(),
+            kind: kind.to_owned(),
+            parent_uid,
+            name: name.to_owned(),
+            discriminator: String::new(),
+            labels: BTreeMap::new(),
+            metadata: serde_json::json!({}),
+            spec: serde_json::json!({}),
+            status: serde_json::json!({}),
+            revision: 1,
+            finalizers: Vec::new(),
+            owner_references: Vec::new(),
+            deletion_timestamp: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn name(kind: &str, name: &str) -> PathSegment {
+        PathSegment::Name {
+            api_versions: vec!["rise.dev/v1alpha1".to_owned()],
+            kind: kind.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    fn uid(kind: &str, uid: Uuid) -> PathSegment {
+        PathSegment::Uid {
+            api_versions: vec!["rise.dev/v1alpha1".to_owned()],
+            kind: kind.to_owned(),
+            uid,
+        }
+    }
+
+    /// The one lookup every store supplies, over an in-memory table.
+    fn walk(
+        rows: &[ResourceRow],
+        segments: &[PathSegment],
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        let mut walk = PathWalk::new(segments)?;
+        while let Some((segment, parent)) = walk.pending() {
+            let row = match segment {
+                PathSegment::Name { kind, name, .. } => rows
+                    .iter()
+                    .find(|row| row.kind == *kind && row.name == *name && row.parent_uid == parent)
+                    .cloned(),
+                PathSegment::Uid { uid, .. } => rows.iter().find(|row| row.uid == *uid).cloned(),
+            };
+            walk.advance(row)?;
+        }
+        Ok(walk.finish())
+    }
+
+    #[test]
+    fn walks_names_root_first() {
+        let org = row("Organization", "acme", None);
+        let project = row("Project", "app", Some(org.uid));
+        let rows = vec![org.clone(), project.clone()];
+        let chain = walk(
+            &rows,
+            &[name("Organization", "acme"), name("Project", "app")],
+        )
+        .unwrap();
+        assert_eq!(
+            chain.iter().map(|row| row.uid).collect::<Vec<_>>(),
+            vec![org.uid, project.uid]
+        );
+    }
+
+    #[test]
+    fn a_missing_leaf_and_a_missing_ancestor_are_told_apart() {
+        let org = row("Organization", "acme", None);
+        let rows = vec![org];
+        assert!(matches!(
+            walk(
+                &rows,
+                &[name("Organization", "acme"), name("Project", "nope")]
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            walk(
+                &rows,
+                &[name("Organization", "nope"), name("Project", "app")]
+            ),
+            Err(StoreError::ParentNotFound)
+        ));
+        assert!(matches!(walk(&rows, &[]), Err(StoreError::EmptyPath)));
+    }
+
+    #[test]
+    fn a_uid_segment_is_checked_against_kind_and_parent() {
+        let acme = row("Organization", "acme", None);
+        let beta = row("Organization", "beta", None);
+        let project = row("Project", "app", Some(acme.uid));
+        let rows = vec![acme.clone(), beta.clone(), project.clone()];
+
+        let chain = walk(&rows, &[uid("Organization", acme.uid)]).unwrap();
+        assert_eq!(chain[0].uid, acme.uid);
+
+        assert!(matches!(
+            walk(&rows, &[uid("Project", acme.uid)]),
+            Err(StoreError::KindMismatch { .. })
+        ));
+        // A real UID from another subtree cannot be spliced under a different parent.
+        assert!(matches!(
+            walk(
+                &rows,
+                &[name("Organization", "beta"), uid("Project", project.uid)]
+            ),
+            Err(StoreError::ParentNotFound)
+        ));
+        assert!(matches!(
+            walk(&rows, &[uid("Organization", Uuid::new_v4())]),
+            Err(StoreError::NotFound)
+        ));
+    }
 }

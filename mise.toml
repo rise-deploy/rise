@@ -3,18 +3,20 @@ railpack = "github:railwayapp/railpack"
 buildkit = "github:moby/buildkit"
 
 [tools]
-minikube = "1.38.1"
-pack = "0.40.9"
+minikube = "1.39.0"
+pack = "0.40.10"
 railpack = "0.15.1"
 buildkit = "0.28.0"
 "cargo:sqlx-cli" = "latest"
 "cargo:cargo-all-features" = "latest"
+# Dependency license policy. See deny.toml.
+"cargo:cargo-deny" = "latest"
 helm = "latest"
 # Pinned, not "latest": the modules' `terraform test` files use override_data and
 # check blocks, whose behaviour is version-sensitive. Bump deliberately, and run
 # `mise run terraform:check` in the same change.
-terraform = "1.16.0"
-rust = { version = "1.95.0", profile = "default" }
+terraform = "1.16.7"
+rust = { version = "1.97.1", profile = "default" }
 kubectl = "latest"
 k9s = "latest"
 vault = "latest"
@@ -75,19 +77,29 @@ mise run backend:run "$backend"
 
 [tasks."sqlx:prepare"]
 description = "Prepare the SQLX query cache that needs to be committed for building with SQLX_OFFLINE=true."
-run = "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets"
+# Build the dependencies first: `sqlx prepare` collects the queries of every
+# crate it compiles, so rise-runtime-sync, which owns its own query cache,
+# would otherwise land in rise-deploy's when it isn't already built, e.g. on a
+# cold CI cache.
+run = [
+    "cargo check --package rise-deploy --features cli,backend --all-targets",
+    "cargo sqlx prepare -- --package rise-deploy --features cli,backend --all-targets",
+]
+
+[tasks.deny]
+description = "Check dependency licenses and sources against deny.toml."
+run = "cargo deny check licenses sources"
 
 [tasks."sqlx:check"]
 description = "Check that all SQLX queries are valid."
-run = "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets"
-
-[tasks."resource-store-postgres:sqlx:prepare"]
-description = "Prepare the SQLX query cache for rise-resource-store-postgres (requires running DB)."
-run = "cargo sqlx prepare -- --package rise-resource-store-postgres --all-targets"
-
-[tasks."resource-store-postgres:sqlx:check"]
-description = "Verify the SQLX query cache for rise-resource-store-postgres is up to date."
-run = "cargo sqlx prepare --check -- --package rise-resource-store-postgres --all-targets"
+# Build the dependencies first: `sqlx prepare` collects the queries of every
+# crate it compiles, so rise-runtime-sync, which owns its own query cache,
+# would otherwise land in rise-deploy's when it isn't already built, e.g. on a
+# cold CI cache.
+run = [
+    "cargo check --package rise-deploy --features cli,backend --all-targets",
+    "cargo sqlx prepare --check -- --package rise-deploy --features cli,backend --all-targets",
+]
 
 [tasks."runtime-sync:db:migrate"]
 description = "Create the runtime_sync schema/tables in the dev DB (needed before runtime-sync:sqlx:prepare)."
@@ -110,6 +122,10 @@ description = "Verify the SQLX query cache for rise-runtime-sync is up to date."
 dir = "crates/rise-runtime-sync"
 run = "cargo sqlx prepare --check -- --all-targets"
 
+[tasks."adr:conformance:check"]
+description = "Verify every applicable ADR-0001 acceptance scenario (1-57) is claimed by a test marker and no deferred scenario (58-61) is."
+run = "bash scripts/check-adr-conformance.sh"
+
 [tasks.lint]
 description = "Run all linting checks (clippy, formatting, sqlx, helm)."
 run = """
@@ -124,7 +140,9 @@ cargo all-features clippy --all-targets -- -D warnings
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo fmt --all -- --check
 mise sqlx:check
+mise deny
 mise resource:schema:check
+mise adr:conformance:check
 helm lint helm/rise
 mise terraform:check
 # Every crate whose tests need no database. Expressed as exclusions so a new
@@ -139,15 +157,16 @@ env.SQLX_OFFLINE = true
 [tasks."terraform:check"]
 description = "Format-check, validate and unit-test the Terraform modules and e2e workspaces."
 run = """
-terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run
+terraform fmt -check -recursive modules/ tests/e2e/bootstrap tests/e2e/run tests/e2e/aws-install
 # -backend=false so the e2e workspaces, which declare an S3 backend, check
 # without credentials or a bucket.
-for dir in modules/*/ tests/e2e/bootstrap tests/e2e/run; do
+for dir in modules/*/ modules/rise-ecs/modules/*/ tests/e2e/bootstrap tests/e2e/run tests/e2e/aws-install; do
   echo "==> $dir"
   terraform -chdir="$dir" init -backend=false -input=false >/dev/null
   terraform -chdir="$dir" validate
   terraform -chdir="$dir" test
 done
+python3 scripts/check-ecs-runtime-upgrade.py
 """
 
 [tasks."terraform:fmt"]

@@ -4,7 +4,7 @@ This Helm chart deploys the Rise application on Kubernetes, including the backen
 
 ## Prerequisites
 
-- Kubernetes 1.19+
+- Kubernetes 1.32+
 - Helm 3.0+
 - PostgreSQL database (can be deployed as a dependency or use external database)
 

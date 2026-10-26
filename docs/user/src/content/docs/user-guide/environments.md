@@ -15,11 +15,11 @@ rise environment list
 ```
 
 ```
-╭────────────┬───────────────┬────────────┬───────╮
-│ NAME       │ PRIMARY GROUP │ PRODUCTION │ COLOR │
-├────────────┼───────────────┼────────────┼───────┤
-│ production │ default       │ yes        │ green │
-╰────────────┴───────────────┴────────────┴───────╯
+╭────────────┬───────────────┬────────────┬───────┬────────────────╮
+│ NAME       │ PRIMARY GROUP │ PRODUCTION │ COLOR │ MAX EXPIRATION │
+├────────────┼───────────────┼────────────┼───────┼────────────────┤
+│ production │ default       │ yes        │ green │ -              │
+╰────────────┴───────────────┴────────────┴───────┴────────────────╯
 ```
 
 ## Creating Environments
@@ -34,6 +34,7 @@ rise environment create dev -p my-app --group dev --color yellow
 | `--group`, `-g` | Primary deployment group for this environment |
 | `--production` | Set as the production environment (one per project) |
 | `--color` | Badge color: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray` (default: `green`) |
+| `--max-expiration` | Caps the lifetime of deployments into any non-primary group, e.g. `7d`, `12h`, `30m` (default: no cap) |
 
 Names must be lowercase alphanumeric with hyphens, no consecutive `--` (same rules as deployment groups).
 
@@ -67,6 +68,12 @@ rise environment update staging --production true
 
 # Change color
 rise environment update staging --color purple
+
+# Set (or change) the max expiration for non-primary groups
+rise environment update staging --max-expiration 7d
+
+# Clear the max expiration
+rise environment update staging --max-expiration ""
 ```
 
 Setting `--production true` automatically transfers the flag from the environment that previously held it.
@@ -98,7 +105,6 @@ When `-E` is omitted, Rise resolves the target environment in order:
 
 1. **`rise.toml` default** — if a `rise.toml` is present and one of its `[environments.<name>]` sections has `default = true`, that environment name is sent to the server.
 2. **Server auto-resolve** — if no environment is specified by the client, the server picks one based on how many environments the project has:
-   - **0 environments**: deploys to the `default` group with no environment association.
    - **1 environment**: uses that environment and its primary group.
    - **2 or more environments**: returns an error — you must pass `-E` explicitly.
 
@@ -122,6 +128,14 @@ The environment and deployment group are resolved together:
 
 If an environment is specified but has no primary deployment group, you must also pass `--group`.
 
+### Maximum Expiration for Non-Primary Groups
+
+An environment's `--max-expiration` caps how long a deployment can live once it lands in a group other than that environment's primary deployment group — the preview deployments created by `--group mr/123`, for example. An environment with no primary group has no group exempt from the cap, so it applies to every deployment created into it.
+
+A deployment created without `--expire` gets the max as its expiration. One created with a longer `--expire` is clamped down to the max; a shorter one is left as requested. Either way, when the cap changes what a deployment's `expires_at` would otherwise have been, that is recorded on the deployment's creation event alongside what was actually requested.
+
+Changing `--max-expiration` only affects deployments created afterward — it does not reach back and change `expires_at` on deployments that already exist.
+
 See [Deployments](../deployments) for the full deployment lifecycle.
 
 ## URL Routing
@@ -132,7 +146,7 @@ Each deployment gets a URL based on how it is associated with environments and g
 |----------------|-------------|---------|
 | Production environment | Project's main URL (and any custom domain) | `my-app.apps.rise.example.com` |
 | Non-production environment | Environment-specific URL | `staging--my-app.preview.rise.example.com` |
-| No environment (group only) | Group-specific staging URL | `mr--123--my-app.preview.rise.example.com` |
+| Any other group (e.g. previews) | Group-specific staging URL | `mr--123--my-app.preview.rise.example.com` |
 
 The exact URL patterns depend on how your Rise platform is configured — contact your operator if the URLs don't match what you expect. Custom domains only apply to deployments in the production environment.
 
@@ -142,7 +156,7 @@ Scope environment variables to a specific environment with the `-E` flag:
 
 ```bash
 # Set a variable only for staging
-rise env set DATABASE_URL postgres://staging-db/mydb -E staging
+rise env set DATABASE_URL postgres://staging-db/mydb --plain -E staging
 
 # List variables for staging (shows merged global + scoped)
 rise env list -p my-app -E staging

@@ -18,7 +18,7 @@
 //!    between drift detection and readiness, and a task definition
 //!    is registered only when its content hash actually moves.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -42,10 +42,13 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::aws_error_detail;
-use crate::service::{self, ActualService, DesiredService, ServiceAction};
+use crate::capacity::Capacity;
+use crate::service::{self, ActualService, DesiredService, IdentityCredentialPlan, ServiceAction};
 use crate::ssm;
 use crate::tags::ServiceTags;
-use crate::task_definition::{self, SecretRef, TaskDefinitionConfig, TaskDefinitionSpec};
+use crate::task_definition::{
+    self, IdentityAgentSpec, SecretRef, TaskDefinitionConfig, TaskDefinitionSpec,
+};
 
 /// Leadership must remain valid for at least this long before we start a
 /// project's destructive work. Mirrors the Docker reconciler.
@@ -157,6 +160,15 @@ const TASK_DEFINITION_HASH_SUFFIX: &str = "task-definition-hash";
 const ECS_META_KEY: &str = "ecs";
 const TD_HASH_META_KEY: &str = "task_definition_hash";
 
+/// Project-scoped state shared by every deployment health pass in one tick.
+struct HealthReconcileInput<'a> {
+    desired: &'a [DesiredContainer],
+    services: &'a [ActualService],
+    registered: &'a HashMap<String, String>,
+    desired_td_hash: Option<&'a str>,
+    server_status_cache: &'a mut HashMap<String, Option<HashMap<String, bool>>>,
+}
+
 impl EcsReconciler {
     /// Load the previous observations, derive what changed, and store both.
     async fn record_observations(
@@ -246,7 +258,7 @@ fn resource_adjustment_event(
     container: &str,
     requested_cpu: &str,
     requested_memory: &str,
-    size: crate::sizing::FargateSize,
+    size: crate::sizing::TaskSize,
 ) -> ForwardedEvent {
     ForwardedEvent {
         dedupe_key: format!(
@@ -300,6 +312,75 @@ fn persisted_td_hash(controller_metadata: &serde_json::Value) -> Option<String> 
         .map(str::to_string)
 }
 
+/// The service-level shape ECS reports for a running service.
+///
+/// `None` when there is no `awsvpc` configuration to read. Unknown is not drift:
+/// a shape we cannot see is left alone rather than "corrected" into a rolling
+/// replacement on the strength of a missing field.
+fn observed_shape(svc: &aws_sdk_ecs::types::Service) -> Option<crate::service::ObservedShape> {
+    let vpc = svc.network_configuration()?.awsvpc_configuration()?;
+    Some(crate::service::ObservedShape {
+        subnets: vpc.subnets().iter().cloned().collect(),
+        security_groups: vpc.security_groups().iter().cloned().collect(),
+        assign_public_ip: matches!(
+            vpc.assign_public_ip(),
+            Some(aws_sdk_ecs::types::AssignPublicIp::Enabled)
+        ),
+        launch_type: svc.launch_type().map(|lt| lt.as_str().to_string()),
+        capacity_providers: svc
+            .capacity_provider_strategy()
+            .iter()
+            .map(|item| item.capacity_provider().to_string())
+            .collect(),
+    })
+}
+
+/// Place a service's tasks on the configured capacity.
+///
+/// `launchType` and `capacityProviderStrategy` are mutually exclusive on
+/// `CreateService`, so this matches exhaustively rather than setting both --
+/// which also means a new [`Capacity`] variant fails the build here instead of
+/// silently placing tasks on the default.
+fn apply_capacity(
+    req: aws_sdk_ecs::operation::create_service::builders::CreateServiceFluentBuilder,
+    capacity: &Capacity,
+) -> Result<aws_sdk_ecs::operation::create_service::builders::CreateServiceFluentBuilder> {
+    use aws_sdk_ecs::types as ecs_types;
+    Ok(match capacity {
+        Capacity::Fargate => req.launch_type(ecs_types::LaunchType::Fargate),
+        Capacity::Ec2 => req.launch_type(ecs_types::LaunchType::Ec2),
+        Capacity::Provider(provider) => {
+            let mut item = ecs_types::CapacityProviderStrategyItem::builder()
+                .capacity_provider(&provider.name);
+            if let Some(base) = provider.base {
+                item = item.base(base);
+            }
+            if let Some(weight) = provider.weight {
+                item = item.weight(weight);
+            }
+            req.capacity_provider_strategy(
+                item.build()
+                    .map_err(|e| anyhow::anyhow!("invalid capacity provider strategy: {e}"))?,
+            )
+        }
+    })
+}
+
+/// The `requiresCompatibilities` token for a capacity.
+///
+/// Matched rather than converted from a string: `Compatibility::from` maps an
+/// unrecognised value to an `Unknown` variant that serialises verbatim, so a
+/// drift between the two enums would reach `RegisterTaskDefinition` as an
+/// AWS-shaped error per deployment rather than a compile error here.
+fn compatibility_type(
+    compatibility: crate::capacity::Compatibility,
+) -> aws_sdk_ecs::types::Compatibility {
+    match compatibility {
+        crate::capacity::Compatibility::Fargate => aws_sdk_ecs::types::Compatibility::Fargate,
+        crate::capacity::Compatibility::Ec2 => aws_sdk_ecs::types::Compatibility::Ec2,
+    }
+}
+
 /// Fold the converged task-definition hash into a controller-metadata object,
 /// leaving any sibling keys untouched. A no-op if `hash` is `None` or the
 /// metadata is not a JSON object.
@@ -324,6 +405,9 @@ pub struct ReconcilerConfig {
     pub subnets: Vec<String>,
     pub security_groups: Vec<String>,
     pub assign_public_ip: bool,
+    /// Where workload tasks run. `awsvpc` either way -- see
+    /// [`crate::capacity`].
+    pub capacity: Capacity,
     pub execution_role_arn: Option<String>,
     pub task_role_arn: Option<String>,
     /// Secrets Manager secret ECS reads to authenticate pulls from a private
@@ -345,6 +429,27 @@ pub struct ReconcilerConfig {
     pub traefik_entrypoint: String,
     pub traefik_certresolver: Option<String>,
     pub traefik_api_url: Option<String>,
+    /// Image the workload-identity sidecar runs (ADR-0005 D8).
+    pub identity_agent_image: String,
+    /// Base URL of the Rise API as the sidecar reaches it.
+    pub identity_exchange_url: String,
+    /// Lifetime of the `[identity]` token files the sidecar mints.
+    pub identity_token_ttl_seconds: u64,
+}
+
+/// Path of the token-exchange endpoint the identity sidecar mints the token
+/// files from, under [`ReconcilerConfig::identity_exchange_url`].
+const TOKEN_EXCHANGE_PATH: &str = "/api/v1/identity/token";
+
+/// A deployment's `[identity].audiences` as filename → audience. Filenames are
+/// validated at deploy time; unsafe ones are dropped again here because the
+/// sidecar turns them into paths.
+fn declared_audiences(identity_audiences: &serde_json::Value) -> BTreeMap<String, String> {
+    serde_json::from_value::<BTreeMap<String, String>>(identity_audiences.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(filename, _)| rise_backend_core::identity::is_safe_token_filename(filename))
+        .collect()
 }
 
 /// Whether a service whose deployment resolved to `status` should be collected.
@@ -903,6 +1008,11 @@ impl EcsReconciler {
                             self.store
                                 .update_project_calculated_status(project.id)
                                 .await?;
+                            rise_backend_core::lifecycle::restore_traefik_predecessor_if_interrupted(
+                                self.store.as_ref(),
+                                deployment.id,
+                            )
+                            .await?;
                         }
                     } else {
                         // Already serving, or on its way down. See
@@ -965,6 +1075,28 @@ impl EcsReconciler {
             desired.iter().map(|(d, _, _)| d.clone()).collect();
         let actions = service::diff_services(&desired_services, &actual, &protected_deployment_ids);
 
+        // Capacity is reported, never applied in place: ECS restricts which
+        // launch-type/capacity-provider transitions `UpdateService` performs,
+        // and the permitted ones need a forced new deployment. A retopology is
+        // the operator's call, and the next deploy carries it for free -- Rise
+        // creates one service per deployment, so those are new services.
+        let capacity_drift = service::capacity_drift(&desired_services, &actual);
+        if let Some(first) = capacity_drift.first() {
+            // One line for the whole project, not one per service: the condition
+            // persists until the project is redeployed, and this loop runs every
+            // `reconcile_interval_secs`.
+            warn!(
+                project = %project.name,
+                services = capacity_drift.len(),
+                "{} of this project's services run on {} but the install is configured \
+                 for {}. ECS cannot move a running service between capacities; the next \
+                 deployment of this project will use the configured one.",
+                capacity_drift.len(),
+                first.observed,
+                first.desired,
+            );
+        }
+
         if !actions.is_empty() && !self.confirm_leadership(election).await {
             return Ok(());
         }
@@ -983,16 +1115,24 @@ impl EcsReconciler {
             if !should_have_infrastructure(deployment) {
                 continue;
             }
+            let selected: Vec<DesiredContainer> = desired
+                .iter()
+                .filter(|(_, _, container)| container.deployment_uuid == deployment.id.to_string())
+                .map(|(_, _, container)| container.clone())
+                .collect();
             if let Err(e) = self
                 .reconcile_health(
                     project,
                     deployment,
-                    &actual,
-                    &registered,
-                    desired_hash_by_deployment
-                        .get(&deployment.deployment_id)
-                        .map(String::as_str),
-                    &mut server_status_cache,
+                    HealthReconcileInput {
+                        desired: &selected,
+                        services: &actual,
+                        registered: &registered,
+                        desired_td_hash: desired_hash_by_deployment
+                            .get(&deployment.deployment_id)
+                            .map(String::as_str),
+                        server_status_cache: &mut server_status_cache,
+                    },
                 )
                 .await
             {
@@ -1038,13 +1178,12 @@ impl EcsReconciler {
 
         // Fail closed on the features v1 does not implement, rather than
         // deploying something that looks fine and is quietly broken.
-        Self::permanent(self.reject_unsupported(deployment, &container_specs))?;
+        Self::permanent(self.reject_unsupported(&container_specs))?;
 
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let env_name = environment.as_ref().map(|e| e.name.clone());
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
@@ -1056,17 +1195,12 @@ impl EcsReconciler {
             &all_environments,
             &custom_domains,
         );
-        let primary_hosts = self.url_builder.primary_ingress_hosts(
+        let primary_hosts = self.url_builder.public_hosts_for_group(
             project,
             &deployment.deployment_group,
-            environment.as_ref().filter(|e| {
-                e.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-            }),
-            &custom_domains,
-            true,
             &all_environments,
+            &custom_domains,
         );
-        let primary_hosts: Vec<String> = primary_hosts.into_iter().map(|h| h.host).collect();
 
         // Secrets are kept SEPARATE from plain env — the whole point of D7. They
         // still ride in the merged env, since a container sees one flat
@@ -1129,14 +1263,9 @@ impl EcsReconciler {
     /// implement.
     ///
     /// Explicit rejection, never silent degradation: a multi-container app whose
-    /// siblings cannot resolve each other, or a workload whose identity token
-    /// files never appear, would deploy "successfully" and then fail in ways that
-    /// look like application bugs.
-    fn reject_unsupported(
-        &self,
-        deployment: &Deployment,
-        container_specs: &[ContainerSpec],
-    ) -> Result<()> {
+    /// siblings cannot resolve each other would deploy "successfully" and then
+    /// fail in ways that look like application bugs.
+    fn reject_unsupported(&self, container_specs: &[ContainerSpec]) -> Result<()> {
         if container_specs.len() > 1 {
             anyhow::bail!(
                 "the ECS backend does not yet support multi-container deployments ({} \
@@ -1146,19 +1275,6 @@ impl EcsReconciler {
                  containers as separate Rise projects, or use the Kubernetes or Docker \
                  backend.",
                 container_specs.len()
-            );
-        }
-        let requests_identity = deployment
-            .identity_audiences
-            .as_object()
-            .is_some_and(|m| !m.is_empty());
-        if requests_identity {
-            anyhow::bail!(
-                "the ECS backend does not yet deliver workload-identity tokens, but this \
-                 deployment declares `[identity].audiences`. The token files would never \
-                 appear at /var/run/secrets/rise/identity/, so the workload would fail at \
-                 runtime. Remove the `[identity]` section, or use the Kubernetes or Docker \
-                 backend."
             );
         }
         Ok(())
@@ -1288,15 +1404,41 @@ impl EcsReconciler {
             Self::permanent(ssm::validate(key, value))?;
         }
 
+        // Every task carries the identity sidecar: the credential is universal
+        // on every backend. A deployment already serving without one gains it
+        // here too, which registers a new revision and rolls it once.
+        let identity_credential = IdentityCredentialPlan {
+            parameter: ssm::identity_credential_parameter(
+                &self.config.ssm_parameter_prefix,
+                &project.name,
+                &deployment.deployment_group,
+                &deployment.deployment_id,
+            ),
+            deployment_uuid: deployment.id,
+            provision: deployment.identity_credential_hash.is_none(),
+        };
+        let identity_agent = IdentityAgentSpec {
+            image: self.config.identity_agent_image.clone(),
+            credential_parameter: identity_credential.parameter.clone(),
+            token_url: format!(
+                "{}{TOKEN_EXCHANGE_PATH}",
+                self.config.identity_exchange_url.trim_end_matches('/')
+            ),
+            audiences: declared_audiences(&deployment.identity_audiences),
+            token_ttl_seconds: self.config.identity_token_ttl_seconds,
+        };
+
         // Everything build() rejects -- an unsatisfiable Fargate size, an
         // environment past the task-definition limit -- is a property of the
         // spec and will be rejected identically forever.
         let task_def = Self::permanent(task_definition::build(
             &desired_container,
             &secrets,
+            Some(&identity_agent),
             &TaskDefinitionConfig {
                 resource_prefix: &self.config.resource_prefix,
                 cpu_architecture: &self.config.cpu_architecture,
+                compatibility: self.config.capacity.compatibility(),
                 execution_role_arn: self.config.execution_role_arn.as_deref(),
                 repository_credentials_secret_arn: self
                     .config
@@ -1348,6 +1490,8 @@ impl EcsReconciler {
             family: task_def.family.clone(),
             task_definition_hash: task_def.content_hash(),
             desired_count: replica_count as i32,
+            shape: self.desired_shape(),
+            identity_credential: Some(identity_credential),
             tags: ServiceTags {
                 project: project.name.clone(),
                 project_uuid: project.id.to_string(),
@@ -1461,6 +1605,7 @@ impl EcsReconciler {
                         deployment_group: String::new(),
                         events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
+                        shape: observed_shape(svc),
                     });
                     continue;
                 };
@@ -1489,6 +1634,7 @@ impl EcsReconciler {
                         deployment_group: parsed.deployment_group.clone(),
                         events: service_narrative(svc),
                         rollout_started_at: primary_rollout_start(svc),
+                        shape: observed_shape(svc),
                     },
                     tags: parsed,
                 });
@@ -1559,6 +1705,11 @@ impl EcsReconciler {
                         None => continue,
                     }
                 }
+                ServiceAction::UpdateServiceShape {
+                    name,
+                    desired_count,
+                    ..
+                } => self.update_service_shape(name, *desired_count).await,
                 ServiceAction::UpdateDesiredCount {
                     name,
                     desired_count,
@@ -1604,10 +1755,63 @@ impl EcsReconciler {
         project: &Project,
         entry: &(DesiredService, TaskDefinitionSpec, DesiredContainer),
     ) -> Result<String> {
-        let (_, task_def, desired_container) = entry;
+        let (desired, task_def, desired_container) = entry;
+        if let Some(plan) = &desired.identity_credential {
+            self.provision_identity_credential(project, plan).await?;
+        }
         self.put_secrets(project, desired_container, task_def)
             .await?;
         self.register_task_definition(task_def).await
+    }
+
+    /// Mint a deployment's workload-identity bootstrap credential, once.
+    ///
+    /// The order is what makes this safe to interrupt: the parameter is written
+    /// first and the hash persisted second, and both happen before the task
+    /// definition that references the parameter is registered. A failure at any
+    /// point leaves no service running with a credential the token endpoint does
+    /// not know, and the next tick -- still seeing no hash -- simply mints again,
+    /// overwriting a parameter nothing has read yet. Once the hash is on record
+    /// the plan stops asking for provisioning and the parameter is left alone.
+    async fn provision_identity_credential(
+        &self,
+        project: &Project,
+        plan: &IdentityCredentialPlan,
+    ) -> Result<()> {
+        if !plan.provision {
+            return Ok(());
+        }
+        let credential = rise_backend_auth::generate_bootstrap_credential();
+        let mut req = self
+            .ssm
+            .put_parameter()
+            .name(&plan.parameter)
+            .value(&credential)
+            .r#type(aws_sdk_ssm::types::ParameterType::SecureString)
+            .overwrite(true);
+        if let Some(key_id) = &self.config.ssm_kms_key_id {
+            req = req.key_id(key_id);
+        }
+        req.send().await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write the workload identity credential for project {} to SSM: {}",
+                project.name,
+                aws_error_detail(&e)
+            )
+        })?;
+        self.store
+            .set_identity_credential_hash(
+                plan.deployment_uuid,
+                &rise_backend_auth::sha256_hex(credential.as_bytes()),
+            )
+            .await
+            .context("Failed to persist the workload identity credential hash")?;
+        info!(
+            project = %project.name,
+            deployment = %plan.deployment_uuid,
+            "Provisioned the workload identity credential"
+        );
+        Ok(())
     }
 
     /// Write the deployment's secret env vars to SSM as `SecureString`s.
@@ -1617,7 +1821,7 @@ impl EcsReconciler {
         desired_container: &DesiredContainer,
         task_def: &TaskDefinitionSpec,
     ) -> Result<()> {
-        let secrets = &task_def.containers[0].secrets;
+        let secrets = &task_def.app().secrets;
         if secrets.is_empty() {
             return Ok(());
         }
@@ -1743,62 +1947,19 @@ impl EcsReconciler {
     async fn register_task_definition(&self, spec: &TaskDefinitionSpec) -> Result<String> {
         use aws_sdk_ecs::types as ecs_types;
 
-        let container = &spec.containers[0];
-        let mut cd = ecs_types::ContainerDefinition::builder()
-            .name(&container.name)
-            .image(&container.image)
-            .essential(true);
-
-        for (k, v) in &container.environment {
-            cd = cd.environment(ecs_types::KeyValuePair::builder().name(k).value(v).build());
-        }
-        for secret in &container.secrets {
-            cd = cd.secrets(
-                ecs_types::Secret::builder()
-                    .name(&secret.name)
-                    .value_from(&secret.value_from)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid secret reference: {e}"))?,
-            );
-        }
-        for (k, v) in &container.docker_labels {
-            cd = cd.docker_labels(k, v);
-        }
-        if let Some(arn) = &container.repository_credentials_secret_arn {
-            cd = cd.repository_credentials(
-                ecs_types::RepositoryCredentials::builder()
-                    .credentials_parameter(arn)
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid repository credentials: {e}"))?,
-            );
-        }
-        if let Some(port) = container.port {
-            cd = cd.port_mappings(
-                ecs_types::PortMapping::builder()
-                    .container_port(port as i32)
-                    .protocol(ecs_types::TransportProtocol::Tcp)
-                    .build(),
-            );
-        }
-        if let Some(log) = &container.log_config {
-            cd = cd.log_configuration(
-                ecs_types::LogConfiguration::builder()
-                    .log_driver(ecs_types::LogDriver::Awslogs)
-                    .options("awslogs-group", &log.log_group)
-                    .options("awslogs-region", &log.region)
-                    .options("awslogs-stream-prefix", &log.stream_prefix)
-                    .options("awslogs-create-group", "true")
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("invalid log configuration: {e}"))?,
-            );
+        let mut container_definitions = Vec::with_capacity(spec.containers.len());
+        for container in &spec.containers {
+            container_definitions.push(container_definition(container)?);
         }
 
         let mut req = self
             .ecs
             .register_task_definition()
             .family(&spec.family)
+            // Not configurable: readiness keys Traefik's `serverStatus` on the
+            // task's own ENI address, which only `awsvpc` provides.
             .network_mode(ecs_types::NetworkMode::Awsvpc)
-            .requires_compatibilities(ecs_types::Compatibility::Fargate)
+            .requires_compatibilities(compatibility_type(self.config.capacity.compatibility()))
             .cpu(&spec.cpu)
             .memory(&spec.memory)
             .runtime_platform(
@@ -1820,7 +1981,12 @@ impl EcsReconciler {
                     .operating_system_family(ecs_types::OsFamily::Linux)
                     .build(),
             )
-            .container_definitions(cd.build());
+            .set_container_definitions(Some(container_definitions));
+        for volume in &spec.volumes {
+            // No host path: a task-scoped volume that lives and dies with the
+            // task (an ephemeral bind mount on Fargate).
+            req = req.volumes(ecs_types::Volume::builder().name(volume).build());
+        }
         if let Some(arn) = &spec.execution_role_arn {
             req = req.execution_role_arn(arn);
         }
@@ -1841,15 +2007,36 @@ impl EcsReconciler {
             .context("RegisterTaskDefinition returned no ARN")
     }
 
+    /// The service-level shape this install wants: where the tasks' ENIs live
+    /// and what capacity places them.
+    fn desired_shape(&self) -> crate::service::DesiredShape {
+        crate::service::DesiredShape {
+            subnets: self.config.subnets.iter().cloned().collect(),
+            security_groups: self.config.security_groups.iter().cloned().collect(),
+            assign_public_ip: self.config.assign_public_ip,
+            capacity: self.config.capacity.clone(),
+        }
+    }
+
     fn network_configuration(&self) -> Result<aws_sdk_ecs::types::NetworkConfiguration> {
         use aws_sdk_ecs::types as ecs_types;
-        let mut vpc = ecs_types::AwsVpcConfiguration::builder().assign_public_ip(
-            if self.config.assign_public_ip {
+        let mut vpc = ecs_types::AwsVpcConfiguration::builder();
+        // Omitted entirely where the capacity does not support it: ECS rejects
+        // the field on EC2 rather than ignoring it. Settings validation already
+        // refuses `assign_public_ip: true` there, so nothing is silently
+        // dropped -- this only keeps the field off the wire.
+        if self
+            .config
+            .capacity
+            .compatibility()
+            .supports_assign_public_ip()
+        {
+            vpc = vpc.assign_public_ip(if self.config.assign_public_ip {
                 ecs_types::AssignPublicIp::Enabled
             } else {
                 ecs_types::AssignPublicIp::Disabled
-            },
-        );
+            });
+        }
         for subnet in &self.config.subnets {
             vpc = vpc.subnets(subnet);
         }
@@ -1899,12 +2086,12 @@ impl EcsReconciler {
             .service_name(name)
             .task_definition(&task_definition_arn)
             .desired_count(desired.desired_count)
-            .launch_type(aws_sdk_ecs::types::LaunchType::Fargate)
             .network_configuration(self.network_configuration()?)
             // Tags must propagate to the tasks: Traefik's ECS provider and any
             // operator debugging both look at task tags, not just service tags.
             .propagate_tags(aws_sdk_ecs::types::PropagateTags::Service)
             .enable_ecs_managed_tags(true);
+        req = apply_capacity(req, &self.config.capacity)?;
         for tag in self.service_tag_list(desired) {
             req = req.tags(tag);
         }
@@ -1996,6 +2183,39 @@ impl EcsReconciler {
         Ok(())
     }
 
+    /// Apply service-level configuration to a service whose task definition is
+    /// already current.
+    ///
+    /// Deliberately sends no task definition: nothing about the task changed, and
+    /// registering a revision to carry a network change would burn the 1 req/s
+    /// `RegisterTaskDefinition` budget for nothing. `desiredCount` rides along
+    /// because it is free here and the scale-only path omits the network
+    /// configuration, so a service needing both would otherwise take two ticks.
+    ///
+    /// Capacity is **not** applied here -- see [`crate::service::capacity_drift`].
+    async fn update_service_shape(&self, name: &str, desired_count: i32) -> Result<()> {
+        self.ecs
+            .update_service()
+            .cluster(&self.config.cluster)
+            .service(name)
+            .desired_count(desired_count)
+            .network_configuration(self.network_configuration()?)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "UpdateService (configuration) {:?} failed: {}",
+                    name,
+                    aws_error_detail(&e)
+                )
+            })?;
+        info!(
+            service = %name,
+            "Applied the configured network placement to ECS service"
+        );
+        Ok(())
+    }
+
     /// Retire a service: ask ECS to scale it to zero, then delete it.
     ///
     /// `DeleteService` refuses a service that still has running tasks unless
@@ -2050,10 +2270,7 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
-        services: &[ActualService],
-        registered: &HashMap<String, String>,
-        desired_td_hash: Option<&str>,
-        server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
+        input: HealthReconcileInput<'_>,
     ) -> Result<()> {
         if !matches!(
             deployment.status,
@@ -2061,6 +2278,14 @@ impl EcsReconciler {
         ) {
             return Ok(());
         }
+
+        let HealthReconcileInput {
+            desired,
+            services,
+            registered,
+            desired_td_hash,
+            server_status_cache,
+        } = input;
 
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
         let by_key: HashMap<&str, &ActualService> = services
@@ -2070,22 +2295,12 @@ impl EcsReconciler {
 
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
         let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
-        let primary_hosts = self.url_builder.primary_ingress_hosts(
+        let primary_hosts = self.url_builder.public_hosts_for_group(
             project,
             &deployment.deployment_group,
-            environment.as_ref().filter(|e| {
-                e.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-            }),
-            &custom_domains,
-            true,
             &all_environments,
+            &custom_domains,
         );
-        let primary_hosts: Vec<String> = primary_hosts.into_iter().map(|h| h.host).collect();
 
         // An empty spec set is never ready — otherwise a corrupt deployment row
         // would report Healthy while running nothing.
@@ -2136,6 +2351,7 @@ impl EcsReconciler {
             let service_names = rise_backend_traefik::service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
+                &deployment.deployment_id,
                 spec,
                 &route_specs,
                 &primary_hosts,
@@ -2346,10 +2562,12 @@ impl EcsReconciler {
             }
         }
 
-        // `controller_metadata` carries exactly one thing: the task-definition
-        // hash the service has converged to. It is the authoritative drift
-        // marker, so it is written even when there is nothing else to record.
-        let metadata = with_persisted_td_hash(serde_json::json!({}), converged_hash.as_deref());
+        // Preserve controller coordination fields while updating the
+        // authoritative task-definition drift marker.
+        let metadata = with_persisted_td_hash(
+            deployment.controller_metadata.clone(),
+            converged_hash.as_deref(),
+        );
         if let Err(e) = self
             .store
             .update_deployment_controller_metadata(deployment.id, &metadata)
@@ -2369,6 +2587,40 @@ impl EcsReconciler {
 
         match deployment.status {
             DeploymentStatus::Deploying if all_ready => {
+                if !rise_backend_core::lifecycle::prepare_traefik_cutover(
+                    self.store.as_ref(),
+                    project,
+                    deployment,
+                )
+                .await?
+                {
+                    info!(deployment = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
+                    return Ok(());
+                }
+                let expected = rise_backend_traefik::dynamic::render_dynamic_config(
+                    desired,
+                    &rise_backend_traefik::TraefikRenderConfig {
+                        label_namespace: &self.config.label_namespace,
+                        controller_class: &self.config.controller_class,
+                        traefik_entrypoint: &self.config.traefik_entrypoint,
+                        catalog_entrypoint: "rise-catalog",
+                        traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+                        network: None,
+                        auth_backend_url: &self.config.auth_backend_url,
+                        access_classes: &self.config.access_classes,
+                    },
+                    "ecs",
+                );
+                if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
+                    warn!(deployment = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
+                    return Ok(());
+                }
+                if let Some(api) = self.traefik_api.as_ref() {
+                    if !api.dynamic_config_applied(&expected).await {
+                        debug!(deployment = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
+                        return Ok(());
+                    }
+                }
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
                     self.store.as_ref(),
                     Some(self),
@@ -2494,9 +2746,14 @@ impl EcsReconciler {
                     .find(|d| d.name() == Some("privateIPv4Address"))
                     .and_then(|d| d.value())
                     .map(str::to_string);
-                // The first container is the app's: Rise runs one container per
-                // task definition, so its exit code is the task's.
-                let container = task.containers().first();
+                // The app's container, not the identity sidecar's: Rise runs one
+                // app container per task definition, so its exit code is the
+                // task's. ECS does not promise to list containers in
+                // task-definition order.
+                let container = task
+                    .containers()
+                    .iter()
+                    .find(|c| c.name() != Some(task_definition::IDENTITY_AGENT_CONTAINER));
                 views.push(TaskView {
                     name: name.clone(),
                     task_definition_arn: task.task_definition_arn().unwrap_or_default().to_string(),
@@ -2523,6 +2780,7 @@ impl EcsReconciler {
             label_namespace: &self.config.label_namespace,
             controller_class: &self.config.controller_class,
             traefik_entrypoint: &self.config.traefik_entrypoint,
+            catalog_entrypoint: "rise-catalog",
             traefik_certresolver: self.config.traefik_certresolver.as_deref(),
             // ECS tasks are on awsvpc ENIs; the ECS provider resolves them itself
             // and would mis-resolve if handed a Docker network name.
@@ -2545,6 +2803,107 @@ impl rise_backend_core::lifecycle::SupersededHook for EcsReconciler {
         )
         .await
     }
+}
+
+/// Convert one container of a [`TaskDefinitionSpec`] to its SDK form.
+fn container_definition(
+    container: &task_definition::ContainerDefinitionSpec,
+) -> Result<aws_sdk_ecs::types::ContainerDefinition> {
+    use aws_sdk_ecs::types as ecs_types;
+
+    let mut cd = ecs_types::ContainerDefinition::builder()
+        .name(&container.name)
+        .image(&container.image)
+        .essential(container.essential);
+
+    for arg in &container.command {
+        cd = cd.command(arg);
+    }
+    for (k, v) in &container.environment {
+        cd = cd.environment(ecs_types::KeyValuePair::builder().name(k).value(v).build());
+    }
+    for secret in &container.secrets {
+        cd = cd.secrets(
+            ecs_types::Secret::builder()
+                .name(&secret.name)
+                .value_from(&secret.value_from)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid secret reference: {e}"))?,
+        );
+    }
+    for (k, v) in &container.docker_labels {
+        cd = cd.docker_labels(k, v);
+    }
+    if let Some(arn) = &container.repository_credentials_secret_arn {
+        cd = cd.repository_credentials(
+            ecs_types::RepositoryCredentials::builder()
+                .credentials_parameter(arn)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid repository credentials: {e}"))?,
+        );
+    }
+    if let Some(port) = container.port {
+        cd = cd.port_mappings(
+            ecs_types::PortMapping::builder()
+                .container_port(port as i32)
+                .protocol(ecs_types::TransportProtocol::Tcp)
+                .build(),
+        );
+    }
+    for mount in &container.mount_points {
+        cd = cd.mount_points(
+            ecs_types::MountPoint::builder()
+                .source_volume(&mount.source_volume)
+                .container_path(&mount.container_path)
+                .read_only(mount.read_only)
+                .build(),
+        );
+    }
+    for dependency in &container.depends_on_healthy {
+        cd = cd.depends_on(
+            ecs_types::ContainerDependency::builder()
+                .container_name(dependency)
+                .condition(ecs_types::ContainerCondition::Healthy)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid container dependency: {e}"))?,
+        );
+    }
+    if let Some(hc) = &container.health_check {
+        cd = cd.health_check(
+            ecs_types::HealthCheck::builder()
+                .set_command(Some(hc.command.clone()))
+                .interval(hc.interval)
+                .timeout(hc.timeout)
+                .retries(hc.retries)
+                .start_period(hc.start_period)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid health check: {e}"))?,
+        );
+    }
+    if container.restart_on_exit {
+        cd = cd.restart_policy(
+            ecs_types::ContainerRestartPolicy::builder()
+                .enabled(true)
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid restart policy: {e}"))?,
+        );
+    }
+    if let Some(mib) = container.memory_reservation_mib {
+        cd = cd.memory_reservation(mib);
+    }
+    if let Some(log) = &container.log_config {
+        cd = cd.log_configuration(
+            ecs_types::LogConfiguration::builder()
+                .log_driver(ecs_types::LogDriver::Awslogs)
+                .options("awslogs-group", &log.log_group)
+                .options("awslogs-region", &log.region)
+                .options("awslogs-stream-prefix", &log.stream_prefix)
+                .options("awslogs-create-group", "true")
+                .build()
+                .map_err(|e| anyhow::anyhow!("invalid log configuration: {e}"))?,
+        );
+    }
+    Ok(cd.build())
 }
 
 /// One observed ECS task, reduced to what the readiness verdict needs.
@@ -2658,7 +3017,7 @@ mod tests {
             "app",
             "128m-500m",
             "192Mi-512Mi",
-            crate::sizing::FargateSize {
+            crate::sizing::TaskSize {
                 cpu_units: 512,
                 memory_mib: 1024,
                 rounded_up: true,
@@ -2755,6 +3114,7 @@ mod tests {
                 project: project.to_string(),
                 deployment_group: "main".to_string(),
                 rollout_started_at: None,
+                shape: None,
             },
             tags: crate::tags::ServiceTags {
                 project: project.to_string(),
@@ -2998,6 +3358,21 @@ mod tests {
                 "{live:?} must not be failed -- its services would be deleted under it"
             );
         }
+    }
+
+    #[test]
+    fn declared_audiences_are_the_safe_entries_of_the_identity_block() {
+        let audiences = super::declared_audiences(&serde_json::json!({
+            "e2e": "rise-e2e-audience",
+            "aws": "sts.amazonaws.com",
+            "../credential": "evil",
+        }));
+        assert_eq!(
+            audiences.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["aws", "e2e"]
+        );
+        assert!(super::declared_audiences(&serde_json::json!({})).is_empty());
+        assert!(super::declared_audiences(&serde_json::Value::Null).is_empty());
     }
 
     /// The rejection text is what `rise deploy` shows the user. The marker in

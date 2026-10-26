@@ -120,6 +120,10 @@ impl BindingState {
                 uid: self.uid,
                 kind: self.kind,
                 role: self.role.clone(),
+                // The gate simulates a binding's before/after policy from the
+                // write's own claims, not a stored row — a create has no name
+                // yet, and nothing here ever feeds an audit finding.
+                name: None,
             },
             tier: self.tier()?,
             subject: self.subject.clone(),
@@ -129,6 +133,9 @@ impl BindingState {
             statements: engine
                 .role_statements(&self.role, self.organization.as_deref())
                 .await?,
+            // Irrelevant to the gate's own comparisons — it only ever reads
+            // `statements` — and this fact is never routed through the audit.
+            role_resolved: true,
         })
     }
 }

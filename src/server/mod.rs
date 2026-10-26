@@ -267,7 +267,8 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     }
 
     // Public routes (no authentication)
-    let public_routes = Router::new()
+    #[allow(unused_mut)]
+    let mut public_routes = Router::new()
         .route("/health", axum::routing::get(health_check))
         .route("/version", axum::routing::get(version_info))
         .route(
@@ -284,10 +285,24 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(auth::exchange::routes::routes())
         .merge(workload_tokens::routes::routes());
 
+    // The generic resource API carries its own authentication and
+    // platform-access layers: they are the platform-wide ones, except that a
+    // workload token exchange at a `/token` subresource reaches its handler
+    // without a Rise credential (ADR-0001 §7).
+    #[cfg(feature = "backend")]
+    {
+        public_routes = public_routes.merge(resources::routes::routes(state.clone()));
+    }
+
     // Auth-only routes (require authentication but NOT platform access)
     let auth_only_routes = Router::new()
         .route("/logs/capabilities", axum::routing::get(logs_capabilities))
         .merge(auth::routes::auth_only_routes())
+        // Scoped sessions (ADR-0006) are checked after authentication.
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
         // Apply auth middleware only
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -309,10 +324,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(encryption::routes::routes())
         .merge(quickstart::routes::routes());
 
-    #[cfg(feature = "backend")]
-    let platform_routes = platform_routes.merge(resources::routes::routes());
-
     let platform_routes = platform_routes
+        // Scoped sessions (ADR-0006) are checked last, before the handler
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
         // Apply platform access middleware (runs second, after auth)
         .route_layer(axum_middleware::from_fn_with_state(
             state.clone(),
@@ -351,6 +368,38 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
     let addr = format!("{}:{}", settings.server.host, settings.server.port);
     info!("HTTP server listening on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    // Docker and ECS expose the Traefik HTTP-provider snapshot on a separate
+    // network-only listener. The shipped Compose/Terraform networking admits
+    // Traefik to this port and never publishes it at the edge.
+    #[cfg(feature = "backend")]
+    let traefik_config_handle = if matches!(
+        &settings.deployment_controller,
+        Some(settings::DeploymentControllerSettings::Docker { .. })
+            | Some(settings::DeploymentControllerSettings::Ecs { .. })
+    ) {
+        let config_app = Router::new()
+            .route(
+                "/internal/traefik/config",
+                axum::routing::get(traefik_dynamic_config),
+            )
+            .with_state(state.clone())
+            .layer(trace_layer!())
+            .layer(axum_middleware::from_fn(
+                self::middleware::request_id_middleware,
+            ));
+        let config_addr = format!("{}:{}", settings.server.host, 3001);
+        info!("Traefik configuration listener on http://{}", config_addr);
+        let config_listener = tokio::net::TcpListener::bind(&config_addr).await?;
+        let config_shutdown = shutdown.clone();
+        Some(tokio::spawn(async move {
+            axum::serve(config_listener, config_app)
+                .with_graceful_shutdown(async move { config_shutdown.cancelled().await })
+                .await
+        }))
+    } else {
+        None
+    };
 
     // Spawn internal webhook listener for Metacontroller (separate port, IP-validated)
     #[cfg(feature = "backend")]
@@ -396,6 +445,11 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         let _ = handle.await;
     }
 
+    #[cfg(feature = "backend")]
+    if let Some(handle) = traefik_config_handle {
+        let _ = handle.await;
+    }
+
     info!("HTTP server shutdown complete");
 
     // Wait for all controller tasks AND the extension reconciliation tasks to
@@ -436,6 +490,7 @@ async fn run_ecr_controller_loop(
             auto_remove,
             access_key_id,
             secret_access_key,
+            registry_host,
         }) => EcrConfig {
             region: region.clone(),
             account_id: account_id.clone(),
@@ -444,6 +499,7 @@ async fn run_ecr_controller_loop(
             auto_remove: *auto_remove,
             access_key_id: access_key_id.clone(),
             secret_access_key: secret_access_key.clone(),
+            registry_host: registry_host.clone(),
         },
         _ => {
             anyhow::bail!("ECR controller requires ECR registry configuration");
@@ -464,6 +520,126 @@ async fn version_info() -> axum::Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "repository": env!("CARGO_PKG_REPOSITORY"),
     }))
+}
+
+#[cfg(feature = "backend")]
+async fn traefik_dynamic_config(
+    axum::extract::State(state): axum::extract::State<state::AppState>,
+) -> Result<axum::Json<rise_backend_traefik::dynamic::DynamicConfig>, axum::http::StatusCode> {
+    build_traefik_dynamic_config(&state)
+        .await
+        .map(axum::Json)
+        .map_err(|error| {
+            tracing::error!("Failed to build Traefik configuration snapshot: {error:#}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[cfg(feature = "backend")]
+async fn build_traefik_dynamic_config(
+    state: &state::AppState,
+) -> anyhow::Result<rise_backend_traefik::dynamic::DynamicConfig> {
+    use anyhow::Context;
+    use rise_backend_core::DeploymentUrlBuilder;
+
+    let provider = state
+        .traefik_http_provider
+        .as_ref()
+        .context("Traefik HTTP provider is not configured")?;
+    let production_template = state
+        .production_ingress_url_template
+        .clone()
+        .context("production ingress URL template is not configured")?;
+    let url_builder = DeploymentUrlBuilder {
+        production_ingress_url_template: production_template,
+        staging_ingress_url_template: state.staging_ingress_url_template.clone(),
+        environment_ingress_url_template: state.environment_ingress_url_template.clone(),
+        ingress_port: state.ingress_port,
+        ingress_schema: state.ingress_schema.clone(),
+        registry_provider: state.registry_provider.clone(),
+    };
+    let access_requirements = state
+        .access_classes
+        .iter()
+        .map(|(name, class)| (name.clone(), class.access_requirement.clone()))
+        .collect();
+    let render_config = rise_backend_traefik::TraefikRenderConfig {
+        label_namespace: &provider.label_namespace,
+        controller_class: &provider.controller_class,
+        traefik_entrypoint: &provider.entrypoint,
+        catalog_entrypoint: "rise-catalog",
+        traefik_certresolver: provider.certresolver.as_deref(),
+        network: None,
+        auth_backend_url: &provider.auth_backend_url,
+        access_classes: &access_requirements,
+    };
+
+    let mut targets = Vec::new();
+    for project in state.deployment_store.list_projects(None).await? {
+        let deployments = state
+            .deployment_store
+            .list_active_deployments_for_project(project.id)
+            .await?;
+        if deployments.is_empty() {
+            continue;
+        }
+
+        if !provider.controller_class.is_empty()
+            && project_controller_class(state, &project).await?.as_deref()
+                != Some(provider.controller_class.as_str())
+        {
+            continue;
+        }
+
+        let environments = state
+            .deployment_store
+            .list_environments_for_project(project.id)
+            .await?;
+        let custom_domains = state
+            .deployment_store
+            .list_project_custom_domains(project.id)
+            .await?;
+        // Any error — store or undecodable data — fails the whole snapshot, so
+        // Traefik keeps serving its last good config instead of dropping a
+        // live router.
+        targets.extend(rise_backend_traefik::dynamic::project_route_targets(
+            &project,
+            &deployments,
+            &environments,
+            &custom_domains,
+            &url_builder,
+        )?);
+    }
+
+    Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
+        targets,
+        &render_config,
+        provider.native_provider,
+    ))
+}
+
+/// The deployment controller class of `project`'s Organization.
+#[cfg(feature = "backend")]
+async fn project_controller_class(
+    state: &state::AppState,
+    project: &rise_backend_core::models::Project,
+) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+
+    let org_uid = state
+        .deployment_store
+        .organization_uid_for_project(project.id)
+        .await?
+        .with_context(|| format!("project '{}' has no Organization linkage", project.name))?;
+    let org = state
+        .resource_store
+        .get(org_uid)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to load Organization {org_uid}: {error}"))?
+        .with_context(|| format!("Organization {org_uid} is missing"))?;
+    let org_spec: rise_resource_api::OrganizationSpec = serde_json::from_value(org.spec)
+        .with_context(|| format!("Organization {org_uid} has malformed spec"))?;
+    Ok(org_spec.deployment_controller_class)
 }
 
 /// Static facts about the configured runtime log backend. Surfaced to the

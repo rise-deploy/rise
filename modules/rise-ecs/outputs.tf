@@ -24,7 +24,7 @@ output "database_subnet_ids" {
 
 output "apps_security_group_id" {
   description = "Security group deployed workloads run in — the value of deployment_controller.security_groups."
-  value       = aws_security_group.apps.id
+  value       = module.security.groups.apps
 }
 
 # -----------------------------------------------------------------------------
@@ -48,17 +48,17 @@ output "cloud_map_namespace_name" {
 
 output "log_group_name" {
   description = "CloudWatch log group carrying control-plane and workload logs."
-  value       = aws_cloudwatch_log_group.this.name
+  value       = module.cluster.logging.name
 }
 
 output "rise_service_name" {
   description = "ECS service running the control plane."
-  value       = aws_ecs_service.rise.name
+  value       = module.runtime.rise.service_name
 }
 
 output "traefik_service_name" {
   description = "ECS service running the ingress router."
-  value       = aws_ecs_service.traefik.name
+  value       = module.runtime.traefik.service_name
 }
 
 # -----------------------------------------------------------------------------
@@ -67,7 +67,7 @@ output "traefik_service_name" {
 
 output "load_balancer_dns_name" {
   description = "DNS name of the edge load balancer."
-  value       = aws_lb.this.dns_name
+  value       = module.ingress.load_balancer.dns_name
 }
 
 output "public_url" {
@@ -77,13 +77,13 @@ output "public_url" {
 
 output "dns_records_required" {
   description = <<-EOT
-    DNS records to create, unless route53_zone_id was set and the module made
+    DNS records to create, unless route53_zone was set and the module made
     them. The wildcard is required, not optional: projects are served at
     <project>.<domain>, and groups and environments add another label.
   EOT
-  value = var.route53_zone_id != null ? [] : [
-    "${var.ingress_domain}    ALIAS/CNAME -> ${aws_lb.this.dns_name}",
-    "*.${var.ingress_domain}  ALIAS/CNAME -> ${aws_lb.this.dns_name}",
+  value = local.create_dns_records ? [] : [
+    "${var.ingress_domain}    ALIAS/CNAME -> ${module.ingress.load_balancer.dns_name}",
+    "*.${var.ingress_domain}  ALIAS/CNAME -> ${module.ingress.load_balancer.dns_name}",
   ]
 }
 
@@ -102,15 +102,8 @@ output "rise_task_environment" {
 }
 
 output "rise_task_secrets" {
-  description = "Secrets Manager ARNs to inject as environment variables, keyed by variable name."
-  value = merge({
-    DATABASE_URL            = local.database_url_secret_arn
-    RISE_JWT_SIGNING_SECRET = aws_secretsmanager_secret.jwt_signing_secret.arn
-    RISE_ENCRYPTION_KEY     = aws_secretsmanager_secret.encryption_key.arn
-    OIDC_CLIENT_SECRET      = aws_secretsmanager_secret.oidc_client_secret.arn
-    }, var.control_plane_local_config_secret_arn == null ? {} : {
-    RISE_LOCAL_CONFIG_YAML = var.control_plane_local_config_secret_arn
-  })
+  description = "Secrets Manager valueFrom references injected as environment variables, keyed by variable name."
+  value       = local.control_plane_secret_environment
 }
 
 output "secret_arns_for_execution_role" {
@@ -119,19 +112,21 @@ output "secret_arns_for_execution_role" {
     read them. Secrets Manager appends a random suffix to every ARN, so these
     are exact ARNs rather than patterns.
   EOT
-  value = compact([
+  value = concat([
     local.database_url_secret_arn,
-    aws_secretsmanager_secret.jwt_signing_secret.arn,
-    aws_secretsmanager_secret.encryption_key.arn,
-    aws_secretsmanager_secret.oidc_client_secret.arn,
+    module.secrets.environment.RISE_JWT_SIGNING_SECRET,
+    module.secrets.environment.RISE_ENCRYPTION_KEY,
+    module.secrets.environment.OIDC_CLIENT_SECRET,
+    ], var.repository_credentials_secret_arn == null ? [] : [
     var.repository_credentials_secret_arn,
+    ], var.control_plane_local_config_secret_arn == null ? [] : [
     var.control_plane_local_config_secret_arn,
-  ])
+  ], local.control_plane_additional_secret_arns)
 }
 
 output "database_endpoint" {
   description = "Control-plane database endpoint, when the module created one."
-  value       = local.create_database ? aws_db_instance.this[0].endpoint : null
+  value       = local.create_database ? module.database.endpoint : null
 }
 
 output "rise_config" {
@@ -142,11 +137,11 @@ output "rise_config" {
       region                  = local.region
       cluster                 = local.cluster_name
       subnets                 = local.private_subnet_ids
-      security_groups         = [aws_security_group.apps.id]
+      security_groups         = [module.security.groups.apps]
       assign_public_ip        = false
       execution_role_arn      = var.execution_role_arn
       task_role_arn           = local.workload_task_role_arn
-      log_group               = aws_cloudwatch_log_group.this.name
+      log_group               = module.cluster.logging.name
       resource_prefix         = var.resource_prefix
       ssm_parameter_prefix    = var.ssm_parameter_prefix
       ssm_kms_key_id          = var.ssm_kms_key_arn

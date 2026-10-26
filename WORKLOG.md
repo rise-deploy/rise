@@ -62,14 +62,24 @@ scope and avoiding dead-end compatibility layers.
    list projection — plus the live `MembershipResolver`, pulled forward from
    increment 10 so the choke point has a real principal to build a snapshot
    from.
-10. **Planned — identity authentication and token convergence.** Add live
-   User/UserIdentity resolution, operator selection/JIT, target-bound workload
-   exchange, delegated `/token`, UID checks, caps, and actor-chain handling.
-   The live `MembershipResolver` moved to 9b; `authorization_details` parsing
-   stays here.
-11. **Planned — full conformance and finalization.** Close every applicable
-   ADR-0001 acceptance scenario, update documentation/status, and audit the
-   implementation requirement by requirement.
+10. **Split into 10a and 10b — identity authentication and token
+   convergence.** 10a (implemented) is the target-bound `/token` subresource
+   on ServiceAccount and Controller: workload exchange against the target's
+   trust policies, delegated issuance under `(create, <kind>, token)`, the
+   identity token with `rise_uid`, `authorization_details` parsing into the
+   engine's cap, UID-bound re-resolution on every request, and the bounded
+   `act` chain. 10b is live User/UserIdentity resolution, operator
+   selection, and JIT login, delivered in three parts: 10b-1 (implemented)
+   resolves logins to `User` resources with JIT provisioning and issues
+   `rise_uid` sessions; 10b-2 (planned) adds `operatorIdentities` selectors;
+   10b-3 (planned) turns legacy admins into default-org RoleBindings.
+11. **Implemented — full conformance and finalization.** Close every
+   applicable ADR-0001 acceptance scenario (1-57) across three test tiers,
+   index them with a marker convention enforced in lint and CI, and update
+   documentation/status accordingly. Scenarios 58-60 (§9 deferred) and 61
+   (product-operation deferred) stay excluded; scenario 10's
+   JIT-login half landed with 10b-1 and its operator-selector half follows
+   10b-2.
 
 ## Increment 1 — dependency-light resource authorization foundation
 
@@ -1839,3 +1849,241 @@ idempotent when a read-modify-write client replays the stored spec.
     which only affects their own resource. The owner-reference half of this —
     holding another resource's deletion open with `blockOwnerDeletion` — is
     closed by the `use` requirement on both attaching and detaching an edge.
+
+## Increment 10a — the `token` subresource and resource principals
+
+- State: implemented on branch `claude/adr-001-token-cutover-6kjopq`.
+- Acceptance criteria:
+  - `POST …/serviceaccounts/{org}/{name}/token` and `POST …/controllers/{name}/token`
+    issue a Rise identity token for exactly the addressed resource; `/token` on
+    any other kind is the ordinary route-not-found before authentication, and
+    every other method on it is `405`.
+  - Workload exchange consults only the target's `ServiceAccountTrustPolicy` /
+    `ControllerTrustPolicy` children, narrowed by issuer before JWKS work,
+    requires exactly one claim match, and answers every post-route failure —
+    absent, wrong-kind, or draining target; unaccepted issuer; failed
+    verification; zero or several matches — with one byte-identical `401`.
+  - Delegated issuance needs `(create, <kind>, token)` on the exact target
+    under the caller's own cap; `get` on the target, `create` on the main
+    resource, and `get` on the subresource each grant nothing. A caller who
+    cannot `get` the target is masked to `404`.
+  - The two modes never mix; a Rise-issued assertion is never exchanged; a
+    trust policy may not name Rise's issuer.
+  - The identity token carries canonical `sub` and `rise_uid`, optional
+    `rise.dev/rbac` `authorization_details`, and a bounded `act` chain; it is
+    accepted only by the generic resource API, where the middleware re-resolves
+    `(sub, rise_uid)` to one live resource on every request and parses the
+    ceiling fail-closed.
+  - Delegation chains only across live token-create grants; actor data never
+    grants; a chain past `MAX_DELEGATION_DEPTH` is refused at both the handler
+    and the signer.
+- Decisions:
+  - The claim types, signer, verifier variant (`RiseToken::Identity`), `act`
+    chain, and TTL enforcement live in `rise-backend-auth`; the
+    `authorization_details` wire form and its parsing into `AuthorizationCap`
+    live in `rise-authz`; `rise-deploy` owns target resolution, trust-policy
+    lookup, and the route. `rise-backend-auth` therefore carries the details as
+    opaque JSON and stays free of the resource API crate.
+  - The generic resource API router carries its own authentication layers,
+    identical to the platform-wide ones except that a credential-less `POST`
+    to a `/token` path reaches the handler. The handler, not the middleware,
+    decides whether that path really is a registered token route; anything
+    else without a credential is `401`, and an unknown collection is `401`
+    rather than `404` so the registry stays invisible to unauthenticated
+    callers.
+  - Token issuance is not a serializable write: it persists nothing and runs
+    on a read-path authorization context.
+  - `server.auth_token_max_ttl_seconds` is the platform-global maximum for
+    identity tokens as well as access tokens; `expires_in` is clamped to it.
+  - Identity tokens are always RS256, signed with the JWKS key, whatever their
+    audience. The request may name an `audience`; omitted means Rise's own
+    API, which is the only audience the middleware accepts, and any other
+    value hands the same token to an external verifier. One token kind and
+    one verification path beat a symmetric internal variant beside an
+    asymmetric external one; the cost is that `rs256_private_key_pem` is now
+    load-bearing for the resource API too, which the upgrade notes say.
+    `authorization_details` is refused with an external audience, and the
+    audience check lives in `resolve_identity` so it is tested with the rest
+    of resolution rather than in the middleware alone.
+  - The membership resolver holds an optional `User`: a resource principal has
+    no Group ties and no operator standing by construction, and the engine
+    rejects a resolver that claims otherwise.
+  - Built on PR #491's controller principals. A Controller resolved per
+    request from its trust policies and one holding an identity token from
+    its `/token` subresource are the same `controller:<name>` principal to
+    the engine; delegated issuance records either as the delegator, and the
+    resource API's `AnyAuth` is the one credential type both arrive through.
+  - The transitional `POST /api/v1/auth/token` and its typed-table principals
+    are untouched; they retire with the typed-object migration.
+- Verification:
+  - `rise-backend-auth`: identity round trip, rejection by both legacy
+    adapters, the `rise_uid` payload guard on the ingress path, the
+    disambiguation matrix, and the chain limit.
+  - `rise-authz`: scenarios 49–52 over `AuthorizationCap::from_details`,
+    including a checked list of malformed shapes.
+  - `rise-deploy` against Postgres: exchange by name and by UID for both
+    kinds; the coarse-401 matrix; delegated issuance across the grant
+    variants; a minted token authenticating as the target, gaining a live
+    grant, and dying with its UID; a two-hop delegation chain; caps applied to
+    `get` and `list`; create-only enforcement; the Rise-issuer guard.
+
+## Increment 10b-1 — live User identity, JIT login, `rise_uid` sessions
+
+- State: implemented on branch `claude/increment-10b-user-jit-vnhxai`.
+- Acceptance criteria:
+  - Every interactive login — CLI code and device flows, the UI callback, and
+    the app-ingress callback — resolves the ID token's exact `(auth.issuer,
+    sub)` to a live `UserIdentity` and its `User`, including inactive rows.
+    An inactive mapping or an active one under an inactive User fails the
+    login and never provisions.
+  - An unknown pair provisions a generated `u-<ulid>` User and its first
+    `UserIdentity` in one `SERIALIZABLE` transaction, on a fresh store too;
+    concurrent first logins converge on one User; a deleted mapping lets the
+    next login provision a fresh User UID; a shared email never links two
+    subjects.
+  - Sessions carry `typ: rise-session+jwt`, `sub = user:<name>`, `rise_uid`,
+    and `rise_identity_uid`, and are re-resolved on every request: a
+    deactivated, deleted, or same-name-recreated User fails every session
+    issued for it, on the typed APIs as well, and a deactivated or deleted
+    UserIdentity fails the sessions minted through it and no others. Both
+    UIDs are admitted only with the session `typ`.
+  - Legacy sessions and app-ingress tokens, which carry the IdP `sub`, are
+    re-checked through that identity's mapping; a store failure while
+    re-checking any token is a `500`, never a `401`.
+  - The resource API principal is `user:<name>` with the User resource's UID;
+    a legacy session (no `rise_uid`) keeps the typed APIs and gets `401` from
+    the resource API. Delegated `/token` issuance records the User resource
+    as its actor.
+  - There is no way to trade a presented ID token for a session: every User
+    session comes from a login flow that received its ID token from the IdP
+    over the back channel.
+  - The typed `users` row records the User resource it last logged in as.
+- Decisions:
+  - JIT is a raw store write, not a choke-point write: there is no principal
+    to authorize yet, and the ADR makes it the configuration-rooted exception
+    to grant-gated linking. It only ever creates a new User; it cannot attach
+    to an existing one.
+  - A returning login is one pool read; only a miss opens the transaction,
+    which re-reads the mapping before creating. A unique-index conflict, a name
+    collision, and a serialization failure all mean "a concurrent login won"
+    and retry into the read.
+  - `auth.issuer` must already be canonical (`Issuer::new`), checked at
+    startup. The issuer grammar now takes the IdP's exact `iss` spelling as
+    canonical, with or without one trailing slash: OIDC compares issuers as
+    exact strings and IdPs differ (Dex omits the slash, Auth0 includes it), so
+    trimming would store an issuer the IdP never stamps. A mapping written in
+    the other spelling can never match a token, so admitting both creates no
+    alias that bypasses deactivation.
+  - An ID-token exchange for non-browser logins was built and then removed:
+    it would honor any ID token the IdP issues for Rise's client (cross-client
+    trust, token exchange, multi-audience tokens) with no PKCE, `state`, or
+    `nonce` binding, and provision Users from it. `ROADMAP.md` §2 records it
+    as rejected.
+  - The session keeps `email`: the typed APIs still find users by it. Ingress
+    tokens keep the IdP `sub` and never carry `rise_uid`, because deployed
+    apps read them.
+  - Legacy sessions are not rejected wholesale, so the upgrade does not log
+    every user out of the typed APIs; they cannot reach the resource API
+    because nothing ties them to a User.
+  - A session records the identity it was minted through, so switching off
+    one UserIdentity ends exactly the sessions that identity produced: the
+    ADR forbids ending the User's other logins, and without the claim the
+    only enforceable choices were "none" or "all".
+  - One `UserLogins::check_token` decides liveness for every Rise-issued User
+    token — the API middleware, the optional middleware, and ingress auth all
+    call it — so the three paths cannot drift apart on which shapes are
+    checked or how a store failure is answered.
+  - Group sync still runs before resolution, so the session's `groups` claim
+    is current; the duplicate second sync in the UI callback is gone.
+  - ULIDs are generated in-crate (48-bit ms timestamp + 80 random bits,
+    lowercase Crockford) rather than through a new dependency.
+  - Operator standing is untouched: still the email and IdP-group lists,
+    matched against the typed user the session also carries. 10b-2 replaces
+    that derivation behind the same resolver.
+  - The e2e harness keeps its offline-minted legacy bearer for the typed APIs,
+    which also survives the upgrade-from-older-release flow; the resource
+    scenario logs the operator in through the real CLI PKCE code flow, driving
+    Dex's login form headlessly.
+- Verification:
+  - `rise-backend-auth`: the session round trip, `rise_uid` bound to the
+    session `typ` in both directions, ingress tokens never carrying it, and the
+    ingress adapter accepting a typed session.
+  - `rise-deploy` against Postgres: first-login provisioning, concurrent
+    convergence, inactive identity/User refusal without reprovisioning,
+    reprovisioning after mapping deletion, email non-linking, session
+    re-resolution (unknown UID, name mismatch, recreated User), and the legacy
+    session refused by the resource API.
+  - `rise-resource-api`: issuer spellings with and without one trailing slash
+    accepted, every other alias refused.
+  - e2e: `cargo clippy` and `cargo test` for the harness, including the Dex
+    login-form and redirect parsing.
+
+## Increment 11 — full conformance
+
+- State: implemented on branch `claude/adr-0001-conformance-suite-utm9mo`.
+- Acceptance criteria:
+  - Every applicable ADR-0001 appendix scenario (1-57) is claimed by at least
+    one test across three tiers: pure fakes
+    (`crates/rise-authz/tests/{policy,engine,gate}.rs`,
+    `crates/rise-resource-api/tests`), the pure signer
+    (`crates/rise-backend-auth/src/signer.rs`), and Postgres/HTTP
+    (`src/server/resources/handlers/conformance.rs`,
+    `crates/rise-resource-store-postgres/tests`). Scenarios 58-60 (§9
+    deferred) and 61 (product-operation deferred) are claimed by none; the
+    prior tiers already covered most scenarios, so this increment retrofits
+    markers there and adds new tests only for the gaps.
+  - Scenario 10 (operator selectors, JIT login, User tokens with `rise_uid`)
+    stayed blocked on 10b: only its "inactive User loses access" half was
+    tested then. 10b-1 adds its JIT-login and session halves; the
+    operator-selector half follows 10b-2.
+  - Multi-org admins, membership/admin removal taking effect on the next
+    request, and UID-bound token invalidation each get dedicated coverage in
+    the engine and Postgres/HTTP tiers, closing the gaps `ROADMAP.md`'s
+    milestone named.
+  - No per-subject token count cap and no revocation list exist (ADR
+    L1048-1050 accepts this), so neither is asserted; the two caps the ADR
+    does specify — the platform-global max TTL and the `MAX_DELEGATION_DEPTH`
+    delegation-chain limit — are.
+  - A deterministic test drives a grant and a revocation racing on stale
+    facts through the write-time grant gate's `begin_write`/`create_once`
+    seam directly, rather than two spawned tasks, so the serialization
+    conflict is reproducible; companion stochastic tests spawn concurrent
+    grant/revoke and membership/revoke pairs across several organizations and
+    assert no torn result and no server error, without pinning a fixed
+    outcome mix.
+  - `scripts/check-adr-conformance.sh` greps every `/// ADR-0001 scenario N`
+    doc-comment marker across the crates that hold conformance tests, fails
+    on any of 1-57 missing or any of 58-61 present, and is wired into `mise
+    run lint` and CI's Rust quality job as its own step.
+- Decisions:
+  - Markers are doc comments directly above each covering
+    `#[test]`/`#[tokio::test]`/`#[sqlx::test]`, one line per claimed scenario,
+    rather than a separate registry file — the claim sits next to the
+    assertions that back it, and a grep-based index is enough to keep it
+    honest without a bespoke test harness.
+  - `dispatch_tests`' shared helpers moved out of
+    `src/server/resources/handlers.rs` into sibling `test_support` and
+    `conformance` modules, so the new Postgres/HTTP scenarios reuse the
+    existing context/auth/resource-creation helpers instead of duplicating
+    them, and the new tests stay out of the pre-existing `dispatch_tests`
+    module.
+  - The check script uses `grep`, not `rg`, since CI runners are not
+    guaranteed to have ripgrep installed.
+- Finding — a lost write reported as success, caught by scenario 33's
+  stochastic race and fixed in the same increment:
+  - After a `RoleBinding`/`PlatformRoleBinding` write, the handler runs the
+    write-time policy audit on the same `SERIALIZABLE` transaction to attach
+    `Warning` headers, and treated any audit failure as "no findings". A
+    serialization conflict raised by one of the audit's reads is a statement
+    error inside the transaction, which PostgreSQL answers by aborting it; the
+    following `COMMIT` then silently rolls back and returns without error, so
+    the handler answered `201 Created` for a row that was never persisted.
+  - `attach_binding_write_warnings` now propagates a store error from the
+    audit — retryable when it is a serialization conflict, so the write loop
+    replays the whole attempt — and keeps the log-and-continue path only for
+    the pure diagnostic failures that leave the transaction intact.
+- Verification:
+  - `cargo test -p rise-authz`, `cargo test -p rise-backend-auth`.
+  - `cargo test --workspace --all-features conformance` and `dispatch_tests`
+    against Postgres, plus `cargo test -p rise-resource-store-postgres`.
+  - `mise run adr:conformance:check` and `mise run lint`.

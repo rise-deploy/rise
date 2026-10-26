@@ -22,12 +22,17 @@ A path always names the **leaf** collection first as `{group}/{version}/{plural}
 | `{group}/{version}/{plural}/{ancestor}…/{name}/status` (`D+2`) | PUT | Status subresource update |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/finalizers` (`D+2`) | PUT | Finalizer subresource update |
 | `{group}/{version}/{plural}/{ancestor}…/{name}/deletion-blockers` (`D+2`) | GET | Deletion-blocker diagnostics |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/explain` (`D+2`) | GET | The caller's own access explanation |
+| `{group}/{version}/{plural}/{ancestor}…/{name}/token` (`D+2`) | POST | Token issuance — `ServiceAccount` and `Controller` only |
 | `{group}/{version}/{plural}/uid:{uuid}` | GET, PUT, DELETE | Item by UID |
 | `{group}/{version}/{plural}/uid:{uuid}/{sub}` | PUT | `status` or `finalizers` by UID |
 | `{group}/{version}/{plural}/uid:{uuid}/deletion-blockers` | GET | Deletion-blocker diagnostics by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/explain` | GET | The caller's own access explanation by UID |
+| `{group}/{version}/{plural}/uid:{uuid}/token` | POST | Token issuance by UID |
 | `pending-deletion` | GET | List tombstoned resources awaiting GC |
+| `policy-audit` | GET | Install-wide policy diagnostics |
 
-Ancestor segments are bare resource *names*; the ancestor *kinds* are derived from the leaf's `ResourceDefinition` parent chain and never appear in the URL. `pending-deletion` is only valid as the sole path segment, so a resource may be named `pending-deletion` without ambiguity.
+Ancestor segments are bare resource *names*; the ancestor *kinds* are derived from the leaf's `ResourceDefinition` parent chain and never appear in the URL. `pending-deletion` and `policy-audit` are only valid as the sole path segment, so a resource may be named either without ambiguity.
 
 Unversioned paths are not supported — `{group}/{version}` always names the leaf collection.
 
@@ -41,24 +46,26 @@ When a UID-prefixed identifier is used in a PUT URL, the body's `metadata.name` 
 
 ## Authorization
 
-Every user-authenticated request is authorized by the ADR-0001 engine: one
-`(verb, ResourceKind, subresource?)` decision per resource, evaluated against
-that resource's own ancestry and effective labels. There is no operator gate in
-front of the API any more. An operator reaches everything because the seeded
-`PlatformRoleBinding/system-admin` says so and because an operator's request
-ignores every `Deny`; anyone else reaches exactly what stored policy grants them.
+Every authenticated request — User or Controller alike — is authorized by the
+ADR-0001 engine: one `(verb, ResourceKind, subresource?)` decision per
+resource, evaluated against that resource's own ancestry and effective labels.
+There is no operator gate in front of the API any more. An operator reaches
+everything because the seeded `PlatformRoleBinding/system-admin` says so and
+because an operator's request ignores every `Deny`; anyone else reaches
+exactly what stored policy grants them.
 
 | Caller | How it is authorized |
 |---|---|
 | Operator (`auth.operator_users`, `auth.operator_idp_groups`) | Expands to `system:operators`, whose seeded binding allows every verb on every kind and subresource |
 | Any other authenticated user | Live RBAC: bindings that name them, one of their Groups, `org:<name>`, or `system:authenticated`, plus dynamic ownership bindings resolved from `rise.dev/owner` |
-| Controller (`auth.controllers` JWT) | PUT `status` and `finalizers` only, gated by the collection's `allowedStatusControllerIds` |
+| A `ServiceAccount` or `Controller` resource, holding an identity token from its [`token` subresource](#token-subresource-serviceaccount-and-controller) | Live RBAC on its own subject (`serviceaccount:<org>/<name>`, `controller:<name>`), intersected with the token's `authorization_details` ceiling. It has no Group ties and is never an operator |
+| Controller (a live `Controller` resource) | Live RBAC like any other principal: bindings naming its `controller:<name>` subject. See [Controller authorization](#controller-authorization) |
 
 The verbs map onto the HTTP surface directly: `list` and `get` for reads,
-`create` for POST, `update` for item PUT and for the `status`/`finalizers`
-subresources, `delete` for DELETE. Subresource permissions are separate from the
-main resource — a statement with no `subresources` field permits the main
-resource only.
+`create` for POST (and for the `token` subresource), `update` for item PUT and
+for the `status`/`finalizers` subresources, `delete` for DELETE. Subresource
+permissions are separate from the main resource — a statement with no
+`subresources` field permits the main resource only.
 
 Two read granularities exist, and they are independent grants:
 
@@ -189,6 +196,8 @@ Editing `org-admin` changes what administrators may do in every organization, ne
 
 An org `RoleBinding`'s subject must belong to the Organization the binding sits in. A subject that names its own organization — `group:`, `serviceaccount:`, `org:` — is checked at write time and refused on a mismatch: both organizations are fixed once the row exists, so such a binding would read as a cross-org grant while granting nothing, forever. `user:` and `system:authenticated` subjects are accepted, because their affiliation is a live membership question rather than a property of the identifier.
 
+A new Organization gets its first administrator through `bootstrap.admin` on the Organization create ([Organization bootstrap](#organization-bootstrap)) — the atomic alternative to authoring an org-root `RoleBinding` by hand afterward.
+
 Because the Organization is implied by placement, that subject also accepts the relative form `group:<name>`, expanded against the parent before the row is stored:
 
 ```json
@@ -197,13 +206,58 @@ Because the Organization is implied by placement, that subject also accepts the 
 
 under `acme` stores `group:acme/platform`. `PlatformRoleBinding` has no parent Organization and so takes absolute subjects only.
 
-Resource lifecycle operations are audit-logged on the `rise::audit` target. Records include `resource.created`, `resource.updated`, `resource.deleted`, `resource.deletion_cascaded`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.user_status_updated`, `resource.user_finalizers_updated`, `resource.pending_deletion_listed`, `resource.deletion_blockers_listed`, `resource.access_denied` (a refused authorization decision), and `resource.grant_gate` (what the grant gate compared, including the operator short-circuit that produces no claims). Cascade records are best-effort after commit; durable delivery would require a transactional outbox or Event resource.
+Resource lifecycle operations are audit-logged on the `rise::audit` target. Records include `resource.created`, `resource.updated`, `resource.deleted`, `resource.deletion_cascaded`, `resource.controller_status_updated`, `resource.controller_finalizers_updated`, `resource.user_status_updated`, `resource.user_finalizers_updated`, `resource.pending_deletion_listed`, `resource.deletion_blockers_listed`, `resource.policy_audited`, `resource.explained`, `resource.access_denied` (a refused authorization decision), and `resource.grant_gate` (what the grant gate compared, including the operator short-circuit that produces no claims). Cascade records are best-effort after commit; durable delivery would require a transactional outbox or Event resource.
 
 ### Controller authorization
 
-A controller JWT is verified by `auth_middleware` against the configured `ControllerIdentity` (issuer + JWKS + claim constraints) and yields a `ControllerAuthContext` carrying the controller's `identity_id` (the stable string written under `status.controllers`).
+A controller JWT is matched against live `ControllerTrustPolicy` resources
+beneath a live root `Controller` and resolves to the ordinary principal
+`controller:<name>`, where `<name>` is the Controller resource's name. From
+there a Controller is authorized exactly like a User: the choke point
+evaluates `(verb, ResourceKind, subresource?)` against stored policy, with no
+separate controller-specific gate. An org `RoleBinding` never reaches a
+Controller — it belongs to no organization (ADR-0001 §3) — so a Controller's
+grants are always `PlatformRoleBinding`s.
 
-For a status/finalizer write, the handler additionally checks that the controller's `identity_id` appears in the resolved collection's `allowedStatusControllerIds`. An empty allowlist is **default-deny** — built-in collections (Organization, ResourceDefinition) currently have an empty allowlist, so controllers cannot write their status to built-ins until a future phase wires controller ownership for them.
+To let a controller reconcile a kind, create its identity and grant it access:
+
+```jsonc
+// 1. The Controller identity — root-scoped, one per controller process.
+POST /api/v1/resources/rise.dev/v1alpha1/controllers
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "Controller",
+  "metadata": { "name": "widget-controller" }, "spec": {} }
+
+// 2. What issuer/claims a token must present to authenticate as it.
+POST /api/v1/resources/rise.dev/v1alpha1/controllertrustpolicies/widget-controller
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "ControllerTrustPolicy",
+  "metadata": { "name": "github-actions" },
+  "spec": { "issuer": "https://token.actions.githubusercontent.com",
+            "claims": { "aud": "rise-controller", "sub": "repo:acme/widget-controller:*" } } }
+
+// 3. The permission to grant.
+POST /api/v1/resources/rise.dev/v1alpha1/platformroles
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "PlatformRole",
+  "metadata": { "name": "widget-controller-role" },
+  "spec": { "statements": [{ "effect": "Allow", "kinds": ["example.dev/Widget"],
+                              "verbs": ["get", "list", "update"],
+                              "subresources": ["status", "finalizers"] }] } }
+
+// 4. Bind it to the controller subject.
+POST /api/v1/resources/rise.dev/v1alpha1/platformrolebindings
+{ "apiVersion": "rise.dev/v1alpha1", "kind": "PlatformRoleBinding",
+  "metadata": { "name": "widget-controller-binding" },
+  "spec": { "subject": "controller:widget-controller",
+            "roleRef": { "kind": "PlatformRole", "name": "widget-controller-role" } } }
+```
+
+Several trust policies matching the *same* Controller are an ordinary match — a
+Controller may accept more than one issuer or claim shape. Policies matching
+*different* Controllers make a token ambiguous and the request is refused with
+`409`. Deleting or tombstoning a Controller resource invalidates every token
+minted for it on the next request; a controller that still holds finalizers
+when its `PlatformRoleBinding` is removed can no longer clear them itself — a
+user with the same subresource grant can, through the same finalizers
+endpoint (see below).
 
 ## Request and response envelopes
 
@@ -256,6 +310,41 @@ Authorization: Bearer <operator-jwt>
 - `status` is rejected on create.
 - Response: `201 Created` with the created resource (envelope projected to the URL's served version).
 
+#### Organization bootstrap
+
+An `Organization` create may carry a top-level `bootstrap` field to create its
+first administrator atomically, alongside the Organization itself:
+
+```http
+POST /api/v1/resources/rise.dev/v1alpha1/organizations
+Content-Type: application/json
+Authorization: Bearer <operator-jwt>
+
+{
+  "apiVersion": "rise.dev/v1alpha1",
+  "kind": "Organization",
+  "metadata": { "name": "acme" },
+  "spec": { "displayName": "Acme" },
+  "bootstrap": { "admin": "user:u-01j9z..." }
+}
+```
+
+`bootstrap` is rejected with `400` on any kind other than a `rise.dev/v1alpha1`
+`Organization`, and `bootstrap.admin` must be a `user:<name>` subject or the
+request is `400`. When present, the handler builds a `RoleBinding` named
+`org-admin-<user name>` under the new Organization — exact org-root scope, no
+selector, `roleRef: { kind: PlatformRole, name: org-admin }`, the structural
+shape ADR-0001 §5 requires for org-admin standing — in the *same* transaction
+as the Organization create: `require_create`, the grant gate, and admission
+all run against it exactly as they would for an ordinary `RoleBinding` create.
+A gate refusal, or admission finding no live User named by `admin` (`422`, the
+store's message), rolls the whole write back — the Organization is never
+persisted without the admin the caller asked to bootstrap alongside it. The
+response is the ordinary `201` Organization envelope; the binding is
+discoverable afterward by listing `rolebindings` under the org. `bootstrap` is
+a request parameter, never stored state — nothing about it appears in the
+Organization's `spec`.
+
 ### Update (PUT)
 
 ```http
@@ -270,7 +359,7 @@ Authorization: Bearer <operator-jwt>
     "name": "my-widget",
     "revision": 7,
     "annotations": {"team": "platform"},
-    "finalizers": ["controller.example.com/cleanup"],
+    "finalizers": ["widget-controller/cleanup"],
     "ownerReferences": []
   },
   "spec": {"color": "red"}
@@ -285,6 +374,24 @@ Authorization: Bearer <operator-jwt>
 - `status` is rejected on update (use the `status` subresource).
 - Reads (GET/LIST) work for any *served* version. Writes (POST/PUT) must use the *storage* version — a write targeting a served non-storage version is rejected with `422 Unprocessable Entity` (version conversion is not yet implemented).
 
+### Write-time policy-audit warnings
+
+A successful create or update of a `RoleBinding` or `PlatformRoleBinding`
+re-runs the row-level policy-audit detectors against the row just written,
+scoped to that row alone, on the same transaction the write used. Every
+resulting finding is attached as an HTTP [`Warning`](https://www.rfc-editor.org/rfc/rfc7234#section-5.5)
+response header, one per finding, in the form Kubernetes uses for admission
+warnings:
+
+```
+Warning: 299 - "roleRef names Role 'viewer' in Organization 'acme', which no longer exists; the binding grants nothing."
+```
+
+This never blocks or fails the write — diagnostics never reject a write
+(ADR-0001 §5) — and the response body is unchanged; a client that ignores
+`Warning` headers sees nothing different. See [Policy audit](#policy-audit)
+for what the detectors catch.
+
 ### Status subresource (controllers and users)
 
 ```http
@@ -295,7 +402,7 @@ Authorization: Bearer <controller-jwt>
 {"status": {"phase": "Ready", "message": "all good"}}
 ```
 
-The body's `status` is stored under `status.controllers[<id>]` where `<id>` is the caller's `identity_id` (for controller tokens) or `operator:<email>` (for user writes, authorized by `(update, Kind, status)`). Other controller slots in `status.controllers` are unaffected. A controller can only write its own slot; a user write lands in its own writer-keyed slot and never overwrites a controller's.
+The body's `status` is stored under `status.controllers[<key>]` where `<key>` is the calling Controller's resource name (for a controller token) or `operator:<subject>` — e.g. `operator:user:<uid>` — for a user write, authorized by `(update, Kind, status)`. Other slots in `status.controllers` are unaffected. A controller can only write its own slot; a user write lands in its own writer-keyed slot and never overwrites a controller's.
 
 The status update applies unconditionally to the latest row (no revision needed) and increments `revision`.
 
@@ -306,10 +413,10 @@ PUT /api/v1/resources/example.dev/v1/widgets/acme/my-widget/finalizers
 Content-Type: application/json
 Authorization: Bearer <controller-jwt>
 
-{"add": ["controller.example.com/cleanup"], "remove": []}
+{"add": ["widget-controller/cleanup"], "remove": []}
 ```
 
-`add` and `remove` are applied in a single transaction. Both lists may be empty. Adding or removing a `system.rise.dev/*` finalizer is rejected with `400`. Controllers can only add or remove finalizers whose name corresponds to a controller-owned token; a user write authorized by `(update, Kind, finalizers)` bypasses the controller-ownership check — that path is the deadlock-break for stuck cascade deletions — but the reserved-prefix guard still applies.
+`add` and `remove` are applied in a single transaction. Both lists may be empty. Adding or removing a `system.rise.dev/*` finalizer is rejected with `400`. A controller can only add or remove finalizers named `<its own resource name>` or `<its own resource name>/<reason>`; a user write authorized by `(update, Kind, finalizers)` bypasses that ownership check — that path is the deadlock-break for stuck cascade deletions — but the reserved-prefix guard still applies.
 
 ### Delete (cascade)
 
@@ -362,16 +469,226 @@ silently omits blockers is worse than one that says how many it withheld — but
 grant the subresource on that basis, not on the assumption that it reveals
 nothing about a subtree the caller cannot list.
 
+### Policy audit
+
+```http
+GET /api/v1/resources/policy-audit?organization=acme&limit=200
+Authorization: Bearer <operator-jwt>
+```
+
+Diagnoses shapes admission accepts but that grant nothing, or nothing durable
+— a dangling `roleRef`, a stale subject, a `subjectMembership` constraint that
+can never bite, an Organization with no live admin, and the rest of the
+detector table below. It never rejects a write; admission stays exactly as it
+is (ADR-0001 §5, "diagnostics never reject writes").
+
+Query parameters:
+
+- `organization` (optional): scope the audit to one Organization by name. Omit
+  to audit every live Organization.
+- `limit` (optional, default 200, clamped to 1–1000): the maximum number of
+  findings returned. `truncated: true` means more existed than `limit` allowed
+  through.
+
+Every finding names a resource — a binding, a Role, a `GroupMembership`, a
+labelled resource, or an Organization — and is included only when the caller
+holds `list` on that resource, exactly like the `pending-deletion` listing.
+Findings the caller may not `list` are counted in `hiddenFindings` rather than
+named, so a partial view never reads as "nothing to see here". A finding whose
+subject's ancestry cannot be resolved is skipped and logged rather than
+failing the whole listing.
+
+```json
+{
+  "findings": [
+    {
+      "severity": "warning",
+      "category": "danglingRoleRef",
+      "subject": { "uid": "...", "kind": "RoleBinding", "name": "viewers", "organization": "acme" },
+      "related": [],
+      "detail": "roleRef names Role 'viewer' in Organization 'acme', which no longer exists; the binding grants nothing."
+    }
+  ],
+  "hiddenFindings": 3,
+  "truncated": false,
+  "scanned": {
+    "organizations": ["acme"],
+    "platformBindings": 6,
+    "organizationBindings": 4
+  }
+}
+```
+
+`shadowedBy` (`"deny"` or `"replacement"`) appears only on a `shadowedAllow`
+finding. `scanned` reports what the run actually looked at — every
+Organization it loaded bindings for, and how many platform and organization
+bindings it read — independent of what it found, so a report with zero
+findings reads as "scanned and healthy" rather than "scanned nothing".
+
+`OrganizationWithoutAdmin` on the configured default Organization
+(`default_organization.name` in settings) comes back as `info` rather than
+`warning`: that Organization is administered by operators through the seeded
+`system-admin` binding, not a per-organization admin, and giving it one is the
+multi-org direction rather than a gap to close today.
+
+| Category | Severity | What it means |
+|---|---|---|
+| `danglingRoleRef` | warning | `roleRef` names no live Role/PlatformRole; the binding grants nothing. |
+| `staleSubject` | warning | A literal subject names no live, active identity. |
+| `staleScope` | warning | A non-wildcard scope names a resource that no longer exists. |
+| `staleMembership` | info | A `GroupMembership` names a User with no live, active row. Markers deliberately outlive Users (ADR-0001 §1), so recreating the name makes the tie live again. |
+| `noOpMembershipConstraint` | warning | `subjectMembership: ResourceOrganization` can never bite — the subject already carries its own organization, or belongs to none. |
+| `recipientBoundaryNoOp` | warning or info | An org `RoleBinding`'s subject can never (warning) or does not currently (info) belong to that Organization. |
+| `inertOwnerLabel` | warning | `rise.dev/owner` resolves to nobody the seeded ownership binding reaches. |
+| `selectorMatchesNothing` | warning | A binding's `labelSelector` matches no resource in its scope. |
+| `shadowedAllow` | warning | A more specific binding drops this Allow, through a Deny (`shadowedBy: "deny"`) or wildcard replacement (`shadowedBy: "replacement"`). |
+| `organizationWithoutAdmin` | warning (info for the default Organization) | No qualifying binding gives this Organization a live, active admin. |
+| `nonQualifyingOrgAdminReference` | warning | A `PlatformRole/org-admin` reference that is not an exact org-root, scope-only binding — it grants the baseline statements without conferring admin standing or the Deny exemption. |
+
+### Explain subresource
+
+```http
+GET /api/v1/resources/rise.dev/v1alpha1/organizations/acme/explain?verb=delete
+Authorization: Bearer <user-jwt>
+```
+
+Explains the **caller's own** access to the addressed resource for one
+`(verb, subresource?)` tuple: every collected statement bearing on it (with
+its binding, placement tier, and whether it was retained, superseded by
+wildcard replacement, or an exempted Deny), plus every binding that matched
+but contributed nothing and why. Explaining another principal's access is not
+supported.
+
+`verb` is required; `subresource` is optional and explains access to that
+subresource instead of the main resource. The subresource is its own grant,
+authorized as `(get, Kind, explain)` — the same shape as
+`deletion-blockers` — so it is refused, not masked, for a caller who can see
+the resource but was not granted `explain` on it. The shipped
+`resource-owner` Role excludes subresources entirely (ADR-0001 §6.2), so an
+ordinary owner cannot explain their own access until granted `explain`
+separately.
+
+```json
+{
+  "decision": "deny",
+  "operatorOverride": false,
+  "ceilingAdmits": true,
+  "contributions": [
+    {
+      "binding": { "uid": "...", "kind": "RoleBinding", "name": "org-cap", "role": { "kind": "Role", "name": "org-cap" } },
+      "tier": { "organization": "acme" },
+      "statement": { "effect": "Deny", "kinds": ["rise.dev/Project"], "verbs": ["delete"] },
+      "retention": "exemptDeny:organizationAdmin"
+    }
+  ],
+  "inert": [
+    { "binding": { "uid": "...", "kind": "PlatformRoleBinding", "name": "...", "role": { "kind": "PlatformRole", "name": "..." } },
+      "tier": "platform", "reason": "resourceOrganization" }
+  ]
+}
+```
+
+`tier` is `"platform"` or `{"organization": "<name>"}`. `retention` is
+`"retained"`, `"supersededAllow"`, `"exemptDeny:operator"`, or
+`"exemptDeny:organizationAdmin"`. `inert[].reason` is one of
+`"unresolvedSubject"`, `"recipientBoundary"`, `"resourceOrganization"`, or
+`"danglingRoleRef"`.
+
+### Token subresource (ServiceAccount and Controller)
+
+```http
+POST /api/v1/resources/rise.dev/v1alpha1/serviceaccounts/acme/ci/token
+Content-Type: application/json
+
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+  "subject_token": "<external OIDC JWT>",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt"
+}
+```
+
+Issues a Rise **identity token** for exactly the resource the URL names, and
+persists nothing — the subresource is create-only, so `GET`, `PUT`, and
+`DELETE` on it are `405`. Only `rise.dev/ServiceAccount` and
+`rise.dev/Controller` register it; `/token` on any other kind is the ordinary
+route-not-found `404`, before authentication. The response is the RFC 8693
+shape: `access_token`, `token_type: Bearer`, `issued_token_type`, and
+`expires_in`.
+
+Two request modes exist, and a request must be exactly one of them:
+
+- **Workload token exchange** — the request carries `subject_token` and **no
+  Rise credential**. The assertion is validated only against the
+  `ServiceAccountTrustPolicy` / `ControllerTrustPolicy` children of the addressed
+  target (issuer, JWKS signature and expiry, then each policy's claim matcher,
+  with `aud` accepting a string or an array) and must match exactly one. There is
+  no RBAC check and no search across identities. Every failure after the route
+  is entered — a target that does not exist, is of another kind, or is being
+  deleted; an issuer no policy names; a signature that does not verify; zero or
+  several matching policies — returns the same `401` body, so the route never
+  confirms whether a given identity or policy exists. A trust policy may not
+  name Rise's own issuer; creating one is a `400`.
+- **Delegated issuance** — the request carries a Rise credential (a user
+  session, or an identity token) and **no** `subject_token`. The caller needs
+  `(create, rise.dev/ServiceAccount, token)` or `(create, rise.dev/Controller,
+  token)` on that exact target under its own capped effective policy; `get` on
+  the target, `create` on the main resource, and `get` on the subresource each
+  grant nothing here. A refused caller who cannot `get` the target is told `404`,
+  like any masked item. The minted token records the caller in a bounded `act`
+  chain (the platform limit is four delegators; a longer chain is `403`), and a
+  minted identity may mint the next only through its own live token-create
+  grant — actor data never grants anything.
+
+Both modes accept three optional fields. `expires_in` is clamped to
+`server.auth_token_max_ttl_seconds`, the platform-global maximum. `audience`
+(RFC 8693) names the verifier the token is for: omitted means Rise's own API;
+any other value mints the same token with that `aud`, which Rise's API refuses
+and the named verifier checks against Rise's JWKS at
+`GET {public_url}/api/v1/auth/jwks` (identity tokens are always RS256-signed
+with that key, whatever their audience). `authorization_details` is an RFC 9396
+list of `rise.dev/rbac` entries that only ever **narrows** the issued token; it
+is a statement about Rise's own RBAC, so it is rejected together with an
+external `audience`:
+
+```json
+{
+  "authorization_details": [
+    {
+      "type": "rise.dev/rbac",
+      "scope": "rise.dev/Organization/acme",
+      "permissions": [
+        {"verbs": ["get", "list"], "kinds": ["rise.dev/ServiceAccount"]},
+        {"verbs": ["update"], "kinds": ["rise.dev/Deployment"], "subresources": ["status"]}
+      ]
+    }
+  ]
+}
+```
+
+Each entry has one qualified `scope` and one or more permission statements in
+Role grammar; entries union, statements union within their entry's scope, and
+omitted `subresources` means the main resource only. An empty list, an unknown
+`type`, an empty axis, or an unqualified kind or scope is a `400` — never a
+fallback to full policy — and a token whose stored claim is malformed fails
+authentication.
+
+The minted token is a bearer for this API. On every request Rise re-resolves
+its `(sub, rise_uid)` pair to one live resource and evaluates the identity's
+**current** policy intersected with the ceiling: narrowing or deleting the
+target affects outstanding tokens immediately, and recreating the same name
+under a new UID does not revive them. Revoking the caller's token-create grant
+stops new issuance only. Identity tokens are not accepted by the typed APIs.
+
 ## Status codes
 
 | Code | Meaning |
 |---|---|
 | 200 / 201 / 202 | Operation succeeded (200 read/update, 201 create, 202 cascade tombstoned) |
 | 400 | Malformed path, body validation, reserved finalizer prefix, wrong version |
-| 401 | No credentials or JWT verification failed |
-| 403 | Authorized to read the resource but not to perform this verb, or refused by the grant gate |
-| 404 | Unknown collection, unknown resource, kind/version mismatch on `uid:`, or a resource the caller may not read |
-| 405 | Method not valid for the addressed path (e.g. GET on `/status`) |
+| 401 | No credentials or JWT verification failed; an assertion the `token` subresource did not accept |
+| 403 | Authorized to read the resource but not to perform this verb, refused by the grant gate, or a delegation chain past the platform limit |
+| 404 | Unknown collection, unknown resource, kind/version mismatch on `uid:`, a resource the caller may not read, or `/token` on a kind that does not register it |
+| 405 | Method not valid for the addressed path (e.g. GET on `/status`, PUT on `/token`) |
 | 409 | Name conflict on create, revision conflict on update |
 | 422 | Write targeting a served non-storage version (no conversion yet) |
 | 503 | Discriminator generator exhausted (10 retries) |

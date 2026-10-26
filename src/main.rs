@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use reqwest::Client;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -81,10 +81,9 @@ fn resolve_project_name_with_config(
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Cli {
-    /// Login profile to use, letting you manage multiple Rise accounts or
-    /// backends side by side. Falls back to the RISE_PROFILE environment
-    /// variable, then the default profile. `rise login --profile <name>`
-    /// registers a new profile if it doesn't already exist.
+    /// Profile alias for the Rise backend. Falls back to RISE_PROFILE, the project's
+    /// targets.default entry, then the profile selected by `rise profile use`.
+    /// `rise login --profile <name>` registers a new profile if needed.
     #[arg(long, global = true)]
     profile: Option<String>,
     #[command(subcommand)]
@@ -164,6 +163,12 @@ struct DeployArgs {
     /// Memory allocation (e.g., "256Mi", "1Gi") — sets both K8s request and limit (overrides rise.toml)
     #[arg(long)]
     memory: Option<String>,
+    /// Emit the completed deployment as JSON on stdout.
+    #[arg(long)]
+    json: bool,
+    /// Write the completed deployment JSON to this file.
+    #[arg(long, value_name = "PATH")]
+    status_file: Option<String>,
     #[command(flatten)]
     build_args: build::BuildArgs,
 }
@@ -225,9 +230,19 @@ enum Commands {
         /// Use browser-based OAuth2 authorization code flow (default)
         #[arg(long, conflicts_with = "device")]
         browser: bool,
-        /// Use device authorization flow
+        /// Use device authorization flow: confirm a code on the Rise web UI
+        /// (for SSH sessions and other machines without a local browser)
         #[arg(long, conflicts_with = "browser")]
         device: bool,
+        /// Restrict the session to a project or environment:
+        /// `<project>[/<environment>]=<preset|permission>[,...]`. Presets: read,
+        /// deploy, develop, admin. Repeatable. With --device this is a request
+        /// the approver may change.
+        #[arg(long = "scope", value_name = "TARGET=ACCESS")]
+        scopes: Vec<String>,
+        /// Ask for full access explicitly (the default without --scope)
+        #[arg(long, conflicts_with = "scopes")]
+        full_access: bool,
     },
     /// Manage CLI login profiles (see the global --profile flag / RISE_PROFILE)
     #[command(subcommand)]
@@ -392,10 +407,23 @@ enum IdentityCommands {
         /// every Rise deployment (/var/run/secrets/rise/identity/credential).
         #[arg(long)]
         credential: Option<String>,
-        /// Requested token lifetime in seconds. Capped by the server's configured maximum
-        /// (default 900). Omitting this field uses the server maximum.
+        /// Requested token lifetime in seconds. Capped by the server's configured maximum,
+        /// the lifetime of the auto-minted token files (default 3600). Omitting this field
+        /// uses the server maximum.
         #[arg(long)]
         ttl_seconds: Option<u64>,
+    },
+    /// Run the workload-identity sidecar the ECS backend adds to every task
+    ///
+    /// Writes the bootstrap credential and the deployment's audience tokens to
+    /// /var/run/secrets/rise/identity and keeps the tokens fresh. Rise starts
+    /// it; there is no reason to run it by hand.
+    #[command(hide = true)]
+    Agent {
+        /// Exit 0 if the agent has written everything the app needs (the
+        /// container health check), non-zero otherwise
+        #[arg(long)]
+        check: bool,
     },
 }
 
@@ -434,6 +462,11 @@ enum ProfileCommands {
     /// List registered login profiles
     #[command(visible_alias = "ls")]
     List,
+    /// Select the fallback profile when no explicit override or project target applies
+    Use {
+        /// Registered profile name (or "default")
+        name: String,
+    },
     /// Remove a profile's saved login/config
     #[command(visible_alias = "rm")]
     Remove {
@@ -635,6 +668,12 @@ enum DeploymentCommands {
         /// Limit number of deployments to show
         #[arg(long, short, default_value = "10")]
         limit: usize,
+        /// Emit deployments as a JSON array on stdout.
+        #[arg(long)]
+        json: bool,
+        /// Write the deployments JSON array to this file.
+        #[arg(long, value_name = "PATH")]
+        status_file: Option<String>,
     },
     /// Show deployment details
     #[command(visible_alias = "s")]
@@ -766,6 +805,12 @@ enum ServiceAccountCommands {
 enum EnvCommands {
     /// Set an environment variable for a project
     #[command(visible_alias = "s")]
+    #[command(group(
+        clap::ArgGroup::new("env_type")
+            .required(true)
+            .multiple(false)
+            .args(["plain", "secret", "protected"])
+    ))]
     Set {
         /// Project name (optional if rise.toml contains [project] section)
         #[arg(long, short = 'p')]
@@ -775,14 +820,17 @@ enum EnvCommands {
         path: String,
         /// Variable name (e.g., DATABASE_URL)
         key: String,
-        /// Variable value
-        value: String,
-        /// Mark as secret (encrypted at rest)
+        /// Variable value (prompted for when omitted)
+        value: Option<String>,
+        /// Store the value as plain text
+        #[arg(long)]
+        plain: bool,
+        /// Store the value as an encrypted secret retrievable through the API
         #[arg(long)]
         secret: bool,
-        /// Mark secret as protected (cannot be decrypted via API). Only applies to secrets. Defaults to true for secrets, must be false for non-secrets.
+        /// Store the value as an encrypted secret that cannot be retrieved
         #[arg(long)]
-        protected: Option<bool>,
+        protected: bool,
         /// Scope variable to a specific environment (e.g., 'staging'). Without this, the variable is global.
         #[arg(long, short = 'E')]
         environment: Option<String>,
@@ -850,7 +898,7 @@ enum EnvCommands {
         #[arg(long, short = 'E')]
         environment: Option<String>,
     },
-    /// Export resolved environment variables in dotfile format (KEY=value)
+    /// Export resolved environment variables as shell export commands
     #[command(visible_alias = "x")]
     Export {
         /// Project name (optional if rise.toml contains [project] section)
@@ -899,6 +947,9 @@ enum EnvironmentCommands {
         /// Badge color (green, blue, yellow, red, purple, orange, gray)
         #[arg(long, default_value = "green")]
         color: String,
+        /// Maximum lifetime for deployments into non-primary groups, e.g. '7d', '12h'.
+        #[arg(long, value_name = "DURATION")]
+        max_expiration: Option<String>,
     },
     /// List all environments for a project
     #[command(visible_alias = "ls")]
@@ -947,6 +998,10 @@ enum EnvironmentCommands {
         /// Badge color (green, blue, yellow, red, purple, orange, gray)
         #[arg(long)]
         color: Option<String>,
+        /// Maximum lifetime for deployments into non-primary groups, e.g. '7d', '12h'
+        /// (empty string clears)
+        #[arg(long, value_name = "DURATION")]
+        max_expiration: Option<String>,
     },
     /// Delete an environment
     #[command(visible_alias = "del")]
@@ -1138,6 +1193,19 @@ fn ansi_enabled(rise_log_color: Option<&str>, no_color: Option<&str>, is_termina
     no_color.is_none_or(|v| v.is_empty())
 }
 
+/// Use the command's application path for project defaults, including positional paths.
+fn project_config_directory(matches: &clap::ArgMatches) -> &str {
+    if let Some((_, child)) = matches.subcommand() {
+        return project_config_directory(child);
+    }
+    matches
+        .try_get_one::<String>("path")
+        .ok()
+        .flatten()
+        .map(String::as_str)
+        .unwrap_or(".")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize tracing for all commands
@@ -1157,14 +1225,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let project_path = project_config_directory(&matches);
+    let cli = Cli::from_arg_matches(&matches)?;
 
-    // Resolve the active login profile once, up front: an explicit --profile
-    // sets a process-wide override (cleared for the literal value "default")
-    // so every independent config load later in the process — not just the
-    // one below — agrees on the same profile. This deliberately avoids
-    // std::env::set_var, which is unsound to mutate concurrently with reads
-    // from other threads once the async runtime's workers are running.
+    // An explicit profile takes priority for every config load in this process.
     if let Some(profile) = &cli.profile {
         config::validate_profile_name(profile).context("Invalid --profile value")?;
         if profile == "default" {
@@ -1180,20 +1245,55 @@ async fn main() -> Result<()> {
         other => other,
     };
 
-    // Backend commands don't need CLI config (they use Settings from TOML/env vars)
-    // Only client commands (login, project, team, deployment, service-account) need it
+    // Backend commands use Settings from TOML/environment variables.
     #[cfg(feature = "backend")]
     if let Commands::Backend(backend_cmd) = &cli_command {
         return backend::handle_backend_command(backend_cmd.clone()).await;
     }
 
+    // Profile management only reads and writes local profile files.
+    if let Commands::Profile(profile_cmd) = &cli_command {
+        match profile_cmd {
+            ProfileCommands::List => profile::list_profiles()?,
+            ProfileCommands::Use { name } => profile::use_profile(name)?,
+            ProfileCommands::Remove { name } => profile::remove_profile(name)?,
+        }
+        return Ok(());
+    }
+
+    // The identity agent runs as a sidecar with no CLI config and must not
+    // reach for a backend on startup: its health check runs every few seconds.
+    if let Commands::Identity(IdentityCommands::Agent { check }) = &cli_command {
+        return cli::identity::agent_command(&Client::new(), *check).await;
+    }
+
+    // Keep config loads and credential writes on the same resolved target.
+    let url = match &cli_command {
+        Commands::Login { url, .. } => url.as_deref(),
+        _ => None,
+    };
+    let project_target = if config::Config::has_target_override(url)? {
+        None
+    } else {
+        build::config::load_default_target(project_path)?
+    };
+    let is_login = matches!(&cli_command, Commands::Login { .. });
+    config::set_target_override(config::Config::resolve_target(
+        url,
+        project_target.as_ref(),
+        is_login,
+    )?);
+
     // Load CLI config for client commands
     let http_client = Client::new();
-    let mut config = config::Config::load()?;
+    let mut config = if is_login {
+        config::Config::load_for_login()?
+    } else {
+        config::Config::load()?
+    };
     let backend_url = config.get_backend_url();
 
-    // Check version compatibility for all commands except Login
-    // (Backend commands are handled above and don't use the HTTP API; Login might use a custom URL)
+    // Commands that call the backend warn when the CLI and server versions differ.
     if !matches!(&cli_command, Commands::Login { .. }) {
         // Non-fatal version check - just warns user
         let _ = version::check_version_compatibility(&http_client, &backend_url).await;
@@ -1201,27 +1301,20 @@ async fn main() -> Result<()> {
 
     match &cli_command {
         Commands::Login {
-            url,
-            browser: _,
             device,
+            scopes,
+            full_access,
+            ..
         } => {
-            // Use provided URL or fall back to config default
-            let login_url = url
-                .as_deref()
-                .map(config::normalize_backend_url)
-                .unwrap_or_else(|| backend_url.clone());
-
+            let access = login::access::request_from_scopes(scopes, *full_access)?;
             if *device {
-                // Device flow (explicit)
-                login::handle_device_flow(&http_client, &login_url, &mut config, url.as_deref())
-                    .await?;
+                login::handle_device_flow(&http_client, &backend_url, &mut config, access).await?;
             } else {
-                // Authorization code flow with PKCE (default)
                 login::handle_authorization_code_flow(
                     &http_client,
-                    &login_url,
+                    &backend_url,
                     &mut config,
-                    url.as_deref(),
+                    access,
                 )
                 .await?;
             }
@@ -1234,10 +1327,7 @@ async fn main() -> Result<()> {
         Commands::Encrypt { plaintext } => {
             cli::encrypt::encrypt_command(&config, plaintext.clone()).await?;
         }
-        Commands::Profile(profile_cmd) => match profile_cmd {
-            ProfileCommands::List => profile::list_profiles()?,
-            ProfileCommands::Remove { name } => profile::remove_profile(name)?,
-        },
+        Commands::Profile(_) => unreachable!("Profile commands are handled before config loading"),
         Commands::Project(project_cmd) => match project_cmd {
             ProjectCommands::Create {
                 name,
@@ -1637,6 +1727,8 @@ async fn main() -> Result<()> {
                         replicas,
                         cpu,
                         memory,
+                        json_output: args.json,
+                        status_file: args.status_file.clone(),
                     },
                 )
                 .await?;
@@ -1646,6 +1738,8 @@ async fn main() -> Result<()> {
                 path,
                 group,
                 limit,
+                json,
+                status_file,
             } => {
                 let project_name = resolve_project_name(project.clone(), path)?;
                 deployment::list_deployments(
@@ -1655,6 +1749,10 @@ async fn main() -> Result<()> {
                     &project_name,
                     group.as_deref(),
                     *limit,
+                    deployment::DeploymentOutputOptions {
+                        json: *json,
+                        status_file: status_file.as_deref(),
+                    },
                 )
                 .await?;
             }
@@ -1811,6 +1909,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            IdentityCommands::Agent { .. } => unreachable!("handled before config load"),
         },
         Commands::Skill(skill_cmd) => match skill_cmd {
             SkillCommands::Install {
@@ -1849,28 +1948,39 @@ async fn main() -> Result<()> {
                 | EnvCommands::ShowDeployment { project, path, .. } => (project, path),
             };
             let project_name = resolve_project_name(project.clone(), path)?;
+            let prompted_value = match env_cmd {
+                EnvCommands::Set {
+                    value,
+                    secret,
+                    protected,
+                    ..
+                } => Some(env::resolve_env_value(
+                    value.as_deref(),
+                    *secret || *protected,
+                )?),
+                _ => None,
+            };
             let token = cli::token_source::resolve_token_with_retry(&http_client, &config).await?;
             match env_cmd {
                 EnvCommands::Set {
                     key,
-                    value,
                     secret,
                     protected,
                     environment,
                     ..
                 } => {
-                    // Protected defaults to true for secrets, false for non-secrets
-                    // Can be explicitly overridden with --protected flag
-                    let is_protected = protected.unwrap_or(*secret);
+                    let is_secret = *secret || *protected;
                     env::set_env(
                         &http_client,
                         &backend_url,
                         &token,
                         &project_name,
                         key,
-                        value,
-                        *secret,
-                        is_protected,
+                        prompted_value
+                            .as_deref()
+                            .expect("set commands resolve an environment variable value"),
+                        is_secret,
+                        *protected,
                         environment.as_deref(),
                     )
                     .await?;
@@ -2260,5 +2370,166 @@ mod log_color_tests {
     fn an_unrecognised_override_defers_rather_than_forcing() {
         assert!(!ansi_enabled(Some("banana"), Some("1"), true));
         assert!(ansi_enabled(Some("banana"), None, false));
+    }
+}
+
+#[cfg(all(test, feature = "cli"))]
+mod deployment_output_cli_tests {
+    use super::{
+        project_config_directory, Cli, Commands, DeploymentCommands, EnvCommands, ProfileCommands,
+    };
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn deploy_accepts_json_and_status_file_flags() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "deploy",
+            "--json",
+            "--status-file",
+            "deployment.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Deploy { args } => {
+                assert!(args.json);
+                assert_eq!(args.status_file.as_deref(), Some("deployment.json"));
+            }
+            _ => panic!("expected deploy command"),
+        }
+    }
+
+    #[test]
+    fn deployment_list_accepts_json_and_status_file_flags() {
+        let cli = Cli::try_parse_from([
+            "rise",
+            "deployment",
+            "list",
+            "--json",
+            "--status-file",
+            "deployments.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Deployment(DeploymentCommands::List {
+                json, status_file, ..
+            }) => {
+                assert!(json);
+                assert_eq!(status_file.as_deref(), Some("deployments.json"));
+            }
+            _ => panic!("expected deployment list command"),
+        }
+    }
+
+    #[test]
+    fn env_set_requires_an_explicit_type() {
+        let error = Cli::try_parse_from(["rise", "env", "set", "KEY", "value"]).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("--plain"));
+        assert!(message.contains("--secret"));
+        assert!(message.contains("--protected"));
+    }
+
+    #[test]
+    fn env_set_accepts_an_omitted_plain_value() {
+        let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--plain"]).unwrap();
+
+        match cli.command {
+            Commands::Env(EnvCommands::Set {
+                key,
+                value,
+                plain,
+                secret,
+                ..
+            }) => {
+                assert_eq!(key, "KEY");
+                assert_eq!(value, None);
+                assert!(plain);
+                assert!(!secret);
+            }
+            _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn env_set_accepts_an_omitted_secret_value() {
+        let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--secret"]).unwrap();
+
+        match cli.command {
+            Commands::Env(EnvCommands::Set {
+                value,
+                secret,
+                protected,
+                ..
+            }) => {
+                assert_eq!(value, None);
+                assert!(secret);
+                assert!(!protected);
+            }
+            _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn env_set_accepts_an_omitted_protected_value() {
+        let cli = Cli::try_parse_from(["rise", "env", "set", "KEY", "--protected"]).unwrap();
+
+        match cli.command {
+            Commands::Env(EnvCommands::Set {
+                value,
+                secret,
+                protected,
+                ..
+            }) => {
+                assert_eq!(value, None);
+                assert!(!secret);
+                assert!(protected);
+            }
+            _ => panic!("expected env set command"),
+        }
+    }
+
+    #[test]
+    fn env_set_rejects_multiple_types() {
+        for types in [
+            ["--plain", "--secret"],
+            ["--plain", "--protected"],
+            ["--secret", "--protected"],
+        ] {
+            assert!(Cli::try_parse_from([
+                "rise", "env", "set", "KEY", "value", types[0], types[1],
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn profile_use_accepts_a_profile_name() {
+        let cli = Cli::try_parse_from(["rise", "profile", "use", "work"]).unwrap();
+
+        match cli.command {
+            Commands::Profile(ProfileCommands::Use { name }) => assert_eq!(name, "work"),
+            _ => panic!("expected profile use command"),
+        }
+    }
+
+    #[test]
+    fn project_target_directory_follows_command_path() {
+        for (args, expected) in [
+            (vec!["rise", "deploy", "app"], "app"),
+            (vec!["rise", "deployment", "create", "app"], "app"),
+            (vec!["rise", "project", "show", "--path", "app"], "app"),
+            (vec!["rise", "env", "list", "--path", "app"], "app"),
+            (vec!["rise", "run", "app"], "app"),
+            (vec!["rise", "compose", "up", "app"], "app"),
+            (vec!["rise", "login"], "."),
+            (vec!["rise", "project", "list"], "."),
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).unwrap();
+            assert_eq!(project_config_directory(&matches), expected);
+        }
     }
 }

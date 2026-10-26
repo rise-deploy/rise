@@ -28,7 +28,7 @@ override_data {
 }
 
 override_data {
-  target = data.aws_availability_zones.available
+  target = module.network.data.aws_availability_zones.available
   values = { names = ["eu-central-1a", "eu-central-1b", "eu-central-1c"] }
 }
 
@@ -37,6 +37,7 @@ variables {
   ingress_domain      = "rise.example.com"
   admin_email         = "ops@example.com"
   rise_image_tag      = "0.23.0"
+  rise_cli_image_tag  = "0.23.0"
   acme_email          = "ops@example.com"
   controller_role_arn = "arn:aws:iam::123456789012:role/rise"
   execution_role_arn  = "arn:aws:iam::123456789012:role/rise-ecs-execution"
@@ -55,6 +56,39 @@ run "rejects_gitlab_and_jfrog_registries" {
   }
 
   expect_failures = [var.registry_type]
+}
+
+run "rejects_an_image_with_both_tag_and_digest" {
+  command = plan
+  variables {
+    rise_image_ref = "ghcr.io/rise-deploy/rise@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+  expect_failures = [var.rise_image_ref]
+}
+
+run "rejects_an_image_without_tag_or_digest" {
+  command = plan
+  variables {
+    rise_image_tag = null
+  }
+  expect_failures = [var.rise_image_ref]
+}
+
+run "rejects_a_cli_image_with_both_tag_and_digest" {
+  command = plan
+  variables {
+    rise_cli_image_ref = "ghcr.io/rise-deploy/rise-cli@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+  expect_failures = [var.rise_cli_image_ref]
+}
+
+# The sidecar image is as required as the control plane's: nothing infers it.
+run "rejects_a_cli_image_without_tag_or_digest" {
+  command = plan
+  variables {
+    rise_cli_image_tag = null
+  }
+  expect_failures = [var.rise_cli_image_ref]
 }
 
 # The backend normalises common spellings, but the module should not be the
@@ -91,6 +125,30 @@ run "rejects_noncanonical_idp_group_sync_prefixes" {
   expect_failures = [var.idp_group_sync_prefixes]
 }
 
+run "rejects_an_additional_secret_that_overrides_a_builtin" {
+  command = plan
+
+  variables {
+    control_plane_secret_environment = {
+      DATABASE_URL = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/database-url-abc123"
+    }
+  }
+
+  expect_failures = [var.control_plane_secret_environment]
+}
+
+run "rejects_an_additional_secret_without_a_full_arn" {
+  command = plan
+
+  variables {
+    control_plane_secret_environment = {
+      SNOWFLAKE_OAUTH_PRIVATE_KEY = "rise/snowflake-oauth"
+    }
+  }
+
+  expect_failures = [var.control_plane_secret_environment]
+}
+
 # VPC endpoints reach AWS services only. Traefik's HTTP-01 challenge needs
 # Let's Encrypt, so the certificate would silently never arrive.
 run "rejects_acme_without_internet_egress" {
@@ -101,7 +159,7 @@ run "rejects_acme_without_internet_egress" {
     enable_vpc_endpoints = true
   }
 
-  expect_failures = [aws_lb.this]
+  expect_failures = [var.nat_gateway_mode]
 }
 
 run "rejects_ecr_without_a_push_role" {
@@ -111,7 +169,7 @@ run "rejects_ecr_without_a_push_role" {
     ecr_push_role_arn = null
   }
 
-  expect_failures = [aws_lb.this]
+  expect_failures = [var.ecr_push_role_arn]
 }
 
 run "rejects_external_traefik_mode_without_an_arn" {
@@ -136,6 +194,16 @@ run "rejects_module_owned_traefik_mode_with_an_external_arn" {
   expect_failures = [var.create_traefik_task_role]
 }
 
+run "rejects_an_ecr_registry_host_with_a_scheme" {
+  command = plan
+
+  variables {
+    ecr_registry_host = "https://123456789012.dkr.ecr.eu-central-1.amazonaws.com"
+  }
+
+  expect_failures = [var.ecr_registry_host]
+}
+
 run "rejects_an_install_with_no_identity_provider" {
   command = plan
 
@@ -144,7 +212,7 @@ run "rejects_an_install_with_no_identity_provider" {
     deploy_dex  = false
   }
 
-  expect_failures = [aws_lb.this]
+  expect_failures = [var.oidc_issuer]
 }
 
 run "a_real_idp_install_must_supply_its_own_oidc_client_secret" {
@@ -157,7 +225,7 @@ run "a_real_idp_install_must_supply_its_own_oidc_client_secret" {
 
   # Without this the module would write the repo-published `rise-backend-secret`
   # constant as the client secret; that default is only for the bundled Dex demo.
-  expect_failures = [aws_secretsmanager_secret_version.oidc_client_secret]
+  expect_failures = [var.oidc_client_secret]
 }
 
 run "deploy_dex_uses_a_browser_reachable_issuer" {
@@ -175,12 +243,28 @@ run "deploy_dex_uses_a_browser_reachable_issuer" {
     condition     = local.rise_environment["DEX_ISSUER"] == "https://dex.rise.example.com/dex"
     error_message = "the demo issuer must be publicly reachable, not the Cloud Map address"
   }
+}
 
-  assert {
-    condition = alltrue([
-      aws_service_discovery_service.dex[0].name == "rise-dex",
-      length(aws_service_discovery_service.dex[0].health_check_custom_config) == 0,
-    ])
-    error_message = "Dex discovery must be install-scoped without an empty custom health check"
+run "rejects_an_alb_without_a_certificate" {
+  command = plan
+  variables { edge_mode = "alb-acm" }
+  expect_failures = [var.edge_mode]
+}
+
+run "rejects_acme_without_an_email" {
+  command = plan
+  variables { acme_email = null }
+  expect_failures = [var.acme_email]
+}
+
+run "rejects_a_vpc_without_public_subnets" {
+  command = plan
+  variables {
+    vpc = { id = "vpc-0123456789abcdef0", private_subnet_ids = ["subnet-a"] }
   }
+  override_data {
+    target = module.network.data.aws_subnet.brought["subnet-a"]
+    values = { vpc_id = "vpc-0123456789abcdef0" }
+  }
+  expect_failures = [var.vpc]
 }

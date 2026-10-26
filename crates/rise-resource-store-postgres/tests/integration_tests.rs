@@ -1,7 +1,7 @@
 use rise_resource_api::{
-    CreateResourceParams, DeleteOutcome, ExternalSubject, Issuer, NoOpValidator, OwnerReference,
-    PathSegment, ResourceApi, ResourceRow, ResourceStore, StoreError, UpdateResourceParams,
-    API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, CONTROLLER_KIND,
+    CreateResourceParams, DeleteOutcome, ExternalSubject, Issuer, LabelKey, NoOpValidator,
+    OwnerReference, PathSegment, ResourceApi, ResourceRow, ResourceStore, StoreError,
+    UpdateResourceParams, API_VERSION_V1ALPHA1, CASCADE_DELETION_FINALIZER, CONTROLLER_KIND,
     CONTROLLER_TRUST_POLICY_KIND, GROUP_KIND, GROUP_MEMBERSHIP_KIND, IDENTITY_KIND_DEFINITIONS,
     ORGANIZATION_KIND, PLATFORM_ROLE_BINDING_KIND, PLATFORM_ROLE_KIND, POLICY_KIND_DEFINITIONS,
     RESOURCE_DEFINITION_KIND, ROLE_BINDING_KIND, ROLE_KIND, SERVICE_ACCOUNT_KIND,
@@ -10,6 +10,7 @@ use rise_resource_api::{
 use rise_resource_store_postgres::{
     BuiltInRegistration, BuiltInRegistry, IdentityLookup, MembershipLookup, OrganizationValidator,
     PgResourceStore, SerializableTransaction, TrustPolicyLookup,
+    CONTROLLER_CANDIDATES_BY_ISSUER_SQL,
 };
 use serde_json::json;
 use sqlx::Executor;
@@ -63,7 +64,6 @@ async fn generic_create_rejects_resource_definitions(pool: sqlx::PgPool) -> sqlx
                 "kind": "User",
                 "plural": "users",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -135,7 +135,6 @@ async fn same_kind_name_is_isolated_by_api_version(pool: sqlx::PgPool) -> sqlx::
                     "kind": "Widget",
                     "plural": plural,
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": []
                 }),
                 validator: None,
             })
@@ -422,7 +421,6 @@ async fn update_api_version_collision_returns_name_conflict(
                     "kind": "Widget",
                     "plural": plural,
                     "versions": [{"name": "v1", "served": true, "storage": true}],
-                    "allowedStatusControllerIds": []
                 }),
                 validator: None,
             })
@@ -796,7 +794,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                 "kind": "Widget",
                 "plural": "widgets",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -839,7 +836,6 @@ async fn resolve_collection_by_kind_resolves_builtins_and_rds(
                     {"name": "v1", "served": false, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
                 ],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -865,7 +861,6 @@ async fn register_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<()> {
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -905,7 +900,6 @@ async fn delete_resource_definition_rejects_existing_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let definition = store
@@ -971,7 +965,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let definition = store
@@ -1017,7 +1010,6 @@ async fn delete_resource_definition_rejects_instances_in_any_served_version(
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
     let definition = store
         .update_resource_definition(
@@ -1053,7 +1045,6 @@ async fn register_resource_definition_rejects_reserved_plural(
         "kind": "Organization",
         "plural": "organizations",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1098,7 +1089,6 @@ async fn register_rejects_resource_definition_as_a_custom_kind(
                 "kind": "ResourceDefinition",
                 "plural": "customdefinitions",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -1128,7 +1118,6 @@ async fn database_guard_rejects_post_activation_legacy_definition_bypass(
         "kind": "User",
         "plural": "users",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     }))
     .execute(&pool)
     .await
@@ -1156,7 +1145,6 @@ async fn register_resource_definition_rejects_zero_served_versions(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": false, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1195,7 +1183,6 @@ async fn register_resource_definition_root_and_parent_validation(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     store
         .register_resource_definition(CreateResourceParams {
@@ -1220,7 +1207,6 @@ async fn register_resource_definition_root_and_parent_validation(
         "plural": "gadgets",
         "parent": {"apiVersion": "no-slash", "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let err = store
         .register_resource_definition(CreateResourceParams {
@@ -1256,7 +1242,6 @@ async fn register_resource_definition_rejects_parent_cycles(
             "kind": kind,
             "plural": plural,
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": []
         });
         if let Some(pk) = parent_kind {
             spec["parent"] = json!({"apiVersion": "cycle.dev/v1", "kind": pk});
@@ -1338,7 +1323,6 @@ async fn register_resource_definition_rejects_duplicate_identity(
             "kind": kind,
             "plural": plural,
             "versions": [{"name": "v1", "served": true, "storage": true}],
-            "allowedStatusControllerIds": []
         }),
         validator: None,
     };
@@ -1611,7 +1595,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1639,7 +1622,6 @@ async fn update_resource_definition_updates_projection(pool: sqlx::PgPool) -> sq
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let updated = store
@@ -1679,7 +1661,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let rd = store
@@ -1722,7 +1703,6 @@ async fn added_version_serves_existing_instances_without_rewriting(
             {"name": "v1", "served": true, "storage": false},
             {"name": "v2", "served": true, "storage": true}
         ],
-        "allowedStatusControllerIds": []
     });
 
     store
@@ -1772,7 +1752,6 @@ async fn update_resource_definition_rejects_identity_change(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1797,7 +1776,6 @@ async fn update_resource_definition_rejects_identity_change(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -1839,7 +1817,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let rd = store
@@ -1882,7 +1859,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v2", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let err = store
         .update_resource_definition(
@@ -1912,7 +1888,6 @@ async fn update_resource_definition_rejects_removing_version_with_instances(
         "kind": "Widget",
         "plural": "widgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     store
         .update_resource_definition(
@@ -1944,7 +1919,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "plural": "widgets",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -1969,7 +1943,6 @@ async fn update_resource_definition_rejects_parent_change(pool: sqlx::PgPool) ->
         "plural": "widgets",
         "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": "Project"},
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -2011,7 +1984,6 @@ async fn register_resource_definition_rejects_invalid_non_storage_schema(
             {"name": "v1", "served": true, "storage": true},
             {"name": "v2", "served": true, "storage": false, "schema": {"type": "not-a-json-schema-type"}}
         ],
-        "allowedStatusControllerIds": []
     });
 
     let err = store
@@ -2058,7 +2030,6 @@ async fn update_resource_definition_invalidates_schema_cache(
                 "properties": {"color": {"type": "string"}}
             }
         }],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -2101,7 +2072,6 @@ async fn update_resource_definition_invalidates_schema_cache(
                 "properties": {"size": {"type": "number"}}
             }
         }],
-        "allowedStatusControllerIds": []
     });
 
     store
@@ -2152,7 +2122,6 @@ async fn update_rejects_resource_definition(pool: sqlx::PgPool) -> sqlx::Result<
         "kind": "Gadget",
         "plural": "gadgets",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
 
     let row = store
@@ -2515,7 +2484,6 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
         "kind": "Blocked",
         "plural": "blockeds",
         "versions": [{"name": "v1", "served": true, "storage": true}],
-        "allowedStatusControllerIds": []
     });
     let register_error = store
         .register_resource_definition(CreateResourceParams {
@@ -2573,7 +2541,6 @@ async fn owner_references_reject_protected_dependent_kinds(pool: sqlx::PgPool) -
                 "kind": "Organization",
                 "plural": "custom-organizations",
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -2732,7 +2699,6 @@ async fn register_example_widget_rd(store: &PgResourceStore) {
                     {"name": "v1", "served": true, "storage": true},
                     {"name": "v2", "served": true, "storage": false}
                 ],
-                "allowedStatusControllerIds": []
             }),
             validator: None,
         })
@@ -3349,7 +3315,7 @@ async fn identity_admission_is_unbypassable_and_persists_canonical_defaults(
         USER_IDENTITY_KIND,
         "malformed",
         Some(user.uid),
-        json!({"issuer":"https://issuer.example/","subject":"alice"}),
+        json!({"issuer":"https://ISSUER.example","subject":"alice"}),
         vec![],
     )
     .await
@@ -3429,6 +3395,7 @@ async fn identity_admission_is_unbypassable_and_persists_canonical_defaults(
     Ok(())
 }
 
+/// ADR-0001 scenario 9
 #[sqlx::test]
 async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
     pool: sqlx::PgPool,
@@ -3537,6 +3504,7 @@ async fn user_identity_uniqueness_is_live_global_and_concurrency_authoritative(
     Ok(())
 }
 
+/// ADR-0001 scenario 16
 #[sqlx::test]
 async fn membership_owner_rules_and_name_bound_reactivation_are_enforced(
     pool: sqlx::PgPool,
@@ -3851,6 +3819,201 @@ async fn narrow_identity_trust_and_membership_lookups_filter_live_builtin_facts(
     Ok(())
 }
 
+#[sqlx::test]
+async fn controller_candidates_by_issuer_filters_live_controllers_and_ignores_other_kinds(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool.clone());
+    let issuer = Issuer::new("https://token.example").unwrap();
+
+    let controller = create_builtin_resource(
+        &store,
+        CONTROLLER_KIND,
+        "reconciler",
+        None,
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-a",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-a"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-b",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-b"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A second, live Controller with its own policy on the same issuer — a
+    // real match, since a caller collapses candidates by controller_uid and
+    // more than one distinct uid is what makes a token ambiguous.
+    let other_controller =
+        create_builtin_resource(&store, CONTROLLER_KIND, "watcher", None, json!({}), vec![])
+            .await
+            .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "github-c",
+        Some(other_controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise","sub":"repo-c"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    // A tombstoned Controller's policy must not surface, even though the
+    // policy row itself is still live.
+    let decommissioned = create_builtin_resource(
+        &store,
+        CONTROLLER_KIND,
+        "decommissioned",
+        None,
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "orphaned",
+        Some(decommissioned.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(decommissioned.uid).await.unwrap();
+
+    // A tombstoned policy under a live Controller must not surface either.
+    let deleted_policy = create_builtin_resource(
+        &store,
+        CONTROLLER_TRUST_POLICY_KIND,
+        "deleted",
+        Some(controller.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    store.delete(deleted_policy.uid).await.unwrap();
+
+    // A ServiceAccountTrustPolicy on the same issuer is a different kind and
+    // must not surface.
+    let org = create_org(&store, "candidate-org").await;
+    let service_account = create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_KIND,
+        "deployer",
+        Some(org.uid),
+        json!({}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    create_builtin_resource(
+        &store,
+        SERVICE_ACCOUNT_TRUST_POLICY_KIND,
+        "ci",
+        Some(service_account.uid),
+        json!({"issuer":"https://token.example","claims":{"aud":"rise"}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+
+    let trust = TrustPolicyLookup::new(pool.clone());
+    let candidates = trust
+        .controller_candidates_by_issuer(&issuer)
+        .await
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| (
+                candidate.controller_name.as_str(),
+                candidate.policy_name.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("reconciler", "github-a"),
+            ("reconciler", "github-b"),
+            ("watcher", "github-c"),
+        ]
+    );
+    assert_eq!(candidates[0].controller_uid, controller.uid);
+    assert_eq!(candidates[2].controller_uid, other_controller.uid);
+
+    assert!(trust
+        .controller_candidates_by_issuer(&Issuer::new("https://other.example").unwrap())
+        .await
+        .unwrap()
+        .is_empty());
+
+    assert!(trust.controller_issuer_exists(&issuer).await.unwrap());
+    assert!(!trust
+        .controller_issuer_exists(&Issuer::new("https://other.example").unwrap())
+        .await
+        .unwrap());
+
+    // The candidates query has no leading-column condition on `policy`, so at
+    // this table's tiny test-scale row count the planner can satisfy it via a
+    // controller-first nested loop through the unrelated child-name-uniqueness
+    // index instead of the dedicated `workload_trust_issuer_parent` index this
+    // migration reorders into place. Drop that alternate path so the assertion
+    // actually exercises whether the SQL text still matches the index's
+    // predicate verbatim (see
+    // `maximum_identity_index_keys_fit_and_projection_queries_use_their_indexes`,
+    // which exercises the same index from its target-bound-lookup side).
+    let mut connection = pool.acquire().await?;
+    connection
+        .execute("DROP INDEX resource_store.resources_child_kind_name_unique")
+        .await?;
+    connection.execute("SET enable_seqscan = off").await?;
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (COSTS OFF) {}",
+        CONTROLLER_CANDIDATES_BY_ISSUER_SQL
+    )))
+    .bind("https://token.example")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        plan.join("\n").contains("workload_trust_issuer_parent"),
+        "{}",
+        plan.join("\n")
+    );
+
+    let exists_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (COSTS OFF) {}",
+        rise_resource_store_postgres::CONTROLLER_ISSUER_EXISTS_SQL
+    )))
+    .bind("https://token.example")
+    .fetch_all(&mut *connection)
+    .await?;
+    assert!(
+        exists_plan
+            .join("\n")
+            .contains("workload_trust_issuer_parent"),
+        "{}",
+        exists_plan.join("\n")
+    );
+    Ok(())
+}
+
 async fn execute_resource_migration(pool: &sqlx::PgPool, version: i64) -> Result<(), sqlx::Error> {
     let migrator = sqlx::migrate!("./migrations");
     let migration = migrator
@@ -3864,7 +4027,7 @@ async fn execute_resource_migration(pool: &sqlx::PgPool, version: i64) -> Result
     connection
         .execute("SET search_path TO resource_store, public")
         .await?;
-    connection.execute(&*migration.sql).await?;
+    connection.execute(migration.sql.clone()).await?;
     Ok(())
 }
 
@@ -3900,7 +4063,7 @@ async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
 
     // Each conflicting population is named specifically, and a rejected upgrade
     // leaves nothing behind — including the guard it would have installed.
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
     let guard_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_identity_reservations')",
@@ -3912,7 +4075,7 @@ async fn identity_activation_upgrade_audit_is_actionable_and_guard_is_durable(
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
         .execute(&pool)
         .await?;
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy resource row(s)"));
 
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
@@ -4054,7 +4217,7 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
         WHERE schemaname = 'resource_store'
           AND indexname IN (
               'user_identities_issuer_subject_unique',
-              'workload_trust_parent_issuer',
+              'workload_trust_issuer_parent',
               'group_memberships_user_name'
           )
         ORDER BY indexname
@@ -4074,10 +4237,10 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     // them cannot silently drop to a sequential scan on the login path.
     let mut connection = pool.acquire().await?;
     connection.execute("SET enable_seqscan = off").await?;
-    let identity_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let identity_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::USER_IDENTITY_BY_EXTERNAL_IDENTITY_SQL
-    ))
+    )))
     .bind("https://issuer.example")
     .bind("subject")
     .fetch_all(&mut *connection)
@@ -4086,22 +4249,22 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
         .join("\n")
         .contains("user_identities_issuer_subject_unique"));
 
-    let trust_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let trust_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::CONTROLLER_TRUST_POLICIES_SQL
-    ))
+    )))
     .bind(uuid::Uuid::nil())
     .bind("https://issuer.example")
     .fetch_all(&mut *connection)
     .await?;
     assert!(trust_plan
         .join("\n")
-        .contains("workload_trust_parent_issuer"));
+        .contains("workload_trust_issuer_parent"));
 
-    let membership_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let membership_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::GROUPS_FOR_USER_SQL
-    ))
+    )))
     .bind(uuid::Uuid::nil())
     .bind("member")
     .fetch_all(&mut *connection)
@@ -4115,10 +4278,10 @@ async fn maximum_identity_index_keys_fit_and_projection_queries_use_their_indexe
     // verbatim: PostgreSQL cannot derive that from `api_version = '...'`, so
     // dropping the seemingly-redundant line de-indexes the lookup entirely and
     // puts a relation-wide `SIReadLock` on every gated identity write.
-    let by_name_plan: Vec<String> = sqlx::query_scalar(&format!(
+    let by_name_plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "EXPLAIN (COSTS OFF) {}",
         rise_resource_store_postgres::GROUP_TIES_BY_USER_NAME_SQL
-    ))
+    )))
     .bind("member")
     .fetch_all(&mut *connection)
     .await?;
@@ -4179,7 +4342,6 @@ async fn register_org_widget_rd(store: &PgResourceStore) {
                 "plural": "orgwidgets",
                 "parent": {"apiVersion": API_VERSION_V1ALPHA1, "kind": ORGANIZATION_KIND},
                 "versions": [{"name": "v1", "served": true, "storage": true}],
-                "allowedStatusControllerIds": []
             }),
             ..Default::default()
         })
@@ -5183,7 +5345,7 @@ async fn policy_activation_upgrade_audit_is_actionable_and_guard_is_durable(
 
     // Each conflicting population is named specifically, and a rejected upgrade
     // leaves nothing behind — including the guard it would have installed.
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy ResourceDefinition(s)"));
     let guard_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'resource_definitions_policy_reservations')",
@@ -5195,7 +5357,7 @@ async fn policy_activation_upgrade_audit_is_actionable_and_guard_is_durable(
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'legacy.example'")
         .execute(&pool)
         .await?;
-    let error = pool.execute(&*activation).await.unwrap_err();
+    let error = pool.execute(activation.clone()).await.unwrap_err();
     assert!(error.to_string().contains("legacy resource row(s)"));
 
     sqlx::query("DELETE FROM resource_store.resources WHERE name = 'orphan'")
@@ -5646,6 +5808,133 @@ async fn label_inheriting_descendants_of_an_unknown_uid_are_empty(
         .await
         .unwrap()
         .is_empty());
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// The audit's label-backed detectors — `list_label_setters`
+// -----------------------------------------------------------------------------
+
+/// The complement of `label_inheriting_descendants`: every live resource that
+/// sets a key itself, any kind, unaffected by a value it does not carry, a
+/// tombstone, or a different key.
+#[sqlx::test]
+async fn list_label_setters_finds_every_live_setter_of_the_key(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_org_widget_rd(&store).await;
+    let key: LabelKey = "rise.dev/owner".parse().unwrap();
+
+    // A root kind (Organization) and a child kind (OrgWidget) both count: the
+    // primitive is kind-agnostic.
+    let acme = create_labeled(
+        &store,
+        ORGANIZATION_KIND,
+        "acme",
+        None,
+        &[("rise.dev/owner", "user:alice")],
+    )
+    .await;
+    let widget = create_labeled(
+        &store,
+        "OrgWidget",
+        "with-owner",
+        Some(acme.uid),
+        &[("rise.dev/owner", "user:bob")],
+    )
+    .await;
+    // Neither is a setter: one carries no labels, the other carries a
+    // different key.
+    let _no_labels = create_labeled(&store, "OrgWidget", "bare", Some(acme.uid), &[]).await;
+    let _other_key = create_labeled(
+        &store,
+        "OrgWidget",
+        "unrelated",
+        Some(acme.uid),
+        &[("rise.dev/team", "group:x")],
+    )
+    .await;
+
+    let found = store.list_label_setters(&key, 100).await.unwrap();
+    let uids: Vec<Uuid> = found.iter().map(|row| row.uid).collect();
+    assert_eq!(uids.len(), 2);
+    assert!(uids.contains(&acme.uid));
+    assert!(uids.contains(&widget.uid));
+
+    Ok(())
+}
+
+/// A tombstoned setter is excluded — unlike `label_inheriting_descendants`,
+/// which deliberately keeps a draining resource's inherited authority visible,
+/// a tombstoned row is no longer a live grant of anything and must not name
+/// anybody as an owner or satisfy a selector.
+#[sqlx::test]
+async fn list_label_setters_excludes_tombstoned_rows(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_org_widget_rd(&store).await;
+    let key: LabelKey = "rise.dev/owner".parse().unwrap();
+
+    let acme = create_labeled(&store, ORGANIZATION_KIND, "acme", None, &[]).await;
+    let draining = create_labeled(
+        &store,
+        "OrgWidget",
+        "draining",
+        Some(acme.uid),
+        &[("rise.dev/owner", "user:alice")],
+    )
+    .await;
+    // A finalizer keeps the row present as a tombstone rather than hard-deleting.
+    store
+        .operator_update_finalizers(draining.uid, "test", &["example.dev/hold".to_string()], &[])
+        .await
+        .unwrap();
+    store.delete(draining.uid).await.unwrap();
+    let tombstoned = store.get(draining.uid).await.unwrap().unwrap();
+    assert!(tombstoned.deletion_timestamp.is_some());
+
+    let found = store.list_label_setters(&key, 100).await.unwrap();
+    assert!(!found.iter().any(|row| row.uid == draining.uid));
+
+    Ok(())
+}
+
+/// `limit` bounds the read, and a caller that pages with an increasing limit
+/// sees a stable, growing prefix — the oldest-first contract, checked without
+/// depending on exact timestamp resolution between two `create` calls.
+#[sqlx::test]
+async fn list_label_setters_respects_the_limit(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    let key: LabelKey = "rise.dev/owner".parse().unwrap();
+
+    let mut created = Vec::new();
+    for i in 0..5 {
+        created.push(
+            create_labeled(
+                &store,
+                ORGANIZATION_KIND,
+                &format!("org-{i}"),
+                None,
+                &[("rise.dev/owner", "user:alice")],
+            )
+            .await
+            .uid,
+        );
+    }
+
+    let capped = store.list_label_setters(&key, 2).await.unwrap();
+    assert_eq!(capped.len(), 2);
+    let full = store.list_label_setters(&key, 100).await.unwrap();
+    assert_eq!(full.len(), 5);
+
+    let capped_uids: Vec<Uuid> = capped.iter().map(|row| row.uid).collect();
+    let full_uids: Vec<Uuid> = full.iter().map(|row| row.uid).collect();
+    assert_eq!(
+        capped_uids,
+        full_uids[..2],
+        "a smaller limit returns a prefix of the unlimited result"
+    );
+
     Ok(())
 }
 
@@ -6133,6 +6422,8 @@ async fn dropping_a_transaction_rolls_its_writes_back(pool: sqlx::PgPool) {
 /// arrives as `StoreError::Serialization` rather than an opaque backend error,
 /// because the caller's correct response is to replay the whole unit of work
 /// (ADR-0001 §5, scenario 33).
+///
+/// ADR-0001 scenario 33
 #[sqlx::test]
 async fn a_serialization_conflict_is_reported_as_retryable(pool: sqlx::PgPool) {
     let store = PgResourceStore::new(pool.clone());

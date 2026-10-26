@@ -85,6 +85,8 @@ fn matcher_sets_reject_duplicates_and_serialize_canonically() {
     );
 }
 
+/// ADR-0001 scenario 6
+/// ADR-0001 scenario 17
 #[test]
 fn platform_membership_omission_normalizes_but_null_fails() {
     let parsed: PlatformRoleBindingSpec =
@@ -105,6 +107,7 @@ fn platform_membership_omission_normalizes_but_null_fails() {
     assert!(serde_json::from_value::<PlatformRoleBindingSpec>(invalid_membership).is_err());
 }
 
+/// ADR-0001 scenario 6
 #[test]
 fn binding_shapes_reject_plural_wrong_case_and_wrong_reference_direction() {
     for invalid in [
@@ -142,6 +145,7 @@ fn binding_shapes_reject_plural_wrong_case_and_wrong_reference_direction() {
     assert!(serde_json::from_value::<PlatformRoleBindingSpec>(wrong_platform_ref).is_err());
 }
 
+/// ADR-0001 scenario 5
 #[test]
 fn binding_subject_grammar_is_closed() {
     for value in [
@@ -164,6 +168,7 @@ fn binding_subject_grammar_is_closed() {
     }
 }
 
+/// ADR-0001 scenario 4
 #[test]
 fn binding_normalization_is_contextual_and_fail_closed() {
     let org: RoleBindingSpec = serde_json::from_value(json!({
@@ -322,6 +327,8 @@ fn generated_binding_schemas_match_omission_and_null_rules() {
 /// An org `RoleBinding` already sits in exactly one Organization, so its subject
 /// may name a Group relatively. Resolution happens at normalization, where the
 /// parent is known — parsing a subject never becomes context-sensitive.
+///
+/// ADR-0001 scenario 5
 #[test]
 fn a_relative_group_subject_resolves_against_the_parent_organization() {
     let relative: RoleBindingSpec = serde_json::from_value(json!({
@@ -416,6 +423,7 @@ fn policy_collections_are_reserved_against_external_definitions() {
     }
 }
 
+/// ADR-0001 scenario 8
 #[test]
 fn policy_kind_definitions_capture_fixed_adr_placement() {
     // Two same-shaped pairs, one per placement level: the org pair hangs under

@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use super::buildkit::ensure_buildx_builder;
 use super::proxy;
-use super::registry::docker_push;
+use super::registry::docker_push_with_output;
 use super::ssl::embed_ssl_cert_in_plan;
 use super::BuildPushMode;
 
@@ -34,6 +34,7 @@ pub(crate) struct RailpackBuildOptions<'a> {
     pub env: &'a [String],
     pub no_cache: bool,
     pub platform: &'a str,
+    pub output: super::CommandOutput,
 }
 
 /// RAII guard for cleaning up temp files and directories
@@ -156,7 +157,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
         );
     }
 
-    let status = cmd.status().context("Failed to execute railpack prepare")?;
+    let status = super::run_command(cmd, "Failed to execute railpack prepare", options.output)?;
 
     if !status.success() {
         bail!("railpack prepare failed with status: {}", status);
@@ -204,6 +205,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
             options.no_cache,
             options.container_cli,
             options.platform,
+            options.output,
         )?;
     } else {
         build_with_buildx(
@@ -217,6 +219,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
             &all_secrets,
             options.no_cache,
             options.platform,
+            options.output,
         )?;
     }
 
@@ -236,6 +239,7 @@ fn build_with_buildx(
     secrets: &HashMap<String, String>,
     no_cache: bool,
     platform: &str,
+    output: super::CommandOutput,
 ) -> Result<()> {
     // Check buildx availability
     if !super::docker::is_buildx_available(container_cli) {
@@ -252,7 +256,7 @@ fn build_with_buildx(
 
     // If buildkit_host is provided, we need to create/use a builder pointing to it
     let builder_name = if let Some(host) = buildkit_host {
-        Some(ensure_buildx_builder(container_cli, host)?)
+        Some(ensure_buildx_builder(container_cli, host, output)?)
     } else {
         None
     };
@@ -307,9 +311,11 @@ fn build_with_buildx(
 
     debug!("Executing command: {:?}", cmd);
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("Failed to execute {} buildx build", container_cli))?;
+    let status = super::run_command(
+        cmd,
+        &format!("Failed to execute {} buildx build", container_cli),
+        output,
+    )?;
 
     if !status.success() {
         bail!(
@@ -320,7 +326,7 @@ fn build_with_buildx(
     }
 
     if needs_fallback_push {
-        docker_push(container_cli, image_tag)?;
+        docker_push_with_output(container_cli, image_tag, output)?;
     }
 
     Ok(())
@@ -352,6 +358,7 @@ pub(crate) fn build_with_buildctl(
     no_cache: bool,
     container_cli: &str,
     platform: &str,
+    output: super::CommandOutput,
 ) -> Result<()> {
     // Check buildctl availability
     let buildctl_check = Command::new("buildctl").arg("--version").output();
@@ -425,7 +432,7 @@ pub(crate) fn build_with_buildctl(
 
         debug!("Executing command: {:?}", cmd);
 
-        let status = cmd.status().context("Failed to execute buildctl build")?;
+        let status = super::run_command(cmd, "Failed to execute buildctl build", output)?;
         if !status.success() {
             bail!("buildctl build failed with status: {}", status);
         }
@@ -446,11 +453,13 @@ pub(crate) fn build_with_buildctl(
             .take()
             .context("Failed to capture buildctl stdout")?;
 
-        let docker_load = Command::new(container_cli)
-            .arg("load")
-            .stdin(buildctl_stdout)
-            .status()
-            .with_context(|| format!("Failed to execute {} load", container_cli))?;
+        let mut docker_load_command = Command::new(container_cli);
+        docker_load_command.arg("load").stdin(buildctl_stdout);
+        let docker_load = super::run_command(
+            docker_load_command,
+            &format!("Failed to execute {} load", container_cli),
+            output,
+        )?;
 
         let buildctl_status = buildctl_child
             .wait()

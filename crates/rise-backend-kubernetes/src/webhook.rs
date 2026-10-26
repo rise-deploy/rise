@@ -970,7 +970,8 @@ async fn compute_desired_children(
     let mut seen_environments: std::collections::HashSet<uuid::Uuid> =
         std::collections::HashSet::new();
     for deployment in &infra_deployments {
-        if let Some(env_id) = deployment.environment_id {
+        {
+            let env_id = deployment.environment_id;
             if seen_environments.insert(env_id) {
                 if let Some(environment) = environments.get(&env_id) {
                     // Check if we should skip SA creation for production
@@ -1059,9 +1060,8 @@ async fn compute_desired_children(
 
     // Helper: look up environment name from preloaded cache
     let env_name_for = |deployment: &Deployment| -> Option<String> {
-        deployment
-            .environment_id
-            .and_then(|id| environments.get(&id))
+        environments
+            .get(&deployment.environment_id)
             .map(|env| env.name.clone())
     };
 
@@ -1165,9 +1165,7 @@ async fn compute_desired_children(
 
         // Resolve service account name from preloaded environments
         let sa_name = {
-            let env = deployment
-                .environment_id
-                .and_then(|id| environments.get(&id));
+            let env = environments.get(&deployment.environment_id);
             match env {
                 Some(environment)
                     if resource_builder.use_default_service_account_for_production
@@ -2498,7 +2496,7 @@ mod tests {
             created_by_id: uuid::Uuid::nil(),
             status,
             deployment_group: "default".to_string(),
-            environment_id: None,
+            environment_id: uuid::Uuid::nil(),
             expires_at: None,
             termination_reason: None,
             completed_at: None,

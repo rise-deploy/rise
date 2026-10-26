@@ -1,16 +1,5 @@
-# The per-run half of the ECS e2e environment, applied and destroyed by the
-# harness around each suite.
-#
-# Deliberately NOT modules/rise-ecs. That module builds ADR-0005 D15's
-# production topology -- NLB, private subnets, RDS, ACME -- and bending it to
-# this shape would take a set of test-only knobs that would leave it with two
-# personalities while still not exercising what operators run. The one contract
-# that genuinely must not drift is shared instead, as
-# modules/rise-ecs/modules/control-plane-env.
-#
-# Postgres and Rise are per-run rather than persistent so every run starts on a
-# fresh database (which exercises bootstrap, as the Docker harness also relies
-# on) and runs the image under test.
+# Per-run fixtures and networking compose the shared Rise and Traefik runtime.
+# The bootstrap supplies the VPC, cluster, namespace, IAM, and log group.
 
 provider "aws" {
   region = var.region
@@ -124,6 +113,14 @@ module "control_plane_env" {
 
   # See `local.controller_class`: this is what isolates one run from another.
   controller_class_name = local.controller_class
+
+  # The identity sidecar runs the rise-cli image built from the same commit as
+  # the control plane under test, and fetches tokens over the in-VPC address:
+  # the edge admits only the harness, not the tasks' public addresses. A short
+  # TTL lets the workload-identity scenario watch a refresh.
+  identity_agent_image       = "${var.rise_cli_image}:${var.rise_image_tag}"
+  identity_exchange_url      = local.auth_backend_url
+  identity_token_ttl_seconds = 120
 
   registry = {
     type          = "ecr"

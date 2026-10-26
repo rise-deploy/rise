@@ -78,9 +78,9 @@ Focused support crates live under `crates/`:
 | `rise-backend-docker` | The Docker deployment backend: `DockerBackend` + the in-process `DockerReconciler`, the first controller extracted onto the `rise-backend-core` seam. Re-exported under `crate::server::deployment::controller::docker`, so existing module paths keep resolving | `backend` |
 | `rise-backend-ecs` | The Amazon ECS deployment backend (Fargate): `EcsBackend` + the in-process `EcsReconciler`, plus the pure Fargate-sizing, tag, task-definition and service-diff modules | `backend` |
 | `rise-backend-traefik` | Traefik routing machinery — the dynamic-config label vocabulary, the `DesiredContainer` → labels renderer with its fail-closed `routes_withheld` predicate, router/service naming, the `serverStatus` API client, and the readiness verdicts built on it. Owned by the Traefik-fronted backends (Docker, ECS) rather than by `rise-backend-core`: Kubernetes routes with nginx annotations and depends on none of it | `backend` |
-| `rise-authz` | Authorization policy evaluation, in two tiers. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies. `engine` is Tier 1: the live ADR-0001 §4 algorithm over `ResourceStore` reads and one `MembershipResolver` seam — still free of HTTP, SQL, and product kinds | `backend` |
+| `rise-authz` | Authorization policy evaluation, in two tiers. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies. `engine` is Tier 1: the live ADR-0001 §4 algorithm over `ResourceStore` reads and one `MembershipResolver` seam — still free of HTTP, SQL, and product kinds. `engine::audit` is the bounded, non-blocking diagnostics pass over the same facts (dangling `roleRef`s, stale subjects, no-op constraints, shadowed Allows, ...), reached over HTTP via the generic resource API's `policy-audit` listing and `explain` subresource | `backend` |
 | `rise-resource-api` | Generic resource API contract (resource kinds, scopes, owner references, identity, policy types) | `backend` |
-| `rise-resource-store-postgres` | PostgreSQL adapter for the resource API. Owns its own migrations in a `resource_store` schema and its own SQLX offline cache | `backend` |
+| `rise-resource-store-postgres` | PostgreSQL adapter for the resource API. Owns its own migrations in a `resource_store` schema; its queries are runtime-checked (`sqlx::query`), so it has no SQLX offline cache | `backend` |
 | `rise-runtime-sync` | Postgres-backed cross-replica primitives: `GlobalLock`, `LeaderElection`, `GlobalSchedule`. Owns its own migrations in a `runtime_sync` schema and its own SQLX offline cache | `backend` |
 
 The Kubernetes controller is still in-tree (`src/server/deployment/controller/kubernetes.rs`)
@@ -104,7 +104,7 @@ The codebase is organized into functional modules:
    - **Environment Variables** (`env_vars/`): Plain and encrypted per-project variables
    - **Custom Domains** (`custom_domains/`): Custom domain registration, verification, TLS wiring
    - **Service Accounts** (`service_accounts/`): CI/CD service accounts (inbound OIDC federation into Rise)
-   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps
+   - **Workload Identity Tokens** (`workload_tokens/`): Token-exchange endpoint issuing Rise-signed workload JWTs to deployed apps — also used by the ECS identity sidecar (`rise identity agent`) to write a deployment's `[identity]` token files
    - **Generic Resources** (`resources/`): The generic resource API (`/api/v1/resources`) and its garbage collector, authorized through `authz/`
    - **Platform** (`platform/`): Platform/organization-level concerns
    - **Quickstart** (`quickstart/`): Catalog of ready-to-deploy templates (see `config/default.yaml`)
@@ -195,7 +195,8 @@ cargo build --all-features     # Full build with CLI + backend
      - [x] Snowflake OAuth provisioner for Snowflake security integrations
 
 3. **CLI Implementation** (`--features cli`, default) ✅
-   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and device flow
+   - [x] OAuth2 authorization code flow with PKCE (browser-based, default) and a Rise-served device flow (code confirmed on the Rise UI's `/device` page)
+   - [x] Scoped logins (`rise login --scope <project>[/<env>]=<preset>`): sessions narrowed to projects/environments, enforced on the typed API (ADR-0006)
    - [x] Project commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Team commands: `create`, `list`, `show`, `update`, `delete`
    - [x] Deployment commands: `create`, `list`, `show`, `stop`, `logs`
@@ -310,6 +311,9 @@ Keep it current as work merges:
   multi-org routing, codebase decomposition). The Project owns *live status*.
   Don't duplicate rationale into the board, and don't create new
   `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files.
+  `ROADMAP.md` §2's *Authentication entry points* table lists every way a
+  credential enters Rise and whether it stays or retires; update it with any
+  new credential path, and never build permanent behavior on a retiring one.
   Architectural decisions are recorded as ADRs under
   `docs/engineering/src/content/docs/adr/` — an ADR records the decision, its
   rationale, and (via its Status field) implementation progress. Prefer an
@@ -330,7 +334,7 @@ Keep it current as work merges:
 - The CLI should first and foremost always accept the names of things (e.g. project names, or project names + deployment timestamp). The UUIDs in our tables are only for internal book-keeping.
 - Admin users (`auth.admin_users`) bypass the regular permission checks on the typed APIs (projects, teams, deployments, etc.) — they have full access there without passing ownership/membership checks. This does **not** extend to the generic resource API (`/api/v1/resources`), which is authorized by the ADR-0001 engine through `src/server/authz/`: every request is one `(verb, ResourceKind, subresource?)` decision against the resource's own ancestry and effective labels, and authorization-changing writes additionally pass the write-time grant gate inside a `SERIALIZABLE` transaction. Operators reach everything through the seeded `system-admin` binding; admins are granted nothing there unless a binding says so. Do not add an `is_admin` shortcut — grant access with a `RoleBinding`.
 - Both roles can also be granted by IdP group (`auth.admin_idp_groups`, `auth.operator_idp_groups`), as can platform access (`auth.platform_access.allowed_idp_groups`). Group matching resolves against the user's **IdP-managed** teams — the ones `sync_user_groups`/the Entra sync mirror from the IdP's `groups` claim — never against teams users create themselves. `src/server/auth/roles.rs` owns that resolution; role checks go through `AppState::is_admin`/`is_operator`, which are async because a configured group list means a DB lookup.
-- In `rise-deploy`, all SQLX queries must be wrapped by helper functions in the `src/db/` module — no SQLX queries elsewhere in the crate's production code. The support crates that own their own schema and migrations (`rise-resource-store-postgres`, `rise-runtime-sync`) are the exception: their queries live in the crate that owns the tables, alongside its own migrations and offline query cache.
+- In `rise-deploy`, all SQLX queries must be wrapped by helper functions in the `src/db/` module — no SQLX queries elsewhere in the crate's production code. The support crates that own their own schema and migrations (`rise-resource-store-postgres`, `rise-runtime-sync`) are the exception: their queries live in the crate that owns the tables, alongside its own migrations (and, for `rise-runtime-sync`, its own offline query cache).
 - When we log errors and don't handle them further, we should include a sensible amount of information about the error. Often logging the error with `{:?}` is good enough.
 - When capturing screenshots, the playwright tool will successfully install the driver even if you might think its install step failed. Always use minimum 1280px width and 800px height for the browser.
 - Never use `// @ts-nocheck` (or `// @ts-ignore` / `// @ts-expect-error`) in frontend code. Existing files that still carry the directive are legacy; new files must not add it, and edits to legacy files should remove it where feasible. If TypeScript flags something, fix the types — don't suppress the diagnostic.
@@ -342,11 +346,14 @@ The frontend exposes a small set of reusable tag-like components from `frontend/
 | Component | Style | Purpose |
 |---|---|---|
 | **`Status`** (from `r-ui`) | Dot + label | Deployment/project lifecycle status (Running, Failed, Stopped, …) |
-| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels via `kind="accent"`, env labels via `kind="env-*"` |
+| **`Pill`** (from `r-ui`) | Bordered, colored bg | Accent labels (`kind="accent"`); environments use `EnvPill` |
 | **`BasePill`** (from `r-ui`) | Icon + name pill | Generic two-cell pill — building block for `EnvPill` / `GroupPill` |
 | **`EnvPill`** (from `r-ui`) | Color dot + env name | Environment chip; pairs with `EnvironmentColorDot` |
 | **`GroupPill`** (from `r-ui`) | Layer glyph + group name | Group chip |
 | **`EnvironmentColorDot`** (from `r-ui`) | Tinted layer glyph | Placed next to environment names to indicate color |
+| **`OwnerLabel`** (from `r-ui`) | People/person icon + name | Every project owner — teams always carry the people icon |
+
+Statuses are coloured by `statusTone` (healthy / failing / in progress / inactive); use it for bare status dots so they agree with `Status` badges.
 
 ### Before Commit & Push
 
@@ -366,11 +373,11 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (us
 | What changed | Command | Why |
 |---|---|---|
 | Any `.rs` file | `cargo test --workspace --all-features` | Unit tests (requires `mise run db:migrate` once); `--workspace` covers the support crates but **not** `tests/e2e` |
+| ADR-0001 conformance test markers/scenarios (`/// ADR-0001 scenario N`) | `mise run adr:conformance:check` | Verifies scenarios 1-57 are each claimed by a test and 58-61 are not; see [testing.md](docs/engineering/src/content/docs/testing.md) |
 | `tests/e2e/**` | `cargo fmt --manifest-path tests/e2e/Cargo.toml`, then `cargo clippy --manifest-path tests/e2e/Cargo.toml --all-targets -- -D warnings` and `cargo test --manifest-path tests/e2e/Cargo.toml` | Standalone workspace, checked by CI in its own job |
 | SQLX queries in `rise-deploy` | `mise run sqlx:prepare` | Regenerate offline query cache (commit the result) |
-| SQLX queries in `rise-resource-store-postgres` | `mise run resource-store-postgres:sqlx:prepare` | Crate-local offline cache (commit the result) |
 | SQLX queries in `rise-runtime-sync` | `mise run runtime-sync:db:migrate` once, then `mise run runtime-sync:sqlx:prepare` | Crate-local offline cache; needs the `runtime_sync` schema applied |
-| Dependencies (`Cargo.toml`/`Cargo.lock`) | `cargo audit` | CI fails on advisories |
+| Dependencies (`Cargo.toml`/`Cargo.lock`) | `cargo audit`, then `mise run deny` | CI fails on advisories, and on a dependency whose license is not in `deny.toml` |
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `rise.toml` structs (`crates/rise-deployment-spec/src/project_config.rs`) | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
 | Resource API types (`crates/rise-resource-api/`) | `mise run resource:schema:generate` | Regenerate the resource/organization/controller-status schemas under `docs/engineering/public/schemas/` (commit the result) |
@@ -393,7 +400,7 @@ cargo test --workspace --all-features  # Unit tests (all workspace crates)
 combinations — `cli` and `cli,backend`, since `always_include_features` pins
 `cli` on; the same two workspace-wide
 (`--workspace --all-features --all-targets`), which cover every support crate
-and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`;
+and every test target; `cargo fmt --all -- --check`; `mise sqlx:check`; `mise deny`;
 `mise resource:schema:check`; `helm lint helm/rise`; and a workspace `cargo
 test` excluding the three crates that need Postgres (`rise-deploy`,
 `rise-resource-store-postgres`, `rise-runtime-sync`) — so every other crate's

@@ -1,214 +1,91 @@
 ---
 title: "Testing"
+description: "How Rise's test suites run, and where ADR-0001's conformance suite lives."
 ---
 
-Guidelines for testing Rise components.
+Rise's Rust tests are split by what they need to run:
 
-## Overview
+- **Pure/fake-store crates** — no database. Run per crate, e.g.:
 
-Rise uses multiple testing strategies:
+  ```bash
+  cargo test -p rise-authz
+  cargo test -p rise-backend-auth
+  cargo test -p rise-resource-api
+  ```
 
-- **Unit tests**: Test individual functions and modules
-- **Integration tests**: Test API endpoints and database interactions
-- **End-to-end tests**: Test full workflows via CLI
+- **The rest of the workspace**, including `rise-deploy`,
+  `rise-resource-store-postgres`, and `rise-runtime-sync` — needs a running
+  Postgres and `DATABASE_URL` set:
 
-## Integration Tests
+  ```bash
+  mise run db:migrate   # once, against a running Postgres
+  cargo test --workspace --all-features
+  ```
 
-Integration tests are in the `tests/` directory and test API endpoints with a real database.
+  `mise run lint` runs the pure/fake-store portion of the workspace tests as
+  part of its checks; the three crates above are excluded there because they
+  need a database, so run them separately as above.
 
-### Setup
+- **`tests/e2e`** is its own Cargo workspace (excluded from the root one so
+  production image builds never compile it), driving the `rise` CLI and HTTP
+  API against a live backend. Its own unit tests run the ordinary way —
+  `cargo test --manifest-path tests/e2e/Cargo.toml`; the end-to-end suite
+  itself is a binary you run, not a `cargo test` target — `cargo run
+  --manifest-path tests/e2e/Cargo.toml`, gated on `RISE_E2E_BACKEND` (skips
+  and exits 0 when unset). See the header comment in `tests/e2e/Cargo.toml`
+  and `tests/e2e/README.md` for the exact invocation per backend.
 
-Integration tests use a test database:
+## ADR-0001 conformance suite
 
-```rust
-// tests/common.rs
-pub async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://rise:rise123@localhost:5432/rise_test".to_string());
+[ADR-0001](./adr/0001-unified-permission-model.md)'s appendix defines 61
+acceptance scenarios. Scenarios 1-57 are covered across three test tiers:
 
-    let pool = PgPool::connect(&database_url).await.unwrap();
+1. **Pure fakes** — `crates/rise-authz/tests/{policy,engine,gate}.rs` and
+   `crates/rise-resource-api/tests/*`, built on the fakes in
+   `crates/rise-authz/tests/support/mod.rs` (`StoreBuilder`,
+   `FakeMemberships`). No database.
+2. **Pure signer** — `crates/rise-backend-auth/src/signer.rs`, covering the
+   token signer's own invariants (e.g. the delegation depth limit) in
+   isolation.
+3. **Postgres/HTTP** — `src/server/resources/handlers/conformance.rs` and
+   `src/server/resources/handlers/test_support.rs`, driving the resource
+   API's dispatch functions against a real Postgres, plus
+   `crates/rise-resource-store-postgres/tests`.
 
-    // Run migrations
-    sqlx::migrate!("../migrations")
-        .run(&pool)
-        .await
-        .unwrap();
-
-    pool
-}
-
-pub async fn cleanup_test_db(pool: &PgPool) {
-    sqlx::query("TRUNCATE projects, deployments, teams, users CASCADE")
-        .execute(pool)
-        .await
-        .unwrap();
-}
-```
-
-### Example Integration Test
-
-```rust
-// tests/projects_api.rs
-use rise_backend::app;
-use axum::http::StatusCode;
-
-#[tokio::test]
-async fn test_create_project() {
-    let pool = common::setup_test_db().await;
-    let app = app(pool.clone()).await;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/projects")
-                .header("content-type", "application/json")
-                .body(r#"{"name": "test-app", "visibility": "public"}"#)
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::CREATED);
-
-    common::cleanup_test_db(&pool).await;
-}
-```
-
-### Best Practices
-
-- **Use test database**: Never test against production or development databases
-- **Clean up after tests**: Truncate tables or use transactions
-- **Test authentication**: Mock JWT tokens for protected endpoints
-- **Test error responses**: Verify 400, 401, 404 responses
-
-## End-to-End Tests
-
-Test full workflows using the CLI:
-
-```bash
-#!/bin/bash
-# tests/e2e/deploy_workflow.sh
-
-# Login
-rise login --email dev@example.com --password password
-
-# Create project
-rise project create e2e-test --visibility public
-
-# Deploy
-rise deployment create e2e-test --image nginx:latest
-
-# Verify deployment
-STATUS=$(rise deployment show e2e-test:latest --format json | jq -r '.status')
-if [ "$STATUS" != "running" ]; then
-  echo "Deployment failed"
-  exit 1
-fi
-
-# Cleanup
-rise project delete e2e-test
-```
-
-## Test Data
-
-### Development Accounts
-**Admin user:**
-- Email: `admin@example.com`
-- Password: `password`
-
-**Developer user:**
-- Email: `dev@example.com`
-- Password: `password`
-
-**End user:**
-- Email: `user@example.com`
-- Password: `password`
-
-### Creating Test Projects
-
-```bash
-# Create test projects
-rise project create test-app-1 --visibility public
-rise project create test-app-2 --visibility private
-```
-
-### Mock Data
-
-For unit tests, create mock data:
+Every test that backs a scenario carries one doc-comment line per scenario it
+claims, directly above the `#[test]` / `#[tokio::test]` / `#[sqlx::test]`:
 
 ```rust
-fn mock_project() -> Project {
-    Project {
-        id: Uuid::new_v4(),
-        name: "test-app".to_string(),
-        owner_type: OwnerType::User,
-        owner_id: Uuid::new_v4(),
-        visibility: Visibility::Public,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    }
+/// ADR-0001 scenario 23
+/// ADR-0001 scenario 13
+async fn a_user_administers_two_organizations_independently(pool: sqlx::PgPool) {
+    ...
 }
 ```
 
-## Troubleshooting
-
-### "Database connection failed"
-
-Ensure PostgreSQL is running:
+`scripts/check-adr-conformance.sh` greps for these markers across the crates
+above and fails if any of scenarios 1-57 is unclaimed, or if any of the
+deferred scenarios below is claimed. Run it directly, or as part of lint:
 
 ```bash
-docker-compose up -d postgres
+mise run adr:conformance:check
+mise run lint          # runs the check as one of its steps
 ```
 
-Set `DATABASE_URL`:
+CI runs the same check as a step in the Rust quality job.
 
-```bash
-export DATABASE_URL="postgres://rise:rise123@localhost:5432/rise_test"
-```
+**Exclusions:**
 
-### "Migration not found"
-
-Run migrations before tests:
-
-```bash
-cd rise-backend
-sqlx migrate run
-```
-
-### Tests are slow
-
-Use `cargo test --release` for faster execution (but slower compilation).
-
-Run specific tests instead of the full suite:
-
-```bash
-cargo test test_projects
-```
-
-## Test Coverage
-
-### Measuring Coverage
-
-Use `cargo-tarpaulin` for code coverage:
-
-```bash
-# Install tarpaulin
-cargo install cargo-tarpaulin
-
-# Run coverage
-cargo tarpaulin --out Html --output-dir coverage
-```
-
-Open `coverage/index.html` to view results.
-
-### Coverage Goals
-
-- **Critical paths**: 90%+ coverage (authentication, deployments)
-- **Utility functions**: 80%+ coverage
-- **Overall**: 70%+ coverage
-
-## Next Steps
-
-- **Set up development environment**: See [Local Development](development.md)
-- **Database testing**: See [Database](database.md)
+- Scenarios 58-60 (marked `§9 deferred` in the ADR) and 61
+  (product-operation deferred) are intentionally out of scope and must not be
+  claimed by any test.
+- Scenario 10 (operator selectors, JIT login, and User tokens carrying
+  `rise_uid`) is only partially covered: JIT login, session re-resolution,
+  and the inactive-User/identity halves are tested
+  (`src/server/auth/user_identity.rs`), but the operator-selector half waits
+  on `operatorIdentities` (`ROADMAP.md` §1; `WORKLOG.md` increment 10b).
+- No per-subject token count cap and no revocation list exist — the ADR
+  accepts this (L1048-1050) — so neither is tested. Only the two caps the ADR
+  does specify are: the platform-global maximum token TTL
+  (`auth_token_max_ttl_seconds`) and the delegation depth limit
+  (`MAX_DELEGATION_DEPTH`).

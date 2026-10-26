@@ -21,10 +21,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: rise-deploy/rise
   BUILDER_IMAGE_NAME: rise-deploy/rise-builder
+  # The CLI alone, on distroless: the ECS workload-identity sidecar's image.
+  CLI_IMAGE_NAME: rise-deploy/rise-cli
   CHART_REGISTRY: ghcr.io/rise-deploy
   NODE_VERSION: "24"
   # renovate: datasource=github-tags depName=rust packageName=rust-lang/rust extractVersion=^(?<version>\d+\.\d+\.\d+)$
-  RUST_VERSION: "1.95.0"
+  RUST_VERSION: "1.97.1"
 
 jobs:
 
@@ -134,10 +136,10 @@ jobs:
           setup-mise: "true"
           mise-tools: "cargo:sqlx-cli cargo:cargo-all-features"
 
-      - name: Install cargo-audit
+      - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
+          tool: cargo-audit,cargo-deny
 
       - name: Verify backend config schema is up to date
         run: mise config:schema:check
@@ -150,6 +152,9 @@ jobs:
 
       - name: Verify CRDs are up to date
         run: mise crd:check
+
+      - name: Verify ADR-0001 conformance markers
+        run: mise adr:conformance:check
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -168,6 +173,10 @@ jobs:
 
       - name: Run cargo audit
         run: cargo audit
+
+      # Licenses and sources only -- cargo-audit above owns advisories.
+      - name: Check dependency licenses
+        run: cargo deny check licenses sources
 
   rise-e2e-quality:
     name: Quality / rise-e2e harness
@@ -340,6 +349,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          # Upgrade tests load the supported Terraform state layout from Git.
+          fetch-depth: 0
 
       - name: Setup mise
         uses: jdx/mise-action@v4
@@ -437,6 +449,17 @@ jobs:
           platforms: ${{ matrix.platform }}
           provenance: false
 
+      - name: Build and optionally push CLI image
+        uses: useblacksmith/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile
+          target: rise-cli
+          push: ${{ needs.prepare.outputs.should_publish == 'true' }}
+          tags: ${{ env.REGISTRY }}/${{ env.CLI_IMAGE_NAME }}:sha-${{ needs.prepare.outputs.short_sha }}-${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
+          provenance: false
+
   package-image:
     name: Build / Image manifest
     runs-on: blacksmith
@@ -484,6 +507,7 @@ jobs:
 
           publish_manifest "${REGISTRY}/${IMAGE_NAME}"
           publish_manifest "${REGISTRY}/${BUILDER_IMAGE_NAME}"
+          publish_manifest "${REGISTRY}/${CLI_IMAGE_NAME}"
 
       - name: Skip manifest publishing
         if: needs.prepare.outputs.should_publish != 'true'
@@ -633,6 +657,57 @@ jobs:
           RISE_E2E_SUITE: compose
           RISE_BIN: ./target/release/rise
         run: cargo run --manifest-path tests/e2e/Cargo.toml
+
+  # The documented AWS install (modules/rise-aws + modules/rise-ecs) applied,
+  # re-planned, permission-probed and destroyed against Floci, a local AWS
+  # emulator. Needs no credentials and no published image, so unlike the ECS
+  # suite (e2e-ecs.yml) it runs on every pull request, forks included.
+  e2e-aws-install:
+    name: E2E / AWS install (Floci)
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - e2e-harness-build
+    timeout-minutes: 20
+    services:
+      floci:
+        # A dated nightly, digest-pinned: the release current at the time
+        # (2.1.0) drops task-definition dockerLabels and tags, which reads as a
+        # perpetual diff. Move to the first release that carries the fix.
+        image: floci/floci:nightly-09252026@sha256:3f73224f568a218bf41436dca986f19516f4adb0ad72e4ed04de00890e620221
+        ports:
+          - 4566:4566
+        env:
+          # The suite tests infrastructure, not a running Rise: with these
+          # mocked, Floci starts no containers and needs no Docker socket.
+          FLOCI_SERVICES_ECS_MOCK: "true"
+          FLOCI_SERVICES_RDS_MOCK: "true"
+          FLOCI_SERVICES_ELBV2_MOCK: "true"
+          FLOCI_SERVICES_EC2_MOCK: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup mise
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+          experimental: true
+          install_args: terraform
+
+      - name: Download e2e harness binary
+        uses: actions/download-artifact@v5
+        with:
+          name: rise-e2e-harness
+          path: harness
+
+      - name: Run the AWS install suite
+        env:
+          RISE_E2E_SUITE: aws-install
+          RISE_E2E_FLOCI_ENDPOINT: http://localhost:4566
+        run: |
+          chmod +x harness/rise-e2e
+          ./harness/rise-e2e
 
   # Self-provisions its own compose stack and runs every Docker scenario
   # (public deploy, SA token exchange, private/forwardAuth, health-rolling

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT COUNT(*) AS \"count!\"\n        FROM deployments\n        WHERE environment_id = $1\n          AND status NOT IN ('Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired')\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9b114551c89a940e978dfbf674484b1085fa26fec64a4a64bc44fce42a473bb6"
+}

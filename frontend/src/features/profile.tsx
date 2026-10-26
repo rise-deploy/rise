@@ -4,6 +4,7 @@ import { Avatar, Button, Field, KV, KVRow, Panel, PanelBody, PanelHead, Segmente
 
 interface ProfileProps {
     user: { email?: string; id?: string } | null;
+    onLogout: () => void;
 }
 
 const PALETTE_SWATCHES: Record<Palette, { primary: string; secondary: string; tertiary: string }> = {
@@ -18,7 +19,7 @@ const DENSITY_DESCRIPTIONS: Record<Density, string> = {
     cozy: 'Default rhythm. Generous spacing without feeling sparse.',
 };
 
-export function Profile({ user }: ProfileProps) {
+export function Profile({ user, onLogout }: ProfileProps) {
     const [prefs, setPrefs] = usePrefs();
     const email = user?.email || 'unknown';
     const userName = email.split('@')[0];
@@ -101,6 +102,9 @@ export function Profile({ user }: ProfileProps) {
                                 <KVRow k="Email"><span className="mono" style={{ fontSize: 12.5 }}>{email}</span></KVRow>
                                 <KVRow k="Sign in"><span>SSO (OIDC)</span></KVRow>
                             </KV>
+                            <div style={{ marginTop: 18 }}>
+                                <Button icon="logout" onClick={onLogout}>Sign out</Button>
+                            </div>
                         </PanelBody>
                     </Panel>
 

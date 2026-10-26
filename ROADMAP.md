@@ -64,21 +64,27 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   target-parent workload trust lookup, and reverse name-based membership edges.
   These remain internal storage projections and do not change the generic
   resource API shape.
-- [~] Implement live membership expansion, per-item list filtering/projection,
+- [x] Implement live membership expansion, per-item list filtering/projection,
   effective-label resolution, typed `SubjectRef` values for dynamic ownership,
   tiered platform/org Deny filtering, admin/operator classification, platform
   ceilings, and the centralized authorization choke point replacing
   `require_operator`. The choke point is live on the generic resource API, with
   per-item list filtering, the allowlisted list-only projection, and
-  `metadata.effectiveLabels` on every response. Remaining: Controller writes
-  still go through `ResourceDefinition.allowedStatusControllerIds` rather than
-  RBAC, because a Controller is not a principal until its identity resource
-  exists; remove that allowlist once it is.
-- [~] Add Role/policy audit and explain diagnostics for semantically inert
-  configuration: no-op recipient or membership constraints, owners with no
+  `metadata.effectiveLabels` on every response. Controllers are ordinary
+  `controller:<name>` principals evaluated by the same choke point, whether
+  they authenticate with a JWT matched against their trust policies or with
+  an identity token from their `/token` subresource; the
+  `ResourceDefinition.allowedStatusControllerIds` allowlist is removed.
+- [x] Add Role/policy audit and explain diagnostics for semantically inert
+  configuration — no-op recipient or membership constraints, owners with no
   current grant, selectors matching nothing, stale references, and shadowed
-  Allows. Keep these out of synchronous write rejection when the grant delta is
-  safely empty.
+  Allows — as `engine::audit` (`rise-authz`) and its HTTP surface: the
+  `GET /api/v1/resources/policy-audit` listing and the read-only `explain`
+  subresource, both filtered per finding on the caller's own `list`/`get`
+  grants. Diagnostics never reject a write: a create or update of a
+  `RoleBinding`/`PlatformRoleBinding` runs the same detectors against the row
+  just written and surfaces any finding as an HTTP `Warning` header, never as
+  a failure.
 - [x] Add request-local `AuthorizationSnapshot` memoization for membership,
   admin classification, and effective policies. Defer cross-request caching
   until it can be invalidated transactionally through an authorization epoch.
@@ -101,7 +107,7 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   paths run it inside the `SERIALIZABLE` transaction that performs the mutation,
   replaying the whole operation on a serialization failure. A cascading delete's
   effect on policy resources beneath the deleted resource is not yet diffed.
-- [~] Seed immutable/healable `system-admin` and platform `resource-owner`
+- [x] Seed immutable/healable `system-admin` and platform `resource-owner`
   Roles, plus an operator-editable global `PlatformRole/org-admin` baseline.
   Organization creation atomically creates an exact org-root, scope-only
   `RoleBinding` from that role to an operator-selected existing User. That
@@ -109,24 +115,29 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   Group is required and no Group name has implicit authorization meaning. The
   five baseline resources are seeded at startup and the operator pair is
   immutable through the store; atomic Organization-plus-admin-binding creation
-  remains open.
-- [ ] Add conformance coverage for every applicable ADR-0001 acceptance
+  is available on an Organization create via `bootstrap.admin`, in the same
+  transaction and rolled back together on failure.
+- [x] Add conformance coverage for every applicable ADR-0001 acceptance
   scenario, including multi-org admins, membership removal, UID-bound token
-  invalidation, token caps, and grant/revocation races.
+  invalidation, token caps, and grant/revocation races. A `/// ADR-0001
+  scenario N` marker on each covering test is enforced by `mise run
+  adr:conformance:check`; scenario 10's operator-selector half remains
+  deferred until the `operatorIdentities` item below lands.
 - [ ] Add the constrained Project ServiceAccount lifecycle operation. It uses
   fresh never-reused canonical names and atomically creates/deletes only its
   fixed Project-scoped policy and trust bundle, applying the effective-delta
   subset check to the result; ordinary Project users do not receive generic
   ServiceAccount or Role/RoleBinding creation authority.
-- [ ] Load `operatorIdentities` `(issuer, subject)` selectors at process startup;
-  JIT-create a generated User plus first UserIdentity after a validated unknown
-  login, and derive operator status live when any identity attached to that User
-  is active and matches the configured set. An inactive exact identity or
-  inactive parent User fails without JIT; deleting a mapping permits a later
-  login to provision a fresh User UID, so durable disablement uses `active:
-  false`. Reject email linking and hot reload; configuration changes complete
-  only after all old instances are drained. Operators remain the recovery tier;
-  legacy admins become qualifying default-org RoleBindings.
+- [x] JIT-create a generated User plus first UserIdentity after a validated
+  unknown login. An inactive exact identity or inactive parent User fails
+  without JIT; deleting a mapping permits a later login to provision a fresh
+  User UID, so durable disablement uses `active: false`. Email never links
+  accounts.
+- [ ] Load `operatorIdentities` `(issuer, subject)` selectors at process startup
+  and derive operator status live when any identity attached to that User is
+  active and matches the configured set. Reject hot reload; configuration
+  changes complete only after all old instances are drained. Operators remain
+  the recovery tier; legacy admins become qualifying default-org RoleBindings.
 
 ### Resource API maturation
 
@@ -153,8 +164,14 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
   subresources.
 - [ ] Add a resumable Watch API with explicit backpressure, connection limits,
   and observability.
-- [ ] Build `rise-resource-client` with Rise-issued credential providers,
-  watch resume, and generic finalizer/subresource helpers.
+- [ ] Build `rise-resource-client` in the shape of Kubernetes' dynamic client:
+  `(group, version, plural)` plus ancestor-name addressing over untyped
+  envelopes, verbs and named subresources that line up one-to-one with the
+  authorization tuples, Rise-issued credential providers (a session bearer,
+  and a `/token`-refreshed identity token from an external assertion or a
+  delegating principal), watch resume, and generic finalizer/subresource
+  helpers. The e2e harness and the CLI's token source become its first
+  consumers; typed wrappers for built-in kinds layer on top later.
 - [ ] Add built-in version conversion and define external
   `ResourceDefinition` schema-evolution behavior.
 - [ ] Close built-in `(group, kind)` shadowing and finish audit coverage for
@@ -170,34 +187,77 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ ] Finish raw-external-token deprecation telemetry, then disable and remove
   direct external JWT acceptance from ordinary resource endpoints.
 
+### Authentication entry points
+
+Every way a credential enters Rise, and whether it stays. A new credential path
+is added to this table in the same change that introduces it, and nothing
+permanent is built on an endpoint marked *retires*.
+
+| Entry point | Credential presented | Status | Why / gate |
+|---|---|---|---|
+| Browser login (`/auth/signin` → `/auth/callback`) | IdP authorization code | Stays | Human UI login; ID token received on the back channel, bound by PKCE, `state`, `nonce` |
+| CLI login (`/auth/code/exchange`) | IdP authorization code | Stays | Human CLI login, same binding |
+| CLI device login (`/auth/device/exchange`) | Rise-issued device code, approved on Rise's `/device` page | Stays | Machines without a local browser. The approving session must be a browser session (`rise_client: browser`, so a CLI session can never mint its successor), must be fresh (≤ 10 min, so it traces back to a bound browser login), and must name its User and identity. The device session is minted for that same `(User, UserIdentity)` and re-checked when redeemed. The code is single-use, stored hashed, and expires in 10 min. No IdP token is presented |
+| App sign-in (`/auth/signin?project=…`, checked by `/auth/ingress`) | IdP authorization code | Stays | End users of private apps; the app-scoped ingress token keeps the IdP `sub` because apps read it |
+| `/token` on ServiceAccount / Controller — workload exchange | External assertion (Kubernetes projected token, CI OIDC, …) | Stays | The target design for every non-human caller; checked only against the target's trust policies |
+| `/token` on ServiceAccount / Controller — delegated issuance | Rise bearer holding `(create, <kind>, token)` | Stays | Minting for another identity, optionally for an external audience |
+| `POST /api/v1/identity/token` | Deployed app's bootstrap credential | Stays | Outbound federation from deployed apps (AWS STS, GCP WIF, Vault); not authentication to Rise |
+| Raw external JWTs on API endpoints (`auth.allow_raw_external_tokens`) | Third-party JWT, unexchanged | Retires | Disabled, then removed, once deprecation telemetry shows no use (item above) |
+| `POST /api/v1/auth/token` with `identity` | CI OIDC JWT for a typed project service account | Retires | Replaced by ServiceAccount `/token`; gated on every typed service account migrating and its traffic draining to zero (item below) |
+| `POST /api/v1/auth/token` without `identity` | External JWT matching a `ControllerTrustPolicy` | Retires | Duplicates Controller `/token`; removed once the remaining controllers (`rise-k8s-controller`, §5) use `/token`. With the row above gone, the endpoint is deleted |
+| Legacy session tokens (no `rise_uid`) | Session issued before User resolution | Retires | No longer minted; they lapse within one session lifetime and are refused by the resource API meanwhile |
+| Operator standing by email / IdP group (`auth.operator_users`, `auth.operator_idp_groups`) | — (configuration) | Retires | Replaced by `operatorIdentities` selectors (§1) |
+| ID-token exchange for sessions | Presented IdP ID token | Rejected | Would honor any ID token the IdP issues for Rise's client (cross-client trust, token exchange, multi-audience) with no PKCE/`state`/`nonce` binding, and provision Users from it. Reconsidered only behind an opt-in setting, off by default, with a single `aud`, `azp == client_id`, and the session capped at the ID token's expiry |
+
 ### Target convergence
 
-- [ ] Issue User sessions with canonical `sub` plus immutable `rise_uid`
+- [x] Issue User sessions with canonical `sub` plus immutable `rise_uid`
   after exact live, active `UserIdentity (issuer, subject)` and active parent
-  User resolution.
-- [ ] Move workload token exchange to each ServiceAccount or Controller `/token`
-  subresource. Validate external assertions only against trust-policy children
-  of that URL target; do not perform a global source-identity search, and mask
-  target/assertion/policy failures behind the same coarse authentication error.
-- [ ] Support delegated issuance on the same `/token` route for an already
+  User resolution. Sessions carry `typ: rise-session+jwt` and are re-resolved
+  on every request.
+- [x] Move workload token exchange to each ServiceAccount or Controller `/token`
+  subresource, introduced additively per kind: a resource-API-backed identity
+  gains its `/token` route without touching any other, not-yet-migrated identity
+  of the same kind still on the legacy exchange endpoint. Validate external
+  assertions only against trust-policy children of that URL target; do not
+  perform a global source-identity search, and mask target/assertion/policy
+  failures behind the same coarse authentication error.
+  The route is live on `rise.dev/ServiceAccount` and `rise.dev/Controller`;
+  the minted identity token (RS256, `typ: rise-identity+jwt`, canonical `sub`
+  plus `rise_uid`) is a principal of the generic resource API, re-resolved to
+  one live resource on every request, and the same token minted for a
+  requested `audience` is verifiable by that party against Rise's JWKS.
+- [x] Support delegated issuance on the same `/token` route for an already
   Rise-authenticated principal holding `(create, qualified ResourceKind,
   token)`. Workload exchange and delegated request modes are disjoint.
-- [ ] Add a canonical RFC 9396 `authorization_details` claim with
+- [x] Add a canonical RFC 9396 `authorization_details` claim with
   `type: rise.dev/rbac`, one qualified `scope` per entry, and multiple entries
   whose permissions union. Reject empty permission axes, carry the parsed cap
   on `AuthenticatedPrincipal`, and enforce live RBAC intersected with that cap
   on every primary and secondary decision.
-- [ ] Add bounded nested `act` attribution. Delegation chains are allowed only
+- [x] Add bounded nested `act` attribution. Delegation chains are allowed only
   across explicit live token-create grants; there is no token-class/one-hop
   bypass rule.
-- [ ] Reject stale UID tokens, inactive/deleted principals, Group subjects as
+- [~] Reject stale UID tokens, inactive/deleted principals, Group subjects as
   principals, malformed subjects/scopes, and external workload JWTs on every
-  non-token endpoint.
-- [ ] Retire synthetic ServiceAccount users/emails and the transitional
-  identity-selection contract once built-in identity resources and target
-  `/token` routes are live.
-- [ ] Keep the platform-global maximum token TTL and add negative tests for
+  non-token endpoint. Identity tokens are rejected on every one of those
+  grounds; raw external JWTs on ordinary endpoints remain governed by the
+  transitional `auth.allow_raw_external_tokens` above.
+- [ ] Retire the typed `service_accounts` table, its synthetic users/emails, and
+  the transitional identity-selection contract — gated on every service account
+  having migrated to a resource-API `ServiceAccount` and that legacy path's
+  traffic having drained to zero (ADR-0001 §10), not merely on the `/token`
+  route existing. Unlike Controller's `auth.controllers[]`, which carried no
+  production traffic and was removed unconditionally in the same change that
+  shipped `ControllerTrustPolicy` (§1), the typed ServiceAccount table is in
+  production use today and needs the same measure-then-drain-then-remove
+  discipline as `auth.allow_raw_external_tokens`.
+- [~] Keep the platform-global maximum token TTL and add negative tests for
   audience, cap, target trust, mode-confusion, and name-recreation behavior.
+  The maximum is `server.auth_token_max_ttl_seconds` for both token kinds,
+  and cap, target-trust, mode-confusion, and name-recreation behavior are
+  tested through the route; audience-mismatch coverage waits on the
+  middleware-level test harness.
 
 ## 3. Subresource execution
 
@@ -206,9 +266,11 @@ Status legend: `[x]` shipped · `[~]` in progress · `[ ]` planned.
 - [ ] Register generic `status` and `finalizers` mutation strategies once in
   the resource layer; individual resource handlers must not reimplement their
   field separation.
-- [ ] Register `token` as a generated finite response with the two typed
+- [~] Register `token` as a generated finite response with the two typed
   authentication outcomes from ADR-0001. Raw assertions are consumed before
-  handler invocation.
+  handler invocation. Both outcomes are served today on the two built-in
+  identity kinds; moving that fixed registration onto the declared registry
+  seam waits on ADR-0002.
 - [ ] Make discovery report each kind's supported subresources, verbs, media
   types, and execution shape.
 - [ ] Design Deployment `logs` as the first streaming product subresource,
@@ -238,7 +300,7 @@ and secret handling remain kind-specific prerequisites.
   User names and exact SSO mappings.
 - [ ] Migrate `ServiceAccount` as an Organization child and trust mappings as
   `ServiceAccountTrustPolicy` children.
-- [ ] Migrate `Controller` as a root built-in and trust mappings as
+- [x] Migrate `Controller` as a root built-in and trust mappings as
   `ControllerTrustPolicy` children.
 - [ ] Migrate `Deployment` as a Project child after pagination and Watch;
   controllers update it through registered `status` and `finalizers`

@@ -1,13 +1,15 @@
 use crate::db::models::User;
 use crate::db::service_accounts;
-use crate::server::auth::controller::{ControllerAuthContext, ControllerIdentity};
+use crate::server::auth::controller::{self, ControllerAuthContext, ControllerResolution};
+use crate::server::auth::identity::ResourcePrincipal;
 use crate::server::auth::sa_match::{match_service_account, SaMatchError};
+use crate::server::auth::user_identity::UserPrincipal;
 use crate::server::error::{ServerError, ServerErrorExt};
+use crate::server::resources::error_map::store_error_to_server_error;
 use crate::server::state::AppState;
 use axum::{extract::FromRequestParts, http::request::Parts, http::StatusCode};
 use rise_backend_auth::{AccessClaims, PrincipalClaims};
 use sqlx::PgPool;
-use std::collections::HashMap;
 
 /// A JWKS-validated external token (phase 1 of two-phase SA auth).
 ///
@@ -20,6 +22,25 @@ pub struct VerifiedExternalToken {
     pub claims: serde_json::Value,
 }
 
+/// What the auth middleware verified about a Rise session that names a
+/// `User` resource, beyond the [`UserPrincipal`] itself.
+///
+/// Present in request extensions exactly when a `UserPrincipal` is: legacy
+/// sessions carry neither. Device-login approval reads it to mint a session
+/// bound to the same identity, and to require a recent browser sign-in.
+#[derive(Clone, Debug)]
+pub struct SessionDetails {
+    /// The `UserIdentity` the session was minted through.
+    pub identity_uid: uuid::Uuid,
+    /// The session's `name` claim, if it carries one.
+    pub name: Option<String>,
+    /// The session's `iat`, in seconds since the Unix epoch.
+    pub issued_at: u64,
+    /// The kind of client the session was issued to; `None` on sessions
+    /// minted before the claim existed.
+    pub client: Option<rise_backend_auth::SessionClient>,
+}
+
 /// Authentication context for request handlers.
 ///
 /// This replaces `Extension<User>` in all handlers and supports two-phase
@@ -30,15 +51,31 @@ pub struct VerifiedExternalToken {
 ///   accounts via `resolve_for_project`.
 #[derive(Clone, Debug)]
 pub enum AuthContext {
-    User(User),
+    /// A Rise session. The `UserPrincipal` is the live `User` resource the
+    /// session names; a legacy session (issued before identity resolution)
+    /// names none and reaches only the typed APIs.
+    User(User, Option<UserPrincipal>),
     ExternalToken(VerifiedExternalToken),
     /// A Rise access token (RFC 8693 exchanged principal). In Phase 1 this is
     /// only ever a service account or controller — the exchange never mints a
     /// `User` access token. Recognized by handlers via `resolve_for_project`.
     Access(AccessClaims),
+    /// A Rise identity token: a ServiceAccount or Controller *resource*
+    /// principal minted by its `/token` subresource and re-resolved against the
+    /// live store on this request (ADR-0001 §7). It is a principal of the
+    /// generic resource API; the typed APIs do not accept it.
+    Identity(ResourcePrincipal),
 }
 
 impl AuthContext {
+    /// The live `User` resource a session names, if it names one.
+    pub fn user_principal(&self) -> Option<&UserPrincipal> {
+        match self {
+            AuthContext::User(_, principal) => principal.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Get the authenticated Rise user.
     ///
     /// Returns the user for Rise JWTs. Returns 401 for service-account / access
@@ -46,8 +83,8 @@ impl AuthContext {
     /// should call this).
     pub fn user(&self) -> Result<&User, ServerError> {
         match self {
-            AuthContext::User(user) => Ok(user),
-            AuthContext::ExternalToken(_) | AuthContext::Access(_) => {
+            AuthContext::User(user, _) => Ok(user),
+            AuthContext::ExternalToken(_) | AuthContext::Access(_) | AuthContext::Identity(_) => {
                 Err(ServerError::unauthorized(
                     "This endpoint does not support service account authentication",
                 ))
@@ -77,27 +114,23 @@ impl AuthContext {
         &self,
         pool: &PgPool,
         project: &crate::db::models::Project,
-        controllers_by_issuer: &HashMap<String, Vec<ControllerIdentity>>,
     ) -> Result<(User, bool), ServerError> {
         match self {
-            AuthContext::User(user) => Ok((user.clone(), false)),
+            AuthContext::User(user, _) => Ok((user.clone(), false)),
             AuthContext::Access(claims) => resolve_access_for_project(pool, project, claims).await,
+            // A resource principal is not bound to a typed Project; the typed
+            // APIs converge onto it with the typed-object migration.
+            AuthContext::Identity(_) => Err(ServerError::unauthorized(
+                "Identity tokens are not accepted by project-scoped endpoints",
+            )),
             AuthContext::ExternalToken(token) => {
-                // Find service accounts for this project + issuer, then run the
-                // shared matcher (controller rejection + per-SA claim matching).
-                let service_accounts =
-                    service_accounts::find_by_project_and_issuer(pool, project.id, &token.issuer)
-                        .await
-                        .internal_err("Failed to look up service accounts")?;
-
-                let sa = match match_service_account(
-                    &token.claims,
-                    &token.issuer,
-                    &service_accounts,
-                    controllers_by_issuer,
-                ) {
-                    Ok(sa) => sa,
-                    Err(SaMatchError::ControllerToken) => {
+                // A token satisfying a live controller trust policy is never a
+                // service account, whatever claims it also happens to carry.
+                match controller::resolve_external(pool, &token.issuer, &token.claims)
+                    .await
+                    .map_err(store_error_to_server_error)?
+                {
+                    ControllerResolution::Controller(_) => {
                         tracing::warn!(
                             "Controller token from issuer '{}' attempted service-account auth for project '{}'",
                             token.issuer,
@@ -107,15 +140,27 @@ impl AuthContext {
                             "Controller tokens cannot be used as service accounts",
                         ));
                     }
-                    Err(SaMatchError::AmbiguousController) => {
+                    ControllerResolution::Ambiguous(names) => {
                         tracing::error!(
-                            "Multiple controller identities matched JWT from issuer '{}' during service-account auth",
-                            token.issuer
+                            "Multiple controller identities matched JWT from issuer '{}' during service-account auth: {:?}",
+                            token.issuer, names
                         );
                         return Err(ServerError::conflict(
                             "Token matched multiple controller identities; configuration is ambiguous",
                         ));
                     }
+                    ControllerResolution::NotAController => {}
+                }
+
+                // Find service accounts for this project + issuer, then run the
+                // shared matcher.
+                let service_accounts =
+                    service_accounts::find_by_project_and_issuer(pool, project.id, &token.issuer)
+                        .await
+                        .internal_err("Failed to look up service accounts")?;
+
+                let sa = match match_service_account(&token.claims, &service_accounts) {
+                    Ok(sa) => sa,
                     Err(SaMatchError::MalformedClaims(sa_id)) => {
                         tracing::error!(
                             "Failed to deserialize claims for service account {}",
@@ -189,7 +234,32 @@ impl AuthContext {
             AuthContext::Access(claims) => {
                 matches!(&claims.principal, PrincipalClaims::ServiceAccount { .. })
             }
-            AuthContext::User(_) => false,
+            AuthContext::Identity(principal) => principal.subject.kind() == "serviceaccount",
+            AuthContext::User(..) => false,
+        }
+    }
+}
+
+/// An `AnyAuth` that may be absent.
+///
+/// Only one route accepts an unauthenticated request: a `/token` subresource
+/// receiving a workload assertion, whose credential is in the body (ADR-0001
+/// §7). Every other handler keeps extracting `AnyAuth` and gets its 401 from
+/// the extractor; this wrapper lets that one route decide for itself.
+#[derive(Clone, Debug)]
+pub struct MaybeAuth(pub Option<AnyAuth>);
+
+impl FromRequestParts<AppState> for MaybeAuth {
+    type Rejection = ServerError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match AnyAuth::from_request_parts(parts, state).await {
+            Ok(auth) => Ok(Self(Some(auth))),
+            Err(error) if error.status == StatusCode::UNAUTHORIZED => Ok(Self(None)),
+            Err(error) => Err(error),
         }
     }
 }
@@ -253,12 +323,18 @@ impl FromRequestParts<AppState> for AuthContext {
     ) -> Result<Self, Self::Rejection> {
         // Try User extension first (Rise JWT path)
         if let Some(user) = parts.extensions.get::<User>().cloned() {
-            return Ok(AuthContext::User(user));
+            let principal = parts.extensions.get::<UserPrincipal>().cloned();
+            return Ok(AuthContext::User(user, principal));
         }
 
         // Try the exchanged access-token extension (Rise access token path)
         if let Some(claims) = parts.extensions.get::<AccessClaims>().cloned() {
             return Ok(AuthContext::Access(claims));
+        }
+
+        // Try the resource-principal extension (Rise identity token path)
+        if let Some(principal) = parts.extensions.get::<ResourcePrincipal>().cloned() {
+            return Ok(AuthContext::Identity(principal));
         }
 
         // Try VerifiedExternalToken extension (legacy raw external JWT path)
@@ -271,16 +347,38 @@ impl FromRequestParts<AppState> for AuthContext {
     }
 }
 
-/// Authentication context that accepts either a user/SA token or a controller token.
+/// Authentication context that accepts either a user/SA token or a controller
+/// token — every principal the generic resource API evaluates.
 ///
-/// Used by endpoints that must handle both kinds of callers (e.g. `dispatch_put`).
-/// Controller auth is tried first (it is more specific — requires both a
-/// `VerifiedExternalToken` extension *and* matching `ControllerIdentity` claims).
-/// If that fails, regular user/SA auth is attempted.
+/// Controller resolution runs first: an exchanged access token naming a
+/// controller principal is authoritative (re-checked for liveness, never a
+/// fallback), and a raw external token is matched against live
+/// `ControllerTrustPolicy` resources before falling back to ordinary user/SA
+/// authentication.
 #[derive(Clone, Debug)]
 pub enum AnyAuth {
     User(AuthContext),
     Controller(ControllerAuthContext),
+}
+
+#[cfg(test)]
+impl AnyAuth {
+    /// The `User` resource a session names, for tests that bind or assert on
+    /// the caller's own subject.
+    pub fn user_principal(&self) -> Option<&UserPrincipal> {
+        match self {
+            AnyAuth::User(auth_ctx) => auth_ctx.user_principal(),
+            AnyAuth::Controller(_) => None,
+        }
+    }
+
+    /// The canonical `user:<name>` subject of the session's User.
+    pub fn user_subject(&self) -> String {
+        self.user_principal()
+            .expect("a User session")
+            .subject()
+            .to_string()
+    }
 }
 
 impl FromRequestParts<AppState> for AnyAuth {
@@ -290,16 +388,43 @@ impl FromRequestParts<AppState> for AnyAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Try controller first (more specific — requires VerifiedExternalToken
-        // AND matching ControllerIdentity claims).
-        // Only fall back to user/SA auth on 401 (not a controller token).
-        // Any other error (e.g. 409 ambiguous config) is propagated immediately.
-        match ControllerAuthContext::from_request_parts(parts, state).await {
-            Ok(ctrl) => return Ok(AnyAuth::Controller(ctrl)),
-            Err(e) if e.status == StatusCode::UNAUTHORIZED => {}
-            Err(e) => return Err(e),
+        // An exchanged Rise access token naming a controller principal is
+        // authoritative: the token unambiguously claims to be a controller, so
+        // a liveness failure is a hard 401, never a fall-through to user/SA
+        // auth.
+        if let Some(claims) = parts.extensions.get::<AccessClaims>() {
+            if let PrincipalClaims::Controller { name, uid } = &claims.principal {
+                let principal =
+                    controller::resolve_access(state.resource_store.as_ref(), name, *uid).await?;
+                return Ok(AnyAuth::Controller(ControllerAuthContext(principal)));
+            }
         }
-        // Fall back to user/SA auth
+
+        // A raw external token is checked against live controller trust
+        // policies before falling back to user/SA auth.
+        if let Some(token) = parts.extensions.get::<VerifiedExternalToken>() {
+            match controller::resolve_external(&state.db_pool, &token.issuer, &token.claims)
+                .await
+                .map_err(store_error_to_server_error)?
+            {
+                ControllerResolution::Controller(principal) => {
+                    return Ok(AnyAuth::Controller(ControllerAuthContext(principal)));
+                }
+                ControllerResolution::Ambiguous(names) => {
+                    tracing::error!(
+                        "Multiple controller identities matched JWT from issuer '{}': {:?}",
+                        token.issuer,
+                        names
+                    );
+                    return Err(ServerError::conflict(
+                        "Token matched multiple controller identities; configuration is ambiguous",
+                    ));
+                }
+                ControllerResolution::NotAController => {}
+            }
+        }
+
+        // Fall back to user/SA auth.
         Ok(AnyAuth::User(
             AuthContext::from_request_parts(parts, state).await?,
         ))
@@ -310,10 +435,13 @@ impl FromRequestParts<AppState> for AnyAuth {
 mod tests {
     use super::*;
     use crate::db::{models::ProjectStatus, projects, service_accounts, users};
-
-    fn empty_controller_index() -> HashMap<String, Vec<ControllerIdentity>> {
-        HashMap::new()
-    }
+    use axum::http::StatusCode;
+    use rise_resource_api::{
+        CreateResourceParams, ResourceApi, API_VERSION_V1ALPHA1, CONTROLLER_KIND,
+        CONTROLLER_TRUST_POLICY_KIND,
+    };
+    use rise_resource_store_postgres::PgResourceStore;
+    use std::collections::HashMap;
 
     /// Helper: create a project and an external token auth context.
     async fn setup(
@@ -322,6 +450,11 @@ mod tests {
         sa_claims: &HashMap<String, String>,
         token_claims: serde_json::Value,
     ) -> (crate::db::models::Project, AuthContext) {
+        // resolve_for_project also checks live controller trust policies,
+        // which live in the resource-store schema.
+        rise_resource_store_postgres::run_migrations(pool)
+            .await
+            .expect("resource store migrations");
         let owner = users::create(pool, "owner@example.com").await.unwrap();
         let project = projects::create(
             pool,
@@ -344,6 +477,41 @@ mod tests {
         (project, auth)
     }
 
+    /// Create a live `Controller` and one `ControllerTrustPolicy` beneath it,
+    /// trusting `issuer` with `claims` (which must include `aud`).
+    async fn create_controller_trust_policy(
+        pool: &PgPool,
+        controller_name: &str,
+        issuer: &str,
+        claims: serde_json::Value,
+    ) {
+        rise_resource_store_postgres::run_migrations(pool)
+            .await
+            .expect("resource store migrations");
+        let store = PgResourceStore::new(pool.clone());
+        let controller = store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: CONTROLLER_KIND.to_string(),
+                name: controller_name.to_string(),
+                spec: serde_json::json!({}),
+                ..Default::default()
+            })
+            .await
+            .expect("create Controller");
+        store
+            .create(CreateResourceParams {
+                api_version: API_VERSION_V1ALPHA1.to_string(),
+                kind: CONTROLLER_TRUST_POLICY_KIND.to_string(),
+                name: "trust".to_string(),
+                parent_uid: Some(controller.uid),
+                spec: serde_json::json!({"issuer": issuer, "claims": claims}),
+                ..Default::default()
+            })
+            .await
+            .expect("create ControllerTrustPolicy");
+    }
+
     #[sqlx::test]
     async fn test_resolve_single_match(pool: PgPool) {
         let mut expected = HashMap::new();
@@ -353,11 +521,7 @@ mod tests {
 
         let (project, auth) = setup(&pool, "https://gitlab.com", &expected, token_claims).await;
 
-        let controllers_by_issuer = empty_controller_index();
-        let (user, is_sa) = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap();
+        let (user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
         assert!(is_sa);
         assert!(user.email.contains("test-project"));
     }
@@ -371,11 +535,7 @@ mod tests {
 
         let (project, auth) = setup(&pool, "https://gitlab.com", &expected, token_claims).await;
 
-        let controllers_by_issuer = empty_controller_index();
-        let err = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap_err();
+        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert!(err.message.contains("do not match"));
     }
@@ -394,22 +554,15 @@ mod tests {
 
         let (project, auth) =
             setup(&pool, "https://issuer.example.com", &expected, token_claims).await;
-        let controllers_by_issuer = HashMap::from([(
-            "https://issuer.example.com".to_string(),
-            vec![ControllerIdentity {
-                id: "controller.example.com".to_string(),
-                issuer: "https://issuer.example.com".to_string(),
-                claims: HashMap::from([
-                    ("aud".to_string(), "rise-controller".to_string()),
-                    ("sub".to_string(), "deploy-bot".to_string()),
-                ]),
-            }],
-        )]);
+        create_controller_trust_policy(
+            &pool,
+            "reconciler",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "rise-controller", "sub": "deploy-bot"}),
+        )
+        .await;
 
-        let err = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap_err();
+        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
 
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert!(err.message.contains("Controller tokens cannot be used"));
@@ -429,22 +582,18 @@ mod tests {
 
         let (project, auth) =
             setup(&pool, "https://issuer.example.com", &expected, token_claims).await;
-        let controllers_by_issuer = HashMap::from([(
-            "https://issuer.example.com".to_string(),
-            vec![ControllerIdentity {
-                id: "controller.example.com".to_string(),
-                issuer: "https://issuer.example.com".to_string(),
-                claims: HashMap::from([
-                    ("aud".to_string(), "rise-controller".to_string()),
-                    ("sub".to_string(), "deploy-bot".to_string()),
-                ]),
-            }],
-        )]);
+        // A controller trust policy on the same issuer, but a different
+        // audience — the token does not satisfy it, so it is free to match
+        // the service account instead.
+        create_controller_trust_policy(
+            &pool,
+            "reconciler",
+            "https://issuer.example.com",
+            serde_json::json!({"aud": "rise-controller", "sub": "deploy-bot"}),
+        )
+        .await;
 
-        let (user, is_sa) = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap();
+        let (user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
 
         assert!(is_sa);
         assert!(user.email.contains("test-project"));
@@ -462,16 +611,15 @@ mod tests {
             .await
             .unwrap();
 
-        let controllers_by_issuer = empty_controller_index();
-        let err = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap_err();
+        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
         assert_eq!(err.status, StatusCode::CONFLICT);
     }
 
     #[sqlx::test]
     async fn test_resolve_malformed_claims_fails_closed(pool: PgPool) {
+        rise_resource_store_postgres::run_migrations(&pool)
+            .await
+            .expect("resource store migrations");
         let owner = users::create(&pool, "owner@example.com").await.unwrap();
         let project = projects::create(
             &pool,
@@ -501,11 +649,7 @@ mod tests {
             claims: serde_json::json!({"sub": "12345"}),
         });
 
-        let controllers_by_issuer = empty_controller_index();
-        let err = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap_err();
+        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(err.message.contains("Invalid service account claims"));
     }
@@ -547,10 +691,7 @@ mod tests {
             },
         };
         let auth = AuthContext::Access(claims);
-        let (user, is_sa) = auth
-            .resolve_for_project(&pool, &project, &empty_controller_index())
-            .await
-            .unwrap();
+        let (user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
         assert!(is_sa);
         assert_eq!(user.id, sa_user.id);
     }
@@ -589,10 +730,7 @@ mod tests {
             },
         };
         let auth = AuthContext::Access(claims);
-        let err = auth
-            .resolve_for_project(&pool, &project, &empty_controller_index())
-            .await
-            .unwrap_err();
+        let err = auth.resolve_for_project(&pool, &project).await.unwrap_err();
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
@@ -611,12 +749,8 @@ mod tests {
         .await
         .unwrap();
 
-        let auth = AuthContext::User(user.clone());
-        let controllers_by_issuer = empty_controller_index();
-        let (resolved_user, is_sa) = auth
-            .resolve_for_project(&pool, &project, &controllers_by_issuer)
-            .await
-            .unwrap();
+        let auth = AuthContext::User(user.clone(), None);
+        let (resolved_user, is_sa) = auth.resolve_for_project(&pool, &project).await.unwrap();
         assert!(!is_sa);
         assert_eq!(resolved_user.id, user.id);
     }

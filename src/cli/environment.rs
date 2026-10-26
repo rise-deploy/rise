@@ -1,5 +1,6 @@
+use crate::cli::auth_hint::AuthHintRequest;
 use anyhow::{Context, Result};
-use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Attribute, Cell, Table};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, Table};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,8 @@ pub(crate) struct EnvironmentResponse {
     color: String,
     #[serde(default)]
     deployment_constraints: Option<EnvironmentDeploymentConstraints>,
+    #[serde(default)]
+    max_deployment_expiration: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -36,6 +39,8 @@ struct CreateEnvironmentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     is_production: Option<bool>,
     color: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_deployment_expiration: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,6 +53,8 @@ struct UpdateEnvironmentRequest {
     is_production: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_deployment_expiration: Option<Option<String>>,
 }
 
 pub async fn handle_environment_command(
@@ -73,6 +80,7 @@ pub async fn handle_environment_command(
             group,
             production,
             color,
+            max_expiration,
             ..
         } => {
             create_environment(
@@ -84,6 +92,7 @@ pub async fn handle_environment_command(
                 group.as_deref(),
                 *production,
                 color,
+                max_expiration.as_deref(),
             )
             .await
         }
@@ -99,6 +108,7 @@ pub async fn handle_environment_command(
             group,
             production,
             color,
+            max_expiration,
             ..
         } => {
             update_environment(
@@ -111,6 +121,7 @@ pub async fn handle_environment_command(
                 group.as_deref(),
                 *production,
                 color.as_deref(),
+                max_expiration.as_deref(),
             )
             .await
         }
@@ -130,6 +141,7 @@ async fn create_environment(
     group: Option<&str>,
     is_production: bool,
     color: &str,
+    max_expiration: Option<&str>,
 ) -> Result<()> {
     let url = format!("{}/api/v1/projects/{}/environments", backend_url, project);
 
@@ -138,13 +150,14 @@ async fn create_environment(
         primary_deployment_group: group.map(|g| g.to_string()),
         is_production: if is_production { Some(true) } else { None },
         color: color.to_string(),
+        max_deployment_expiration: max_expiration.map(|d| d.to_string()),
     };
 
     let response = http_client
         .post(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to create environment")?;
 
@@ -173,6 +186,10 @@ async fn create_environment(
         println!("  Production: yes");
     }
     println!("  Color: {}", env.color);
+    println!(
+        "  Max expiration: {}",
+        env.max_deployment_expiration.as_deref().unwrap_or("none")
+    );
 
     Ok(())
 }
@@ -188,7 +205,7 @@ async fn list_environments(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to list environments")?;
 
@@ -213,13 +230,13 @@ async fn list_environments(
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             Cell::new("NAME").add_attribute(Attribute::Bold),
             Cell::new("PRIMARY GROUP").add_attribute(Attribute::Bold),
             Cell::new("PRODUCTION").add_attribute(Attribute::Bold),
             Cell::new("COLOR").add_attribute(Attribute::Bold),
+            Cell::new("MAX EXPIRATION").add_attribute(Attribute::Bold),
         ]);
 
     for env in envs {
@@ -228,6 +245,7 @@ async fn list_environments(
             Cell::new(env.primary_deployment_group.as_deref().unwrap_or("-")),
             Cell::new(if env.is_production { "yes" } else { "-" }),
             Cell::new(&env.color),
+            Cell::new(env.max_deployment_expiration.as_deref().unwrap_or("-")),
         ]);
     }
 
@@ -251,7 +269,7 @@ async fn show_environment(
     let response = http_client
         .get(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to get environment")?;
 
@@ -279,6 +297,10 @@ async fn show_environment(
         if env.is_production { "yes" } else { "no" }
     );
     println!("Color:          {}", env.color);
+    println!(
+        "Max expiration: {}",
+        env.max_deployment_expiration.as_deref().unwrap_or("none")
+    );
     if let Some(ref c) = env.deployment_constraints {
         println!("\nDeployment Constraints:");
         println!(
@@ -314,6 +336,7 @@ async fn update_environment(
     group: Option<&str>,
     is_production: Option<bool>,
     color: Option<&str>,
+    max_expiration: Option<&str>,
 ) -> Result<()> {
     let url = format!(
         "{}/api/v1/projects/{}/environments/{}",
@@ -327,19 +350,27 @@ async fn update_environment(
             Some(g.to_string())
         }
     });
+    let max_deployment_expiration = max_expiration.map(|d| {
+        if d.is_empty() {
+            None
+        } else {
+            Some(d.to_string())
+        }
+    });
 
     let payload = UpdateEnvironmentRequest {
         name: rename.map(|n| n.to_string()),
         primary_deployment_group,
         is_production,
         color: color.map(|c| c.to_string()),
+        max_deployment_expiration,
     };
 
     let response = http_client
         .patch(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to update environment")?;
 
@@ -380,7 +411,7 @@ async fn delete_environment(
     let response = http_client
         .delete(&url)
         .bearer_auth(token)
-        .send()
+        .send_with_auth_hint(backend_url)
         .await
         .context("Failed to delete environment")?;
 

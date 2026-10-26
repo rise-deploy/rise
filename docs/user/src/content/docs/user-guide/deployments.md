@@ -47,7 +47,7 @@ Reuse the image from a previous deployment:
 rise deploy --from 20241205-1234
 ```
 
-By default, the new deployment uses the project's current environment variables. To copy environment variables from the source deployment instead:
+By default, the new deployment uses the project's current environment variables, with the source deployment's `rise.toml` and CLI-flag variables on top: like its port, resources and routes, they travel with the source. Variables passed with this command (`--env`, the local `rise.toml`) still take precedence. To copy all environment variables from the source deployment instead:
 
 ```bash
 rise deploy --from 20241205-1234 --use-source-env-vars
@@ -102,7 +102,7 @@ Once a deployment enters a running state it stays there indefinitely — Rise do
 
 A deployment group is a label that identifies a set of related deployments. Only one deployment per group can be active at a time — when a new deployment in a group reaches `Healthy`, the previous one is `Superseded`.
 
-**Group names are just labels — they carry no intrinsic meaning on their own.** A group name only acquires routing, URL, and variable-scoping semantics when it is set as the primary group of an [Environment](../environments). Without a matching environment, deployments in a custom group still run but receive the generic staging URL pattern and no environment-scoped variables.
+**Group names are just labels — they carry no intrinsic meaning on their own.** A group name only acquires routing, URL, and variable-scoping semantics when it is set as the primary group of an [Environment](../environments). Every deployment still belongs to an environment: a deployment to a custom group takes the one you name with `-E` (or the project's only one) and gets that environment's variables, but the group's own staging URL rather than the environment's.
 
 ```bash
 # Deploy to the default group
@@ -117,7 +117,7 @@ Group names must match `[a-z0-9][a-z0-9/-]*[a-z0-9]` (no consecutive hyphens `--
 
 ### Environments
 
-[Environments](../environments) give semantic meaning to deployment groups. Each environment has a primary deployment group and controls URL routing, variable scoping, and access. The environment marked as **production** determines which deployments receive production traffic and the project's main URL — not the deployment group name itself.
+[Environments](../environments) give semantic meaning to deployment groups. Each environment has a primary deployment group and controls URL routing, variable scoping, and access. The environment marked as **production** determines which deployments receive production traffic and the project's main URL — not the deployment group name itself. The project's status (`Running`, `Deploying`, `Failed`, `Stopped`) likewise follows what the production environment's primary group serves.
 
 New projects start with a `production` environment mapped to the `default` group. You can create additional environments for staging, dev, etc. See [Environments](../environments) for details.
 
@@ -132,6 +132,8 @@ When `rise deploy` runs inside a CI pipeline, the CLI automatically attaches dep
 | Git repository | `CI_PROJECT_URL` | `GITHUB_SERVER_URL` + `GITHUB_REPOSITORY` | `BITBUCKET_GIT_HTTP_ORIGIN`, `CIRCLE_REPOSITORY_URL`, `BUILD_REPOSITORY_URI` (Azure), `BUILDKITE_REPO`, `DRONE_GIT_HTTP_URL`, `GIT_URL` (Jenkins) |
 
 This metadata is stored with the deployment and displayed in the Rise web UI, making it easy to trace a running deployment back to the pipeline job and merge/pull request that created it. No extra configuration is needed — detection is fully automatic.
+
+Outside CI too, `rise deploy` records the commit it built from (revision, branch, and whether the working tree had uncommitted changes); the web UI shows it on the deployment, and redeploys, rollbacks and promotions carry it over from the deployment they were created from.
 
 When no CI environment is detected, the Git repository falls back to the local `origin` remote. Repository URLs in `ssh://`, `git://`, and `git@host:owner/repo` form are normalized to `https://` (credentials, ports, and the trailing `.git` are stripped). You can override detection with `rise deploy --git-repository <url>`.
 
@@ -148,6 +150,8 @@ rise deploy --group temp --expire 7d      # Days (max unit; no weeks shorthand)
 ```
 
 Expired deployments are automatically cleaned up.
+
+When the target environment sets a `--max-expiration` (see [Environments](../environments#maximum-expiration-for-non-primary-groups)), a deployment landing in a non-primary group is capped at that value: a missing `--expire` gets the max, and a longer one is clamped down to it.
 
 ## Monitoring Deployments
 
@@ -166,6 +170,25 @@ rise d s -p my-app latest --follow --timeout 10m
 rise deployment list -p my-app
 rise d ls -p my-app --group staging
 ```
+
+For CI and other scripts, `--json` writes a deliberately minimal JSON payload. Each
+deployment contains `deployment_id` and `status`, plus `primary_url` when available and
+`error_message` when present. `rise deploy` waits for the deployment to reach its
+terminal state and writes one object; `rise deployment list` writes an array. Build and
+push failures also produce a failed payload after the deployment record is created.
+`--status-file <path>` writes the same JSON to a file, while preserving human-readable
+output unless `--json` is also supplied.
+
+```bash
+# Retrieve the URL of the deployment that just completed
+rise deploy -p my-app --status-file deployment.json
+jq -r '.primary_url // empty' deployment.json
+
+# Write JSON directly to stdout
+rise deployment list -p my-app --json | jq '.[].primary_url'
+```
+
+Status files are replaced atomically after a complete JSON document is available.
 
 ### Viewing Deployment Details
 

@@ -4,11 +4,11 @@
 //! it owns only half of it. The AWS side is split:
 //!
 //! - **`tests/e2e/bootstrap`** is applied once, by hand, and never touched
-//!   here: VPC, cluster, Cloud Map, Traefik, Dex, a Route 53 zone, and all the
+//!   here: VPC, cluster, Cloud Map namespace, log group, a Route 53 zone, and
 //!   IAM. It is separate because CI runs under a role with no IAM-write.
 //! - **`tests/e2e/run`** is applied and destroyed around every suite:
-//!   Postgres and the Rise control plane, so each run starts on a fresh database
-//!   and the image under test.
+//!   Postgres, Dex, and the shared Rise/Traefik runtime, so each run starts on a
+//!   fresh database and the image under test.
 //!
 //! The whole Rise stack runs *inside* the cluster, which is what lets Traefik
 //! reach Rise for the forwardAuth subrequest and therefore what lets the
@@ -72,6 +72,8 @@ const CONTROLLER_CLASS_TAG: &str = "rise.dev/controller-class";
 pub struct EcsBackend {
     repo_root: PathBuf,
     image_repository: String,
+    /// The `rise-cli` image the identity sidecar runs, at `image_tag`.
+    cli_image_repository: String,
     image_tag: String,
     /// Environment name — the bootstrap's `name`, and the SSM path its outputs
     /// are published under.
@@ -145,6 +147,8 @@ impl EcsBackend {
             .context("resolve repo root")?;
         let image_repository = std::env::var("RISE_IMAGE_REPOSITORY")
             .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise".to_string());
+        let cli_image_repository = std::env::var("RISE_CLI_IMAGE_REPOSITORY")
+            .unwrap_or_else(|_| "ghcr.io/rise-deploy/rise-cli".to_string());
         let image_tag = std::env::var("RISE_IMAGE_TAG")
             .context("RISE_IMAGE_TAG must be set for the ecs backend (ECS pulls it from GHCR)")?;
         let env_name = std::env::var("RISE_E2E_ENV").unwrap_or_else(|_| "rise-e2e".to_string());
@@ -172,6 +176,7 @@ impl EcsBackend {
         Ok(Self {
             repo_root,
             image_repository,
+            cli_image_repository,
             image_tag,
             env_name,
             region,
@@ -548,6 +553,7 @@ impl EcsBackend {
             format!("state_bucket       = {}", q(&env.state_bucket)),
             format!("rise_image         = {}", q(&self.image_repository)),
             format!("rise_image_tag     = {}", q(&self.image_tag)),
+            format!("rise_cli_image     = {}", q(&self.cli_image_repository)),
             format!("scope              = {}", q(&self.scope)),
             format!("dns_zone_name      = {}", q(&env.dns_zone_name)),
             format!("jwt_signing_secret = {}", q(&self.jwt_secret_b64)),
@@ -1307,6 +1313,17 @@ impl Backend for EcsBackend {
         cli::run(c)
     }
 
+    fn workload_api_url(&self) -> Result<Option<String>> {
+        self.run_output("rise_internal_url").map(Some)
+    }
+
+    fn supports_source_build(&self) -> bool {
+        // Built locally, pushed to ECR with the credentials Rise mints, pulled
+        // by the task execution role -- the path `registry-build-push-pull`
+        // proves.
+        true
+    }
+
     fn wait_registry_ready(&self, project: &str) -> Result<()> {
         let repo = format!("{}{project}", self.scoped_repo_prefix());
         let deadline = std::time::Instant::now() + Duration::from_secs(90);
@@ -1706,56 +1723,8 @@ impl Backend for EcsBackend {
         Ok(false)
     }
 
-    /// Assert the ECS task definition carries the Traefik forwardAuth labels.
-    ///
-    /// The ECS analogue of inspecting container labels on Docker: the provider
-    /// reads routing configuration from `dockerLabels` on the container
-    /// definition, so that is where the evidence lives.
     fn assert_ingress_auth_configured(&self, project: &str) -> Result<()> {
-        let mut last = String::new();
-        for _ in 0..30 {
-            if let Ok(services) = self.project_services(project) {
-                for svc in &services {
-                    let raw = self.aws(&[
-                        "ecs",
-                        "describe-services",
-                        "--cluster",
-                        &self.env().cluster_name,
-                        "--services",
-                        svc,
-                        "--query",
-                        "services[0].taskDefinition",
-                        "--output",
-                        "text",
-                    ])?;
-                    let td = raw.trim();
-                    if td.is_empty() {
-                        continue;
-                    }
-                    let labels = self.aws(&[
-                        "ecs",
-                        "describe-task-definition",
-                        "--task-definition",
-                        td,
-                        "--query",
-                        "taskDefinition.containerDefinitions[0].dockerLabels",
-                        "--output",
-                        "json",
-                    ])?;
-                    last = labels.clone();
-                    if labels.contains("forwardauth.address")
-                        && labels.contains(".routers.")
-                        && labels.contains(".middlewares")
-                    {
-                        return Ok(());
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_secs(3));
-        }
-        anyhow::bail!(
-            "no forwardAuth middleware labels found on {project}'s task definition; last saw: {last}"
-        )
+        super::assert_traefik_ingress_auth_configured(self, project)
     }
 
     fn wait_workload_removed(&self, project: &str) -> Result<()> {

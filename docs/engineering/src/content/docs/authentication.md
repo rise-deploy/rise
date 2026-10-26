@@ -16,11 +16,12 @@ algorithm/claim disambiguation rules, see the engineering reference in
 |---|---|---|---|---|---|
 | **[Session](#session-hs256)** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.jwt_signing_secret`, `server.jwt_expiry_seconds` |
 | **[Access](#access-hs256--token-exchange)** | Issued | HS256 | Rise `public_url` | Rise API middleware | `server.auth_token_max_ttl_seconds`, `auth.allow_raw_external_tokens` |
+| **[Identity](#identity-rs256--the-token-subresource)** | Issued | RS256 | Rise `public_url`, or a caller-named external verifier | Rise API middleware (re-resolved against the resource store per request), or the external verifier via Rise JWKS | `server.rs256_private_key_pem`, `server.auth_token_max_ttl_seconds`; trust policies are resources |
 | **[Ingress](#ingress-rs256)** | Issued | RS256 | Project URL | Nginx/ingress via Rise JWKS | `server.rs256_private_key_pem` |
 | **[Workload identity](#workload-identity-rs256)** | Issued | RS256 | Caller-supplied (e.g. `sts.amazonaws.com`) | External system via Rise JWKS | `server.rs256_private_key_pem`, `deployment_controller.identity_token_ttl_seconds` |
 | **[User login (OIDC)](#user-login-oidc)** | Accepted | per IdP | — | Rise (JWKS of `auth.issuer`) | `auth.issuer`, `auth.client_id`, `auth.client_secret` |
 | **[Service account](#service-accounts-cicd)** | Accepted | RS256 (JWKS) | project-scoped | Rise (JWKS of the SA issuer) | per-project (CLI/API managed) |
-| **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per identity | Rise (JWKS of controller issuer) | `auth.controllers[]` |
+| **[Controller](#controllers)** | Accepted | RS256 (JWKS) | per policy | Rise (JWKS of the trust policy's issuer) | `Controller` + `ControllerTrustPolicy` resources |
 
 ## Tokens Rise issues
 
@@ -39,6 +40,25 @@ to the Rise API and UI. It is symmetric (HS256), signed with
 `public_url` audience, and carries the claims listed in `server.jwt_claims`.
 Lifetime is `server.jwt_expiry_seconds` (default 24h). Session tokens are an
 internal concern — they are never verified outside Rise.
+
+A session names the user's Rise `User` resource: its header `typ` is
+`rise-session+jwt`, `sub` is the canonical `user:<name>`, `rise_uid` is the
+User's UID, and `rise_identity_uid` is the `UserIdentity` the login came
+through. `rise_client` records what the session was issued to: `browser`
+(the web UI's sign-in) or `cli` (`rise login`, with either flow). Every
+request re-resolves the User and identity:
+
+- `spec.active: false` on the User, or deleting it, ends every session issued
+  for it;
+- `spec.active: false` on one UserIdentity, or deleting it, ends the sessions
+  minted through that identity, and leaves the User's other logins alone.
+
+`email` stays in the token for the typed APIs. A session issued before this
+shape (default `typ`, the IdP's `sub`, no `rise_uid`) keeps working on the typed
+APIs until it expires, and ends early once any login has mapped its IdP `sub`
+and that identity or its User is disabled; the generic resource API refuses it
+with `401` — log in again. If the store cannot be reached to re-check a session,
+the request fails with `500` rather than logging the user out.
 
 ### Access (HS256) — token exchange
 
@@ -92,6 +112,54 @@ environment restrictions only takes effect once it expires).
 > authorization-code exchange at `/api/v1/auth/code/exchange`); the discovery
 > document continues to advertise the latter.
 
+This endpoint resolves the *typed* service accounts and configured controllers
+that the project APIs use today. Its resource-model successor is the `token`
+subresource below; the two coexist until the typed-object migration moves
+service accounts onto the resource store.
+
+### Identity (RS256) — the `token` subresource
+
+A short-lived, Rise-issued token whose subject is a **ServiceAccount or
+Controller resource** of the generic resource API (`serviceaccount:<org>/<name>`
+or `controller:<name>`), carrying that resource's UID as `rise_uid`. It is minted
+only by the target's own `token` subresource —
+`POST /api/v1/resources/rise.dev/v1alpha1/serviceaccounts/{org}/{name}/token` or
+`…/controllers/{name}/token` — in one of two disjoint modes: **workload token
+exchange**, where an external OIDC JWT in the body is validated against the
+`ServiceAccountTrustPolicy` / `ControllerTrustPolicy` children of that exact
+target; or **delegated issuance**, where an already-authenticated Rise principal
+holding `(create, <kind>, token)` on the target mints for it.
+
+It is always RS256, signed with the same key as ingress and workload tokens and
+distinguished from them by its header `typ` (`rise-identity+jwt`). The request
+may name an `audience`: omitted, the token is for Rise's own API, which is the
+only audience the API accepts; any other value mints the same token for that
+external verifier, which checks it against the JWKS above. One key and one
+token kind serve both, which is why the key is load-bearing for the resource
+API as well.
+
+**What it carries and what it does not.** Identity and an optional ceiling,
+never a snapshot of grants. Rise re-resolves `(sub, rise_uid)` to one live
+resource on every request and evaluates the identity's *current* RBAC,
+intersected with the token's RFC 9396 `authorization_details` if present. So:
+
+- deleting the target, or a draining Organization above it, fails every
+  outstanding token immediately — there is nothing to revoke;
+- recreating the same name under a new UID does not revive old tokens;
+- narrowing the target's Roles takes effect on the next request;
+- revoking the *caller's* token-create grant stops new issuance only.
+
+Delegated tokens record their delegators in a bounded `act` chain (at most four),
+for audit; actor data never grants access. Lifetime is capped by
+`server.auth_token_max_ttl_seconds`, the platform-global maximum shared with
+Access tokens. Trust policies are ordinary governed resources: they hold public
+matching configuration (issuer, `aud`, further string claims with `*` globs),
+never keys, and may not name Rise's own issuer. Every failure of a workload
+exchange after the route is entered is one coarse `401`, so the route confirms
+nothing about which identities or policies exist. The request/response shape and
+the authorization rules are specified in the
+[resource HTTP API](/operator-docs/resources/api/#token-subresource-serviceaccount-and-controller).
+
 **Migrating off raw tokens (`auth.allow_raw_external_tokens`).** Defaults to
 `true`: a service account may still present its raw external OIDC token directly
 to project-scoped endpoints (the legacy per-request path), which Rise resolves as
@@ -129,14 +197,18 @@ Two paths produce these tokens:
   re-mints once a token passes half its lifetime.
 - Apps may also call `POST /api/v1/identity/token` directly, exchanging their
   deployment bootstrap credential (`Authorization: Bearer <credential>`) for a
-  token with a requested audience.
+  token with a requested audience. Its lifetime is capped by the same
+  `identity_token_ttl_seconds` — one cap for every workload identity token —
+  and defaults to it. On ECS the identity sidecar writes the token files through
+  this endpoint.
 
 ### The RS256 key is operationally load-bearing
 
-`server.rs256_private_key_pem` signs **both** ingress and workload tokens and
+`server.rs256_private_key_pem` signs ingress, workload, and identity tokens and
 backs the JWKS. If you do **not** configure it, Rise generates a fresh key pair
-on every start — which silently invalidates all previously issued ingress and
-workload tokens and rotates the JWKS out from under any external verifier.
+on every start — which silently invalidates all previously issued ingress,
+workload, and identity tokens, differs between replicas, and rotates the JWKS
+out from under any external verifier.
 
 - **Always** set `rs256_private_key_pem` (and optionally `rs256_public_key_pem`,
   otherwise derived) in any non-ephemeral deployment.
@@ -157,6 +229,61 @@ Interactive login federates to your IdP via `auth.issuer` / `auth.client_id` /
 `auth.client_secret` / `auth.scopes`. On success Rise mints a **Session** token
 (above). This is how operators wire Rise to Dex, Okta, Entra ID, Google, etc.
 
+Each login is resolved to a Rise `User` resource by the ID token's exact
+`(iss, sub)` pair, recorded in a `UserIdentity` child of the User (ADR-0001 §1):
+
+- **First login.** No live `UserIdentity` holds the pair, so Rise creates a new
+  `User` named `u-<ulid>` and its first `UserIdentity` in one transaction.
+  Concurrent first logins converge on one User. The new User holds no grants of
+  its own.
+- **Returning login.** The pair resolves to its User. Email never links
+  accounts: a different `sub` with the same email is a different User.
+- **Disabled.** An inactive `UserIdentity`, or an active one under an inactive
+  User, refuses the login (`403`); it is never treated as unknown. Deleting the
+  `UserIdentity` instead only unlinks it — the next login provisions a fresh
+  User with a new UID — so disable with `spec.active: false`.
+
+`auth.issuer` must be spelled exactly as the IdP stamps `iss` — with or
+without its trailing slash, as the IdP does — and otherwise canonical (lower-case
+host, no default port), or the server refuses to start. The IdP must issue a
+stable `sub`.
+
+There is deliberately no way to trade an ID token for a session outside these
+login flows: they receive the ID token from the IdP over the back channel,
+bound to the login by PKCE, `state`, and `nonce`, while an endpoint accepting
+presented ID tokens would honor any token the IdP issues for Rise's client,
+from any flow.
+
+#### Device login (`rise login --device`)
+
+Rise is the RFC 8628 authorization server itself; the IdP needs no device grant.
+
+1. The CLI calls `POST /api/v1/auth/authorize {"flow": "device"}` and gets a
+   device code, a user code (`XXXX-XXXX`, from the RFC's consonant alphabet) and
+   `verification_uri_complete = {public_url}/device?user_code=…`. The row lands
+   in `device_authorizations`, holding only a SHA-256 of the device code; it
+   expires after 10 minutes. The endpoint is unauthenticated, so starts count
+   against `server.oauth_rate_limit` (per client IP, and in their own bucket).
+2. The user opens `/device` in the Rise UI, signs in the usual way, and approves
+   (`POST /api/v1/auth/device/approve`) or denies. Approval requires a
+   *browser* session (`rise_client: browser`) that names its User and identity
+   and was issued at most 10 minutes ago. Anything else gets `401`, and the
+   page sends the user through `/auth/signin/start` first. The approval records
+   that session's User UID and `UserIdentity` UID.
+3. The CLI polls `POST /api/v1/auth/device/exchange`. Answers are the RFC's
+   `authorization_pending`, `slow_down` (the interval grows by 5s),
+   `access_denied` and `expired_token`, plus `server_error` for a transient
+   failure. An approved row is deleted as it is redeemed, so it yields one
+   session. The User and identity are re-resolved first, and the session is
+   minted for exactly that pair. Disabling either one ends the device session,
+   just like the browser session that approved it.
+
+No IdP token is presented at any step. Every device session traces back to a
+recent browser login that was bound by PKCE, `state` and `nonce`. Device
+sessions are `cli` sessions, and so are those from `rise login`'s code flow,
+so a CLI session can never approve a device login. That means it cannot mint
+its own successor and outlive the IdP login.
+
 ### Service accounts (CI/CD)
 
 Project-scoped identities for automation (e.g. pipelines) that present an OIDC
@@ -167,16 +294,27 @@ workflow in the Rise user documentation.
 
 ### Controllers
 
-Trusted external controllers authenticate with OIDC JWTs declared under
-`auth.controllers[]` — each entry binds a stable `id`, an `issuer`, and required
-`claims` (`aud` is mandatory; add `sub`/`scope`/etc. as needed; `*` wildcards are
-supported). Use a dedicated issuer or audience per controller to keep identities
-unambiguous.
+Trusted external controllers authenticate with OIDC JWTs matched against live
+`ControllerTrustPolicy` resources rather than static config. An operator
+creates a root-scoped `Controller` resource for the identity, then one or more
+`ControllerTrustPolicy` children under it, each declaring an `issuer` and
+required `claims` (`aud` is mandatory; add `sub`/`scope`/etc. as needed; `*`
+wildcards are supported). Several trust policies matching the *same*
+Controller is an ordinary match — a Controller may accept more than one
+issuer or claim shape; policies matching *different* Controllers make a token
+ambiguous and the request is refused with `409`. `spec.issuer` must equal the
+token's `iss` byte-for-byte, matching `UserIdentity`.
 
-> Controllers authenticate against the generic resource API
-> (`/api/v1/resources`). Today, built-in resources do not yet grant controllers
-> write access (their `allowed_status_controller_ids` is empty), so configuring
-> controllers is currently forward-looking — it is safe to set up ahead of time.
+> A Controller authenticates against the generic resource API
+> (`/api/v1/resources`) as the ordinary principal `controller:<name>`. What it
+> may do is decided by RBAC alone: grant it `update` on the `status` and
+> `finalizers` subresources of a kind (or any other verb) through a
+> `PlatformRoleBinding` naming that subject. See
+> [Controller authorization](/operator-docs/resources/api/#controller-authorization)
+> for the full model and a worked example. A controller may also exchange its
+> OIDC JWT once, at its own `token` subresource, for an
+> [identity token](#identity-rs256--the-token-subresource) that carries the
+> same `controller:<name>` principal.
 
 ## Security checklist
 

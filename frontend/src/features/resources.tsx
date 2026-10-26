@@ -13,7 +13,6 @@ import {
     ConfirmDialog as RConfirmDialog,
     Empty as REmpty,
     EnvironmentColorDot,
-    EnvironmentColorPicker,
     EnvPill as REnvPill,
     Field as RField,
     GroupBar as RGroupBar,
@@ -36,6 +35,7 @@ import {
 import { validateJson } from '../lib/json-validate';
 import { MonoTable, MonoTableBody, MonoTableEmptyRow, MonoTableFrame, MonoTableHead, MonoTableRow, MonoTd, MonoTh } from '../components/table';
 import { Icon } from '../components/icon';
+import { SectionHead } from '../components/section-head';
 
 // CodeMirror is heavy; load it only when an extension's Spec tab is opened.
 const JsonEditor = lazy(() => import('../components/json-editor'));
@@ -49,7 +49,6 @@ import {
   AwsRdsDetailView,
   AwsRdsExtensionUI,
   OAuthDetailView,
-  OAuthExtensionUI,
   SnowflakeOAuthDetailView,
   SnowflakeOAuthExtensionUI,
   getExtensionDetailView,
@@ -189,445 +188,6 @@ function sortObjectKeys(obj) {
 // Deployment statuses considered terminal — those deployments are no longer
 // running or relevant to the environment's current state, so they're excluded
 // from the environment's active-deployments view.
-const TERMINAL_DEPLOYMENT_STATUSES = new Set([
-    'Cancelled', 'Stopped', 'Superseded', 'Failed', 'Expired',
-]);
-
-function EnvironmentCard({ env, projectName, deployments, onEdit, onDelete }) {
-    // Only the production environment card starts expanded; other envs
-    // collapse by default to keep the page compact on first load.
-    const [open, setOpen] = useState(!!env.is_production);
-
-    const activeDeployments = deployments.filter(d => !TERMINAL_DEPLOYMENT_STATUSES.has(d.status));
-
-    const primaryGroup = env.primary_deployment_group || 'default';
-    const isPrimary = (d) =>
-        d.is_active && (d.deployment_group || 'default') === primaryGroup;
-
-    // The deployment serving traffic on the env's primary URL — drives the
-    // status/replicas summary shown in the collapsed header.
-    const primaryDeploy = activeDeployments.find(isPrimary);
-    const headerStatus = primaryDeploy?.status || (activeDeployments[0]?.status) || null;
-    const headerReplicas = primaryDeploy?.replicas;
-
-    return (
-        <RPanel>
-            <RGroupBar
-                open={open}
-                onToggle={() => setOpen(o => !o)}
-                right={
-                    <>
-                        {headerStatus && <RStatus status={headerStatus} />}
-                        {headerReplicas != null && (
-                            <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
-                                {headerReplicas} replica{headerReplicas === 1 ? '' : 's'}
-                            </span>
-                        )}
-                        <RButton
-                            size="sm"
-                            icon="edit"
-                            onClick={(e) => { e.stopPropagation(); onEdit(env); }}
-                        >
-                            Edit
-                        </RButton>
-                        <RButton
-                            size="sm"
-                            variant="danger"
-                            icon="trash"
-                            disabled={env.is_production}
-                            onClick={(e) => { e.stopPropagation(); onDelete(env); }}
-                        >
-                            Delete
-                        </RButton>
-                    </>
-                }
-            >
-                <EnvironmentColorDot color={env.color} size="0.7rem" />
-                <a
-                    className="r-link"
-                    style={{ fontWeight: 600, fontSize: 14, textTransform: 'capitalize' }}
-                    onClick={(e) => {
-                        e.stopPropagation();
-                        navigate(`/project/${projectName}/environment/${env.name}`);
-                    }}
-                    title="View the active deployment of this environment"
-                >
-                    {env.name}
-                </a>
-                {env.is_production && env.name.toLowerCase() !== 'production' && (
-                    <span className="r-pill env-prod">production</span>
-                )}
-                <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
-                    · {activeDeployments.length} active deployment{activeDeployments.length === 1 ? '' : 's'}
-                </span>
-            </RGroupBar>
-            {open && (
-                activeDeployments.length === 0 ? (
-                    <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
-                        No active deployments in this environment.
-                    </div>
-                ) : (
-                    <table className="r-table r-table-fixed">
-                        <colgroup>
-                            <col style={{ width: 230 }} />
-                            <col style={{ width: 130 }} />
-                            <col style={{ width: 180 }} />
-                            <col />
-                            <col style={{ width: 110 }} />
-                        </colgroup>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Status</th>
-                                <th>Group</th>
-                                <th>Author</th>
-                                <th style={{ textAlign: 'right' }}>Age</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {activeDeployments.map(d => {
-                                const group = d.deployment_group || 'default';
-                                const groupIsPrimary = group === primaryGroup;
-                                return (
-                                    <tr
-                                        key={d.deployment_id}
-                                        className="click"
-                                        onClick={() => navigate(`/deployment/${projectName}/${d.deployment_id}`)}
-                                    >
-                                        <td className="mono" style={{ fontSize: 12.25 }}>
-                                            {d.deployment_id}
-                                            {isPrimary(d) && (
-                                                <span style={{
-                                                    marginLeft: 8, fontSize: 10.5, padding: '1px 6px',
-                                                    background: 'var(--accent-soft)', color: 'var(--accent)',
-                                                    borderRadius: 4, fontFamily: 'Inter',
-                                                }} title="Currently serving this environment's primary URL">PRIMARY</span>
-                                            )}
-                                        </td>
-                                        <td><RStatus status={d.status || 'Unknown'} /></td>
-                                        <td>
-                                            <RGroupPill group={group} primary={groupIsPrimary} />
-                                        </td>
-                                        <td>{d.created_by_email || <span style={{ color: 'var(--text-soft)' }}>—</span>}</td>
-                                        <td style={{ textAlign: 'right', color: 'var(--text-muted)' }}>
-                                            {d.created ? formatRelativeTimeRounded(d.created) : '—'}
-                                        </td>
-                                    </tr>
-                                );
-                            })}
-                        </tbody>
-                    </table>
-                )
-            )}
-        </RPanel>
-    );
-}
-
-// Environments Component
-export function EnvironmentsList({ projectName, platformConstraints = null }) {
-    const [environments, setEnvironments] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
-    const [isModalOpen, setIsModalOpen] = useState(false);
-    const [editingEnv, setEditingEnv] = useState(null);
-    const [formData, setFormData] = useState({
-        name: '', primary_deployment_group: '', is_production: false, color: 'green',
-        min_replicas: '', max_replicas: '', min_cpu: '', max_cpu: '', min_memory: '', max_memory: '',
-    });
-    const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
-    const [envToDelete, setEnvToDelete] = useState(null);
-    const [deleting, setDeleting] = useState(false);
-    const [saving, setSaving] = useState(false);
-    const [currentUser, setCurrentUser] = useState(null);
-    const [deployments, setDeployments] = useState([]);
-    const { showToast } = useToast();
-
-    const loadEnvironments = useCallback(async () => {
-        try {
-            const [envData, deployData] = await Promise.all([
-                api.getProjectEnvironments(projectName),
-                api.getProjectDeployments(projectName, { limit: 100 }).catch(() => []),
-            ]);
-            setEnvironments(envData || []);
-            setDeployments(deployData || []);
-            setLoading(false);
-        } catch (err) {
-            setError(err.message);
-            setLoading(false);
-        }
-    }, [projectName]);
-
-    useEffect(() => {
-        loadEnvironments();
-    }, [loadEnvironments]);
-
-    useEffect(() => {
-        api.getMe().then(setCurrentUser).catch(() => {});
-    }, []);
-
-    const isAdmin = currentUser?.is_admin ?? false;
-
-    const handleAddClick = () => {
-        setEditingEnv(null);
-        setFormData({
-            name: '', primary_deployment_group: '', is_production: false, color: 'green',
-            min_replicas: '', max_replicas: '', min_cpu: '', max_cpu: '', min_memory: '', max_memory: '',
-        });
-        setIsModalOpen(true);
-    };
-
-    const handleEditClick = (env) => {
-        setEditingEnv(env);
-        const c = env.deployment_constraints;
-        setFormData({
-            name: env.name,
-            primary_deployment_group: env.primary_deployment_group || '',
-            is_production: env.is_production,
-            color: env.color || 'green',
-            min_replicas: c?.min_replicas?.toString() ?? '',
-            max_replicas: c?.max_replicas?.toString() ?? '',
-            min_cpu: c?.min_cpu ?? '',
-            max_cpu: c?.max_cpu ?? '',
-            min_memory: c?.min_memory ?? '',
-            max_memory: c?.max_memory ?? '',
-        });
-        setIsModalOpen(true);
-    };
-
-    const handleDeleteClick = (env) => {
-        setEnvToDelete(env);
-        setConfirmDialogOpen(true);
-    };
-
-    const handleSave = async () => {
-        if (!formData.name) {
-            showToast('Environment name is required', 'error');
-            return;
-        }
-
-        setSaving(true);
-        try {
-            if (editingEnv) {
-                const updates: any = {
-                    primary_deployment_group: formData.primary_deployment_group || null,
-                    is_production: formData.is_production,
-                    color: formData.color,
-                };
-                // Include deployment constraints if admin
-                if (isAdmin) {
-                    const hasAnyConstraint = formData.min_replicas || formData.max_replicas ||
-                        formData.min_cpu || formData.max_cpu || formData.min_memory || formData.max_memory;
-                    updates.deployment_constraints = hasAnyConstraint ? {
-                        min_replicas: formData.min_replicas ? parseInt(formData.min_replicas) : null,
-                        max_replicas: formData.max_replicas ? parseInt(formData.max_replicas) : null,
-                        min_cpu: formData.min_cpu || null,
-                        max_cpu: formData.max_cpu || null,
-                        min_memory: formData.min_memory || null,
-                        max_memory: formData.max_memory || null,
-                    } : {
-                        min_replicas: null, max_replicas: null,
-                        min_cpu: null, max_cpu: null, min_memory: null, max_memory: null,
-                    };
-                }
-                await api.updateEnvironment(projectName, editingEnv.name, updates);
-                showToast(`Environment ${editingEnv.name} updated`, 'success');
-            } else {
-                await api.createEnvironment(projectName, {
-                    name: formData.name,
-                    primary_deployment_group: formData.primary_deployment_group || null,
-                    is_production: formData.is_production,
-                    color: formData.color,
-                });
-                showToast(`Environment ${formData.name} created`, 'success');
-            }
-            setIsModalOpen(false);
-            loadEnvironments();
-        } catch (err) {
-            showToast(`Failed to ${editingEnv ? 'update' : 'create'} environment: ${err.message}`, 'error');
-        } finally {
-            setSaving(false);
-        }
-    };
-
-    const handleDeleteConfirm = async () => {
-        if (!envToDelete) return;
-
-        setDeleting(true);
-        try {
-            await api.deleteEnvironment(projectName, envToDelete.name);
-            showToast(`Environment ${envToDelete.name} deleted`, 'success');
-            setConfirmDialogOpen(false);
-            setEnvToDelete(null);
-            loadEnvironments();
-        } catch (err) {
-            showToast(`Failed to delete environment: ${err.message}`, 'error');
-        } finally {
-            setDeleting(false);
-        }
-    };
-
-    if (loading) return <LoadingState label="Loading environments…" />;
-    if (error) return <ErrorState message={`Error loading environments: ${error}`} onRetry={loadEnvironments} />;
-
-    const deploymentsForEnv = (envName) => deployments.filter(d => d.environment === envName);
-
-    return (
-        <div>
-            <div className="r-section-head">
-                <div>
-                    <div className="r-section-title">Environments</div>
-                    <div className="r-section-sub">Deployment targets and their deployment groups for this project.</div>
-                </div>
-                <RButton variant="primary" icon="plus" onClick={handleAddClick}>
-                    New environment
-                </RButton>
-            </div>
-
-            {environments.length === 0 ? (
-                <RPanel>
-                    <REmpty title="No environments">
-                        <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
-                            No environments configured. Create one to define a deployment target.
-                        </div>
-                    </REmpty>
-                </RPanel>
-            ) : (
-                <div className="r-stack">
-                    {environments.map(env => (
-                        <EnvironmentCard
-                            key={env.name}
-                            env={env}
-                            projectName={projectName}
-                            deployments={deploymentsForEnv(env.name)}
-                            onEdit={handleEditClick}
-                            onDelete={handleDeleteClick}
-                        />
-                    ))}
-                </div>
-            )}
-
-            <RModal
-                isOpen={isModalOpen}
-                onClose={() => setIsModalOpen(false)}
-                title={editingEnv ? 'Edit Environment' : 'Create Environment'}
-                footer={
-                    <>
-                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>Cancel</RButton>
-                        <RButton variant="primary" onClick={handleSave} loading={saving}>
-                            {editingEnv ? 'Update' : 'Create'}
-                        </RButton>
-                    </>
-                }
-            >
-                <RField label={<>Name<span className="text-red-300 ml-1">*</span></>}>
-                    <RInput
-                        value={formData.name}
-                        onChange={(e) => setFormData({ ...formData, name: e.target.value.toLowerCase() })}
-                        placeholder="staging"
-                        disabled={editingEnv !== null}
-                    />
-                </RField>
-                <RField
-                    label="Primary Deployment Group"
-                    hint="The deployment group that maps to this environment. Leave empty if not applicable."
-                >
-                    <RInput
-                        value={formData.primary_deployment_group}
-                        onChange={(e) => setFormData({ ...formData, primary_deployment_group: e.target.value })}
-                        placeholder="default"
-                    />
-                </RField>
-                <div className="flex gap-6">
-                    <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                            type="checkbox"
-                            checked={formData.is_production}
-                            onChange={(e) => setFormData({ ...formData, is_production: e.target.checked })}
-                            className="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500"
-                        />
-                        <span className="text-sm text-gray-700 dark:text-gray-300">Production</span>
-                    </label>
-                </div>
-                <RField label="Color">
-                    <EnvironmentColorPicker
-                        value={formData.color}
-                        onChange={(c) => setFormData({ ...formData, color: c })}
-                    />
-                </RField>
-
-                {isAdmin && editingEnv && (
-                    <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
-                        <span className="mono-label">Resource Constraints</span>
-                        <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
-                            Bounds for what a deployment can <em>request</em> at deploy time (via <span className="mono">rise.toml</span> or the CLI). These are not Kubernetes requests/limits — they constrain the user's choice. Leave empty to use platform defaults.
-                        </p>
-                        <div className="grid grid-cols-2 gap-3">
-                            <RField label="Min Replicas">
-                                <RInput
-                                    type="number"
-                                    value={formData.min_replicas}
-                                    onChange={(e) => setFormData({ ...formData, min_replicas: e.target.value })}
-                                    placeholder={platformConstraints?.min_replicas?.toString() ?? '1'}
-                                />
-                            </RField>
-                            <RField label="Max Replicas">
-                                <RInput
-                                    type="number"
-                                    value={formData.max_replicas}
-                                    onChange={(e) => setFormData({ ...formData, max_replicas: e.target.value })}
-                                    placeholder={platformConstraints?.max_replicas?.toString() ?? '1'}
-                                />
-                            </RField>
-                            <RField label="Min CPU">
-                                <RInput
-                                    value={formData.min_cpu}
-                                    onChange={(e) => setFormData({ ...formData, min_cpu: e.target.value })}
-                                    placeholder={platformConstraints?.min_cpu ?? '100m'}
-                                />
-                            </RField>
-                            <RField label="Max CPU">
-                                <RInput
-                                    value={formData.max_cpu}
-                                    onChange={(e) => setFormData({ ...formData, max_cpu: e.target.value })}
-                                    placeholder={platformConstraints?.max_cpu ?? '2'}
-                                />
-                            </RField>
-                            <RField label="Min Memory">
-                                <RInput
-                                    value={formData.min_memory}
-                                    onChange={(e) => setFormData({ ...formData, min_memory: e.target.value })}
-                                    placeholder={platformConstraints?.min_memory ?? '64Mi'}
-                                />
-                            </RField>
-                            <RField label="Max Memory">
-                                <RInput
-                                    value={formData.max_memory}
-                                    onChange={(e) => setFormData({ ...formData, max_memory: e.target.value })}
-                                    placeholder={platformConstraints?.max_memory ?? '2Gi'}
-                                />
-                            </RField>
-                        </div>
-                    </div>
-                )}
-            </RModal>
-
-            <RConfirmDialog
-                isOpen={confirmDialogOpen}
-                onClose={() => {
-                    setConfirmDialogOpen(false);
-                    setEnvToDelete(null);
-                }}
-                onConfirm={handleDeleteConfirm}
-                title="Delete Environment"
-                message={`Are you sure you want to delete the environment "${envToDelete?.name}"? This action cannot be undone.`}
-                confirmText="Delete Environment"
-                confirmTone="danger"
-                loading={deleting}
-            />
-        </div>
-    );
-}
-
 // Custom Domains Component
 export function DomainsList({ projectName, defaultUrl = null }) {
     const [domains, setDomains] = useState([]);
@@ -783,8 +343,8 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         }
     };
 
-    if (loading) return <LoadingState label="Loading custom domains…" />;
-    if (error) return <ErrorState message={`Error loading custom domains: ${error}`} onRetry={loadDomains} />;
+    if (loading) return <><SectionHead section="domains" /><LoadingState label="Loading custom domains…" /></>;
+    if (error) return <><SectionHead section="domains" /><ErrorState message={`Error loading custom domains: ${error}`} onRetry={loadDomains} /></>;
 
     const defaultHost = (() => {
         if (!defaultUrl) return null;
@@ -856,9 +416,9 @@ export function DomainsList({ projectName, defaultUrl = null }) {
         if (!isProd && envDomains.length === 0) return null;
 
         return (
-            <div key={env.id} style={{ marginBottom: 20 }}>
+            <div key={env.name} style={{ marginBottom: 20 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '0 0 8px 4px' }}>
-                    <REnvPill env={env.name} color={env.color} />
+                    <REnvPill projectName={projectName} env={env.name} color={env.color} />
                     {orphaned && (
                         <RTooltip content={`Environment '${env.name}' has no primary deployment group, so domains here aren't attached to any ingress. Set a primary group on the environment to publish them.`}>
                             <span style={{ display: 'inline-flex', color: 'var(--accent-warning, #fbbf24)', lineHeight: 0 }} aria-label="No primary deployment group">
@@ -928,15 +488,7 @@ export function DomainsList({ projectName, defaultUrl = null }) {
 
     return (
         <div>
-            <div className="r-section-head">
-                <div>
-                    <div className="r-section-title">Custom domains</div>
-                    <div className="r-section-sub">Point your own domains at this project. Each environment has its own primary domain.</div>
-                </div>
-                <RButton variant="primary" icon="plus" onClick={handleAddClick}>
-                    Add domain
-                </RButton>
-            </div>
+            <SectionHead section="domains" actions={<RButton variant="primary" icon="plus" onClick={handleAddClick}>Add domain</RButton>} />
 
             {sortedEnvs.length === 0 ? (
                 <RPanel>
@@ -1081,106 +633,15 @@ function EnvVarSourceTag({ source, environments = [] }) {
 }
 
 // One collapsible scope panel (Global, or a single environment) of env vars.
-function EnvVarScopeGroup({ scope, vars, searching, defaultOpen, environments, renderTypeTag, renderValueCell, onAdd, onEdit, onDelete }) {
-    const [open, setOpen] = useState(defaultOpen);
-    const secretCount = vars.filter(v => v.is_secret).length;
-    // When searching, collapse empty scopes entirely.
-    if (searching && vars.length === 0) return null;
-
-    return (
-        <RPanel>
-            <RGroupBar
-                open={open}
-                onToggle={() => setOpen(o => !o)}
-                right={
-                    <>
-                        <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>
-                            {vars.length} variable{vars.length !== 1 ? 's' : ''}
-                        </span>
-                        {secretCount > 0 && (
-                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 11.5, color: 'var(--text-soft)' }}>
-                                <Icon name="lock" size={11} /> {secretCount} secret{secretCount !== 1 ? 's' : ''}
-                            </span>
-                        )}
-                        <RButton size="sm" icon="plus" onClick={(e) => { e.stopPropagation(); onAdd(); }}>
-                            Add
-                        </RButton>
-                    </>
-                }
-            >
-                <span className={`r-pill ${scope.kind}`}>
-                    {scope.color && <EnvironmentColorDot color={scope.color} />}
-                    {scope.label}
-                </span>
-                <span style={{ fontSize: 11.5, color: 'var(--text-soft)' }}>· {scope.hint}</span>
-            </RGroupBar>
-            {open && (
-                vars.length === 0 ? (
-                    <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-soft)', fontSize: 13 }}>
-                        No variables in this scope.
-                    </div>
-                ) : (
-                    <table className="r-table r-table-fixed">
-                        <colgroup>
-                            <col style={{ width: '28%' }} />
-                            <col />
-                            <col style={{ width: 110 }} />
-                            <col style={{ width: 130 }} />
-                        </colgroup>
-                        <thead>
-                            <tr><th>Key</th><th>Value</th><th>Type</th><th></th></tr>
-                        </thead>
-                        <tbody>
-                            {vars.map(v => (
-                                <tr key={`${v.key}-${v.environment || ''}`}>
-                                    <td className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{v.key}</td>
-                                    <td>{renderValueCell(v)}</td>
-                                    <td>{renderTypeTag(v)}</td>
-                                    <td>
-                                        <div className="row-actions" style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
-                                            <RButton size="sm" icon="edit" onClick={() => onEdit(v)}>Edit</RButton>
-                                            <RButton size="sm" variant="danger" icon="trash" onClick={() => onDelete(v)}>Delete</RButton>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                )
-            )}
-        </RPanel>
-    );
-}
-
-// Environment Variables Component
+// Read-only variable snapshot of one deployment. Project variables are edited
+// in the Variables section (`./variables`).
 export function EnvVarsList({ projectName, deploymentId }) {
     const [envVars, setEnvVars] = useState([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
-    const [isModalOpen, setIsModalOpen] = useState(false);
-    const [editingEnvVar, setEditingEnvVar] = useState(null);
-    const [formData, setFormData] = useState({ key: '', value: '', type: 'plain', environment: null });
-    const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
-    const [envVarToDelete, setEnvVarToDelete] = useState(null);
-    const [deleting, setDeleting] = useState(false);
-    const [saving, setSaving] = useState(false);
     const [environments, setEnvironments] = useState([]);
-    const [search, setSearch] = useState('');
     const [revealed, setRevealed] = useState({});
-    const importInputRef = useRef(null);
     const { showToast } = useToast();
-
-    // Convert API representation to UI type
-    const apiToType = (isSecret, isProtected) => {
-        if (!isSecret) return 'plain';
-        return isProtected ? 'protected' : 'secret';
-    };
-
-    // Convert UI type to API representation
-    const typeToApi = (type) => ({
-        is_secret: type !== 'plain',
-        is_protected: type === 'protected',
-    });
 
     // Load environments for source color dots
     useEffect(() => {
@@ -1191,9 +652,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
 
     const loadEnvVars = useCallback(async () => {
         try {
-            const response = deploymentId
-                ? await api.getDeploymentEnvVars(projectName, deploymentId)
-                : await api.getProjectEnvVars(projectName, null);
+            const response = await api.getDeploymentEnvVars(projectName, deploymentId);
             setEnvVars(response.env_vars || []);
             setLoading(false);
         } catch (err) {
@@ -1206,137 +665,6 @@ export function EnvVarsList({ projectName, deploymentId }) {
         loadEnvVars();
     }, [loadEnvVars]);
 
-    const handleAddClick = (environment = null) => {
-        setEditingEnvVar(null);
-        setFormData({ key: '', value: '', type: 'plain', environment: environment || null });
-        setIsModalOpen(true);
-    };
-
-    const handleEditClick = (envVar) => {
-        setEditingEnvVar(envVar);
-        setFormData({
-            key: envVar.key,
-            value: envVar.is_secret ? '' : envVar.value,
-            type: apiToType(envVar.is_secret, envVar.is_protected),
-            environment: envVar.environment || null,
-        });
-        setIsModalOpen(true);
-    };
-
-    const handleDeleteClick = (envVar) => {
-        setEnvVarToDelete(envVar);
-        setConfirmDialogOpen(true);
-    };
-
-    const handleSave = async () => {
-        if (!formData.key || (!editingEnvVar && !formData.value)) {
-            showToast('Key and value are required', 'error');
-            return;
-        }
-
-        setSaving(true);
-        try {
-            const originalEnv = editingEnvVar?.environment || null;
-            const targetEnv = formData.environment || null;
-            const envChanged = editingEnvVar && originalEnv !== targetEnv;
-
-            // Move to different environment if needed
-            if (envChanged) {
-                await api.moveEnvVar(projectName, formData.key, originalEnv, targetEnv);
-            }
-
-            // Update value/type (skip for secrets with no new value provided)
-            if (formData.value) {
-                const { is_secret, is_protected } = typeToApi(formData.type);
-                await api.setEnvVar(projectName, formData.key, formData.value, is_secret, is_protected, targetEnv);
-            }
-
-            showToast(`Environment variable ${formData.key} ${editingEnvVar ? 'updated' : 'created'} successfully`, 'success');
-            setIsModalOpen(false);
-            loadEnvVars();
-        } catch (err) {
-            showToast(`Failed to save environment variable: ${err.message}`, 'error');
-        } finally {
-            setSaving(false);
-        }
-    };
-
-    const handleDeleteConfirm = async () => {
-        if (!envVarToDelete) return;
-
-        setDeleting(true);
-        try {
-            await api.deleteEnvVar(projectName, envVarToDelete.key, envVarToDelete.environment || null);
-            showToast(`Environment variable ${envVarToDelete.key} deleted successfully`, 'success');
-            setConfirmDialogOpen(false);
-            setEnvVarToDelete(null);
-            loadEnvVars();
-        } catch (err) {
-            showToast(`Failed to delete environment variable: ${err.message}`, 'error');
-        } finally {
-            setDeleting(false);
-        }
-    };
-
-    // Export currently-loaded variables as a .env file. Secret values are not
-    // available client-side, so secret keys are written without a value.
-    const handleExport = () => {
-        const lines = envVars.map(v => {
-            if (v.is_secret) return `# ${v.key} is a secret; value not exported\n${v.key}=`;
-            return `${v.key}=${v.value ?? ''}`;
-        });
-        const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${projectName}.env`;
-        a.click();
-        URL.revokeObjectURL(url);
-    };
-
-    // Parse an uploaded .env file and create each variable as a plain global var.
-    const handleImportFile = async (e) => {
-        const file = e.target.files?.[0];
-        e.target.value = '';
-        if (!file) return;
-        let text = '';
-        try {
-            text = await file.text();
-        } catch (err) {
-            showToast(`Failed to read file: ${err.message}`, 'error');
-            return;
-        }
-        const entries = [];
-        for (const raw of text.split('\n')) {
-            const line = raw.trim();
-            if (!line || line.startsWith('#')) continue;
-            const eq = line.indexOf('=');
-            if (eq <= 0) continue;
-            let key = line.slice(0, eq).trim();
-            if (key.startsWith('export ')) key = key.slice(7).trim();
-            let value = line.slice(eq + 1).trim();
-            if (value.length >= 2 && ((value[0] === '"' && value.endsWith('"')) || (value[0] === "'" && value.endsWith("'")))) {
-                value = value.slice(1, -1);
-            }
-            if (key) entries.push([key, value]);
-        }
-        if (entries.length === 0) {
-            showToast('No variables found in file', 'error');
-            return;
-        }
-        let ok = 0;
-        for (const [key, value] of entries) {
-            try {
-                await api.setEnvVar(projectName, key, value, false, false, null);
-                ok++;
-            } catch (err) {
-                showToast(`Failed to import ${key}: ${err.message}`, 'error');
-            }
-        }
-        if (ok > 0) showToast(`Imported ${ok} variable${ok === 1 ? '' : 's'} into Global`, 'success');
-        loadEnvVars();
-    };
-
     if (loading) return <LoadingState label="Loading environment variables…" />;
     if (error) return <ErrorState message={`Error loading environment variables: ${error}`} onRetry={loadEnvVars} />;
 
@@ -1347,9 +675,7 @@ export function EnvVarsList({ projectName, deploymentId }) {
             return;
         }
         try {
-            const response = deploymentId
-                ? await api.getDeploymentEnvVarValue(projectName, deploymentId, envVar.key)
-                : await api.getEnvVarValue(projectName, envVar.key, envVar.environment || null);
+            const response = await api.getDeploymentEnvVarValue(projectName, deploymentId, envVar.key);
             setRevealed(r => ({ ...r, [revealKey]: response.value }));
         } catch (err) {
             showToast(`Failed to reveal secret: ${err.message}`, 'error');
@@ -1359,12 +685,10 @@ export function EnvVarsList({ projectName, deploymentId }) {
 
     const TypeTag = ({ envVar }) => {
         if (envVar.is_protected) {
-            return <span className="r-pill" style={{ color: 'var(--info)', background: 'var(--info-bg)', borderColor: 'transparent' }}>protected</span>;
+            return <span className="r-var-badge protected" title="Write-only: can't be revealed or read back"><Icon name="lock" size={10} />Protected</span>;
         }
-        if (envVar.is_secret) {
-            return <span className="r-pill" style={{ color: 'var(--warn)', background: 'var(--warn-bg)', borderColor: 'transparent' }}>secret</span>;
-        }
-        return <span className="r-pill">plain</span>;
+        if (envVar.is_secret) return <span className="r-var-badge secret">Secret</span>;
+        return <span className="muted">Plain</span>;
     };
 
     // Renders the masked/revealed value cell with a reveal eye for readable secrets.
@@ -1398,201 +722,67 @@ export function EnvVarsList({ projectName, deploymentId }) {
         );
     };
 
-    // Deployment snapshot mode: a single read-only table.
-    if (deploymentId) {
-        return (
-            <div>
-                <RPanel>
-                    {envVars.length === 0 ? (
-                        <REmpty title="No environment variables">
-                            <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
-                                This deployment has no environment variables.
-                            </div>
-                        </REmpty>
-                    ) : (
-                        <table className="r-table r-table-fixed">
-                            <colgroup>
-                                <col style={{ width: '28%' }} />
-                                <col />
-                                <col style={{ width: 110 }} />
-                                <col style={{ width: 150 }} />
-                            </colgroup>
-                            <thead>
-                                <tr><th>Key</th><th>Value</th><th>Type</th><th>Source</th></tr>
-                            </thead>
-                            <tbody>
-                                {envVars.map(env => (
-                                    <tr key={`${env.key}-${env.environment || ''}`}>
-                                        <td className="mono" style={{ fontSize: 13, fontWeight: 500 }}>{env.key}</td>
-                                        <td><ValueCell envVar={env} /></td>
-                                        <td><TypeTag envVar={env} /></td>
-                                        <td><EnvVarSourceTag source={env.source} environments={environments} /></td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    )}
-                </RPanel>
-                <p style={{ marginTop: 16, fontSize: 12.5, color: 'var(--text-muted)' }}>
-                    Environment variables are read-only snapshots taken at deployment time.
-                    Secret values are always masked unless revealed.
-                </p>
-            </div>
-        );
-    }
-
-    // Project mode: group all vars by scope (Global + one per environment).
-    const search_q = search.trim().toLowerCase();
-    const matchesSearch = (v) =>
-        !search_q || v.key.toLowerCase().includes(search_q) || (v.value || '').toLowerCase().includes(search_q);
-
-    const envOrder = environments.map(e => e.name);
-    const scopeNames = Array.from(new Set(envVars.map(v => v.environment).filter(Boolean)));
-    // Keep declared environment order first, then any extra scopes present in the data.
-    const orderedEnvScopes = [
-        ...envOrder.filter(n => scopeNames.includes(n)),
-        ...scopeNames.filter(n => !envOrder.includes(n)),
+    // Deployment snapshots separate injected system values by their API source.
+    const groups = [
+        {
+            id: 'configured',
+            title: 'Configured variables',
+            description: 'From project settings, environments, and extensions',
+            vars: envVars.filter(env => env.source !== 'system'),
+        },
+        {
+            id: 'system',
+            title: 'System variables',
+            description: 'Provided automatically by Rise',
+            vars: envVars.filter(env => env.source === 'system'),
+        },
     ];
-
-    const scopes = [
-        { id: null, label: 'Global', hint: 'applies to every environment', kind: 'env-global' },
-        ...orderedEnvScopes.map(name => ({
-            id: name,
-            label: name,
-            hint: `overrides global for ${name}`,
-            kind: 'env-prod',
-            color: environments.find(e => e.name === name)?.color,
-        })),
-    ];
-
     return (
         <div>
-            <div className="r-section-head">
-                <RSearchInput
-                    value={search}
-                    onChange={setSearch}
-                    placeholder="Filter keys or values…"
-                    style={{ maxWidth: 320 }}
-                />
-                <div style={{ display: 'flex', gap: 8 }}>
-                    <input
-                        ref={importInputRef}
-                        type="file"
-                        accept=".env,text/plain"
-                        style={{ display: 'none' }}
-                        onChange={handleImportFile}
-                    />
-                    <RButton icon="copy" onClick={() => importInputRef.current?.click()}>
-                        Import .env
-                    </RButton>
-                    <RButton icon="ext" onClick={handleExport}>
-                        Export
-                    </RButton>
-                    <RButton variant="primary" icon="plus" onClick={() => handleAddClick()}>
-                        Add variable
-                    </RButton>
-                </div>
-            </div>
-
-            <RAlert icon="lock">
-                Global variables apply to all environments. A variable redefined in a specific environment
-                <strong> overrides</strong> the global one for that env. Secrets are encrypted at rest.
-            </RAlert>
-
-            <div className="r-stack tight" style={{ marginTop: 16 }}>
-                {scopes.map((scope, i) => (
-                    <EnvVarScopeGroup
-                        key={scope.id || '__global__'}
-                        scope={scope}
-                        vars={envVars.filter(v => (v.environment || null) === scope.id && matchesSearch(v))}
-                        searching={!!search_q}
-                        defaultOpen={i < 2}
-                        environments={environments}
-                        renderTypeTag={(v) => <TypeTag envVar={v} />}
-                        renderValueCell={(v) => <ValueCell envVar={v} />}
-                        onAdd={() => handleAddClick(scope.id)}
-                        onEdit={handleEditClick}
-                        onDelete={handleDeleteClick}
-                    />
+            <div className="r-stack">
+                {envVars.length === 0 ? (
+                    <REmpty title="No environment variables">
+                        <div style={{ color: 'var(--text-soft)', fontSize: 13 }}>
+                            This deployment has no environment variables.
+                        </div>
+                    </REmpty>
+                ) : groups.filter(group => group.vars.length > 0).map(group => (
+                    <RPanel key={group.id}>
+                        <RPanelHead
+                            title={group.title}
+                            sub={group.description}
+                            right={<span className="r-pill">{group.vars.length} variable{group.vars.length === 1 ? '' : 's'}</span>}
+                        />
+                        <div className="r-deployment-vars-table" role="region" aria-label={group.title} tabIndex={0}>
+                            <table className="r-table r-table-fixed" aria-label={group.title}>
+                                <colgroup>
+                                    <col style={{ width: '28%' }} />
+                                    <col />
+                                    <col style={{ width: 110 }} />
+                                    <col style={{ width: 150 }} />
+                                </colgroup>
+                                <thead>
+                                    <tr><th scope="col">Key</th><th scope="col">Value</th><th scope="col">Type</th><th scope="col">Source</th></tr>
+                                </thead>
+                                <tbody>
+                                    {group.vars.map(env => (
+                                        <tr key={`${env.key}-${env.environment || ''}`}>
+                                            <td className="mono" style={{ fontSize: 13, fontWeight: 500, overflowWrap: 'anywhere' }}>{env.key}</td>
+                                            <td><ValueCell envVar={env} /></td>
+                                            <td><TypeTag envVar={env} /></td>
+                                            <td><EnvVarSourceTag source={env.source} environments={environments} /></td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </RPanel>
                 ))}
             </div>
             <p style={{ marginTop: 16, fontSize: 12.5, color: 'var(--text-muted)' }}>
-                Environment variables are snapshots at deployment time. Changes to project variables only
-                apply to new deployments, not existing ones. Secret values are always masked unless revealed.
+                Environment variables are read-only snapshots taken at deployment time.
+                Secret values are always masked unless revealed.
             </p>
-
-            <RModal
-                isOpen={isModalOpen}
-                onClose={() => setIsModalOpen(false)}
-                title={editingEnvVar ? 'Edit environment variable' : 'Add environment variable'}
-                footer={
-                    <>
-                        <RButton onClick={() => setIsModalOpen(false)} disabled={saving}>Cancel</RButton>
-                        <RButton variant="primary" onClick={handleSave} loading={saving}>
-                            {editingEnvVar ? 'Update' : 'Add'}
-                        </RButton>
-                    </>
-                }
-            >
-                {!deploymentId && environments.length > 0 && (
-                    <RField label="Environment">
-                        <RCombobox
-                            value={formData.environment || ''}
-                            onChange={(v) => setFormData({ ...formData, environment: v || null })}
-                            options={[
-                                { value: '', label: 'Global (all environments)' },
-                                ...environments.map(env => ({ value: env.name, label: env.name })),
-                            ]}
-                            placeholder="Global (all environments)"
-                        />
-                    </RField>
-                )}
-                <RField label="Key">
-                    <RInput
-                        value={formData.key}
-                        onChange={(e) => setFormData({ ...formData, key: e.target.value })}
-                        placeholder="DATABASE_URL"
-                        disabled={editingEnvVar !== null}
-                        autoFocus={!editingEnvVar}
-                    />
-                </RField>
-                <RField label="Value">
-                    <RTextarea
-                        value={formData.value}
-                        onChange={(e) => setFormData({ ...formData, value: e.target.value })}
-                        placeholder="postgres://…"
-                        rows={3}
-                    />
-                </RField>
-                <RField
-                    label="Type"
-                    hint="Protected secrets are write-only and cannot be read back. Secret values can be retrieved for development and CI."
-                >
-                    <RSegmented
-                        value={formData.type}
-                        options={[
-                            { value: 'plain', label: 'Plain' },
-                            { value: 'secret', label: 'Secret' },
-                            { value: 'protected', label: 'Protected' },
-                        ]}
-                        onChange={(type) => setFormData({ ...formData, type })}
-                    />
-                </RField>
-            </RModal>
-
-            <RConfirmDialog
-                isOpen={confirmDialogOpen}
-                onClose={() => {
-                    setConfirmDialogOpen(false);
-                    setEnvVarToDelete(null);
-                }}
-                onConfirm={handleDeleteConfirm}
-                title="Delete Environment Variable"
-                message={`Are you sure you want to delete the environment variable "${envVarToDelete?.key}"? This action cannot be undone.`}
-                confirmText="Delete Variable"
-                confirmTone="danger"
-                loading={deleting}
-            />
         </div>
     );
 }
@@ -1728,25 +918,17 @@ export function ExtensionsList({ projectName }) {
         return enabledExtensions.find(e => e.extension_type === extensionTypeName);
     };
 
-    if (loading) return <LoadingState label="Loading extensions…" />;
-    if (error) return <ErrorState message={`Error loading extensions: ${error}`} onRetry={loadExtensions} />;
+    if (loading) return <><SectionHead section="extensions" /><LoadingState label="Loading extensions…" /></>;
+    if (error) return <><SectionHead section="extensions" /><ErrorState message={`Error loading extensions: ${error}`} onRetry={loadExtensions} /></>;
 
     const sortedAvailable = [...availableExtensions].sort((a, b) => a.display_name.localeCompare(b.display_name));
     const sortedEnabled = [...enabledExtensions].sort((a, b) => a.extension.localeCompare(b.extension));
 
     return (
         <div>
-            <div className="r-section-head">
-                <div>
-                    <div className="r-section-title">Extensions</div>
-                    <div className="r-section-sub">Datastores and managed services connected to this project.</div>
-                </div>
-                {availableExtensions.length > 0 && (
-                    <RButton variant="primary" icon="plus" onClick={() => setIsAddModalOpen(true)}>
-                        Add extension
-                    </RButton>
-                )}
-            </div>
+            <SectionHead section="extensions" actions={availableExtensions.length > 0 && (
+                <RButton variant="primary" icon="plus" onClick={() => setIsAddModalOpen(true)}>Add extension</RButton>
+            )} />
 
             {enabledExtensions.length === 0 ? (
                 <RPanel>

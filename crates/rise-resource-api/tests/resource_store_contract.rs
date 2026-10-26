@@ -98,6 +98,13 @@ impl ResourceStore for FakeStore {
     ) -> Result<Vec<ResourceRow>, StoreError> {
         Ok(vec![])
     }
+    async fn list_label_setters(
+        &self,
+        _: &rise_resource_api::LabelKey,
+        _: i64,
+    ) -> Result<Vec<ResourceRow>, StoreError> {
+        Ok(vec![])
+    }
     async fn operator_update_status(
         &self,
         _: Uuid,

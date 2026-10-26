@@ -31,7 +31,7 @@ run "accepts_an_external_traefik_role_that_is_unknown_during_planning" {
   }
 
   override_data {
-    target = module.rise.data.aws_availability_zones.available
+    target = module.rise.module.network.data.aws_availability_zones.available
     values = { names = ["eu-central-1a", "eu-central-1b", "eu-central-1c"] }
   }
 }

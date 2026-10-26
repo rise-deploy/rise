@@ -159,8 +159,8 @@ pub struct ReconcilerConfig {
     /// with embedded basic-auth userinfo. The reconciler reads the top-level
     /// `serverStatus` map from Traefik (falling back to a
     /// `loadBalancer.serverStatus` nesting for version tolerance) to learn
-    /// whether a container's server is actually in Traefik's rotation (UP) before
-    /// retiring the prior active deployment. Required for health-checked
+    /// whether a container's server is actually in Traefik's rotation (UP), and
+    /// whether HTTP-provider routers select the deployment service. Required for routed
     /// containers — `serverStatus` is the authoritative readiness signal with no
     /// fallback, so when this is `None` (unset) a health-checked deployment never
     /// becomes Healthy. See the `Docker` settings variant's `traefik_api_url`.
@@ -638,9 +638,8 @@ impl DockerReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
         // Memoize Traefik `serverStatus` per service for THIS reconcile pass:
-        // during a rollout a group has 2+ non-terminal deployments sharing one
-        // group-scoped service, so without this each `reconcile_health` would
-        // re-fetch the SAME serverStatus (up to 3s each). Populated once per
+        // Replicas and repeated checks can query the same deployment-scoped
+        // service, so cache each serverStatus response for this pass. Populated once per
         // service and reused across the group's deployments this tick.
         let mut server_status_cache: HashMap<String, Option<HashMap<String, bool>>> =
             HashMap::new();
@@ -649,7 +648,7 @@ impl DockerReconciler {
                 continue;
             }
             if let Err(e) = self
-                .reconcile_health(project, deployment, &mut server_status_cache)
+                .reconcile_health(project, deployment, &desired, &mut server_status_cache)
                 .await
             {
                 warn!(
@@ -692,11 +691,10 @@ impl DockerReconciler {
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Environment context.
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
+        let environment = self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?;
         let env_name = environment.as_ref().map(|e| e.name.clone());
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
@@ -709,21 +707,12 @@ impl DockerReconciler {
             &all_environments,
             &custom_domains,
         );
-        let primary_hosts: Vec<String> = self
-            .url_builder
-            .primary_ingress_hosts(
-                project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|env| {
-                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &all_environments,
-            )
-            .into_iter()
-            .map(|h| h.host)
-            .collect();
+        let primary_hosts = self.url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            &all_environments,
+            &custom_domains,
+        );
 
         // Env vars: plain + decrypted secret (merged into plain — Docker has no
         // secret concept) + system env vars.
@@ -858,7 +847,7 @@ impl DockerReconciler {
                     access: r.access.clone(),
                 })
                 .collect();
-            // Every infra-bearing deployment normally joins the group-scoped
+            // Every infra-bearing deployment normally publishes its native-provider
             // Traefik service immediately. The exception is a container with an
             // unknown access class, or an auth-required effective route without
             // a forwardAuth backend: its routers fail closed, so desired
@@ -876,7 +865,7 @@ impl DockerReconciler {
 
             // Base container (replica 0). All replicas are clones of this with
             // only their `replica` index differing — same image/env/routes, so
-            // they share one Traefik service and one DNS alias, and the route-hash
+            // they share one deployment service and one DNS alias, and the route-hash
             // (which never depends on the replica) is computed once below.
             let mut base = DesiredContainer {
                 project: project.name.clone(),
@@ -961,7 +950,7 @@ impl DockerReconciler {
         &self,
         extra_label_filter: String,
     ) -> Result<Vec<ActualContainer>> {
-        use bollard::container::ListContainersOptions;
+        use bollard::query_parameters::ListContainersOptions;
         let ns = &self.config.label_namespace;
         let mut filters: HashMap<String, Vec<String>> = HashMap::new();
         filters.insert(
@@ -980,7 +969,7 @@ impl DockerReconciler {
             .docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters,
+                filters: Some(filters),
                 ..Default::default()
             }))
             .await?;
@@ -1031,7 +1020,7 @@ impl DockerReconciler {
                     // Daemon-reported lifecycle state ("running", "exited",
                     // "created", "dead", …). Used by the diff to restart
                     // containers that exist but aren't running.
-                    state: s.state,
+                    state: s.state.map(|state| state.to_string()),
                 })
             })
             .collect())
@@ -1163,6 +1152,11 @@ impl DockerReconciler {
                                         .update_project_calculated_status(project.id)
                                         .await
                                         .context("Failed to update project status after container creation failure")?;
+                                    rise_backend_core::lifecycle::restore_traefik_predecessor_if_interrupted(
+                                        self.store.as_ref(),
+                                        deployment_uuid,
+                                    )
+                                    .await?;
                                     failed_deployment_uuids.insert(d.deployment_uuid.clone());
                                 }
                             } else {
@@ -1268,7 +1262,7 @@ impl DockerReconciler {
         already_pulled: bool,
         identity: Option<&PreparedIdentity>,
     ) -> Result<()> {
-        use bollard::container::{CreateContainerOptions, StartContainerOptions};
+        use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
 
         let built = container_builder::build_container(desired, builder_cfg);
 
@@ -1281,8 +1275,8 @@ impl DockerReconciler {
         self.docker
             .create_container(
                 Some(CreateContainerOptions {
-                    name: built.name.clone(),
-                    platform: None,
+                    name: Some(built.name.clone()),
+                    ..Default::default()
                 }),
                 built.config,
             )
@@ -1306,7 +1300,7 @@ impl DockerReconciler {
         }
 
         self.docker
-            .start_container(&built.name, None::<StartContainerOptions<String>>)
+            .start_container(&built.name, None::<StartContainerOptions>)
             .await?;
 
         if let Some(identity) = identity {
@@ -1704,15 +1698,16 @@ impl DockerReconciler {
     /// Resolve a deployment's environment name (`None` for the no-environment
     /// case), shared by identity preparation and refresh.
     async fn resolve_environment_name(&self, deployment: &Deployment) -> Result<Option<String>> {
-        match deployment.environment_id {
-            Some(env_id) => Ok(self.store.find_environment(env_id).await?.map(|e| e.name)),
-            None => Ok(None),
-        }
+        Ok(self
+            .store
+            .find_environment(deployment.environment_id)
+            .await?
+            .map(|e| e.name))
     }
 
     async fn pull_image(&self, image: &str) -> Result<()> {
         use bollard::auth::DockerCredentials;
-        use bollard::image::CreateImageOptions;
+        use bollard::query_parameters::CreateImageOptions;
 
         let creds = match self.registry_provider.get_pull_credentials().await {
             Ok((username, password)) if !username.is_empty() || !password.is_empty() => {
@@ -1734,7 +1729,7 @@ impl DockerReconciler {
         };
 
         let options = Some(CreateImageOptions {
-            from_image: image.to_string(),
+            from_image: Some(image.to_string()),
             ..Default::default()
         });
         let mut stream = self.docker.create_image(options, None, creds);
@@ -1764,7 +1759,7 @@ impl DockerReconciler {
     /// failure still returns `Err`, so the Recreate guard keeps fencing a genuinely
     /// stuck remove.
     async fn remove_container(&self, id: &str) -> Result<()> {
-        use bollard::container::RemoveContainerOptions;
+        use bollard::query_parameters::RemoveContainerOptions;
         match self
             .docker
             .remove_container(
@@ -1800,34 +1795,21 @@ impl DockerReconciler {
         project: &Project,
         deployment: &Deployment,
     ) -> Result<Vec<String>> {
-        let environment = if let Some(env_id) = deployment.environment_id {
-            self.store.find_environment(env_id).await?
-        } else {
-            None
-        };
         let all_environments = self.store.list_environments_for_project(project.id).await?;
         let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-        Ok(self
-            .url_builder
-            .primary_ingress_hosts(
-                project,
-                &deployment.deployment_group,
-                environment.as_ref().filter(|env| {
-                    env.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-                }),
-                &custom_domains,
-                true,
-                &all_environments,
-            )
-            .into_iter()
-            .map(|h| h.host)
-            .collect())
+        Ok(self.url_builder.public_hosts_for_group(
+            project,
+            &deployment.deployment_group,
+            &all_environments,
+            &custom_domains,
+        ))
     }
 
     async fn reconcile_health(
         &self,
         project: &Project,
         deployment: &Deployment,
+        desired: &[DesiredContainer],
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
     ) -> Result<()> {
         // Only probe states where health is meaningful.
@@ -1900,6 +1882,7 @@ impl DockerReconciler {
             let service_names = service_names_for_spec(
                 &project.name,
                 &deployment.deployment_group,
+                &deployment.deployment_id,
                 spec,
                 &route_specs,
                 &primary_hosts,
@@ -2085,10 +2068,45 @@ impl DockerReconciler {
 
         match deployment.status {
             DeploymentStatus::Deploying if is_ready => {
-                info!(
-                    deployment_id = %deployment.deployment_id,
-                    "Deployment is ready, marking as Healthy"
+                if !rise_backend_core::lifecycle::prepare_traefik_cutover(
+                    self.store.as_ref(),
+                    project,
+                    deployment,
+                )
+                .await?
+                {
+                    info!(deployment_id = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
+                    return Ok(());
+                }
+                let selected: Vec<DesiredContainer> = desired
+                    .iter()
+                    .filter(|container| container.deployment_uuid == deployment.id.to_string())
+                    .cloned()
+                    .collect();
+                let expected = rise_backend_traefik::dynamic::render_dynamic_config(
+                    &selected,
+                    &rise_backend_traefik::TraefikRenderConfig {
+                        label_namespace: &self.config.label_namespace,
+                        controller_class: &self.config.controller_class,
+                        traefik_entrypoint: &self.config.traefik_entrypoint,
+                        catalog_entrypoint: "rise-catalog",
+                        traefik_certresolver: self.config.traefik_certresolver.as_deref(),
+                        network: Some(&self.config.traefik_network),
+                        auth_backend_url: &self.config.auth_backend_url,
+                        access_classes: &self.config.access_classes,
+                    },
+                    "docker",
                 );
+                if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
+                    warn!(deployment_id = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
+                    return Ok(());
+                }
+                if let Some(api) = self.traefik_api.as_ref() {
+                    if !api.dynamic_config_applied(&expected).await {
+                        debug!(deployment_id = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
+                        return Ok(());
+                    }
+                }
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
                     self.store.as_ref(),
                     None,

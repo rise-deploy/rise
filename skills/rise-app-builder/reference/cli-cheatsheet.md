@@ -6,7 +6,7 @@ Complete inventory of `rise` CLI commands. Verified against `src/main.rs` clap d
 
 | Command | Flags | Description |
 |---------|-------|-------------|
-| `rise login` | `--url <url>`, `--browser` (default), `--device` | Authenticate with the Rise backend. Default: OAuth2 authorization-code flow with PKCE via browser. `--device`: device authorization flow. |
+| `rise login` | `--url <url>`, `--browser` (default), `--device`, `--scope <project>[/<env>]=<preset\|perms>` (repeatable), `--full-access` | Authenticate with the Rise backend. Default: OAuth2 authorization-code flow with PKCE via browser. `--device`: confirm a code on the Rise web UI instead (SSH sessions, headless machines). `--scope`: restrict the session to a project or environment; presets `read`, `deploy`, `develop`, `admin` (project only). **AI agents always use `--device` with the narrowest `--scope`** and hand the printed URL and code to the user to approve (see SKILL.md, invariant 0). |
 
 ## Projects (`rise project` / `rise p`)
 
@@ -127,10 +127,10 @@ Build and run a container locally for development.
 
 | Command | Aliases | Key Flags |
 |---------|---------|-----------|
-| `rise environment create <name>` | `c`, `new` | `-p`, `--path`, `-g/--group`, `--production`, `--color` (default: green) |
+| `rise environment create <name>` | `c`, `new` | `-p`, `--path`, `-g/--group`, `--production`, `--color` (default: green), `--max-expiration <duration>` |
 | `rise environment list` | `ls`, `l` | `-p`, `--path` |
 | `rise environment show <name>` | `s` | `-p`, `--path` |
-| `rise environment update <name>` | `u`, `edit` | `-p`, `--path`, `--rename <new>`, `-g/--group`, `--production [bool]`, `--color` |
+| `rise environment update <name>` | `u`, `edit` | `-p`, `--path`, `--rename <new>`, `-g/--group`, `--production [bool]`, `--color`, `--max-expiration <duration>` (empty string clears) |
 | `rise environment delete <name>` | `del`, `rm` | `-p`, `--path` |
 
 Valid colors: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray`.
@@ -139,12 +139,12 @@ Valid colors: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray`.
 
 | Command | Aliases | Key Flags |
 |---------|---------|-----------|
-| `rise env set <key> <value>` | `s` | `-p`, `--path`, `--secret`, `--protected [bool]`, `-E/--environment` |
+| `rise env set <key> [value]` | `s` | `--plain`, `--secret`, or `--protected` (exactly one required), `-p`, `--path`, `-E/--environment` |
 | `rise env list` | `ls`, `l` | `-p`, `--path`, `-E/--environment` |
 | `rise env get <key>` | `g` | `-p`, `--path`, `-E/--environment` |
 | `rise env delete <key>` | `unset`, `rm`, `del` | `-p`, `--path`, `-E/--environment` |
 | `rise env import <file>` | `i` | `-p`, `--path`, `-E/--environment`. Format: `KEY=value` or `KEY=secret:value` |
-| `rise env export` | `x` | `-p`, `--path`, `-E/--environment`. Outputs `KEY=value` dotfile format |
+| `rise env export` | `x` | `-p`, `--path`, `-E/--environment`. Outputs shell-safe `export KEY=value` commands |
 
 Without `-E`, variables are global (apply to all environments). With `-E`, scoped to that environment (merged on top of globals).
 
