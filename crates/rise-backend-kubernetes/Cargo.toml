@@ -42,4 +42,5 @@ urlencoding = "2.1"
 uuid = { workspace = true }
 
 [dev-dependencies]
+rise-backend-core = { path = "../rise-backend-core", features = ["test-helpers"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
