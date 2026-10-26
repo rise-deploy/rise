@@ -31,6 +31,17 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Path-based app URLs are no longer supported.** *Breaking* for installs
+  whose ingress URL templates contain a path (e.g.
+  `production_ingress_url_template: "apps.example.com/{project_name}"`); only
+  the Kubernetes backend ever honored one. Every
+  `*_ingress_url_template` must now be a bare hostname pattern — no scheme,
+  port or path — and the backend refuses to start otherwise. Apps sharing a
+  host shared its cookies and origin, and on Docker and ECS their routers
+  collided outright. Switch to subdomain templates such as
+  `{project_name}.apps.example.com` with a wildcard DNS record and
+  certificate before upgrading; app URLs change accordingly.
+
 - **The Kubernetes and ECS backends are now licensed under BUSL-1.1.** *Action
   required* for Kubernetes and ECS operators. The Kubernetes and Amazon ECS
   backends and the Helm chart move from `MIT OR Apache-2.0` to the Business

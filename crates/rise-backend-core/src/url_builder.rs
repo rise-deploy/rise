@@ -18,15 +18,11 @@ use crate::group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 use crate::models::{CustomDomain, Deployment, Environment, Project};
 use crate::providers::{ImageTagType, RegistryProvider};
 
-/// Parsed ingress URL components.
-#[derive(Debug, Clone)]
-pub struct IngressUrl {
-    pub host: String,
-    pub path_prefix: Option<String>,
-}
-
 /// Holds the ingress-template + registry configuration needed to resolve a
 /// deployment's hostnames, URLs, and image. Pure spec computation — no client.
+///
+/// Every ingress template resolves to a bare hostname: settings validation
+/// rejects templates with a path, so each app owns its host outright.
 #[derive(Clone)]
 pub struct DeploymentUrlBuilder {
     pub production_ingress_url_template: String,
@@ -53,19 +49,6 @@ impl DeploymentUrlBuilder {
     }
 
     // ── URL resolution ─────────────────────────────────────────────────
-
-    pub fn parse_ingress_url(url: &str) -> IngressUrl {
-        match url.find('/') {
-            Some(slash_pos) => IngressUrl {
-                host: url[..slash_pos].to_string(),
-                path_prefix: Some(url[slash_pos..].to_string()),
-            },
-            None => IngressUrl {
-                host: url.to_string(),
-                path_prefix: None,
-            },
-        }
-    }
 
     pub fn resolved_ingress_url(&self, project: &Project, deployment: &Deployment) -> String {
         self.resolved_ingress_url_for_group(project, &deployment.deployment_group)
@@ -172,27 +155,17 @@ impl DeploymentUrlBuilder {
         }
     }
 
-    pub fn full_ingress_url_from_host(&self, url: &str) -> String {
-        if let Some(port) = self.ingress_port {
-            let parsed = Self::parse_ingress_url(url);
-            let host_with_port = format!("{}:{}", parsed.host, port);
-            match parsed.path_prefix {
-                Some(path) => format!("{}{}", host_with_port, path),
-                None => host_with_port,
-            }
-        } else {
-            url.to_string()
+    /// `host` with the configured ingress port appended, if any.
+    pub fn host_with_port(&self, host: &str) -> String {
+        match self.ingress_port {
+            Some(port) => format!("{}:{}", host, port),
+            None => host.to_string(),
         }
     }
 
     pub fn full_ingress_url(&self, project: &Project, deployment: &Deployment) -> String {
-        let url = self.resolved_ingress_url(project, deployment);
-        self.full_ingress_url_from_host(&url)
-    }
-
-    pub fn ingress_url_components(&self, project: &Project, deployment: &Deployment) -> IngressUrl {
-        let url = self.resolved_ingress_url(project, deployment);
-        Self::parse_ingress_url(&url)
+        let host = self.resolved_ingress_url(project, deployment);
+        self.host_with_port(&host)
     }
 
     /// Returns `true` if `host` would also be emitted as the env URL of some
@@ -211,10 +184,7 @@ impl DeploymentUrlBuilder {
             if env.primary_deployment_group.as_deref() == Some(deployment_group) {
                 return false;
             }
-            match self.resolved_environment_url(project, env) {
-                Some(env_url) => Self::parse_ingress_url(&env_url).host == host,
-                None => false,
-            }
+            self.resolved_environment_url(project, env).as_deref() == Some(host)
         })
     }
 
@@ -240,34 +210,32 @@ impl DeploymentUrlBuilder {
         custom_domains_for_env: &[CustomDomain],
         include_custom_domains_inline: bool,
         all_environments: &[Environment],
-    ) -> Vec<IngressUrl> {
-        let mut hosts: Vec<IngressUrl> = Vec::new();
+    ) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        if let Some(dg_url) = self.resolved_deployment_group_url(project, deployment_group) {
-            let parsed = Self::parse_ingress_url(&dg_url);
+        if let Some(dg_host) = self.resolved_deployment_group_url(project, deployment_group) {
             if self.host_conflicts_with_other_env(
                 project,
                 deployment_group,
-                &parsed.host,
+                &dg_host,
                 all_environments,
             ) {
                 warn!(
                     project = %project.name,
                     deployment_group = %deployment_group,
-                    host = %parsed.host,
+                    host = %dg_host,
                     "Suppressing deployment-group URL: collides with env URL of an environment whose primary deployment group is different"
                 );
-            } else if seen.insert(parsed.host.clone()) {
-                hosts.push(parsed);
+            } else if seen.insert(dg_host.clone()) {
+                hosts.push(dg_host);
             }
         }
 
         if let Some(env) = environment_for_group {
-            if let Some(env_url) = self.resolved_environment_url(project, env) {
-                let parsed = Self::parse_ingress_url(&env_url);
-                if seen.insert(parsed.host.clone()) {
-                    hosts.push(parsed);
+            if let Some(env_host) = self.resolved_environment_url(project, env) {
+                if seen.insert(env_host.clone()) {
+                    hosts.push(env_host);
                 }
             }
         }
@@ -275,10 +243,7 @@ impl DeploymentUrlBuilder {
         if include_custom_domains_inline {
             for cd in custom_domains_for_env {
                 if seen.insert(cd.domain.clone()) {
-                    hosts.push(IngressUrl {
-                        host: cd.domain.clone(),
-                        path_prefix: None,
-                    });
+                    hosts.push(cd.domain.clone());
                 }
             }
         }
@@ -337,9 +302,6 @@ impl DeploymentUrlBuilder {
             true,
             all_environments,
         )
-        .into_iter()
-        .map(|host| host.host)
-        .collect()
     }
 
     pub fn filter_valid_custom_domains(
@@ -379,12 +341,7 @@ impl DeploymentUrlBuilder {
     // ── Deployment URLs ────────────────────────────────────────────────
 
     fn host_to_url(&self, host: &str) -> String {
-        let host_with_port = if let Some(port) = self.ingress_port {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
-        };
-        format!("{}://{}", self.ingress_schema, host_with_port)
+        format!("{}://{}", self.ingress_schema, self.host_with_port(host))
     }
 
     pub fn compute_deployment_urls(
@@ -430,17 +387,14 @@ impl DeploymentUrlBuilder {
         custom_domains: &[CustomDomain],
     ) -> DeploymentUrls {
         let host = self.resolved_ingress_url_for_group(project, deployment_group);
-        let default_url_host = self.full_ingress_url_from_host(&host);
-        let default_url = format!("{}://{}", self.ingress_schema, default_url_host);
+        let default_url = self.host_to_url(&host);
 
         let environment_for_group = environment
             .filter(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
 
         let environment_url = environment_for_group.and_then(|env| {
-            self.resolved_environment_url(project, env).map(|url_host| {
-                let full_host = self.full_ingress_url_from_host(&url_host);
-                format!("{}://{}", self.ingress_schema, full_host)
-            })
+            self.resolved_environment_url(project, env)
+                .map(|env_host| self.host_to_url(&env_host))
         });
 
         let domains_for_env =
@@ -471,7 +425,7 @@ impl DeploymentUrlBuilder {
         let mut all_urls: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for host in &templated_hosts {
-            let url = self.host_to_url(&host.host);
+            let url = self.host_to_url(host);
             if seen.insert(url.clone()) {
                 all_urls.push(url);
             }

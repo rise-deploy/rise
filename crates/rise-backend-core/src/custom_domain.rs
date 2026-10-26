@@ -9,16 +9,8 @@
 /// This function converts the template into a regex pattern that can be used to check
 /// if a domain would conflict with the project's default domain pattern.
 ///
-/// Supports templates with:
-/// - Subdomain-based routing: `{project_name}.apps.example.com`
-/// - Path-based routing: `apps.example.com/{project_name}`
-/// - Mixed routing: `{project_name}.apps.example.com/{deployment_group}`
-///
-/// # Examples
-///
-/// - `"{project_name}.apps.example.com"` → regex matching `*.apps.example.com`
-/// - `"apps.example.com/{project_name}"` → exact match for `apps.example.com`
-/// - `"{project_name}.example.com/{deployment_group}"` → regex matching `*.example.com`
+/// Templates are bare hostnames (settings validation rejects a path), e.g.
+/// `"{project_name}.apps.example.com"` → regex matching `*.apps.example.com`.
 ///
 /// # Arguments
 ///
@@ -28,12 +20,7 @@
 ///
 /// An optional regex::Regex object that matches domains conflicting with the template
 pub fn template_to_regex(template: &str) -> Option<regex::Regex> {
-    // Extract the hostname part (before any slash for path-based routing)
-    let hostname = if let Some(slash_pos) = template.find('/') {
-        &template[..slash_pos]
-    } else {
-        template
-    };
+    let hostname = template;
 
     // Build regex pattern by replacing placeholders and escaping the rest
     let mut regex_pattern = String::from("^");
@@ -196,24 +183,6 @@ mod tests {
     }
 
     #[test]
-    fn test_template_to_regex_path_based() {
-        let regex = template_to_regex("example.com/{project_name}").unwrap();
-        assert!(regex.is_match("example.com"));
-        assert!(!regex.is_match("other.com"));
-        assert!(!regex.is_match("foo.example.com"));
-    }
-
-    #[test]
-    fn test_template_to_regex_mixed() {
-        // Template with both hostname placeholder and path
-        let regex = template_to_regex("{project_name}.example.com/{deployment_group}").unwrap();
-        assert!(regex.is_match("foo.example.com"));
-        assert!(regex.is_match("bar.example.com"));
-        assert!(!regex.is_match("example.com"));
-        assert!(!regex.is_match("foo.bar.example.com"));
-    }
-
-    #[test]
     fn test_template_to_regex_staging() {
         let regex =
             template_to_regex("{project_name}-{deployment_group}.preview.example.com").unwrap();
@@ -272,28 +241,6 @@ mod tests {
             None,
             None,
         );
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_custom_domain_path_based_conflict() {
-        let result = validate_custom_domain(
-            "example.com",
-            "example.com/{project_name}",
-            None,
-            None,
-            None,
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("conflicts with the project default domain pattern"));
-    }
-
-    #[test]
-    fn test_validate_custom_domain_path_based_ok() {
-        let result =
-            validate_custom_domain("other.com", "example.com/{project_name}", None, None, None);
         assert!(result.is_ok());
     }
 
@@ -365,21 +312,5 @@ mod tests {
             Some("https://rise.example.com"),
         );
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_validate_custom_domain_mixed_template() {
-        // Template with both hostname placeholders and path
-        let result = validate_custom_domain(
-            "foo.example.com",
-            "{project_name}.example.com/{deployment_group}",
-            None,
-            None,
-            None,
-        );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("conflicts with the project default domain pattern"));
     }
 }
