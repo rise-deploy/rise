@@ -146,6 +146,27 @@ pub fn all_healthy(actual: &[ActualContainer]) -> HashMap<String, bool> {
         .collect()
 }
 
+/// A reversible stand-in for a real encryption provider.
+///
+/// Backend tests that exercise secret env-var resolution care that ciphertext
+/// round-trips, not which cipher produced it. This keeps those tests free of a
+/// crypto dependency and of any one provider's key handling.
+pub struct ReversibleEncryptionProvider;
+
+#[async_trait::async_trait]
+impl crate::EncryptionProvider for ReversibleEncryptionProvider {
+    async fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
+        Ok(format!("enc:{plaintext}"))
+    }
+
+    async fn decrypt(&self, ciphertext: &str) -> anyhow::Result<String> {
+        ciphertext
+            .strip_prefix("enc:")
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("not produced by this provider: {ciphertext}"))
+    }
+}
+
 // ── Model fixtures ─────────────────────────────────────────────────────
 
 /// A project named `name` with the given access class.

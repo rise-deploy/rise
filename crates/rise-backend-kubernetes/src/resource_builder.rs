@@ -24,9 +24,9 @@ use k8s_openapi::ByteString;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::db::models::{CustomDomain, Deployment, Project};
-use crate::server::registry::models::{RegistryAuthMethod, RegistryCredentials};
-use crate::server::settings::AccessRequirement;
+use rise_backend_core::models::{CustomDomain, Deployment, Environment, Project};
+use rise_backend_core::providers::{RegistryAuthMethod, RegistryCredentials};
+use rise_backend_core::AccessRequirement;
 use rise_backend_core::DeploymentUrlBuilder;
 // The parsed-ingress-URL type and the URL/image computation live in
 // `rise-backend-core`; re-exported so existing `resource_builder::IngressUrl`
@@ -183,7 +183,7 @@ pub struct ContainerRuntime<'a> {
     /// server's `HealthProbeConfig` defaults; `None` falls back to the
     /// defaults. The reconciler resolves the "probe only routed containers"
     /// policy into this field before constructing the runtime.
-    pub health_check: Option<crate::server::deployment::models::HealthCheckSpec>,
+    pub health_check: Option<rise_deployment_spec::request_spec::HealthCheckSpec>,
 }
 
 /// Holds configuration for building Kubernetes resource specs.
@@ -194,22 +194,22 @@ pub struct ResourceBuilder {
     pub url_builder: DeploymentUrlBuilder,
     pub auth_backend_url: String,
     pub auth_signin_url: String,
-    pub backend_address: Option<crate::server::settings::BackendAddress>,
+    pub backend_address: Option<crate::config::BackendAddress>,
     pub namespace_labels: std::collections::HashMap<String, String>,
     pub namespace_annotations: std::collections::HashMap<String, String>,
     pub ingress_annotations: std::collections::HashMap<String, String>,
     pub ingress_tls_secret_name: Option<String>,
-    pub custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode,
+    pub custom_domain_tls_mode: crate::config::CustomDomainTlsMode,
     pub custom_domain_ingress_annotations: std::collections::HashMap<String, String>,
     pub node_selector: std::collections::HashMap<String, String>,
     pub image_pull_secret_name: Option<String>,
-    pub access_classes: std::collections::HashMap<String, crate::server::settings::AccessClass>,
+    pub access_classes: std::collections::HashMap<String, rise_backend_core::AccessClass>,
     pub host_aliases: std::collections::HashMap<String, String>,
     pub extra_service_token_audiences: std::collections::HashMap<String, String>,
     pub use_default_service_account_for_production: bool,
-    pub network_policy: crate::server::settings::NetworkPolicyConfig,
+    pub network_policy: crate::config::NetworkPolicyConfig,
     pub pod_security_enabled: bool,
-    pub health_probes: Option<crate::server::settings::HealthProbeConfig>,
+    pub health_probes: Option<crate::config::HealthProbeConfig>,
 }
 
 impl ResourceBuilder {
@@ -274,10 +274,10 @@ impl ResourceBuilder {
         &self,
         project: &Project,
         deployment_group: &str,
-        environment_for_group: Option<&crate::db::models::Environment>,
+        environment_for_group: Option<&rise_backend_core::models::Environment>,
         custom_domains_for_env: &[CustomDomain],
         include_custom_domains_inline: bool,
-        all_environments: &[crate::db::models::Environment],
+        all_environments: &[rise_backend_core::models::Environment],
     ) -> Vec<IngressUrl> {
         self.url_builder.primary_ingress_hosts(
             project,
@@ -300,10 +300,10 @@ impl ResourceBuilder {
         &self,
         project: &Project,
         deployment: &Deployment,
-        environment: Option<&crate::db::models::Environment>,
-        all_environments: &[crate::db::models::Environment],
+        environment: Option<&rise_backend_core::models::Environment>,
+        all_environments: &[rise_backend_core::models::Environment],
         custom_domains: &[CustomDomain],
-    ) -> super::controller::DeploymentUrls {
+    ) -> rise_backend_core::DeploymentUrls {
         self.url_builder.compute_deployment_urls(
             project,
             deployment,
@@ -317,9 +317,9 @@ impl ResourceBuilder {
         &self,
         project: &Project,
         deployment_group: &str,
-        environments: &[crate::db::models::Environment],
+        environments: &[Environment],
         custom_domains: &[CustomDomain],
-    ) -> super::controller::DeploymentUrls {
+    ) -> rise_backend_core::DeploymentUrls {
         self.url_builder.compute_project_urls(
             project,
             deployment_group,
@@ -437,7 +437,7 @@ impl ResourceBuilder {
     /// single-container app doesn't get a pointless self-entry.
     pub fn auto_container_host_env_vars(
         deployment: &Deployment,
-        container_specs: &[crate::server::deployment::models::ContainerSpec],
+        container_specs: &[rise_deployment_spec::request_spec::ContainerSpec],
     ) -> Vec<EnvVar> {
         let group = Self::escaped_group_name(&deployment.deployment_group);
         container_specs
@@ -870,8 +870,8 @@ impl ResourceBuilder {
         cpu: &str,
         memory: &str,
     ) -> Option<ResourceRequirements> {
-        use crate::server::deployment::quantity;
         use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        use rise_backend_core::quantity;
 
         // Each value is either fixed (request == limit) or a `request-limit`
         // range. Values were validated at deploy time; if parsing somehow fails
@@ -922,14 +922,14 @@ impl ResourceBuilder {
         &self,
         port: i32,
         probe_type: ProbeType,
-        override_spec: Option<&crate::server::deployment::models::HealthCheckSpec>,
+        override_spec: Option<&rise_deployment_spec::request_spec::HealthCheckSpec>,
     ) -> Option<Probe> {
         if matches!(override_spec, Some(o) if o.disabled) {
             return None;
         }
 
         let defaults = self.health_probes.as_ref().cloned().unwrap_or_else(|| {
-            crate::server::settings::HealthProbeConfig {
+            crate::config::HealthProbeConfig {
                 liveness_enabled: true,
                 readiness_enabled: true,
                 path: "/".to_string(),
@@ -1521,10 +1521,10 @@ impl ResourceBuilder {
         project: &Project,
         deployment: &Deployment,
         namespace: &str,
-        environment_for_group: Option<&crate::db::models::Environment>,
+        environment_for_group: Option<&rise_backend_core::models::Environment>,
         inline_custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
-        all_environments: &[crate::db::models::Environment],
+        all_environments: &[rise_backend_core::models::Environment],
         // Resolved route table with per-route effective access requirement. A
         // single-container deployment passes one route (`/` → `<group>-app`); a
         // multi-container one passes its full table. An empty slice means a
@@ -1798,7 +1798,7 @@ impl ResourceBuilder {
         let mut tls_configs = Vec::new();
 
         match self.custom_domain_tls_mode {
-            crate::server::settings::CustomDomainTlsMode::Shared => {
+            crate::config::CustomDomainTlsMode::Shared => {
                 let shared_secret = self.ingress_tls_secret_name.as_ref()?;
                 let all_hosts: Vec<String> =
                     custom_domains.iter().map(|d| d.domain.clone()).collect();
@@ -1807,7 +1807,7 @@ impl ResourceBuilder {
                     secret_name: Some(shared_secret.clone()),
                 });
             }
-            crate::server::settings::CustomDomainTlsMode::PerDomain => {
+            crate::config::CustomDomainTlsMode::PerDomain => {
                 for domain in custom_domains {
                     tls_configs.push(k8s_openapi::api::networking::v1::IngressTLS {
                         hosts: Some(vec![domain.domain.clone()]),
@@ -1841,10 +1841,10 @@ impl ResourceBuilder {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use crate::server::registry::models::RegistryCredentials;
-    use crate::server::registry::{ImageTagType, RegistryProvider};
     use anyhow::Result;
     use async_trait::async_trait;
+    use rise_backend_core::providers::RegistryCredentials;
+    use rise_backend_core::providers::{ImageTagType, RegistryProvider};
     use std::sync::Arc;
 
     struct TestRegistryProvider {
@@ -1907,7 +1907,7 @@ mod tests {
             namespace_annotations: std::collections::HashMap::new(),
             ingress_annotations: std::collections::HashMap::new(),
             ingress_tls_secret_name: None,
-            custom_domain_tls_mode: crate::server::settings::CustomDomainTlsMode::PerDomain,
+            custom_domain_tls_mode: crate::config::CustomDomainTlsMode::PerDomain,
             custom_domain_ingress_annotations: std::collections::HashMap::new(),
             node_selector: std::collections::HashMap::new(),
             image_pull_secret_name: None,
@@ -1915,7 +1915,7 @@ mod tests {
             host_aliases: std::collections::HashMap::new(),
             extra_service_token_audiences: std::collections::HashMap::new(),
             use_default_service_account_for_production: true,
-            network_policy: crate::server::settings::NetworkPolicyConfig {
+            network_policy: crate::config::NetworkPolicyConfig {
                 ingress: vec![],
                 egress: None,
             },
@@ -1940,7 +1940,7 @@ mod tests {
         Project {
             id: uuid::Uuid::nil(),
             name: "demo".to_string(),
-            status: crate::db::models::ProjectStatus::Running,
+            status: rise_backend_core::models::ProjectStatus::Running,
             access_class: "default".to_string(),
             owner_user_id: None,
             owner_team_id: None,
@@ -1959,7 +1959,7 @@ mod tests {
             deployment_id: "20260502-000000".to_string(),
             project_id: uuid::Uuid::nil(),
             created_by_id: uuid::Uuid::nil(),
-            status: crate::db::models::DeploymentStatus::Healthy,
+            status: rise_backend_core::models::DeploymentStatus::Healthy,
             deployment_group: "default".to_string(),
             environment_id: uuid::Uuid::nil(),
             expires_at: None,
@@ -2484,8 +2484,8 @@ mod tests {
         name: &str,
         is_production: bool,
         primary_group: &str,
-    ) -> crate::db::models::Environment {
-        crate::db::models::Environment {
+    ) -> rise_backend_core::models::Environment {
+        rise_backend_core::models::Environment {
             id: uuid::Uuid::nil(),
             project_id: uuid::Uuid::nil(),
             name: name.to_string(),
@@ -2520,7 +2520,7 @@ mod tests {
     fn project_urls_exist_without_a_deployment() {
         let builder = test_resource_builder();
         let mut project = test_project();
-        project.status = crate::db::models::ProjectStatus::Stopped;
+        project.status = rise_backend_core::models::ProjectStatus::Stopped;
         let urls = builder.compute_project_urls(&project, "default", &[], &[]);
         assert_eq!(urls.default_url, "https://demo.example.test");
         assert_eq!(urls.primary_url, urls.default_url);
@@ -2745,11 +2745,11 @@ mod tests {
         builder.ingress_tls_secret_name = Some("shared-wildcard".to_string());
         builder.access_classes.insert(
             "default".to_string(),
-            crate::server::settings::AccessClass {
+            rise_backend_core::AccessClass {
                 display_name: "Public".to_string(),
                 description: "Public access".to_string(),
                 ingress_class: "nginx".to_string(),
-                access_requirement: crate::server::settings::AccessRequirement::None,
+                access_requirement: rise_backend_core::AccessRequirement::None,
                 custom_annotations: std::collections::HashMap::new(),
             },
         );
@@ -2804,11 +2804,11 @@ mod tests {
             Some("{environment}--{project_name}.preview.example.test".to_string());
         builder.access_classes.insert(
             "default".to_string(),
-            crate::server::settings::AccessClass {
+            rise_backend_core::AccessClass {
                 display_name: "Public".to_string(),
                 description: "Public access".to_string(),
                 ingress_class: "nginx".to_string(),
-                access_requirement: crate::server::settings::AccessRequirement::None,
+                access_requirement: rise_backend_core::AccessRequirement::None,
                 custom_annotations: std::collections::HashMap::new(),
             },
         );
@@ -2841,7 +2841,7 @@ mod tests {
         let mut builder = test_resource_builder();
         builder.access_classes.insert(
             "default".to_string(),
-            crate::server::settings::AccessClass {
+            rise_backend_core::AccessClass {
                 display_name: "Public".to_string(),
                 description: "Public".to_string(),
                 ingress_class: "nginx".to_string(),
@@ -2926,7 +2926,7 @@ mod tests {
 
     #[test]
     fn auto_container_host_env_vars_emits_one_entry_per_routable_container() {
-        use crate::server::deployment::models::ContainerSpec;
+        use rise_deployment_spec::request_spec::ContainerSpec;
         let deployment = test_deployment(); // deployment_group = "default"
         let specs = vec![
             ContainerSpec {
@@ -3001,7 +3001,7 @@ mod tests {
 
     #[test]
     fn auto_container_host_env_vars_uses_escaped_group_name() {
-        use crate::server::deployment::models::ContainerSpec;
+        use rise_deployment_spec::request_spec::ContainerSpec;
         let mut deployment = test_deployment();
         deployment.deployment_group = "staging".to_string();
         let specs = vec![ContainerSpec {

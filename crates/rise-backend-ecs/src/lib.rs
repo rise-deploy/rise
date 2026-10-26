@@ -29,6 +29,7 @@
 
 pub mod capacity;
 pub mod client;
+pub mod logs;
 pub mod reconciler;
 pub mod service;
 pub mod sizing;

@@ -76,16 +76,13 @@ Focused support crates live under `crates/`:
 | `rise-backend-auth` | Pure-core token signing, verification, and claim matching — the single home for auth-token logic (see `ROADMAP.md` § 2, "Rise-issued authentication and token issuance") | `backend` |
 | `rise-backend-core` | The deployment-backend contract seam: shared deployment models, the `DeploymentBackend` trait, registry/encryption provider traits, the pure `quantity`/`state_machine`/`runtime`/`url_builder`/`token_ttl`/`custom_domain` helpers, the `DeploymentStore` trait — the database boundary implemented by `rise-deploy`'s `PgDeploymentStore` — and the runtime-agnostic reconcile machinery every backend shares (`desired`/`env`/`naming`/`labels`/`diff`/`rolling`). Deliberately free of any one proxy's machinery: routing lives in `rise-backend-traefik` | `backend` |
 | `rise-backend-docker` | The Docker deployment backend: `DockerBackend` + the in-process `DockerReconciler`, the first controller extracted onto the `rise-backend-core` seam. Re-exported under `crate::server::deployment::controller::docker`, so existing module paths keep resolving | `backend` |
+| `rise-backend-kubernetes` | The Kubernetes deployment backend: `KubernetesBackend`, the `ResourceBuilder` that renders Deployment/Service/Ingress/NetworkPolicy specs, the Metacontroller sync/finalize webhook, the `RiseProject` CRD, and the pod/identity-refresh machinery. Re-exported under `crate::server::deployment::*`, so existing module paths keep resolving | `backend` |
 | `rise-backend-ecs` | The Amazon ECS deployment backend (Fargate): `EcsBackend` + the in-process `EcsReconciler`, plus the pure Fargate-sizing, tag, task-definition and service-diff modules | `backend` |
 | `rise-backend-traefik` | Traefik routing machinery — the dynamic-config label vocabulary, the `DesiredContainer` → labels renderer with its fail-closed `routes_withheld` predicate, router/service naming, the `serverStatus` API client, and the readiness verdicts built on it. Owned by the Traefik-fronted backends (Docker, ECS) rather than by `rise-backend-core`: Kubernetes routes with nginx annotations and depends on none of it | `backend` |
 | `rise-authz` | Authorization policy evaluation, in two tiers. `policy` is a hard Tier-0 boundary: pure functions and canonical values only — no store, database, HTTP, or product-resource dependencies. `engine` is Tier 1: the live ADR-0001 §4 algorithm over `ResourceStore` reads and one `MembershipResolver` seam — still free of HTTP, SQL, and product kinds. `engine::audit` is the bounded, non-blocking diagnostics pass over the same facts (dangling `roleRef`s, stale subjects, no-op constraints, shadowed Allows, ...), reached over HTTP via the generic resource API's `policy-audit` listing and `explain` subresource | `backend` |
 | `rise-resource-api` | Generic resource API contract (resource kinds, scopes, owner references, identity, policy types) | `backend` |
 | `rise-resource-store-postgres` | PostgreSQL adapter for the resource API. Owns its own migrations in a `resource_store` schema; its queries are runtime-checked (`sqlx::query`), so it has no SQLX offline cache | `backend` |
 | `rise-runtime-sync` | Postgres-backed cross-replica primitives: `GlobalLock`, `LeaderElection`, `GlobalSchedule`. Owns its own migrations in a `runtime_sync` schema and its own SQLX offline cache | `backend` |
-
-The Kubernetes controller is still in-tree (`src/server/deployment/controller/kubernetes.rs`)
-pending the same extraction onto the `rise-backend-core` seam that `rise-backend-docker`
-received.
 
 The **e2e harness** (`tests/e2e`) is a standalone workspace, `exclude`d from the root
 one so production image builds never compile it. It is linted and tested separately —
@@ -110,7 +107,7 @@ The codebase is organized into functional modules:
    - **Quickstart** (`quickstart/`): Catalog of ready-to-deploy templates (see `config/default.yaml`)
    - **Extensions** (`extensions/`): Extension registry and providers
    - **Container Registry** (`registry/`): Temporary registry credentials — ECR, GitLab, JFrog, and generic OCI basic-auth providers
-   - **Deployment Module** (`deployment/`): Deployment models, CRD, webhook, logs, resource builder, and the Kubernetes controller (the Docker controller lives in `rise-backend-docker`)
+   - **Deployment Module** (`deployment/`): Deployment models, HTTP handlers, the Docker and Loki runtime-log backends, and the factory that picks the configured log backend (each deployment backend, with its own log backend, lives in its own `rise-backend-*` crate)
    - **ECR Integration** (`ecr/`): AWS ECR repository management
    - **Encryption** (`encryption/`): Local AES-GCM and AWS KMS providers
    - **OCI Client** (`oci/`): OCI registry interaction
@@ -381,7 +378,7 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings  # Lint (us
 | Server settings structs (`src/server/settings.rs`) | `mise run config:schema:generate` | Regenerate `docs/engineering/public/schemas/backend-settings.schema.json` (commit the result) |
 | `rise.toml` structs (`crates/rise-deployment-spec/src/project_config.rs`) | `mise run rise-toml:schema:generate` | Regenerate `docs/user/public/schemas/rise-toml-v1.schema.json` (commit the result) |
 | Resource API types (`crates/rise-resource-api/`) | `mise run resource:schema:generate` | Regenerate the resource/organization/controller-status schemas under `docs/engineering/public/schemas/` (commit the result) |
-| CRD structs (`src/server/deployment/crd.rs`) | `mise run crd:generate` | Regenerate `helm/rise/crds/riseproject-crd.yaml` (commit the result) |
+| CRD structs (`crates/rise-backend-kubernetes/src/crd.rs`) | `mise run crd:generate` | Regenerate `helm/rise/crds/riseproject-crd.yaml` (commit the result) |
 | Helm chart (`helm/rise/`) | `helm lint helm/rise` | Validate chart templates |
 
 **Full CI-equivalent check** (slower, runs everything):
@@ -440,4 +437,4 @@ merely unimplemented is a **parity bug** to track and close.
 
 ## Ingress Authentication
 
-Ingress-level authentication is driven by each project's **access class** (`access_requirement`: `None` / `Authenticated` / `Member`). The Kubernetes controller is fully wired: for non-`None` access requirements it stamps nginx auth annotations (`nginx.ingress.kubernetes.io/auth-url` → `/api/v1/auth/ingress`, `auth-signin`, `auth-response-headers`) — see `ResourceBuilder::build_ingress_annotations` in `src/server/deployment/resource_builder.rs`. The subrequest is served by the `ingress_auth` handler in `src/server/auth/handlers.rs`, which validates the Rise JWT session cookie, then enforces `Authenticated` (any logged-in user) or `Member` (project owner/team member) and returns `X-Auth-Request-Email`/`X-Auth-Request-User` on success. The Docker backend enforces the same access classes via Traefik forwardAuth against the same handler.
+Ingress-level authentication is driven by each project's **access class** (`access_requirement`: `None` / `Authenticated` / `Member`). The Kubernetes controller is fully wired: for non-`None` access requirements it stamps nginx auth annotations (`nginx.ingress.kubernetes.io/auth-url` → `/api/v1/auth/ingress`, `auth-signin`, `auth-response-headers`) — see `ResourceBuilder::build_ingress_annotations` in `crates/rise-backend-kubernetes/src/resource_builder.rs`. The subrequest is served by the `ingress_auth` handler in `src/server/auth/handlers.rs`, which validates the Rise JWT session cookie, then enforces `Authenticated` (any logged-in user) or `Member` (project owner/team member) and returns `X-Auth-Request-Email`/`X-Auth-Request-User` on success. The Docker backend enforces the same access classes via Traefik forwardAuth against the same handler.

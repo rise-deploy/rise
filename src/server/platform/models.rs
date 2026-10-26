@@ -1,23 +1,6 @@
 use serde::Serialize;
 
-/// Normalize architecture names from runtime APIs to OCI platform names.
-///
-/// Docker normally reports Go's `GOARCH` values (already `amd64`, `arm64`,
-/// etc.), but compatible/remote daemons may expose kernel-style aliases.  Keep
-/// the capability stable so the CLI can safely prepend `linux/`.
-pub(crate) fn normalize_runtime_arch(raw: &str) -> Option<String> {
-    let arch = raw.trim().to_ascii_lowercase();
-    let normalized = match arch.as_str() {
-        "" => return None,
-        "x86_64" | "x86-64" => "amd64",
-        "aarch64" => "arm64",
-        "i386" | "i486" | "i586" | "i686" | "x86" => "386",
-        "armv7" | "armv7l" => "arm/v7",
-        "armv6" | "armv6l" => "arm/v6",
-        other => other,
-    };
-    Some(normalized.to_string())
-}
+pub use rise_backend_core::normalize_runtime_arch;
 
 /// Read-only description of the deployment platform's capabilities, surfaced to
 /// clients via `GET /api/v1/platform/capabilities`.
@@ -62,17 +45,6 @@ impl PlatformCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalizes_runtime_architectures_to_oci_names() {
-        assert_eq!(normalize_runtime_arch("amd64").as_deref(), Some("amd64"));
-        assert_eq!(normalize_runtime_arch("x86_64").as_deref(), Some("amd64"));
-        assert_eq!(normalize_runtime_arch("aarch64").as_deref(), Some("arm64"));
-        assert_eq!(normalize_runtime_arch("ARM64").as_deref(), Some("arm64"));
-        assert_eq!(normalize_runtime_arch("armv7l").as_deref(), Some("arm/v7"));
-        assert_eq!(normalize_runtime_arch("s390x").as_deref(), Some("s390x"));
-        assert_eq!(normalize_runtime_arch("  "), None);
-    }
 
     #[test]
     fn enforced_pod_security_disallows_root() {

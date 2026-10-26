@@ -1724,15 +1724,11 @@ pub async fn create_deployment(
         );
 
         // Trigger Metacontroller resync so the webhook picks up the new Pushed deployment
-        if let Some(ref kube_client) = state.kube_client {
-            if let Err(e) =
-                crate::server::deployment::crd::trigger_resync(kube_client, &project.name).await
-            {
-                tracing::warn!(
-                    project = %project.name,
-                    "Failed to trigger CRD resync after rollback deployment: {:?}", e
-                );
-            }
+        if let Err(e) = state.deployment_backend.project_changed(&project).await {
+            tracing::warn!(
+                project = %project.name,
+                "Failed to notify deployment backend after rollback deployment: {:?}", e
+            );
         }
 
         // Return response with image tag and empty credentials (no push needed)
@@ -1981,15 +1977,11 @@ pub async fn create_deployment(
         insert_rise_env_vars(&state, &deployment, &project).await?;
 
         // Trigger Metacontroller resync so the webhook picks up the new Pushed deployment
-        if let Some(ref kube_client) = state.kube_client {
-            if let Err(e) =
-                crate::server::deployment::crd::trigger_resync(kube_client, &project.name).await
-            {
-                tracing::warn!(
-                    project = %project.name,
-                    "Failed to trigger CRD resync after pre-built image deployment: {:?}", e
-                );
-            }
+        if let Err(e) = state.deployment_backend.project_changed(&project).await {
+            tracing::warn!(
+                project = %project.name,
+                "Failed to notify deployment backend after pre-built image deployment: {:?}", e
+            );
         }
 
         // Return response with digest as image_tag and empty credentials
@@ -2208,16 +2200,13 @@ async fn perform_status_update(
         deployment_id, status_copy
     );
 
-    // Trigger Metacontroller resync so the webhook picks up the status change
-    if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) =
-            crate::server::deployment::crd::trigger_resync(kube_client, &project.name).await
-        {
-            tracing::warn!(
-                project = %project.name,
-                "Failed to trigger CRD resync: {:?}", e
-            );
-        }
+    // Ask the backend to converge on the status change now rather than at its
+    // next reconcile.
+    if let Err(e) = state.deployment_backend.project_changed(project).await {
+        tracing::warn!(
+            project = %project.name,
+            "Failed to notify deployment backend of status change: {:?}", e
+        );
     }
 
     // Only calculate URLs for non-terminal deployments that could receive traffic
@@ -2722,17 +2711,12 @@ pub async fn stop_deployments_by_group(
         .await
         .internal_err("Failed to update project status")?;
 
-    // Trigger Metacontroller resync
     if !stopped_ids.is_empty() {
-        if let Some(ref kube_client) = state.kube_client {
-            if let Err(e) =
-                crate::server::deployment::crd::trigger_resync(kube_client, &project.name).await
-            {
-                tracing::warn!(
-                    project = %project.name,
-                    "Failed to trigger CRD resync: {:?}", e
-                );
-            }
+        if let Err(e) = state.deployment_backend.project_changed(&project).await {
+            tracing::warn!(
+                project = %project.name,
+                "Failed to notify deployment backend after stopping deployments: {:?}", e
+            );
         }
     }
 
@@ -2837,16 +2821,11 @@ pub async fn stop_deployment(
         .await
         .internal_err("Failed to update project status")?;
 
-    // Trigger Metacontroller resync
-    if let Some(ref kube_client) = state.kube_client {
-        if let Err(e) =
-            crate::server::deployment::crd::trigger_resync(kube_client, &project.name).await
-        {
-            tracing::warn!(
-                project = %project.name,
-                "Failed to trigger CRD resync: {:?}", e
-            );
-        }
+    if let Err(e) = state.deployment_backend.project_changed(&project).await {
+        tracing::warn!(
+            project = %project.name,
+            "Failed to notify deployment backend after stopping deployment: {:?}", e
+        );
     }
 
     // Calculate deployment URLs dynamically
@@ -3445,18 +3424,18 @@ pub async fn stream_deployment_logs(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     // Resolve the project's Org-scoped namespace prefix; the backend doesn't
-    // have access to `AppState`'s cache, so the caller threads the prefix in
-    // via LogQuery (same pattern as the Metacontroller webhook). Only the
-    // Kubernetes log backend uses it; Loki ignores it.
-    let org_uid =
-        crate::server::deployment::webhook::resolve_project_organization_uid(&state, &project)
-            .await
-            .internal_err("Failed to resolve project organization linkage")?;
-    let namespace_prefix = crate::server::deployment::webhook::resolve_project_namespace_prefix(
-        &state, &project, org_uid,
-    )
-    .await
-    .internal_err("Failed to resolve project namespace prefix")?;
+    // have access to `AppState`, so the caller threads the prefix in via
+    // LogQuery. Only the Kubernetes log backend uses it; Loki ignores it.
+    let org_uid = state
+        .org_view
+        .organization_uid_for_project(project.id)
+        .await
+        .internal_err("Failed to resolve project organization linkage")?;
+    let namespace_prefix = state
+        .org_view
+        .namespace_prefix(org_uid)
+        .await
+        .internal_err("Failed to resolve project namespace prefix")?;
     let log_stream = state
         .runtime_log_backend
         .stream_logs(
