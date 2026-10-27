@@ -76,9 +76,17 @@ changes:
   - id: v0-22-0-011
     title: Registry credentials endpoint moved
     group: breaking-changes
+    type: deprecation
+    feature: deployment-response-registry-credentials
+    stage: deprecated
+    featureTitle: Registry credentials in deployment-creation responses
     impact: breaking
+    availability: |-
+      The `credentials` field in `CreateDeploymentResponse` still contains registry push credentials for build-from-source and push-image deployments. Deployments that do not need a push return empty credentials. No removal version or date is announced.
     details: |-
       — credentials are now fetched from `GET /projects/{name}/deployments/{id}/registry-credentials` (scoped to Pending/Building/Pushing states) instead of the old project-scoped endpoint. Older CLI versions fall back to credentials in `CreateDeploymentResponse`, which is now deprecated.
+    migration: |-
+      Use the deployment ID from the creation response to fetch credentials with `GET /api/v1/projects/{project_name}/deployments/{deployment_id}/registry-credentials`. Fetch them when needed for a registry operation rather than retaining the creation response's credentials throughout a long build. This endpoint is available only while the deployment is Pending, Building, or Pushing. The current Rise CLI uses this endpoint; upgrade older CLI installations and update custom API clients. See [#265](https://github.com/rise-deploy/rise/pull/265).
   - id: v0-22-0-012
     title: Dependency updates
     group: dependency-updates
