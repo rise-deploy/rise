@@ -1,0 +1,35 @@
+name: Upgrade Notes
+
+# A pull request labelled `operator-impact` must carry its operator Upgrade
+# Notes entry. Runs on label changes too, which the CI workflow does not.
+on:
+  pull_request:
+    branches:
+      - develop
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade-notes:
+    name: Upgrade Notes entry
+    if: contains(github.event.pull_request.labels.*.name, 'operator-impact')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the Upgrade Notes page is touched
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          NOTES: docs/engineering/src/content/docs/upgrade-notes.md
+        run: |
+          if git diff --quiet "$BASE...$HEAD" -- "$NOTES"; then
+            echo "::error file=$NOTES::This PR is labelled operator-impact but adds no entry to $NOTES. Add one under 'Unreleased', or remove the label."
+            exit 1
+          fi

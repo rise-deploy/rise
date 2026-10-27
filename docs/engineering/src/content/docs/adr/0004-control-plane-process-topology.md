@@ -535,9 +535,9 @@ leg the burden inverts, and §4 states its rule and its CI job.
 - The apiserver becomes browser-facing after `ROADMAP.md` §4, inheriting CORS,
   cookie and CSRF handling the typed API owns today.
 - Operators run, scale and upgrade more processes with no single-process escape
-  hatch. This is an operator-impact change: it needs Upgrade Notes and a Rollout
-  Tracker item when it lands. Local development and the e2e harness run two
-  processes from G5 onward.
+  hatch. This is an operator-impact change: it needs an Upgrade Notes entry
+  when it lands. Local development and the e2e harness run two processes from
+  G5 onward.
 - Debugging crosses a process boundary; request correlation IDs through the
   client become mandatory rather than nice.
 

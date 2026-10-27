@@ -8,10 +8,11 @@ new or changed configuration. Read the section for the version you are upgrading
 **to** before upgrading.
 
 :::note
-This page is fed from the [**Rise Rollout Tracker**](https://github.com/orgs/rise-deploy/projects/1)
-GitHub Project. Any tracked item whose `Operator impact` is not `None` must have a
-matching entry here for its `Target release` before it is marked `Done`. The
-project's "Operator impact" view is the worklist; this page is what operators read.
+Every pull request with operator impact adds its entry under **Unreleased** in
+the same change and carries the `operator-impact` label, which CI checks. The
+section moves under its version heading when a full release is cut. Deferred
+follow-up steps are tracked as
+[`rollout-gate` issues](https://github.com/rise-deploy/rise/issues?q=is%3Aissue+is%3Aopen+label%3Arollout-gate).
 :::
 
 ## Impact legend

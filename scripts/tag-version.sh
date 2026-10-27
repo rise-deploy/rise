@@ -68,6 +68,7 @@ check_prerequisites() {
 DRY_RUN=false
 SKIP_AI_RELEASE_NOTES=false
 AI_GUIDANCE=""
+UPGRADE_NOTES_FILE="docs/engineering/src/content/docs/upgrade-notes.md"
 VERSION=""
 COMMIT_RANGE=""
 
@@ -234,6 +235,22 @@ EOF
         cat >> "$TEMP_PROMPT" << EOF
 Additional guidance:
 ${AI_GUIDANCE}
+
+EOF
+    fi
+
+    # The operator upgrade notes are written alongside each change, so they are
+    # the authoritative account of breaking changes and required actions.
+    UPGRADE_NOTES=$(awk '/^## Unreleased$/{f=1; next} f && /^## /{exit} f' "$UPGRADE_NOTES_FILE")
+    if [ -n "${UPGRADE_NOTES//[[:space:]]/}" ]; then
+        cat >> "$TEMP_PROMPT" << EOF
+The operator upgrade notes below are authoritative for breaking changes and
+required operator actions: carry every Breaking and Action required item from
+them into the release notes, and point readers to the Upgrade Notes page for
+the details.
+
+Upgrade notes:
+${UPGRADE_NOTES}
 
 EOF
     fi
