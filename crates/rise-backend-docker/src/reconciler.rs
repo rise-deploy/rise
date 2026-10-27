@@ -730,17 +730,14 @@ impl DockerReconciler {
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Environment context.
-        let environment = self
-            .store
-            .find_environment(deployment.environment_id)
-            .await?;
-        let env_name = environment.as_ref().map(|e| e.name.clone());
+        let env_name = routing
+            .environment(deployment.environment_id)
+            .map(|e| e.name.clone());
 
         // URLs (drives Traefik hosts + RISE_* system env vars).
-        let urls =
-            routing.deployment_urls(&self.url_builder, project, deployment, environment.as_ref());
+        let urls = routing.urls_for_group(&self.url_builder, project, &deployment.deployment_group);
         let primary_hosts =
-            routing.primary_hosts(&self.url_builder, project, &deployment.deployment_group);
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
 
         // Env vars: plain + decrypted secret (merged into plain — Docker has no
         // secret concept) + system env vars.
@@ -1872,7 +1869,7 @@ impl DockerReconciler {
         // host gate). These are the same hosts `compute_desired_for_deployment`
         // feeds into each route; no host → no router → no `serverStatus`.
         let primary_hosts =
-            routing.primary_hosts(&self.url_builder, project, &deployment.deployment_group);
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
         for spec in &container_specs {
             // A withheld router must never be marked Ready: otherwise a
             // ready-when-running container could supersede a working deployment

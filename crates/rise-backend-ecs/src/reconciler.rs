@@ -1220,16 +1220,13 @@ impl EcsReconciler {
         // deploying something that looks fine and is quietly broken.
         Self::permanent(self.reject_unsupported(&container_specs))?;
 
-        let environment = self
-            .store
-            .find_environment(deployment.environment_id)
-            .await?;
-        let env_name = environment.as_ref().map(|e| e.name.clone());
+        let env_name = routing
+            .environment(deployment.environment_id)
+            .map(|e| e.name.clone());
 
-        let urls =
-            routing.deployment_urls(&self.url_builder, project, deployment, environment.as_ref());
+        let urls = routing.urls_for_group(&self.url_builder, project, &deployment.deployment_group);
         let primary_hosts =
-            routing.primary_hosts(&self.url_builder, project, &deployment.deployment_group);
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
 
         // Secrets are kept SEPARATE from plain env — the whole point of D7. They
         // still ride in the merged env, since a container sees one flat
@@ -2332,7 +2329,7 @@ impl EcsReconciler {
             .collect();
 
         let primary_hosts =
-            routing.primary_hosts(&self.url_builder, project, &deployment.deployment_group);
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
 
         // An empty spec set is never ready — otherwise a corrupt deployment row
         // would report Healthy while running nothing.

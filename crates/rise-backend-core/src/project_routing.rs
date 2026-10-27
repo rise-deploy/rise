@@ -1,24 +1,22 @@
-//! Project-scoped routing inputs, loaded once per project per reconcile pass.
+//! A project's routing inputs and the one place they are turned into a
+//! deployment group's hosts and URLs.
 //!
-//! A deployment's hosts and URLs depend on two project-wide lists — the
-//! project's environments and its custom domains — that are identical for every
-//! deployment of the project. A reconciler that read them inside its
-//! per-deployment work would pay two store round-trips per deployment (and per
-//! pass: desired computation and readiness both need them). [`ProjectRouting`]
-//! is the preload: read once in the per-project pass and threaded into each
-//! deployment's work, mirroring the Kubernetes webhook, which loads the same
-//! lists once per sync.
+//! A group's public hosts and its reported URLs both follow from two
+//! project-wide lists: the project's environments and its custom domains.
+//! [`ProjectRouting`] holds those lists, and every consumer goes through it:
+//! the Docker and ECS reconcilers (loaded once per project pass and threaded
+//! into each deployment's work, rather than re-read per deployment), the
+//! Kubernetes sync webhook, and each backend's URL lookups for the HTTP API.
 
 use anyhow::Result;
 use uuid::Uuid;
 
 use crate::backend::DeploymentUrls;
-use crate::models::{CustomDomain, Deployment, Environment, Project};
+use crate::models::{CustomDomain, Environment, Project};
 use crate::store::DeploymentStore;
 use crate::url_builder::DeploymentUrlBuilder;
 
-/// The project's environments and custom domains, as read at the start of one
-/// project's reconcile pass.
+/// The project's environments and custom domains.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectRouting {
     pub environments: Vec<Environment>,
@@ -34,9 +32,14 @@ impl ProjectRouting {
         })
     }
 
+    /// The project's environment `id`, e.g. a deployment's `environment_id`.
+    pub fn environment(&self, id: Uuid) -> Option<&Environment> {
+        self.environments.iter().find(|env| env.id == id)
+    }
+
     /// The public hosts `deployment_group` is routed under (see
     /// [`DeploymentUrlBuilder::public_hosts_for_group`]).
-    pub fn primary_hosts(
+    pub fn hosts_for_group(
         &self,
         url_builder: &DeploymentUrlBuilder,
         project: &Project,
@@ -50,19 +53,17 @@ impl ProjectRouting {
         )
     }
 
-    /// The URLs `deployment` is reachable at (see
-    /// [`DeploymentUrlBuilder::compute_deployment_urls`]).
-    pub fn deployment_urls(
+    /// The URLs `deployment_group` — and so each of its deployments — is
+    /// reachable at (see [`DeploymentUrlBuilder::urls_for_group`]).
+    pub fn urls_for_group(
         &self,
         url_builder: &DeploymentUrlBuilder,
         project: &Project,
-        deployment: &Deployment,
-        environment: Option<&Environment>,
+        deployment_group: &str,
     ) -> DeploymentUrls {
-        url_builder.compute_deployment_urls(
+        url_builder.urls_for_group(
             project,
-            deployment,
-            environment,
+            deployment_group,
             &self.environments,
             &self.custom_domains,
         )
@@ -77,7 +78,7 @@ mod tests {
 
     use super::*;
     use crate::events::{EventSource, ForwardedEvent};
-    use crate::models::{DeploymentEnvVar, DeploymentStatus, TerminationReason};
+    use crate::models::{Deployment, DeploymentEnvVar, DeploymentStatus, TerminationReason};
     use crate::observation::{ContainerObservation, DerivedEvent};
     use crate::store::SupersessionOutcome;
     use crate::test_helpers;
@@ -234,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_load_serves_every_deployment_of_the_project() {
+    async fn one_load_serves_every_group_of_the_project() {
         let project = test_helpers::project("myapp", "public");
         let production = test_helpers::environment(&project, "production", Some("default"));
         let staging = test_helpers::environment(&project, "staging", Some("staging"));
@@ -247,51 +248,29 @@ mod tests {
 
         let routing = ProjectRouting::load(&store, project.id).await.unwrap();
 
-        let deployments = [
-            test_helpers::deployment(&project, "20260101-120000", "default"),
-            test_helpers::deployment(&project, "20260101-120100", "staging"),
-            test_helpers::deployment(&project, "20260101-120200", "mr/7"),
-        ];
-        for deployment in &deployments {
-            let environment = [&production, &staging].into_iter().find(|e| {
-                e.primary_deployment_group.as_deref() == Some(&deployment.deployment_group)
-            });
-            // The preloaded lists give exactly what the builder computes from
-            // the store's lists directly.
+        for group in ["default", "staging", "mr/7"] {
+            let hosts = routing.hosts_for_group(&url_builder, &project, group);
+            let urls = routing.urls_for_group(&url_builder, &project, group);
+            // A group's reported URLs are exactly the hosts it is routed under.
             assert_eq!(
-                routing.primary_hosts(&url_builder, &project, &deployment.deployment_group),
-                url_builder.public_hosts_for_group(
-                    &project,
-                    &deployment.deployment_group,
-                    &store.environments,
-                    &store.custom_domains,
-                ),
-            );
-            // `DeploymentUrls` has no `PartialEq`; compare its serialized form.
-            assert_eq!(
-                serde_json::to_value(routing.deployment_urls(
-                    &url_builder,
-                    &project,
-                    deployment,
-                    environment
-                ))
-                .unwrap(),
-                serde_json::to_value(url_builder.compute_deployment_urls(
-                    &project,
-                    deployment,
-                    environment,
-                    &store.environments,
-                    &store.custom_domains,
-                ))
-                .unwrap(),
+                urls.all_urls,
+                hosts
+                    .iter()
+                    .map(|host| format!("https://{host}"))
+                    .collect::<Vec<_>>(),
+                "group {group}"
             );
         }
+        assert!(routing
+            .hosts_for_group(&url_builder, &project, "default")
+            .contains(&"app.example.org".to_string()));
+        assert_eq!(
+            routing.environment(staging.id).map(|env| env.name.as_str()),
+            Some("staging")
+        );
 
-        // Three deployments, two consumers each — still one read per list.
+        // Three groups, two consumers each — still one read per list.
         assert_eq!(store.environment_reads.load(Ordering::SeqCst), 1);
         assert_eq!(store.custom_domain_reads.load(Ordering::SeqCst), 1);
-        assert!(routing
-            .primary_hosts(&url_builder, &project, "default")
-            .contains(&"app.example.org".to_string()));
     }
 }
