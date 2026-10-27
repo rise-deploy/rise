@@ -322,13 +322,15 @@ changelog operators read before upgrading.
   configuration adds its entry under **Unreleased** in the **same** PR, with
   the matching impact badge, and carries the `operator-impact` label. CI fails
   a labelled PR that does not touch the page. `scripts/tag-version.sh` puts the
-  Unreleased section into the release notes; whoever cuts a full release moves
-  it under the version heading.
-- A deferred finalization step (flip a default, drop a compat shim, tighten a
-  constraint) is filed as a `rollout-gate` issue, on the milestone of the
-  release it is due in when that is known. Open `rollout-gate` issues are the
-  list of what is still owed; check it when planning or reviewing large or
-  breaking work.
+  Unreleased section into the release notes and, for a full release, moves it
+  under the version heading.
+- Planned operator-facing change that has not merged — a deferred finalization
+  step (flip a default, drop a compat shim, tighten a constraint) or a known
+  limitation awaiting a fix — is filed as a `rollout-gate` issue **and** listed
+  on the [Upcoming Changes](docs/engineering/src/content/docs/upcoming-changes.md)
+  page under its target release, or "Not yet scheduled". The PR that lands it
+  moves the entry from that page into the Upgrade Notes. Check both when
+  planning or reviewing large or breaking work.
 - `ROADMAP.md` owns the *why*, phase rationale, and milestone checkboxes for every
   in-flight architectural workstream (its numbered sections: generic resource and
   authorization foundation, Rise-issued authentication and token issuance,

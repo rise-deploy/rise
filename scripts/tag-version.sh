@@ -177,14 +177,14 @@ if [ "$DRY_RUN" = false ]; then
     fi
 fi
 
+# A full release has no prerelease suffix like -rc1, -beta.2, etc.
+IS_FULL_RELEASE=false
+if ! [[ "$VERSION" =~ - ]]; then
+    IS_FULL_RELEASE=true
+fi
+
 # Determine commit range
 if [ -z "$COMMIT_RANGE" ]; then
-    # Check if this is a full release (no prerelease suffix like -rc1, -beta.2, etc.)
-    IS_FULL_RELEASE=false
-    if ! [[ "$VERSION" =~ - ]]; then
-        IS_FULL_RELEASE=true
-    fi
-
     if [ "$IS_FULL_RELEASE" = true ]; then
         # For full releases, find the previous full version tag (skip prereleases)
         # so the changelog covers everything since the last stable release.
@@ -316,6 +316,9 @@ echo ""
 echo "The following actions will be performed:"
 echo "  1. Update version in Cargo.toml to ${VERSION}"
 echo "  2. Update Cargo.lock"
+if [ "$IS_FULL_RELEASE" = true ]; then
+    echo "     and move the Unreleased upgrade notes under '## ${VERSION}'"
+fi
 echo "  3. Commit changes with message: 'chore: bump version to ${VERSION}'"
 if [ "$SKIP_AI_RELEASE_NOTES" = true ]; then
     echo "  4. Create git tag: ${TAG} (default annotation, AI notes skipped)"
@@ -352,12 +355,15 @@ sed -i.bak "s/^version: .*/version: ${VERSION}/" helm/rise/Chart.yaml && rm helm
 sed -i.bak "s/^appVersion: .*/appVersion: \"${VERSION}\"/" helm/rise/Chart.yaml && rm helm/rise/Chart.yaml.bak
 
 # Step 2: Update Cargo.lock
-echo "[2/5] Updating Cargo.lock..."
+echo "[2/5] Updating Cargo.lock and upgrade notes..."
 cargo update --workspace --quiet
+if [ "$IS_FULL_RELEASE" = true ]; then
+    scripts/promote-upgrade-notes.sh "${VERSION}" "${UPGRADE_NOTES_FILE}"
+fi
 
 # Step 3: Commit the changes
 echo "[3/5] Committing version bump..."
-git add Cargo.toml Cargo.lock helm/rise/Chart.yaml
+git add Cargo.toml Cargo.lock helm/rise/Chart.yaml "${UPGRADE_NOTES_FILE}"
 git commit -m "chore: bump version to ${VERSION}"
 
 # Step 4: Create the tag with AI-generated notes in the annotation

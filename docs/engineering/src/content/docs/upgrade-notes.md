@@ -10,9 +10,9 @@ new or changed configuration. Read the section for the version you are upgrading
 :::note
 Every pull request with operator impact adds its entry under **Unreleased** in
 the same change and carries the `operator-impact` label, which CI checks. The
-section moves under its version heading when a full release is cut. Deferred
-follow-up steps are tracked as
-[`rollout-gate` issues](https://github.com/rise-deploy/rise/issues?q=is%3Aissue+is%3Aopen+label%3Arollout-gate).
+section moves under its version heading when a full release is tagged. Changes
+that are planned but not merged yet are listed on
+[Upcoming Changes](/operator-docs/upcoming-changes/).
 :::
 
 ## Impact legend
@@ -27,10 +27,8 @@ follow-up steps are tracked as
 
 ## Unreleased
 
-_Changes merged to `develop` but not yet in a tagged release. Moved into a
-version section at tag time._
-
-Merged to `develop`:
+_Changes merged to `develop` but not yet in a release. `scripts/tag-version.sh`
+moves them into a version section when it tags a full release._
 
 - **Path-based app URLs are no longer supported.** *Breaking* for installs
   whose ingress URL templates contain a path (e.g.
@@ -841,29 +839,3 @@ configuration knobs they introduce.
   resolve to the **same** namespace names as before (`rise-` prefix → `rise-myapp`).
   The Kubernetes controller's `controller_class_name` defaults to a stable value
   for existing installs if unset.
-
-### Watch for later (not yet released)
-
-These are tracked as finalization gates and will land in a **future** release —
-listed here so operators can anticipate them:
-
-- **Breaking (future) — multi-tenancy phase 2.** Tightening
-  `organization_resource_uid` to `NOT NULL` after backfill, and migrating typed
-  tables onto the generic resource model. Tracked in
-  [#372](https://github.com/rise-deploy/rise/issues/372).
-- **Breaking (0.25.0, behind operator toggle) — removal of the legacy auth path.**
-  `auth.allow_raw_external_tokens` defaults to `false` starting in **0.25.0**,
-  and auth token-exchange phase 3 removes the legacy in-handler verification
-  path. The `rise::deprecation` raw-external-token metric (above) tells you when
-  raw-token traffic has drained and it is safe to upgrade. Tracked in
-  [#374](https://github.com/rise-deploy/rise/issues/374).
-- **Future — org-scoped controller enablement and API-group claims.** Now that
-  `allowedStatusControllerIds` is removed, a controller that loses its
-  `PlatformRoleBinding` mid-reconcile can no longer clear its own finalizers
-  (an operator can, via the existing recovery path). A design for
-  org-opt-in enablement and an exclusive, operator-granted API-group claim on
-  `Controller` is tracked in
-  [#437](https://github.com/rise-deploy/rise/issues/437); it does not change
-  anything documented above, but will add a required enablement step for
-  controllers registering `ResourceDefinition`s in an organization's own API
-  group.
