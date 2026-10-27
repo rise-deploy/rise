@@ -28,25 +28,25 @@ pub struct DeploymentUrls {
 /// needed by HTTP handlers: log streaming, URL computation, and environment cleanup.
 #[async_trait]
 pub trait DeploymentBackend: Send + Sync {
-    /// Calculate URLs where this deployment can be accessed
-    ///
-    /// Returns the primary URL (from ingress templates) and any custom domain URLs.
-    /// URLs are calculated dynamically based on current controller configuration.
-    async fn get_deployment_urls(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-    ) -> anyhow::Result<DeploymentUrls>;
-
-    /// Calculate URLs where a project would be accessed for a given deployment group.
-    ///
-    /// Similar to `get_deployment_urls` but takes a group name string instead of a Deployment object.
-    /// Used for preview endpoints where no deployment exists yet.
+    /// Calculate URLs where a project is reached for a given deployment group,
+    /// whether or not the group has a deployment yet. URLs are calculated
+    /// dynamically from the current controller configuration.
     async fn get_project_urls(
         &self,
         project: &Project,
         deployment_group: &str,
     ) -> anyhow::Result<DeploymentUrls>;
+
+    /// Calculate URLs where this deployment can be accessed: its deployment
+    /// group's, as routing is per group.
+    async fn get_deployment_urls(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+    ) -> anyhow::Result<DeploymentUrls> {
+        self.get_project_urls(project, &deployment.deployment_group)
+            .await
+    }
 
     /// Clean up resources associated with a deleted environment
     ///

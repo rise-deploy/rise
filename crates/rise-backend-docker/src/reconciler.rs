@@ -39,6 +39,7 @@ use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_core::events::EventSource;
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::observation::{derive_events, ContainerObservation, ObservedState};
+use rise_backend_core::project_routing::ProjectRouting;
 use rise_backend_core::rise_system_env_vars;
 use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
@@ -205,6 +206,16 @@ pub struct DockerReconciler {
     /// the single leader's sequential tick.
     identity_refresh: Mutex<HashMap<String, DateTime<Utc>>>,
     config: ReconcilerConfig,
+}
+
+/// Outcome of one deployment's health pass ([`DockerReconciler::reconcile_health`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthPass {
+    /// The pass ran to completion (or had nothing to do).
+    Done,
+    /// The leader lease could not be re-confirmed before the pass's DB writes,
+    /// so none were made; the rest of the project's health pass must stop too.
+    LeaseLost,
 }
 
 /// Workload-identity material prepared once per deployment per tick and delivered
@@ -517,8 +528,14 @@ impl DockerReconciler {
         // DB-write error can't abort the whole project tick — matching the
         // desired-compute and health loops. A deployment this moves to a
         // terminal status needs no separate container cleanup here: it drops
-        // out of the desired set and is GC'd by the next diff pass.
+        // out of the desired set and is GC'd by the next diff pass. Each
+        // transition is a status write, so leadership is re-confirmed before
+        // each one like every other write in this pass (a local-clock check
+        // while the cached lease horizon covers it).
         for deployment in &non_terminal {
+            if !self.confirm_leadership(election).await {
+                return Ok(());
+            }
             if let Err(e) = rise_backend_core::lifecycle::perform_status_transition(
                 self.store.as_ref(),
                 project,
@@ -539,6 +556,14 @@ impl DockerReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
 
+        // The project's environments and custom domains feed every
+        // deployment's hosts, in both the desired computation and the
+        // readiness pass below. Read them once for the whole project pass
+        // rather than once per deployment per pass (mirrors the K8s webhook's
+        // per-sync preload). A failed read aborts the project pass before any
+        // desired state is computed, so nothing is GC'd against a partial view.
+        let routing = ProjectRouting::load(self.store.as_ref(), project.id).await?;
+
         // 2. Compute desired containers across all infra-bearing deployments.
         // Track deployments whose desired computation FAILED this tick: their
         // existing containers must be protected from GC so a transient error
@@ -553,7 +578,7 @@ impl DockerReconciler {
                 continue;
             }
             match self
-                .compute_desired_for_deployment(project, deployment)
+                .compute_desired_for_deployment(project, deployment, &routing)
                 .await
             {
                 Ok(mut containers) => desired.append(&mut containers),
@@ -647,14 +672,27 @@ impl DockerReconciler {
             if !should_have_infrastructure(deployment) {
                 continue;
             }
-            if let Err(e) = self
-                .reconcile_health(project, deployment, &desired, &mut server_status_cache)
+            match self
+                .reconcile_health(
+                    project,
+                    deployment,
+                    &desired,
+                    &routing,
+                    &mut server_status_cache,
+                    election,
+                )
                 .await
             {
-                warn!(
-                    deployment_id = %deployment.deployment_id,
-                    "Health reconcile failed: {:?}", e
-                );
+                Ok(HealthPass::Done) => {}
+                // The lease is global: once it is gone, no further deployment
+                // of this project (or any other — `tick` re-checks) may write.
+                Ok(HealthPass::LeaseLost) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        deployment_id = %deployment.deployment_id,
+                        "Health reconcile failed: {:?}", e
+                    );
+                }
             }
         }
 
@@ -686,33 +724,20 @@ impl DockerReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
+        routing: &ProjectRouting,
     ) -> Result<Vec<DesiredContainer>> {
         // Container + route side-data.
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
 
         // Environment context.
-        let environment = self
-            .store
-            .find_environment(deployment.environment_id)
-            .await?;
-        let env_name = environment.as_ref().map(|e| e.name.clone());
-        let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
+        let env_name = routing
+            .environment(deployment.environment_id)
+            .map(|e| e.name.clone());
 
         // URLs (drives Traefik hosts + RISE_* system env vars).
-        let urls = self.url_builder.compute_deployment_urls(
-            project,
-            deployment,
-            environment.as_ref(),
-            &all_environments,
-            &custom_domains,
-        );
-        let primary_hosts = self.url_builder.public_hosts_for_group(
-            project,
-            &deployment.deployment_group,
-            &all_environments,
-            &custom_domains,
-        );
+        let urls = routing.urls_for_group(&self.url_builder, project, &deployment.deployment_group);
+        let primary_hosts =
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
 
         // Env vars: plain + decrypted secret (merged into plain — Docker has no
         // secret concept) + system env vars.
@@ -1786,38 +1811,29 @@ impl DockerReconciler {
 
     // ── Health → status ────────────────────────────────────────────────
 
-    /// Resolve the deployment's primary ingress hosts — the same set
-    /// `compute_desired_for_deployment` feeds into each route's `hosts`. Used by
-    /// the readiness pass to decide whether the container emits a Traefik router
-    /// at all (no host → no router → no `serverStatus` to query).
-    async fn primary_hosts_for_deployment(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-    ) -> Result<Vec<String>> {
-        let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-        Ok(self.url_builder.public_hosts_for_group(
-            project,
-            &deployment.deployment_group,
-            &all_environments,
-            &custom_domains,
-        ))
-    }
-
+    /// Probe one deployment's containers and drive its health status.
+    ///
+    /// The probing (container inspection, Traefik `serverStatus`) can take
+    /// long enough for the lease confirmed at the start of the project pass to
+    /// lapse, so leadership is re-confirmed immediately before the DB writes —
+    /// and again after the Traefik cutover check, which is another HTTP round
+    /// trip. Returns [`HealthPass::LeaseLost`] when it can't be confirmed; the
+    /// caller then stops the project's health pass.
     async fn reconcile_health(
         &self,
         project: &Project,
         deployment: &Deployment,
         desired: &[DesiredContainer],
+        routing: &ProjectRouting,
         server_status_cache: &mut HashMap<String, Option<HashMap<String, bool>>>,
-    ) -> Result<()> {
+        election: &LeaderElection,
+    ) -> Result<HealthPass> {
         // Only probe states where health is meaningful.
         if !matches!(
             deployment.status,
             DeploymentStatus::Deploying | DeploymentStatus::Healthy | DeploymentStatus::Unhealthy
         ) {
-            return Ok(());
+            return Ok(HealthPass::Done);
         }
 
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
@@ -1850,10 +1866,10 @@ impl DockerReconciler {
         let running_of =
             |i: &Option<InspectedContainer>| i.as_ref().map(|i| i.running).unwrap_or(false);
         // The readiness pass consults `service_names_for_spec` (which needs the
-        // host gate), so resolve the hosts once per tick for this deployment.
-        let primary_hosts = self
-            .primary_hosts_for_deployment(project, deployment)
-            .await?;
+        // host gate). These are the same hosts `compute_desired_for_deployment`
+        // feeds into each route; no host → no router → no `serverStatus`.
+        let primary_hosts =
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
         for spec in &container_specs {
             // A withheld router must never be marked Ready: otherwise a
             // ready-when-running container could supersede a working deployment
@@ -2044,6 +2060,13 @@ impl DockerReconciler {
             }
         }
 
+        // Everything below writes to the DB. Re-confirm the lease now that the
+        // probing is done: a former leader must not record observations or
+        // move this deployment's status after a peer has taken over.
+        if !self.confirm_leadership(election).await {
+            return Ok(HealthPass::LeaseLost);
+        }
+
         // Compare against what the last tick saw and record both the difference
         // and the new baseline. A failure here must not fail the health pass:
         // the deployment's status is the reconciler's job, and its history is a
@@ -2076,7 +2099,7 @@ impl DockerReconciler {
                 .await?
                 {
                     info!(deployment_id = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
-                    return Ok(());
+                    return Ok(HealthPass::Done);
                 }
                 let selected: Vec<DesiredContainer> = desired
                     .iter()
@@ -2099,13 +2122,19 @@ impl DockerReconciler {
                 );
                 if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
                     warn!(deployment_id = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
-                    return Ok(());
+                    return Ok(HealthPass::Done);
                 }
                 if let Some(api) = self.traefik_api.as_ref() {
                     if !api.dynamic_config_applied(&expected).await {
                         debug!(deployment_id = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
-                        return Ok(());
+                        return Ok(HealthPass::Done);
                     }
+                }
+                // The router check above is another Traefik round trip; the
+                // supersession below retires the group's previous deployment,
+                // so confirm the lease once more right before it.
+                if !self.confirm_leadership(election).await {
+                    return Ok(HealthPass::LeaseLost);
                 }
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
                     self.store.as_ref(),
@@ -2150,7 +2179,7 @@ impl DockerReconciler {
             _ => {}
         }
 
-        Ok(())
+        Ok(HealthPass::Done)
     }
 
     /// Probe each live replica's HTTP health for the rolling-recreate throttle,

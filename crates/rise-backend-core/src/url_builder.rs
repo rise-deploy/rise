@@ -25,6 +25,14 @@ pub struct IngressUrl {
     pub path_prefix: Option<String>,
 }
 
+/// A deployment group's environment, that environment's valid custom
+/// domains, and the hosts the group is routed under.
+struct GroupRouting<'a> {
+    environment: Option<&'a Environment>,
+    custom_domains: Vec<CustomDomain>,
+    hosts: Vec<IngressUrl>,
+}
+
 /// Holds the ingress-template + registry configuration needed to resolve a
 /// deployment's hostnames, URLs, and image. Pure spec computation — no client.
 #[derive(Clone)]
@@ -314,12 +322,12 @@ impl DeploymentUrlBuilder {
             .collect()
     }
 
-    /// The public hosts Traefik routes to `deployment_group`'s active
-    /// deployment: [`Self::primary_ingress_hosts`] with the environment whose
+    /// The public hosts `deployment_group`'s active deployment is routed
+    /// under: [`Self::primary_ingress_hosts`] with the environment whose
     /// `primary_deployment_group` is this group, and only that environment's
-    /// valid custom domains — the same per-group scoping as the Kubernetes
-    /// webhook, so a production custom domain never lands on a preview group's
-    /// router. Unlike Kubernetes, there is no fallback host when none applies.
+    /// valid custom domains, so a production custom domain never lands on a
+    /// preview group's route. Unlike Kubernetes, there is no fallback host
+    /// when none applies.
     pub fn public_hosts_for_group(
         &self,
         project: &Project,
@@ -327,19 +335,37 @@ impl DeploymentUrlBuilder {
         all_environments: &[Environment],
         custom_domains: &[CustomDomain],
     ) -> Vec<String> {
+        self.group_routing(project, deployment_group, all_environments, custom_domains)
+            .hosts
+            .into_iter()
+            .map(|host| host.host)
+            .collect()
+    }
+
+    /// The one derivation behind both [`Self::public_hosts_for_group`] and
+    /// [`Self::urls_for_group`], so a group's routes and reported URLs agree.
+    fn group_routing<'a>(
+        &self,
+        project: &Project,
+        deployment_group: &str,
+        all_environments: &'a [Environment],
+        custom_domains: &[CustomDomain],
+    ) -> GroupRouting<'a> {
         let environment = Self::environment_for_group(deployment_group, all_environments);
-        let domains_for_env = self.valid_domains_for_environment(environment, custom_domains);
-        self.primary_ingress_hosts(
+        let custom_domains = self.valid_domains_for_environment(environment, custom_domains);
+        let hosts = self.primary_ingress_hosts(
             project,
             deployment_group,
             environment,
-            &domains_for_env,
+            &custom_domains,
             true,
             all_environments,
-        )
-        .into_iter()
-        .map(|host| host.host)
-        .collect()
+        );
+        GroupRouting {
+            environment,
+            custom_domains,
+            hosts,
+        }
     }
 
     pub fn filter_valid_custom_domains(
@@ -387,45 +413,19 @@ impl DeploymentUrlBuilder {
         format!("{}://{}", self.ingress_schema, host_with_port)
     }
 
-    pub fn compute_deployment_urls(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-        environment: Option<&Environment>,
-        all_environments: &[Environment],
-        custom_domains: &[CustomDomain],
-    ) -> DeploymentUrls {
-        self.compute_urls_for_group(
-            project,
-            &deployment.deployment_group,
-            environment,
-            all_environments,
-            custom_domains,
-        )
-    }
-
-    pub fn compute_project_urls(
+    /// The URLs `deployment_group` is reachable at: its default template URL,
+    /// its primary URL, its environment's custom domains and every URL it is
+    /// routed under.
+    ///
+    /// Everything derives from the group — the environment whose
+    /// `primary_deployment_group` it is, and that environment's custom domains
+    /// — exactly as [`Self::public_hosts_for_group`] derives the routed hosts,
+    /// so a deployment's reported URLs and its routes always agree. A
+    /// deployment's URLs are its group's.
+    pub fn urls_for_group(
         &self,
         project: &Project,
         deployment_group: &str,
-        all_environments: &[Environment],
-        custom_domains: &[CustomDomain],
-    ) -> DeploymentUrls {
-        let environment = Self::environment_for_group(deployment_group, all_environments);
-        self.compute_urls_for_group(
-            project,
-            deployment_group,
-            environment,
-            all_environments,
-            custom_domains,
-        )
-    }
-
-    fn compute_urls_for_group(
-        &self,
-        project: &Project,
-        deployment_group: &str,
-        environment: Option<&Environment>,
         all_environments: &[Environment],
         custom_domains: &[CustomDomain],
     ) -> DeploymentUrls {
@@ -433,18 +433,18 @@ impl DeploymentUrlBuilder {
         let default_url_host = self.full_ingress_url_from_host(&host);
         let default_url = format!("{}://{}", self.ingress_schema, default_url_host);
 
-        let environment_for_group = environment
-            .filter(|env| env.primary_deployment_group.as_deref() == Some(deployment_group));
+        let GroupRouting {
+            environment,
+            custom_domains: domains_for_env,
+            hosts,
+        } = self.group_routing(project, deployment_group, all_environments, custom_domains);
 
-        let environment_url = environment_for_group.and_then(|env| {
+        let environment_url = environment.and_then(|env| {
             self.resolved_environment_url(project, env).map(|url_host| {
                 let full_host = self.full_ingress_url_from_host(&url_host);
                 format!("{}://{}", self.ingress_schema, full_host)
             })
         });
-
-        let domains_for_env =
-            self.valid_domains_for_environment(environment_for_group, custom_domains);
 
         let starred = domains_for_env.iter().find(|d| d.is_primary);
         let primary_url = if let Some(starred) = starred {
@@ -460,27 +460,11 @@ impl DeploymentUrlBuilder {
             .map(|d| self.host_to_url(&d.domain))
             .collect();
 
-        let templated_hosts = self.primary_ingress_hosts(
-            project,
-            deployment_group,
-            environment_for_group,
-            &[],
-            false,
-            all_environments,
-        );
-        let mut all_urls: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for host in &templated_hosts {
-            let url = self.host_to_url(&host.host);
-            if seen.insert(url.clone()) {
-                all_urls.push(url);
-            }
-        }
-        for url in &custom_domain_urls {
-            if seen.insert(url.clone()) {
-                all_urls.push(url.clone());
-            }
-        }
+        // Exactly the hosts the group is routed under, as URLs.
+        let all_urls: Vec<String> = hosts
+            .iter()
+            .map(|host| self.host_to_url(&host.host))
+            .collect();
 
         DeploymentUrls {
             default_url,
