@@ -38,7 +38,7 @@ Resources follow consistent naming patterns:
 | ServiceAccount | `env-{environment}` | `env-production`, `env-staging` |
 | Secret | `rise-registry-creds` | `rise-registry-creds` |
 
-**Character escaping**: Sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`. For example, `mr/26` becomes `mr--26`. Consecutive hyphens (`--`) are disallowed in group names to prevent collisions, and the normalized result must be at most 63 characters (Kubernetes label value limit).
+**Character escaping**: Sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`. For example, `mr/26` becomes `mr--26`. Group names are lowercase alphanumeric segments joined by single `-` or `/` separators — adjacent separators (`--`, `//`, `-/`, `/-`) are rejected so no two group names normalize to the same string, and the normalized result must be at most 63 characters (Kubernetes label value limit).
 
 ## Deployment Groups and URLs
 

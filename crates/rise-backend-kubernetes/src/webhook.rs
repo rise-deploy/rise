@@ -34,6 +34,7 @@ use crate::resource_builder::{
 use rise_backend_auth::WorkloadSubjectInfo;
 use rise_backend_auth::{sha256_hex, workload_subject, NO_ENVIRONMENT};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project, TerminationReason};
+use rise_backend_core::project_routing::ProjectRouting;
 use rise_backend_core::runtime::{
     resolve_deployment_env_vars, resolve_runtime_containers, should_have_infrastructure,
     ResolvedDeploymentEnvVars,
@@ -919,13 +920,13 @@ async fn compute_desired_children(
     let mut identity_refresh_due_at: Option<DateTime<Utc>> = None;
     let namespace = ResourceBuilder::namespace_name(project, namespace_prefix);
 
-    // Preload all environments for this project to avoid per-deployment DB lookups
-    let environments: HashMap<uuid::Uuid, rise_backend_core::models::Environment> = ctx
-        .deployment_store
-        .list_environments_for_project(project.id)
-        .await?
-        .into_iter()
-        .map(|env| (env.id, env))
+    // Load the project's environments and custom domains once for the whole
+    // sync rather than per deployment.
+    let routing = ProjectRouting::load(ctx.deployment_store.as_ref(), project.id).await?;
+    let environments: HashMap<uuid::Uuid, rise_backend_core::models::Environment> = routing
+        .environments
+        .iter()
+        .map(|env| (env.id, env.clone()))
         .collect();
 
     // 1. Namespace (always)
@@ -1325,11 +1326,8 @@ async fn compute_desired_children(
     }
 
     // Services, Ingresses, NetworkPolicies — one per group with an active deployment
-    let custom_domains = ctx
-        .deployment_store
-        .list_project_custom_domains(project.id)
-        .await?;
-    let valid_custom_domains = resource_builder.filter_valid_custom_domains(&custom_domains);
+    let valid_custom_domains =
+        resource_builder.filter_valid_custom_domains(&routing.custom_domains);
 
     // Index custom domains by environment_id.
     let mut domains_by_env: HashMap<uuid::Uuid, Vec<rise_backend_core::models::CustomDomain>> =

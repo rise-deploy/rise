@@ -113,7 +113,7 @@ rise deploy --group mr/123 --expire 7d
 rise deploy --group feature/login
 ```
 
-Group names must match `[a-z0-9][a-z0-9/-]*[a-z0-9]` (no consecutive hyphens `--`, normalized length max 63 characters). The default group is named `default`.
+Group names are lowercase letters and digits in segments joined by a single `-` or `/` (e.g. `pr-123`, `team/feature-x`), with no two separators in a row and a normalized length of at most 63 characters. The default group is named `default`.
 
 ### Environments
 

@@ -24,7 +24,7 @@ use k8s_openapi::ByteString;
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use rise_backend_core::models::{CustomDomain, Deployment, Environment, Project};
+use rise_backend_core::models::{CustomDomain, Deployment, Project};
 use rise_backend_core::providers::{RegistryAuthMethod, RegistryCredentials};
 use rise_backend_core::AccessRequirement;
 use rise_backend_core::DeploymentUrlBuilder;
@@ -263,8 +263,8 @@ impl ResourceBuilder {
     //
     // Backend-agnostic; the implementations live on the composed
     // `DeploymentUrlBuilder`. Thin wrappers below cover the methods the K8s
-    // resource builders and the HTTP handlers call through `ResourceBuilder`;
-    // other URL/image work goes through `self.url_builder` directly.
+    // resource builders call through `ResourceBuilder`; URL lookups go through
+    // `ProjectRouting`, and other URL/image work through `self.url_builder`.
 
     pub fn primary_ingress_hosts(
         &self,
@@ -290,38 +290,6 @@ impl ResourceBuilder {
         custom_domains: &[CustomDomain],
     ) -> Vec<CustomDomain> {
         self.url_builder.filter_valid_custom_domains(custom_domains)
-    }
-
-    pub fn compute_deployment_urls(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-        environment: Option<&rise_backend_core::models::Environment>,
-        all_environments: &[rise_backend_core::models::Environment],
-        custom_domains: &[CustomDomain],
-    ) -> rise_backend_core::DeploymentUrls {
-        self.url_builder.compute_deployment_urls(
-            project,
-            deployment,
-            environment,
-            all_environments,
-            custom_domains,
-        )
-    }
-
-    pub fn compute_project_urls(
-        &self,
-        project: &Project,
-        deployment_group: &str,
-        environments: &[Environment],
-        custom_domains: &[CustomDomain],
-    ) -> rise_backend_core::DeploymentUrls {
-        self.url_builder.compute_project_urls(
-            project,
-            deployment_group,
-            environments,
-            custom_domains,
-        )
     }
 
     // ── Labels ─────────────────────────────────────────────────────────
@@ -2464,7 +2432,9 @@ mod tests {
         let builder = test_resource_builder();
         let mut project = test_project();
         project.status = rise_backend_core::models::ProjectStatus::Stopped;
-        let urls = builder.compute_project_urls(&project, "default", &[], &[]);
+        let urls = builder
+            .url_builder
+            .urls_for_group(&project, "default", &[], &[]);
         assert_eq!(urls.default_url, "https://demo.example.test");
         assert_eq!(urls.primary_url, urls.default_url);
     }
@@ -2479,7 +2449,7 @@ mod tests {
         let mut staging_domain = test_custom_domain("staging.example.org", true);
         staging_domain.environment_id = staging.id;
         let production_domain = test_custom_domain("app.example.org", true);
-        let urls = builder.compute_project_urls(
+        let urls = builder.url_builder.urls_for_group(
             &project,
             "default",
             &[production, staging],
@@ -2487,31 +2457,6 @@ mod tests {
         );
         assert_eq!(urls.primary_url, "https://app.example.org");
         assert_eq!(urls.custom_domain_urls, vec!["https://app.example.org"]);
-    }
-
-    #[test]
-    fn project_urls_match_deployment_urls_for_the_same_environment() {
-        let mut builder = test_resource_builder();
-        builder.url_builder.environment_ingress_url_template =
-            Some("{project_name}-{environment}.example.test".to_string());
-        let project = test_project();
-        let environment = test_environment("staging", false, "staging");
-        let environments = vec![environment.clone()];
-        let mut deployment = test_deployment();
-        deployment.deployment_group = "staging".to_string();
-        deployment.environment_id = environment.id;
-        let before = builder.compute_deployment_urls(
-            &project,
-            &deployment,
-            Some(&environment),
-            &environments,
-            &[],
-        );
-        let after = builder.compute_project_urls(&project, "staging", &environments, &[]);
-        assert_eq!(after.primary_url, "https://demo-staging.example.test");
-        assert_eq!(after.default_url, before.default_url);
-        assert_eq!(after.primary_url, before.primary_url);
-        assert_eq!(after.all_urls, before.all_urls);
     }
 
     #[test]

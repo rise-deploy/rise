@@ -1589,7 +1589,7 @@ fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
 ///
 /// Mirrors the Kubernetes `backend_address` ingress-auth flow (see
 /// `ResourceBuilder::build_ingress_annotations` in
-/// `src/server/deployment/resource_builder.rs`): the signin page must be served
+/// `crates/rise-backend-kubernetes/src/resource_builder.rs`): the signin page must be served
 /// on the **same host** as the app so the login cookie is set on the app host
 /// that forwardAuth subsequently reads. A cross-host redirect to the control
 /// plane would set the cookie on the wrong host and loop.

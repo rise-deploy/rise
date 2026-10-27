@@ -36,7 +36,7 @@ rise environment create dev -p my-app --group dev --color yellow
 | `--color` | Badge color: `green`, `blue`, `yellow`, `red`, `purple`, `orange`, `gray` (default: `green`) |
 | `--max-expiration` | Caps the lifetime of deployments into any non-primary group, e.g. `7d`, `12h`, `30m` (default: no cap) |
 
-Names must be lowercase alphanumeric with hyphens, no consecutive `--` (same rules as deployment groups).
+Names must be lowercase alphanumeric with hyphens, no consecutive `--`.
 
 ## Listing and Viewing
 
