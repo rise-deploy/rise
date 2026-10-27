@@ -178,7 +178,7 @@ function GlobalNav({ route, summary }: { route: Route; summary: SidebarProps['su
                 {GLOBAL_NAV.map(item => {
                     const count = countFor(item.id);
                     return (
-                        <a key={item.id} href={item.href} className={cx(active === item.id && 'active')} onClick={linkClick(item.href)}>
+                        <a key={item.id} href={item.href} aria-current={active === item.id ? 'page' : undefined} className={cx(active === item.id && 'active')} onClick={linkClick(item.href)}>
                             <Icon name={item.icon} className="ico" />
                             {item.label}
                             {count !== undefined && <span className="badge">{count}</span>}
@@ -233,7 +233,7 @@ function ProjectNav({ route, onOpenPalette }: { route: Route; onOpenPalette: She
                     const href = projectPath(projectName, s.id);
                     const count = s.id === 'overview' || s.id === 'access' || s.id === 'logs' ? undefined : counts[s.id];
                     return (
-                        <a key={s.id} href={href} className={cx(active === s.id && 'active')} onClick={linkClick(href)}>
+                        <a key={s.id} href={href} aria-current={active === s.id ? 'page' : undefined} className={cx(active === s.id && 'active')} onClick={linkClick(href)}>
                             <Icon name={s.icon} className="ico" />
                             {s.label}
                             {count !== undefined && <span className="badge">{count}</span>}

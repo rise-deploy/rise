@@ -20,6 +20,7 @@ import { deploymentPath, logsPath, projectPath, type ProjectSection } from '../l
 import type { AccessClass } from '../lib/access';
 import { SectionHead } from '../components/section-head';
 import { DeploymentSource } from '../components/deployment-source';
+import { CommandHint } from '../components/command-hint';
 
 // Sections that render their own head because it carries actions.
 const SELF_HEADED = new Set<ProjectSection>(['environments', 'variables', 'domains', 'extensions']);
@@ -37,7 +38,7 @@ export function ProjectDetail({ section }: { section: ProjectSection }) {
     }, []);
 
     if (error) return <ErrorState message={`Failed to load project: ${error}`} onRetry={reload} />;
-    if (!project) return <LoadingState label="Loading project…" />;
+    if (!project) return <LoadingState label="Loading project…" layout="detail" />;
 
     const accessClass = accessClasses.find(a => a.id === project.access_class);
     const accessLabel = accessClass?.display_name || project.access_class || '—';
@@ -365,7 +366,7 @@ function ProjectOverview({ project, onUpdated }: { project: Project; onUpdated: 
                 <SectionLabelRow label="Recent deployments" href={projectPath(projectName, 'deployments')} link="View all →" />
                 <Panel className="r-list">
                     {recent.length === 0 ? (
-                        <div className="r-list-empty">No deployments yet. Deploy with <span className="mono">rise deploy</span>.</div>
+                        <div className="r-list-empty"><p>No deployments yet.</p><CommandHint /></div>
                     ) : recent.map(d => (
                         <div
                             key={d.deployment_id}

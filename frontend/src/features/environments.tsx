@@ -422,7 +422,7 @@ export function EnvironmentsSection() {
 /** Compact environment rows for the project overview. */
 export function EnvironmentRows({ states, projectName }: { states: EnvState[]; projectName: string }): React.ReactElement {
     return (
-        <Panel className="r-list">
+        <Panel className="r-list r-environment-stack">
             {states.map(state => {
                 const d = state.live ?? state.latest;
                 const url = envUrl(state);
@@ -431,14 +431,18 @@ export function EnvironmentRows({ states, projectName }: { states: EnvState[]; p
                         key={state.env.name}
                         role="link"
                         tabIndex={0}
-                        className="r-list-row r-env-row-v2"
+                        className={cx('r-list-row r-env-row-v2', state.env.is_production && 'is-production')}
                         onClick={() => navigate(d ? deploymentPath(projectName, d.deployment_id) : projectPath(projectName, 'environments'))}
                         onKeyDown={e => { if (e.key === 'Enter') navigate(d ? deploymentPath(projectName, d.deployment_id) : projectPath(projectName, 'environments')); }}
                     >
-                        <span className="env-name"><EnvironmentIcon color={state.env.color} size={12} />{state.env.name}</span>
+                        <span className="env-name"><EnvironmentIcon color={state.env.color} size={16} />
+                            <span>{state.env.name}<small>{state.env.is_production ? 'Production environment' : 'Environment'}</small></span>
+                        </span>
                         <span className="env-status"><Status {...healthBadge(state)} /></span>
-                        <span className="mono id">{state.live?.deployment_id ?? '—'}</span>
-                        <span className="msg">{state.live ? <DeploymentSource d={state.live} projectName={projectName} /> : 'Not deployed'}</span>
+                        <span className="r-env-deployment">
+                            <span className="msg">{d ? <DeploymentSource d={d} projectName={projectName} /> : 'Not deployed'}</span>
+                            {d && <span className="id">{state.live ? 'Serving' : 'Latest'} · <span className="mono">{d.deployment_id}</span></span>}
+                        </span>
                         {url && (
                             <a className="r-link mono url" href={url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()}>
                                 {stripUrlScheme(url)}

@@ -1,25 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
 import { navigate, useQueryParam } from '../lib/navigation';
-import { Button, Combobox, SearchInput, Segmented } from '../components/r-ui';
-import { ProjectTable } from '../components/project-table';
+import { Button, Combobox, Empty, Panel, SearchInput, Segmented } from '../components/r-ui';
+import { ProjectTable, type AccessClassOption, type ProjectRow } from '../components/project-table';
 import { LoadingState, ErrorState } from '../components/states';
 import { effectiveStatus } from '../lib/project-status';
-
-interface Project {
-    id?: string;
-    name: string;
-    status?: string;
-    active_deployment_id?: string;
-    primary_url?: string;
-    access_class?: string;
-    owner?: { email?: string; name?: string; id?: string };
-    created?: string;
-    updated?: string;
-}
+import { CommandHint } from '../components/command-hint';
 
 export function ProjectsList() {
-    const [projects, setProjects] = useState<Project[] | null>(null);
+    const [projects, setProjects] = useState<ProjectRow[] | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [searchParam, setSearchParam] = useQueryParam('q');
     const search = searchParam || '';
@@ -28,14 +17,15 @@ export function ProjectsList() {
     const statusFilter = statusParam || 'all';
     const setStatusFilter = (v: string) => setStatusParam(v === 'all' ? null : v);
     const [accessFilter, setAccessFilter] = useState('all');
-    const [accessClasses, setAccessClasses] = useState<any[]>([]);
+    const [accessClasses, setAccessClasses] = useState<AccessClassOption[]>([]);
 
     const loadProjects = useCallback(async () => {
         try {
             const data = await api.getProjects();
             setProjects(data);
-        } catch (err: any) {
-            setError(err.message);
+            setError(null);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : 'Unable to load projects');
         }
     }, []);
 
@@ -70,7 +60,7 @@ export function ProjectsList() {
     }, [projects, search, statusFilter, accessFilter]);
 
     if (error) return <ErrorState message={`Failed to load projects: ${error}`} onRetry={loadProjects} />;
-    if (!projects) return <LoadingState label="Loading projects…" />;
+    if (!projects) return <LoadingState label="Loading projects…" layout="table" />;
 
     const owners = new Set(projects.map(p => p.owner?.name ? `team:${p.owner.name}` : null).filter(Boolean));
     const teamCount = owners.size;
@@ -91,7 +81,7 @@ export function ProjectsList() {
     };
 
     return (
-        <section>
+        <section className="r-projects-page">
             <div className="r-page-head">
                 <div className="title-stack">
                     <h1 className="r-page-title">Projects</h1>
@@ -104,46 +94,58 @@ export function ProjectsList() {
                 </Button>
             </div>
 
-            <div className="r-toolbar">
-                <SearchInput value={search} onChange={setSearch} placeholder="Filter by name or owner" style={{ flex: '1 1 220px', maxWidth: 360 }} />
-                <Segmented<string>
-                    value={statusFilter}
-                    options={[
-                        { value: 'all', label: `All ${projects.length}` },
-                        { value: 'healthy', label: `Healthy ${counts.healthy}` },
-                        { value: 'deploying', label: `Deploying ${counts.deploying}` },
-                        { value: 'failed', label: `Failed ${counts.unhealthy}` },
-                        { value: 'stopped', label: `Stopped ${counts.inactive}` },
-                    ]}
-                    onChange={setStatusFilter}
-                />
-                {accessClasses.length > 0 && (
-                    <div style={{ width: 200 }}>
-                        <Combobox
-                            value={accessFilter}
-                            onChange={setAccessFilter}
+            {projects.length === 0 ? (
+                <Panel>
+                    <Empty title="Your first app starts here">
+                        <p>Create a project, then deploy it from your terminal.</p>
+                        <Button variant="primary" icon="plus" onClick={() => navigate('/projects/new')}>Create a project</Button>
+                        <CommandHint command="rise project create my-app" label="Or use the CLI" />
+                    </Empty>
+                </Panel>
+            ) : (
+                <>
+                    <div className="r-projects-toolbar">
+                        <SearchInput value={search} onChange={setSearch} placeholder="Filter by name or owner" />
+                        <Segmented<string>
+                            value={statusFilter}
                             options={[
-                                { value: 'all', label: 'Access: all' },
-                                ...accessClasses.map(ac => ({ value: ac.id, label: `Access: ${ac.display_name}` })),
+                                { value: 'all', label: `All ${projects.length}` },
+                                { value: 'healthy', label: `Healthy ${counts.healthy}` },
+                                { value: 'deploying', label: `Deploying ${counts.deploying}` },
+                                { value: 'failed', label: `Failed ${counts.unhealthy}` },
+                                { value: 'stopped', label: `Stopped ${counts.inactive}` },
                             ]}
-                            placeholder="Access: all"
+                            onChange={setStatusFilter}
                         />
+                        {accessClasses.length > 0 && (
+                            <div className="r-projects-access">
+                                <Combobox
+                                    value={accessFilter}
+                                    onChange={setAccessFilter}
+                                    options={[
+                                        { value: 'all', label: 'Access: all' },
+                                        ...accessClasses.map(ac => ({ value: ac.id, label: `Access: ${ac.display_name}` })),
+                                    ]}
+                                    placeholder="Access: all"
+                                />
+                            </div>
+                        )}
                     </div>
-                )}
-            </div>
 
-            <ProjectTable
-                projects={filtered}
-                accessClasses={accessClasses}
-                onRowClick={(p) => navigate(`/project/${p.name}`)}
-                emptyText="No projects match these filters."
-            />
-            {filtered.length === 0 && (search || statusFilter !== 'all' || accessFilter !== 'all') && (
-                <div style={{ marginTop: 10 }}>
-                    <button type="button" className="r-link-btn" onClick={() => { setSearch(''); setStatusFilter('all'); setAccessFilter('all'); }}>Clear filters</button>
-                </div>
+                    <ProjectTable
+                        projects={filtered}
+                        accessClasses={accessClasses}
+                        onRowClick={(p) => navigate(`/project/${p.name}`)}
+                        emptyText="No projects match these filters."
+                    />
+                    {filtered.length === 0 && (search || statusFilter !== 'all' || accessFilter !== 'all') && (
+                        <div className="r-projects-clear">
+                            <button type="button" className="r-link-btn" onClick={() => { setSearch(''); setStatusFilter('all'); setAccessFilter('all'); }}>Clear filters</button>
+                        </div>
+                    )}
+                    <CommandHint />
+                </>
             )}
-
         </section>
     );
 }

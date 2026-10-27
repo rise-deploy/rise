@@ -103,7 +103,7 @@ export function Home({ user }: HomeProps) {
     }, []);
 
     if (error) return <ErrorState message={`Failed to load workspace: ${error}`} />;
-    if (!projects || !teams) return <LoadingState label="Loading workspace…" />;
+    if (!projects || !teams) return <LoadingState label="Loading workspace…" layout="workspace" />;
 
     const byName = new Map(projects.map(p => [p.name, p]));
     const healthy = projects.filter(p => effectiveStatus(p) === 'Running').length;
