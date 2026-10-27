@@ -314,27 +314,31 @@ and drop whatever the migration created.
 
 ## Rollout Tracking
 
-High-impact, multi-PR, or operator-affecting changes are tracked in the **Rise
-Rollout Tracker** GitHub Project: <https://github.com/orgs/rise-deploy/projects/1>.
-Consult it when planning or reviewing large or breaking work to see in-flight
-workstreams, their phase, and outstanding finalization gates (deferred steps that
-flip a default, drop a compat shim, or tighten a constraint).
+Operator-facing change is recorded in the operator docs **Changelog**
+(`docs/engineering/src/content/docs/changelog/`): its
+[Upcoming releases](docs/engineering/src/content/docs/changelog/index.md) page
+plus one page per released version.
 
-Keep it current as work merges:
-
-- When a PR advances a tracked workstream, add it to the Project, link it from the
-  PR body, and move the item's `Status`. When you defer a finalization step, file
-  it as a `rollout-gate` issue and add it to the Project.
-- Set `Workstream`, `Breaking?`, `Operator impact`, and `Target release` on every
-  item. If `Operator impact` is not `None`, the item is **not** `Done` until the
-  operator [Upgrade Notes](docs/engineering/src/content/docs/upgrade-notes.md) page
-  has a matching entry for that release.
+- A PR that is breaking, needs operator action, or adds or changes
+  configuration adds its entry under **Unreleased** on Upcoming releases in the
+  **same** PR, with the matching impact badge, and carries the
+  `operator-impact` label. CI fails a labelled PR that does not touch the page.
+- `scripts/tag-version.sh` feeds Unreleased into the AI release notes and, for a
+  full release, runs `scripts/changelog-release.sh`: it writes the version's
+  page (release notes plus the Unreleased entries as its upgrade notes) and
+  empties Unreleased. Release candidates get no page of their own.
+- Planned operator-facing change that has not merged — a deferred finalization
+  step (flip a default, drop a compat shim, tighten a constraint) or a known
+  limitation awaiting a fix — is filed as a `rollout-gate` issue **and** listed
+  under **Planned** on Upcoming releases, under its target release or "Not yet
+  scheduled". The PR that lands it moves the entry into Unreleased. Check both
+  when planning or reviewing large or breaking work.
 - `ROADMAP.md` owns the *why*, phase rationale, and milestone checkboxes for every
   in-flight architectural workstream (its numbered sections: generic resource and
   authorization foundation, Rise-issued authentication and token issuance,
   subresource execution, typed-object migration, external controllers and
-  multi-org routing, codebase decomposition). The Project owns *live status*.
-  Don't duplicate rationale into the board, and don't create new
+  multi-org routing, codebase decomposition); open PRs and `rollout-gate`
+  issues show live status. Don't create new
   `<TOPIC>_PLAN.md` / `<TOPIC>_ROADMAP.md` files.
   `ROADMAP.md` §2's *Authentication entry points* table lists every way a
   credential enters Rise and whether it stays or retires; update it with any

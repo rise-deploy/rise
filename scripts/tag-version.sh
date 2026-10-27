@@ -68,6 +68,7 @@ check_prerequisites() {
 DRY_RUN=false
 SKIP_AI_RELEASE_NOTES=false
 AI_GUIDANCE=""
+UPGRADE_NOTES_FILE="docs/engineering/src/content/docs/changelog/index.md"
 VERSION=""
 COMMIT_RANGE=""
 
@@ -176,14 +177,14 @@ if [ "$DRY_RUN" = false ]; then
     fi
 fi
 
+# A full release has no prerelease suffix like -rc1, -beta.2, etc.
+IS_FULL_RELEASE=false
+if ! [[ "$VERSION" =~ - ]]; then
+    IS_FULL_RELEASE=true
+fi
+
 # Determine commit range
 if [ -z "$COMMIT_RANGE" ]; then
-    # Check if this is a full release (no prerelease suffix like -rc1, -beta.2, etc.)
-    IS_FULL_RELEASE=false
-    if ! [[ "$VERSION" =~ - ]]; then
-        IS_FULL_RELEASE=true
-    fi
-
     if [ "$IS_FULL_RELEASE" = true ]; then
         # For full releases, find the previous full version tag (skip prereleases)
         # so the changelog covers everything since the last stable release.
@@ -234,6 +235,22 @@ EOF
         cat >> "$TEMP_PROMPT" << EOF
 Additional guidance:
 ${AI_GUIDANCE}
+
+EOF
+    fi
+
+    # The operator upgrade notes are written alongside each change, so they are
+    # the authoritative account of breaking changes and required actions.
+    UPGRADE_NOTES=$(awk '/^## Unreleased$/{f=1; next} f && /^## /{exit} f' "$UPGRADE_NOTES_FILE")
+    if [ -n "${UPGRADE_NOTES//[[:space:]]/}" ]; then
+        cat >> "$TEMP_PROMPT" << EOF
+The operator upgrade notes below are authoritative for breaking changes and
+required operator actions: carry every Breaking and Action required item from
+them into the release notes, and point readers to the changelog in the
+operator docs for the details.
+
+Upgrade notes:
+${UPGRADE_NOTES}
 
 EOF
     fi
@@ -299,6 +316,9 @@ echo ""
 echo "The following actions will be performed:"
 echo "  1. Update version in Cargo.toml to ${VERSION}"
 echo "  2. Update Cargo.lock"
+if [ "$IS_FULL_RELEASE" = true ]; then
+    echo "     and add the ${VERSION} page to the operator docs changelog"
+fi
 echo "  3. Commit changes with message: 'chore: bump version to ${VERSION}'"
 if [ "$SKIP_AI_RELEASE_NOTES" = true ]; then
     echo "  4. Create git tag: ${TAG} (default annotation, AI notes skipped)"
@@ -335,12 +355,20 @@ sed -i.bak "s/^version: .*/version: ${VERSION}/" helm/rise/Chart.yaml && rm helm
 sed -i.bak "s/^appVersion: .*/appVersion: \"${VERSION}\"/" helm/rise/Chart.yaml && rm helm/rise/Chart.yaml.bak
 
 # Step 2: Update Cargo.lock
-echo "[2/5] Updating Cargo.lock..."
+echo "[2/5] Updating Cargo.lock and the changelog..."
 cargo update --workspace --quiet
+if [ "$IS_FULL_RELEASE" = true ]; then
+    RELEASE_NOTES_FILE=$(mktemp)
+    if [ "$SKIP_AI_RELEASE_NOTES" = false ]; then
+        printf '%s\n' "${RELEASE_SUMMARY}" > "${RELEASE_NOTES_FILE}"
+    fi
+    scripts/changelog-release.sh "${VERSION}" "${RELEASE_NOTES_FILE}"
+    rm "${RELEASE_NOTES_FILE}"
+fi
 
 # Step 3: Commit the changes
 echo "[3/5] Committing version bump..."
-git add Cargo.toml Cargo.lock helm/rise/Chart.yaml
+git add Cargo.toml Cargo.lock helm/rise/Chart.yaml docs/engineering/src/content/docs/changelog
 git commit -m "chore: bump version to ${VERSION}"
 
 # Step 4: Create the tag with AI-generated notes in the annotation

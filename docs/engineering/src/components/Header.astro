@@ -9,6 +9,7 @@ const selectorUrl = process.env.RISE_DOCS_SELECTOR_URL;
 const switchUrl = process.env.RISE_DOCS_SWITCH_URL;
 const switchLabel = process.env.RISE_DOCS_SWITCH_LABEL ?? 'Switch docs';
 const platformUrl = process.env.RISE_DOCS_PLATFORM_URL || undefined;
+const baseUrl = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
 
 <div class="header">
@@ -40,9 +41,12 @@ const platformUrl = process.env.RISE_DOCS_PLATFORM_URL || undefined;
 				</nav>
 			)
 		}
+		<a class="header-link" href={`${baseUrl}/changelog/`}>
+			Changelog
+		</a>
 		<a
-			class="schema-link"
-			href={`${import.meta.env.BASE_URL.replace(/\/$/, '')}/schemas/backend-settings.schema.json`}
+			class="header-link"
+			href={`${baseUrl}/schemas/backend-settings.schema.json`}
 			title="Config JSON Schema"
 			aria-label="Config JSON Schema"
 		>
@@ -119,7 +123,7 @@ const platformUrl = process.env.RISE_DOCS_PLATFORM_URL || undefined;
 			color: var(--sl-color-white);
 		}
 
-		.schema-link {
+		.header-link {
 			display: inline-flex;
 			align-items: center;
 			justify-content: center;
@@ -136,8 +140,8 @@ const platformUrl = process.env.RISE_DOCS_PLATFORM_URL || undefined;
 			background: var(--sl-color-gray-6);
 		}
 
-		.schema-link:hover,
-		.schema-link:focus-visible {
+		.header-link:hover,
+		.header-link:focus-visible {
 			background: var(--sl-color-gray-5);
 			color: var(--sl-color-white);
 		}

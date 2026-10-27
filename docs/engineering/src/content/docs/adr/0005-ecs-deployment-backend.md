@@ -911,8 +911,7 @@ should stop claiming to be Healthy.
 
 **Operator impact:** new install topology, new IAM, new settings variant, new logs
 backend variant. This ADR's implementation requires an
-[Upgrade Notes](../upgrade-notes.md) entry in the release it lands in, and the
-workstream is tracked on the Rise Rollout Tracker.
+[changelog](/operator-docs/changelog/) entry in the release it lands in.
 
 ## Deployment-backend parity
 
