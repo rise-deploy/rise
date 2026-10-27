@@ -10,11 +10,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use tracing::warn;
-
 use crate::backend::DeploymentUrls;
 use crate::custom_domain::validate_custom_domain;
 use crate::group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
+use crate::log_once::warn_once;
 use crate::models::{CustomDomain, Deployment, Environment, Project};
 use crate::providers::{ImageTagType, RegistryProvider};
 
@@ -229,7 +228,8 @@ impl DeploymentUrlBuilder {
                 &dg_host,
                 all_environments,
             ) {
-                warn!(
+                warn_once!(
+                    format!("dg-host-suppressed:{}:{}:{}", project.id, deployment_group, dg_host),
                     project = %project.name,
                     deployment_group = %deployment_group,
                     host = %dg_host,
@@ -352,7 +352,8 @@ impl DeploymentUrlBuilder {
         ) {
             Ok(()) => true,
             Err(reason) => {
-                warn!(
+                warn_once!(
+                    format!("custom-domain-ignored:{}:{}", domain.id, domain.domain),
                     domain_id = %domain.id,
                     project_id = %domain.project_id,
                     domain = %domain.domain,
