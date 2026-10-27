@@ -25,12 +25,14 @@ The CLI resolves a token in this precedence order (verified in `src/cli/token_so
 
 | Priority | Source | What it provides | Exchange? |
 |----------|--------|------------------|-----------|
-| 1 | `RISE_TOKEN` env var | An OIDC JWT minted by your CI (e.g. GitLab `id_tokens`) | Yes — set `RISE_IDENTITY` |
-| 2 | `RISE_TOKEN_COMMAND` env var | A shell command that outputs an OIDC JWT (generic escape hatch) | Yes — set `RISE_IDENTITY` |
+| 1 | `RISE_TOKEN` env var | An explicit bearer token, such as an OIDC JWT minted by your CI | External OIDC: set `RISE_IDENTITY`. Rise-issued: no exchange needed. |
+| 2 | `RISE_TOKEN_COMMAND` env var | A shell command that outputs a bearer token | External OIDC: set `RISE_IDENTITY`. Rise-issued: no exchange needed. |
 | 3 | GitHub Actions OIDC (auto-detected) | OIDC JWT minted on demand by GHA | Yes — set `RISE_IDENTITY` |
 | 4 | Stored login (`rise login`) | A Rise access token from interactive login | No — used directly |
 
-When `RISE_IDENTITY` is set, the resolved token is **exchanged** for a Rise access token bound to that Service Account (RFC 8693, `POST /api/v1/auth/token`). For CI, always set `RISE_IDENTITY` to the service-account email so the OIDC token is exchanged — an OIDC JWT is not a valid Rise access token on its own. The only token used directly (without exchange) is the interactive login token from `rise login`.
+When `RISE_IDENTITY` is set, the resolved token is **exchanged** for a Rise access token bound to that Service Account (RFC 8693, `POST /api/v1/auth/token`). For external OIDC tokens in CI, set `RISE_IDENTITY` to the service-account email.
+
+Sending a raw external token without exchange is deprecated. It still works when the operator enables `auth.allow_raw_external_tokens`; the current default is `true`, with a default of `false` planned for 0.25.0. Interactive login tokens and other already-issued Rise tokens can be used directly without `RISE_IDENTITY`. See [Service accounts](/docs/user-guide/service-accounts/) for the deprecation scope and migration instructions.
 
 | Your CI provider | Token source | Exchange? | Env vars to set |
 |-----------------|-------------|-----------|-----------------|
@@ -179,5 +181,5 @@ The `--job-url` and `--pull-request-url` metadata are auto-detected from `CI_JOB
 - **Forgetting the `aud` claim** — `rise sa create` will reject the command. The `aud` value must match `RISE_GHA_AUDIENCE` (or the GitLab `id_tokens.aud`) in your CI config.
 - **Manually fetching an OIDC token into `RISE_TOKEN` on GitHub Actions** — the CLI mints OIDC tokens itself via auto-detection (just set `id-token: write` and `RISE_GHA_AUDIENCE`). Use `RISE_TOKEN` only for CI providers like GitLab that inject the token via `id_tokens`.
 - **Forgetting `permissions: id-token: write`** in your GitHub Actions workflow — the CLI cannot mint OIDC tokens without it.
-- **Not setting `RISE_IDENTITY` in CI** — an OIDC token from CI is not a valid Rise access token on its own; it must be exchanged. Always set `RISE_IDENTITY` to the service-account email in CI jobs.
+- **Not setting `RISE_IDENTITY` when using an external CI token** — this uses the deprecated raw-token path, which operators can disable. Set `RISE_IDENTITY` to the service-account email to exchange the token.
 - **Deploying to production from a preview job** — prevent this by restricting the preview SA to the `staging` environment only (configured via the web UI or API after creation).

@@ -159,4 +159,4 @@ ID-token claim selected by `auth.idp_group_claim` (`OIDC_GROUP_CLAIM`, default
 `groups`) at login. `RISE_IDP_GROUP_SYNC_PREFIXES` can limit synchronization to
 canonical names under one or more prefixes. Teams users create themselves never
 match, and a group removal in the IdP takes effect on the user's next login. See
-[Roles](/operator-docs/configuration/#authentication-auth) for details.
+[Auth settings](/operator-docs/configuration/#auth-settings) for details.

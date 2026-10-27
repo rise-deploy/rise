@@ -1,0 +1,55 @@
+---
+import { createMarkdownProcessor } from '@astrojs/markdown-remark';
+import { deriveDeprecations, deprecationStatus, lifecycleLabels, lifecycleVersionLabel, changelogChangeLink } from '../../../../scripts/deprecations-data.mjs';
+import { parseChangelogYaml, validateChangelog } from '../../../../scripts/changelog-data.mjs';
+import remarkDocLinks, { resolveDocLink } from '../../../../shared/remark-doc-links.mjs';
+
+const data = import.meta.glob<string>('../../data/changelog/*.yaml', { eager: true, query: '?raw', import: 'default' });
+const documents = validateChangelog(Object.entries(data).map(([filename, source]) => parseChangelogYaml(source, filename)));
+const records = deriveDeprecations(documents);
+const linkOptions = { site: 'engineering', base: import.meta.env.BASE_URL, switchUrl: process.env.RISE_DOCS_SWITCH_URL };
+const processor = await createMarkdownProcessor({ syntaxHighlight: false, remarkPlugins: [[remarkDocLinks, linkOptions]] });
+const rendered = await Promise.all(records.map(async record => ({
+  ...record,
+  status: deprecationStatus(record),
+  availabilityHtml: (await processor.render(record.availability)).code,
+  migrationHtml: (await processor.render(record.migration)).code,
+  events: record.events.map(event => ({ ...event, changeLink: resolveDocLink(changelogChangeLink(event.changeId, documents), linkOptions) })),
+})));
+---
+
+<div class="deprecation-registry">
+  {rendered.map(record => (
+    <section class="deprecation-record" id={record.id}>
+      <header class="deprecation-heading"><h2>{record.title}</h2><span class="deprecation-status" data-status={record.status}>{record.status === 'removed' ? 'Removed' : 'Deprecated · still available'}</span></header>
+      <div class="sl-markdown-content availability" set:html={record.availabilityHtml} />
+      <dl class="lifecycle" aria-label="Feature lifecycle">
+        {record.events.map(event => (
+          <div class="milestone"><dt>{lifecycleLabels[event.kind]}</dt><dd><span class="milestone-version">{lifecycleVersionLabel(event)}</span>{event.date && <time datetime={event.date}>{event.date}</time>}{event.state === 'unknown' && <span class="milestone-context">The first release is not established.</span>}{event.state === 'upcoming' && <span class="milestone-context">Merged; not in a full release.</span>}{event.state === 'unscheduled' && <span class="milestone-context">No version or date announced.</span>}{event.state === 'planned' && <span class="milestone-context">Not yet merged; no release date announced.</span>}{event.firstCandidate && <span class="milestone-context">First candidate: <a href={`https://github.com/rise-deploy/rise/releases/tag/v${event.firstCandidate.version}`}>{event.firstCandidate.version}</a> · {event.firstCandidate.date}</span>}{event.changeLink && <a class="milestone-note" href={event.changeLink}>Release note ↗</a>}</dd></div>
+        ))}
+      </dl>
+      <h3>Migration</h3>
+      <div class="sl-markdown-content migration" set:html={record.migrationHtml} />
+    </section>
+  ))}
+</div>
+
+<style>
+  .deprecation-record { margin:2rem 0; padding-bottom:1.5rem; border-bottom:1px solid var(--rise-line); }
+  .deprecation-heading { display:flex; flex-wrap:wrap; align-items:center; gap:.75rem; margin:0 0 1rem; }
+  .deprecation-heading h2 { margin:0; font-size:1.3rem; line-height:1.5; letter-spacing:-.025em; }
+  .deprecation-status { display:inline-block; margin:0; padding:.2rem .5rem; border-radius:.35rem; background:var(--rise-alert-tint); color:var(--rise-alert); font-size:.7rem; white-space:nowrap; }
+  .deprecation-status[data-status="removed"] { background:var(--rise-red-tint); color:var(--rise-red); }
+  .availability { color:var(--rise-muted); }
+  .availability :global(> :first-child), .migration :global(> :first-child) { margin-top:0; }
+  .lifecycle { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1.25rem 2rem; margin:1.5rem 0 2rem; padding:1.25rem 0; border-block:1px solid var(--rise-line); }
+  .milestone { min-width:0; margin:0; }
+  .milestone dt { margin:0 0 .4rem; color:var(--rise-muted); font-size:.75rem; font-weight:500; }
+  .milestone dd { margin:0; padding:0; font-size:.8rem; line-height:1.8; }
+  .milestone-version { display:block; color:var(--rise-ink); font-size:.9rem; font-weight:600; }
+  .milestone time, .milestone-context, .milestone-note { display:block; margin:.25rem 0 0; font-size:.75rem; color:var(--rise-muted); }
+  .milestone-note { color:var(--rise-accent); }
+  .deprecation-record > h3 { margin:1.5rem 0 .75rem; font-size:1.05rem; }
+  .migration { font-size:.875rem; line-height:1.9; }
+  @media(max-width:40rem) { .lifecycle { grid-template-columns:1fr; } }
+</style>

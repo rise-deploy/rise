@@ -84,5 +84,5 @@ These are *Kubernetes-issued* SA tokens. They are distinct from **Rise workload
 identity tokens** (`/var/run/secrets/rise/identity/`), which are issued and
 signed by Rise itself, describe the Rise project/environment, and are
 configured per project in `.rise.toml`. See the
-[Workload Identity Tokens](../../user-guide/workload-identity-tokens) user guide.
+[Workload Identity Tokens](/docs/user-guide/workload-identity-tokens/) user guide.
 :::

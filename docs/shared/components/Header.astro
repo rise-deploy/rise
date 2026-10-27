@@ -1,0 +1,43 @@
+---
+import Search from '@astrojs/starlight/components/Search.astro';
+import SocialIcons from '@astrojs/starlight/components/SocialIcons.astro';
+import ThemeSelect from '@astrojs/starlight/components/ThemeSelect.astro';
+import MobileMenuToggle from '@astrojs/starlight/components/MobileMenuToggle.astro';
+import strataUrl from '../assets/rise-strata.svg?url';
+import { getSection, hrefFor, sectionsFor } from '../navigation.mjs';
+
+interface Props {
+  site: 'user' | 'engineering';
+}
+
+const { site } = Astro.props;
+const base = import.meta.env.BASE_URL;
+const sections = sectionsFor(site);
+const activeSection = getSection(site, Astro.url.pathname, base);
+---
+
+<div class="rise-docs-header">
+  <div class="rise-docs-mast">
+    <a class="rise-docs-brand" href={hrefFor(base, 'index')} aria-label={`Rise ${site === 'user' ? 'user' : 'operator'} docs home`}>
+      <span class="rise-docs-strata" style={`--rise-strata-image: url("${strataUrl}")`} aria-hidden="true"></span>
+      <span class="rise-docs-wordmark">rise<span>.</span></span>
+      <span class="rise-docs-site-label">{site === 'user' ? 'User docs' : 'Operator docs'}</span>
+    </a>
+    <div class="rise-docs-tools print:hidden">
+      <div class="rise-docs-search"><Search /></div>
+      {Astro.locals.starlightRoute.hasSidebar && <MobileMenuToggle />}
+      <div class="rise-docs-desktop-tools">
+        <SocialIcons />
+        <ThemeSelect />
+      </div>
+    </div>
+  </div>
+  <nav class="rise-docs-sections" aria-label="Documentation sections">
+    {sections.map((section) => (
+      <a href={hrefFor(base, section.slug)} aria-current={section.id === activeSection.id ? 'page' : undefined}>
+        {section.label}
+        {section.wip && <span class="rise-wip" aria-label="Work in progress">WIP</span>}
+      </a>
+    ))}
+  </nav>
+</div>

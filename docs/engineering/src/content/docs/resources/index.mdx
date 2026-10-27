@@ -1,47 +1,33 @@
 ---
-title: "Resources"
-description: "Rise's generic, Kubernetes-style resource substrate: storage model, API, and custom resource registration."
+title: "Resource API"
+description: "The current generic resource implementation and its intended role in extending Rise."
 ---
 
-Rise carries a small generic resource substrate that backs Organizations, ResourceDefinitions, and (eventually) any custom kind an external controller wants to reconcile. The model is intentionally Kubernetes-shaped — typed objects with `apiVersion` / `kind` / `metadata` / `spec` / `status`, controller-owned status keys, finalizer-gated deletion, optimistic concurrency on `revision` — without making Kubernetes itself a dependency.
+The Resource API provides a generic, Kubernetes-shaped model for platform objects and custom resource kinds. This section documents its current capabilities, limitations, and intended role in the evolution of Rise's typed API.
 
-The contract was introduced together with multi-organization support: an Organization is just a built-in root-scoped resource, and the same substrate that stores it can store anything else a controller registers.
+## Current capabilities
 
-## When to use it
+Resources have an `apiVersion`, `kind`, `metadata`, `spec`, and `status`. The generic HTTP API exposes resource collections, individual objects, and status and finalizer subresources under `/api/v1/resources/`.
 
-- **You're writing a controller** that reconciles state outside Kubernetes (Snowflake, ECR, AWS RDS, internal services). Register a `ResourceDefinition`, persist `spec`, write under `status.controllers["your-id"]`. See [Custom Resources](./custom-resources).
-- **You're an operator** managing built-in objects (Organizations, ResourceDefinitions). Use the HTTP API directly. See [HTTP API](./api).
-- **You need to understand storage semantics** — finalizers, cascade deletion, revision conflicts. See [Storage Model](./storage).
+A `ResourceDefinition` registers a custom kind and its JSON Schema. A controller reconciles desired state with an external system, writes its own status, and uses finalizers to coordinate cleanup before deletion. These objects use the same resource storage semantics as built-in kinds.
 
-## What's in scope today
+The storage model includes optimistic concurrency through revisions, owner references, finalizer-gated deletion, and controller-owned status. Access to the HTTP API is evaluated through resource permissions; see the [HTTP API reference](/operator-docs/resources/api/) for authorization and token details.
 
-| Built-in resources | `Organization`, `ResourceDefinition` |
-|---|---|
-| External custom resources | Yes, via `ResourceDefinition` |
-| HTTP API authorization | Live ADR-0001 RBAC per resource; Controller (own status/finalizers) stays allowlist-gated |
-| Status writes by end users | Yes, with `(update, Kind, status)` |
-| Watch / change feed | Not yet — controllers poll `list` |
-| Pagination / selectors | Not yet — `list` returns everything |
-| Version conversion | Storage-version writes only; reads/lists project across served versions |
+## Intended extension model
 
-Authorization is the ADR-0001 engine: every request is one
-`(verb, ResourceKind, subresource?)` decision against the resource's own ancestry
-and effective labels, and authorization-changing writes additionally pass the
-write-time grant gate inside a `SERIALIZABLE` transaction. Operators reach
-everything through the seeded `system-admin` binding; anyone else reaches what a
-binding grants them. `auth.admin_users` are admins on the default Organization
-for typed APIs only and are granted nothing here. Controllers still use a
-dedicated controller-JWT auth context for status/finalizer writes and cannot
-perform CRUD.
+The goal is to move functionality exposed by the typed API toward the generic resource model. An extension would define resource kinds and use a controller to reconcile their desired state with an external service. This provides a common model for defining, authorizing, observing, and deleting the objects managed by an integration.
 
-Bindings naming a `user:` or `group:` subject need `User` and `Group` resources
-to exist, which arrives with identity resolution; until then the subjects that
-reach an ordinary caller are `system:authenticated`, `org:<name>`, and whoever a
-`rise.dev/owner` label names.
+Configuration for the existing project extension providers is documented under [Extend](/operator-docs/extensions/).
 
-## Section guide
+## Current limitations
 
-- [Storage Model](./storage) — the `resources` table, finalizers, cascade deletion, garbage collection, revision/concurrency semantics, organization namespace-prefix behavior.
-- [HTTP API](./api) — path grammar, authorization and the grant gate, request/response envelopes, status and finalizer subresources.
-- [Custom Resources](./custom-resources) — registering a `ResourceDefinition`, schema validation, version lifecycle, controller migration responsibilities.
-- [Schema Reference](./schemas) — generated JSON Schemas for `Resource`, `ResourceMetadata`, `Organization`, `ResourceDefinition`, and the controller status map.
+- Controllers poll for changes; a watch or change-feed API is planned.
+- List pagination and label/field selectors are planned.
+- Writes target the storage version. Served versions do not provide automatic schema conversion; resource and controller authors manage schema migrations.
+
+## Detailed references
+
+- [Storage model](/operator-docs/resources/storage/) — object storage, finalizers, deletion, garbage collection, and revision semantics.
+- [Custom resources](/operator-docs/resources/custom-resources/) — `ResourceDefinition` registration, schema validation, versioning, and controller ownership.
+- [HTTP API](/operator-docs/resources/api/) — resource paths, authorization, request and response envelopes, and subresource operations.
+- [JSON schemas](/operator-docs/resources/schemas/) — generated schemas for resource objects and metadata.

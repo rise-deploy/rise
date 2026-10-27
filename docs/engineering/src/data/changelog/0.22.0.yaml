@@ -1,0 +1,87 @@
+version: 0.22.0
+date: 2026-05-18
+introduction: |-
+  This release adds JFrog Artifactory and AWS S3 as first-class extensions, introduces per-deployment resource configuration, hardens authentication security, and overhauls the documentation site.
+groups:
+  - id: new-features
+    title: New Features
+  - id: bug-fixes
+    title: Bug Fixes
+  - id: breaking-changes
+    title: ⚠️ Breaking Changes
+  - id: dependency-updates
+    title: Dependency Updates
+changes:
+  - id: v0-22-0-001
+    title: JFrog Artifactory registry support
+    group: new-features
+    type: feature
+    details: |-
+      — mint scoped, short-lived credentials for image push and Kubernetes pull secrets via JFrog's access token API or a Vault plugin. Separate push/pull TTLs, per-project scope isolation, and pull credential caching included.
+  - id: v0-22-0-002
+    title: AWS S3 bucket extension
+    group: new-features
+    type: feature
+    details: |-
+      — automatically provisions a dedicated S3 bucket and scoped IAM credentials per project, injected as environment variables. Supports `DeletionBlocked` state when a bucket is non-empty, with opt-in `force_empty_bucket` for safe teardown.
+  - id: v0-22-0-003
+    title: Configurable deployment replicas and resources
+    group: new-features
+    type: feature
+    details: |-
+      — set `replicas`, `cpu`, and `memory` in `rise.toml` or via `--replicas`/`--cpu`/`--memory` CLI flags. Admins can set per-environment min/max constraints; values are validated at deployment time.
+  - id: v0-22-0-004
+    title: Starlight documentation sites
+    group: new-features
+    type: feature
+    details: |-
+      — user and engineering docs now live at `docs/user` and `docs/engineering` with improved structure and navigation.
+  - id: v0-22-0-005
+    title: "`rise backend rise-toml-schema` CLI command"
+    group: new-features
+    type: feature
+    details: |-
+      — generates the `rise-toml-v1.schema.json` directly; the old `/api/v1/schema/rise-toml/v1` endpoint now redirects (301) to `/docs/schemas/rise-toml-v1.schema.json`.
+  - id: v0-22-0-006
+    title: "Auth: cookies scoped to exact host"
+    group: bug-fixes
+    type: fix
+    details: |-
+      — cookies no longer carry a `Domain` attribute, preventing cross-subdomain leakage between the Rise API and app subdomains. Ingress auth flows now always redirect through `/.rise/auth/complete` on the app's own domain.
+  - id: v0-22-0-007
+    title: "Auth: ingress JWTs now carry the correct `aud` claim"
+    group: bug-fixes
+    type: fix
+    details: |-
+      — private-app JWTs previously used the Rise server URL as audience; they now use the app's own URL. API middleware rejects RS256 ingress tokens, preventing them from authenticating API calls.
+  - id: v0-22-0-008
+    title: AWS error detection
+    group: bug-fixes
+    type: fix
+    details: |-
+      — replaced brittle string-matching on formatted error types with typed AWS SDK error variants across S3 and RDS extension providers.
+  - id: v0-22-0-009
+    title: "`cookie_domain` setting repurposed"
+    group: breaking-changes
+    impact: breaking
+    details: |-
+      — this field no longer sets the `Domain` attribute on new cookies. It is now used only to clear stale domain-scoped cookies during migration. Existing configs continue to work, but cross-subdomain cookie sharing via `cookie_domain` is no longer supported.
+  - id: v0-22-0-010
+    title: Legacy Metacontroller adoption code removed
+    group: breaking-changes
+    impact: breaking
+    backends: [ kubernetes ]
+    details: |-
+      — the `legacy_adopt_existing_resources_to_metacontroller` backend setting and `adoptExistingResources` Helm value have been removed. Clusters that still rely on this one-time migration path must complete the migration before upgrading.
+  - id: v0-22-0-011
+    title: Registry credentials endpoint moved
+    group: breaking-changes
+    impact: breaking
+    details: |-
+      — credentials are now fetched from `GET /projects/{name}/deployments/{id}/registry-credentials` (scoped to Pending/Building/Pushing states) instead of the old project-scoped endpoint. Older CLI versions fall back to credentials in `CreateDeploymentResponse`, which is now deprecated.
+  - id: v0-22-0-012
+    title: Dependency updates
+    group: dependency-updates
+    type: maintenance
+    details: |-
+      Routine updates to tokio, openssl, aws-sdk-s3/s3-js, jsonwebtoken, tailwindcss 4.3, vite 8, react 19.2, pack 0.40.6, gunicorn 26, and several other crates and npm packages.

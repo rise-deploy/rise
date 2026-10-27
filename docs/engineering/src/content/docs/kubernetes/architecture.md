@@ -49,7 +49,7 @@ Each deployment group gets its own Service and Ingress with a unique URL:
 | `default` | `production_ingress_url_template` | `my-app.apps.rise.local` |
 | Custom groups | `staging_ingress_url_template` | `my-app--mr--26.preview.rise.local` |
 
-**Environments and URL routing**: [Environments](../../user-guide/environments) layer on top of deployment groups to control which URL template applies. The environment marked as **production** determines which deployments receive the production URL (via `production_ingress_url_template`). All other deployments — regardless of their group name — use the staging URL template. Custom domains also attach to production environment deployments only. See [user-guide/environments](../../user-guide/environments) for how to create and configure environments.
+**Environments and URL routing**: [Environments](/docs/user-guide/environments/) layer on top of deployment groups to control which URL template applies. The environment marked as **production** determines which deployments receive the production URL (via `production_ingress_url_template`). All other deployments — regardless of their group name — use the staging URL template. Custom domains also attach to production environment deployments only. See the [environments guide](/docs/user-guide/environments/) for how to create and configure environments.
 
 ## Hostnames
 

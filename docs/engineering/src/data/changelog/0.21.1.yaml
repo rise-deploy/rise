@@ -1,0 +1,15 @@
+version: 0.21.1
+date: 2026-05-04
+introduction: |-
+  **Overview:** A single bug fix addressing network connectivity issues with ingress controllers.
+groups:
+  - id: bug-fixes
+    title: Bug Fixes
+changes:
+  - id: v0-21-1-001
+    title: Fix NetworkPolicy blocking ingress traffic
+    group: bug-fixes
+    type: fix
+    backends: [ kubernetes ]
+    details: |-
+      — Updated the NetworkPolicy to allow ingress controller traffic to reach the main HTTP port, resolving potential connectivity issues where applications were unreachable despite correct ingress configuration. (#262)

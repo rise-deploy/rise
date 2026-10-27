@@ -41,6 +41,12 @@ check_prerequisites() {
         missing+=("cargo")
     fi
 
+    if ! command -v node &> /dev/null; then
+        missing+=("node")
+    elif ! node -e 'require.resolve("yaml", { paths: ["docs"] })' &> /dev/null; then
+        missing+=("docs dependencies (run npm ci --prefix docs)")
+    fi
+
     if [ "$SKIP_AI_RELEASE_NOTES" = false ] && ! select_release_notes_ai; then
         if [ "$RELEASE_NOTES_AI" = "auto" ]; then
             missing+=("claude or codex (AI release notes CLI)")
@@ -68,7 +74,6 @@ check_prerequisites() {
 DRY_RUN=false
 SKIP_AI_RELEASE_NOTES=false
 AI_GUIDANCE=""
-UPGRADE_NOTES_FILE="docs/engineering/src/content/docs/changelog/index.md"
 VERSION=""
 COMMIT_RANGE=""
 
@@ -241,7 +246,7 @@ EOF
 
     # The operator upgrade notes are written alongside each change, so they are
     # the authoritative account of breaking changes and required actions.
-    UPGRADE_NOTES=$(awk '/^## Unreleased$/{f=1; next} f && /^## /{exit} f' "$UPGRADE_NOTES_FILE")
+    UPGRADE_NOTES=$(node docs/scripts/changelog-release.mjs --unreleased)
     if [ -n "${UPGRADE_NOTES//[[:space:]]/}" ]; then
         cat >> "$TEMP_PROMPT" << EOF
 The operator upgrade notes below are authoritative for breaking changes and
@@ -368,7 +373,7 @@ fi
 
 # Step 3: Commit the changes
 echo "[3/5] Committing version bump..."
-git add Cargo.toml Cargo.lock helm/rise/Chart.yaml docs/engineering/src/content/docs/changelog
+git add Cargo.toml Cargo.lock helm/rise/Chart.yaml docs/engineering/src/content/docs/changelog docs/engineering/src/data/changelog
 git commit -m "chore: bump version to ${VERSION}"
 
 # Step 4: Create the tag with AI-generated notes in the annotation
