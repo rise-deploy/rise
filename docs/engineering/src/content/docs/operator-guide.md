@@ -26,5 +26,5 @@ Upgrading from a release that predates this model recreates the K8s resources
 for every running deployment on the first reconcile: each app's Deployment and
 Service are renamed and the ingress backend moves, so **every app restarts once**.
 Existing container images are reused (the synthesized `app` pulls the
-deployment's existing image tag — nothing is rebuilt), and both subdomain and
-sub-path routing are preserved. Schedule a maintenance window for the upgrade.
+deployment's existing image tag — nothing is rebuilt), and routing is
+preserved. Schedule a maintenance window for the upgrade.

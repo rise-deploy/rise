@@ -359,7 +359,7 @@
             },
             "environment_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for named environments (e.g., staging, dev)\nOnly used for non-production environments whose primary deployment group matches\nthe deployment's group. Production environments use `production_ingress_url_template`.\nSupports both subdomain and sub-path routing:\n  Subdomain: \"{environment}--{project_name}.apps.rise.dev\"\n  Sub-path: \"rise.dev/{project_name}/{environment}\"\nMust contain both {project_name} and {environment} placeholders\nIf not set, environment-specific URLs are not generated.",
+              "description": "Ingress URL template for named environments (e.g., staging, dev)\nOnly used for non-production environments whose primary deployment group matches\nthe deployment's group. Production environments use `production_ingress_url_template`.\ne.g. \"{environment}--{project_name}.apps.rise.dev\"\nMust be a hostname containing both {project_name} and {environment}\nIf not set, environment-specific URLs are not generated.",
               "type": [
                 "string",
                 "null"
@@ -504,12 +504,12 @@
               "type": "boolean"
             },
             "production_ingress_url_template": {
-              "description": "Ingress URL template for production (default) deployment group\nSupports both subdomain and sub-path routing:\n  Subdomain: \"{project_name}.apps.rise.dev\"\n  Sub-path: \"rise.dev/{project_name}\"\nMust contain {project_name} placeholder",
+              "description": "Ingress URL template for production (default) deployment group,\ne.g. \"{project_name}.apps.rise.dev\"\nMust be a hostname (no scheme, port or path) containing {project_name}",
               "type": "string"
             },
             "staging_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for staging (non-default) deployment groups\nSupports both subdomain and sub-path routing:\n  Subdomain: \"{project_name}-{deployment_group}.preview.rise.dev\"\n  Sub-path: \"rise.dev/{project_name}/{deployment_group}\"\nMust contain both {project_name} and {deployment_group} placeholders\nIf not set, falls back to inserting \"-{deployment_group}\" before first dot",
+              "description": "Ingress URL template for staging (non-default) deployment groups,\ne.g. \"{project_name}-{deployment_group}.preview.rise.dev\"\nMust be a hostname containing both {project_name} and {deployment_group}\nIf not set, falls back to inserting \"-{deployment_group}\" before first dot",
               "type": [
                 "string",
                 "null"
