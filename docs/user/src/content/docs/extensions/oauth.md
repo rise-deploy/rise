@@ -10,7 +10,7 @@ OAuth providers require pre-registering every allowed redirect URI. A Rise proje
 
 - **Production**: `my-app.apps.rise.example.com`
 - **Staging environment**: `staging--my-app.preview.rise.example.com`
-- **Preview deployments**: `my-app-mr--26.preview.rise.example.com` (created dynamically per branch/MR)
+- **Preview deployments**: `my-app--mr--26.preview.rise.example.com` (created dynamically per branch/MR)
 - **Local development**: `http://localhost:3000`
 
 Registering all of these at the OAuth provider is impractical, especially for preview URLs that are generated on demand. The OAuth extension solves this by making Rise the single registered redirect URI. Your application redirects users to Rise's authorize endpoint; Rise redirects to the upstream provider using Rise's own callback URL; after authentication, Rise forwards back to whichever app URL initiated the request.

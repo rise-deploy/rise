@@ -141,6 +141,44 @@ pub fn project_route_targets(
     Ok(targets)
 }
 
+/// Keep every public host routed to one project only.
+///
+/// The host-template rule (`rise_backend_core::host_template`) makes each
+/// project's hosts its own, but a project named before project names lost
+/// `--` can still render a host another project also renders. Traefik would
+/// then split that host's traffic, and its auth decisions, between two
+/// tenants. Fail closed instead: the first project in `targets` to claim a
+/// host keeps it, and later projects' routes lose it. Pass targets oldest
+/// project first, so a newer project can never take an existing one's host.
+pub fn withhold_shared_hosts(targets: Vec<DynamicRouteTarget>) -> Vec<DynamicRouteTarget> {
+    let mut owners: BTreeMap<String, String> = BTreeMap::new();
+    targets
+        .into_iter()
+        .map(|mut target| {
+            for route in &mut target.routes {
+                route.hosts.retain(|host| {
+                    let owner = owners
+                        .entry(host.clone())
+                        .or_insert_with(|| target.project.clone());
+                    if *owner == target.project {
+                        true
+                    } else {
+                        tracing::warn!(
+                            host = %host,
+                            project = %target.project,
+                            owner = %owner,
+                            deployment_group = %target.deployment_group,
+                            "Not routing a host another project already routes"
+                        );
+                        false
+                    }
+                });
+            }
+            target
+        })
+        .collect()
+}
+
 pub fn render_dynamic_route_targets(
     targets: impl IntoIterator<Item = DynamicRouteTarget>,
     cfg: &TraefikRenderConfig<'_>,
@@ -270,6 +308,63 @@ mod tests {
         }
     }
 
+    fn target(project: &str, group: &str, hosts: &[&str]) -> DynamicRouteTarget {
+        DynamicRouteTarget {
+            project: project.to_string(),
+            access_class: "public".to_string(),
+            deployment_group: group.to_string(),
+            deployment_id: format!("{project}-{group}-1"),
+            container: "app".to_string(),
+            port: Some(8080),
+            routes: vec![DesiredRoute {
+                hosts: hosts.iter().map(|host| host.to_string()).collect(),
+                path_prefix: Some("/".to_string()),
+                access: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_host_stays_with_the_first_project_that_routes_it() {
+        // `x--y` was named before project names lost `--`: its production
+        // host is also project `y`'s preview host for group `x`.
+        let targets = withhold_shared_hosts(vec![
+            target("x--y", "default", &["x--y.example.test"]),
+            target("y", "x", &["x--y.example.test", "pr.example.org"]),
+            target("y", "default", &["y.example.test"]),
+        ]);
+        let hosts: Vec<(&str, &str, Vec<&str>)> = targets
+            .iter()
+            .map(|t| {
+                (
+                    t.project.as_str(),
+                    t.deployment_group.as_str(),
+                    t.routes[0].hosts.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                ("x--y", "default", vec!["x--y.example.test"]),
+                ("y", "x", vec!["pr.example.org"]),
+                ("y", "default", vec!["y.example.test"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_project_may_route_a_host_from_several_targets() {
+        // A multi-container deployment repeats its hosts per container.
+        let targets = withhold_shared_hosts(vec![
+            target("app", "default", &["app.example.test"]),
+            target("app", "default", &["app.example.test"]),
+        ]);
+        assert!(targets
+            .iter()
+            .all(|t| t.routes[0].hosts == vec!["app.example.test".to_string()]));
+    }
+
     #[test]
     fn router_name_stays_stable_while_service_follows_deployment() {
         let classes = HashMap::from([("public".to_string(), AccessRequirement::None)]);
@@ -367,12 +462,12 @@ mod tests {
                 .find(|rule| rule.contains(&format!("Host(`{host}`)")))
                 .unwrap_or_else(|| panic!("no router for {host}"))
         };
-        let production_rule = rule_for("docs-app-default.preview.example.test");
+        let production_rule = rule_for("docs-app--default.preview.example.test");
         assert!(production_rule.contains("Host(`docs-app.example.test`)"));
         assert!(production_rule.contains("Host(`docs.customer.com`)"));
         for preview in [
-            "docs-app-pr--123.preview.example.test",
-            "docs-app-pr--124.preview.example.test",
+            "docs-app--pr--123.preview.example.test",
+            "docs-app--pr--124.preview.example.test",
         ] {
             assert!(!rule_for(preview).contains("docs.customer.com"));
         }

@@ -294,16 +294,16 @@ impl RegistryProvider for TestRegistryProvider {
 }
 
 /// A URL builder with production template `{project_name}.example.test`,
-/// staging template `{project_name}-{deployment_group}.preview.example.test`
-/// and environment template `{project_name}-{environment}.example.test`.
+/// staging template `{project_name}--{deployment_group}.preview.example.test`
+/// and environment template `{project_name}--{environment}.example.test`.
 pub fn url_builder() -> DeploymentUrlBuilder {
     DeploymentUrlBuilder {
         production_ingress_url_template: "{project_name}.example.test".to_string(),
         staging_ingress_url_template: Some(
-            "{project_name}-{deployment_group}.preview.example.test".to_string(),
+            "{project_name}--{deployment_group}.preview.example.test".to_string(),
         ),
         environment_ingress_url_template: Some(
-            "{project_name}-{environment}.example.test".to_string(),
+            "{project_name}--{environment}.example.test".to_string(),
         ),
         ingress_port: None,
         ingress_schema: "https".to_string(),

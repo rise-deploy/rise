@@ -47,7 +47,7 @@ Each deployment group gets its own Service and Ingress with a unique URL:
 | Group | URL Pattern | Example |
 |-------|-------------|---------|
 | `default` | `production_ingress_url_template` | `my-app.apps.rise.local` |
-| Custom groups | `staging_ingress_url_template` | `my-app-mr--26.preview.rise.local` |
+| Custom groups | `staging_ingress_url_template` | `my-app--mr--26.preview.rise.local` |
 
 **Environments and URL routing**: [Environments](../../user-guide/environments) layer on top of deployment groups to control which URL template applies. The environment marked as **production** determines which deployments receive the production URL (via `production_ingress_url_template`). All other deployments — regardless of their group name — use the staging URL template. Custom domains also attach to production environment deployments only. See [user-guide/environments](../../user-guide/environments) for how to create and configure environments.
 
@@ -57,7 +57,7 @@ Every URL template is a hostname pattern, so each project (and each deployment
 group and environment) gets a host of its own:
 
 - Production: `{project_name}.apps.rise.local`
-- Staging: `{project_name}-{deployment_group}.preview.rise.local`
+- Staging: `{project_name}--{deployment_group}.preview.rise.local`
 - Ingress paths are the app's own routes (`/` by default, `Prefix` type); no path rewriting
 - Requires a wildcard TLS certificate (e.g., `*.apps.rise.example.com` and `*.preview.rise.example.com`) — see [Custom Domains](custom-domains) for cert-manager setup
 

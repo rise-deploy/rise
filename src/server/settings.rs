@@ -1179,9 +1179,11 @@ pub enum DeploymentControllerSettings {
         production_ingress_url_template: String,
 
         /// Ingress URL template for staging (non-default) deployment groups,
-        /// e.g. "{project_name}-{deployment_group}.preview.rise.dev"
-        /// Must be a hostname containing both {project_name} and {deployment_group}
-        /// If not set, falls back to inserting "-{deployment_group}" before first dot
+        /// e.g. "{deployment_group}--{project_name}.preview.rise.dev"
+        /// Must be a hostname joining {project_name} and {deployment_group} with
+        /// "--" (see the Configuration docs for the full rule)
+        /// If not set, {project_name} in the production template becomes
+        /// "{project_name}--{deployment_group}"
         #[serde(default)]
         staging_ingress_url_template: Option<String>,
 
@@ -1189,7 +1191,8 @@ pub enum DeploymentControllerSettings {
         /// Only used for non-production environments whose primary deployment group matches
         /// the deployment's group. Production environments use `production_ingress_url_template`.
         /// e.g. "{environment}--{project_name}.apps.rise.dev"
-        /// Must be a hostname containing both {project_name} and {environment}
+        /// Must be a hostname joining {project_name} and {environment} with "--",
+        /// on the same side as the staging template
         /// If not set, environment-specific URLs are not generated.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
@@ -1394,12 +1397,12 @@ pub enum DeploymentControllerSettings {
         production_ingress_url_template: String,
 
         /// Ingress URL template for staging (non-default) deployment groups.
-        /// Must contain both `{project_name}` and `{deployment_group}`.
+        /// Must join `{project_name}` and `{deployment_group}` with `--`.
         #[serde(default)]
         staging_ingress_url_template: Option<String>,
 
         /// Ingress URL template for named environments.
-        /// Must contain both `{project_name}` and `{environment}`.
+        /// Must join `{project_name}` and `{environment}` with `--`.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
 
@@ -1691,12 +1694,12 @@ pub enum DeploymentControllerSettings {
         production_ingress_url_template: String,
 
         /// Ingress URL template for staging (non-default) deployment groups.
-        /// Must contain both `{project_name}` and `{deployment_group}`.
+        /// Must join `{project_name}` and `{deployment_group}` with `--`.
         #[serde(default)]
         staging_ingress_url_template: Option<String>,
 
         /// Ingress URL template for named environments.
-        /// Must contain both `{project_name}` and `{environment}`.
+        /// Must join `{project_name}` and `{environment}` with `--`.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
 
@@ -2588,7 +2591,9 @@ impl Settings {
     }
 
     /// Validate the three ingress URL templates every deployment controller
-    /// carries: each must name its placeholders and resolve to a bare hostname.
+    /// carries: each must name its placeholders and resolve to a bare
+    /// hostname, and together they must keep every project's hosts its own
+    /// (see `rise_backend_core::host_template`).
     fn validate_ingress_templates(
         production: &str,
         staging: Option<&str>,
@@ -2613,6 +2618,9 @@ impl Settings {
                 &["{project_name}", "{environment}"],
             )?;
         }
+        #[cfg(feature = "backend")]
+        rise_backend_core::host_template::check_ingress_templates(production, staging, environment)
+            .map_err(|reason| ConfigError::Message(format!("deployment_controller: {reason}")))?;
         Ok(())
     }
 
@@ -2784,7 +2792,7 @@ mod tests {
     fn ingress_templates_must_be_host_only() {
         assert!(Settings::validate_ingress_templates(
             "{project_name}.apps.example.com",
-            Some("{project_name}-{deployment_group}.preview.example.com"),
+            Some("{deployment_group}--{project_name}.preview.example.com"),
             Some("{environment}--{project_name}.apps.example.com"),
         )
         .is_ok());

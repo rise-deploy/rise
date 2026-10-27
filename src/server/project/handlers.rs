@@ -63,6 +63,12 @@ pub fn validate_project_name(
     if !starts_ok || !ends_ok {
         return Err("must start and end with a letter or digit".to_string());
     }
+    // `--` separates the project from its deployment group or environment in
+    // preview hostnames (`{deployment_group}--{project_name}`), so a project
+    // name containing it could claim another project's preview host.
+    if name.contains("--") {
+        return Err("must not contain consecutive hyphens ('--')".to_string());
+    }
     if reserved_project_names.contains(name) {
         return Err("is reserved for a control-plane hostname".to_string());
     }
@@ -1290,6 +1296,7 @@ mod tests {
             "-app",   // leading hyphen
             "app-",   // trailing hyphen
             "app_1",  // underscore
+            "a--b",   // the preview-host separator
         ] {
             assert!(
                 validate_project_name(bad, &reserved).is_err(),

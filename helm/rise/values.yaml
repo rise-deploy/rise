@@ -302,7 +302,7 @@ config:
   #   kubeconfig: ""  # Optional: Path to kubeconfig (defaults to in-cluster config)
   #   ingress_class: "nginx"
   #   production_ingress_url_template: "{project_name}.apps.rise.dev"  # Must contain {project_name}
-  #   staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.dev"  # Optional, must contain {project_name} and {deployment_group}
+  #   staging_ingress_url_template: "{project_name}--{deployment_group}.preview.rise.dev"  # Optional, must contain {project_name} and {deployment_group}
   #   auth_backend_url: "http://rise-backend.default.svc.cluster.local:3000"  # Internal cluster URL for Nginx auth
   #   auth_signin_url: "https://rise.dev"  # Public URL for browser redirects
   #   namespace_labels: {}  # Optional: Labels for managed namespaces

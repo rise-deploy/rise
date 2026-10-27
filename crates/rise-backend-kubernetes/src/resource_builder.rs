@@ -2496,7 +2496,7 @@ mod tests {
             builder
                 .url_builder
                 .resolved_deployment_group_url(&project, "mr-42"),
-            Some("demo-mr-42.example.test".to_string())
+            Some("demo--mr-42.example.test".to_string())
         );
     }
 
@@ -2504,19 +2504,19 @@ mod tests {
     fn dg_host_uses_staging_template_when_set() {
         let mut builder = test_resource_builder();
         builder.url_builder.staging_ingress_url_template =
-            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+            Some("{project_name}--{deployment_group}.preview.example.test".to_string());
         let project = test_project();
         assert_eq!(
             builder
                 .url_builder
                 .resolved_deployment_group_url(&project, "default"),
-            Some("demo-default.preview.example.test".to_string())
+            Some("demo--default.preview.example.test".to_string())
         );
         assert_eq!(
             builder
                 .url_builder
                 .resolved_deployment_group_url(&project, "mr/42"),
-            Some("demo-mr--42.preview.example.test".to_string())
+            Some("demo--mr--42.preview.example.test".to_string())
         );
     }
 
@@ -2524,7 +2524,7 @@ mod tests {
     fn primary_hosts_default_group_prod_env_includes_production_and_custom() {
         let mut builder = test_resource_builder();
         builder.url_builder.staging_ingress_url_template =
-            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+            Some("{project_name}--{deployment_group}.preview.example.test".to_string());
         let project = test_project();
         let prod_env = test_environment("production", true, "default");
         let domains = vec![test_custom_domain("api.example.com", true)];
@@ -2539,7 +2539,7 @@ mod tests {
         );
         let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
 
-        assert!(host_strs.contains(&"demo-default.preview.example.test"));
+        assert!(host_strs.contains(&"demo--default.preview.example.test"));
         assert!(host_strs.contains(&"demo.example.test"));
         assert!(host_strs.contains(&"api.example.com"));
     }
@@ -2548,7 +2548,7 @@ mod tests {
     fn primary_hosts_non_default_group_with_staging_env() {
         let mut builder = test_resource_builder();
         builder.url_builder.staging_ingress_url_template =
-            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+            Some("{project_name}--{deployment_group}.preview.example.test".to_string());
         builder.url_builder.environment_ingress_url_template =
             Some("{environment}.{project_name}.example.test".to_string());
         let project = test_project();
@@ -2561,7 +2561,7 @@ mod tests {
         assert_eq!(
             host_strs,
             vec![
-                "demo-mr-42.preview.example.test",
+                "demo--mr-42.preview.example.test",
                 "staging.demo.example.test"
             ]
         );
@@ -2585,12 +2585,12 @@ mod tests {
     fn primary_hosts_no_env_returns_only_dg_host() {
         let mut builder = test_resource_builder();
         builder.url_builder.staging_ingress_url_template =
-            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+            Some("{project_name}--{deployment_group}.preview.example.test".to_string());
         let project = test_project();
 
         let hosts = builder.primary_ingress_hosts(&project, "mr-42", None, &[], false, &[]);
         let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
-        assert_eq!(host_strs, vec!["demo-mr-42.preview.example.test"]);
+        assert_eq!(host_strs, vec!["demo--mr-42.preview.example.test"]);
     }
 
     #[test]
@@ -2646,7 +2646,7 @@ mod tests {
     fn create_primary_ingress_emits_multiple_rules_and_tls_entries() {
         let mut builder = test_resource_builder();
         builder.url_builder.staging_ingress_url_template =
-            Some("{project_name}-{deployment_group}.preview.example.test".to_string());
+            Some("{project_name}--{deployment_group}.preview.example.test".to_string());
         builder.ingress_tls_secret_name = Some("shared-wildcard".to_string());
         builder.access_classes.insert(
             "default".to_string(),
@@ -2682,7 +2682,7 @@ mod tests {
         let spec = ingress.spec.as_ref().expect("spec");
         let rules = spec.rules.as_ref().expect("rules");
         let hosts: Vec<String> = rules.iter().filter_map(|r| r.host.clone()).collect();
-        assert!(hosts.contains(&"demo-default.preview.example.test".to_string()));
+        assert!(hosts.contains(&"demo--default.preview.example.test".to_string()));
         assert!(hosts.contains(&"demo.example.test".to_string()));
         assert!(hosts.contains(&"api.example.com".to_string()));
 

@@ -26,6 +26,7 @@ pub mod events;
 pub mod expiration;
 pub mod group;
 pub mod health_path;
+pub mod host_template;
 pub mod identity;
 pub mod labels;
 pub mod lifecycle;

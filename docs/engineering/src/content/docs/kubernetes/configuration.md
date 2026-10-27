@@ -18,7 +18,7 @@ kubernetes:
 
   # Optional: Ingress URL template for staging (non-default) deployment groups
   # Must contain both {project_name} and {deployment_group} placeholders
-  staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
+  staging_ingress_url_template: "{project_name}--{deployment_group}.preview.rise.local"
 
   # Custom domain TLS mode
   # - "per-domain": Each custom domain gets its own tls-{domain} secret (for cert-manager)

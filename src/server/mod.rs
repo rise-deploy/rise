@@ -636,8 +636,11 @@ async fn build_traefik_dynamic_config(
     let mut custom_domains =
         crate::db::custom_domains::get_custom_domains_batch(&state.db_pool, &owned_ids).await?;
 
+    // Oldest project first (`find_by_ids` returns newest first), so
+    // `withhold_shared_hosts` lets an existing project keep a host a newer one
+    // also renders.
     let mut targets = Vec::new();
-    for project in &projects {
+    for project in projects.iter().rev() {
         let deployments = deployments_by_project
             .remove(&project.id)
             .unwrap_or_default();
@@ -656,7 +659,7 @@ async fn build_traefik_dynamic_config(
     }
 
     Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
-        targets,
+        rise_backend_traefik::dynamic::withhold_shared_hosts(targets),
         &render_config,
         provider.native_provider,
     ))

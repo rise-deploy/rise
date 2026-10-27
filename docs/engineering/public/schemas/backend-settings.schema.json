@@ -359,7 +359,7 @@
             },
             "environment_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for named environments (e.g., staging, dev)\nOnly used for non-production environments whose primary deployment group matches\nthe deployment's group. Production environments use `production_ingress_url_template`.\ne.g. \"{environment}--{project_name}.apps.rise.dev\"\nMust be a hostname containing both {project_name} and {environment}\nIf not set, environment-specific URLs are not generated.",
+              "description": "Ingress URL template for named environments (e.g., staging, dev)\nOnly used for non-production environments whose primary deployment group matches\nthe deployment's group. Production environments use `production_ingress_url_template`.\ne.g. \"{environment}--{project_name}.apps.rise.dev\"\nMust be a hostname joining {project_name} and {environment} with \"--\",\non the same side as the staging template\nIf not set, environment-specific URLs are not generated.",
               "type": [
                 "string",
                 "null"
@@ -509,7 +509,7 @@
             },
             "staging_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for staging (non-default) deployment groups,\ne.g. \"{project_name}-{deployment_group}.preview.rise.dev\"\nMust be a hostname containing both {project_name} and {deployment_group}\nIf not set, falls back to inserting \"-{deployment_group}\" before first dot",
+              "description": "Ingress URL template for staging (non-default) deployment groups,\ne.g. \"{deployment_group}--{project_name}.preview.rise.dev\"\nMust be a hostname joining {project_name} and {deployment_group} with\n\"--\" (see the Configuration docs for the full rule)\nIf not set, {project_name} in the production template becomes\n\"{project_name}--{deployment_group}\"",
               "type": [
                 "string",
                 "null"
@@ -615,7 +615,7 @@
             },
             "environment_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "description": "Ingress URL template for named environments.\nMust join `{project_name}` and `{environment}` with `--`.",
               "type": [
                 "string",
                 "null"
@@ -678,7 +678,7 @@
             },
             "staging_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust join `{project_name}` and `{deployment_group}` with `--`.",
               "type": [
                 "string",
                 "null"
@@ -807,7 +807,7 @@
             },
             "environment_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for named environments.\nMust contain both `{project_name}` and `{environment}`.",
+              "description": "Ingress URL template for named environments.\nMust join `{project_name}` and `{environment}` with `--`.",
               "type": [
                 "string",
                 "null"
@@ -939,7 +939,7 @@
             },
             "staging_ingress_url_template": {
               "default": null,
-              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust contain both `{project_name}` and `{deployment_group}`.",
+              "description": "Ingress URL template for staging (non-default) deployment groups.\nMust join `{project_name}` and `{deployment_group}` with `--`.",
               "type": [
                 "string",
                 "null"
