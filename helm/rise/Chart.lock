@@ -1,12 +1,12 @@
 dependencies:
 - name: metacontroller-helm
   repository: oci://ghcr.io/metacontroller
-  version: 4.17.2
+  version: 4.17.6
 - name: loki
   repository: https://grafana.github.io/helm-charts
   version: 7.3.0
 - name: alloy
   repository: https://grafana.github.io/helm-charts
   version: 1.14.3
-digest: sha256:349db1c5efb921898b22809548fa9b71ea656c0d240c73596bfde3bb58903eb5
-generated: "2026-10-24T13:56:53.183158-05:00"
+digest: sha256:e47b85715e90b47d324045d7eda8902c217de7a2e2362219ec70db8ad5361064
+generated: "2026-10-27T01:37:33.971233062Z"
