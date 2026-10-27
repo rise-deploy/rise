@@ -42,6 +42,16 @@ Merged to `develop`:
   `{project_name}.apps.example.com` with a wildcard DNS record and
   certificate before upgrading; app URLs change accordingly.
 
+- **Kubernetes no longer routes a group that has no host of its own.** A
+  deployment group with neither a deployment-group host nor an environment
+  host — in practice the `default` group, with no
+  `staging_ingress_url_template`, in a project that has no production
+  environment mapped to it — used to get an Ingress on the production host
+  on Kubernetes only. It now gets none, as on Docker and ECS, and Rise no
+  longer advertises a URL for it: its `primary_url` is empty and its
+  containers get no `RISE_APP_URL`. Point an environment at the group, or
+  configure a staging template, to route it.
+
 - **The Kubernetes and ECS backends are now licensed under BUSL-1.1.** *Action
   required* for Kubernetes and ECS operators. The Kubernetes and Amazon ECS
   backends and the Helm chart move from `MIT OR Apache-2.0` to the Business

@@ -7,7 +7,8 @@ use crate::group::normalize_deployment_group;
 ///
 /// Returns `(key, value)` pairs for:
 /// - `RISE_ISSUER` — Rise server URL (base URL for all Rise endpoints and JWT issuer)
-/// - `RISE_APP_URL` — Canonical URL where the app is accessible
+/// - `RISE_APP_URL` — Canonical URL where the app is accessible (omitted when
+///   the deployment's group has no public host)
 /// - `RISE_APP_URLS` — JSON array of all URLs where the app can be accessed
 /// - `RISE_DEPLOYMENT_GROUP` — The deployment group name (e.g. "default", "mr/123")
 /// - `RISE_DEPLOYMENT_GROUP_NORMALIZED` — The group name normalized for URLs (e.g. "mr--123")
@@ -18,21 +19,15 @@ pub fn rise_system_env_vars(
     deployment_urls: &DeploymentUrls,
     environment_name: Option<&str>,
 ) -> Vec<(String, String)> {
-    let urls_for_env: Vec<String> = if deployment_urls.all_urls.is_empty() {
-        let mut combined = vec![deployment_urls.default_url.clone()];
-        combined.extend(deployment_urls.custom_domain_urls.clone());
-        combined
-    } else {
-        deployment_urls.all_urls.clone()
-    };
-    let app_urls_json = serde_json::to_string(&urls_for_env).unwrap_or_else(|_| "[]".to_string());
+    let app_urls_json =
+        serde_json::to_string(&deployment_urls.all_urls).unwrap_or_else(|_| "[]".to_string());
 
-    let mut vars = vec![
-        ("RISE_ISSUER".to_string(), public_url.to_string()),
-        (
-            "RISE_APP_URL".to_string(),
-            deployment_urls.primary_url.clone(),
-        ),
+    let mut vars = vec![("RISE_ISSUER".to_string(), public_url.to_string())];
+    // An unrouted group has no URL to advertise.
+    if let Some(primary_url) = &deployment_urls.primary_url {
+        vars.push(("RISE_APP_URL".to_string(), primary_url.clone()));
+    }
+    vars.extend([
         ("RISE_APP_URLS".to_string(), app_urls_json),
         (
             "RISE_DEPLOYMENT_GROUP".to_string(),
@@ -42,7 +37,7 @@ pub fn rise_system_env_vars(
             "RISE_DEPLOYMENT_GROUP_NORMALIZED".to_string(),
             normalize_deployment_group(deployment_group),
         ),
-    ];
+    ]);
 
     if let Some(env_name) = environment_name {
         vars.push(("RISE_ENVIRONMENT".to_string(), env_name.to_string()));

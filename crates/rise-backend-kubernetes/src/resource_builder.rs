@@ -22,7 +22,7 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::ByteString;
 use std::collections::BTreeMap;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use rise_backend_core::models::{CustomDomain, Deployment, Project};
 use rise_backend_core::providers::{RegistryAuthMethod, RegistryCredentials};
@@ -1469,7 +1469,7 @@ impl ResourceBuilder {
         if routes.is_empty() {
             return Ok(Vec::new());
         }
-        let mut hosts = self.primary_ingress_hosts(
+        let hosts = self.primary_ingress_hosts(
             project,
             &deployment.deployment_group,
             environment_for_group,
@@ -1478,29 +1478,17 @@ impl ResourceBuilder {
             all_environments,
         );
 
-        // Historical fallback: when neither a DG host nor an env host applies
-        // (e.g. the default group with no staging template and no production
-        // env mapping), use the single-host computation so the deployment is
-        // still reachable. Skip this fallback when the resulting host would
-        // collide with another env's URL — nginx would reject it and we'd
-        // rather emit no ingress than spin on admission failures.
+        // A group with neither a deployment-group host nor an environment
+        // host (e.g. the default group with no staging template in a project
+        // without a production environment) is not routed, matching the
+        // Traefik-fronted backends.
         if hosts.is_empty() {
-            let fallback = self.url_builder.resolved_ingress_url(project, deployment);
-            if self.url_builder.host_conflicts_with_other_env(
-                project,
-                &deployment.deployment_group,
-                &fallback,
-                all_environments,
-            ) {
-                warn!(
-                    project = %project.name,
-                    deployment_group = %deployment.deployment_group,
-                    host = %fallback,
-                    "Skipping ingress: all candidate hosts collide with another env's URL"
-                );
-                return Ok(Vec::new());
-            }
-            hosts.push(fallback);
+            debug!(
+                project = %project.name,
+                deployment_group = %deployment.deployment_group,
+                "Skipping ingress: the deployment group has no public host"
+            );
+            return Ok(Vec::new());
         }
 
         let templated_hosts: Vec<String> = hosts
@@ -1509,9 +1497,9 @@ impl ResourceBuilder {
             .cloned()
             .collect();
         let tls = self.build_primary_tls_config(&templated_hosts, inline_custom_domains);
-        // Resolve the access class only now — past the host-collision skip above,
-        // so a group whose hosts all collide never forces a (possibly
-        // misconfigured) access class to resolve for an ingress we won't emit.
+        // Resolve the access class only now — past the no-host skip above, so a
+        // group without a public host never forces a (possibly misconfigured)
+        // access class to resolve for an ingress we won't emit.
         let ingress_class = self.get_ingress_class_for_project(project)?.to_string();
         let project_requirement = self.project_access_requirement(project)?;
         let base_name = Self::ingress_name(project, deployment);
@@ -2432,11 +2420,40 @@ mod tests {
         let builder = test_resource_builder();
         let mut project = test_project();
         project.status = rise_backend_core::models::ProjectStatus::Stopped;
+        let production = test_environment("production", true, "default");
         let urls = builder
             .url_builder
-            .urls_for_group(&project, "default", &[], &[]);
+            .urls_for_group(&project, "default", &[production], &[]);
         assert_eq!(urls.default_url, "https://demo.example.test");
-        assert_eq!(urls.primary_url, urls.default_url);
+        assert_eq!(urls.primary_url.as_deref(), Some(urls.default_url.as_str()));
+    }
+
+    /// A group with neither a deployment-group host (no staging template, so
+    /// none for `default`) nor an environment host is not routed: no ingress,
+    /// and no URL advertised for it — the same as on Docker and ECS.
+    #[test]
+    fn group_without_a_host_is_not_routed() {
+        let builder = test_resource_builder();
+        let project = test_project();
+        let deployment = test_deployment();
+        assert_eq!(deployment.deployment_group, "default");
+
+        let urls =
+            builder
+                .url_builder
+                .urls_for_group(&project, &deployment.deployment_group, &[], &[]);
+        assert_eq!(urls.primary_url, None);
+        assert!(urls.all_urls.is_empty());
+
+        let routes = vec![IngressRoute {
+            path: "/".to_string(),
+            service_name: "default-app".to_string(),
+            access_override: None,
+        }];
+        let ingresses = builder
+            .create_primary_ingress(&project, &deployment, "ns", None, &[], None, &[], &routes)
+            .unwrap();
+        assert!(ingresses.is_empty());
     }
 
     #[test]
@@ -2455,7 +2472,7 @@ mod tests {
             &[production, staging],
             &[staging_domain, production_domain],
         );
-        assert_eq!(urls.primary_url, "https://app.example.org");
+        assert_eq!(urls.primary_url.as_deref(), Some("https://app.example.org"));
         assert_eq!(urls.custom_domain_urls, vec!["https://app.example.org"]);
     }
 
@@ -2748,15 +2765,16 @@ mod tests {
             iroute("/", "default-web", None),
             iroute("/admin", "default-web", Some(AccessRequirement::Member)),
         ];
+        let production = test_environment("production", true, "default");
         let ingresses = builder
             .create_primary_ingress(
                 &project,
                 &deployment,
                 "demo",
-                None,
+                Some(&production),
                 &[],
                 Some("production"),
-                &[],
+                std::slice::from_ref(&production),
                 &routes,
             )
             .expect("ingresses");
