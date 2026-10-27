@@ -3,6 +3,7 @@ import { OwnerLabel, Panel, Status } from './r-ui';
 import { useIsMobile } from '../lib/use-media';
 import { formatRelativeTimeRounded, stripUrlScheme } from '../lib/utils';
 import { effectiveStatus, hasFailedDeploy, statusLabel } from '../lib/project-status';
+import { deploymentPath } from '../lib/routes';
 
 export interface ProjectOwner {
     id?: string;
@@ -55,6 +56,20 @@ export interface AccessClassOption {
     description?: string;
 }
 
+function ProjectProduction({ project }: { project: ProjectRow }) {
+    const id = project.active_deployment_id;
+    return (
+        <div className="r-project-production">
+            <ProjectStatusPill project={project} />
+            {id && <a className="r-project-deployment mono" href={deploymentPath(project.name, id)}
+                aria-label={`Open serving deployment ${id} for ${project.name}`}
+                onClick={e => { e.stopPropagation(); if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; e.preventDefault(); navigate(deploymentPath(project.name, id)); }}>
+                {id}
+            </a>}
+        </div>
+    );
+}
+
 export interface ProjectTableProps {
     projects: ProjectRow[];
     accessClasses?: AccessClassOption[];
@@ -87,7 +102,7 @@ export function ProjectTable({
                             onClick={() => onRowClick(project)} onKeyDown={e => { if (e.key === 'Enter') onRowClick(project); }}>
                             <div className="r-card-row">
                                 <span className="r-card-title">{project.name}</span>
-                                <span style={{ marginLeft: 'auto' }}><ProjectStatusPill project={project} /></span>
+                                <ProjectProduction project={project} />
                             </div>
                             {project.primary_url && <div className="r-card-meta mono">{stripUrlScheme(project.primary_url)}</div>}
                             <div className="r-card-meta r-card-row">
@@ -108,9 +123,8 @@ export function ProjectTable({
                 <thead>
                     <tr>
                         <th>Project</th>
-                        <th style={{ width: 130 }}>Status</th>
-                        <th style={{ width: 170 }}>Active deployment</th>
-                        <th style={{ width: 200 }}>Owner</th>
+                        <th style={{ width: 170 }}>Production</th>
+                        <th style={{ width: 180 }}>Owner</th>
                         <th style={{ width: 120 }}>Access</th>
                         <th style={{ width: 110, textAlign: 'right' }}>Updated</th>
                     </tr>
@@ -121,7 +135,7 @@ export function ProjectTable({
                         return (
                             <tr key={project.id || project.name} className="click" onClick={() => onRowClick(project)}>
                                 <td>
-                                    <div className="r-cell-main" style={{ fontWeight: 600 }}>
+                                    <div className="r-cell-main r-project-name">
                                         <a className="r-row-link" href={`/project/${project.name}`}
                                             onClick={(e) => { e.stopPropagation(); if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; e.preventDefault(); onRowClick(project); }}>
                                             {project.name}
@@ -129,7 +143,7 @@ export function ProjectTable({
                                     </div>
                                     {project.primary_url && (
                                         <a
-                                            className="r-link mono r-cell-sub r-url-sub"
+                                            className="r-link r-cell-sub r-url-sub"
                                             href={project.primary_url}
                                             target="_blank"
                                             rel="noopener noreferrer"
@@ -139,10 +153,7 @@ export function ProjectTable({
                                         </a>
                                     )}
                                 </td>
-                                <td><ProjectStatusPill project={project} /></td>
-                                <td className="mono r-nowrap" style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                                    {project.active_deployment_id || <span className="muted">—</span>}
-                                </td>
+                                <td><ProjectProduction project={project} /></td>
                                 <td className="r-cell-ellipsis"><OwnerLabel owner={project.owner} /></td>
                                 <td style={{ color: 'var(--text-muted)' }}>{accessLabel(project)}</td>
                                 <td className="r-nowrap" style={{ textAlign: 'right', color: 'var(--text-muted)' }}>

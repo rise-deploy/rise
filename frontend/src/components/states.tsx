@@ -1,7 +1,22 @@
 import React from 'react';
 import { Button } from './r-ui';
 
-export function LoadingState({ label = 'Loading…' }: { label?: string }) {
+export function LoadingState({ label = 'Loading…', layout }: { label?: string; layout?: 'table' | 'workspace' | 'detail' }) {
+    if (layout) {
+        return (
+            <div className={`r-loading r-loading-${layout}`} role="status" aria-label={label}>
+                <div className="r-loading-heading" aria-hidden="true"><span className="r-skeleton" /><span className="r-skeleton" /></div>
+                <div className="r-loading-content" aria-hidden="true">
+                    {Array.from({ length: layout === 'table' ? 5 : 3 }, (_, i) => (
+                        <div className="r-loading-row" key={i}>
+                            <span className="r-skeleton" /><span className="r-skeleton" /><span className="r-skeleton" />
+                        </div>
+                    ))}
+                </div>
+                <span className="r-loading-label">{label}</span>
+            </div>
+        );
+    }
     return (
         <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-muted)' }}>
             <span className="r-spinner lg" />

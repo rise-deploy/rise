@@ -103,7 +103,7 @@ export function Home({ user }: HomeProps) {
     }, []);
 
     if (error) return <ErrorState message={`Failed to load workspace: ${error}`} />;
-    if (!projects || !teams) return <LoadingState label="Loading workspace…" />;
+    if (!projects || !teams) return <LoadingState label="Loading workspace…" layout="workspace" />;
 
     const byName = new Map(projects.map(p => [p.name, p]));
     const healthy = projects.filter(p => effectiveStatus(p) === 'Running').length;
@@ -114,7 +114,7 @@ export function Home({ user }: HomeProps) {
     // Failed projects whose deployments weren't read still need a card.
     const covered = new Set(attention.map(a => a.project));
     const failedProjects = projects.filter(p => (effectiveStatus(p) === 'Failed' || p.status === 'Deleting') && !covered.has(p.name));
-    const needAttention = new Set([...attention.filter(a => a.kind === 'failed').map(a => a.project), ...failedProjects.map(p => p.name)]).size;
+    const needAttention = new Set([...attention.map(a => a.project), ...failedProjects.map(p => p.name)]).size;
 
     const recentDeployments = deployments
         ? Object.entries(deployments).flatMap(([name, ds]) => ds.map(d => ({ project: name, d })))
@@ -188,8 +188,8 @@ export function Home({ user }: HomeProps) {
                                 onClick={() => navigate(deploymentPath(project, d.deployment_id))}
                                 onKeyDown={e => { if (e.key === 'Enter') navigate(deploymentPath(project, d.deployment_id)); }}>
                                 <span className={cx('r-dot', statusTone(d.status))} title={d.status} />
-                                <span className="proj">{project}</span>
-                                {d.environment && <EnvTag env={d.environment} color={d.environment_color} />}
+                                <span className="proj" title={project}>{project}</span>
+                                <span className="r-dep-env">{d.environment && <EnvTag env={d.environment} color={d.environment_color} />}</span>
                                 <span className="msg"><DeploymentSource d={d} projectName={project} /></span>
                                 <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                             </div>

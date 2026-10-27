@@ -140,7 +140,7 @@ export function TeamsPage({ currentUser, teamName, openCreate = false }: { curre
                                     >
                                         <span className="r-team-tile">{t.name.slice(0, 1).toUpperCase()}</span>
                                         <span className="body">
-                                            <span className="name">{t.name}{t.idp_managed && <span className="r-env-tag">IdP</span>}{mine && <span className="r-env-tag prod">owner</span>}</span>
+                                            <span className="name">{t.name}{t.idp_managed && <span className="r-env-tag">IdP</span>}{mine && <span className="r-env-tag accent">owner</span>}</span>
                                             <span className="sub">{people(t).length} {people(t).length === 1 ? 'person' : 'people'} · {count} project{count === 1 ? '' : 's'}</span>
                                         </span>
                                         <Icon name="chev" size={14} />

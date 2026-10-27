@@ -180,8 +180,7 @@ export function EnvironmentIcon({ color, size = 11 }: { color?: string; size?: n
 // Resolved palette for the named env colors. Single source of truth for both
 // the `EnvironmentIcon` glyph and the bordered `EnvironmentColorDot`/picker.
 // Backgrounds are translucent tints of the foreground color so the icon cell
-// reads as a light shade of the env color in both light and dark mode (the old
-// values used a darker base tint that mostly disappeared on a white surface).
+// remains visible on both light and dark surfaces.
 export const ENV_COLOR_STYLES: Record<string, { color: string; borderColor: string; background: string }> = {
     green:  { color: '#34d399', borderColor: '#2e6c44', background: 'rgba(52, 211, 153, 0.18)' },
     blue:   { color: '#60a5fa', borderColor: '#2e5a8c', background: 'rgba(96, 165, 250, 0.18)' },
@@ -196,18 +195,18 @@ const ENV_COLORS = Object.keys(ENV_COLOR_STYLES);
 
 /**
  * Compact environment chip for dense rows (deployment lists, pickers): the
- * environment's colour as a layer glyph, accent-tinted for production. Colour
- * and production flag come from the current project unless passed in.
+ * environment's colour across its glyph, label and background. The colour
+ * comes from the current project unless passed in.
  */
-export function EnvTag({ env, color, production }: { env: string; color?: string; production?: boolean }) {
+export function EnvTag({ env, color }: { env: string; color?: string }) {
     const project = useCurrentProject();
     const known = project?.environments.find(e => e.name === env);
-    const isProd = production ?? known?.is_production ?? env === 'production';
     const tint = color ?? known?.color;
+    const resolved = tint ? ENV_COLOR_STYLES[tint]?.color ?? tint : undefined;
     return (
-        <span className={cx('r-env-tag', isProd && 'prod')}>
-            {tint && <EnvironmentIcon color={tint} size={10} />}
-            {env}
+        <span className="r-env-tag" title={env} style={resolved ? { '--env-color': resolved } as React.CSSProperties : undefined}>
+            {resolved && <EnvironmentIcon size={10} />}
+            <span className="r-env-tag-name">{env}</span>
         </span>
     );
 }
