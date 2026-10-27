@@ -13,7 +13,7 @@ Ingress authentication is driven by each project's **access class**
   stamps a Traefik **forwardAuth** middleware on the app's router.
 
 For a non-`None` class, the reconciler emits (see `render_traefik_labels` in
-`labels.rs`):
+`crates/rise-backend-traefik/src/labels.rs`):
 
 ```
 traefik.http.middlewares.<router>-auth.forwardauth.address

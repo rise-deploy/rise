@@ -1940,6 +1940,39 @@ pub async fn get_active_deployments_for_project(
     Ok(deployments)
 }
 
+/// Every active deployment across the install, grouped by project (one per
+/// project and deployment group).
+pub async fn list_all_active(pool: &PgPool) -> Result<Vec<Deployment>> {
+    let deployments = sqlx::query_as!(
+        Deployment,
+        r#"
+        SELECT
+            id, deployment_id, project_id, created_by_id,
+            status as "status: DeploymentStatus",
+            deployment_group, environment_id, expires_at,
+            completed_at, error_message, build_logs,
+            controller_metadata as "controller_metadata: serde_json::Value",
+            image, image_digest, rolled_back_from_deployment_id,
+            http_port, needs_reconcile, is_active,
+            deploying_started_at,
+            first_healthy_at, job_url, pull_request_url, git_repository_url,
+            replicas, cpu, memory,
+            termination_reason as "termination_reason: _",
+            created_at, updated_at, identity_credential_hash,
+            identity_audiences as "identity_audiences: serde_json::Value",
+            containers as "containers: serde_json::Value",
+            routes as "routes: serde_json::Value"
+        FROM deployments
+        WHERE is_active = TRUE
+        ORDER BY project_id, deployment_group, created_at DESC
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(deployments)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

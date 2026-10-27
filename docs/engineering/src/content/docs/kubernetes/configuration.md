@@ -13,16 +13,12 @@ kubernetes:
   ingress_class: "nginx"
 
   # Ingress URL template for production (default) deployment group
-  # Supports both subdomain and sub-path routing (must contain {project_name})
+  # A hostname (no scheme, port or path) that must contain {project_name}
   production_ingress_url_template: "{project_name}.apps.rise.local"
 
   # Optional: Ingress URL template for staging (non-default) deployment groups
   # Must contain both {project_name} and {deployment_group} placeholders
   staging_ingress_url_template: "{project_name}-{deployment_group}.preview.rise.local"
-
-  # Or for sub-path routing:
-  # production_ingress_url_template: "rise.local/{project_name}"
-  # staging_ingress_url_template: "rise.local/{project_name}/{deployment_group}"
 
   # Custom domain TLS mode
   # - "per-domain": Each custom domain gets its own tls-{domain} secret (for cert-manager)

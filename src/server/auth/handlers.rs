@@ -76,17 +76,13 @@ async fn project_redirect_hosts(state: &AppState, project_name: &str) -> Vec<Str
     hosts
 }
 
-/// Whether a token's `aud` names the app at `candidate`: same host, explicit
-/// port and path prefix (sub-path layouts put several apps on one host). The
-/// scheme is ignored, as one app may be reached over either.
+/// Whether a token's `aud` names the app at `candidate`: same host and
+/// explicit port (every app owns its host). The scheme is ignored, as one app
+/// may be reached over either.
 fn audience_names_app(aud: &str, candidate: &str) -> bool {
-    fn key(url: &str) -> Option<(String, Option<u16>, String)> {
+    fn key(url: &str) -> Option<(String, Option<u16>)> {
         let url = url::Url::parse(url).ok()?;
-        Some((
-            url.host_str()?.to_lowercase(),
-            url.port(),
-            url.path().trim_end_matches('/').to_string(),
-        ))
+        Some((url.host_str()?.to_lowercase(), url.port()))
     }
     match (key(aud), key(candidate)) {
         (Some(aud), Some(candidate)) => aud == candidate,
@@ -1078,11 +1074,9 @@ pub async fn oauth_signin_start(
 
     // For /.rise/auth paths, determine the app base URL for cookie setting after the callback.
     // Only use the request host as the base URL when it's a *true* custom domain — i.e. when
-    // the request host doesn't match the standard ingress template host.  For sub-path ingress
-    // (`apps.example.com/{project_name}`), extract_request_base_url would return just
-    // `https://apps.example.com`, missing the path prefix and producing a wrong JWT audience.
-    // In that case we leave custom_domain_base_url as None and let build_project_url supply the
-    // full URL (including path) in the callback handler.
+    // the request host doesn't match the standard ingress template host. On the template host
+    // we leave custom_domain_base_url as None and let build_project_url supply the canonical
+    // URL (configured scheme and port) in the callback handler.
     let custom_domain_base_url = if is_rise_path {
         let request_base_url = extract_request_base_url(&headers, &state);
         let is_standard_ingress = params
@@ -1595,7 +1589,7 @@ fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
 ///
 /// Mirrors the Kubernetes `backend_address` ingress-auth flow (see
 /// `ResourceBuilder::build_ingress_annotations` in
-/// `src/server/deployment/resource_builder.rs`): the signin page must be served
+/// `crates/rise-backend-kubernetes/src/resource_builder.rs`): the signin page must be served
 /// on the **same host** as the app so the login cookie is set on the app host
 /// that forwardAuth subsequently reads. A cross-host redirect to the control
 /// plane would set the cookie on the wrong host and loop.
@@ -2187,12 +2181,6 @@ mod tests {
             app,
             "https://shop.apps.example.com:8443"
         ));
-
-        // Sub-path layouts share a host: the path tells the apps apart.
-        let shop = "https://apps.example.com/shop";
-        assert!(audience_names_app(shop, "https://apps.example.com/shop/"));
-        assert!(!audience_names_app(shop, "https://apps.example.com/other"));
-        assert!(!audience_names_app(shop, "https://apps.example.com"));
 
         assert!(!audience_names_app("not a url", app));
     }

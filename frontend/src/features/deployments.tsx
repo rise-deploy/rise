@@ -27,7 +27,7 @@ import { DeploymentSource } from '../components/deployment-source';
 // Memory is the same — IEC suffixes (Ki/Mi/Gi/...) plus the SI suffixes K/M/G.
 // A value may also be a `request-limit` range (`"128m-1"`, `"256Mi-1Gi"`),
 // mirroring the backend's `split_request_limit` in
-// `src/server/deployment/quantity.rs`: a bare value means request == limit, a
+// `crates/rise-backend-core/src/quantity.rs`: a bare value means request == limit, a
 // `req-lim` value carries both sides.
 // Aggregation goes through (millicores, bytes), then re-formats for display so
 // "500m × 2 replicas + 1 × 3 replicas" prints as "4" (not "4000m") and "256Mi

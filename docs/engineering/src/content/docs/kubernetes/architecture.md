@@ -38,59 +38,31 @@ Resources follow consistent naming patterns:
 | ServiceAccount | `env-{environment}` | `env-production`, `env-staging` |
 | Secret | `rise-registry-creds` | `rise-registry-creds` |
 
-**Character escaping**: Sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`. For example, `mr/26` becomes `mr--26`. Consecutive hyphens (`--`) are disallowed in group names to prevent collisions, and the normalized result must be at most 63 characters (Kubernetes label value limit).
+**Character escaping**: Sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`. For example, `mr/26` becomes `mr--26`. Group names are lowercase alphanumeric segments joined by single `-` or `/` separators — adjacent separators (`--`, `//`, `-/`, `/-`) are rejected so no two group names normalize to the same string, and the normalized result must be at most 63 characters (Kubernetes label value limit).
 
 ## Deployment Groups and URLs
 
 Each deployment group gets its own Service and Ingress with a unique URL:
 
-| Group | URL Pattern | Example (Subdomain) | Example (Sub-path) |
-|-------|-------------|---------------------|-------------------|
-| `default` | `production_ingress_url_template` | `my-app.apps.rise.local` | `rise.local/my-app` |
-| Custom groups | `staging_ingress_url_template` | `my-app-mr--26.preview.rise.local` | `rise.local/my-app/mr--26` |
+| Group | URL Pattern | Example |
+|-------|-------------|---------|
+| `default` | `production_ingress_url_template` | `my-app.apps.rise.local` |
+| Custom groups | `staging_ingress_url_template` | `my-app-mr--26.preview.rise.local` |
 
 **Environments and URL routing**: [Environments](../../user-guide/environments) layer on top of deployment groups to control which URL template applies. The environment marked as **production** determines which deployments receive the production URL (via `production_ingress_url_template`). All other deployments — regardless of their group name — use the staging URL template. Custom domains also attach to production environment deployments only. See [user-guide/environments](../../user-guide/environments) for how to create and configure environments.
 
-## Sub-path vs Subdomain Routing
+## Hostnames
 
-Rise supports two Ingress routing modes configured globally via URL templates.
+Every URL template is a hostname pattern, so each project (and each deployment
+group and environment) gets a host of its own:
 
-**Subdomain Routing** (recommended for production):
 - Production: `{project_name}.apps.rise.local`
 - Staging: `{project_name}-{deployment_group}.preview.rise.local`
-- Each project gets a unique subdomain
-- Ingress path: `/` (Prefix type)
-- No path rewriting needed
+- Ingress paths are the app's own routes (`/` by default, `Prefix` type); no path rewriting
 - Requires a wildcard TLS certificate (e.g., `*.apps.rise.example.com` and `*.preview.rise.example.com`) — see [Custom Domains](custom-domains) for cert-manager setup
 
-**Sub-path Routing** (development / single-domain setups only):
-- Production: `rise.local/{project_name}`
-- Staging: `rise.local/{project_name}/{deployment_group}`
-- All projects share the same domain with different paths
-- Ingress path: `/{project}(/|$)(.*)` (ImplementationSpecific type with regex)
-- Nginx automatically rewrites paths
-- Not recommended for production: applications must handle `X-Forwarded-Prefix` correctly, and path-based cookie isolation does not protect project cookies from sibling projects on the same host
-
-For production deployments, subdomain routing with a wildcard certificate is strongly recommended.
-
-### Path Rewriting
-
-For sub-path routing, Nginx automatically rewrites paths so your application receives requests at `/` while preserving the original path prefix:
-
-- **Client request**: `GET https://rise.local/myapp/api/users`
-- **Application receives**: `GET /api/users`
-- **Headers added**: `X-Forwarded-Prefix: /myapp`
-
-The controller uses the built-in `nginx.ingress.kubernetes.io/x-forwarded-prefix` annotation to add this header. Configure your application to use the `X-Forwarded-Prefix` header when generating URLs to ensure links and assets work correctly.
-
-**Example configuration**:
-```yaml
-kubernetes:
-  production_ingress_url_template: "rise.local/{project_name}"
-  staging_ingress_url_template: "rise.local/{project_name}/{deployment_group}"
-  auth_backend_url: "http://rise-backend.default.svc.cluster.local:3000"
-  auth_signin_url: "https://rise.local"
-```
+Path-based templates such as `rise.local/{project_name}` are rejected at
+startup: apps sharing one host would share its cookies and origin.
 
 ## Blue/Green Deployments
 

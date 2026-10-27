@@ -8,13 +8,17 @@
 //! [`DockerBackend`] itself implements [`DeploymentBackend`] and only provides
 //! the synchronous HTTP-handler operations: URL computation and a no-op
 //! environment cleanup (the reconciler GCs deleted-environment containers on
-//! its next tick).
+//! its next tick). Runtime logs are served by [`DockerLogBackend`], which reads
+//! the reconciler's containers straight from the daemon.
 
 pub mod client;
 pub mod container_builder;
 pub mod health;
 pub mod identity;
+pub mod logs;
 pub mod reconciler;
+
+pub use logs::DockerLogBackend;
 
 // The runtime-agnostic reconcile machinery lives in `rise-backend-core`, and the
 // Traefik routing machinery in `rise-backend-traefik` — shared with the ECS
@@ -34,7 +38,8 @@ pub mod labels {
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::Docker;
-use rise_backend_core::models::{Deployment, Project};
+use rise_backend_core::models::Project;
+use rise_backend_core::project_routing::ProjectRouting;
 use rise_backend_core::{DeploymentBackend, DeploymentStore, DeploymentUrlBuilder, DeploymentUrls};
 use std::sync::Arc;
 
@@ -74,41 +79,14 @@ impl DockerBackend {
 
 #[async_trait]
 impl DeploymentBackend for DockerBackend {
-    async fn get_deployment_urls(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-    ) -> Result<DeploymentUrls> {
-        let environment = self
-            .store
-            .find_environment(deployment.environment_id)
-            .await?;
-        let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-
-        Ok(self.url_builder.compute_deployment_urls(
-            project,
-            deployment,
-            environment.as_ref(),
-            &all_environments,
-            &custom_domains,
-        ))
-    }
-
     async fn get_project_urls(
         &self,
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
-        let environments = self.store.list_environments_for_project(project.id).await?;
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-
-        Ok(self.url_builder.compute_project_urls(
-            project,
-            deployment_group,
-            &environments,
-            &custom_domains,
-        ))
+        Ok(ProjectRouting::load(self.store.as_ref(), project.id)
+            .await?
+            .urls_for_group(&self.url_builder, project, deployment_group))
     }
 
     async fn cleanup_environment(&self, project: &Project, environment_name: &str) -> Result<()> {

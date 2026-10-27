@@ -156,8 +156,7 @@ Access check logic:
 //
 // NOTE: Rise validates project access via database permissions, not JWT claims.
 // Cookie isolation (host-only, no Domain) ensures a cookie for one app is never
-// sent to a different app — additional DB permission checks guard access within
-// the same host (e.g. sub-path routing where multiple projects share a host).
+// sent to a different app: every app owns its host.
 ```
 
 ## Ingress Annotations

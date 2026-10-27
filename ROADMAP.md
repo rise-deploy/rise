@@ -329,8 +329,14 @@ and secret handling remain kind-specific prerequisites.
 
 ## 6. Codebase decomposition
 
-- [x] Extracted the Docker deployment backend behind the `DeploymentStore`
-  seam.
+- [x] Extracted the deployment backends onto the `rise-backend-core` seam
+  (`DeploymentBackend`, `DeploymentStore`, the provider and runtime-log traits):
+  `rise-backend-docker`, `rise-backend-kubernetes`, and `rise-backend-ecs`, with
+  the Traefik routing they share in `rise-backend-traefik`. Each crate owns its
+  controller and its runtime-log backend, and reaches deployment state only
+  through `DeploymentStore` (its one `PgPool` is the `rise-runtime-sync` leader
+  lease); `rise-deploy` implements the store and composes the backends from
+  its settings.
 - [ ] Complete remaining backend extraction work only where it supports the
   resource/controller migration above; avoid parallel abstractions that bypass
   the generic resource API or unified authorization engine.

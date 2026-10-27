@@ -12,8 +12,8 @@ pub const DEFAULT_DEPLOYMENT_GROUP: &str = "default";
 /// label value regex: `(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?`
 ///
 /// **Collision safety**: This function is injective (collision-free) only when
-/// input group names do not contain `--`. The deployment group validation in
-/// `is_valid_group_name` enforces this constraint.
+/// input group names have no adjacent separators (`--`, `//`, `-/`, `/-`).
+/// The deployment group validation in `is_valid_group_name` enforces this.
 ///
 /// This matches the normalization used in the `{deployment_group}` placeholder
 /// of `staging_ingress_url_template`.

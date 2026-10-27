@@ -24,14 +24,10 @@ use k8s_openapi::ByteString;
 use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
-use rise_backend_core::models::{CustomDomain, Deployment, Environment, Project};
+use rise_backend_core::models::{CustomDomain, Deployment, Project};
 use rise_backend_core::providers::{RegistryAuthMethod, RegistryCredentials};
 use rise_backend_core::AccessRequirement;
 use rise_backend_core::DeploymentUrlBuilder;
-// The parsed-ingress-URL type and the URL/image computation live in
-// `rise-backend-core`; re-exported so existing `resource_builder::IngressUrl`
-// consumers (e.g. the Docker reconciler) keep their import path.
-pub use rise_backend_core::IngressUrl;
 
 /// A resolved ingress route: `(path, service_name)` plus its per-route auth
 /// override (`.rise.toml` `[routes].access`, `None` = inherit the project).
@@ -267,8 +263,8 @@ impl ResourceBuilder {
     //
     // Backend-agnostic; the implementations live on the composed
     // `DeploymentUrlBuilder`. Thin wrappers below cover the methods the K8s
-    // resource builders and the HTTP handlers call through `ResourceBuilder`;
-    // other URL/image work goes through `self.url_builder` directly.
+    // resource builders call through `ResourceBuilder`; URL lookups go through
+    // `ProjectRouting`, and other URL/image work through `self.url_builder`.
 
     pub fn primary_ingress_hosts(
         &self,
@@ -278,7 +274,7 @@ impl ResourceBuilder {
         custom_domains_for_env: &[CustomDomain],
         include_custom_domains_inline: bool,
         all_environments: &[rise_backend_core::models::Environment],
-    ) -> Vec<IngressUrl> {
+    ) -> Vec<String> {
         self.url_builder.primary_ingress_hosts(
             project,
             deployment_group,
@@ -294,38 +290,6 @@ impl ResourceBuilder {
         custom_domains: &[CustomDomain],
     ) -> Vec<CustomDomain> {
         self.url_builder.filter_valid_custom_domains(custom_domains)
-    }
-
-    pub fn compute_deployment_urls(
-        &self,
-        project: &Project,
-        deployment: &Deployment,
-        environment: Option<&rise_backend_core::models::Environment>,
-        all_environments: &[rise_backend_core::models::Environment],
-        custom_domains: &[CustomDomain],
-    ) -> rise_backend_core::DeploymentUrls {
-        self.url_builder.compute_deployment_urls(
-            project,
-            deployment,
-            environment,
-            all_environments,
-            custom_domains,
-        )
-    }
-
-    pub fn compute_project_urls(
-        &self,
-        project: &Project,
-        deployment_group: &str,
-        environments: &[Environment],
-        custom_domains: &[CustomDomain],
-    ) -> rise_backend_core::DeploymentUrls {
-        self.url_builder.compute_project_urls(
-            project,
-            deployment_group,
-            environments,
-            custom_domains,
-        )
     }
 
     // ── Labels ─────────────────────────────────────────────────────────
@@ -1406,14 +1370,6 @@ impl ResourceBuilder {
     /// backend path is appended last — the caller sets it on exactly one group
     /// ingress so the shared-host merge keeps `/.rise` unique.
     ///
-    /// `prefix` is the deployment's URL sub-path in sub-path mode (no wildcard
-    /// cert), e.g. `/pr-123`; `None` in subdomain mode. In sub-path mode every
-    /// route is emitted as a regex that strips the prefix and preserves the route
-    /// path, so the container receives the same path it would behind a subdomain.
-    /// The single per-ingress `rewrite-target: /$2` (set by the caller) works
-    /// uniformly because every route's regex captures the container-visible path
-    /// (minus its leading slash) into group `$2`.
-    ///
     /// Routes whose path does not start with `/` are skipped with a warning; the
     /// request-time validator should make this unreachable, but emitting an
     /// invalid Ingress would take the whole project's traffic plane down —
@@ -1421,7 +1377,6 @@ impl ResourceBuilder {
     fn build_ingress_paths(
         &self,
         routes: &[(String, String)],
-        prefix: Option<&str>,
         append_rise: bool,
     ) -> Vec<HTTPIngressPath> {
         let mut sorted: Vec<(&str, &str)> = routes
@@ -1443,42 +1398,19 @@ impl ResourceBuilder {
 
         let mut paths: Vec<HTTPIngressPath> = sorted
             .into_iter()
-            .map(|(route_path, service_name)| {
-                let (path, path_type) = match prefix {
-                    None => (route_path.to_string(), "Prefix"),
-                    Some(prefix) => {
-                        let prefix = prefix.trim_end_matches('/');
-                        if route_path == "/" {
-                            // Root route: strip the prefix; container sees `/` + rest.
-                            (format!("{prefix}(/|$)(.*)"), "ImplementationSpecific")
-                        } else {
-                            // Non-root: capture the container-visible path (route
-                            // path + remainder) into $2 so the uniform `/$2`
-                            // rewrite preserves the route path. The route body is
-                            // regex-escaped (user input); the segment boundary is
-                            // non-capturing so $2 keeps its index.
-                            let body = regex::escape(route_path.trim_start_matches('/'));
-                            (
-                                format!("{prefix}(/)({body}(?:/|$).*)"),
-                                "ImplementationSpecific",
-                            )
-                        }
-                    }
-                };
-                HTTPIngressPath {
-                    path: Some(path),
-                    path_type: path_type.to_string(),
-                    backend: IngressBackend {
-                        service: Some(IngressServiceBackend {
-                            name: service_name.to_string(),
-                            port: Some(ServiceBackendPort {
-                                name: Some("http".to_string()),
-                                ..Default::default()
-                            }),
+            .map(|(route_path, service_name)| HTTPIngressPath {
+                path: Some(route_path.to_string()),
+                path_type: "Prefix".to_string(),
+                backend: IngressBackend {
+                    service: Some(IngressServiceBackend {
+                        name: service_name.to_string(),
+                        port: Some(ServiceBackendPort {
+                            name: Some("http".to_string()),
+                            ..Default::default()
                         }),
-                        ..Default::default()
-                    },
-                }
+                    }),
+                    ..Default::default()
+                },
             })
             .collect();
 
@@ -1561,8 +1493,8 @@ impl ResourceBuilder {
 
         let templated_hosts: Vec<String> = hosts
             .iter()
-            .filter(|h| !inline_custom_domains.iter().any(|cd| cd.domain == h.host))
-            .map(|h| h.host.clone())
+            .filter(|h| !inline_custom_domains.iter().any(|cd| &cd.domain == *h))
+            .cloned()
             .collect();
         let tls = self.build_primary_tls_config(&templated_hosts, inline_custom_domains);
         // Resolve the access class only now — past the no-host skip above, so a
@@ -1578,33 +1510,18 @@ impl ResourceBuilder {
         // more than one group exists (so the common single-group case keeps the
         // stable, un-suffixed name and never churns on upgrade).
         //
-        // Auth-gate correctness in sub-path mode (regex locations) relies on
-        // ingress-nginx merging all same-host paths into one server block ordered
-        // by path length — so the longer, more-specific gated regex outranks a
-        // shorter group's public catch-all whether the two live in one Ingress or
-        // are split across group Ingresses. This is the same ordering the existing
-        // multi-container routing depends on to send `/api` and `/` to different
-        // containers; the split preserves it. The `RouteAccessOverride` e2e
+        // Auth-gate correctness relies on ingress-nginx merging all same-host
+        // paths into one server block ordered by path length — so the longer,
+        // more-specific gated path outranks a shorter group's public catch-all
+        // whether the two live in one Ingress or are split across group
+        // Ingresses. Multi-container routing depends on the same ordering to send
+        // `/api` and `/` to different containers. The `RouteAccessOverride` e2e
         // scenario exercises this against a real ingress on both backends.
         let groups = group_routes_by_requirement(routes, &project_requirement);
         let multi = groups.len() > 1;
         let mut ingresses = Vec::with_capacity(groups.len());
         for (idx, (requirement, group_routes)) in groups.into_iter().enumerate() {
-            let mut annotations = self.build_ingress_annotations(project, &requirement)?;
-
-            // Sub-path (path-based) hosts need the rewrite-target annotation; it
-            // is per-ingress and keyed off the first host's prefix, and every
-            // group ingress shares the same hosts so each replicates it.
-            if let Some(ref path) = hosts[0].path_prefix {
-                annotations.insert(
-                    "nginx.ingress.kubernetes.io/rewrite-target".to_string(),
-                    "/$2".to_string(),
-                );
-                annotations.insert(
-                    "nginx.ingress.kubernetes.io/x-forwarded-prefix".to_string(),
-                    path.trim_end_matches('/').to_string(),
-                );
-            }
+            let annotations = self.build_ingress_annotations(project, &requirement)?;
 
             let group_table: Vec<(String, String)> = group_routes
                 .iter()
@@ -1613,16 +1530,11 @@ impl ResourceBuilder {
             let append_rise = idx == 0;
             let rules: Vec<IngressRule> = hosts
                 .iter()
-                .map(|host| {
-                    let paths = self.build_ingress_paths(
-                        &group_table,
-                        host.path_prefix.as_deref(),
-                        append_rise,
-                    );
-                    IngressRule {
-                        host: Some(host.host.clone()),
-                        http: Some(HTTPIngressRuleValue { paths }),
-                    }
+                .map(|host| IngressRule {
+                    host: Some(host.clone()),
+                    http: Some(HTTPIngressRuleValue {
+                        paths: self.build_ingress_paths(&group_table, append_rise),
+                    }),
                 })
                 .collect();
 
@@ -1670,8 +1582,7 @@ impl ResourceBuilder {
         namespace: &str,
         custom_domains: &[CustomDomain],
         environment_name: Option<&str>,
-        // Resolved route table (same as `create_primary_ingress`). Custom domains
-        // are always served at the host root (no sub-path prefix). Partitioned by
+        // Resolved route table (same as `create_primary_ingress`). Partitioned by
         // effective requirement into one Ingress per group, like the primary.
         routes: &[IngressRoute],
     ) -> anyhow::Result<Vec<Ingress>> {
@@ -1701,7 +1612,7 @@ impl ResourceBuilder {
             let rules: Vec<IngressRule> = custom_domains
                 .iter()
                 .map(|domain| {
-                    let paths = self.build_ingress_paths(&group_table, None, append_rise);
+                    let paths = self.build_ingress_paths(&group_table, append_rise);
                     IngressRule {
                         host: Some(domain.domain.clone()),
                         http: Some(HTTPIngressRuleValue { paths }),
@@ -2510,7 +2421,9 @@ mod tests {
         let mut project = test_project();
         project.status = rise_backend_core::models::ProjectStatus::Stopped;
         let production = test_environment("production", true, "default");
-        let urls = builder.compute_project_urls(&project, "default", &[production], &[]);
+        let urls = builder
+            .url_builder
+            .urls_for_group(&project, "default", &[production], &[]);
         assert_eq!(urls.default_url, "https://demo.example.test");
         assert_eq!(urls.primary_url.as_deref(), Some(urls.default_url.as_str()));
     }
@@ -2525,7 +2438,10 @@ mod tests {
         let deployment = test_deployment();
         assert_eq!(deployment.deployment_group, "default");
 
-        let urls = builder.compute_deployment_urls(&project, &deployment, None, &[], &[]);
+        let urls =
+            builder
+                .url_builder
+                .urls_for_group(&project, &deployment.deployment_group, &[], &[]);
         assert_eq!(urls.primary_url, None);
         assert!(urls.all_urls.is_empty());
 
@@ -2550,7 +2466,7 @@ mod tests {
         let mut staging_domain = test_custom_domain("staging.example.org", true);
         staging_domain.environment_id = staging.id;
         let production_domain = test_custom_domain("app.example.org", true);
-        let urls = builder.compute_project_urls(
+        let urls = builder.url_builder.urls_for_group(
             &project,
             "default",
             &[production, staging],
@@ -2558,34 +2474,6 @@ mod tests {
         );
         assert_eq!(urls.primary_url.as_deref(), Some("https://app.example.org"));
         assert_eq!(urls.custom_domain_urls, vec!["https://app.example.org"]);
-    }
-
-    #[test]
-    fn project_urls_match_deployment_urls_for_the_same_environment() {
-        let mut builder = test_resource_builder();
-        builder.url_builder.environment_ingress_url_template =
-            Some("{project_name}-{environment}.example.test".to_string());
-        let project = test_project();
-        let environment = test_environment("staging", false, "staging");
-        let environments = vec![environment.clone()];
-        let mut deployment = test_deployment();
-        deployment.deployment_group = "staging".to_string();
-        deployment.environment_id = environment.id;
-        let before = builder.compute_deployment_urls(
-            &project,
-            &deployment,
-            Some(&environment),
-            &environments,
-            &[],
-        );
-        let after = builder.compute_project_urls(&project, "staging", &environments, &[]);
-        assert_eq!(
-            after.primary_url.as_deref(),
-            Some("https://demo-staging.example.test")
-        );
-        assert_eq!(after.default_url, before.default_url);
-        assert_eq!(after.primary_url, before.primary_url);
-        assert_eq!(after.all_urls, before.all_urls);
     }
 
     #[test]
@@ -2649,7 +2537,7 @@ mod tests {
             true,
             &[],
         );
-        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
 
         assert!(host_strs.contains(&"demo-default.preview.example.test"));
         assert!(host_strs.contains(&"demo.example.test"));
@@ -2668,7 +2556,7 @@ mod tests {
 
         let hosts =
             builder.primary_ingress_hosts(&project, "mr-42", Some(&staging_env), &[], false, &[]);
-        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
 
         assert_eq!(
             host_strs,
@@ -2689,7 +2577,7 @@ mod tests {
 
         let hosts =
             builder.primary_ingress_hosts(&project, "default", Some(&prod_env), &[], false, &[]);
-        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
         assert_eq!(host_strs, vec!["demo.example.test"]);
     }
 
@@ -2701,7 +2589,7 @@ mod tests {
         let project = test_project();
 
         let hosts = builder.primary_ingress_hosts(&project, "mr-42", None, &[], false, &[]);
-        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
         assert_eq!(host_strs, vec!["demo-mr-42.preview.example.test"]);
     }
 
@@ -2744,7 +2632,7 @@ mod tests {
             false,
             std::slice::from_ref(&staging_env),
         );
-        let host_strs: Vec<&str> = hosts.iter().map(|h| h.host.as_str()).collect();
+        let host_strs: Vec<&str> = hosts.iter().map(String::as_str).collect();
         assert_eq!(
             host_strs,
             vec![
@@ -3078,14 +2966,13 @@ mod tests {
     }
 
     #[test]
-    fn build_ingress_paths_subdomain_emits_literal_prefix_paths() {
-        // No sub-path prefix → literal `Prefix` paths, longest-first, no regex.
+    fn build_ingress_paths_emits_literal_prefix_paths_longest_first() {
         let builder = test_resource_builder();
         let routes = vec![
             ("/".to_string(), "default-frontend".to_string()),
             ("/api".to_string(), "default-api".to_string()),
         ];
-        let paths = builder.build_ingress_paths(&routes, None, true);
+        let paths = builder.build_ingress_paths(&routes, true);
         // `/api` (longer) is emitted before `/`.
         assert_eq!(paths[0].path.as_deref(), Some("/api"));
         assert_eq!(paths[0].path_type, "Prefix");
@@ -3095,42 +2982,6 @@ mod tests {
         );
         assert_eq!(paths[1].path.as_deref(), Some("/"));
         assert_eq!(paths[1].path_type, "Prefix");
-    }
-
-    #[test]
-    fn build_ingress_paths_subpath_strips_prefix_and_preserves_route() {
-        // Sub-path mode: each route becomes a regex that strips the deployment
-        // prefix and captures the container-visible path into $2 (so the uniform
-        // `rewrite-target: /$2` keeps the route path).
-        let builder = test_resource_builder();
-        let routes = vec![
-            ("/".to_string(), "default-frontend".to_string()),
-            ("/api".to_string(), "default-api".to_string()),
-        ];
-        let paths = builder.build_ingress_paths(&routes, Some("/pr-123"), true);
-        // Longest-first: `/api` before `/`.
-        assert_eq!(
-            paths[0].path.as_deref(),
-            Some("/pr-123(/)(api(?:/|$).*)"),
-            "non-root route strips prefix, keeps the route path, segment-bounded"
-        );
-        assert_eq!(paths[0].path_type, "ImplementationSpecific");
-        assert_eq!(
-            paths[1].path.as_deref(),
-            Some("/pr-123(/|$)(.*)"),
-            "root route strips the prefix to `/`"
-        );
-        assert_eq!(paths[1].path_type, "ImplementationSpecific");
-    }
-
-    #[test]
-    fn build_ingress_paths_subpath_regex_escapes_route_body() {
-        // A route path containing a regex metacharacter must be escaped so it
-        // matches literally (and can't inject regex structure).
-        let builder = test_resource_builder();
-        let routes = vec![("/a.b".to_string(), "default-svc".to_string())];
-        let paths = builder.build_ingress_paths(&routes, Some("/pr-1"), true);
-        assert_eq!(paths[0].path.as_deref(), Some(r"/pr-1(/)(a\.b(?:/|$).*)"));
     }
 }
 
