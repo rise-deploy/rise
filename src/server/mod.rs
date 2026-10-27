@@ -574,36 +574,80 @@ async fn build_traefik_dynamic_config(
         access_classes: &access_requirements,
     };
 
+    // A fixed number of queries per poll, however many projects exist: every
+    // active deployment install-wide, then the projects that have one and
+    // their environments, custom domains and (when a controller class filters
+    // them) Organization linkage, each in one batch.
+    let mut deployments_by_project: std::collections::HashMap<
+        uuid::Uuid,
+        Vec<rise_backend_core::models::Deployment>,
+    > = std::collections::HashMap::new();
+    for deployment in crate::db::deployments::list_all_active(&state.db_pool).await? {
+        deployments_by_project
+            .entry(deployment.project_id)
+            .or_default()
+            .push(deployment);
+    }
+    if deployments_by_project.is_empty() {
+        return Ok(rise_backend_traefik::dynamic::render_dynamic_route_targets(
+            Vec::new(),
+            &render_config,
+            provider.native_provider,
+        ));
+    }
+    let project_ids: Vec<uuid::Uuid> = deployments_by_project.keys().copied().collect();
+    let mut projects = crate::db::projects::find_by_ids(&state.db_pool, &project_ids).await?;
+
+    if !provider.controller_class.is_empty() {
+        let org_uids = crate::db::organization_links::organization_uids_for_projects(
+            &state.db_pool,
+            &project_ids,
+        )
+        .await?;
+        let mut classes: std::collections::HashMap<uuid::Uuid, Option<String>> =
+            std::collections::HashMap::new();
+        let mut owned = Vec::with_capacity(projects.len());
+        for project in projects {
+            let org_uid = org_uids
+                .get(&project.id)
+                .copied()
+                .flatten()
+                .with_context(|| {
+                    format!("project '{}' has no Organization linkage", project.name)
+                })?;
+            let class = match classes.get(&org_uid) {
+                Some(class) => class.clone(),
+                None => {
+                    let class = organization_controller_class(state, org_uid).await?;
+                    classes.insert(org_uid, class.clone());
+                    class
+                }
+            };
+            if class.as_deref() == Some(provider.controller_class.as_str()) {
+                owned.push(project);
+            }
+        }
+        projects = owned;
+    }
+
+    let owned_ids: Vec<uuid::Uuid> = projects.iter().map(|project| project.id).collect();
+    let mut environments =
+        crate::db::environments::list_for_projects(&state.db_pool, &owned_ids).await?;
+    let mut custom_domains =
+        crate::db::custom_domains::get_custom_domains_batch(&state.db_pool, &owned_ids).await?;
+
     let mut targets = Vec::new();
-    for project in state.deployment_store.list_projects(None).await? {
-        let deployments = state
-            .deployment_store
-            .list_active_deployments_for_project(project.id)
-            .await?;
-        if deployments.is_empty() {
-            continue;
-        }
-
-        if !provider.controller_class.is_empty()
-            && project_controller_class(state, &project).await?.as_deref()
-                != Some(provider.controller_class.as_str())
-        {
-            continue;
-        }
-
-        let environments = state
-            .deployment_store
-            .list_environments_for_project(project.id)
-            .await?;
-        let custom_domains = state
-            .deployment_store
-            .list_project_custom_domains(project.id)
-            .await?;
+    for project in &projects {
+        let deployments = deployments_by_project
+            .remove(&project.id)
+            .unwrap_or_default();
+        let environments = environments.remove(&project.id).unwrap_or_default();
+        let custom_domains = custom_domains.remove(&project.id).unwrap_or_default();
         // Any error — store or undecodable data — fails the whole snapshot, so
         // Traefik keeps serving its last good config instead of dropping a
         // live router.
         targets.extend(rise_backend_traefik::dynamic::project_route_targets(
-            &project,
+            project,
             &deployments,
             &environments,
             &custom_domains,
@@ -618,19 +662,14 @@ async fn build_traefik_dynamic_config(
     ))
 }
 
-/// The deployment controller class of `project`'s Organization.
+/// The deployment controller class of the Organization `org_uid`.
 #[cfg(feature = "backend")]
-async fn project_controller_class(
+async fn organization_controller_class(
     state: &state::AppState,
-    project: &rise_backend_core::models::Project,
+    org_uid: uuid::Uuid,
 ) -> anyhow::Result<Option<String>> {
     use anyhow::Context;
 
-    let org_uid = state
-        .deployment_store
-        .organization_uid_for_project(project.id)
-        .await?
-        .with_context(|| format!("project '{}' has no Organization linkage", project.name))?;
     let org = state
         .resource_store
         .get(org_uid)
