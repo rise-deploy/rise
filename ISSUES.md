@@ -412,7 +412,7 @@ own project authz, so operators never delegate CloudWatch access.
 - Docker/Kubernetes hash secret plaintext into their env-hash label/annotation
   (deferred by the user). **Partially fixed in #460**: Kubernetes' pod
   annotation hash now goes through `rise_backend_core::env::hash_env` over
-  secret *fingerprints* (`src/server/deployment/webhook.rs`), same approach ECS
+  secret *fingerprints* (`crates/rise-backend-kubernetes/src/webhook.rs`), same approach ECS
   already used (`redact_secrets_for_hash` at `reconciler.rs:1034`). **Docker is
   still open** — `crates/rise-backend-docker/src/reconciler.rs:847` hashes the
   full merged env including plaintext secret values, with no redaction step.

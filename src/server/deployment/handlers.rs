@@ -27,40 +27,37 @@ use crate::server::state::AppState;
 use rise_backend_auth::session_scope::{Kind, Operation, Verb};
 use rise_backend_core::events::EventSeverity;
 
-/// Validate group name format: must be 'default' or match [a-z0-9][a-z0-9/-]*[a-z0-9]
-/// with additional constraints:
-/// - No consecutive hyphens (`--`) to avoid collisions with normalized names
-///   (e.g. `mr/123` normalizes to `mr--123`, so `mr--123` as a raw group name is disallowed)
-/// - Normalized result must be <= 63 chars (Kubernetes label value limit)
+/// A deployment group name: `default`, or lowercase alphanumeric segments joined
+/// by single `-` or `/` separators (`main`, `pr-123`, `team/feature-x`).
+///
+/// Separators may not be adjacent, which keeps [`models::normalize_deployment_group`]
+/// injective: it turns each `/` into `--` and keeps `-`, so with no adjacent
+/// separators a `--` in the normalized name can only come from a `/`. Without
+/// the rule `pr/123` and `pr//123` (or `a/-b` and `a-/b`) would normalize to
+/// the same name, and so share a hostname and Kubernetes resource names.
+static GROUP_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9]+(?:[-/][a-z0-9]+)*$").unwrap());
+
+/// Validate a deployment group name for a new deployment: [`GROUP_NAME_RE`],
+/// at most 100 characters, and a normalized form within the 63-character
+/// Kubernetes label value limit.
 fn is_valid_group_name(name: &str) -> bool {
     if name == models::DEFAULT_DEPLOYMENT_GROUP {
         return true;
     }
+    name.len() <= 100
+        && GROUP_NAME_RE.is_match(name)
+        && models::normalize_deployment_group(name).len() <= 63
+}
 
-    if name.len() > 100 {
-        return false;
-    }
-
-    // Disallow consecutive hyphens to prevent collisions with normalized names
-    if name.contains("--") {
-        return false;
-    }
-
-    let valid_pattern = Regex::new(r"^[a-z0-9][a-z0-9/-]*[a-z0-9]$")
-        .unwrap()
-        .is_match(name);
-
-    if !valid_pattern {
-        return false;
-    }
-
-    // Ensure the normalized result fits within Kubernetes label value limit (63 chars)
-    let normalized = models::normalize_deployment_group(name);
-    if normalized.len() > 63 {
-        return false;
-    }
-
-    true
+/// Whether `name` could name an existing deployment group. Looser than
+/// [`is_valid_group_name`] so groups created before its separator rule can
+/// still be addressed (e.g. stopped).
+fn is_addressable_group_name(name: &str) -> bool {
+    static ADDRESSABLE_GROUP_NAME_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9/-]*[a-z0-9]$").unwrap());
+    name == models::DEFAULT_DEPLOYMENT_GROUP
+        || (name.len() <= 100 && ADDRESSABLE_GROUP_NAME_RE.is_match(name))
 }
 
 /// Resolve image tag to digest by contacting OCI registry directly
@@ -1120,7 +1117,7 @@ pub async fn create_deployment(
     if let Some(ref group) = payload.group {
         if !is_valid_group_name(group) {
             return Err(ServerError::bad_request(format!(
-                "Invalid group name '{}'. Must be 'default' or match pattern [a-z0-9][a-z0-9/-]*[a-z0-9] (no consecutive hyphens, normalized length max 63 chars)",
+                "Invalid group name '{}'. Must be 'default' or lowercase alphanumeric segments joined by single '-' or '/' (e.g. 'pr-123', 'team/feature'), with no adjacent separators and a normalized length of at most 63 characters",
                 group
             )));
         }
@@ -2587,9 +2584,9 @@ pub async fn stop_deployments_by_group(
     );
 
     // Validate group name
-    if !is_valid_group_name(&query.group) {
+    if !is_addressable_group_name(&query.group) {
         return Err(ServerError::bad_request(format!(
-            "Invalid group name '{}'. Must be 'default' or match pattern [a-z0-9][a-z0-9/-]*[a-z0-9] (no consecutive hyphens, normalized length max 63 chars)",
+            "Invalid group name '{}'. Must be 'default' or match pattern [a-z0-9][a-z0-9/-]*[a-z0-9]",
             query.group
         )));
     }
@@ -3726,14 +3723,42 @@ fn default_log_count_step_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_log_containers, normalize_env_override_is_protected, resolve_resource_check_inputs,
-        validate_env_override, validate_env_override_key, validate_identity_audiences,
-        validate_log_stream_query, validate_reported_attributes, LogStreamParams,
-        MAX_REPORTED_ATTRIBUTES_BYTES,
+        check_log_containers, is_addressable_group_name, is_valid_group_name,
+        normalize_env_override_is_protected, resolve_resource_check_inputs, validate_env_override,
+        validate_env_override_key, validate_identity_audiences, validate_log_stream_query,
+        validate_reported_attributes, LogStreamParams, MAX_REPORTED_ATTRIBUTES_BYTES,
     };
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn group_names_normalize_injectively() {
+        for ok in [
+            "default",
+            "main",
+            "a",
+            "pr-123",
+            "pr/123",
+            "team/feature-x",
+            "v1-2/rc-3",
+        ] {
+            assert!(is_valid_group_name(ok), "{ok} should be valid");
+        }
+        // Adjacent separators would collide after normalization: `pr//123`
+        // with `pr/123`, `a/-b` with `a-/b`, `pr--123` with `pr/123`.
+        for bad in [
+            "pr//123", "pr--123", "a/-b", "a-/b", "-pr", "pr/", "PR-1", "pr_1", "pr.1", "",
+        ] {
+            assert!(!is_valid_group_name(bad), "{bad} should be invalid");
+        }
+        assert!(!is_valid_group_name(&"a".repeat(64)));
+
+        // Existing groups named before the separator rule can still be stopped.
+        assert!(is_addressable_group_name("pr//123"));
+        assert!(is_addressable_group_name("default"));
+        assert!(!is_addressable_group_name("PR 1"));
+    }
 
     #[test]
     fn log_container_filter_accepts_only_declared_containers() {

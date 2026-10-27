@@ -16,8 +16,9 @@ through the `docker` deployment controller (`deployment_controller.type: docker`
 | `traefik` | `rise-traefik` | Reverse proxy; routes `{project}.<domain>` to app containers. |
 
 The reconciler creates one container per running deployment and stamps two
-families of labels on each (see
-`crates/rise-backend-docker/src/labels.rs`):
+families of labels on each (see `labels.rs` in
+`crates/rise-backend-core` for bookkeeping and `crates/rise-backend-traefik` for
+routing):
 
 - **Bookkeeping labels** (`rise.dev/managed-by=rise`, `…/project`,
   `…/deployment-id`, `…/route-hash`, etc.) so the reconciler can find its

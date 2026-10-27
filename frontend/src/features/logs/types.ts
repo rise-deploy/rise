@@ -1,5 +1,5 @@
 // TypeScript mirrors of the log types the backend serialises. The Rust
-// definitions live in `src/server/deployment/logs.rs`; keep the two in sync.
+// definitions live in `crates/rise-backend-core/src/logs/mod.rs`; keep the two in sync.
 
 /** `LogStatusReason` — why a range came back without the lines you expected. */
 export type LogStatusReason =

@@ -35,6 +35,7 @@ pub mod models;
 pub mod naming;
 pub mod observation;
 pub mod organization;
+pub mod project_routing;
 pub mod providers;
 pub mod quantity;
 pub mod rolling;
@@ -83,4 +84,4 @@ pub use runtime::{
 pub use store::{DeploymentStore, SupersessionOutcome};
 pub use system_env::rise_system_env_vars;
 pub use token_ttl::{refresh_due_after_secs, remint_after_secs};
-pub use url_builder::{DeploymentUrlBuilder, IngressUrl};
+pub use url_builder::DeploymentUrlBuilder;
