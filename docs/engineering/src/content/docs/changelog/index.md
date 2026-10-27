@@ -1,19 +1,13 @@
 ---
-title: "Upgrade Notes & Breaking Changes"
+title: "Upcoming releases"
+description: What the next Rise release changes for operators, and what is planned after it.
+sidebar:
+  order: 0
 ---
 
-This page is the canonical, per-release reference for changes that affect
-operators running a Rise installation: breaking changes, required actions, and
-new or changed configuration. Read the section for the version you are upgrading
-**to** before upgrading.
-
-:::note
-Every pull request with operator impact adds its entry under **Unreleased** in
-the same change and carries the `operator-impact` label, which CI checks. The
-section moves under its version heading when a full release is tagged. Changes
-that are planned but not merged yet are listed on
-[Upcoming Changes](/operator-docs/upcoming-changes/).
-:::
+What changes for operators in the next release, and what is planned after it.
+Read [Unreleased](#unreleased) before upgrading to a new release candidate or
+release; each released version has its own page in this changelog.
 
 ## Impact legend
 
@@ -27,8 +21,9 @@ that are planned but not merged yet are listed on
 
 ## Unreleased
 
-_Changes merged to `develop` but not yet in a release. `scripts/tag-version.sh`
-moves them into a version section when it tags a full release._
+_Merged to `develop` and not yet in a full release; release candidates already
+carry them. `scripts/tag-version.sh` moves this section onto the version's page
+when it tags a full release._
 
 - **Path-based app URLs are no longer supported.** *Breaking* for installs
   whose ingress URL templates contain a path (e.g.
@@ -797,6 +792,18 @@ moves them into a version section when it tags a full release._
   `[containers.X.env]`). If any of your users' apps set `RISE_*` keys, rename them
   before upgrading.
 
+- **Config change — Operator role (`auth.operator_users`).** The generic resource
+  API (`/api/v1/resources`) is gated to a new, separately configured Operator
+  role. `auth.admin_users` do **not** receive Operator access. No action needed
+  unless you want operators to manage generic resources. See
+  [`ROADMAP.md`](https://github.com/rise-deploy/rise/blob/develop/ROADMAP.md).
+- **Config change — default Organization / Kubernetes `controller_class_name`.**
+  Backend startup bootstraps a single default Organization and backfills existing
+  users, teams, and projects to it under an advisory lock. Existing installs
+  resolve to the **same** namespace names as before (`rise-` prefix → `rise-myapp`).
+  The Kubernetes controller's `controller_class_name` defaults to a stable value
+  for existing installs if unset.
+
 ### Known release-candidate limitations
 
 - **Docker drift-driven recreation can briefly interrupt a single replica.** A
@@ -822,20 +829,48 @@ moves them into a version section when it tags a full release._
 
 ---
 
-## 0.23.0
+## Planned
 
-First release of the generic resource substrate (compatibility phase). None of
-these change behavior for existing installs by default; the items below are the
-configuration knobs they introduce.
+Not merged yet. Each item is tracked by a
+[`rollout-gate` issue](https://github.com/rise-deploy/rise/issues?q=is%3Aissue+is%3Aopen+label%3Arollout-gate)
+and moves to [Unreleased](#unreleased) in the pull request that lands it.
 
-- **Config change — Operator role (`auth.operator_users`).** The generic resource
-  API (`/api/v1/resources`) is gated to a new, separately configured Operator
-  role. `auth.admin_users` do **not** receive Operator access. No action needed
-  unless you want operators to manage generic resources. See
-  [`ROADMAP.md`](https://github.com/rise-deploy/rise/blob/develop/ROADMAP.md).
-- **Config change — default Organization / Kubernetes `controller_class_name`.**
-  Backend startup bootstraps a single default Organization and backfills existing
-  users, teams, and projects to it under an advisory lock. Existing installs
-  resolve to the **same** namespace names as before (`rise-` prefix → `rise-myapp`).
-  The Kubernetes controller's `controller_class_name` defaults to a stable value
-  for existing installs if unset.
+### 0.25.0
+
+- **Breaking — raw external tokens are refused by default.**
+  `auth.allow_raw_external_tokens` defaults to `false`, so a service account
+  must exchange its external OIDC token at `/api/v1/auth/token` before calling
+  project-scoped endpoints. The legacy in-handler verification path is then
+  removed. **Prepare now:** aggregate the `rise::deprecation`
+  `raw_external_token` events to find the workload identities that still
+  present raw tokens, and move their CI to pre-exchange (see
+  [Authentication & Tokens](/operator-docs/authentication/#access-hs256--token-exchange)).
+  Tracked in [#374](https://github.com/rise-deploy/rise/issues/374).
+
+### Not yet scheduled
+
+- **Breaking — organization linkage becomes mandatory.** The
+  `organization_resource_uid` columns on teams and projects become `NOT NULL`
+  once startup backfill is proven reliable. Backend startup already backfills
+  them, so no action is expected; the release that tightens them will say if
+  that changes.
+  Tracked in [#372](https://github.com/rise-deploy/rise/issues/372).
+- **Action required (for controller authors) — organization opt-in for
+  controllers.** Controllers that register `ResourceDefinition`s in an
+  organization's own API group will need an explicit, operator-granted
+  enablement step per organization. The design is still open. Tracked in
+  [#437](https://github.com/rise-deploy/rise/issues/437).
+- **Resource API — list pagination and label/field selectors.** `list` and
+  `list_versions` return every row today; pagination and selectors land before
+  high-cardinality kinds move onto the resource store. Additive. Tracked in
+  [#368](https://github.com/rise-deploy/rise/issues/368).
+- **Resource API — watch / change feed.** Lets controllers reconcile without
+  polling `list`. Additive. Tracked in
+  [#369](https://github.com/rise-deploy/rise/issues/369).
+- **Resource API — secret fields.** Write-once, never-read-back values in the
+  resource store. Additive. Tracked in
+  [#370](https://github.com/rise-deploy/rise/issues/370).
+- **Docker — no outage when a single-replica container is recreated.** The
+  replacement container starts before the old one is removed, closing the
+  short gap a drift-driven recreate leaves today. No action needed. Tracked in
+  [#379](https://github.com/rise-deploy/rise/issues/379).

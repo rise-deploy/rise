@@ -68,7 +68,7 @@ check_prerequisites() {
 DRY_RUN=false
 SKIP_AI_RELEASE_NOTES=false
 AI_GUIDANCE=""
-UPGRADE_NOTES_FILE="docs/engineering/src/content/docs/upgrade-notes.md"
+UPGRADE_NOTES_FILE="docs/engineering/src/content/docs/changelog/index.md"
 VERSION=""
 COMMIT_RANGE=""
 
@@ -246,8 +246,8 @@ EOF
         cat >> "$TEMP_PROMPT" << EOF
 The operator upgrade notes below are authoritative for breaking changes and
 required operator actions: carry every Breaking and Action required item from
-them into the release notes, and point readers to the Upgrade Notes page for
-the details.
+them into the release notes, and point readers to the changelog in the
+operator docs for the details.
 
 Upgrade notes:
 ${UPGRADE_NOTES}
@@ -317,7 +317,7 @@ echo "The following actions will be performed:"
 echo "  1. Update version in Cargo.toml to ${VERSION}"
 echo "  2. Update Cargo.lock"
 if [ "$IS_FULL_RELEASE" = true ]; then
-    echo "     and move the Unreleased upgrade notes under '## ${VERSION}'"
+    echo "     and add the ${VERSION} page to the operator docs changelog"
 fi
 echo "  3. Commit changes with message: 'chore: bump version to ${VERSION}'"
 if [ "$SKIP_AI_RELEASE_NOTES" = true ]; then
@@ -355,15 +355,20 @@ sed -i.bak "s/^version: .*/version: ${VERSION}/" helm/rise/Chart.yaml && rm helm
 sed -i.bak "s/^appVersion: .*/appVersion: \"${VERSION}\"/" helm/rise/Chart.yaml && rm helm/rise/Chart.yaml.bak
 
 # Step 2: Update Cargo.lock
-echo "[2/5] Updating Cargo.lock and upgrade notes..."
+echo "[2/5] Updating Cargo.lock and the changelog..."
 cargo update --workspace --quiet
 if [ "$IS_FULL_RELEASE" = true ]; then
-    scripts/promote-upgrade-notes.sh "${VERSION}" "${UPGRADE_NOTES_FILE}"
+    RELEASE_NOTES_FILE=$(mktemp)
+    if [ "$SKIP_AI_RELEASE_NOTES" = false ]; then
+        printf '%s\n' "${RELEASE_SUMMARY}" > "${RELEASE_NOTES_FILE}"
+    fi
+    scripts/changelog-release.sh "${VERSION}" "${RELEASE_NOTES_FILE}"
+    rm "${RELEASE_NOTES_FILE}"
 fi
 
 # Step 3: Commit the changes
 echo "[3/5] Committing version bump..."
-git add Cargo.toml Cargo.lock helm/rise/Chart.yaml "${UPGRADE_NOTES_FILE}"
+git add Cargo.toml Cargo.lock helm/rise/Chart.yaml docs/engineering/src/content/docs/changelog
 git commit -m "chore: bump version to ${VERSION}"
 
 # Step 4: Create the tag with AI-generated notes in the annotation

@@ -314,23 +314,25 @@ and drop whatever the migration created.
 
 ## Rollout Tracking
 
-Operator-facing change is recorded in the operator
-[Upgrade Notes](docs/engineering/src/content/docs/upgrade-notes.md) page — the
-changelog operators read before upgrading.
+Operator-facing change is recorded in the operator docs **Changelog**
+(`docs/engineering/src/content/docs/changelog/`): its
+[Upcoming releases](docs/engineering/src/content/docs/changelog/index.md) page
+plus one page per released version.
 
 - A PR that is breaking, needs operator action, or adds or changes
-  configuration adds its entry under **Unreleased** in the **same** PR, with
-  the matching impact badge, and carries the `operator-impact` label. CI fails
-  a labelled PR that does not touch the page. `scripts/tag-version.sh` puts the
-  Unreleased section into the release notes and, for a full release, moves it
-  under the version heading.
+  configuration adds its entry under **Unreleased** on Upcoming releases in the
+  **same** PR, with the matching impact badge, and carries the
+  `operator-impact` label. CI fails a labelled PR that does not touch the page.
+- `scripts/tag-version.sh` feeds Unreleased into the AI release notes and, for a
+  full release, runs `scripts/changelog-release.sh`: it writes the version's
+  page (release notes plus the Unreleased entries as its upgrade notes) and
+  empties Unreleased. Release candidates get no page of their own.
 - Planned operator-facing change that has not merged — a deferred finalization
   step (flip a default, drop a compat shim, tighten a constraint) or a known
   limitation awaiting a fix — is filed as a `rollout-gate` issue **and** listed
-  on the [Upcoming Changes](docs/engineering/src/content/docs/upcoming-changes.md)
-  page under its target release, or "Not yet scheduled". The PR that lands it
-  moves the entry from that page into the Upgrade Notes. Check both when
-  planning or reviewing large or breaking work.
+  under **Planned** on Upcoming releases, under its target release or "Not yet
+  scheduled". The PR that lands it moves the entry into Unreleased. Check both
+  when planning or reviewing large or breaking work.
 - `ROADMAP.md` owns the *why*, phase rationale, and milestone checkboxes for every
   in-flight architectural workstream (its numbered sections: generic resource and
   authorization foundation, Rise-issued authentication and token issuance,
