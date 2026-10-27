@@ -20,8 +20,8 @@ const rendered = await Promise.all(records.map(async record => ({
 
 <div class="deprecation-registry">
   {rendered.map(record => (
-    <section class="deprecation-record" id={record.id}>
-      <header class="deprecation-heading"><h2>{record.title}</h2><span class="deprecation-status" data-status={record.status}>{record.status === 'removed' ? 'Removed' : 'Deprecated · still available'}</span></header>
+    <section class="deprecation-record" aria-labelledby={record.id}>
+      <header class="deprecation-heading"><h2 id={record.id}>{record.title}</h2><span class="deprecation-status" data-status={record.status}>{record.status === 'removed' ? 'Removed' : 'Deprecated · still available'}</span></header>
       <div class="sl-markdown-content availability" set:html={record.availabilityHtml} />
       <dl class="lifecycle" aria-label="Feature lifecycle">
         {record.events.map(event => (
