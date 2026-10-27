@@ -29,11 +29,9 @@
         }
         .logo {
             width: 48px; height: 48px; margin: 0 auto;
-            border-radius: 12px;
-            background: linear-gradient(135deg, var(--accent), oklch(0.62 0.18 245));
-            display: grid; place-items: center;
-            color: #fff; font-weight: 700; font-size: 22px;
         }
+        .logo svg { display: block; width: 100%; height: 100%; }
+        .logo svg g { fill: var(--accent); }
         h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; margin: 18px 0 0; }
         p { color: var(--muted); font-size: 13.5px; line-height: 1.55; margin: 10px 0 0; }
         .pill {
@@ -62,7 +60,7 @@
 </head>
 <body>
     <div class="card">
-        <div class="logo" aria-hidden="true">R</div>
+        <div class="logo" aria-hidden="true">{% include "assets/logo.svg" %}</div>
         <span class="pill">Private project</span>
         <h1>Authentication required</h1>
         <p>

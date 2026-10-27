@@ -29,11 +29,9 @@
         }
         .logo {
             width: 48px; height: 48px; margin: 0 auto;
-            border-radius: 12px;
-            background: linear-gradient(135deg, var(--accent), oklch(0.62 0.18 245));
-            display: grid; place-items: center;
-            color: #fff; font-weight: 700; font-size: 22px;
         }
+        .logo svg { display: block; width: 100%; height: 100%; }
+        .logo svg g { fill: var(--accent); }
         .badge {
             width: 44px; height: 44px; border-radius: 50%;
             display: grid; place-items: center; margin: 18px auto 0;
@@ -74,7 +72,7 @@
 <body>
     <div class="card">
         {% if success %}
-        <div class="logo" aria-hidden="true">R</div>
+        <div class="logo" aria-hidden="true">{% include "assets/logo.svg" %}</div>
         <div class="badge ok" aria-hidden="true">&check;</div>
         <h1>CLI authentication successful</h1>
         <p>You're signed in to the Rise CLI. You can close this window and return to your terminal.</p>
@@ -99,7 +97,7 @@
             </ul>
         </div>
         {% else %}
-        <div class="logo" aria-hidden="true">R</div>
+        <div class="logo" aria-hidden="true">{% include "assets/logo.svg" %}</div>
         <div class="badge bad" aria-hidden="true">!</div>
         <h1>CLI authentication failed</h1>
         <p>Failed to authenticate with the Rise CLI.</p>
