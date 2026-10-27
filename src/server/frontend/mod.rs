@@ -7,7 +7,11 @@ use tera::Tera;
 
 /// Names of shared Tera partials that should be registered alongside any
 /// auth-page template so `{% include %}` statements resolve.
-const AUTH_TEMPLATE_PARTIALS: &[&str] = &["_auth-tokens.css.tera", "_auth-theme.js.tera"];
+const AUTH_TEMPLATE_PARTIALS: &[&str] = &[
+    "_auth-tokens.css.tera",
+    "_auth-theme.js.tera",
+    "assets/logo.svg",
+];
 
 /// Load a static file from the configured static_dir, with path traversal protection.
 pub async fn load_static_file(static_dir: &str, rel_path: &str) -> Option<Vec<u8>> {

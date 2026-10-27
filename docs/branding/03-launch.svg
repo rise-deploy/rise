@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" role="img" aria-labelledby="title">
+  <title id="title">Rise Launch logo concept</title>
+  <g stroke="#818cf8" stroke-linejoin="round" stroke-width="6">
+    <path d="M8 24v22l24 13 24-13V24M8 24l24 13 24-13M32 37v22"/>
+    <path d="M32 27V5m-9 9 9-9 9 9"/>
+  </g>
+</svg>

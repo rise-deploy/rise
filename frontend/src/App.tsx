@@ -53,7 +53,7 @@ function LoginPage() {
         <div className="r-login-wrap">
             <div className="r-signin">
                 <div className="r-signin-brand">
-                    <div className="r-brand-mark">R</div>
+                    <span className="r-brand-mark" aria-hidden="true" />
                     <div className="r-brand-name">Rise</div>
                 </div>
                 <div>

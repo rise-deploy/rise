@@ -206,11 +206,9 @@ a { color: inherit; }
 .r-brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .r-brand-mark {
     width: 26px; height: 26px;
-    border-radius: 4px;
     background: var(--accent);
-    color: var(--accent-fg);
-    display: grid; place-items: center;
-    font-weight: 700; font-size: 13px;
+    mask: url('../../../static/assets/logo.svg') center / contain no-repeat;
+    display: block;
     flex: 0 0 auto;
 }
 .r-brand-name { font-weight: 600; font-size: 15px; letter-spacing: -0.01em; color: var(--text); }
@@ -1789,7 +1787,7 @@ a.r-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; 
 /* ---------- Sign in ---------- */
 .r-signin { width: 100%; max-width: 380px; display: flex; flex-direction: column; gap: 22px; }
 .r-signin-brand { display: flex; align-items: center; gap: 10px; }
-.r-signin-brand .r-brand-mark { width: 30px; height: 30px; border-radius: 5px; font-size: 14px; }
+.r-signin-brand .r-brand-mark { width: 30px; height: 30px; }
 .r-signin-brand .r-brand-name { font-size: 17px; }
 .r-signin .r-page-sub { margin-top: 4px; }
 .r-signin-pending { display: flex; align-items: center; gap: 10px; color: var(--text-muted); font-size: 13px; min-height: 44px; }

@@ -128,7 +128,7 @@ function Sidebar({ route, user, onLogout, onOpenPalette, summary, theme, onToggl
     return (
         <aside className="r-side">
             <button type="button" className="r-brand" onClick={() => navigate('/home')} aria-label="Go to home">
-                <div className="r-brand-mark">R</div>
+                <span className="r-brand-mark" aria-hidden="true" />
                 <div className="r-brand-name">Rise</div>
             </button>
 
@@ -310,7 +310,7 @@ function MobileShell({ route, pathname, breadcrumbs, onOpenPalette, fullBleed, c
                     </button>
                 ) : (
                     <button type="button" className="r-tap-btn" onClick={() => navigate('/home')} aria-label="Go to home">
-                        <span className="r-brand-mark">R</span>
+                        <span className="r-brand-mark" aria-hidden="true" />
                     </button>
                 )}
                 <div className="r-mhead-title">
