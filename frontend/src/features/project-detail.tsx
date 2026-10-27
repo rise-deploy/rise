@@ -377,8 +377,8 @@ function ProjectOverview({ project, onUpdated }: { project: Project; onUpdated: 
                             onKeyDown={e => { if (e.key === 'Enter') navigate(deploymentPath(projectName, d.deployment_id)); }}
                         >
                             <span className={cx('r-dot', statusTone(d.status))} title={d.status} />
-                            <span className="mono id">{d.deployment_id}</span>
-                            {d.environment && <EnvTag env={d.environment} />}
+                            <span className="mono id" title={d.deployment_id}>{d.deployment_id}</span>
+                            <span className="r-dep-env">{d.environment && <EnvTag env={d.environment} color={d.environment_color} />}</span>
                             <span className="msg"><DeploymentSource d={d} projectName={projectName} /></span>
                             <span className="age">{formatRelativeTimeRounded(d.created)}</span>
                         </div>

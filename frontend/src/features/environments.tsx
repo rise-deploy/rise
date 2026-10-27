@@ -15,6 +15,7 @@ import {
     Button,
     ConfirmDialog,
     Empty,
+    EnvTag,
     EnvironmentColorPicker,
     EnvironmentIcon,
     Field,
@@ -76,7 +77,7 @@ function EnvironmentCard({ state, projectName, environments, onEdit }: {
             <div className="r-env-card-head">
                 <EnvironmentIcon color={env.color} size={13} />
                 <h2 className="name">{env.name}</h2>
-                {env.is_production && env.name !== 'production' && <span className="r-env-tag prod">production</span>}
+                {env.is_production && env.name !== 'production' && <EnvTag env="production" color={env.color} />}
                 <Status {...healthBadge(state)} />
                 <span className="right">{replicas ?? (live ? `${live.replicas} replica${live.replicas === 1 ? '' : 's'}` : '')}</span>
             </div>

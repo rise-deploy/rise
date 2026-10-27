@@ -1934,12 +1934,15 @@ a.r-meta-link:hover { color: var(--text); }
     line-height: 1.6;
     padding: 0 6px;
     border-radius: 3px;
-    color: var(--text-muted);
-    background: var(--surface-2);
+    color: color-mix(in oklab, var(--env-color, var(--text-muted)) 55%, var(--text));
+    background: color-mix(in oklab, var(--env-color, var(--text-muted)) 12%, var(--surface));
     white-space: nowrap;
     flex: 0 0 auto;
+    max-width: 100%;
+    box-sizing: border-box;
 }
-.r-env-tag.prod { color: var(--accent); background: var(--accent-soft); }
+.r-env-tag-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.r-env-tag.accent { color: var(--accent); background: var(--accent-soft); }
 
 /* Clickable list rows in a panel (overview lists, recent deployments). */
 .r-list { overflow: hidden; }
@@ -2366,7 +2369,20 @@ a.r-btn { text-decoration: none; }
 .r-attention .sub { font-size: 12.5px; color: var(--text-muted); overflow-wrap: anywhere; }
 .r-attention .cta { color: var(--accent); font-size: 12.75px; white-space: nowrap; }
 .r-home-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 26px; align-items: start; }
-.r-dep-row .proj { font-weight: 600; flex: 0 0 auto; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.r-dep-row { display: grid; grid-template-columns: 7px minmax(0, 140px) minmax(0, 120px) minmax(0, 1fr) max-content; }
+.r-dep-row .id, .r-dep-row .proj { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.r-dep-row .proj { font-weight: 600; }
+.r-dep-env { min-width: 0; }
+.r-dep-row .msg { grid-column: 4; }
+.r-home .r-dep-row { grid-template-columns: 7px minmax(0, .8fr) minmax(0, .8fr) minmax(0, 2fr) max-content; }
+@media (min-width: 768px) and (max-width: 1100px) {
+    .r-dep-row { grid-template-columns: 7px minmax(0, .8fr) minmax(0, .8fr) minmax(0, 2fr) max-content; }
+}
+@media (max-width: 767px) {
+    .r-dep-row, .r-home .r-dep-row { grid-template-columns: 7px minmax(0, 1fr) minmax(0, 1fr) max-content; }
+    .r-dep-row .msg { grid-column: 2 / -1; grid-row: 2; order: initial; }
+    .r-dep-row .age { grid-column: 4; grid-row: 1; }
+}
 .r-project-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
 .r-project-card {
     background: var(--surface);
