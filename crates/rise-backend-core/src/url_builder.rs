@@ -229,7 +229,7 @@ impl DeploymentUrlBuilder {
                 all_environments,
             ) {
                 warn_once!(
-                    format!("dg-host-suppressed:{}:{}:{}", project.id, deployment_group, parsed.host),
+                    format!("dg-host-suppressed:{}:{}:{}", project.id, deployment_group, dg_host),
                     project = %project.name,
                     deployment_group = %deployment_group,
                     host = %dg_host,
