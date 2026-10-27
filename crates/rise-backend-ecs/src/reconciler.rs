@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use rise_backend_core::events::{EventSeverity, EventSource, ForwardedEvent};
 use rise_backend_core::models::{Deployment, DeploymentStatus, Project};
 use rise_backend_core::observation::{derive_events, ContainerObservation, ObservedState};
+use rise_backend_core::project_routing::ProjectRouting;
 use rise_backend_core::{
     effective_health_path, hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash,
     resolve_deployment_env_vars, resolve_runtime_containers, rise_system_env_vars,
@@ -166,7 +167,22 @@ struct HealthReconcileInput<'a> {
     services: &'a [ActualService],
     registered: &'a HashMap<String, String>,
     desired_td_hash: Option<&'a str>,
+    /// The project's environments and custom domains, preloaded once for the
+    /// project pass.
+    routing: &'a ProjectRouting,
     server_status_cache: &'a mut HashMap<String, Option<HashMap<String, bool>>>,
+    /// Re-confirmed before the pass's DB writes.
+    election: &'a LeaderElection,
+}
+
+/// Outcome of one deployment's health pass ([`EcsReconciler::reconcile_health`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthPass {
+    /// The pass ran to completion (or had nothing to do).
+    Done,
+    /// The leader lease could not be re-confirmed before the pass's DB writes,
+    /// so none were made; the rest of the project's health pass must stop too.
+    LeaseLost,
 }
 
 impl EcsReconciler {
@@ -930,7 +946,13 @@ impl EcsReconciler {
             .store
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
+        // Each transition is a status write, so leadership is re-confirmed
+        // before each one like every other write in this pass (a local-clock
+        // check while the cached lease horizon covers it).
         for deployment in &non_terminal {
+            if !self.confirm_leadership(election).await {
+                return Ok(());
+            }
             if let Err(e) = rise_backend_core::lifecycle::perform_status_transition(
                 self.store.as_ref(),
                 project,
@@ -950,6 +972,15 @@ impl EcsReconciler {
             .list_non_terminal_deployments_for_project(project.id)
             .await?;
 
+        // The project's environments and custom domains feed every
+        // deployment's hosts, in both the desired computation and the
+        // readiness pass below. Read them once for the whole project pass
+        // rather than once per deployment per pass (mirrors the K8s webhook's
+        // per-sync preload). A failed read aborts the project pass before any
+        // desired state is computed, so nothing is retired against a partial
+        // view.
+        let routing = ProjectRouting::load(self.store.as_ref(), project.id).await?;
+
         // 2. Desired state. A deployment whose desired state cannot be computed
         // is PROTECTED rather than dropped: its services would otherwise look
         // orphaned and be deleted, taking a healthy app offline over a transient
@@ -961,7 +992,7 @@ impl EcsReconciler {
                 continue;
             }
             match self
-                .compute_desired_for_deployment(project, deployment)
+                .compute_desired_for_deployment(project, deployment, &routing)
                 .await
             {
                 Ok((mut entries, events)) => {
@@ -1120,7 +1151,7 @@ impl EcsReconciler {
                 .filter(|(_, _, container)| container.deployment_uuid == deployment.id.to_string())
                 .map(|(_, _, container)| container.clone())
                 .collect();
-            if let Err(e) = self
+            match self
                 .reconcile_health(
                     project,
                     deployment,
@@ -1131,15 +1162,23 @@ impl EcsReconciler {
                         desired_td_hash: desired_hash_by_deployment
                             .get(&deployment.deployment_id)
                             .map(String::as_str),
+                        routing: &routing,
                         server_status_cache: &mut server_status_cache,
+                        election,
                     },
                 )
                 .await
             {
-                warn!(
-                    deployment = %deployment.deployment_id,
-                    "Health reconciliation failed: {:?}", e
-                );
+                Ok(HealthPass::Done) => {}
+                // The lease is global: once it is gone, no further deployment
+                // of this project (or any other — `tick` re-checks) may write.
+                Ok(HealthPass::LeaseLost) => return Ok(()),
+                Err(e) => {
+                    warn!(
+                        deployment = %deployment.deployment_id,
+                        "Health reconciliation failed: {:?}", e
+                    );
+                }
             }
         }
         Ok(())
@@ -1170,6 +1209,7 @@ impl EcsReconciler {
         &self,
         project: &Project,
         deployment: &Deployment,
+        routing: &ProjectRouting,
     ) -> Result<(
         Vec<(DesiredService, TaskDefinitionSpec, DesiredContainer)>,
         Vec<ForwardedEvent>,
@@ -1180,27 +1220,13 @@ impl EcsReconciler {
         // deploying something that looks fine and is quietly broken.
         Self::permanent(self.reject_unsupported(&container_specs))?;
 
-        let environment = self
-            .store
-            .find_environment(deployment.environment_id)
-            .await?;
-        let env_name = environment.as_ref().map(|e| e.name.clone());
-        let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
+        let env_name = routing
+            .environment(deployment.environment_id)
+            .map(|e| e.name.clone());
 
-        let urls = self.url_builder.compute_deployment_urls(
-            project,
-            deployment,
-            environment.as_ref(),
-            &all_environments,
-            &custom_domains,
-        );
-        let primary_hosts = self.url_builder.public_hosts_for_group(
-            project,
-            &deployment.deployment_group,
-            &all_environments,
-            &custom_domains,
-        );
+        let urls = routing.urls_for_group(&self.url_builder, project, &deployment.deployment_group);
+        let primary_hosts =
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
 
         // Secrets are kept SEPARATE from plain env — the whole point of D7. They
         // still ride in the merged env, since a container sees one flat
@@ -2266,17 +2292,24 @@ impl EcsReconciler {
     /// so "ready" means "Traefik is actually routing to it" and the outgoing
     /// deployment is never retired while the incoming one is invisible to the
     /// router.
+    ///
+    /// The probing (`DescribeTasks`, Traefik `serverStatus`) can take long
+    /// enough for the lease confirmed at the start of the project pass to
+    /// lapse, so leadership is re-confirmed immediately before the DB writes —
+    /// and again after the Traefik cutover check, which is another HTTP round
+    /// trip. Returns [`HealthPass::LeaseLost`] when it can't be confirmed; the
+    /// caller then stops the project's health pass.
     async fn reconcile_health(
         &self,
         project: &Project,
         deployment: &Deployment,
         input: HealthReconcileInput<'_>,
-    ) -> Result<()> {
+    ) -> Result<HealthPass> {
         if !matches!(
             deployment.status,
             DeploymentStatus::Deploying | DeploymentStatus::Healthy | DeploymentStatus::Unhealthy
         ) {
-            return Ok(());
+            return Ok(HealthPass::Done);
         }
 
         let HealthReconcileInput {
@@ -2284,7 +2317,9 @@ impl EcsReconciler {
             services,
             registered,
             desired_td_hash,
+            routing,
             server_status_cache,
+            election,
         } = input;
 
         let (container_specs, route_specs) = resolve_runtime_containers(deployment)?;
@@ -2293,14 +2328,8 @@ impl EcsReconciler {
             .filter_map(|s| s.key.as_deref().map(|k| (k, s)))
             .collect();
 
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-        let all_environments = self.store.list_environments_for_project(project.id).await?;
-        let primary_hosts = self.url_builder.public_hosts_for_group(
-            project,
-            &deployment.deployment_group,
-            &all_environments,
-            &custom_domains,
-        );
+        let primary_hosts =
+            routing.hosts_for_group(&self.url_builder, project, &deployment.deployment_group);
 
         // An empty spec set is never ready — otherwise a corrupt deployment row
         // would report Healthy while running nothing.
@@ -2506,6 +2535,14 @@ impl EcsReconciler {
             persisted_td_hash(&deployment.controller_metadata)
         };
 
+        // Everything below writes to the DB. Re-confirm the lease now that the
+        // probing is done: a former leader must not record observations, stamp
+        // `controller_metadata` or move this deployment's status after a peer
+        // has taken over.
+        if !self.confirm_leadership(election).await {
+            return Ok(HealthPass::LeaseLost);
+        }
+
         // Record what was seen, but only from a tick that saw everything. An
         // incomplete pass would look like tasks having stopped, and the log
         // would gain terminations that never happened.
@@ -2595,7 +2632,7 @@ impl EcsReconciler {
                 .await?
                 {
                     info!(deployment = %deployment.deployment_id, "Deployment selected as the desired Traefik target");
-                    return Ok(());
+                    return Ok(HealthPass::Done);
                 }
                 let expected = rise_backend_traefik::dynamic::render_dynamic_config(
                     desired,
@@ -2613,13 +2650,19 @@ impl EcsReconciler {
                 );
                 if !expected.http.routers.is_empty() && self.traefik_api.is_none() {
                     warn!(deployment = %deployment.deployment_id, "Traefik API is required to confirm the HTTP-provider cutover");
-                    return Ok(());
+                    return Ok(HealthPass::Done);
                 }
                 if let Some(api) = self.traefik_api.as_ref() {
                     if !api.dynamic_config_applied(&expected).await {
                         debug!(deployment = %deployment.deployment_id, "Waiting for Traefik to apply the selected deployment routers");
-                        return Ok(());
+                        return Ok(HealthPass::Done);
                     }
+                }
+                // The router check above is another Traefik round trip; the
+                // supersession below retires the group's previous deployment,
+                // so confirm the lease once more right before it.
+                if !self.confirm_leadership(election).await {
+                    return Ok(HealthPass::LeaseLost);
                 }
                 rise_backend_core::lifecycle::handle_deployment_became_healthy(
                     self.store.as_ref(),
@@ -2668,7 +2711,7 @@ impl EcsReconciler {
             DeploymentStatus::Unhealthy if all_ready => {}
             _ => {}
         }
-        Ok(())
+        Ok(HealthPass::Done)
     }
 
     /// Describe a service's tasks, projecting each onto the backend-agnostic

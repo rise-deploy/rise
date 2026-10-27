@@ -8,7 +8,8 @@
 use crate::resource_builder::ResourceBuilder;
 use anyhow::Result;
 use async_trait::async_trait;
-use rise_backend_core::models::{Deployment, Project};
+use rise_backend_core::models::Project;
+use rise_backend_core::project_routing::ProjectRouting;
 use rise_backend_core::BackendCapabilities;
 use rise_backend_core::DeploymentStore;
 use rise_backend_core::{DeploymentBackend, DeploymentUrls};
@@ -18,7 +19,7 @@ use std::sync::Arc;
 ///
 /// Provides log streaming, URL computation, and environment cleanup.
 /// Reconciliation/health checks/termination are handled by the Metacontroller
-/// sync webhook (`src/server/deployment/webhook.rs`).
+/// sync webhook (`crate::webhook`).
 pub struct KubernetesBackend {
     kube_client: kube::Client,
     resource_builder: Arc<ResourceBuilder>,
@@ -58,48 +59,18 @@ impl KubernetesBackend {
 
 #[async_trait]
 impl DeploymentBackend for KubernetesBackend {
-    async fn get_deployment_urls(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-    ) -> Result<DeploymentUrls> {
-        // Load environment info if the deployment has one
-        let environment = self
-            .store
-            .find_environment(deployment.environment_id)
-            .await?;
-
-        // All envs are needed so `compute_deployment_urls` can suppress a DG URL
-        // whose host would collide with another env's URL (see
-        // `host_conflicts_with_other_env`).
-        let all_environments = self.store.list_environments_for_project(project.id).await?;
-
-        // Load custom domains for the project
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-
-        Ok(self.resource_builder.compute_deployment_urls(
-            project,
-            deployment,
-            environment.as_ref(),
-            &all_environments,
-            &custom_domains,
-        ))
-    }
-
     async fn get_project_urls(
         &self,
         project: &Project,
         deployment_group: &str,
     ) -> Result<DeploymentUrls> {
-        let environments = self.store.list_environments_for_project(project.id).await?;
-        let custom_domains = self.store.list_project_custom_domains(project.id).await?;
-
-        Ok(self.resource_builder.compute_project_urls(
-            project,
-            deployment_group,
-            &environments,
-            &custom_domains,
-        ))
+        Ok(ProjectRouting::load(self.store.as_ref(), project.id)
+            .await?
+            .urls_for_group(
+                &self.resource_builder.url_builder,
+                project,
+                deployment_group,
+            ))
     }
 
     async fn cleanup_environment(&self, project: &Project, _environment_name: &str) -> Result<()> {

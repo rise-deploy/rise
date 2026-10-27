@@ -6,6 +6,8 @@
 //! typed APIs that need to stamp the default organization on newly created
 //! rows.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
@@ -208,6 +210,25 @@ pub async fn organization_uid_for_project(
     .await
     .context("Failed to look up project organization linkage")?;
     Ok(row.and_then(|r| r.organization_resource_uid))
+}
+
+/// The Organization each of `project_ids` is linked to, in one query. Projects
+/// without a linkage map to `None`; unknown IDs are absent.
+pub async fn organization_uids_for_projects(
+    pool: &PgPool,
+    project_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Option<Uuid>>> {
+    let rows = sqlx::query!(
+        r#"SELECT id, organization_resource_uid FROM projects WHERE id = ANY($1)"#,
+        project_ids
+    )
+    .fetch_all(pool)
+    .await
+    .context("Failed to look up project organization linkages")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.id, row.organization_resource_uid))
+        .collect())
 }
 
 /// Stamp `organization_resource_uid` on a freshly created team. Only called

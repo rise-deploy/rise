@@ -124,7 +124,7 @@ Rise automatically injects these variables into every deployment:
 |----------|-------------|---------|
 | `PORT` | HTTP port the container should listen on | `8080` |
 | `RISE_ISSUER` | Rise server URL and JWT issuer | `https://rise.example.com` |
-| `RISE_APP_URL` | Canonical URL (primary custom domain or default URL) | `https://myapp.example.com` |
+| `RISE_APP_URL` | Canonical URL (primary custom domain, else the environment URL, else the deployment group URL); unset when the deployment group has no URL | `https://myapp.example.com` |
 | `RISE_APP_URLS` | JSON array of all URLs for the app | `["https://myapp.app.example.com"]` |
 | `RISE_DEPLOYMENT_GROUP` | Deployment group name | `default` |
 | `RISE_DEPLOYMENT_GROUP_NORMALIZED` | Deployment group name normalized for URLs and K8s resource names (sequences of characters not in `[A-Za-z0-9-_.]` are replaced with `--`, and non-alphanumeric leading/trailing characters are trimmed) | `mr--123` |

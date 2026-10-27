@@ -31,6 +31,27 @@ version section at tag time._
 
 Merged to `develop`:
 
+- **Path-based app URLs are no longer supported.** *Breaking* for installs
+  whose ingress URL templates contain a path (e.g.
+  `production_ingress_url_template: "apps.example.com/{project_name}"`); only
+  the Kubernetes backend ever honored one. Every
+  `*_ingress_url_template` must now be a bare hostname pattern — no scheme,
+  port or path — and the backend refuses to start otherwise. Apps sharing a
+  host shared its cookies and origin, and on Docker and ECS their routers
+  collided outright. Switch to subdomain templates such as
+  `{project_name}.apps.example.com` with a wildcard DNS record and
+  certificate before upgrading; app URLs change accordingly.
+
+- **Kubernetes no longer routes a group that has no host of its own.** A
+  deployment group with neither a deployment-group host nor an environment
+  host — in practice the `default` group, with no
+  `staging_ingress_url_template`, in a project that has no production
+  environment mapped to it — used to get an Ingress on the production host
+  on Kubernetes only. It now gets none, as on Docker and ECS, and Rise no
+  longer advertises a URL for it: its `primary_url` is empty and its
+  containers get no `RISE_APP_URL`. Point an environment at the group, or
+  configure a staging template, to route it.
+
 - **Preview hostnames join the project with `--`.** *Breaking.* The staging and
   environment templates must now join `{project_name}` to
   `{deployment_group}` / `{environment}` with exactly `--`, and the backend

@@ -8,10 +8,14 @@ use crate::models::{Deployment, Project};
 /// URLs where a deployment can be accessed
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeploymentUrls {
-    /// Default URL based on ingress template configuration
+    /// Default URL based on ingress template configuration. It names the
+    /// group's template host whether or not the group is routed there; see
+    /// `all_urls` for where it actually answers.
     pub default_url: String,
-    /// Primary URL - the starred custom domain if one exists, otherwise the default URL
-    pub primary_url: String,
+    /// Primary URL: the starred custom domain, else the environment URL, else
+    /// the first routed URL. `None` when the deployment's group has no public
+    /// host at all, so it is not reachable.
+    pub primary_url: Option<String>,
     /// Additional URLs for custom domains
     pub custom_domain_urls: Vec<String>,
     /// Full ordered list of every URL the deployment is reachable at — deployment-group
@@ -28,25 +32,25 @@ pub struct DeploymentUrls {
 /// needed by HTTP handlers: log streaming, URL computation, and environment cleanup.
 #[async_trait]
 pub trait DeploymentBackend: Send + Sync {
-    /// Calculate URLs where this deployment can be accessed
-    ///
-    /// Returns the primary URL (from ingress templates) and any custom domain URLs.
-    /// URLs are calculated dynamically based on current controller configuration.
-    async fn get_deployment_urls(
-        &self,
-        deployment: &Deployment,
-        project: &Project,
-    ) -> anyhow::Result<DeploymentUrls>;
-
-    /// Calculate URLs where a project would be accessed for a given deployment group.
-    ///
-    /// Similar to `get_deployment_urls` but takes a group name string instead of a Deployment object.
-    /// Used for preview endpoints where no deployment exists yet.
+    /// Calculate URLs where a project is reached for a given deployment group,
+    /// whether or not the group has a deployment yet. URLs are calculated
+    /// dynamically from the current controller configuration.
     async fn get_project_urls(
         &self,
         project: &Project,
         deployment_group: &str,
     ) -> anyhow::Result<DeploymentUrls>;
+
+    /// Calculate URLs where this deployment can be accessed: its deployment
+    /// group's, as routing is per group.
+    async fn get_deployment_urls(
+        &self,
+        deployment: &Deployment,
+        project: &Project,
+    ) -> anyhow::Result<DeploymentUrls> {
+        self.get_project_urls(project, &deployment.deployment_group)
+            .await
+    }
 
     /// Clean up resources associated with a deleted environment
     ///

@@ -462,7 +462,7 @@ async fn projects_to_api(
             latest_deployment_status,
             latest_deployment_id,
             default_url: Some(urls.default_url),
-            primary_url: Some(urls.primary_url),
+            primary_url: urls.primary_url,
             custom_domain_urls: urls.custom_domain_urls,
             deployment_groups: None, // Not populated in list view for performance
             finalizers: vec![],      // Not populated in list view for performance
@@ -571,7 +571,7 @@ pub async fn get_project(
 
     let mut api_project = convert_project(project.clone(), owner_info, &state);
     api_project.default_url = Some(urls.default_url);
-    api_project.primary_url = Some(urls.primary_url);
+    api_project.primary_url = urls.primary_url;
     api_project.custom_domain_urls = urls.custom_domain_urls;
     if let Some(deployment) = active_deployment {
         api_project.active_deployment_id = Some(deployment.deployment_id);

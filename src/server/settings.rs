@@ -1173,19 +1173,15 @@ pub enum DeploymentControllerSettings {
         #[serde(default)]
         kubeconfig: Option<String>,
 
-        /// Ingress URL template for production (default) deployment group
-        /// Supports both subdomain and sub-path routing:
-        ///   Subdomain: "{project_name}.apps.rise.dev"
-        ///   Sub-path: "rise.dev/{project_name}"
-        /// Must contain {project_name} placeholder
+        /// Ingress URL template for production (default) deployment group,
+        /// e.g. "{project_name}.apps.rise.dev"
+        /// Must be a hostname (no scheme, port or path) containing {project_name}
         production_ingress_url_template: String,
 
-        /// Ingress URL template for staging (non-default) deployment groups
-        /// Supports both subdomain and sub-path routing:
-        ///   Subdomain: "{deployment_group}--{project_name}.preview.rise.dev"
-        ///   Sub-path: "rise.dev/{project_name}/{deployment_group}"
-        /// Must join {project_name} and {deployment_group} with "--" (see the
-        /// Configuration docs for the full rule)
+        /// Ingress URL template for staging (non-default) deployment groups,
+        /// e.g. "{deployment_group}--{project_name}.preview.rise.dev"
+        /// Must be a hostname joining {project_name} and {deployment_group} with
+        /// "--" (see the Configuration docs for the full rule)
         /// If not set, {project_name} in the production template becomes
         /// "{project_name}--{deployment_group}"
         #[serde(default)]
@@ -1194,11 +1190,9 @@ pub enum DeploymentControllerSettings {
         /// Ingress URL template for named environments (e.g., staging, dev)
         /// Only used for non-production environments whose primary deployment group matches
         /// the deployment's group. Production environments use `production_ingress_url_template`.
-        /// Supports both subdomain and sub-path routing:
-        ///   Subdomain: "{environment}--{project_name}.apps.rise.dev"
-        ///   Sub-path: "rise.dev/{project_name}/{environment}"
-        /// Must join {project_name} and {environment} with "--", on the same side
-        /// as the staging template
+        /// e.g. "{environment}--{project_name}.apps.rise.dev"
+        /// Must be a hostname joining {project_name} and {environment} with "--",
+        /// on the same side as the staging template
         /// If not set, environment-specific URLs are not generated.
         #[serde(default)]
         environment_ingress_url_template: Option<String>,
@@ -2345,48 +2339,15 @@ impl Settings {
             ..
         }) = settings.deployment_controller
         {
-            Self::validate_format_string(
+            Self::validate_ingress_templates(
                 production_ingress_url_template,
-                "production_ingress_url_template",
-                "{project_name}",
+                staging_ingress_url_template.as_deref(),
+                environment_ingress_url_template.as_deref(),
             )?;
 
             Self::validate_label_value(
                 controller_class_name,
                 "deployment_controller.controller_class_name",
-            )?;
-
-            if let Some(ref staging_template) = staging_ingress_url_template {
-                Self::validate_format_string(
-                    staging_template,
-                    "staging_ingress_url_template",
-                    "{project_name}",
-                )?;
-                Self::validate_format_string(
-                    staging_template,
-                    "staging_ingress_url_template",
-                    "{deployment_group}",
-                )?;
-            }
-
-            if let Some(ref environment_template) = environment_ingress_url_template {
-                Self::validate_format_string(
-                    environment_template,
-                    "environment_ingress_url_template",
-                    "{project_name}",
-                )?;
-                Self::validate_format_string(
-                    environment_template,
-                    "environment_ingress_url_template",
-                    "{environment}",
-                )?;
-            }
-
-            #[cfg(feature = "backend")]
-            Self::validate_host_templates(
-                production_ingress_url_template,
-                staging_ingress_url_template.as_deref(),
-                environment_ingress_url_template.as_deref(),
             )?;
 
             Self::validate_extra_service_token_audiences(extra_service_token_audiences)?;
@@ -2428,9 +2389,10 @@ impl Settings {
         }
 
         // Validate the Docker deployment controller variant with the same
-        // contract as the Kubernetes variant: the ingress templates must carry
-        // their placeholders (otherwise every project collides on one Traefik
-        // Host(...) rule) and the controller class name must be a valid label.
+        // contract as the Kubernetes variant: host-only ingress templates that
+        // carry their placeholders (otherwise every project collides on one
+        // Traefik Host(...) rule) and a controller class name that is a valid
+        // label.
         if let Some(DeploymentControllerSettings::Docker {
             ref production_ingress_url_template,
             ref staging_ingress_url_template,
@@ -2439,48 +2401,15 @@ impl Settings {
             ..
         }) = settings.deployment_controller
         {
-            Self::validate_format_string(
+            Self::validate_ingress_templates(
                 production_ingress_url_template,
-                "production_ingress_url_template",
-                "{project_name}",
+                staging_ingress_url_template.as_deref(),
+                environment_ingress_url_template.as_deref(),
             )?;
 
             Self::validate_label_value(
                 controller_class_name,
                 "deployment_controller.controller_class_name",
-            )?;
-
-            if let Some(ref staging_template) = staging_ingress_url_template {
-                Self::validate_format_string(
-                    staging_template,
-                    "staging_ingress_url_template",
-                    "{project_name}",
-                )?;
-                Self::validate_format_string(
-                    staging_template,
-                    "staging_ingress_url_template",
-                    "{deployment_group}",
-                )?;
-            }
-
-            if let Some(ref environment_template) = environment_ingress_url_template {
-                Self::validate_format_string(
-                    environment_template,
-                    "environment_ingress_url_template",
-                    "{project_name}",
-                )?;
-                Self::validate_format_string(
-                    environment_template,
-                    "environment_ingress_url_template",
-                    "{environment}",
-                )?;
-            }
-
-            #[cfg(feature = "backend")]
-            Self::validate_host_templates(
-                production_ingress_url_template,
-                staging_ingress_url_template.as_deref(),
-                environment_ingress_url_template.as_deref(),
             )?;
         }
 
@@ -2505,48 +2434,15 @@ impl Settings {
             ..
         }) = settings.deployment_controller
         {
-            Self::validate_format_string(
+            Self::validate_ingress_templates(
                 production_ingress_url_template,
-                "production_ingress_url_template",
-                "{project_name}",
+                staging_ingress_url_template.as_deref(),
+                environment_ingress_url_template.as_deref(),
             )?;
 
             Self::validate_label_value(
                 controller_class_name,
                 "deployment_controller.controller_class_name",
-            )?;
-
-            if let Some(ref staging_template) = staging_ingress_url_template {
-                Self::validate_format_string(
-                    staging_template,
-                    "staging_ingress_url_template",
-                    "{project_name}",
-                )?;
-                Self::validate_format_string(
-                    staging_template,
-                    "staging_ingress_url_template",
-                    "{deployment_group}",
-                )?;
-            }
-
-            if let Some(ref environment_template) = environment_ingress_url_template {
-                Self::validate_format_string(
-                    environment_template,
-                    "environment_ingress_url_template",
-                    "{project_name}",
-                )?;
-                Self::validate_format_string(
-                    environment_template,
-                    "environment_ingress_url_template",
-                    "{environment}",
-                )?;
-            }
-
-            #[cfg(feature = "backend")]
-            Self::validate_host_templates(
-                production_ingress_url_template,
-                staging_ingress_url_template.as_deref(),
-                environment_ingress_url_template.as_deref(),
             )?;
 
             if cluster.trim().is_empty() {
@@ -2694,28 +2590,61 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Validate that a format string contains the required placeholder
-    /// Refuse ingress templates that would let one project's preview host
-    /// equal another project's (see `rise_backend_core::host_template`).
-    #[cfg(feature = "backend")]
-    fn validate_host_templates(
+    /// Validate the three ingress URL templates every deployment controller
+    /// carries: each must name its placeholders and resolve to a bare
+    /// hostname, and together they must keep every project's hosts its own
+    /// (see `rise_backend_core::host_template`).
+    fn validate_ingress_templates(
         production: &str,
         staging: Option<&str>,
         environment: Option<&str>,
     ) -> Result<(), ConfigError> {
+        Self::validate_ingress_template(
+            production,
+            "production_ingress_url_template",
+            &["{project_name}"],
+        )?;
+        if let Some(staging) = staging {
+            Self::validate_ingress_template(
+                staging,
+                "staging_ingress_url_template",
+                &["{project_name}", "{deployment_group}"],
+            )?;
+        }
+        if let Some(environment) = environment {
+            Self::validate_ingress_template(
+                environment,
+                "environment_ingress_url_template",
+                &["{project_name}", "{environment}"],
+            )?;
+        }
+        #[cfg(feature = "backend")]
         rise_backend_core::host_template::check_ingress_templates(production, staging, environment)
-            .map_err(|reason| ConfigError::Message(format!("deployment_controller: {reason}")))
+            .map_err(|reason| ConfigError::Message(format!("deployment_controller: {reason}")))?;
+        Ok(())
     }
 
-    fn validate_format_string(
-        format_str: &str,
+    /// An ingress URL template is a hostname pattern: no scheme, port or path.
+    /// Every app owns its host outright, so a path (`apps.example.com/{project_name}`)
+    /// is refused rather than letting projects share one host.
+    fn validate_ingress_template(
+        template: &str,
         field_name: &str,
-        required_placeholder: &str,
+        required_placeholders: &[&str],
     ) -> Result<(), ConfigError> {
-        if !format_str.contains(required_placeholder) {
+        for placeholder in required_placeholders {
+            if !template.contains(placeholder) {
+                return Err(ConfigError::Message(format!(
+                    "deployment_controller.{field_name} must contain the '{placeholder}' \
+                     placeholder. Got: '{template}'"
+                )));
+            }
+        }
+        if template.contains('/') || template.contains(':') {
             return Err(ConfigError::Message(format!(
-                "Kubernetes configuration error: '{}' must contain '{}' placeholder. Got: '{}'",
-                field_name, required_placeholder, format_str
+                "deployment_controller.{field_name} must be a hostname template such as \
+                 '{{project_name}}.apps.example.com', with no scheme, port or path; \
+                 path-based app URLs are not supported. Got: '{template}'"
             )));
         }
         Ok(())
@@ -2857,6 +2786,46 @@ mod tests {
         assert_eq!(from_str.n, 10);
         // A non-numeric string is rejected.
         assert!(serde_yaml::from_str::<Holder>("n: \"abc\"").is_err());
+    }
+
+    #[test]
+    fn ingress_templates_must_be_host_only() {
+        assert!(Settings::validate_ingress_templates(
+            "{project_name}.apps.example.com",
+            Some("{deployment_group}--{project_name}.preview.example.com"),
+            Some("{environment}--{project_name}.apps.example.com"),
+        )
+        .is_ok());
+
+        for (production, staging, environment) in [
+            ("apps.example.com/{project_name}", None, None),
+            (
+                "{project_name}.apps.example.com",
+                Some("preview.example.com/{project_name}/{deployment_group}"),
+                None,
+            ),
+            (
+                "{project_name}.apps.example.com",
+                None,
+                Some("{project_name}.apps.example.com/{environment}"),
+            ),
+            ("https://{project_name}.apps.example.com", None, None),
+            ("{project_name}.apps.example.com:8443", None, None),
+        ] {
+            let err = Settings::validate_ingress_templates(production, staging, environment)
+                .expect_err("path, scheme or port must be rejected")
+                .to_string();
+            assert!(err.contains("hostname template"), "{err}");
+        }
+
+        let err = Settings::validate_ingress_templates(
+            "{project_name}.apps.example.com",
+            Some("{project_name}.preview.example.com"),
+            None,
+        )
+        .expect_err("staging template needs {deployment_group}")
+        .to_string();
+        assert!(err.contains("{deployment_group}"), "{err}");
     }
 
     fn ok_template(id: &str) -> QuickstartTemplateConfig {
