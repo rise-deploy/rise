@@ -8,13 +8,17 @@
 //! [`DockerBackend`] itself implements [`DeploymentBackend`] and only provides
 //! the synchronous HTTP-handler operations: URL computation and a no-op
 //! environment cleanup (the reconciler GCs deleted-environment containers on
-//! its next tick).
+//! its next tick). Runtime logs are served by [`DockerLogBackend`], which reads
+//! the reconciler's containers straight from the daemon.
 
 pub mod client;
 pub mod container_builder;
 pub mod health;
 pub mod identity;
+pub mod logs;
 pub mod reconciler;
+
+pub use logs::DockerLogBackend;
 
 // The runtime-agnostic reconcile machinery lives in `rise-backend-core`, and the
 // Traefik routing machinery in `rise-backend-traefik` — shared with the ECS

@@ -274,7 +274,8 @@ against both while both exist.
 The generic seam runs in the apiserver; the *capability* a product subresource
 needs often does not. `deployment-logs` decides the rule: the runtime log
 backend holds a live `kube::Client` or `bollard::Docker`
-(`src/server/deployment/logs.rs:189-190`, `:253`, `:312`). Compiling it into the
+(`KubernetesLogBackend` in `crates/rise-backend-kubernetes/src/logs.rs`,
+`DockerLogBackend` in `crates/rise-backend-docker/src/logs.rs`). Compiling it into the
 apiserver would hand the control plane cluster and daemon credentials — the
 merged blast radius this decision exists to separate — and require it to know
 which cluster serves which Organization, which is controller state.
