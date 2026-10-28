@@ -118,7 +118,7 @@ services:
   # docker-compose.standalone.demo-idp.yaml. For real use, replace Dex with a
   # proper IdP (see the operator docs "Production caveat").
   dex:
-    image: dexidp/dex:v2.45.1
+    image: dexidp/dex:v2.46.1
     container_name: rise-dex
     restart: unless-stopped
     user: "0:0"
