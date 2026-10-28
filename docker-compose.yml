@@ -30,7 +30,7 @@ services:
 
   # OIDC provider for authentication in the development environment.
   dex:
-    image: dexidp/dex:v2.45.1
+    image: dexidp/dex:v2.46.1
     container_name: rise-dex
     restart: unless-stopped
     user: "0:0"
@@ -123,7 +123,7 @@ services:
   # Start locally with: docker compose --profile jfrog-vault up -d jfrog vault
   vault:
     profiles: ["jfrog-vault"]
-    image: hashicorp/vault:2.1
+    image: hashicorp/vault:2.2
     container_name: rise-vault
     # The image runs as the unprivileged `vault` user; the entrypoint installs
     # curl with apk and writes into the plugin volume, both of which need root.

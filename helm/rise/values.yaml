@@ -360,7 +360,7 @@ dex:
 
   image:
     repository: ghcr.io/dexidp/dex
-    tag: v2.45.1
+    tag: v2.46.1
     pullPolicy: IfNotPresent
 
   imagePullSecrets: []
