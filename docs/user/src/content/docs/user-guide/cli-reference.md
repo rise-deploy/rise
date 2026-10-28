@@ -47,6 +47,7 @@ rise project show
 | `RISE_URL` | Backend URL override; credentials are loaded for this URL. Takes priority over the project target and profile URL. |
 | `RISE_PROFILE` | Login profile to use, equivalent to the global `--profile` flag. See [Login Profiles](../configuration#login-profiles). |
 | `RISE_TOKEN` | Authentication token (skips interactive login) |
+| `RISE_IDENTITY` | Service-account email to exchange the selected external OIDC token for. Set this when authenticating with a CI provider's token; direct raw external-token authentication is deprecated. |
 | `RISE_TOKEN_COMMAND` | Shell command whose stdout is used as the bearer token. JWT output uses the embedded `exp` claim; opaque output uses `RISE_TOKEN_COMMAND_TTL` as its assumed lifetime. |
 | `RISE_TOKEN_COMMAND_TTL` | Assumed lifetime (seconds) for opaque tokens produced by `RISE_TOKEN_COMMAND`. The command is re-run after two thirds of this TTL has elapsed. JWT tokens ignore this setting and use their `exp` claim instead. Default: `600` (10 minutes). |
 | `RISE_TOKEN_COMMAND_TIMEOUT` | Maximum runtime (seconds) for `RISE_TOKEN_COMMAND` before the CLI kills it and treats the attempt as failed. Default: `10`. |
@@ -70,6 +71,8 @@ The CLI picks its backend bearer token from the first available of these sources
 4. Stored login token from `rise login` (in the config file).
 
 Caveat: because GitHub Actions OIDC (3) is auto-detected and ranks above the stored login token (4), a workflow with `id-token: write` and no `RISE_TOKEN`/`RISE_TOKEN_COMMAND` will use OIDC and **error if `RISE_GHA_AUDIENCE` is unset** — it does not fall back to a stored token. Setting `RISE_TOKEN` overrides everything.
+
+After selecting a source, the CLI exchanges its token at `POST /api/v1/auth/token` when `RISE_IDENTITY` is nonblank. Without `RISE_IDENTITY`, it passes the token through unchanged. For external CI tokens, that uses the deprecated raw-token compatibility path; the current backend default permits it, and disabling it by default is planned for 0.25.0. Interactive `rise login` and other Rise-issued tokens used directly are unaffected. See [Service accounts](/docs/user-guide/service-accounts/) for setup and migration details.
 
 ### Token refresh policy
 

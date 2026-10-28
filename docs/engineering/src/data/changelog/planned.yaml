@@ -1,0 +1,83 @@
+version: planned
+introduction: |-
+  Not yet merged. Each item is tracked by a [rollout-gate issue](https://github.com/rise-deploy/rise/issues?q=is%3Aissue+is%3Aopen+label%3Arollout-gate) and moves to Unreleased when its implementation lands.
+groups:
+  - id: 0-25-0
+    title: 0.25.0
+  - id: not-yet-scheduled
+    title: Not yet scheduled
+changes:
+  - id: planned-001
+    title: Breaking — raw external tokens are refused by default.
+    group: 0-25-0
+    action: |-
+      Move CI and scripts from raw external tokens to token exchange before upgrading.
+    feature: raw-external-service-account-tokens
+    stage: default-disabled
+    targetVersion: 0.25.0
+    type: deprecation
+    impact: breaking
+    details: |-
+      `auth.allow_raw_external_tokens` defaults to `false`, so a service account
+      must exchange its external OIDC token at `/api/v1/auth/token` before calling
+      project-scoped endpoints. With that default, direct external-token presentation is rejected unless an
+      operator explicitly enables the compatibility setting. No removal version or
+      date is announced. **Prepare now:** aggregate the `rise::deprecation`
+      `raw_external_token` events to find the workload identities that still
+      present raw tokens, and move their CI to pre-exchange (see
+      [Authentication & Tokens](/operator-docs/authentication/#access-hs256--token-exchange)).
+      Tracked in [#374](https://github.com/rise-deploy/rise/issues/374).
+  - id: planned-002
+    title: Breaking — organization linkage becomes mandatory.
+    group: not-yet-scheduled
+    impact: breaking
+    details: |-
+      The
+      `organization_resource_uid` columns on teams and projects become `NOT NULL`
+      once startup backfill is proven reliable. Backend startup already backfills
+      them, so no action is expected; the release that tightens them will say if
+      that changes.
+      Tracked in [#372](https://github.com/rise-deploy/rise/issues/372).
+  - id: planned-003
+    title: Action required (for controller authors) — organization opt-in for controllers.
+    group: not-yet-scheduled
+    impact: action-required
+    details: |-
+      Controllers that register `ResourceDefinition`s in an
+      organization's own API group will need an explicit, operator-granted
+      enablement step per organization. The design is still open. Tracked in
+      [#437](https://github.com/rise-deploy/rise/issues/437).
+  - id: planned-004
+    title: Resource API — list pagination and label/field selectors.
+    group: not-yet-scheduled
+    type: feature
+    details: |-
+      `list` and
+      `list_versions` return every row today; pagination and selectors land before
+      high-cardinality kinds move onto the resource store. Additive. Tracked in
+      [#368](https://github.com/rise-deploy/rise/issues/368).
+  - id: planned-005
+    title: Resource API — watch / change feed.
+    group: not-yet-scheduled
+    type: feature
+    details: |-
+      Lets controllers reconcile without
+      polling `list`. Additive. Tracked in
+      [#369](https://github.com/rise-deploy/rise/issues/369).
+  - id: planned-006
+    title: Resource API — secret fields.
+    group: not-yet-scheduled
+    type: feature
+    details: |-
+      Write-once, never-read-back values in the
+      resource store. Additive. Tracked in
+      [#370](https://github.com/rise-deploy/rise/issues/370).
+  - id: planned-007
+    title: Docker — no outage when a single-replica container is recreated.
+    group: not-yet-scheduled
+    backends: [ docker ]
+    details: |-
+      The
+      replacement container starts before the old one is removed, closing the
+      short gap a drift-driven recreate leaves today. No action needed. Tracked in
+      [#379](https://github.com/rise-deploy/rise/issues/379).

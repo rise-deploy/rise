@@ -1,0 +1,17 @@
+version: 0.19.0
+date: 2026-03-31
+introduction: |-
+  This archive records the deployment-status API deprecation. See the GitHub release for the complete release notes.
+changes:
+  - id: unscoped-deployment-status-deprecated
+    title: Deployment status updates require a project-scoped endpoint
+    type: deprecation
+    feature: unscoped-deployment-status
+    stage: deprecated
+    featureTitle: Deployment status updates without a project in the URL
+    availability: |-
+      `PATCH /api/v1/deployments/{deployment_id}/status` remains available to authorized callers when the deployment ID identifies a single deployment across projects. Ambiguous IDs return `409 Conflict`. Scoped CLI sessions cannot use this route. No removal version or date is announced.
+    details: |-
+      The project-scoped status endpoint identifies the deployment using both project name and deployment ID. The unscoped endpoint is deprecated and emits a warning when called. See [#182](https://github.com/rise-deploy/rise/pull/182).
+    migration: |-
+      Update API clients to call `PATCH /api/v1/projects/{project_name}/deployments/{deployment_id}/status` with the same status payload. Include the intended project explicitly rather than assuming deployment IDs are unique across projects. The current Rise CLI uses this project-scoped route; upgrade older CLI installations and check backend logs for `Deprecated endpoint called: PATCH /deployments/` to find remaining callers.

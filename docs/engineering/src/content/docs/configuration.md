@@ -439,7 +439,7 @@ registry:
 - **CLI pushes**: the backend mints a short-lived multi-scope token with `r,w` permissions scoped to the deployment tag, blob uploads, and content-addressed manifests. The token is used for `docker login` before push.
 - **Kubernetes pull secrets**: when `mint_pull_secrets: true`, the controller creates image pull secrets with a long-lived read-only scoped token (`artifact:{docker_repo_key}/{project}/**:r`). Pull tokens are cached in memory and refreshed after 2/3 of their TTL to avoid minting a new token on every deploy.
 
-See [Registry Backend Operations](operator-registry-operations.md#jfrog-artifactory) for scope details and troubleshooting.
+See [JFrog registry operations](/operator-docs/operator-registry-operations/jfrog/#artifact-scope-details) for scope details and troubleshooting.
 
 ### Controller Settings (Optional)
 

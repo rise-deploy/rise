@@ -1,0 +1,13 @@
+version: 0.20.2
+date: 2026-04-30
+introduction: |-
+  Two bug fixes improving OAuth security controls and environment variable handling.
+changes:
+  - id: v0-20-2-001
+    title: OAuth rate limiting is now per-project, per-IP, and configurable
+    details: |-
+      — Rate limiting for OAuth token exchanges is scoped more granularly instead of being global, and can now be tuned via configuration. (#247)
+  - id: v0-20-2-002
+    title: Environment variable source display and scoped propagation
+    details: |-
+      — Fixed how environment variable sources are displayed and how environment-scoped variables are propagated to deployments. (#246)

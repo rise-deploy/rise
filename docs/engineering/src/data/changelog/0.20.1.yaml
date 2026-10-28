@@ -1,0 +1,66 @@
+version: 0.20.1
+date: 2026-04-29
+introduction: |-
+  This release focuses on configuration improvements, OAuth fixes, and developer experience enhancements.
+groups:
+  - id: new-features
+    title: New features
+  - id: fixes
+    title: Fixes
+  - id: other
+    title: Other
+changes:
+  - id: v0-20-1-001
+    title: Public JSON Schema endpoint for `rise.toml`
+    group: new-features
+    type: feature
+    details: |-
+      — A new endpoint serves the JSON Schema for `rise.toml`, enabling editor autocompletion and validation (#243)
+  - id: v0-20-1-002
+    title: "`rise.toml` is now deploy-time config"
+    group: new-features
+    type: feature
+    details: |-
+      — The configuration is read at deployment time rather than being baked into the project, making it easier to iterate on build/deploy settings (#244)
+  - id: v0-20-1-003
+    title: Improved local dev setup
+    group: new-features
+    type: feature
+    details: |-
+      — Pod security disabled by default (needed for Railpack/root builds), and `docker-compose.yaml` now sets a `name` field for cleaner container naming
+  - id: v0-20-1-004
+    title: Allow PKCE and client_secret together
+    group: fixes
+    type: fix
+    details: |-
+      for confidential OAuth clients (#245)
+  - id: v0-20-1-005
+    title: Enforce environment default/production flag invariants
+    group: fixes
+    type: fix
+    details: |-
+      — Prevents invalid states where multiple environments claim to be the default or production environment (#242)
+  - id: v0-20-1-006
+    title: Use hostPort for ingress-nginx
+    group: fixes
+    type: fix
+    details: |-
+      in k3s dev setup, fixing local routing issues (#241)
+  - id: v0-20-1-007
+    title: Set fallback value for `environment_ingress_url_template`
+    group: fixes
+    type: fix
+    details: |-
+      — Prevents missing config errors (#236)
+  - id: v0-20-1-008
+    title: Added `.gitattributes` for `.sqlx/*.json` files (linguist/diff handling)
+    group: other
+  - id: v0-20-1-009
+    title: Updated Rust dependencies (patch-level updates for `aws-sdk-kms`, `reqwest`, and others)
+    group: other
+  - id: v0-20-1-010
+    title: Updated frontend dependency `jose` to v6.2.3
+    group: other
+  - id: v0-20-1-011
+    title: "Documentation: enforced mandatory `cargo fmt` before every commit"
+    group: other

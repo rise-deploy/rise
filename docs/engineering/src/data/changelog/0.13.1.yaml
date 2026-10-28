@@ -1,0 +1,17 @@
+version: 0.13.1
+date: 2026-02-06
+introduction: |-
+  This archive records the OAuth credential deprecation. See the GitHub release for the complete release notes.
+changes:
+  - id: oauth-client-secret-ref-deprecated
+    title: OAuth client_secret_ref is deprecated
+    type: deprecation
+    feature: oauth-client-secret-ref
+    stage: deprecated
+    featureTitle: OAuth client_secret_ref as a live credential source
+    availability: |-
+      In this release, OAuth extensions can resolve their upstream client secret from the project environment variable named by `client_secret_ref`. Store the encrypted secret directly in `client_secret_encrypted` instead. Direct use of `client_secret_ref` ends in 0.15.7; existing stored records have automatic migration support.
+    details: |-
+      OAuth extensions support `client_secret_encrypted` for direct encrypted storage of the upstream provider's client secret. The environment-variable reference `client_secret_ref` is deprecated. See [#125](https://github.com/rise-deploy/rise/pull/125).
+    migration: |-
+      Configure the upstream client secret through the OAuth extension editor, or supply `client_secret_encrypted` in the extension spec. See [OAuth configuration](/operator-docs/extensions/oauth/#configuration).

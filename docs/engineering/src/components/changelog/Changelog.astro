@@ -1,0 +1,254 @@
+---
+import { Icon } from '@astrojs/starlight/components';
+import { createMarkdownProcessor } from '@astrojs/markdown-remark';
+import { parseChangelogYaml, validateChangelog, impactLabels } from '../../../../scripts/changelog-data.mjs';
+import remarkDocLinks from '../../../../shared/remark-doc-links.mjs';
+
+interface Props { releaseId?: string }
+const { releaseId } = Astro.props;
+const data = import.meta.glob<string>('../../data/changelog/*.yaml', { eager: true, query: '?raw', import: 'default' });
+const documents = validateChangelog(Object.entries(data).map(([filename, source]) => parseChangelogYaml(source, filename))).filter(document => !releaseId || document.id === releaseId);
+if (releaseId && documents.length === 0) throw new Error(`Unknown changelog release: ${releaseId}`);
+const processor = await createMarkdownProcessor({
+  syntaxHighlight: false,
+  remarkPlugins: [[remarkDocLinks, { site: 'engineering', base: import.meta.env.BASE_URL, switchUrl: process.env.RISE_DOCS_SWITCH_URL }]],
+});
+const html = async (markdown: string) => markdown ? (await processor.render(markdown)).code : '';
+const inlineHtml = async (markdown: string) => (await html(markdown)).replace(/^<p>/, '').replace(/<\/p>\s*$/, '');
+const rendered = await Promise.all(documents.map(async document => ({
+  ...document,
+  introductionHtml: await html(document.introduction),
+  sections: await Promise.all(document.sections.map(async section => ({
+    ...section,
+    anchor: section.title ? (await processor.render(`## ${section.title}`)).metadata.headings[0]?.slug ?? section.id : section.id,
+    introductionHtml: await html(section.introduction ?? ''),
+    entries: await Promise.all(section.entries.map(async entry => ({
+      ...entry,
+      titleHtml: await inlineHtml(entry.title),
+      detailsHtml: await html(entry.details),
+      actionHtml: await html(entry.action ?? ''),
+      migrationHtml: await html(entry.migration ?? ''),
+    }))),
+  }))),
+})));
+const backendLabels = { all: 'All backends', kubernetes: 'Kubernetes', docker: 'Docker', ecs: 'Amazon ECS' };
+const typeLabels = { feature: 'Feature', fix: 'Fix', change: 'Change', maintenance: 'Maintenance', limitation: 'Known limitation', deprecation: 'Deprecation' };
+const prefix = `changelog-${releaseId ?? 'overview'}`;
+---
+
+<section class="rise-changelog" data-release-id={releaseId} aria-label={releaseId ? `Rise ${releaseId} changes` : 'Rise changelog'}>
+  <div class="changelog-controls" data-controls hidden>
+    {!releaseId && (
+      <div class="release-switcher" role="group" aria-label="Release channel">
+        <button type="button" data-channel="upcoming" aria-pressed="true">Upcoming</button>
+        <button type="button" data-channel="released" aria-pressed="false">Released</button>
+        <button type="button" data-channel="planned" aria-pressed="false">Planned</button>
+      </div>
+    )}
+    <form class="change-filters" role="search" aria-label="Filter changes">
+      <label class="search-field" for={`${prefix}-search`}>
+        <span class="field-label">Search changes</span>
+        <span class="input-wrap"><Icon name="magnifier" class="field-icon search-icon" /><input id={`${prefix}-search`} type="search" name="q" placeholder="Search release notes…" autocomplete="off" /></span>
+      </label>
+      <label for={`${prefix}-impact`}>
+        <span class="field-label">Impact</span>
+        <span class="input-wrap"><select id={`${prefix}-impact`} name="impact"><option value="all">All impacts</option><option value="breaking">Breaking</option><option value="action-required">Action required</option><option value="configuration">Config change</option><option value="none">No action required</option></select><Icon name="down-caret" class="field-icon" /></span>
+      </label>
+      <label for={`${prefix}-backend`}>
+        <span class="field-label">Backend</span>
+        <span class="input-wrap"><select id={`${prefix}-backend`} name="backend"><option value="all">All backends</option><option value="kubernetes">Kubernetes</option><option value="docker">Docker</option><option value="ecs">Amazon ECS</option></select><Icon name="down-caret" class="field-icon" /></span>
+      </label>
+    </form>
+    <div class="filter-status"><p class="result-count" aria-live="polite" aria-atomic="true" data-count></p><button type="button" class="clear-filters" data-clear hidden><Icon name="close" />Clear filters</button></div>
+    <p class="empty-results" data-empty hidden>No changes match these filters. Try a different search, impact, or backend.</p>
+  </div>
+  <noscript><p>All release notes are shown below. Filtering is available with JavaScript enabled.</p></noscript>
+
+  {rendered.map(document => (
+    <section class="release" id={document.id === 'unreleased' ? 'unreleased' : document.id === 'planned' ? 'planned' : `v${document.version}`} data-document data-status={document.status}>
+      <header class="release-header">
+        <div><h2>{document.status === 'released' ? `Rise ${document.version}` : document.title}</h2>{document.date && <time datetime={document.date}>{document.date}</time>}</div>
+        <span class="release-status">{document.status === 'upcoming' ? 'Merged · not released' : document.status === 'planned' ? 'Not yet merged' : 'Released'}</span>
+        {document.version && <a class="github-release" href={`https://github.com/rise-deploy/rise/releases/tag/v${document.version}`}>GitHub release ↗</a>}
+      </header>
+      <div class="release-introduction sl-markdown-content" set:html={document.introductionHtml} />
+      {document.sections.map(section => (
+        <section class="change-group" data-change-group data-entry-count={section.entries.length} id={releaseId || document.status !== 'released' ? section.anchor : `${document.id.replaceAll('.', '-')}-${section.id}`}>
+          {section.title && <h3 class="group-title">{section.title}</h3>}
+          {section.introduction && <div class="sl-markdown-content group-introduction" set:html={section.introductionHtml} />}
+          {section.entries.map((entry, index) => (
+            <article class="change-entry" id={`change-${entry.id}`} data-entry data-impact={entry.impact} data-backends={entry.backends.join(' ')}>
+              <div class="change-meta"><span class="impact-badge" data-impact={entry.impact}>{entry.impact === 'none' ? typeLabels[entry.type] : impactLabels[entry.impact]}</span><span>{entry.backends.map(backend => backendLabels[backend]).join(' · ')}</span>{entry.impact !== 'none' && <span>{typeLabels[entry.type]}</span>}</div>
+              <details class="change-details" open={Boolean(releaseId) || index < 2}>
+                <summary><h4 set:html={entry.titleHtml} /><Icon name="down-caret" class="entry-caret" /></summary>
+                {entry.details && <div class="change-body sl-markdown-content" set:html={entry.detailsHtml} />}
+                {entry.action && <aside class="upgrade-action"><strong>Before you upgrade</strong><div class="sl-markdown-content" set:html={entry.actionHtml} /></aside>}
+                {entry.migration && <aside class="upgrade-action"><strong>Migration</strong><div class="sl-markdown-content" set:html={entry.migrationHtml} /></aside>}
+              </details>
+            </article>
+          ))}
+        </section>
+      ))}
+    </section>
+  ))}
+
+  <details class="impact-legend" id="impact-legend">
+    <summary>What do the impact labels mean?</summary>
+    <dl><dt>Breaking</dt><dd>Requires action or changes behavior incompatibly. Read the instructions before upgrading.</dd><dt>Action required</dt><dd>The upgrade succeeds, but an operator action is needed for the expected behavior.</dd><dt>Config change</dt><dd>Configuration is available or changes; defaults preserve existing behavior.</dd><dt>No action required</dt><dd>Features, fixes, and maintenance with no required operator action.</dd></dl>
+  </details>
+</section>
+
+<script>
+  function initializeChangelogs() {
+    for (const root of document.querySelectorAll<HTMLElement>('.rise-changelog')) {
+      if (root.dataset.initialized) continue;
+      root.dataset.initialized = 'true';
+      const controls = root.querySelector<HTMLElement>('[data-controls]')!;
+      const form = root.querySelector<HTMLFormElement>('form')!;
+      const search = form.querySelector<HTMLInputElement>('input[name="q"]')!;
+      const impact = form.querySelector<HTMLSelectElement>('select[name="impact"]')!;
+      const backend = form.querySelector<HTMLSelectElement>('select[name="backend"]')!;
+      const count = root.querySelector<HTMLElement>('[data-count]')!;
+      const empty = root.querySelector<HTMLElement>('[data-empty]')!;
+      const clear = root.querySelector<HTMLButtonElement>('[data-clear]')!;
+      const entries = [...root.querySelectorAll<HTMLElement>('[data-entry]')];
+      const searchable = new Map(entries.map(entry => [entry, entry.textContent?.toLocaleLowerCase() ?? '']));
+      const url = new URL(window.location.href);
+      function hashTarget() {
+        try { return root.querySelector<HTMLElement>(`#${CSS.escape(decodeURIComponent(window.location.hash.slice(1)))}`); }
+        catch { return null; }
+      }
+      function channelForHash() { return hashTarget()?.closest<HTMLElement>('[data-document]')?.dataset.status; }
+      let channel = ['upcoming', 'released', 'planned'].includes(url.searchParams.get('channel') ?? '') ? url.searchParams.get('channel')! : channelForHash() ?? 'upcoming';
+      search.value = url.searchParams.get('q') ?? '';
+      for (const select of [impact, backend]) {
+        const value = url.searchParams.get(select.name);
+        if (value && [...select.options].some(option => option.value === value)) select.value = value;
+      }
+
+      function update(saveUrl = false) {
+        const query = search.value.trim().toLocaleLowerCase();
+        const hasFilters = Boolean(query) || impact.value !== 'all' || backend.value !== 'all';
+        let matches = 0;
+        for (const release of root.querySelectorAll<HTMLElement>('[data-document]')) {
+          const inChannel = Boolean(root.dataset.releaseId) || release.dataset.status === channel;
+          let releaseMatches = 0;
+          for (const entry of release.querySelectorAll<HTMLElement>('[data-entry]')) {
+            const supported = entry.dataset.backends!.split(' ');
+            const visible = inChannel && (impact.value === 'all' || entry.dataset.impact === impact.value) && (backend.value === 'all' || supported.includes(backend.value)) && (!query || searchable.get(entry)!.includes(query));
+            entry.hidden = !visible;
+            if (visible) releaseMatches++;
+          }
+          for (const group of release.querySelectorAll<HTMLElement>('[data-change-group]')) {
+            group.hidden = !inChannel || (group.dataset.entryCount === '0' ? hasFilters : !group.querySelector('[data-entry]:not([hidden])'));
+          }
+          release.hidden = !inChannel || (hasFilters && releaseMatches === 0);
+          matches += releaseMatches;
+        }
+        root.querySelectorAll<HTMLButtonElement>('[data-channel]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.channel === channel)));
+        count.textContent = `${matches} ${matches === 1 ? 'change' : 'changes'}${backend.value === 'all' ? '' : ` affecting ${backend.selectedOptions[0].textContent}`}`;
+        empty.textContent = hasFilters ? 'No changes match these filters. Try a different search, impact, or backend.' : root.dataset.releaseId ? 'No individual changes are recorded for this release.' : `No ${channel} changes are recorded.`;
+        empty.hidden = matches !== 0;
+        clear.hidden = !hasFilters;
+        if (saveUrl) {
+          const next = new URL(window.location.href);
+          for (const [key, value] of Object.entries({ q: search.value.trim(), impact: impact.value === 'all' ? '' : impact.value, backend: backend.value === 'all' ? '' : backend.value, channel: root.dataset.releaseId || channel === 'upcoming' ? '' : channel })) {
+            if (value) next.searchParams.set(key, value); else next.searchParams.delete(key);
+          }
+          history.replaceState(null, '', next);
+        }
+      }
+      form.addEventListener('submit', event => event.preventDefault());
+      search.addEventListener('input', () => update(true));
+      impact.addEventListener('change', () => update(true));
+      backend.addEventListener('change', () => update(true));
+      root.querySelectorAll<HTMLButtonElement>('[data-channel]').forEach(button => button.addEventListener('click', () => {
+        channel = button.dataset.channel!;
+        if (channelForHash() && channelForHash() !== channel) history.replaceState(null, '', `${location.pathname}${location.search}`);
+        update(true);
+      }));
+      clear.addEventListener('click', () => { search.value = ''; impact.value = 'all'; backend.value = 'all'; update(true); });
+      function revealHashTarget() {
+        const target = hashTarget();
+        if (!target) return;
+        const releaseChannel = channelForHash();
+        if (!root.dataset.releaseId && releaseChannel) channel = releaseChannel;
+        update();
+        const details = target.matches('[data-entry]') ? target.querySelector<HTMLDetailsElement>('details') : target.closest('details');
+        if (details) details.open = true;
+        if (!target.hidden) requestAnimationFrame(() => target.scrollIntoView({ block: 'start' }));
+      }
+      window.addEventListener('hashchange', revealHashTarget);
+      controls.hidden = false;
+      update();
+      revealHashTarget();
+    }
+  }
+  initializeChangelogs();
+  document.addEventListener('astro:page-load', initializeChangelogs);
+</script>
+
+<style>
+  .rise-changelog { margin-top:1.5rem; font-size:.9rem; }
+  .rise-changelog [hidden] { display:none !important; }
+  .release-switcher { display:inline-flex; align-items:stretch; gap:.2rem; padding:.25rem; border:1px solid var(--rise-line); border-radius:.65rem; background:var(--rise-inset); }
+  .release-switcher button { display:flex; align-items:center; justify-content:center; min-height:2.25rem; margin:0; padding:.4rem .9rem; border:0; border-radius:.4rem; background:transparent; color:var(--rise-muted); font:inherit; font-size:.8rem; line-height:1.4; cursor:pointer; }
+  .release-switcher button:hover { color:var(--rise-ink); }
+  .release-switcher button[aria-pressed="true"] { background:var(--rise-pane); color:var(--rise-accent); box-shadow:0 1px 3px color-mix(in srgb,var(--rise-ink) 10%,transparent); }
+  .change-filters { display:grid; align-items:start; grid-template-columns:minmax(10rem,1fr) minmax(9rem,.6fr) minmax(9rem,.6fr); gap:.75rem; margin:1.5rem 0 0; }
+  .change-filters label { display:flex; flex-direction:column; gap:.4rem; min-width:0; margin:0; }
+  .field-label { margin:0; color:var(--rise-ink); font-size:.75rem; font-weight:550; }
+  .input-wrap { position:relative; display:flex; align-items:center; min-width:0; margin:0; border:1px solid color-mix(in srgb,var(--rise-muted) 28%,transparent); border-radius:.5rem; background:var(--rise-inset); }
+  .input-wrap:hover { border-color:color-mix(in srgb,var(--rise-accent) 45%,transparent); }
+  .input-wrap:focus-within { border-color:var(--rise-accent); outline:2px solid color-mix(in srgb,var(--rise-accent) 35%,transparent); outline-offset:2px; }
+  input,select { appearance:none; width:100%; min-width:0; min-height:2.5rem; margin:0; padding:.5rem 2rem .5rem .75rem; border:0; border-radius:.5rem; background:transparent; color:var(--rise-ink); font:inherit; font-size:.8rem; }
+  input { padding-left:2.1rem; }
+  input::placeholder { color:var(--rise-muted); opacity:1; }
+  select option { color:var(--rise-ink); background:var(--rise-pane); }
+  .input-wrap :global(.field-icon) { position:absolute; right:.65rem; width:.9rem; height:.9rem; margin:0; pointer-events:none; color:var(--rise-muted); }
+  .input-wrap :global(.search-icon) { right:auto; left:.65rem; }
+  .filter-status { display:flex; flex-wrap:wrap; align-items:center; gap:.75rem; min-height:2rem; margin:.75rem 0 1.5rem; }
+  .result-count { margin:0; font-size:.75rem; font-variant-numeric:tabular-nums; color:var(--rise-muted); }
+  .clear-filters { display:inline-flex; gap:.3rem; align-items:center; min-height:2rem; margin:0; padding:.25rem .55rem; border:1px solid var(--rise-line); border-radius:.4rem; background:var(--rise-tint); color:var(--rise-accent); font:inherit; font-size:.75rem; cursor:pointer; }
+  .clear-filters :global(svg) { width:.8rem; height:.8rem; margin:0; }
+  .empty-results { padding:1.5rem 0; color:var(--rise-muted); }
+  .release { margin:1.75rem 0 2.5rem; }
+  .release-header { display:flex; flex-wrap:wrap; align-items:center; gap:.75rem; padding-bottom:1rem; border-bottom:1px solid var(--rise-line); }
+  .release-header h2 { margin:0; font-family:var(--rise-font-heading); font-size:1.3rem; letter-spacing:-.025em; }
+  .release-header time { display:block; margin-top:.3rem; font-size:.75rem; color:var(--rise-muted); }
+  .release-status { padding:.2rem .45rem; border-radius:.3rem; color:var(--rise-accent); background:var(--rise-tint); font-size:.65rem; letter-spacing:.035em; }
+  .github-release { margin-left:auto; font-size:.75rem; color:var(--rise-accent); }
+  .release-introduction { margin-top:1rem; color:var(--rise-muted); }
+  .group-title { margin:1.75rem 0 .5rem; font-size:1rem; font-weight:600; }
+  .group-introduction { color:var(--rise-muted); }
+  .change-entry { margin:0; padding:1.15rem 0; border-bottom:1px solid var(--rise-line); scroll-margin-top:9rem; }
+  .change-meta { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin-bottom:.6rem; color:var(--rise-muted); font-size:.7rem; }
+  .impact-badge { padding:.15rem .4rem; border-radius:.3rem; color:var(--rise-accent); background:var(--rise-tint); }
+  .impact-badge[data-impact="breaking"] { color:var(--rise-red); background:var(--rise-red-tint); }
+  .impact-badge[data-impact="action-required"] { color:var(--rise-alert); background:var(--rise-alert-tint); }
+  .impact-badge[data-impact="none"] { color:var(--rise-green); background:var(--rise-green-tint); }
+  .change-details { margin:0; padding:0; background:none; border:0; }
+  .change-details summary { display:flex; gap:.75rem; justify-content:space-between; align-items:baseline; margin:0; padding:0; list-style:none; text-align:start; cursor:pointer; color:var(--rise-ink); }
+  .change-details summary::before { display:none; content:none; }
+  .change-details summary::marker { content:''; }
+  .change-details summary::-webkit-details-marker { display:none; }
+  .change-details h4 { flex:1; min-width:0; margin:0; font:inherit; font-weight:600; font-size:.95rem; line-height:1.65; text-align:start; }
+  .change-details :global(.entry-caret) { flex:0 0 auto; width:.85rem; height:.85rem; margin:0; color:var(--rise-muted); transition:transform 150ms ease-out; }
+  .change-details[open] :global(.entry-caret) { transform:rotate(180deg); }
+  .change-body { margin-top:.75rem; color:var(--rise-muted); }
+  .change-body :global(> :first-child) { margin-top:0; }
+  .change-body :global(> :last-child) { margin-bottom:0; }
+  .change-body :global(pre) { overflow-x:auto; padding:1rem; border-radius:.5rem; background:var(--rise-inset); color:var(--rise-ink); font-size:.8rem; }
+  .change-body :global(table) { font-size:.8rem; }
+  .upgrade-action { margin-top:1rem; padding:.75rem 1rem; border-radius:.4rem; color:var(--rise-alert); background:var(--rise-alert-tint); }
+  .upgrade-action > strong { display:block; margin-bottom:.35rem; font-size:.75rem; font-weight:600; }
+  .upgrade-action :global(p) { margin:0; color:inherit; font-size:.8rem; line-height:1.8; }
+  .impact-legend { margin-top:2rem; padding-top:1rem; border-top:1px solid var(--rise-line); color:var(--rise-muted); }
+  .impact-legend summary { cursor:pointer; font-size:.8rem; }
+  .impact-legend dt { margin-top:1rem; color:var(--rise-ink); font-weight:600; }
+  .impact-legend dd { margin:.25rem 0 0; font-size:.8rem; }
+  button:focus-visible,summary:focus-visible { outline:2px solid var(--rise-accent); outline-offset:3px; }
+  @media(max-width:64rem) { .change-filters { grid-template-columns:repeat(2,minmax(0,1fr)); } .search-field { grid-column:1/-1; } }
+  @media(pointer:coarse) { button,summary,input,select { min-height:44px; } input,select { font-size:1rem; } }
+  @media(prefers-reduced-motion:reduce) { .change-details :global(.entry-caret) { transition:none; } }
+</style>

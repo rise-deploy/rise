@@ -40,12 +40,19 @@ rise sa create -p my-app \
 
 Then, in the web UI, edit the preview service account and restrict it to the `staging` environment.
 
+Record the `Email` shown for each service account by `rise sa create` or `rise sa list`. Set it as `RISE_IDENTITY` in that account's CI job so the CLI exchanges the provider's OIDC JWT for a Rise access token. The example below uses `my-app+0@sa.rise.local` for production and `my-app+1@sa.rise.local` for previews; replace them with your actual account emails.
+
+Direct external-token authentication without exchange is deprecated. It still works when the operator allows raw external tokens; disabling that compatibility path by default is planned for 0.25.0. See [Service accounts](/docs/user-guide/service-accounts/) for the exact scope and migration instructions.
+
 **Step 3 — Deploy from CI:**
 
 ```yaml
 # GitLab CI example
 deploy-production:
   only: [tags]
+  variables:
+    RISE_URL: https://rise.example.net
+    RISE_IDENTITY: my-app+0@sa.rise.local
   id_tokens:
     RISE_TOKEN:
       aud: https://rise.example.net
@@ -54,6 +61,9 @@ deploy-production:
 
 deploy-preview:
   except: [tags]
+  variables:
+    RISE_URL: https://rise.example.net
+    RISE_IDENTITY: my-app+1@sa.rise.local
   id_tokens:
     RISE_TOKEN:
       aud: https://rise.example.net

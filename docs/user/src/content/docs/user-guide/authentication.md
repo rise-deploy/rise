@@ -114,6 +114,7 @@ details.
 - `RISE_URL` — default backend URL
 - `RISE_PROFILE` — login profile to use (see [Login Profiles](../configuration#login-profiles))
 - `RISE_TOKEN` — authentication token (bypasses interactive login)
+- `RISE_IDENTITY` — service-account email to select for exchanging an external OIDC token; see [Service accounts](/docs/user-guide/service-accounts/)
 
 ### API Usage
 
@@ -121,7 +122,9 @@ Protected endpoints require `Authorization: Bearer <token>`. Missing or invalid 
 
 ## Service Accounts (Workload Identity)
 
-Service accounts let CI/CD pipelines authenticate with Rise using short-lived OIDC tokens — no long-lived secrets required. Each job presents a JWT from the CI provider; Rise validates it against the service account's claim configuration and grants project-scoped deployment access.
+Service accounts let CI/CD pipelines authenticate with Rise using short-lived OIDC tokens. Set `RISE_IDENTITY` to the service-account email; the CLI exchanges the provider's JWT for a Rise access token after Rise validates the issuer and configured claims.
+
+Direct authentication with an unexchanged external CI token is deprecated. It still works when the operator allows raw external tokens; disabling that path by default is planned for 0.25.0. This deprecation does not apply to interactive login or to Rise-issued tokens used directly without `RISE_IDENTITY`.
 
 See [Service Accounts](../service-accounts) for full setup instructions, available claims, GitLab CI and GitHub Actions examples, and local testing.
 

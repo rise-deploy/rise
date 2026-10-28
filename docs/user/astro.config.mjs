@@ -1,100 +1,32 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { unified } from '@astrojs/markdown-remark';
+import { sidebarFor } from '../shared/navigation.mjs';
+import remarkDocLinks from '../shared/remark-doc-links.mjs';
 
 const base = process.env.ASTRO_BASE ?? '/docs';
 
 export default defineConfig({
   base,
+  markdown: {
+    processor: unified({
+      remarkPlugins: [[remarkDocLinks, { site: 'user', base, switchUrl: process.env.RISE_DOCS_SWITCH_URL }]],
+    }),
+  },
   integrations: [
     starlight({
       title: 'Rise User Docs',
       favicon: '/favicon.ico',
-      social: [
-        {
-          icon: 'github',
-          label: 'GitHub',
-          href: 'https://github.com/NiklasRosenstein/rise',
-        },
-      ],
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/rise-deploy/rise' }],
+      customCss: ['../shared/styles/docs.css'],
+      routeMiddleware: './src/section-middleware.ts',
       components: {
         Header: './src/components/Header.astro',
+        Sidebar: './src/components/Sidebar.astro',
+        MobileMenuToggle: '../shared/components/RelocatedControls.astro',
+        MobileMenuFooter: '../shared/components/RelocatedControls.astro',
       },
-      sidebar: [
-        {
-          label: 'Start Here',
-          items: [
-            { label: 'Overview', slug: 'index' },
-            { label: 'Getting Started', slug: 'user-guide/getting-started' },
-            { label: 'Project Configuration', slug: 'user-guide/configuration' },
-          ],
-        },
-        {
-          label: 'Guides',
-          items: [
-            { label: 'Using Rise with AI Agents', slug: 'guides/ai-app-builder' },
-            { label: 'Deploying from CI', slug: 'guides/deploying-from-ci' },
-            { label: 'Authenticating End Users', slug: 'guides/authenticating-end-users' },
-            { label: 'Choosing a Build Backend', slug: 'guides/choosing-a-build-backend' },
-          ],
-        },
-        {
-          label: 'Deploy Applications',
-          items: [
-            { label: 'Deployments', slug: 'user-guide/deployments' },
-            { label: 'Environments', slug: 'user-guide/environments' },
-            { label: 'CI/CD Setup', slug: 'user-guide/ci-cd' },
-            {
-              label: 'Building Images',
-              items: [
-                { label: 'Overview', slug: 'user-guide/builds' },
-                { label: 'Docker', slug: 'user-guide/builds/docker' },
-                { label: 'Pack (Buildpacks)', slug: 'user-guide/builds/pack' },
-                { label: 'Railpack', slug: 'user-guide/builds/railpack' },
-              ],
-            },
-            { label: 'Environment Variables', slug: 'user-guide/environment-variables' },
-            { label: 'Custom Domains', slug: 'user-guide/custom-domains' },
-            { label: 'Local Development', slug: 'user-guide/local-development' },
-            { label: 'Docker Runtime', slug: 'user-guide/docker-runtime' },
-          ],
-        },
-        {
-          label: 'Access',
-          items: [
-            { label: 'Authentication', slug: 'user-guide/authentication' },
-            { label: 'Service Accounts', slug: 'user-guide/service-accounts' },
-            { label: 'Workload Identity Tokens', slug: 'user-guide/workload-identity-tokens' },
-            {
-              label: 'Authentication for Applications',
-              items: [
-                { label: 'Overview', slug: 'user-guide/authentication-for-apps' },
-                { label: 'rise_jwt Cookie', slug: 'user-guide/authentication-for-apps/rise-jwt-cookie' },
-                { label: 'Validating JWTs', slug: 'user-guide/authentication-for-apps/validating-jwts' },
-                { label: 'Example Code', slug: 'user-guide/authentication-for-apps/examples' },
-              ],
-            },
-            { label: 'OAuth Extensions', slug: 'user-guide/oauth' },
-            { label: 'SSL & Proxy Configuration', slug: 'user-guide/ssl-proxy' },
-          ],
-        },
-        {
-          label: 'Reference',
-          items: [
-            { label: 'CLI Reference', slug: 'user-guide/cli-reference' },
-            { label: 'Troubleshooting', slug: 'user-guide/troubleshooting' },
-          ],
-        },
-        {
-          label: 'Project Extensions',
-          items: [
-            { label: 'Overview', slug: 'extensions' },
-            { label: 'AWS RDS Provisioner', slug: 'extensions/aws-rds-provisioner' },
-            { label: 'AWS S3 Bucket', slug: 'extensions/aws-s3-bucket' },
-            { label: 'OAuth Provider', slug: 'extensions/oauth' },
-            { label: 'Snowflake OAuth Provisioner', slug: 'extensions/snowflake-oauth-provisioner' },
-          ],
-        },
-      ],
+      sidebar: sidebarFor('user'),
     }),
   ],
 });

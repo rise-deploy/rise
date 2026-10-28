@@ -1,0 +1,15 @@
+---
+import DefaultMarkdownContent from '@astrojs/starlight/components/MarkdownContent.astro';
+import { RESOURCE_API_STATUS } from '../navigation.mjs';
+
+const id = Astro.locals.starlightRoute.entry.id.replace(/\.(md|mdx)$/, '');
+const isResourceApi = id === 'resources' || id === 'resources/index' || id.startsWith('resources/');
+---
+
+{isResourceApi && (
+  <aside class="rise-resource-status" aria-label="Resource API status">
+    <strong>Work in progress</strong>
+    <p>{RESOURCE_API_STATUS}</p>
+  </aside>
+)}
+<DefaultMarkdownContent><slot /></DefaultMarkdownContent>

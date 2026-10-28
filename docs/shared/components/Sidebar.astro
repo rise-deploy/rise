@@ -1,0 +1,31 @@
+---
+import DefaultSidebar from '@astrojs/starlight/components/Sidebar.astro';
+import MobileMenuFooter from '@astrojs/starlight/components/MobileMenuFooter.astro';
+
+interface Props {
+  site: 'user' | 'engineering';
+}
+
+const { site } = Astro.props;
+const selectorUrl = process.env.RISE_DOCS_SELECTOR_URL;
+const switchUrl = process.env.RISE_DOCS_SWITCH_URL;
+const switchLabel = process.env.RISE_DOCS_SWITCH_LABEL ?? 'Switch docs';
+const platformUrl = site === 'user'
+  ? process.env.RISE_DOCS_PLATFORM_URL === ''
+    ? undefined
+    : process.env.RISE_DOCS_PLATFORM_URL ?? (selectorUrl ? undefined : '/')
+  : process.env.RISE_DOCS_PLATFORM_URL || undefined;
+const hasAuxiliaryLinks = Boolean(selectorUrl || switchUrl || platformUrl);
+---
+
+<DefaultSidebar />
+<div class:list={['rise-docs-sidebar-footer', { 'rise-docs-sidebar-footer-mobile': !hasAuxiliaryLinks }]}>
+  {hasAuxiliaryLinks && (
+    <nav class="rise-docs-sidebar-links" aria-label="Documentation resources">
+      {selectorUrl && <a href={selectorUrl}>All docs</a>}
+      {switchUrl && <a href={switchUrl}>{switchLabel}</a>}
+      {platformUrl && <a href={platformUrl}>← Back to Rise</a>}
+    </nav>
+  )}
+  <div class="rise-docs-mobile-preferences md:sl-hidden"><MobileMenuFooter /></div>
+</div>

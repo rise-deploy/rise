@@ -2,8 +2,15 @@
   "name": "docs",
   "license": "MIT OR Apache-2.0",
   "private": true,
+  "scripts": {
+    "test": "node --test shared/*.test.mjs scripts/*.test.mjs"
+  },
   "workspaces": [
     "user",
     "engineering"
-  ]
+  ],
+  "dependencies": {
+    "@astrojs/starlight": "^0.42.7",
+    "yaml": "2.9.1"
+  }
 }

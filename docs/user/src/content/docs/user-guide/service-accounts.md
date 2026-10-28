@@ -2,9 +2,17 @@
 title: "Service Accounts"
 ---
 
-Service accounts let CI/CD pipelines authenticate with Rise using short-lived OIDC tokens. No long-lived secrets are stored anywhere — each job presents a JWT issued by the CI provider and Rise validates it against the service account's claim configuration.
+Service accounts let CI/CD pipelines authenticate with Rise using short-lived OIDC tokens. Set `RISE_IDENTITY` to the service account's email so the CLI exchanges the CI provider's JWT for a short-lived Rise access token.
 
-**How it works:** CI generates a JWT → Rise validates its signature against the configured OIDC issuer → matches claims against the service account → grants project-scoped deployment access.
+Rise validates the provider token against the service account's issuer and claim configuration during exchange. Subsequent API requests use the Rise-issued token with that service account's project permissions.
+
+:::caution[Deprecated: direct external CI tokens]
+Sending a CI provider's OIDC JWT directly to Rise, without exchanging it for a Rise access token, is deprecated. With `RISE_IDENTITY` unset, the CLI passes its selected token through unchanged; for an external CI token, this uses the deprecated per-request service-account authentication path.
+
+This path still works when the operator enables `auth.allow_raw_external_tokens`, whose current default is `true`. Disabling it by default is **planned for 0.25.0**; the path is not removed today. Set `RISE_IDENTITY` in CI jobs to use token exchange.
+
+Interactive `rise login` and Rise-issued tokens used directly without `RISE_IDENTITY` are unaffected. See the [deprecation register](https://rise-deploy.github.io/rise/operator/changelog/deprecations/) for status and release history.
+:::
 
 For the recommended two-SA setup (production + preview with environment restrictions), see [CI/CD Setup](../ci-cd).
 
@@ -22,9 +30,14 @@ rise sa create -p my-project \
 
 Add to `.gitlab-ci.yml`:
 
+Use the service account's `Email` from `rise sa create` or `rise sa list` as `RISE_IDENTITY`. The addresses below are examples; use the email for the account you created.
+
 ```yaml
 deploy:
   stage: deploy
+  variables:
+    RISE_URL: https://rise.example.net
+    RISE_IDENTITY: my-project+0@sa.rise.local
   id_tokens:
     RISE_TOKEN:
       aud: https://rise.example.net
@@ -62,6 +75,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Deploy
         env:
+          RISE_URL: https://rise.example.net
+          RISE_IDENTITY: my-app+0@sa.rise.local
           # The CLI auto-detects GitHub Actions and mints an OIDC token on demand,
           # re-minting after about 2/3 of its lifetime so long builds can't outlast it.
           # Set the audience to the Rise server URL (`https://rise.example.net`).
@@ -73,14 +88,14 @@ Because GitHub Actions OIDC auto-detection ranks above the stored login token (s
 
 ## Exchanging the OIDC token (`RISE_IDENTITY`)
 
-By default the CLI sends your token to Rise as-is, and the backend federates it
-per request. To instead **exchange** the external OIDC token up front for a
-short-lived, Rise-issued access token, set `RISE_IDENTITY` to the service
+To **exchange** the external OIDC token for a short-lived, Rise-issued access
+token, set `RISE_IDENTITY` to the service
 account's email (shown by `rise sa list` / `rise sa show`, of the form
 `<project>+<n>@sa.rise.local`):
 
 ```yaml
 env:
+  RISE_URL: https://rise.example.net
   RISE_GHA_AUDIENCE: https://rise.example.net
   RISE_IDENTITY: my-app+0@sa.rise.local   # exchange the OIDC token for this SA
 ```
@@ -91,15 +106,6 @@ exchange. `RISE_IDENTITY` only *selects* the identity; your OIDC token still has
 to prove (issuer + claims) that it may assume that service account. The resulting
 access token carries the resolved principal, so it works across every command
 (including `rise project list`) without a per-command `--project`.
-
-:::caution[Deprecated: service accounts without exchange]
-Presenting a raw external token **without** `RISE_IDENTITY` (the legacy
-per-request path, where the backend federates the token on every call) is
-**deprecated**. Starting in **0.25.0** the operator toggle
-[`auth.allow_raw_external_tokens`](/operator-docs/authentication/) defaults to
-`false`, at which point an un-exchanged external token is rejected. **Set
-`RISE_IDENTITY` now** so your CI keeps working through the cutover.
-:::
 
 ## Creating Service Accounts
 
@@ -207,6 +213,8 @@ rise sa create -p my-project \
 Mint a token and use it:
 
 ```bash
+export RISE_URL=https://rise.example.net
+export RISE_IDENTITY=my-project+0@sa.rise.local
 export RISE_TOKEN=$(curl -s http://localhost:9229/token \
   -d '{"aud": "https://rise.example.net", "sub": "dev"}' | jq -r .access_token)
 rise deploy --image my-image:latest
