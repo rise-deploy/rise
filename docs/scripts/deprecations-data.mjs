@@ -88,6 +88,7 @@ export function deriveDeprecations(documents) {
       availability: text(last.availability) ? last.availability : last.details ?? '',
       migration: latest('migration'),
       events,
+      ...(milestones.get('removed')?.document.status === 'released' && milestones.get('removed').entry.archived === true ? { archived: true } : {}),
     });
   }
   return records.sort((a, b) => a.id.localeCompare(b.id));
@@ -95,6 +96,14 @@ export function deriveDeprecations(documents) {
 
 export function deprecationStatus(record) {
   return record.events.some(event => event.kind === 'removed' && ['upcoming', 'released'].includes(event.state)) ? 'removed' : 'deprecated';
+}
+
+/** Group the current register; archived removal notices remain in release history. */
+export function groupDeprecations(records) {
+  return [
+    { id: 'deprecated', title: 'Deprecated', description: 'These features still work under the conditions documented below. Follow the migration instructions before their planned default changes or removal.', records: records.filter(record => deprecationStatus(record) === 'deprecated') },
+    { id: 'removed', title: 'Removed', description: 'These features are unavailable in current releases. Migration instructions cover upgrades from affected versions.', records: records.filter(record => deprecationStatus(record) === 'removed' && !record.archived) },
+  ];
 }
 
 export function lifecycleVersionLabel(event) {
@@ -114,17 +123,20 @@ export function changelogChangeLink(changeId, documents) {
 }
 
 export function renderDeprecationsMarkdown(records, { documents = [] } = {}) {
-  const parts = ['# Deprecated features', 'Features listed as deprecated remain available under the conditions documented below. Disabling a feature by default and removing it are separate milestones. Planned milestones are not release guarantees.'];
-  if (records.length === 0) parts.push('No implemented deprecations are recorded.');
-  for (const record of records) {
-    parts.push(`## ${record.title}`, `**${deprecationStatus(record) === 'removed' ? 'Removed' : 'Deprecated · still available'}**`, record.availability);
-    parts.push('| Milestone | Version | Release date |\n|---|---|---|\n' + record.events.map(event => `| ${lifecycleLabels[event.kind]} | ${lifecycleVersionLabel(event)} | ${event.date ?? 'Not announced / not established'} |`).join('\n'));
-    for (const event of record.events) {
-      if (event.firstCandidate) parts.push(`${lifecycleLabels[event.kind]} first appears in candidate **${event.firstCandidate.version}**, published **${event.firstCandidate.date}**. The candidate date is separate from the full-release date.`);
-      const link = changelogChangeLink(event.changeId, documents);
-      if (link) parts.push(`[${lifecycleLabels[event.kind]} release note](${link})`);
+  const parts = ['# Deprecated and removed features', 'A planned default change and a feature\'s removal are separate milestones. Planned milestones are not release guarantees.'];
+  for (const group of groupDeprecations(records)) {
+    parts.push(`## ${group.title}`, group.description);
+    if (group.records.length === 0) parts.push(group.id === 'deprecated' ? 'No implemented deprecations are recorded.' : 'No removal notices are listed.');
+    for (const record of group.records) {
+      parts.push(`### ${record.title}`, `**${deprecationStatus(record) === 'removed' ? 'Removed' : 'Deprecated · still available'}**`, record.availability);
+      parts.push('| Milestone | Version | Release date |\n|---|---|---|\n' + record.events.map(event => `| ${lifecycleLabels[event.kind]} | ${lifecycleVersionLabel(event)} | ${event.date ?? 'Not announced / not established'} |`).join('\n'));
+      for (const event of record.events) {
+        if (event.firstCandidate) parts.push(`${lifecycleLabels[event.kind]} first appears in candidate **${event.firstCandidate.version}**, published **${event.firstCandidate.date}**. The candidate date is separate from the full-release date.`);
+        const link = changelogChangeLink(event.changeId, documents);
+        if (link) parts.push(`[${lifecycleLabels[event.kind]} release note](${link})`);
+      }
+      parts.push('#### Migration', record.migration);
     }
-    parts.push('### Migration', record.migration);
   }
   return `${parts.join('\n\n')}\n`;
 }

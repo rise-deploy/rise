@@ -15,6 +15,7 @@ export interface ChangelogEntry {
   availability?: string;
   firstCandidate?: { version: string; date: string };
   targetVersion?: string;
+  archived?: boolean;
 }
 export interface ChangelogSection {
   id: string;

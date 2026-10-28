@@ -78,6 +78,16 @@ file; planned milestones remain planned. A default change does not imply
 removal. The deprecated-features page derives this lifecycle from the release
 entries; there is no separate registry.
 
+The register separates **Deprecated** features that still work from **Removed**
+features. Keep a removal notice while its migration instructions are relevant
+to supported upgrades, including stored records that still need conversion.
+Once that guidance is no longer relevant, set `archived: true` on the released
+`removed` milestone. This omits the feature from the register and its on-page
+navigation in both browser and Markdown exports. The release notes, lifecycle
+entries, and migration text remain in their original YAML files and release
+pages. Only released removal milestones accept `archived`; current
+deprecations and planned or unreleased removals cannot be archived.
+
 ## Publishing
 
 `node --test docs/scripts/changelog-data.test.mjs` checks YAML parsing and

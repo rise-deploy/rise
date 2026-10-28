@@ -59,6 +59,7 @@ export function validateChangelogDocument(document) {
       } else {
         assert(entry.feature === undefined && entry.stage === undefined, `${entry.id}: feature and stage require type deprecation`);
       }
+      if (entry.archived !== undefined) assert(typeof entry.archived === 'boolean' && entry.type === 'deprecation' && entry.stage === 'removed' && document.status === 'released', `${entry.id}: archived is a boolean for released removal milestones only`);
       assert(entry.targetVersion === undefined || document.status === 'planned' && fullVersion.test(entry.targetVersion), `${entry.id}: targetVersion is a planned X.Y.Z version`);
       if (entry.firstCandidate) assert(/^\d+\.\d+\.\d+-[0-9A-Za-z.-]+$/.test(entry.firstCandidate.version) && validDate(entry.firstCandidate.date), `${entry.id}: invalid candidate evidence`);
     }
@@ -95,7 +96,7 @@ function normalizeChangelogYaml(text, filename) {
   const byId = new Map(sections.map(section => [section.id, section]));
   for (const value of source.changes) {
     assert(value && typeof value === 'object' && !Array.isArray(value), `${version}: change must be a mapping`);
-    checkFields(value, ['group', 'id', 'title', 'type', 'impact', 'backends', 'details', 'action', 'migration', 'feature', 'stage', 'featureTitle', 'availability', 'firstCandidate', 'targetVersion'], `change ${value.id ?? ''}`);
+    checkFields(value, ['group', 'id', 'title', 'type', 'impact', 'backends', 'details', 'action', 'migration', 'feature', 'stage', 'featureTitle', 'availability', 'firstCandidate', 'targetVersion', 'archived'], `change ${value.id ?? ''}`);
     if (value.firstCandidate) checkFields(value.firstCandidate, ['version', 'date'], 'firstCandidate');
     const { group, ...entry } = value;
     let section;

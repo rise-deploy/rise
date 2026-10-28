@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deriveDeprecations, deprecationStatus, lifecycleVersionLabel, changelogChangeLink, renderDeprecationsMarkdown } from './deprecations-data.mjs';
+import { deriveDeprecations, groupDeprecations, deprecationStatus, lifecycleVersionLabel, changelogChangeLink, renderDeprecationsMarkdown } from './deprecations-data.mjs';
 
 const announcement = {
   id: 'deprecation-signal', title: 'Deprecate direct external tokens',
@@ -102,6 +102,44 @@ test('an implemented removal changes status while preserving the deprecation his
   assert.equal(records[0].availability, removal.availability);
   assert.equal(records[0].migration, removal.migration);
   assert.equal(milestone(records, 'deprecated').version, '0.24.0');
+});
+
+test('the register groups current deprecations and removals and archives only their register notices', async () => {
+  const { parseChangelogYaml, stringifyChangelogDocument, renderChangelogMarkdown } = await import('./changelog-data.mjs');
+  const removal = { ...announcement, id: 'remove-external-jwts', stage: 'removed', details: 'Direct external JWT support is removed.', availability: 'Direct external JWT support is removed.' };
+  delete removal.firstCandidate;
+  const other = { ...announcement, id: 'other-announcement', feature: 'another-feature', featureTitle: 'Another supported feature' };
+  const older = document('released', [announcement, other]);
+  const newer = document('released', [removal], { version: '0.25.0', date: '2027-01-04' });
+  const records = deriveDeprecations([older, newer]);
+  assert.deepEqual(groupDeprecations(records).map(group => [group.id, group.records.map(record => record.id)]), [
+    ['deprecated', ['another-feature']], ['removed', ['external-jwts']],
+  ]);
+  const markdown = renderDeprecationsMarkdown(records, { documents: [older, newer] });
+  assert.ok(markdown.indexOf('## Deprecated\n') < markdown.indexOf('## Removed\n'));
+  assert.match(markdown, /### Another supported feature/);
+
+  newer.sections[0].entries[0].archived = true;
+  const roundTrip = parseChangelogYaml(stringifyChangelogDocument(newer), '0.25.0.yaml');
+  const archived = deriveDeprecations([older, roundTrip]);
+  assert.equal(archived.find(record => record.id === 'external-jwts').archived, true);
+  assert.deepEqual(groupDeprecations(archived).map(group => group.records.map(record => record.id)), [['another-feature'], []]);
+  assert.doesNotMatch(renderDeprecationsMarkdown(archived, { documents: [older, roundTrip] }), /Raw external JWTs/);
+  assert.match(renderChangelogMarkdown(roundTrip), /Direct external JWT support is removed/);
+  assert.match(renderChangelogMarkdown(roundTrip), /Exchange the token first/);
+});
+
+test('archiving cannot hide a functioning feature or an unreleased removal', async () => {
+  const { validateChangelogDocument } = await import('./changelog-data.mjs');
+  for (const [status, stage, archived] of [
+    ['released', 'deprecated', true],
+    ['released', 'default-disabled', true],
+    ['upcoming', 'removed', true],
+    ['planned', 'removed', true],
+    ['released', 'removed', 'true'],
+  ]) {
+    assert.throws(() => validateChangelogDocument(document(status, [{ ...announcement, stage, archived }])), /released removal milestones only/);
+  }
 });
 
 test('implemented milestone details replace stale availability when explicit availability is omitted', () => {
