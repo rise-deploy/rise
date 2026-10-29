@@ -34,6 +34,8 @@ auth:
   issuer: "http://rise-dex:5556/dex"
   client_id: "rise-backend"
   client_secret: "rise-backend-secret"
+  # Dex's static users have no group memberships or groups claim.
+  idp_group_missing_claim_policy: treat_as_empty
   # ID-token claim containing group names (default: "groups").
   # idp_group_claim: "cognito:groups"
   # Optional prefixes limiting which canonical groups become Rise teams.

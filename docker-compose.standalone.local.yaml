@@ -97,6 +97,8 @@ services:
       - RISE_COOKIE_SECURE=false
       - RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS=true
       - DEX_ISSUER=http://rise-dex:5556/dex
+      # Dex's static users have no group memberships or groups claim.
+      - RISE_IDP_GROUP_MISSING_CLAIM_POLICY=treat_as_empty
       # LOCAL ONLY: open the SSRF guard so the backend can reach the internal
       # plain-HTTP http://rise-dex:5556 issuer (and other private-network
       # services). Prod keeps the guard closed (default false) and relies on

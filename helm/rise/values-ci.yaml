@@ -81,6 +81,8 @@ config:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
     client_id: rise-backend
     client_secret: rise-backend-secret
+    # Dex's static users have no group memberships or groups claim.
+    idp_group_missing_claim_policy: treat_as_empty
     # The e2e CI bearer is an admin, so it bypasses ownership checks on the
     # typed APIs.
     admin_users:

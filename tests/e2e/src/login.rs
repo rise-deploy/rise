@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use reqwest::cookie::{CookieStore, Jar};
 use reqwest::Url;
 
 use crate::dex::DexEndpoint;
@@ -89,7 +90,7 @@ pub fn browser_login(
     username: &str,
     password: &str,
 ) -> Result<String> {
-    let response = sign_in(api_base, dex, None, username, password)?;
+    let (_, response) = sign_in(api_base, dex, None, username, password)?;
     anyhow::ensure!(
         response.status().is_success(),
         "sign-in callback answered {}",
@@ -100,8 +101,8 @@ pub fn browser_login(
 
 /// Sign `username` in to `project`'s app, as a visitor's browser does, and
 /// return the app token Rise sets as the app's `rise_jwt` cookie. The app's
-/// `/.rise/auth/complete` step is reached through `api_base`: Rise serves it
-/// whatever the host.
+/// `/.rise/auth/complete` step uses the app's host and proof cookie while the
+/// harness reaches Rise through `api_base`.
 pub fn app_login(
     api_base: &str,
     dex: &DexEndpoint,
@@ -109,7 +110,7 @@ pub fn app_login(
     username: &str,
     password: &str,
 ) -> Result<String> {
-    let response = sign_in(api_base, dex, Some(project), username, password)?;
+    let (mut browser, response) = sign_in(api_base, dex, Some(project), username, password)?;
     // The callback hands the browser to the app's completion step, by
     // redirect or from a page that links to it.
     let complete = if response.status().is_redirection() {
@@ -124,14 +125,75 @@ pub fn app_login(
             .map_or(body.len(), |len| start + len);
         body[start..end].replace("&amp;", "&")
     };
-    let token = query_param(Url::parse("http://app")?.join(&complete)?.as_ref(), "token")?
-        .context("completion step carries no token")?;
-    let complete = format!("{api_base}/.rise/auth/complete?token={token}");
-    let response = no_redirect_client()?
-        .get(&complete)
-        .send()
-        .with_context(|| format!("GET {complete}"))?;
+    let complete = browser.public_url.join(&complete)?;
+    query_param(complete.as_str(), "token")?.context("completion step carries no token")?;
+    let response = browser.get(&complete)?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "completion step answered {}",
+        response.status()
+    );
     session_cookie(response.headers()).context("completion step set no rise_jwt cookie")
+}
+
+/// Keep Rise's logical hosts and their proof cookies while connecting through
+/// the local API port or Kubernetes port-forward.
+struct BrowserLogin {
+    client: reqwest::blocking::Client,
+    api: Url,
+    public_url: Url,
+    cookies: Jar,
+}
+
+impl BrowserLogin {
+    fn new(api_base: &str) -> Result<Self> {
+        let client = no_redirect_client()?;
+        let api = Url::parse(api_base).context("parse API base")?;
+        let metadata: serde_json::Value = client
+            .get(api.join("/.well-known/openid-configuration")?)
+            .send()
+            .context("discover Rise's public origin")?
+            .error_for_status()?
+            .json()?;
+        let public_url = Url::parse(
+            metadata["issuer"]
+                .as_str()
+                .context("discovery has no issuer")?,
+        )?;
+        Ok(Self {
+            client,
+            api,
+            public_url,
+            cookies: Jar::default(),
+        })
+    }
+
+    fn get(&mut self, url: &Url) -> Result<reqwest::blocking::Response> {
+        let host = url.host_str().context("browser URL has no host")?;
+        let mut reachable = self.api.join(url.path())?;
+        reachable.set_query(url.query());
+        let authority = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        };
+        let mut request = self
+            .client
+            .get(reachable)
+            .header(reqwest::header::HOST, authority);
+        if let Some(cookies) = self.cookies.cookies(url) {
+            request = request.header(reqwest::header::COOKIE, cookies);
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("GET {} on {host}", url.path()))?;
+        // Cookie scope belongs to the browser URL, not the local transport URL.
+        for cookie in response.headers().get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(cookie) = cookie.to_str() {
+                self.cookies.add_cookie_str(cookie, url);
+            }
+        }
+        Ok(response)
+    }
 }
 
 /// Walk Rise's browser sign-in through Dex and return Rise's answer to the
@@ -142,37 +204,53 @@ fn sign_in(
     project: Option<&str>,
     username: &str,
     password: &str,
-) -> Result<reqwest::blocking::Response> {
-    let client = no_redirect_client()?;
-    let start = match project {
-        Some(project) => format!("{api_base}/api/v1/auth/signin/start?project={project}"),
-        None => format!("{api_base}/api/v1/auth/signin/start"),
-    };
-    let response = client
-        .get(&start)
-        .send()
-        .with_context(|| format!("GET {start}"))?;
-    anyhow::ensure!(
-        response.status().is_redirection(),
-        "sign-in start answered {} instead of redirecting to Dex",
-        response.status()
-    );
-    let authorization_url = location(&response)?;
+) -> Result<(BrowserLogin, reqwest::blocking::Response)> {
+    let mut browser = BrowserLogin::new(api_base)?;
+    let mut start = browser.public_url.join("/api/v1/auth/signin/start")?;
+    if let Some(project) = project {
+        start.query_pairs_mut().append_pair("project", project);
+    }
+    let mut response = browser.get(&start)?;
+    let mut authorization_url = None;
+    for _ in 0..MAX_STEPS {
+        anyhow::ensure!(
+            response.status().is_redirection(),
+            "sign-in start answered {} instead of redirecting to Dex",
+            response.status()
+        );
+        let next = start.join(&location(&response)?)?;
+        if query_param(next.as_str(), "redirect_uri")?.is_some() {
+            authorization_url = Some(next);
+            break;
+        }
+        anyhow::ensure!(
+            matches!(
+                next.path(),
+                "/.rise/auth/signin/start" | "/api/v1/auth/signin/begin"
+            ),
+            "unexpected sign-in hop {}",
+            next.path()
+        );
+        start = next;
+        response = browser.get(&start)?;
+    }
+    let authorization_url = authorization_url.context("sign-in did not reach Dex")?;
     // Rise's own callback, spelled with its public URL, which the harness may
     // not resolve: it is reached through `api_base` instead.
-    let redirect_uri = query_param(&authorization_url, "redirect_uri")?
+    let redirect_uri = query_param(authorization_url.as_str(), "redirect_uri")?
         .context("authorize URL carries no redirect_uri")?;
 
-    let callback = run_dex_login(dex, &authorization_url, &redirect_uri, username, password)?;
-    if let Some(error) = query_param(&callback, "error")? {
-        anyhow::bail!("Dex refused the login: {error}");
-    }
-    let api = Url::parse(api_base).context("parse API base")?;
-    let callback = reroute(&Url::parse(&callback)?, &Url::parse(&redirect_uri)?, &api);
-    client
-        .get(callback.clone())
-        .send()
-        .with_context(|| format!("GET {callback}"))
+    let expected_state = query_param(authorization_url.as_str(), "state")?;
+    let callback = run_dex_login(
+        dex,
+        authorization_url.as_str(),
+        &redirect_uri,
+        username,
+        password,
+    )?;
+    code_from_callback(&callback, expected_state.as_deref())?;
+    let response = browser.get(&Url::parse(&callback)?)?;
+    Ok((browser, response))
 }
 
 /// The non-empty `rise_jwt` among a response's cookies. A cleared legacy
@@ -407,6 +485,282 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    struct BrowserHop {
+        path: String,
+        host: Option<&'static str>,
+        cookie: Option<&'static str>,
+        response: String,
+    }
+
+    fn mock_response(status: u16, headers: &[(&str, &str)], body: &str) -> String {
+        let mut response = format!(
+            "HTTP/1.1 {status} Mock\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
+    }
+
+    fn browser_server(hops: Vec<BrowserHop>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            for hop in hops {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing request {}", hop.path);
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept mock browser request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), format!("GET {} HTTP/1.1", hop.path));
+                let mut headers = Vec::new();
+                loop {
+                    line.clear();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    let (name, value) = line.split_once(':').unwrap();
+                    headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+                }
+                let header = |name: &str| {
+                    headers
+                        .iter()
+                        .find(|(key, _)| key == name)
+                        .map(|(_, value)| value.as_str())
+                };
+                if let Some(host) = hop.host {
+                    assert_eq!(header("host"), Some(host), "{}", hop.path);
+                }
+                assert_eq!(header("cookie"), hop.cookie, "{}", hop.path);
+                stream.write_all(hop.response.as_bytes()).unwrap();
+            }
+        });
+        (api, server)
+    }
+
+    #[test]
+    fn browser_logins_follow_public_and_app_hosts_with_separate_secure_proofs() {
+        const PUBLIC: &str = "https://rise.example:3443";
+        const CALLBACK: &str = "https://rise.example:3443/api/v1/auth/callback";
+        const APP: &str = "https://app.example:7443";
+        const CENTRAL_COOKIE: &str = "__Host-rise_oauth_central=central-proof";
+        const APP_COOKIE: &str = "__Host-rise_oauth_app=app-proof";
+        for app in [false, true] {
+            let mut authorize = Url::parse("http://dex.invalid:5556/dex/auth").unwrap();
+            authorize
+                .query_pairs_mut()
+                .append_pair("redirect_uri", CALLBACK)
+                .append_pair("state", "state");
+            let mut hops = vec![BrowserHop {
+                path: "/.well-known/openid-configuration".into(),
+                host: None,
+                cookie: None,
+                response: mock_response(
+                    200,
+                    &[("Content-Type", "application/json")],
+                    &format!(r#"{{"issuer":"{PUBLIC}"}}"#),
+                ),
+            }];
+            if app {
+                hops.extend([
+                    BrowserHop {
+                        path: "/api/v1/auth/signin/start?project=app".into(),
+                        host: Some("rise.example:3443"),
+                        cookie: None,
+                        response: mock_response(
+                            302,
+                            &[(
+                                "Location",
+                                &format!("{APP}/.rise/auth/signin/start?project=app"),
+                            )],
+                            "",
+                        ),
+                    },
+                    BrowserHop {
+                        path: "/.rise/auth/signin/start?project=app".into(),
+                        host: Some("app.example:7443"),
+                        cookie: None,
+                        response: mock_response(
+                            302,
+                            &[
+                                (
+                                    "Location",
+                                    &format!("{PUBLIC}/api/v1/auth/signin/begin?transaction=tx"),
+                                ),
+                                (
+                                    "Set-Cookie",
+                                    &format!(
+                                        "{APP_COOKIE}; Secure; HttpOnly; Path=/; SameSite=Lax"
+                                    ),
+                                ),
+                            ],
+                            "",
+                        ),
+                    },
+                ]);
+            }
+            hops.push(BrowserHop {
+                path: if app {
+                    "/api/v1/auth/signin/begin?transaction=tx"
+                } else {
+                    "/api/v1/auth/signin/start"
+                }
+                .into(),
+                host: Some("rise.example:3443"),
+                cookie: None,
+                response: mock_response(
+                    302,
+                    &[
+                        ("Location", authorize.as_str()),
+                        (
+                            "Set-Cookie",
+                            &format!("{CENTRAL_COOKIE}; Secure; HttpOnly; Path=/; SameSite=Lax"),
+                        ),
+                    ],
+                    "",
+                ),
+            });
+            hops.push(BrowserHop {
+                path: format!("{}?{}", authorize.path(), authorize.query().unwrap()),
+                host: None,
+                cookie: None,
+                response: mock_response(
+                    302,
+                    &[("Location", &format!("{CALLBACK}?code=code&state=state"))],
+                    "",
+                ),
+            });
+            hops.push(BrowserHop {
+                path: "/api/v1/auth/callback?code=code&state=state".into(),
+                host: Some("rise.example:3443"),
+                cookie: Some(CENTRAL_COOKIE),
+                response: if app {
+                    mock_response(
+                        302,
+                        &[(
+                            "Location",
+                            &format!("{APP}/.rise/auth/complete?token=completion"),
+                        )],
+                        "",
+                    )
+                } else {
+                    mock_response(
+                        200,
+                        &[(
+                            "Set-Cookie",
+                            "rise_jwt=ui-session; Secure; Path=/; HttpOnly",
+                        )],
+                        "success",
+                    )
+                },
+            });
+            if app {
+                hops.push(BrowserHop {
+                    path: "/.rise/auth/complete?token=completion".into(),
+                    host: Some("app.example:7443"),
+                    cookie: Some(APP_COOKIE),
+                    response: mock_response(
+                        200,
+                        &[(
+                            "Set-Cookie",
+                            "rise_jwt=app-session; Secure; Path=/; HttpOnly",
+                        )],
+                        "success",
+                    ),
+                });
+            }
+            let (api, server) = browser_server(hops);
+            let dex = DexEndpoint {
+                issuer: "http://dex.invalid:5556/dex".into(),
+                token_url: format!("{api}/dex/token"),
+                client_id: "test".into(),
+                client_secret: "test".into(),
+            };
+            let result = if app {
+                app_login(&api, &dex, "app", "user", "password")
+            } else {
+                browser_login(&api, &dex, "user", "password")
+            };
+            server.join().unwrap();
+            assert_eq!(
+                result.unwrap(),
+                if app { "app-session" } else { "ui-session" }
+            );
+        }
+    }
+
+    #[test]
+    fn logical_cookie_scope_refuses_other_hosts_and_insecure_requests() {
+        let mut hops = vec![BrowserHop {
+            path: "/.well-known/openid-configuration".into(),
+            host: None,
+            cookie: None,
+            response: mock_response(
+                200,
+                &[("Content-Type", "application/json")],
+                r#"{"issuer":"https://rise.example"}"#,
+            ),
+        }];
+        for (path, cookie) in [
+            ("/set", None),
+            ("/insecure", None),
+            ("/other-host", None),
+            ("/same-host", Some("__Host-rise_oauth_central=proof")),
+        ] {
+            hops.push(BrowserHop {
+                path: path.into(),
+                host: None,
+                cookie,
+                response: mock_response(
+                    200,
+                    if path == "/set" {
+                        &[(
+                            "Set-Cookie",
+                            "__Host-rise_oauth_central=proof; Secure; HttpOnly; Path=/",
+                        )]
+                    } else {
+                        &[]
+                    },
+                    "",
+                ),
+            });
+        }
+        let (api, server) = browser_server(hops);
+        let mut browser = BrowserLogin::new(&api).unwrap();
+        for url in [
+            "https://rise.example/set",
+            "http://rise.example/insecure",
+            "https://app.example/other-host",
+            "https://rise.example/same-host",
+        ] {
+            browser.get(&Url::parse(url).unwrap()).unwrap();
+        }
+        server.join().unwrap();
+    }
 
     #[test]
     fn pkce_challenge_is_base64url_sha256_of_the_verifier() {

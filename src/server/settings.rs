@@ -2831,6 +2831,43 @@ mod tests {
     }
 
     #[test]
+    fn static_dex_fixtures_accept_missing_groups_while_production_configs_refuse() {
+        for (yaml, pointer, expected) in [
+            (
+                include_str!("../../config/development.yaml"),
+                "/auth/idp_group_missing_claim_policy",
+                MissingGroupClaimPolicy::TreatAsEmpty,
+            ),
+            (
+                include_str!("../../helm/rise/values-ci.yaml"),
+                "/config/auth/idp_group_missing_claim_policy",
+                MissingGroupClaimPolicy::TreatAsEmpty,
+            ),
+            (
+                include_str!("../../config/docker.yaml"),
+                "/auth/idp_group_missing_claim_policy",
+                MissingGroupClaimPolicy::RefuseLogin,
+            ),
+            (
+                include_str!("../../config/ecs.yaml"),
+                "/auth/idp_group_missing_claim_policy",
+                MissingGroupClaimPolicy::RefuseLogin,
+            ),
+            (
+                include_str!("../../config/production.yaml"),
+                "/auth/idp_group_missing_claim_policy",
+                MissingGroupClaimPolicy::RefuseLogin,
+            ),
+        ] {
+            let expanded = Settings::substitute_env_vars_in_string_with(yaml, &|_| None);
+            let config: serde_json::Value = serde_yaml::from_str(&expanded).unwrap();
+            let policy: MissingGroupClaimPolicy =
+                serde_json::from_value(config.pointer(pointer).unwrap().clone()).unwrap();
+            assert_eq!(policy, expected);
+        }
+    }
+
+    #[test]
     fn idp_group_claim_defaults_to_groups() {
         let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
 

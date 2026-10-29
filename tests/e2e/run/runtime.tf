@@ -46,6 +46,8 @@ module "runtime" {
     RISE_JWT_SIGNING_SECRET = var.jwt_signing_secret
     RISE_ENCRYPTION_KEY     = var.encryption_key
     OIDC_CLIENT_SECRET      = "rise-backend-secret"
+    # Dex's static users have no group memberships or groups claim.
+    RISE_IDP_GROUP_MISSING_CLAIM_POLICY = "treat_as_empty"
   })
   traefik = {
     name              = "${var.name}-${var.scope}-traefik"

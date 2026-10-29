@@ -35,7 +35,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 # Blocking HTTP + form bodies (Dex password grant) — sequential harness, no async
 # runtime. The harness only hits local HTTP, so it just uses reqwest's default TLS.
-reqwest = { version = "0.13", features = ["blocking", "json", "form"] }
+reqwest = { version = "0.13", features = ["blocking", "json", "form", "cookies"] }
 # Reused to mint the HS256 CI bearer the same way the server signs sessions.
 rise-backend-auth = { path = "../../crates/rise-backend-auth" }
 # Verifies an audience-bound identity token the way an external party would:
