@@ -52,8 +52,10 @@ Metacontroller manages the child resources (namespaces, secrets, service
 accounts, deployments, services, ingresses, network policies) through its own
 ClusterRole. The chart's bundled Metacontroller (`metacontroller.install: true`)
 gets `metacontroller-operator.clusterRole.rules` from `values.yaml`: its own
-CRDs, `riseprojects` with their `status` and `finalizers` subresources, those
-seven child kinds, and event writes. The rules are cluster-wide, since child
+controller configuration reads and revision records, read-only CRD discovery,
+a finalizer patch on `rise-project-controller`, `riseprojects` with their `status`
+and `finalizers` subresources, those seven child kinds, and event writes. The
+rules are cluster-wide, since child
 namespaces are created on demand, so Metacontroller can read every Secret in
 the cluster. When you run Metacontroller yourself, grant it the same rules
 rather than its upstream default, which allows every verb on every resource.

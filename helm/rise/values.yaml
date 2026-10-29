@@ -168,12 +168,21 @@ metacontroller-operator:
   # (templates/metacontroller.yaml) needs: its own CRDs, the RiseProject parent,
   # and exactly the child kinds listed under childResources. Keep the child
   # rules in step with that list. Another CompositeController or
-  # DecoratorController on the same Metacontroller needs its kinds added here.
+  # DecoratorController needs its kinds and controller mutation permissions added here.
   clusterRole:
     rules:
+      # Cached discovery lists and watches CRDs without a name selector.
+      - apiGroups: ["apiextensions.k8s.io"]
+        resources: ["customresourcedefinitions"]
+        verbs: ["get", "list", "watch"]
       - apiGroups: ["metacontroller.k8s.io"]
         resources: ["compositecontrollers", "decoratorcontrollers"]
         verbs: ["get", "list", "watch"]
+      # The controller-runtime reconciler patches this controller's finalizer.
+      - apiGroups: ["metacontroller.k8s.io"]
+        resources: ["compositecontrollers"]
+        resourceNames: ["rise-project-controller"]
+        verbs: ["patch"]
       - apiGroups: ["metacontroller.k8s.io"]
         resources: ["controllerrevisions"]
         verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

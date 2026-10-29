@@ -2902,6 +2902,88 @@ mod tests {
     }
 
     #[test]
+    fn metacontroller_rbac_allows_discovery_and_only_its_own_controller_finalizer_patch() {
+        let values: serde_json::Value =
+            serde_yaml::from_str(include_str!("../../helm/rise/values.yaml")).unwrap();
+        let rules = values["metacontroller-operator"]["clusterRole"]["rules"]
+            .as_array()
+            .unwrap();
+        for rule in rules {
+            for field in ["apiGroups", "resources", "verbs"] {
+                assert!(!rule[field]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("*")));
+            }
+        }
+        let allows = |group: &str, resource: &str, verb: &str, name: Option<&str>| {
+            rules.iter().any(|rule| {
+                ["apiGroups", "resources", "verbs"]
+                    .into_iter()
+                    .zip([group, resource, verb])
+                    .all(|(field, value)| {
+                        rule[field]
+                            .as_array()
+                            .unwrap()
+                            .contains(&serde_json::json!(value))
+                    })
+                    && rule.get("resourceNames").is_none_or(|names| {
+                        name.is_some_and(|name| {
+                            names.as_array().unwrap().contains(&serde_json::json!(name))
+                        })
+                    })
+            })
+        };
+        for verb in ["get", "list", "watch"] {
+            assert!(allows(
+                "apiextensions.k8s.io",
+                "customresourcedefinitions",
+                verb,
+                None
+            ));
+            for resource in ["compositecontrollers", "decoratorcontrollers"] {
+                assert!(allows("metacontroller.k8s.io", resource, verb, None));
+            }
+        }
+        for verb in ["create", "update", "patch", "delete"] {
+            assert!(!allows(
+                "apiextensions.k8s.io",
+                "customresourcedefinitions",
+                verb,
+                Some("riseprojects.rise.dev")
+            ));
+        }
+        assert!(allows(
+            "metacontroller.k8s.io",
+            "compositecontrollers",
+            "patch",
+            Some("rise-project-controller")
+        ));
+        for name in [None, Some("another-controller")] {
+            assert!(!allows(
+                "metacontroller.k8s.io",
+                "compositecontrollers",
+                "patch",
+                name
+            ));
+        }
+        for verb in ["create", "update", "delete"] {
+            assert!(!allows(
+                "metacontroller.k8s.io",
+                "compositecontrollers",
+                verb,
+                Some("rise-project-controller")
+            ));
+        }
+        assert!(!allows(
+            "metacontroller.k8s.io",
+            "decoratorcontrollers",
+            "patch",
+            Some("rise-project-controller")
+        ));
+    }
+
+    #[test]
     fn idp_group_claim_defaults_to_groups() {
         let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
 
