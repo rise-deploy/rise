@@ -1,6 +1,6 @@
 # Rise Helm Chart
 
-This Helm chart deploys the Rise application on Kubernetes, including the backend API server and optionally Dex for OIDC authentication.
+This Helm chart deploys Rise on Kubernetes with authentication through your configured OIDC provider. An optional Dex deployment is available for development and testing.
 
 ## Prerequisites
 
@@ -18,6 +18,8 @@ helm install rise ./helm/rise
 
 ### Production installation with custom values
 
+Register Rise as a client with your production OIDC provider and set its exact
+issuer URL below. Keep `dex.enabled: false` when using an external provider.
 Create a `values-prod.yaml` file:
 
 ```yaml
@@ -34,9 +36,9 @@ config:
     public_url: "https://rise.example.com"
 
   auth:
-    issuer: "https://dex.example.com/dex"
+    issuer: "https://idp.example.com"
     client_id: "rise-backend"
-    # client_secret comes from OIDC_CLIENT_SECRET; see oidcClientSecret below.
+    # client_secret comes from OIDC_CLIENT_SECRET via envFrom below.
     admin_users:
       - "admin@example.com"
     # Alternatively (or additionally), grant the admin role by IdP group:
@@ -76,12 +78,7 @@ ingress:
       hosts:
         - rise.example.com
 
-# OIDC client secret, injected as OIDC_CLIENT_SECRET
-oidcClientSecret:
-  name: rise-oidc
-  key: client-secret
-
-# Other sensitive configuration
+# Sensitive configuration, including OIDC_CLIENT_SECRET
 envFrom:
   - secretRef:
       name: rise-secrets
@@ -95,41 +92,13 @@ server:
     requests:
       cpu: 500m
       memory: 256Mi
-
-# Optional: Enable Dex for OIDC authentication
-# Optional: Enable Dex for OIDC authentication (see Dex Configuration below)
-dex:
-  enabled: true
-  config:
-    issuer: "https://dex.example.com/dex"
-    storage:
-      type: kubernetes
-      config:
-        inCluster: true
-    web:
-      http: "0.0.0.0:5556"
-    staticClients:
-      - id: rise-backend
-        redirectURIs:
-          - "https://rise.example.com/api/v1/auth/callback"
-        name: "Rise Backend"
-        secret: "<client secret>"
-    connectors:
-      - type: github
-        id: github
-        name: GitHub
-        config:
-          clientID: $GITHUB_CLIENT_ID
-          clientSecret: $GITHUB_CLIENT_SECRET
-          redirectURI: https://dex.example.com/dex/callback
 ```
 
 Create the secrets:
 
 ```bash
-kubectl create secret generic rise-oidc \
-  --from-literal=client-secret=YOUR_CLIENT_SECRET
 kubectl create secret generic rise-secrets \
+  --from-literal=OIDC_CLIENT_SECRET=YOUR_CLIENT_SECRET \
   --from-literal=DATABASE_URL=postgres://rise:YOUR_DB_PASSWORD@postgresql:5432/rise \
   --from-literal=RISE_JWT_SIGNING_SECRET="$(openssl rand -base64 32)"
 ```
@@ -153,8 +122,6 @@ The following table lists the configurable parameters of the Rise chart and thei
 | `image.tag` | Image tag | `""` (uses Chart appVersion) |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `config` | Rise configuration in YAML format | See values.yaml |
-| `oidcClientSecret.name` | Secret injected as `OIDC_CLIENT_SECRET` (empty: supply it via `env`/`envFrom`) | `""` |
-| `oidcClientSecret.key` | Key inside that Secret | `client-secret` |
 | `logs.backend` | Runtime log backend (`kubernetes` or `loki`) | `kubernetes` |
 | `logs.loki.enabled` | Install bundled Grafana Loki subchart | `false` |
 | `logs.loki.externalUrl` | External Loki URL when not using bundled Loki | `""` |
@@ -216,7 +183,7 @@ alloy:
 |-----------|-------------|---------|
 | `server.resources` | Server container resource requests/limits | See values.yaml |
 
-### Dex (Optional OIDC Provider)
+### Dex (Development and Testing)
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -275,7 +242,7 @@ The Rise backend runs as a single process that includes:
 
 The backend can optionally be deployed alongside:
 
-- **Dex**: OIDC provider for authentication (optional, disabled by default, runs as a separate deployment)
+- **Dex**: OIDC provider for development and testing (optional, disabled by default, runs as a separate deployment)
 
 ## Security Considerations
 
@@ -323,7 +290,7 @@ When Kubernetes deployment is configured (via `config.kubernetes`), Rise require
 
 The `config` parameter is converted to YAML and mounted as `/etc/rise/local.yaml`. The backend loads required `production` (from `RISE_CONFIG_RUN_MODE=production`) and then applies optional `local` overrides, without requiring Helm chart updates for new options.
 
-**Sensitive Values:** `config` is rendered into a ConfigMap. Leave secrets out of it entirely — an empty string still overrides the environment variable `production.yaml` reads — and provide them through `oidcClientSecret` or `envFrom`. See [Environment Variables](#environment-variables) below.
+**Sensitive Values:** `config` is rendered into a ConfigMap. Supply secrets through `env` or `envFrom`. Leave secret fields unset to use the variables read by `production.yaml`, or set them to `${VARIABLE_NAME}` to reference another environment variable. An empty string overrides the default. See [Environment Variables](#environment-variables) below.
 
 Example:
 
@@ -335,7 +302,7 @@ config:
     public_url: "https://rise.example.com"
 
   auth:
-    issuer: "https://dex.example.com/dex"
+    issuer: "https://idp.example.com"
     client_id: "rise-backend"
 
   registry:
@@ -346,7 +313,7 @@ config:
 
 ### Dex Configuration
 
-With `dex.enabled: true` the chart runs Dex with `dex.config` as its
+For development and testing, `dex.enabled: true` runs Dex with `dex.config` as its
 configuration file. The default has in-memory storage, a `rise-backend` client
 with placeholder redirect URIs, and **no users**: add `connectors` for a real
 identity provider, or enable the password DB with users whose hashes you
@@ -422,8 +389,10 @@ The `envFrom` parameter allows you to inject environment variables from Secrets 
 - Cloud provider credentials
 
 The image's `production.yaml` reads secrets from these variables:
-`DATABASE_URL`, `OIDC_CLIENT_SECRET` and `RISE_JWT_SIGNING_SECRET`. A key set
-under `config` overrides the variable, so leave those keys out of `config`.
+`DATABASE_URL`, `OIDC_CLIENT_SECRET` and `RISE_JWT_SIGNING_SECRET`. Leave those
+keys unset under `config` to use these defaults. To reference a different
+variable, set a field such as `config.auth.client_secret` to `${CLIENT_SECRET}`
+and supply `CLIENT_SECRET` through `env` or `envFrom`.
 
 **Example:**
 

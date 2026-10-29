@@ -8,7 +8,7 @@ The Kubernetes controller implements ingress-level authentication for private pr
 
 - **Public projects**: Accessible without authentication
 - **Private projects**: Require user authentication AND project access authorization
-- **Authentication method**: OAuth2 via configured identity provider (Dex)
+- **Authentication method**: OAuth2/OIDC via the configured identity provider
 - **Token security**: Rise-issued JWTs scoped to specific projects
 - **Cookie isolation**: Separate cookies prevent projects from accessing Rise APIs
 
@@ -63,11 +63,11 @@ User clicks "Sign In" button
   ↓
 GET /api/v1/auth/signin/start (OAuth Start):
   - Stores project_name='myapp' in OAuth2State (PKCE state)
-  - Redirects to Dex IdP authorize endpoint
+  - Redirects to the configured IdP's authorization endpoint
   ↓
-User completes OAuth at Dex
+User completes OAuth at the IdP
   ↓
-Dex redirects to /api/v1/auth/callback?code=xyz&state=abc
+IdP redirects to /api/v1/auth/callback?code=xyz&state=abc
   ↓
 GET /api/v1/auth/callback (Token Exchange):
   - Retrieve OAuth2State (includes project_name='myapp')

@@ -94,7 +94,7 @@ The codebase is organized into functional modules:
 
 - **`src/db/`**: Database access layer (PostgreSQL via SQLX) — shared by server modules
 - **`src/server/`**: Backend server implementation (feature: `backend`)
-   - **Authentication** (`auth/`): OAuth2/OIDC with Dex, JWT validation, ingress auth subrequests, admin/operator classification
+   - **Authentication** (`auth/`): OAuth2/OIDC with the configured identity provider, JWT validation, ingress auth subrequests, admin/operator classification
    - **Project Management** (`project/`): Project CRUD and lifecycle management
    - **Team Management** (`team/`): Team and membership management
    - **Environments** (`environments/`): Named environments (production, staging, …)
@@ -159,12 +159,12 @@ cargo build --all-features     # Full build with CLI + backend
 1. **Core Infrastructure** ✅
    - [x] Cargo workspace; primary crate feature-gated (`cli`, `backend`)
    - [x] PostgreSQL database with SQLX (compile-time verified queries and migrations)
-   - [x] Dex OAuth2/OIDC integration for authentication
+   - [x] OAuth2/OIDC integration with the configured identity provider
    - [x] Docker Compose setup for local development (PostgreSQL, Dex, Registry)
 
 2. **Server Implementation** (`--features backend`) ✅
    - [x] Axum-based HTTP API with RESTful endpoints
-   - [x] Authentication: OAuth2/OIDC with Dex, JWT validation, PKCE flow, Rise-issued tokens
+   - [x] Authentication: OAuth2/OIDC with the configured identity provider, JWT validation, PKCE flow, Rise-issued tokens
    - [x] Project management: CRUD operations, ownership, access classes
    - [x] Team management: Team creation, membership, role-based access
    - [x] Environments, environment variables (plain + encrypted), custom domains

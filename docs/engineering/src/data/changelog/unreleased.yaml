@@ -89,13 +89,14 @@ changes:
     impact: breaking
     backends: [kubernetes, ecs]
     details: |-
-      ECS workloads require a dedicated task role. Helm injects the OIDC secret
-      from a Secret, ships no demo Dex users, and narrows Metacontroller rules.
+      ECS workloads require a dedicated task role. Helm supports OIDC secrets
+      through `env`/`envFrom`, ships no demo Dex users, and narrows Metacontroller rules.
       Startup budgets accommodate credential migration.
     action: |-
       Set ECS `workload_task_role_arn` and grant application permissions before
-      its workload rollout. For Helm, set `oidcClientSecret.name`, remove inline
-      `config.auth.client_secret`, and configure Dex sign-in. Extend rules if
+      its workload rollout. For Helm, supply `OIDC_CLIENT_SECRET` through `env` or
+      `envFrom`, leave `config.auth.client_secret` unset or use an environment-variable
+      reference, and configure sign-in with your OIDC provider. Extend rules if
       Metacontroller serves other controllers. Allow sufficient startup time
       (30 minutes by default) and avoid automatic rollback to an incompatible image.
   - id: upcoming-001

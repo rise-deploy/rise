@@ -32,9 +32,9 @@ Use AWS Secrets Manager or HashiCorp Vault for: `DATABASE_URL`, OAuth2 client se
 
 ### Authentication
 
-- Use trusted OIDC providers (Dex, Auth0, Okta)
+- Configure your production OIDC provider through `auth.issuer`, `auth.client_id`, and `auth.client_secret`.
 - Configure redirect URLs, enable PKCE
-- Dex production: external storage backend (PostgreSQL/etcd), configure SSO connectors, enable TLS. See [Dex docs](https://dexidp.io/docs/kubernetes/)
+- See [Authentication](./authentication/) for provider configuration and sign-in requirements. The bundled Dex configuration is for development and testing.
 
 ## Environment Variables
 

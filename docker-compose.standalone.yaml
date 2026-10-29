@@ -42,8 +42,8 @@
 #   * SET RISE_DOMAIN + ACME_EMAIL. TLS is on by default via the `le` ACME
 #     resolver (HTTP-01). Use the LE STAGING directory while testing (set
 #     ACME_CA_SERVER, see the traefik service) to avoid rate limits, then drop
-#     it for real certs. The Dex client secret must stay in sync with
-#     dev/dex/config.yaml.
+#     it for real certs. Configure the issuer and client credentials for your
+#     production OIDC provider; see the operator authentication docs.
 #   * REGISTRY AUTH. The registry is exposed at registry.${RISE_DOMAIN} behind
 #     a Traefik basicauth middleware (htpasswd via REGISTRY_BASIC_AUTH). Set the
 #     matching plaintext RISE_REGISTRY_USERNAME / RISE_REGISTRY_PASSWORD if Rise
@@ -293,8 +293,8 @@ services:
       # than overriding the config default with an empty string); if unset they
       # fall back to the INSECURE repo placeholders baked into config/docker.yaml.
       # Regenerate before exposing the stack: jwt secret + encryption key via
-      # `openssl rand -base64 32`, the OAuth client_secret kept in sync with
-      # dev/dex/config.yaml.
+      # `openssl rand -base64 32`; set OIDC_CLIENT_SECRET to the client secret
+      # registered with your OIDC provider.
       - RISE_JWT_SIGNING_SECRET
       - RISE_ENCRYPTION_KEY
       - RISE_ENCRYPTION_MIGRATION_SOURCE_KEY
