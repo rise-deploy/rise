@@ -9,7 +9,7 @@ Rise can protect deployed applications and pass the authenticated user identity 
 
 When a user opens a protected Rise-deployed application:
 
-1. Rise authenticates the user via OAuth2/OIDC, for example through Dex.
+1. Rise authenticates the user via OAuth2/OIDC through the installation's configured identity provider.
 2. Rise issues an RS256-signed JWT token with user information.
 3. The JWT is stored in the `rise_jwt` cookie.
 4. Your application validates the cookie before trusting the user identity.

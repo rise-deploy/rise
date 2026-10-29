@@ -308,6 +308,7 @@ config:
     # cookie_secure: true  # Optional: Set Secure flag on cookies (default: true, set false for HTTP development)
 
   auth:
+    # Local Dex example; set your production OIDC provider's exact issuer URL.
     issuer: "http://dex:5556/dex"
     client_id: "rise-backend"
     # client_secret is unset so production.yaml reads OIDC_CLIENT_SECRET from
@@ -415,7 +416,7 @@ postgresql:
       tag: "18-trixie"
       pullPolicy: IfNotPresent
 
-# Dex OIDC provider (optional)
+# Dex OIDC provider for development and testing (optional)
 dex:
   enabled: false
   replicaCount: 1

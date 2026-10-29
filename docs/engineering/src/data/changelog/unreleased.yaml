@@ -96,7 +96,7 @@ changes:
       Set ECS `workload_task_role_arn` and grant application permissions before
       its workload rollout. For Helm, supply `OIDC_CLIENT_SECRET` through `env` or
       `envFrom`, leave `config.auth.client_secret` unset or use an environment-variable
-      reference, and configure Dex sign-in. Extend rules if
+      reference, and configure sign-in with your OIDC provider. Extend rules if
       Metacontroller serves other controllers. Allow sufficient startup time
       (30 minutes by default) and avoid automatic rollback to an incompatible image.
   - id: upcoming-001

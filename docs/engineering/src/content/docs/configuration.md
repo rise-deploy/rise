@@ -140,7 +140,7 @@ server:
   cookie_secure: true
 
 auth:
-  issuer: "${DEX_ISSUER}"
+  issuer: "${OIDC_ISSUER}"
   client_id: "${OIDC_CLIENT_ID}"
   client_secret: "${OIDC_CLIENT_SECRET}"
   admin_users:
@@ -160,7 +160,7 @@ Environment file:
 ```bash
 # .env
 PUBLIC_URL=https://rise.example.com
-DEX_ISSUER=https://dex.example.com
+OIDC_ISSUER=https://idp.example.com
 OIDC_CLIENT_ID=rise-production
 OIDC_CLIENT_SECRET=very-secret-value
 ADMIN_EMAIL=admin@example.com

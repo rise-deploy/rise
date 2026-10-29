@@ -1,6 +1,6 @@
 # Rise Helm Chart
 
-This Helm chart deploys the Rise application on Kubernetes, including the backend API server and optionally Dex for OIDC authentication.
+This Helm chart deploys Rise on Kubernetes with authentication through your configured OIDC provider. An optional Dex deployment is available for development and testing.
 
 ## Prerequisites
 
@@ -18,6 +18,8 @@ helm install rise ./helm/rise
 
 ### Production installation with custom values
 
+Register Rise as a client with your production OIDC provider and set its exact
+issuer URL below. Keep `dex.enabled: false` when using an external provider.
 Create a `values-prod.yaml` file:
 
 ```yaml
@@ -34,7 +36,7 @@ config:
     public_url: "https://rise.example.com"
 
   auth:
-    issuer: "https://dex.example.com/dex"
+    issuer: "https://idp.example.com"
     client_id: "rise-backend"
     # client_secret comes from OIDC_CLIENT_SECRET via envFrom below.
     admin_users:
@@ -90,33 +92,6 @@ server:
     requests:
       cpu: 500m
       memory: 256Mi
-
-# Optional: Enable Dex for OIDC authentication
-# Optional: Enable Dex for OIDC authentication (see Dex Configuration below)
-dex:
-  enabled: true
-  config:
-    issuer: "https://dex.example.com/dex"
-    storage:
-      type: kubernetes
-      config:
-        inCluster: true
-    web:
-      http: "0.0.0.0:5556"
-    staticClients:
-      - id: rise-backend
-        redirectURIs:
-          - "https://rise.example.com/api/v1/auth/callback"
-        name: "Rise Backend"
-        secret: "<client secret>"
-    connectors:
-      - type: github
-        id: github
-        name: GitHub
-        config:
-          clientID: $GITHUB_CLIENT_ID
-          clientSecret: $GITHUB_CLIENT_SECRET
-          redirectURI: https://dex.example.com/dex/callback
 ```
 
 Create the secrets:
@@ -208,7 +183,7 @@ alloy:
 |-----------|-------------|---------|
 | `server.resources` | Server container resource requests/limits | See values.yaml |
 
-### Dex (Optional OIDC Provider)
+### Dex (Development and Testing)
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
@@ -267,7 +242,7 @@ The Rise backend runs as a single process that includes:
 
 The backend can optionally be deployed alongside:
 
-- **Dex**: OIDC provider for authentication (optional, disabled by default, runs as a separate deployment)
+- **Dex**: OIDC provider for development and testing (optional, disabled by default, runs as a separate deployment)
 
 ## Security Considerations
 
@@ -327,7 +302,7 @@ config:
     public_url: "https://rise.example.com"
 
   auth:
-    issuer: "https://dex.example.com/dex"
+    issuer: "https://idp.example.com"
     client_id: "rise-backend"
 
   registry:
@@ -338,7 +313,7 @@ config:
 
 ### Dex Configuration
 
-With `dex.enabled: true` the chart runs Dex with `dex.config` as its
+For development and testing, `dex.enabled: true` runs Dex with `dex.config` as its
 configuration file. The default has in-memory storage, a `rise-backend` client
 with placeholder redirect URIs, and **no users**: add `connectors` for a real
 identity provider, or enable the password DB with users whose hashes you

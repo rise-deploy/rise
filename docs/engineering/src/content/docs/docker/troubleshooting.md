@@ -27,9 +27,10 @@ on the app host) and that the `302` `Location` points at
 `deployment_controller.auth_backend_url` (e.g. `http://rise:3000`) or set the
 offending access classes to `access_requirement: None`.
 
-**OIDC issuer mismatch / Dex rejects login in production.** `DEX_ISSUER` and the
-issuer Dex actually serves (`dev/dex/config.yaml`) must be identical. See the
-[production caveat](/operator-docs/docker/authentication/#production-caveat-important).
+**OIDC issuer mismatch.** `auth.issuer` must exactly match the issuer advertised
+by your OIDC provider. The Docker configuration reads it from `DEX_ISSUER` for
+any provider. See [production identity provider](/operator-docs/docker/authentication/#production-identity-provider).
+For bundled Dex demos, match `DEX_ISSUER` to `issuer` in `dev/dex/config.yaml`.
 
 **App `404` right after a deploy reports Healthy.** Traefik observes new
 containers asynchronously via the Docker provider, so routing lags the API's

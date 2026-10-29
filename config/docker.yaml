@@ -65,9 +65,8 @@ encryption:
   key: "${RISE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
   migration_source_key: "${RISE_ENCRYPTION_MIGRATION_SOURCE_KEY:-}"
 auth:
-  # Single OIDC issuer. Local default is the internal Dex (http://rise-dex:5556/dex);
-  # prod sets DEX_ISSUER=https://dex.${RISE_DOMAIN} (computed in compose because the
-  # loader does a single, non-recursive ${VAR} pass).
+  # DEX_ISSUER accepts any OIDC provider's issuer URL. The default is local Dex;
+  # set DEX_ISSUER to your production provider's exact issuer URL.
   issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
   client_id: "${OIDC_CLIENT_ID:-rise-backend}"
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"

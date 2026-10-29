@@ -107,7 +107,7 @@ cases, depending on where the backend runs:
 Traefik, which terminates TLS and forwards to the backend; injecting an
 `extra_hosts` override in production would wrongly bypass Traefik and break TLS.
 
-## Authentication / Dex
+## OIDC authentication
 
 The backend uses a **single OIDC issuer** for both server-side token exchange and
 browser logins. The issuer URL must resolve **identically** from inside the Rise
@@ -127,12 +127,19 @@ Using one hostname that resolves the same everywhere avoids issuer-mismatch
 failures where the backend and the browser would otherwise disagree on the
 issuer URL.
 
-### Production caveat (important)
+### Production identity provider
 
 The bundled Dex is a **demo IdP** (in-memory storage, static passwords —
 `admin@example.com` / `password`). For production, prefer an external IdP: set
 `auth.issuer`, `auth.client_id` and `auth.client_secret` to the external
-provider's values and drop the `dex` service from the stack.
+provider's values and drop the `dex` service from the stack. The Docker
+configuration reads the issuer from `DEX_ISSUER` for any OIDC provider; set it
+to your provider's exact issuer URL and set `OIDC_CLIENT_SECRET` to the registered
+client secret. If the client ID differs from `rise-backend`, supply
+`OIDC_CLIENT_ID` in the `rise` service's `environment` through a Compose override.
+Register `{public_url}/api/v1/auth/callback` with your provider.
+
+### Bundled Dex for demos
 
 The base Compose file does **not** publish Dex publicly; the backend reaches it
 only over the internal `rise_default` network. Exposing the demo IdP at
@@ -144,7 +151,7 @@ docker compose -f docker-compose.standalone.yaml \
                -f docker-compose.standalone.demo-idp.yaml up -d
 ```
 
-If you do run the **bundled Dex in production** (demo overlay layered), two
+When exposing the bundled Dex through the demo overlay, two
 config changes in `dev/dex/config.yaml` are **both** required — Dex enforces
 each independently:
 
@@ -155,7 +162,7 @@ each independently:
    rejects the discovery/token requests.
 2. **Redirect URI.** The backend builds the OAuth callback as
    `{public_url}/api/v1/auth/callback`, i.e.
-   `https://rise.${RISE_DOMAIN}/api/v1/auth/callback` in production. Dex rejects
+   `https://rise.${RISE_DOMAIN}/api/v1/auth/callback` with the demo overlay. Dex rejects
    any `redirect_uri` not in `staticClients[rise-backend].redirectURIs`, which
    only lists the local hosts. **Add** `https://rise.${RISE_DOMAIN}/api/v1/auth/callback`
    to that list — this is the only redirect URI the backend registers, including

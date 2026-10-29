@@ -17,7 +17,6 @@ Point these records at the host running the stack:
 | `rise.${RISE_DOMAIN}` | Control plane (UI + API) |
 | `*.${RISE_DOMAIN}` | App ingress (`{project}.${RISE_DOMAIN}`) |
 | `registry.${RISE_DOMAIN}` | Container registry |
-| `dex.${RISE_DOMAIN}` | Bundled Dex IdP (only if you keep it) |
 
 App hosts in the standard layout are **subdomains of the ingress domain**
 (`{project}.${RISE_DOMAIN}`), which makes them *siblings* of the control-plane
@@ -80,13 +79,13 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `REGISTRY_BASIC_AUTH` | empty | htpasswd users for the public registry (see [Container registry](/operator-docs/docker/registry/)). |
 | `RISE_REGISTRY_USERNAME` | empty | Optional static registry username returned to trusted users during deploy. |
 | `RISE_REGISTRY_PASSWORD` | empty | Optional static registry password returned to trusted users during deploy. |
-| `DEX_ISSUER` | `https://dex.${RISE_DOMAIN}` | OIDC issuer (see [Authentication / Dex](/operator-docs/docker/authentication/)). |
+| `DEX_ISSUER` | `https://dex.${RISE_DOMAIN}` | **Set it** to your production OIDC provider's issuer URL. The Docker configuration uses this variable name for any provider; see [OIDC authentication](/operator-docs/docker/authentication/). |
 | `RISE_IMAGE_TAG` | `0.23.0` | **Manual stable image pin** — bump on upgrade; set an exact published tag for a prerelease. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
 | `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`; Rise refuses placeholder keys unless insecure development mode is explicitly enabled. `openssl rand -base64 32`. |
 | `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key; refused like the signing secret. `openssl rand -base64 32`. |
-| `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it.** Keep in sync with the Dex client secret in `dev/dex/config.yaml`. |
+| `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it** to the client secret registered with your OIDC provider. |
 | `OIDC_GROUP_CLAIM` | `groups` | ID-token claim containing group names. Set to `cognito:groups` for AWS Cognito. |
 | `RISE_AUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept ID tokens without an `email_verified` claim. See [`auth.allow_missing_email_verified`](/operator-docs/configuration/#auth-settings). |
 | `RISE_IDP_GROUP_SYNC_PREFIXES` | empty | Optional comma-separated prefixes limiting which canonical IdP groups become Rise teams. |
@@ -108,8 +107,8 @@ env vars default to those placeholders when unset). Before any real use:
 
 - **Regenerate every secret.** Set `RISE_JWT_SIGNING_SECRET`,
   `RISE_ENCRYPTION_KEY` (each `openssl rand -base64 32`), `OIDC_CLIENT_SECRET`,
-  and `POSTGRES_PASSWORD`. The `OIDC_CLIENT_SECRET` must stay in sync with the
-  Dex client secret in `dev/dex/config.yaml`. These override the demo defaults
+  and `POSTGRES_PASSWORD`. Set `OIDC_CLIENT_SECRET` to the secret registered
+  for Rise's client at your production IdP. These override the demo defaults
   baked into `config/docker.yaml`.
 - **Use a real IdP.** The bundled Dex is a demo provider with static passwords
   (`admin@example.com` / `password`) that grant a Rise admin session. The base
