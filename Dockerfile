@@ -40,6 +40,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 
 COPY frontend/ ./
+COPY static/assets/logo.svg ../static/assets/logo.svg
 RUN npm run build
 
 # Stage 2.6: Build bundled user documentation

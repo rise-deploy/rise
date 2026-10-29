@@ -214,6 +214,7 @@ a { color: inherit; }
     flex: 0 0 auto;
 }
 .r-brand-name { font-weight: 600; font-size: 15px; letter-spacing: -0.01em; color: var(--text); }
+.r-brand-name > span { color: var(--accent); }
 
 .r-nav { display: flex; flex-direction: column; gap: 4px; }
 .r-nav-section {
@@ -2365,9 +2366,12 @@ a.r-btn { text-decoration: none; }
 .r-attention .tile.failed { background: var(--err-bg); color: var(--err); }
 .r-attention .tile.deploying { background: var(--accent-soft); color: var(--accent); }
 .r-attention .body { flex: 1; min-width: 0; }
-.r-attention .title { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.r-attention .title { font-weight: 600; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; overflow-wrap: anywhere; }
 .r-attention .sub { font-size: 12.5px; color: var(--text-muted); overflow-wrap: anywhere; }
 .r-attention .cta { color: var(--accent); font-size: 12.75px; white-space: nowrap; }
+.r-attention-link { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; color: inherit; text-decoration: none; }
+.r-attention-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 2px; }
+.r-attention .meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 12px; color: var(--text-muted); margin-top: 4px; overflow-wrap: anywhere; }
 .r-home-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: 26px; align-items: start; }
 .r-dep-row { display: grid; grid-template-columns: 7px minmax(0, 140px) minmax(0, 120px) minmax(0, 1fr) max-content; }
 .r-dep-row .id, .r-dep-row .proj { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
