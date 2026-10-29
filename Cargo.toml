@@ -50,7 +50,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [package]
 name = "rise-deploy"
-version = "0.23.0-rc19"
+version = "0.23.0-rc20"
 publish = false
 edition.workspace = true
 license.workspace = true
