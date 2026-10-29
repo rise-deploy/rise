@@ -68,8 +68,14 @@ Using `KEY` without `=VALUE` reads the variable from your shell environment (use
 **How backends use these variables:**
 
 - **Docker**: Passed as `--build-arg` (requires `ARG` declaration in Dockerfile)
-- **Pack**: Passed as `--env` to pack CLI
+- **Pack**: Passed in an owner-only temporary env file outside the build context.
+  Names use ASCII letters, digits, underscore, dot or hyphen. Values cannot
+  contain CR, LF or NUL bytes or end in whitespace; Pack cannot preserve those
+  values through its env-file format.
 - **Railpack**: Passed as BuildKit secrets
+
+Docker build-argument values are visible in process arguments and can appear in
+image metadata. Use build secrets for credentials.
 
 Build args are for build configuration only (compiler flags, tool versions). For runtime variables, use `-e` / `--env` on `rise deploy`, or `rise env set`. See [Environment Variables](../environment-variables) for the distinction.
 

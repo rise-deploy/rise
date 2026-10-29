@@ -13,6 +13,7 @@ pub fn public_routes() -> Router<AppState> {
         .route("/auth/device/exchange", post(device::exchange))
         .route("/auth/signin", get(handlers::signin_page))
         .route("/auth/signin/start", get(handlers::oauth_signin_start))
+        .route("/auth/signin/begin", get(handlers::oauth_signin_begin))
         .route("/auth/callback", get(handlers::oauth_callback))
         .route("/auth/ingress", get(handlers::ingress_auth))
         .route("/auth/logout", get(handlers::oauth_logout))

@@ -185,14 +185,15 @@ pub fn resolve_runtime_containers(
 /// Returns true if this deployment should carry live infrastructure (the
 /// backend's workload resources, workload-identity tokens, etc.).
 pub fn should_have_infrastructure(deployment: &Deployment) -> bool {
-    matches!(
-        deployment.status,
-        DeploymentStatus::Pushed
-            | DeploymentStatus::Deploying
-            | DeploymentStatus::Healthy
-            | DeploymentStatus::Unhealthy
-            | DeploymentStatus::Terminating
-    )
+    !deployment.preparation_incomplete()
+        && matches!(
+            deployment.status,
+            DeploymentStatus::Pushed
+                | DeploymentStatus::Deploying
+                | DeploymentStatus::Healthy
+                | DeploymentStatus::Unhealthy
+                | DeploymentStatus::Terminating
+        )
 }
 
 /// Load and decrypt a deployment's environment variables into the neutral
@@ -223,7 +224,10 @@ pub async fn resolve_deployment_env_vars(
         let value = if var.is_secret {
             match encryption_provider {
                 Some(provider) => provider
-                    .decrypt(&var.value)
+                    .decrypt(
+                        &var.value,
+                        &crate::EncryptionContext::deployment_env(var.deployment_id, &var.key),
+                    )
                     .await
                     .with_context(|| format!("Failed to decrypt secret variable '{}'", key))?,
                 None => {
@@ -293,10 +297,18 @@ mod tests {
 
     #[async_trait]
     impl EncryptionProvider for PassthroughProvider {
-        async fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
+        async fn encrypt(
+            &self,
+            plaintext: &str,
+            _context: &crate::EncryptionContext,
+        ) -> anyhow::Result<String> {
             Ok(plaintext.to_string())
         }
-        async fn decrypt(&self, ciphertext: &str) -> anyhow::Result<String> {
+        async fn decrypt(
+            &self,
+            ciphertext: &str,
+            _context: &crate::EncryptionContext,
+        ) -> anyhow::Result<String> {
             Ok(ciphertext.to_string())
         }
     }

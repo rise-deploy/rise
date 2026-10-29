@@ -83,6 +83,7 @@ pub(crate) struct ResourceApiCtx {
     /// (operators administer it through the seeded `system-admin` binding,
     /// not a per-organization admin — see decision D4 in the audit plan).
     default_organization_name: String,
+    policy_audit_limiter: Arc<crate::server::rate_limit::PolicyAuditRateLimiter>,
 }
 
 impl ResourceApiCtx {
@@ -99,6 +100,7 @@ impl ResourceApiCtx {
                 Some(state.oauth_rate_limiter.clone()),
             )),
             default_organization_name: state.default_organization_name.clone(),
+            policy_audit_limiter: state.policy_audit_rate_limiter.clone(),
         }
     }
 }
@@ -846,6 +848,90 @@ fn mask_not_found(error: ServerError) -> ServerError {
 }
 
 // -----------------------------------------------------------------------------
+// Policy-audit authorization
+// -----------------------------------------------------------------------------
+
+/// The subresource name a `policy-audit` run is authorized by, as
+/// `(get, Organization, policy-audit)` on each Organization it covers.
+const POLICY_AUDIT_SUBRESOURCE: &str = "policy-audit";
+
+/// Authorize a `policy-audit` run against every Organization it covers.
+///
+/// The audit reads policy wholesale — Organization names, binding counts, and
+/// the bindings related to each finding — so it is authorized up front against
+/// its scope, not only filtered per finding afterwards. A run scoped to one
+/// Organization needs `(get, Organization, policy-audit)` on it, refused like
+/// any item addressed by name: a caller who may not read the Organization is
+/// told it does not exist. An install-wide run needs the tuple on every live
+/// Organization, and is refused without naming the one that failed; an
+/// install with no Organization has nothing to authorize it against and
+/// refuses it too.
+async fn authorize_policy_audit(
+    authz: &AuthorizationContext,
+    organization: Option<&str>,
+) -> Result<(), ServerError> {
+    let subresource: SubresourceName = POLICY_AUDIT_SUBRESOURCE
+        .parse()
+        .expect("policy-audit is a valid subresource name");
+    if let Some(name) = organization {
+        let row = authz
+            .store()
+            .get_by_name(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, name, None)
+            .await
+            .map_err(store_error_to_server_error)?
+            .filter(|row| row.deletion_timestamp.is_none())
+            .ok_or_else(|| ServerError::not_found(RESOURCE_NOT_FOUND))?;
+        let target = authz.tree(row.uid).await.map_err(mask_not_found)?;
+        return authz
+            .require_visible(&target, Verb::Get, Some(&subresource))
+            .await;
+    }
+
+    let organizations: Vec<ResourceRow> = authz
+        .store()
+        .list(API_VERSION_V1ALPHA1, ORGANIZATION_KIND, None)
+        .await
+        .map_err(store_error_to_server_error)?
+        .into_iter()
+        .filter(|row| row.deletion_timestamp.is_none())
+        .collect();
+    let refused = || {
+        ServerError::forbidden(format!(
+            "not authorized to audit policy install-wide: that requires get on the \
+             {POLICY_AUDIT_SUBRESOURCE} subresource of every Organization; pass \
+             organization=<name> to audit one"
+        ))
+    };
+    if organizations.is_empty() {
+        return Err(refused());
+    }
+    for row in &organizations {
+        let target = authz.tree(row.uid).await?;
+        if !authz.allows(&target, Verb::Get, Some(&subresource)).await? {
+            tracing::warn!(
+                target: "rise::audit",
+                actor = %authz.actor(),
+                subject = %authz.subject(),
+                verb = "get",
+                kind = %target.leaf().kind,
+                name = %row.name,
+                subresource = POLICY_AUDIT_SUBRESOURCE,
+                "resource.access_denied"
+            );
+            return Err(refused());
+        }
+    }
+    Ok(())
+}
+
+fn policy_audit_rate_limited(retry_after: u64) -> ServerError {
+    ServerError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("Too many policy audits; retry in {retry_after}s"),
+    )
+}
+
+// -----------------------------------------------------------------------------
 // Dispatch handlers
 // -----------------------------------------------------------------------------
 pub async fn dispatch_get(
@@ -919,6 +1005,13 @@ async fn dispatch_get_inner(
             Ok(Json(serde_json::json!({ "items": items })).into_response())
         }
         ResolvedPath::PolicyAudit => {
+            if let Err(retry_after) = ctx.policy_audit_limiter.requested(authz.actor()).await {
+                return Err(policy_audit_rate_limited(retry_after));
+            }
+            authorize_policy_audit(&authz, q.organization.as_deref()).await?;
+            if let Err(retry_after) = ctx.policy_audit_limiter.authorized().await {
+                return Err(policy_audit_rate_limited(retry_after));
+            }
             let limit = q.limit.unwrap_or(200).clamp(1, 1000);
             let scope = rise_authz::engine::AuditScope {
                 organization: q.organization.clone(),
@@ -926,29 +1019,34 @@ async fn dispatch_get_inner(
             };
             let report = authz.policy_audit(&scope).await?;
             // Every finding names a resource (a binding, a Role, an
-            // Organization, ...); it is included only when the caller may
-            // `list` that resource, exactly as `pending-deletion` filters its
-            // rows. A finding whose subject's ancestry cannot be resolved is
-            // skipped and logged rather than failing the whole listing.
+            // Organization, ...), and some name others in `related` and in
+            // their detail sentence. A finding is included only when the
+            // caller may `list` every resource it names, exactly as
+            // `pending-deletion` filters its rows; otherwise it is counted as
+            // hidden. A finding naming a resource whose ancestry cannot be
+            // resolved is skipped and logged rather than failing the whole
+            // listing.
             let mut findings = Vec::new();
             let mut hidden = 0usize;
-            for finding in report.findings {
-                let target = match authz.tree(finding.subject.uid).await {
-                    Ok(target) => target,
-                    Err(error) => {
-                        tracing::warn!(
-                            uid = %finding.subject.uid,
-                            kind = %finding.subject.kind,
-                            "Skipping a policy-audit finding whose subject's ancestry could \
-                             not be resolved: {}",
-                            error.message
-                        );
-                        continue;
+            'findings: for finding in report.findings {
+                for named in std::iter::once(&finding.subject).chain(&finding.related) {
+                    let target = match authz.tree(named.uid).await {
+                        Ok(target) => target,
+                        Err(error) => {
+                            tracing::warn!(
+                                uid = %named.uid,
+                                kind = %named.kind,
+                                "Skipping a policy-audit finding naming a resource whose \
+                                 ancestry could not be resolved: {}",
+                                error.message
+                            );
+                            continue 'findings;
+                        }
+                    };
+                    if !authz.allows(&target, Verb::List, None).await? {
+                        hidden += 1;
+                        continue 'findings;
                     }
-                };
-                if !authz.allows(&target, Verb::List, None).await? {
-                    hidden += 1;
-                    continue;
                 }
                 // The engine has no notion of "the default Organization" — it
                 // is a deployment setting, not a policy fact — so the
@@ -5868,6 +5966,9 @@ mod dispatch_tests {
     async fn policy_audit_filters_findings_by_list_and_counts_hidden(pool: sqlx::PgPool) {
         let ctx = ctx(pool).await;
         register_widget_rd(&ctx).await;
+        // The Organization an install-wide audit is authorized against. Its
+        // own `organizationWithoutAdmin` finding is the second one below.
+        create_org(&ctx, DEFAULT_ORGANIZATION).await;
         // A live `rise.dev/owner` setter, so the seeded `resource-owner`
         // binding's selector matches something — otherwise every fresh
         // install would carry its own `selectorMatchesNothing` finding and
@@ -5923,31 +6024,41 @@ mod dispatch_tests {
         let (status, body) = read(resp).await;
         assert_eq!(status, StatusCode::OK);
         let findings = body["findings"].as_array().expect("findings array");
-        assert_eq!(findings.len(), 1, "{body}");
-        assert_eq!(findings[0]["category"], "danglingRoleRef");
-        assert_eq!(findings[0]["severity"], "warning");
-        assert_eq!(findings[0]["subject"]["uid"], binding_uid.to_string());
+        assert_eq!(findings.len(), 2, "{body}");
+        let dangling = findings
+            .iter()
+            .find(|finding| finding["category"] == "danglingRoleRef")
+            .expect("the dangling binding is reported");
+        assert_eq!(dangling["severity"], "warning");
+        assert_eq!(dangling["subject"]["uid"], binding_uid.to_string());
         assert_eq!(body["hiddenFindings"], 0);
         assert_eq!(body["truncated"], false);
-        // No Organization exists in this fixture, but the platform tier was
-        // scanned: the block is what tells "healthy" apart from "skipped".
+        // The scanned block is what tells "healthy" apart from "skipped".
         assert_eq!(
-            body["scanned"]["organizations"].as_array().unwrap().len(),
-            0
+            body["scanned"]["organizations"],
+            json!([DEFAULT_ORGANIZATION])
         );
         assert!(body["scanned"]["platformBindings"].as_u64().unwrap() >= 1);
 
-        // A caller granted `list` only on a different kind sees nothing, but
-        // the hidden count says something was withheld — never a bare 403
-        // that would confirm something is there.
+        // A caller authorized to run the audit but granted `list` only on a
+        // different kind sees no finding, and the hidden count says something
+        // was withheld.
         grant_authenticated(
             &ctx,
             "widget-lister",
-            json!([{
-                "effect": "Allow",
-                "kinds": ["example.dev/Widget"],
-                "verbs": ["list"],
-            }]),
+            json!([
+                {
+                    "effect": "Allow",
+                    "kinds": ["example.dev/Widget"],
+                    "verbs": ["list"],
+                },
+                {
+                    "effect": "Allow",
+                    "kinds": ["rise.dev/Organization"],
+                    "verbs": ["get"],
+                    "subresources": ["policy-audit"],
+                },
+            ]),
         )
         .await;
         let resp = dispatch_get_inner(
@@ -5957,14 +6068,14 @@ mod dispatch_tests {
             PendingDeletionQuery::default(),
         )
         .await
-        .expect("a listing is never a 403");
+        .expect("the audit grant admits the run");
         let (status, body) = read(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["findings"].as_array().expect("findings array").len(),
             0
         );
-        assert_eq!(body["hiddenFindings"], 1);
+        assert_eq!(body["hiddenFindings"], 2);
     }
 
     /// `limit` bounds the findings returned and `truncated` says whether more
@@ -5976,8 +6087,10 @@ mod dispatch_tests {
         // Silence the seeded `resource-owner` binding's own
         // `selectorMatchesNothing` finding — see the comment in
         // `policy_audit_filters_findings_by_list_and_counts_hidden` — so the
-        // two dangling-role-ref findings below are the only ones counted.
+        // two dangling-role-ref findings below and the default Organization's
+        // `organizationWithoutAdmin` are the only ones counted.
         create_widget_with_owner_label(&ctx, "owned").await;
+        create_org(&ctx, DEFAULT_ORGANIZATION).await;
         for n in 0..2 {
             let role_name = format!("temp-role-{n}");
             create_at(
@@ -6045,9 +6158,265 @@ mod dispatch_tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["findings"].as_array().expect("findings array").len(),
-            2
+            3
         );
         assert_eq!(body["truncated"], false);
+    }
+
+    /// The audit is authorized by `(get, Organization, policy-audit)` on every
+    /// Organization it covers — not merely filtered per finding — so a caller
+    /// holding nothing on it learns neither the Organizations' names nor the
+    /// binding counts the run reports. Addressing one Organization by name is
+    /// masked like any item read: a caller who may not read it is told it does
+    /// not exist.
+    #[sqlx::test]
+    async fn policy_audit_requires_its_own_grant(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, DEFAULT_ORGANIZATION).await;
+        create_org(&ctx, "acme").await;
+        let audit = |organization: Option<&str>| {
+            dispatch_get_inner(
+                &ctx,
+                "policy-audit".to_string(),
+                auth(PLAIN_USER),
+                PendingDeletionQuery {
+                    organization: organization.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        };
+
+        assert_eq!(status_of(audit(None).await), StatusCode::FORBIDDEN);
+        assert_eq!(status_of(audit(Some("acme")).await), StatusCode::NOT_FOUND);
+
+        // Reading the Organization is not auditing it.
+        grant_authenticated(
+            &ctx,
+            "org-reader",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+            }]),
+        )
+        .await;
+        assert_eq!(status_of(audit(None).await), StatusCode::FORBIDDEN);
+        assert_eq!(status_of(audit(Some("acme")).await), StatusCode::FORBIDDEN);
+
+        // The audit grant on one Organization admits that Organization's run,
+        // and an install-wide run still needs it on every Organization.
+        platform_deny(
+            &ctx,
+            "no-default-audit",
+            &format!("rise.dev/Organization/{DEFAULT_ORGANIZATION}"),
+            json!([{
+                "effect": "Deny",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+                "subresources": ["policy-audit"],
+            }]),
+        )
+        .await;
+        grant_authenticated(
+            &ctx,
+            "auditor",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+                "subresources": ["policy-audit"],
+            }]),
+        )
+        .await;
+        let (status, body) = read(audit(Some("acme")).await.expect("acme audit")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["scanned"]["organizations"], json!(["acme"]));
+        let refused = audit(None).await.expect_err("default is denied");
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert!(
+            !refused.message.contains(DEFAULT_ORGANIZATION),
+            "the refusal names no Organization: {}",
+            refused.message
+        );
+
+        // An operator holds the tuple everywhere through `system-admin`.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator audit");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A finding whose `related` names a binding the caller may not `list`
+    /// is withheld as a whole: its detail sentence names that binding too.
+    #[sqlx::test]
+    async fn policy_audit_hides_findings_naming_unlistable_related_bindings(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, DEFAULT_ORGANIZATION).await;
+        grant_authenticated(
+            &ctx,
+            "auditor",
+            json!([{
+                "effect": "Allow",
+                "kinds": ["rise.dev/Organization"],
+                "verbs": ["get"],
+                "subresources": ["policy-audit"],
+            }]),
+        )
+        .await;
+        // The caller may list exactly the platform bindings labelled visible.
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "binding-lister"},
+                "spec": {"statements": [{
+                    "effect": "Allow",
+                    "kinds": ["rise.dev/PlatformRoleBinding"],
+                    "verbs": ["list"],
+                }]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {"name": "binding-lister"},
+                "spec": {
+                    "subject": "system:authenticated",
+                    "labelSelector": {"key": "example.dev/visible", "value": "true"},
+                    "roleRef": {"kind": "PlatformRole", "name": "binding-lister"},
+                },
+            }),
+        )
+        .await;
+        // A visible Allow, shadowed by an unlabelled Deny.
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformroles",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRole",
+                "metadata": {"name": "group-deleter"},
+                "spec": {"statements": [{
+                    "effect": "Allow",
+                    "kinds": ["rise.dev/Group"],
+                    "verbs": ["delete"],
+                }]},
+            }),
+        )
+        .await;
+        create_at(
+            &ctx,
+            "rise.dev/v1alpha1/platformrolebindings",
+            json!({
+                "apiVersion": "rise.dev/v1alpha1",
+                "kind": "PlatformRoleBinding",
+                "metadata": {
+                    "name": "shadowed",
+                    "labels": {"example.dev/visible": "true"},
+                },
+                "spec": {
+                    "subject": "system:authenticated",
+                    "roleRef": {"kind": "PlatformRole", "name": "group-deleter"},
+                },
+            }),
+        )
+        .await;
+        platform_deny(
+            &ctx,
+            "hidden-denier",
+            "*",
+            json!([{
+                "effect": "Deny",
+                "kinds": ["rise.dev/Group"],
+                "verbs": ["delete"],
+            }]),
+        )
+        .await;
+        let is_shadowed = |finding: &&serde_json::Value| {
+            finding["category"] == "shadowedAllow" && finding["subject"]["name"] == "shadowed"
+        };
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("operator audit");
+        let (_, body) = read(resp).await;
+        let finding = body["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .find(is_shadowed)
+            .expect("the Deny shadows the Allow")
+            .clone();
+        assert_eq!(finding["related"][0]["name"], "hidden-denier");
+
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(PLAIN_USER),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("authorized audit");
+        let (status, body) = read(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let findings = body["findings"].as_array().expect("findings array");
+        assert!(
+            !findings.iter().any(|finding| is_shadowed(&finding)),
+            "{body}"
+        );
+        assert!(body["hiddenFindings"].as_u64().unwrap() >= 1);
+    }
+
+    /// Each caller has a small budget of runs per window.
+    #[sqlx::test]
+    async fn policy_audit_is_rate_limited_per_caller(pool: sqlx::PgPool) {
+        let ctx = ctx(pool).await;
+        create_org(&ctx, DEFAULT_ORGANIZATION).await;
+        let operator = auth(OPERATOR);
+        let mut statuses = Vec::new();
+        for _ in 0..7 {
+            statuses.push(status_of(
+                dispatch_get_inner(
+                    &ctx,
+                    "policy-audit".to_string(),
+                    operator.clone(),
+                    PendingDeletionQuery::default(),
+                )
+                .await,
+            ));
+        }
+        assert!(
+            statuses[..6].iter().all(|s| *s == StatusCode::OK),
+            "{statuses:?}"
+        );
+        assert_eq!(statuses[6], StatusCode::TOO_MANY_REQUESTS);
+
+        // Another caller's budget is untouched.
+        let resp = dispatch_get_inner(
+            &ctx,
+            "policy-audit".to_string(),
+            auth(OPERATOR),
+            PendingDeletionQuery::default(),
+        )
+        .await
+        .expect("a different caller");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// The default Organization is administered by operators through the

@@ -46,6 +46,14 @@ run "routing_and_discovery_contract" {
   command = plan
 
   assert {
+    condition = (
+      aws_ecs_service.rise.health_check_grace_period_seconds == 1800 &&
+      one(aws_ecs_service.rise.deployment_circuit_breaker).rollback
+    )
+    error_message = "Rise must have a configurable startup budget and retain the default rollback policy."
+  }
+
+  assert {
     condition = alltrue([
       for flag in [
         "--providers.ecs=true",
@@ -96,6 +104,41 @@ run "routing_and_discovery_contract" {
     )
     error_message = "Secret references must reach ECS secret injection without becoming plain environment values."
   }
+}
+
+run "control_plane_maintenance_startup_policy" {
+  command = plan
+  variables {
+    control_plane = {
+      name                              = "rise-control-plane"
+      discovery_name                    = "rise-control-plane"
+      image                             = "ghcr.io/rise-deploy/rise:0.23.0"
+      labels                            = { "rise.dev/controller-class" = "default" }
+      health_check_grace_period_seconds = 5400
+      deployment_rollback               = false
+    }
+  }
+  assert {
+    condition = (
+      aws_ecs_service.rise.health_check_grace_period_seconds == 5400 &&
+      !one(aws_ecs_service.rise.deployment_circuit_breaker).rollback
+    )
+    error_message = "Maintenance startup settings must reach the service without enabling automatic rollback."
+  }
+}
+
+run "rejects_fractional_startup_budget" {
+  command = plan
+  variables {
+    control_plane = {
+      name                              = "rise-control-plane"
+      discovery_name                    = "rise-control-plane"
+      image                             = "ghcr.io/rise-deploy/rise:0.23.0"
+      labels                            = { "rise.dev/controller-class" = "default" }
+      health_check_grace_period_seconds = 0.5
+    }
+  }
+  expect_failures = [var.control_plane]
 }
 
 run "acme_has_a_single_writer" {

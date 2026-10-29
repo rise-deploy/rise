@@ -1,3 +1,4 @@
+pub(crate) mod browser_binding;
 pub mod context;
 pub mod controller;
 pub mod cookie_helpers;
@@ -18,3 +19,6 @@ pub mod sa_match;
 pub mod session_scope;
 pub mod token_storage;
 pub mod user_identity;
+
+#[cfg(test)]
+mod browser_flow_tests;

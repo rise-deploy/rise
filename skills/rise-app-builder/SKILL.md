@@ -155,10 +155,12 @@ Do not add a Dockerfile unless the user needs one. Don't fight auto-detection.
 Never paste plaintext secrets into extension specs. Encrypt first:
 
 ```bash
-ENCRYPTED=$(rise encrypt "my_client_secret")
+ENCRYPTED=$(printf '%s' "my_client_secret" | rise encrypt \
+  --project my-app --extension-type oauth --extension oauth-google \
+  --slot /spec/client_secret_encrypted --oauth-spec oauth.json)
 ```
 
-Then reference `$ENCRYPTED` in the `--spec` JSON.
+The project must exist. `oauth.json` contains the intended upstream OAuth settings; the extension need not exist yet. Reference `$ENCRYPTED` in that configuration. Reseal when the upstream client, issuer, endpoints, or authentication method change.
 
 ### 8. Encrypted env vars have three tiers
 
@@ -193,7 +195,7 @@ Authenticating end-users via OAuth?
 
 Steps:
 1. Register OAuth app upstream with callback: {RISE_URL}/oidc/{project}/{ext}/callback
-2. rise encrypt "client_secret"  →  $ENCRYPTED
+2. Seal via stdin: rise encrypt --project my-app --extension-type oauth --extension oauth-google --slot /spec/client_secret_encrypted --oauth-spec oauth.json
 3. rise extension create oauth-google -p my-app --type oauth --spec '{...}'
 4. App redirects to: GET {OAUTH_<NAME>_ISSUER}/authorize
 5. App exchanges code at: POST {OAUTH_<NAME>_ISSUER}/token

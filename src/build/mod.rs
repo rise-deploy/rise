@@ -26,6 +26,43 @@ pub(crate) enum CommandOutput {
     Stderr,
 }
 
+/// Render `command` for a log line: the program and its arguments, preceded by
+/// the names of the variables set on its environment with their values
+/// withheld. Build secrets reach child processes through the environment, and
+/// `Command`'s `Debug` output prints those values.
+pub(crate) fn command_for_log(command: &Command) -> String {
+    let mut parts: Vec<String> = command
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|_| format!("{}=<redacted>", key.to_string_lossy())))
+        .collect();
+    parts.push(format!("{:?}", command.get_program()));
+    let mut assignment = false;
+    for arg in command.get_args() {
+        let arg = arg.to_string_lossy();
+        let rendered = if assignment {
+            assignment = false;
+            match arg.split_once('=') {
+                Some((key, _)) => format!("{key}=<redacted>"),
+                None => arg.to_string(),
+            }
+        } else if let Some((flag, value)) = arg.split_once('=') {
+            if matches!(flag, "--env" | "-e" | "--build-arg") {
+                match value.split_once('=') {
+                    Some((key, _)) => format!("{flag}={key}=<redacted>"),
+                    None => arg.to_string(),
+                }
+            } else {
+                arg.to_string()
+            }
+        } else {
+            assignment = matches!(arg.as_ref(), "--env" | "-e" | "--build-arg");
+            arg.to_string()
+        };
+        parts.push(format!("{rendered:?}"));
+    }
+    parts.join(" ")
+}
+
 /// Run a child command while keeping its stdout out of a machine-readable
 /// command's stdout.
 pub(crate) fn run_command(
@@ -629,5 +666,42 @@ mod tests {
         let (value, source) = resolve_platform(None, None, None, None);
         assert_eq!(value, host_platform());
         assert_eq!(source, PlatformSource::HostFallback);
+    }
+
+    #[test]
+    fn command_for_log_withholds_build_argument_and_env_values() {
+        let mut cmd = Command::new("docker");
+        cmd.args([
+            "build",
+            "--build-arg",
+            "TOKEN=build-secret",
+            "--env=PASSWORD=env-secret",
+            "-e",
+            "PROXY=proxy-secret",
+            "--build-arg=OTHER=other-secret",
+            ".",
+        ]);
+        let line = command_for_log(&cmd);
+        for value in ["build-secret", "env-secret", "proxy-secret", "other-secret"] {
+            assert!(!line.contains(value), "{line}");
+        }
+        assert!(line.contains("TOKEN=<redacted>"));
+        assert!(line.contains("PASSWORD=<redacted>"));
+    }
+
+    #[test]
+    fn command_for_log_withholds_environment_values() {
+        let mut cmd = Command::new("docker");
+        cmd.arg("buildx")
+            .arg("--secret")
+            .arg("id=API_TOKEN,env=RISE_SECRET_API_TOKEN")
+            .env("RISE_SECRET_API_TOKEN", "s3cr3t");
+        let line = command_for_log(&cmd);
+        assert!(!line.contains("s3cr3t"), "{line}");
+        assert!(line.contains("RISE_SECRET_API_TOKEN=<redacted>"), "{line}");
+        assert!(
+            line.contains("\"id=API_TOKEN,env=RISE_SECRET_API_TOKEN\""),
+            "{line}"
+        );
     }
 }

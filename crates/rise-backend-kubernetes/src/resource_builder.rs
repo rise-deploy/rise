@@ -1763,6 +1763,7 @@ mod tests {
         async fn get_credentials(
             &self,
             _repository: &str,
+            _project_id: uuid::Uuid,
             _tags: &[&str],
         ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
@@ -1798,6 +1799,7 @@ mod tests {
                 ingress_port: None,
                 ingress_schema: "https".to_string(),
                 registry_provider: Arc::new(TestRegistryProvider::default()),
+                control_plane_hosts: Vec::new(),
             },
             auth_backend_url: "https://auth.example.test".to_string(),
             auth_signin_url: "https://signin.example.test".to_string(),

@@ -57,6 +57,7 @@ pub trait RegistryProvider: Send + Sync {
     /// * `repository` - The repository name (e.g., `"my-app"`). Every tag in
     ///   `tags` is written to this repository — multi-container deployments
     ///   share one repository and only differ in their tag suffix.
+    /// * `project_id` - Immutable identity from the trusted project row.
     /// * `tags` - All image tags the returned credentials must be able to
     ///   write to. For single-container this is a one-element slice (the
     ///   deployment ID); for multi-container it has one entry per container
@@ -67,24 +68,80 @@ pub trait RegistryProvider: Send + Sync {
     ///
     /// Implementations may assume `tags` is non-empty; the caller guarantees
     /// at least one tag.
-    async fn get_credentials(&self, repository: &str, tags: &[&str])
-        -> Result<RegistryCredentials>;
+    async fn get_credentials(
+        &self,
+        repository: &str,
+        project_id: uuid::Uuid,
+        tags: &[&str],
+    ) -> Result<RegistryCredentials>;
 
     /// Get credentials for pulling/reading images (registry-wide)
     ///
     /// Used for resolving image digests. Returns (username, password) tuple.
     /// Returns empty strings if no credentials are available (e.g., anonymous access).
+    /// Providers requiring project scope refuse this operation.
     async fn get_pull_credentials(&self) -> Result<(String, String)>;
+
+    /// Get pull credentials for a project's repository, including provider
+    /// eligibility checks. Used by image admission and deployment runtimes.
+    async fn get_project_pull_credentials(
+        &self,
+        repository: &str,
+        project_id: uuid::Uuid,
+    ) -> Result<RegistryCredentials> {
+        self.get_k8s_pull_credentials(repository, project_id).await
+    }
+
+    /// Opaque identity of the current project pull-credential scope. Runtimes
+    /// compare it with cached credentials to detect provider-side rotations.
+    /// Providers without rotating scopes return `None`.
+    async fn project_pull_credential_scope(
+        &self,
+        _repository: &str,
+        _project_id: uuid::Uuid,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Return credentials together with the scope they were minted for.
+    /// Providers with mutable scopes must override this method to return the
+    /// exact scope snapshot used to mint or retrieve the credentials atomically.
+    async fn get_project_pull_credentials_with_scope(
+        &self,
+        repository: &str,
+        project_id: uuid::Uuid,
+    ) -> Result<(RegistryCredentials, Option<String>)> {
+        let credentials = self
+            .get_project_pull_credentials(repository, project_id)
+            .await?;
+        let scope = self
+            .project_pull_credential_scope(repository, project_id)
+            .await?;
+        Ok((credentials, scope))
+    }
+
+    /// The project named by a Rise-managed image, or `None` for an external
+    /// image. Registry namespaces are matched on a path-segment boundary.
+    fn image_project<'a>(&self, image: &'a str) -> Option<&'a str> {
+        let path = image
+            .strip_prefix(self.registry_url().trim_end_matches('/'))?
+            .strip_prefix('/')?;
+        path.split([':', '/', '@'])
+            .next()
+            .filter(|name| !name.is_empty())
+    }
 
     /// Get credentials for a Kubernetes image pull secret.
     ///
     /// `repository` is the project/app name (e.g. `"my-app"`). Providers that issue
-    /// repository-scoped tokens (GitLab) use it to restrict the JWT to pull access on
-    /// that specific image. Other providers (ECR, OCI client-auth) ignore it.
+    /// repository-scoped credentials use it to restrict access to that image.
     ///
     /// Defaults to wrapping `get_pull_credentials()` as `LoginCredentials`.
-    async fn get_k8s_pull_credentials(&self, repository: &str) -> Result<RegistryCredentials> {
-        let _ = repository;
+    async fn get_k8s_pull_credentials(
+        &self,
+        _repository: &str,
+        _project_id: uuid::Uuid,
+    ) -> Result<RegistryCredentials> {
         let (username, password) = self.get_pull_credentials().await?;
         Ok(RegistryCredentials {
             registry_url: self.registry_host().to_string(),
@@ -125,12 +182,18 @@ pub trait RegistryProvider: Send + Sync {
     }
 }
 
-/// Encryption provider trait for encrypting/decrypting secrets
+/// Encryption authenticates the consumer's independently derived resource and slot.
 #[async_trait]
 pub trait EncryptionProvider: Send + Sync {
-    /// Encrypt plaintext and return base64-encoded ciphertext
-    async fn encrypt(&self, plaintext: &str) -> Result<String>;
+    async fn encrypt(&self, plaintext: &str, context: &crate::EncryptionContext) -> Result<String>;
+    async fn decrypt(
+        &self,
+        envelope: &str,
+        expected_context: &crate::EncryptionContext,
+    ) -> Result<String>;
 
-    /// Decrypt base64-encoded ciphertext and return plaintext
-    async fn decrypt(&self, ciphertext: &str) -> Result<String>;
+    /// Only the startup migration may accept an unbound baseline value.
+    async fn decrypt_legacy_for_migration(&self, _ciphertext: &str) -> Result<String> {
+        anyhow::bail!("This provider does not support legacy baseline migration")
+    }
 }

@@ -21,6 +21,7 @@ pub mod backend;
 pub mod custom_domain;
 pub mod desired;
 pub mod diff;
+pub mod encryption;
 pub mod env;
 pub mod events;
 pub mod expiration;
@@ -53,12 +54,13 @@ pub mod test_helpers;
 pub use backend::{
     normalize_runtime_arch, AccessClass, BackendCapabilities, DeploymentBackend, DeploymentUrls,
 };
-pub use custom_domain::validate_custom_domain;
+pub use custom_domain::{control_plane_host, reject_control_plane_host, validate_custom_domain};
 pub use desired::{DesiredContainer, DesiredRoute};
 pub use diff::{
     diff_desired_vs_actual, identity_key, spec_key, ActualContainer, InspectedContainer,
     ReconcileAction,
 };
+pub use encryption::EncryptionContext;
 pub use env::{hash_env, merge_container_env, pin_system_env, redact_secrets_for_hash, upsert_env};
 pub use group::{normalize_deployment_group, DEFAULT_DEPLOYMENT_GROUP};
 pub use health_path::effective_health_path;

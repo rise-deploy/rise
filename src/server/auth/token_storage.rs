@@ -10,14 +10,21 @@ use sqlx::PgPool;
 /// OAuth2 state data stored temporarily during the PKCE flow
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OAuth2State {
+    /// Proof required on the central callback host.
+    #[serde(default)]
+    pub browser_proof: Option<super::browser_binding::BrowserProof>,
+    /// Independent proof required on the app's completion host.
+    #[serde(default)]
+    pub app_browser_proof: Option<super::browser_binding::BrowserProof>,
+    /// Project instance that owns this sign-in transaction.
+    #[serde(default)]
+    pub project_id: Option<uuid::Uuid>,
     pub code_verifier: String,
     pub redirect_url: Option<String>,
     /// Project name for ingress authentication flow
     pub project_name: Option<String>,
-    /// Custom domain base URL for custom domain auth routing
-    /// When set, after IdP callback completes on the main domain,
-    /// we redirect to `{base_url}/.rise/auth/complete` to set cookies there
-    pub custom_domain_base_url: Option<String>,
+    /// Exact app origin that receives the browser-bound completion.
+    pub app_base_url: Option<String>,
 }
 
 /// Completed auth session data for custom domain token exchange
@@ -25,6 +32,12 @@ pub struct OAuth2State {
 /// and retrieved by the custom domain to set cookies
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompletedAuthSession {
+    #[serde(default)]
+    pub browser_proof: Option<super::browser_binding::BrowserProof>,
+    #[serde(default)]
+    pub app_base_url: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<uuid::Uuid>,
     /// The signed Rise JWT to set as cookie
     pub rise_jwt: String,
     /// Max age for the cookie in seconds

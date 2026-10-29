@@ -211,6 +211,23 @@ pub async fn validate_url(url: &str, config: &SsrfConfig) -> Result<(), SsrfErro
 /// When `allow_private_networks` is true, redirect checks for HTTPS and blocked IPs are skipped.
 /// When `allow_http` is true, only the HTTPS requirement on redirects is relaxed.
 pub fn safe_client(config: &SsrfConfig) -> reqwest::Client {
+    safe_client_builder(config)
+        .build()
+        .expect("failed to build SSRF-safe HTTP client")
+}
+
+/// Credential-bearing token requests never carry their body to a redirect target.
+pub fn token_client(config: &SsrfConfig) -> reqwest::Client {
+    token_client_builder(config)
+        .build()
+        .expect("failed to build OAuth token HTTP client")
+}
+
+pub(crate) fn token_client_builder(config: &SsrfConfig) -> reqwest::ClientBuilder {
+    safe_client_builder(config).redirect(reqwest::redirect::Policy::none())
+}
+
+pub(crate) fn safe_client_builder(config: &SsrfConfig) -> reqwest::ClientBuilder {
     let config = config.clone();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -234,8 +251,6 @@ pub fn safe_client(config: &SsrfConfig) -> reqwest::Client {
                 attempt.error("redirect target has no host")
             }
         }))
-        .build()
-        .expect("failed to build SSRF-safe HTTP client")
 }
 
 #[cfg(test)]

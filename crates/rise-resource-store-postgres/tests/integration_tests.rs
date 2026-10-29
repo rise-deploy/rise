@@ -395,6 +395,49 @@ async fn create_rejects_non_storage_version_in_child_scope(pool: sqlx::PgPool) -
     Ok(())
 }
 
+/// A kind registered through a ResourceDefinition is refused under a parent
+/// that is being deleted, as a built-in kind is: the parent's bindings stop
+/// applying once it is tombstoned, so a child created there would escape them.
+#[sqlx::test]
+async fn create_rejects_rd_backed_kind_under_a_deleting_parent(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let store = PgResourceStore::new(pool);
+    register_example_widget_rd(&store).await;
+    let parent = store
+        .create(CreateResourceParams {
+            api_version: API_VERSION_V1ALPHA1.to_string(),
+            kind: ORGANIZATION_KIND.to_string(),
+            name: "draining".to_string(),
+            finalizers: vec!["controller.example.com/cleanup".to_string()],
+            spec: json!({"displayName": "Draining"}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let widget = |name: &str| CreateResourceParams {
+        api_version: "example.dev/v1".to_string(),
+        kind: "Widget".to_string(),
+        name: name.to_string(),
+        parent_uid: Some(parent.uid),
+        spec: json!({}),
+        ..Default::default()
+    };
+    store.create(widget("before")).await.unwrap();
+
+    assert!(matches!(
+        store.delete(parent.uid).await.unwrap(),
+        DeleteOutcome::MarkedForDeletion(_)
+    ));
+    let error = store.create(widget("after")).await.unwrap_err();
+    assert!(
+        matches!(&error, StoreError::Validation(message) if message.contains("not being deleted")),
+        "expected the deleting parent to be refused, got {error:?}"
+    );
+
+    Ok(())
+}
+
 #[sqlx::test]
 async fn update_api_version_collision_returns_name_conflict(
     pool: sqlx::PgPool,

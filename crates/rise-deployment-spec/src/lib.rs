@@ -1,6 +1,7 @@
 //! Shared deployment specification and project configuration model for Rise.
 
 pub mod access;
+pub mod credential_binding;
 pub mod project_config;
 pub mod request_spec;
 pub mod side_data;

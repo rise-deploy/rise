@@ -4,6 +4,7 @@ use super::models::{
 };
 use crate::db::{extensions as db_extensions, oauth_transient_state, projects as db_projects};
 use crate::server::auth::redirect::{is_loopback_host, origins_match};
+use crate::server::encryption::EncryptionContext;
 use crate::server::state::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -193,9 +194,9 @@ mod authorization_url_tests {
 
 /// Resolved OAuth endpoints from spec or OIDC discovery
 #[derive(Debug, Clone)]
-struct ResolvedEndpoints {
-    authorization_endpoint: String,
-    token_endpoint: String,
+pub(crate) struct ResolvedEndpoints {
+    pub(crate) authorization_endpoint: String,
+    pub(crate) token_endpoint: String,
 }
 
 /// Fetch OIDC discovery document from issuer URL
@@ -245,7 +246,7 @@ async fn fetch_oidc_discovery(
 }
 
 /// Resolve OAuth endpoints from spec, falling back to OIDC discovery
-async fn resolve_oauth_endpoints(
+pub(crate) async fn resolve_oauth_endpoints(
     spec: &OAuthExtensionSpec,
     ssrf_config: &crate::server::ssrf::SsrfConfig,
 ) -> Result<ResolvedEndpoints, String> {
@@ -774,7 +775,10 @@ pub async fn authorize(
         )
     })?;
 
-    debug!("Redirecting to OAuth provider: {}", auth_url.as_str());
+    debug!(
+        "Redirecting to OAuth provider: {}",
+        crate::server::middleware::url_for_log(auth_url.as_str())
+    );
 
     // Redirect to OAuth provider
     Ok(Redirect::to(auth_url.as_str()).into_response())
@@ -883,7 +887,7 @@ pub async fn callback(
     debug!(
         "OAuth callback: flow_type={}, final_redirect_uri={}",
         if is_test_flow { "test" } else { "real" },
-        final_redirect_uri
+        crate::server::middleware::url_for_log(&final_redirect_uri)
     );
 
     // Get project
@@ -910,7 +914,7 @@ pub async fn callback(
         )
     })?;
 
-    // Resolve OAuth provider's client secret (prefers encrypted in spec, falls back to env var ref)
+    // Build the OAuth client with Rise's configured encryption provider.
     let Some(encryption_provider) = state.encryption_provider.as_ref() else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -924,20 +928,9 @@ pub async fn callback(
     let oauth_provider = OAuthProvider::new(OAuthProviderConfig {
         db_pool: state.db_pool.clone(),
         encryption_provider: encryption_provider.clone(),
-        http_client: crate::server::ssrf::safe_client(ssrf_config),
+        ssrf_config: ssrf_config.clone(),
         api_domain: state.public_url.clone(),
     });
-
-    let client_secret = oauth_provider
-        .resolve_oauth_client_secret(project.id, &spec)
-        .await
-        .map_err(|e| {
-            error!("Failed to resolve OAuth client secret: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to resolve OAuth client secret: {}", e),
-            )
-        })?;
 
     // Compute callback redirect URI - must match exactly what was sent in authorize request
     let api_url = Url::parse(&state.public_url).map_err(|e| {
@@ -992,29 +985,43 @@ pub async fn callback(
             )
         })?;
 
-    // Exchange authorization code for tokens (with PKCE code verifier)
-    let http_client = crate::server::ssrf::safe_client(ssrf_config);
-    let response = super::provider::upstream_token_request(
-        &http_client,
-        &endpoints.token_endpoint,
-        &spec,
-        &client_secret,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", &req.code),
-            ("redirect_uri", &redirect_uri),
-            ("code_verifier", &claimed_state.code_verifier),
-        ],
-    )
-    .send()
-    .await
-    .map_err(|e| {
-        error!("Token exchange request failed: {:?}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Token exchange request failed: {}", e),
+    let client_secret = oauth_provider
+        .resolve_oauth_client_secret(
+            project.id,
+            &extension_name,
+            &spec,
+            &endpoints.token_endpoint,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            error!("Failed to resolve OAuth client secret: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve OAuth client secret: {}", e),
+            )
+        })?;
+
+    // Exchange authorization code for tokens (with PKCE code verifier)
+    let response = oauth_provider
+        .request_tokens(
+            &spec,
+            &client_secret,
+            &endpoints.token_endpoint,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &req.code),
+                ("redirect_uri", &redirect_uri),
+                ("code_verifier", &claimed_state.code_verifier),
+            ],
+        )
+        .await
+        .map_err(|e| {
+            error!("Token exchange request failed: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Token exchange request failed: {}", e),
+            )
+        })?;
 
     // Branch based on flow type: test flows skip token parsing/encryption
     if is_test_flow {
@@ -1148,6 +1155,7 @@ pub async fn callback(
             )
         })?;
 
+        let authorization_code = generate_state_token();
         // Encrypt raw response body
         let Some(encryption_provider) = state.encryption_provider.as_ref() else {
             return Err((
@@ -1157,7 +1165,15 @@ pub async fn callback(
         };
 
         let token_response_encrypted = encryption_provider
-            .encrypt(&String::from_utf8_lossy(&response_body))
+            .encrypt(
+                &String::from_utf8_lossy(&response_body),
+                &EncryptionContext::extension(
+                    project.id,
+                    "oauth",
+                    &extension_name,
+                    &format!("/tokens/response/{authorization_code}"),
+                ),
+            )
             .await
             .map_err(|e| {
                 error!("Failed to encrypt token response: {:?}", e);
@@ -1195,9 +1211,6 @@ pub async fn callback(
                 format!("Failed to update status: {}", e),
             )
         })?;
-
-        // Generate authorization code for token exchange
-        let authorization_code = generate_state_token();
 
         // Store encrypted raw token response in authorization code state (5-minute TTL, single-use)
         let code_state = OAuthCodeState {
@@ -1255,7 +1268,7 @@ pub async fn callback(
 
         info!(
             "OAuth callback complete: redirecting to {}",
-            redirect_url.as_str()
+            crate::server::middleware::url_for_log(redirect_url.as_str())
         );
 
         if let Err(e) = claimed_state.finalize().await {
@@ -1749,7 +1762,15 @@ async fn handle_authorization_code_grant(
     })?;
 
     let token_response_body = encryption_provider
-        .decrypt(&code_state.token_response_encrypted)
+        .decrypt(
+            &code_state.token_response_encrypted,
+            &EncryptionContext::extension(
+                project.id,
+                "oauth",
+                &extension_name,
+                &format!("/tokens/response/{code}"),
+            ),
+        )
         .await
         .map_err(|e| {
             error!("Failed to decrypt token response: {:?}", e);
@@ -1803,13 +1824,35 @@ async fn handle_refresh_token_grant(
             error!("Encryption provider not configured");
             oauth2_error("server_error", Some("Internal server error".to_string()))
         })?,
-        http_client: crate::server::ssrf::safe_client(&state.server_settings.ssrf),
+        ssrf_config: state.server_settings.ssrf.clone(),
         api_domain: state.public_url.clone(),
     });
 
-    // Get upstream OAuth client secret (prefers encrypted in spec, falls back to env var ref)
+    let endpoints = resolve_oauth_endpoints(&spec, &state.server_settings.ssrf)
+        .await
+        .map_err(|_| {
+            oauth2_error(
+                "server_error",
+                Some("Failed to resolve OAuth endpoints".into()),
+            )
+        })?;
+    crate::server::ssrf::validate_url(&endpoints.token_endpoint, &state.server_settings.ssrf)
+        .await
+        .map_err(|_| {
+            oauth2_error(
+                "server_error",
+                Some("OAuth token endpoint is not permitted".into()),
+            )
+        })?;
+
+    // Resolve the credential for this extension and the effective upstream destination.
     let client_secret = oauth_provider
-        .resolve_oauth_client_secret(project.id, &spec)
+        .resolve_oauth_client_secret(
+            project.id,
+            &extension_name,
+            &spec,
+            &endpoints.token_endpoint,
+        )
         .await
         .map_err(|e| {
             error!("Failed to resolve OAuth client secret: {:?}", e);
@@ -1818,7 +1861,12 @@ async fn handle_refresh_token_grant(
 
     // Refresh tokens with upstream provider
     let token_response = oauth_provider
-        .refresh_token(&spec, &client_secret, &refresh_token)
+        .refresh_token(
+            &spec,
+            &client_secret,
+            &refresh_token,
+            &endpoints.token_endpoint,
+        )
         .await
         .map_err(|e| {
             error!("Failed to refresh token with upstream provider: {:?}", e);
@@ -2241,4 +2289,32 @@ pub async fn oidc_jwks(
             ))
         }
     }
+}
+
+/// Derive an opaque upstream binding for clients sealing a not-yet-created OAuth extension.
+pub async fn credential_binding(
+    State(state): State<AppState>,
+    auth: crate::server::auth::context::AuthContext,
+    Path((project_name, _extension_name)): Path<(String, String)>,
+    Json(spec): Json<OAuthExtensionSpec>,
+) -> Result<Json<serde_json::Value>, crate::server::error::ServerError> {
+    use crate::server::error::{ServerError, ServerErrorExt};
+    let user = auth.user()?;
+    let project = crate::db::projects::find_by_name(&state.db_pool, &project_name)
+        .await
+        .internal_err("Failed to find project")?
+        .ok_or_else(|| ServerError::not_found("Project not found"))?;
+    crate::server::project::handlers::ensure_project_access_or_admin(&state, user, &project)
+        .await?;
+    let endpoints = resolve_oauth_endpoints(&spec, &state.server_settings.ssrf)
+        .await
+        .map_err(|_| ServerError::bad_request("Failed to resolve OAuth endpoints"))?;
+    crate::server::ssrf::validate_url(&endpoints.token_endpoint, &state.server_settings.ssrf)
+        .await
+        .map_err(|_| ServerError::bad_request("OAuth token endpoint is not permitted"))?;
+    let binding = rise_deployment_spec::credential_binding::oauth_credential_binding(
+        &serde_json::to_value(spec).internal_err("Invalid OAuth spec")?,
+        &endpoints.token_endpoint,
+    );
+    Ok(Json(serde_json::json!({"binding": binding})))
 }

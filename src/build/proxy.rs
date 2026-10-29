@@ -36,7 +36,7 @@ pub(crate) fn read_and_transform_proxy_vars() -> HashMap<String, String> {
                 }
             };
 
-            debug!("Found proxy variable: {}={}", var_name, transformed_value);
+            debug!("Found proxy variable: {}", var_name);
             proxy_vars.insert(var_name.to_string(), transformed_value);
         }
     }
@@ -60,17 +60,10 @@ fn transform_proxy_url(url: &str) -> Result<String> {
             .set_host(Some("host.docker.internal"))
             .context("Failed to set host to host.docker.internal")?;
 
-        debug!("Transformed proxy URL: {} -> {}", url, parsed.as_str());
+        debug!("Rewrote loopback proxy host to host.docker.internal");
     }
 
     Ok(parsed.to_string())
-}
-
-/// Format proxy variables for pack CLI (--env KEY=VALUE format)
-pub(crate) fn format_for_pack(vars: &HashMap<String, String>) -> Vec<String> {
-    vars.iter()
-        .map(|(key, value)| format!("{}={}", key, value))
-        .collect()
 }
 
 /// Parse environment variables from CLI format to HashMap.
@@ -203,33 +196,10 @@ mod tests {
     }
 
     #[test]
-    fn test_no_proxy_unchanged() {
-        // NO_PROXY values should not be transformed
-        let mut vars = HashMap::new();
-        vars.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
-
-        let formatted = format_for_pack(&vars);
-        assert_eq!(formatted.len(), 1);
-        assert_eq!(formatted[0], "NO_PROXY=localhost,127.0.0.1");
-    }
-
-    #[test]
     fn test_invalid_url_fallback() {
         // Invalid URLs should return an error
         let result = transform_proxy_url("not a valid url");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_format_for_pack() {
-        let mut vars = HashMap::new();
-        vars.insert("HTTP_PROXY".to_string(), "http://proxy:3128".to_string());
-        vars.insert("HTTPS_PROXY".to_string(), "https://proxy:3128".to_string());
-
-        let formatted = format_for_pack(&vars);
-        assert_eq!(formatted.len(), 2);
-        assert!(formatted.contains(&"HTTP_PROXY=http://proxy:3128".to_string()));
-        assert!(formatted.contains(&"HTTPS_PROXY=https://proxy:3128".to_string()));
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub(super) async fn ctx_with_operators(
         ),
         tokens: Arc::new(token::tests::service(pool)),
         default_organization_name: DEFAULT_ORGANIZATION.to_string(),
+        policy_audit_limiter: Arc::new(crate::server::rate_limit::PolicyAuditRateLimiter::new()),
     }
 }
 

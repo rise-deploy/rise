@@ -40,6 +40,10 @@ pub struct DeploymentUrlBuilder {
     pub ingress_port: Option<u16>,
     pub ingress_schema: String,
     pub registry_provider: Arc<dyn RegistryProvider>,
+    /// Rise's own hosts, as [`crate::control_plane_host`] produces them. A
+    /// stored custom domain claiming one of them, or a subdomain of one, is
+    /// never routed.
+    pub control_plane_hosts: Vec<String>,
 }
 
 impl DeploymentUrlBuilder {
@@ -320,14 +324,15 @@ impl DeploymentUrlBuilder {
             .collect()
     }
 
-    /// Whether `domain` stays clear of the ingress URL templates; logs why not.
+    /// Whether `domain` stays clear of the ingress URL templates and the
+    /// control-plane hosts; logs why not.
     fn is_valid_custom_domain(&self, domain: &CustomDomain) -> bool {
         match validate_custom_domain(
             &domain.domain,
             &self.production_ingress_url_template,
             self.staging_ingress_url_template.as_deref(),
             self.environment_ingress_url_template.as_deref(),
-            None,
+            &self.control_plane_hosts,
         ) {
             Ok(()) => true,
             Err(reason) => {
@@ -336,7 +341,7 @@ impl DeploymentUrlBuilder {
                     domain_id = %domain.id,
                     project_id = %domain.project_id,
                     domain = %domain.domain,
-                    "Ignoring custom domain that conflicts with project default domain pattern: {}",
+                    "Ignoring custom domain that conflicts with a project default domain pattern or a control-plane host: {}",
                     reason
                 );
                 false

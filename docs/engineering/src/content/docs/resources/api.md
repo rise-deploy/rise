@@ -490,13 +490,30 @@ Query parameters:
   findings returned. `truncated: true` means more existed than `limit` allowed
   through.
 
+A run is authorized by `(get, Organization, policy-audit)` on every
+Organization it covers: the one named by `organization` — a caller who may not
+read it gets the same `404` as for a nonexistent name — or, without it, every
+live Organization (`403` if any one is refused, or if there is none). Operators
+hold it through `system-admin`; an org admin holds it on their own
+Organization. Granting it discloses that Organization's name and the run's
+`scanned` binding counts, including the install-wide platform binding count.
+
+```json
+{ "effect": "Allow", "kinds": ["rise.dev/Organization"], "verbs": ["get"], "subresources": ["policy-audit"] }
+```
+
+Each run reads every binding in scope, so it is rate limited per replica: six
+requests per caller per minute, and thirty authorized runs per minute
+altogether. Over either budget the answer is `429`.
+
 Every finding names a resource — a binding, a Role, a `GroupMembership`, a
-labelled resource, or an Organization — and is included only when the caller
-holds `list` on that resource, exactly like the `pending-deletion` listing.
-Findings the caller may not `list` are counted in `hiddenFindings` rather than
-named, so a partial view never reads as "nothing to see here". A finding whose
-subject's ancestry cannot be resolved is skipped and logged rather than
-failing the whole listing.
+labelled resource, or an Organization — and some name further resources in
+`related` and in their `detail`. A finding is included only when the caller
+holds `list` on every resource it names, exactly like the `pending-deletion`
+listing. Findings the caller may not see in full are counted in
+`hiddenFindings` rather than named, so a partial view never reads as "nothing
+to see here". A finding naming a resource whose ancestry cannot be resolved is
+skipped and logged rather than failing the whole listing.
 
 ```json
 {

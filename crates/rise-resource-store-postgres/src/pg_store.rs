@@ -489,6 +489,50 @@ impl PgResourceStore {
         }
     }
 
+    /// Refuse a create of a `ResourceDefinition`-registered kind under an
+    /// ancestor that is missing or being deleted, the rule
+    /// [`Self::validate_builtin_placement`] applies to built-in kinds.
+    ///
+    /// A tombstoned ancestor's bindings are no longer live, so its Denies stop
+    /// applying the moment it enters deletion: a child created beneath it would
+    /// be authorized without them. Each ancestor row is read `FOR SHARE`, so a
+    /// concurrent delete stamping it waits for this transaction and then
+    /// cascades to the child it inserted.
+    async fn validate_live_ancestry(
+        conn: &mut sqlx::PgConnection,
+        kind: &str,
+        mut parent_uid: Option<Uuid>,
+    ) -> Result<(), StoreError> {
+        let mut depth = 0usize;
+        while let Some(uid) = parent_uid {
+            depth += 1;
+            if depth > MAX_PARENT_CHAIN_DEPTH {
+                return Err(StoreError::Validation(format!(
+                    "{kind} parent chain exceeds the maximum depth of {MAX_PARENT_CHAIN_DEPTH}"
+                )));
+            }
+            let ancestor = sqlx::query_as::<_, PgResourceRow>(
+                "SELECT * FROM resource_store.resources WHERE uid = $1 FOR SHARE",
+            )
+            .bind(uid)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(Self::db_error)?;
+            match ancestor {
+                Some(ancestor) if ancestor.deletion_timestamp.is_none() => {
+                    parent_uid = ancestor.parent_uid;
+                }
+                _ => {
+                    return Err(StoreError::Validation(format!(
+                        "{kind} parent must identify a live resource whose ancestors are \
+                         not being deleted"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Tombstone every immediate lifecycle dependent that has not already
     /// entered deletion. Structural children are updated first, so a resource
     /// that is both a structural child and an owner-reference dependent emits
@@ -1057,6 +1101,8 @@ impl ResourceApi for PgResourceStore {
                     .admit_create_context(&mut tx, &self.builtins, &mut params)
                     .await?;
             }
+        } else {
+            Self::validate_live_ancestry(&mut tx, &params.kind, params.parent_uid).await?;
         }
 
         // Always require the lock (and therefore verify the RD exists) unless this is a

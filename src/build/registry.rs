@@ -20,7 +20,7 @@ pub(crate) fn docker_push_with_output(
     let mut cmd = Command::new(container_cli);
     cmd.arg("push").arg(image_tag);
 
-    debug!("Executing command: {:?}", cmd);
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(
         cmd,
@@ -47,7 +47,7 @@ pub(crate) fn docker_pull_with_output(
     let mut cmd = Command::new(container_cli);
     cmd.arg("pull").arg("--platform").arg(platform).arg(image);
 
-    debug!("Executing command: {:?}", cmd);
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(
         cmd,
@@ -74,7 +74,7 @@ pub(crate) fn docker_tag_with_output(
     let mut cmd = Command::new(container_cli);
     cmd.arg("tag").arg(source).arg(target);
 
-    debug!("Executing command: {:?}", cmd);
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(
         cmd,
@@ -125,13 +125,38 @@ pub(crate) fn inject_registry_auth(container_cli: &str, registry: &str, token: &
     // Set the registrytoken entry
     config["auths"][registry]["registrytoken"] = serde_json::Value::String(token.to_string());
 
-    // Write atomically via a temp file in the same directory
-    let tmp_path = auth_file.with_extension("tmp");
-    std::fs::write(&tmp_path, serde_json::to_string_pretty(&config)?)
-        .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &auth_file)
-        .with_context(|| format!("Failed to update {}", auth_file.display()))?;
+    write_private_file(
+        &auth_file,
+        serde_json::to_string_pretty(&config)?.as_bytes(),
+    )
+}
 
+/// Atomically replace `path` with `contents`, readable by the owner only.
+///
+/// The auth file holds every registry credential the container CLI stores, so it is
+/// written `0600` regardless of the mode the previous file had. A symlinked auth file
+/// is updated at its target, leaving the link in place.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let path = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)
+            .with_context(|| format!("Failed to resolve symlink {}", path.display()))?,
+        _ => path.to_path_buf(),
+    };
+    let dir = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    // NamedTempFile is created 0600 on Unix; persist renames it over the destination.
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("Failed to create temporary file in {}", dir.display()))?;
+    file.write_all(contents)
+        .with_context(|| format!("Failed to write {}", file.path().display()))?;
+    file.as_file()
+        .sync_all()
+        .with_context(|| format!("Failed to flush {}", file.path().display()))?;
+    file.persist(&path)
+        .with_context(|| format!("Failed to update {}", path.display()))?;
     Ok(())
 }
 
@@ -193,4 +218,55 @@ pub(crate) fn docker_login_with_output(
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn private_file_replaces_world_readable_file_with_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_private_file(&path, br#"{"auths":{}}"#).unwrap();
+
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"auths":{}}"#);
+    }
+
+    #[test]
+    fn private_file_creates_new_file_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        write_private_file(&path, b"{}").unwrap();
+
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn private_file_updates_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.json");
+        let link = dir.path().join("config.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_private_file(&link, b"{\"a\":1}").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{\"a\":1}");
+        assert_eq!(mode(&target), 0o600);
+    }
 }

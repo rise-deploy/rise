@@ -219,7 +219,22 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
     const extensionName = instanceName || (isEnabled ? '' : 'YOUR_EXTENSION_NAME');
     const redirectUri = `${backendUrl}/oidc/${projectName || 'YOUR_PROJECT'}/${extensionName}/callback`;
     const scopeList = parseScopes(scopes);
-    const secretPending = clientSecretPlaintext.trim() !== '' && clientSecretPlaintext !== encryptedFor;
+    const bindingSpec: OAuthSpec = {
+        provider_name: providerName, client_id: clientId, issuer_url: issuerUrl,
+        ...(endpointMode === 'manual' && authorizationEndpoint.trim() ? { authorization_endpoint: authorizationEndpoint.trim() } : {}),
+        ...(endpointMode === 'manual' && tokenEndpoint.trim() ? { token_endpoint: tokenEndpoint.trim() } : {}),
+        ...(authMethod !== 'client_secret_post' ? { token_endpoint_auth_method: authMethod } : {}),
+    };
+    const bindingInputs = JSON.stringify([
+        projectName, instanceName, clientId, issuerUrl,
+        bindingSpec.authorization_endpoint ?? null, bindingSpec.token_endpoint ?? null, authMethod,
+    ]);
+    const sealTag = JSON.stringify([clientSecretPlaintext, bindingInputs]);
+    const encryptedBindingRef = useRef(bindingInputs);
+    const requiresFreshSecret = clientSecretEncrypted !== '' && encryptedBindingRef.current !== bindingInputs && clientSecretPlaintext.trim() === '';
+    const secretPending = requiresFreshSecret || (clientSecretPlaintext.trim() !== '' && sealTag !== encryptedFor);
+    const encryptionScopeRef = useRef({ projectName, instanceName, spec: bindingSpec, tag: sealTag, bindingInputs });
+    encryptionScopeRef.current = { projectName, instanceName, spec: bindingSpec, tag: sealTag, bindingInputs };
 
     const applyTemplate = (next: ProviderTemplate) => {
         const previousName = template?.name;
@@ -248,11 +263,18 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
     const encryptNow = async () => {
         clearTimeout(encryptTimerRef.current);
         const plaintext = plaintextRef.current;
-        if (plaintext.trim() === '' || plaintext === encryptedForRef.current) return;
+        const target = encryptionScopeRef.current;
+        if (plaintext.trim() === '' || target.tag === encryptedForRef.current
+            || !target.projectName || !target.instanceName || !target.spec.client_id || !target.spec.issuer_url) return;
         const request = ++encryptRequestRef.current;
         setIsEncrypting(true);
         try {
-            const response = await api.encryptSecret(plaintext);
+            const { binding } = await api.oauthCredentialBinding(target.projectName, target.instanceName, target.spec);
+            const response = await api.encryptSecret(plaintext, {
+                project: target.projectName, extension_type: 'oauth', extension: target.instanceName,
+                slot: '/spec/client_secret_encrypted', binding,
+            });
+            if (target.tag !== encryptionScopeRef.current.tag) return;
             if (!mountedRef.current) {
                 // The form closed (e.g. a tab switch) mid-request; hand the
                 // final secret to the parent directly so it is not dropped.
@@ -260,8 +282,9 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
                 return;
             }
             if (request !== encryptRequestRef.current) return;
+            encryptedBindingRef.current = target.bindingInputs;
             setClientSecretEncrypted(response.encrypted);
-            setEncryptedFor(plaintext);
+            setEncryptedFor(target.tag);
         } catch (err) {
             if (!mountedRef.current || request !== encryptRequestRef.current) return;
             const message = err instanceof Error ? err.message : String(err);
@@ -281,7 +304,7 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
         if (!secretPending) return;
         encryptTimerRef.current = setTimeout(encryptNow, ENCRYPT_DEBOUNCE_MS);
         return () => clearTimeout(encryptTimerRef.current);
-    }, [clientSecretPlaintext]);
+    }, [clientSecretPlaintext, bindingInputs]);
     useEffect(() => {
         mountedRef.current = true;
         return () => {
@@ -320,7 +343,9 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
         }
     };
 
-    const secretStatus = isEncrypting
+    const secretStatus = requiresFreshSecret
+        ? 'Enter the client secret again for this provider configuration.'
+        : isEncrypting
         ? 'Encrypting…'
         : secretPending
             ? 'Encrypted automatically when you stop typing.'

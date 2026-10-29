@@ -1,5 +1,4 @@
-use crate::db::env_vars as db_env_vars;
-use crate::server::encryption::EncryptionProvider;
+use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::providers::oauth::models::{
     OAuthExtensionSpec, OAuthExtensionStatus, TokenEndpointAuthMethod, TokenResponse,
 };
@@ -18,7 +17,7 @@ use uuid::Uuid;
 pub struct OAuthProviderConfig {
     pub db_pool: PgPool,
     pub encryption_provider: Arc<dyn EncryptionProvider>,
-    pub http_client: reqwest::Client,
+    pub ssrf_config: crate::server::ssrf::SsrfConfig,
     pub api_domain: String,
 }
 
@@ -39,6 +38,24 @@ impl Clone for OAuthProvider {
             api_domain: self.api_domain.clone(),
         }
     }
+}
+
+pub fn oauth_client_secret_context(
+    project_id: Uuid,
+    extension_name: &str,
+    spec: &OAuthExtensionSpec,
+    token_endpoint: &str,
+) -> Result<EncryptionContext> {
+    let spec = serde_json::to_value(spec)?;
+    Ok(EncryptionContext::extension(
+        project_id,
+        "oauth",
+        extension_name,
+        "/spec/client_secret_encrypted",
+    )
+    .with_binding(
+        rise_deployment_spec::credential_binding::oauth_credential_binding(&spec, token_endpoint),
+    ))
 }
 
 /// Build a POST to the upstream token endpoint with `params` as the form body,
@@ -101,7 +118,7 @@ impl OAuthProvider {
         Self {
             db_pool: config.db_pool,
             encryption_provider: config.encryption_provider,
-            http_client: config.http_client,
+            http_client: crate::server::ssrf::token_client(&config.ssrf_config),
             api_domain: config.api_domain,
         }
     }
@@ -117,162 +134,48 @@ impl OAuthProvider {
         )
     }
 
-    /// Resolve client_secret from project environment variable
-    #[allow(dead_code)]
-    pub async fn resolve_client_secret(
-        &self,
-        project_id: Uuid,
-        client_secret_ref: &str,
-    ) -> Result<String> {
-        // Get all environment variables for the project
-        let env_vars = db_env_vars::list_project_env_vars(&self.db_pool, project_id, None).await?;
-
-        // Find the environment variable by key
-        let env_var = env_vars
-            .iter()
-            .find(|var| var.key == client_secret_ref)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Environment variable '{}' not found for OAuth client secret",
-                    client_secret_ref
-                )
-            })?;
-
-        // Decrypt the value if it's a secret
-        let client_secret = if env_var.is_secret {
-            self.encryption_provider
-                .decrypt(&env_var.value)
-                .await
-                .context("Failed to decrypt OAuth client secret")?
-        } else {
-            env_var.value.clone()
-        };
-
-        Ok(client_secret)
-    }
-
-    /// Resolve token endpoint from spec or OIDC discovery
-    #[allow(dead_code)]
-    async fn resolve_token_endpoint(&self, spec: &OAuthExtensionSpec) -> Result<String> {
-        // If token_endpoint is provided in spec, use it
-        if let Some(ref endpoint) = spec.token_endpoint {
-            if !endpoint.is_empty() {
-                return Ok(endpoint.clone());
-            }
-        }
-
-        // Fetch from OIDC discovery
-        let discovery_url = format!(
-            "{}/.well-known/openid-configuration",
-            spec.issuer_url.trim_end_matches('/')
-        );
-
-        let response = self
-            .http_client
-            .get(&discovery_url)
-            .send()
-            .await
-            .context("Failed to fetch OIDC discovery")?;
-
-        if !response.status().is_success() {
-            return Err(anyhow!(
-                "OIDC discovery failed with status {}",
-                response.status()
-            ));
-        }
-
-        #[derive(serde::Deserialize)]
-        struct DiscoveryDoc {
-            token_endpoint: Option<String>,
-        }
-
-        let discovery: DiscoveryDoc = response
-            .json()
-            .await
-            .context("Failed to parse OIDC discovery")?;
-
-        discovery
-            .token_endpoint
-            .ok_or_else(|| anyhow!("No token_endpoint in OIDC discovery"))
-    }
-
-    /// Resolve OAuth provider's client_secret from spec
-    #[allow(dead_code)]
+    /// Decrypt only for the independently resolved extension and upstream destination.
     pub async fn resolve_oauth_client_secret(
         &self,
-        _project_id: Uuid,
+        project_id: Uuid,
+        extension_name: &str,
         spec: &OAuthExtensionSpec,
+        token_endpoint: &str,
     ) -> Result<String> {
-        if let Some(ref encrypted) = spec.client_secret_encrypted {
-            return self
-                .encryption_provider
-                .decrypt(encrypted)
-                .await
-                .context("Failed to decrypt OAuth client secret from spec");
-        }
-
-        Err(anyhow!(
-            "No client_secret_encrypted configured. \
-             If this extension uses the deprecated client_secret_ref, \
-             it should be auto-migrated by the reconciler on the next cycle."
-        ))
+        let encrypted = spec
+            .client_secret_encrypted
+            .as_deref()
+            .context("client_secret_encrypted is required")?;
+        self.encryption_provider
+            .decrypt(
+                encrypted,
+                &oauth_client_secret_context(project_id, extension_name, spec, token_endpoint)?,
+            )
+            .await
+            .context("OAuth credential does not match its resource, slot, or destination")
     }
 
-    /// Exchange authorization code for tokens
-    #[allow(dead_code)]
-    pub async fn exchange_code_for_tokens(
+    /// Send credentials only to the already validated and bound token endpoint.
+    pub(super) async fn request_tokens(
         &self,
         spec: &OAuthExtensionSpec,
         client_secret: &str,
-        authorization_code: &str,
-        redirect_uri: &str,
-    ) -> Result<TokenResponse> {
-        // Resolve token endpoint from spec or OIDC discovery
-        let token_endpoint = self.resolve_token_endpoint(spec).await?;
-
-        debug!(
-            "Exchanging authorization code for tokens with endpoint: {}",
-            token_endpoint
-        );
-
+        token_endpoint: &str,
+        params: &[(&str, &str)],
+    ) -> Result<reqwest::Response> {
         let response = upstream_token_request(
             &self.http_client,
-            &token_endpoint,
+            token_endpoint,
             spec,
             client_secret,
-            &[
-                ("grant_type", "authorization_code"),
-                ("code", authorization_code),
-                ("redirect_uri", redirect_uri),
-            ],
+            params,
         )
         .send()
         .await
-        .context("Failed to send token exchange request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error response".to_string());
-            error!(
-                "Token exchange failed with status {}: {}",
-                status, error_text
-            );
-            return Err(anyhow!(
-                "Token exchange failed with status {}: {}",
-                status,
-                error_text
-            ));
-        }
-
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .context("Failed to parse token response")?;
-
-        Ok(token_response)
+        .context("Failed to send OAuth token request")?;
+        anyhow::ensure!(!response.status().is_redirection(),
+            "OAuth token endpoint redirects are not permitted; configure the canonical endpoint and reseal the credential");
+        Ok(response)
     }
 
     /// Refresh an expired token using refresh_token
@@ -282,25 +185,21 @@ impl OAuthProvider {
         spec: &OAuthExtensionSpec,
         client_secret: &str,
         refresh_token: &str,
+        token_endpoint: &str,
     ) -> Result<TokenResponse> {
-        // Resolve token endpoint from spec or OIDC discovery
-        let token_endpoint = self.resolve_token_endpoint(spec).await?;
-
         debug!("Refreshing token with endpoint: {}", token_endpoint);
 
-        let response = upstream_token_request(
-            &self.http_client,
-            &token_endpoint,
-            spec,
-            client_secret,
-            &[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", refresh_token),
-            ],
-        )
-        .send()
-        .await
-        .context("Failed to send token refresh request")?;
+        let response = self
+            .request_tokens(
+                spec,
+                client_secret,
+                token_endpoint,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", refresh_token),
+                ],
+            )
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -325,87 +224,6 @@ impl OAuthProvider {
             .context("Failed to parse token refresh response")?;
 
         Ok(token_response)
-    }
-
-    /// Migrate an extension from client_secret_ref to client_secret_encrypted.
-    /// If the extension has client_secret_ref set but no client_secret_encrypted,
-    /// resolves the env var value, encrypts it, updates the spec, and deletes the env var.
-    // Only reached from `main` (through the extension registry), which is not a
-    // dead-code root when the binary is built for tests.
-    #[cfg_attr(test, allow(dead_code))]
-    async fn migrate_client_secret_ref(
-        &self,
-        ext: &crate::db::models::ProjectExtension,
-    ) -> Result<()> {
-        let spec: OAuthExtensionSpec = serde_json::from_value(ext.spec.clone())
-            .context("Failed to parse OAuth extension spec")?;
-
-        // Only migrate if client_secret_ref is set and client_secret_encrypted is not
-        let client_secret_ref = match (&spec.client_secret_ref, &spec.client_secret_encrypted) {
-            (Some(ref_name), None) => ref_name.clone(),
-            _ => return Ok(()),
-        };
-
-        info!(
-            "Migrating OAuth extension {}/{} from client_secret_ref ({}) to client_secret_encrypted",
-            ext.project_id, ext.extension, client_secret_ref
-        );
-
-        // Resolve the secret from the env var
-        let client_secret = self
-            .resolve_client_secret(ext.project_id, &client_secret_ref)
-            .await
-            .context("Failed to resolve client secret during migration")?;
-
-        // Encrypt it
-        let encrypted = self
-            .encryption_provider
-            .encrypt(&client_secret)
-            .await
-            .context("Failed to encrypt client secret during migration")?;
-
-        // Update the spec: set client_secret_encrypted, client_secret_ref will be
-        // dropped on serialization because it has skip_serializing
-        let mut updated_spec = spec.clone();
-        updated_spec.client_secret_encrypted = Some(encrypted);
-        updated_spec.client_secret_ref = None;
-
-        crate::db::extensions::update_spec(
-            &self.db_pool,
-            ext.project_id,
-            &ext.extension,
-            &serde_json::to_value(&updated_spec)
-                .context("Failed to serialize updated OAuth spec")?,
-        )
-        .await
-        .context("Failed to update OAuth extension spec during migration")?;
-
-        // Best-effort cleanup: delete the legacy env var
-        if let Err(e) = db_env_vars::delete_project_env_var(
-            &self.db_pool,
-            ext.project_id,
-            &client_secret_ref,
-            None,
-        )
-        .await
-        {
-            warn!(
-                "Failed to delete migrated environment variable {}: {:?}",
-                client_secret_ref, e
-            );
-        } else {
-            info!(
-                "Deleted migrated environment variable {} for project {}",
-                client_secret_ref, ext.project_id
-            );
-        }
-
-        info!(
-            "Successfully migrated OAuth extension {}/{} to client_secret_encrypted",
-            ext.project_id, ext.extension
-        );
-
-        Ok(())
     }
 
     /// Handle deletion of an OAuth extension
@@ -612,17 +430,7 @@ impl Extension for OAuthProvider {
                                 continue;
                             }
 
-                            // Migrate client_secret_ref → client_secret_encrypted
-                            if !election.is_leader() {
-                                warn!("Lost leadership before OAuth migration reconcile");
-                                break;
-                            }
-                            if let Err(e) = provider.migrate_client_secret_ref(&ext).await {
-                                error!(
-                                    "Failed to migrate client_secret_ref for OAuth extension {}/{}: {:?}",
-                                    ext.project_id, ext.extension, e
-                                );
-                            }
+
                         }
                     }
                     Err(e) => {
@@ -713,21 +521,11 @@ impl Extension for OAuthProvider {
                 value: InjectedEnvVarValue::Plain(rise_client_id.clone()),
             });
 
-            // CLIENT_SECRET (encrypted secret, unprotected — safe for local dev)
-            let encrypted_client_secret = self
-                .encryption_provider
-                .encrypt(rise_client_secret)
-                .await
-                .context(format!(
-                    "Failed to encrypt {} for project {}",
-                    client_secret_key, project.name
-                ))?;
-
+            // CLIENT_SECRET is retrievable; the deployment boundary encrypts its snapshot.
             result.push(InjectedEnvVar {
                 key: client_secret_key.clone(),
                 value: InjectedEnvVarValue::Secret {
                     decrypted: rise_client_secret.clone(),
-                    encrypted: encrypted_client_secret,
                 },
             });
 
@@ -800,108 +598,59 @@ The OAuth extension requires:
    `Authorization` header. Use `client_secret_basic` for providers that reject
    body credentials with `invalid_client`, such as Notion.
 
-## Setup Steps
+## Setup
 
-### Step 1: Encrypt Client Secret
+Create the project first. The extension can be sealed before it exists. Put the
+upstream configuration in `oauth.json`:
 
-```bash
-ENCRYPTED=$(rise encrypt "your_client_secret")
+```json
+{
+  "provider_name": "Google",
+  "client_id": "123456789.apps.googleusercontent.com",
+  "issuer_url": "https://accounts.google.com",
+  "scopes": ["openid", "email", "profile"]
+}
 ```
 
-### Step 2: Create OAuth Extension
+Seal the upstream secret for this project, extension name, slot, and OAuth
+configuration, then create the extension:
 
 ```bash
-rise extension create my-app oauth-provider \
-  --type oauth \
-  --spec '{
-    "provider_name": "My OAuth Provider",
-    "description": "OAuth authentication for my app",
-    "client_id": "your_client_id",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://provider.com",
-    "authorization_endpoint": "https://provider.com/oauth/authorize",
-    "token_endpoint": "https://provider.com/oauth/token",
-    "scopes": ["openid", "email", "profile"]
-  }'
+ENCRYPTED=$(printf '%s' "your_client_secret" | rise encrypt \
+  --project my-app --extension-type oauth --extension oauth-google \
+  --slot /spec/client_secret_encrypted --oauth-spec oauth.json)
+
+rise extension create oauth-google -p my-app --type oauth \
+  --spec "$(jq --arg secret "$ENCRYPTED" '.client_secret_encrypted = $secret' oauth.json)"
 ```
 
-## Provider-Specific Examples
+`--oauth-spec` resolves the effective token endpoint through Rise and binds the
+secret to the upstream client ID, issuer, explicit endpoints, authentication
+method, and resolved token destination. Token redirects are refused; use the
+provider's canonical final token URL. Re-enter and seal the secret when any
+of those change. A ciphertext sealed for another project, extension, or slot
+cannot be used here. Restoring the same extension name within the same project
+permits reuse when its OAuth configuration matches; recreating the project does
+not. The generic resource API carries ciphertext as an opaque value.
 
-### Snowflake OAuth
+`rise encrypt` reads plaintext from stdin when its optional plaintext argument
+is omitted. It permits 100 encryptions per hour per user and requires an
+unrestricted login plus access to the enclosing project.
 
-```bash
-ENCRYPTED=$(rise encrypt "your_snowflake_client_secret")
-rise extension create my-app oauth-snowflake \
-  --type oauth \
-  --spec '{
-    "provider_name": "Snowflake Production",
-    "description": "Snowflake OAuth for analytics",
-    "client_id": "ABC123XYZ...",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://myorg.snowflakecomputing.com",
-    "authorization_endpoint": "https://myorg.snowflakecomputing.com/oauth/authorize",
-    "token_endpoint": "https://myorg.snowflakecomputing.com/oauth/token-request",
-    "scopes": ["refresh_token"]
-  }'
-```
+## Provider endpoints
 
-### Google OAuth
+Put each provider's client ID and endpoint configuration in `oauth.json` before sealing.
 
-```bash
-ENCRYPTED=$(rise encrypt "your_google_client_secret")
-rise extension create my-app oauth-google \
-  --type oauth \
-  --spec '{
-    "provider_name": "Google",
-    "description": "Sign in with Google",
-    "client_id": "123456789.apps.googleusercontent.com",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://accounts.google.com",
-    "scopes": ["openid", "email", "profile"]
-  }'
-```
+| Provider | Issuer | Explicit endpoints |
+| --- | --- | --- |
+| Google | `https://accounts.google.com` | Discovered |
+| Snowflake | `https://ACCOUNT.snowflakecomputing.com` | `/oauth/authorize`, `/oauth/token-request` |
+| GitHub | `https://github.com` | `/login/oauth/authorize`, `/login/oauth/access_token` |
+| Notion | `https://api.notion.com` | `/v1/oauth/authorize?owner=user`, `/v1/oauth/token` |
 
-### GitHub OAuth
-
-```bash
-ENCRYPTED=$(rise encrypt "your_github_client_secret")
-rise extension create my-app oauth-github \
-  --type oauth \
-  --spec '{
-    "provider_name": "GitHub",
-    "description": "Sign in with GitHub",
-    "client_id": "Iv1.abc123...",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://github.com",
-    "authorization_endpoint": "https://github.com/login/oauth/authorize",
-    "token_endpoint": "https://github.com/login/oauth/access_token",
-    "scopes": ["read:user", "user:email"]
-  }'
-```
-
-### Notion OAuth
-
-Create a public integration at https://www.notion.so/profile/integrations.
-Notion has no scopes (access is chosen by the user on the consent screen), needs
-`owner=user` on the authorization URL, and only accepts HTTP Basic client
-authentication.
-
-```bash
-ENCRYPTED=$(rise encrypt "your_notion_client_secret")
-rise extension create my-app oauth-notion \
-  --type oauth \
-  --spec '{
-    "provider_name": "Notion",
-    "description": "Connect a Notion workspace",
-    "client_id": "your-notion-client-id",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://api.notion.com",
-    "authorization_endpoint": "https://api.notion.com/v1/oauth/authorize?owner=user",
-    "token_endpoint": "https://api.notion.com/v1/oauth/token",
-    "token_endpoint_auth_method": "client_secret_basic",
-    "scopes": []
-  }'
-```
+Notion uses `token_endpoint_auth_method: "client_secret_basic"` and `scopes: []`.
+For providers with explicit endpoints, use full URLs in `authorization_endpoint`
+and `token_endpoint`.
 
 ## OAuth Flows
 
@@ -1041,8 +790,8 @@ const authUrl = 'https://api.rise.dev/oidc/my-app/oauth-provider/authorize?redir
                 },
                 "client_secret_encrypted": {
                     "type": "string",
-                    "description": "Encrypted client secret (use 'rise encrypt' to encrypt)",
-                    "example": "encrypted:..."
+                    "description": "Context-bound client secret; seal with rise encrypt --project ... --extension-type oauth --extension ... --slot /spec/client_secret_encrypted --oauth-spec oauth.json",
+                    "example": "rise:enc:v2:..."
                 },
                 "issuer_url": {
                     "type": "string",
@@ -1160,5 +909,395 @@ mod tests {
             .unwrap()
             .get("token_endpoint_auth_method")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod credential_scope_tests {
+    use super::*;
+    use crate::server::encryption::providers::local::LocalEncryptionProvider;
+
+    #[tokio::test]
+    async fn oauth_credentials_reject_resource_client_and_effective_destination_substitution() {
+        let encryption = Arc::new(
+            LocalEncryptionProvider::new("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").unwrap(),
+        );
+        let provider = OAuthProvider::new(OAuthProviderConfig {
+            db_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://test:test@localhost/test")
+                .unwrap(),
+            encryption_provider: encryption.clone(),
+            ssrf_config: crate::server::ssrf::SsrfConfig::default(),
+            api_domain: "https://rise.example.com".into(),
+        });
+        let project = Uuid::new_v4();
+        let mut spec: OAuthExtensionSpec = serde_json::from_value(json!({
+            "provider_name":"Example", "client_id":"client", "issuer_url":"https://idp.example.com",
+            "authorization_endpoint":"https://idp.example.com/auth", "token_endpoint":"https://idp.example.com/token"
+        })).unwrap();
+        let endpoint = spec.token_endpoint.clone().unwrap();
+        spec.client_secret_encrypted = Some(
+            encryption
+                .encrypt(
+                    "secret",
+                    &oauth_client_secret_context(project, "login", &spec, &endpoint).unwrap(),
+                )
+                .await
+                .unwrap(),
+        );
+        // Callback and refresh both resolve against the same effective endpoint.
+        assert_eq!(
+            provider
+                .resolve_oauth_client_secret(project, "login", &spec, &endpoint)
+                .await
+                .unwrap(),
+            "secret"
+        );
+        assert!(provider
+            .resolve_oauth_client_secret(Uuid::new_v4(), "login", &spec, &endpoint)
+            .await
+            .is_err());
+        assert!(provider
+            .resolve_oauth_client_secret(project, "other", &spec, &endpoint)
+            .await
+            .is_err());
+        assert!(provider
+            .resolve_oauth_client_secret(project, "login", &spec, "https://other.example.com/token")
+            .await
+            .is_err());
+        for field in [
+            "client_id",
+            "issuer_url",
+            "authorization_endpoint",
+            "token_endpoint",
+            "token_endpoint_auth_method",
+        ] {
+            let mut changed = serde_json::to_value(&spec).unwrap();
+            changed[field] = json!(if field == "token_endpoint_auth_method" {
+                "client_secret_basic"
+            } else {
+                "https://attacker.example.com/"
+            });
+            let changed: OAuthExtensionSpec = serde_json::from_value(changed).unwrap();
+            assert!(
+                provider
+                    .resolve_oauth_client_secret(project, "login", &changed, &endpoint)
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut ref_only = serde_json::to_value(spec).unwrap();
+        ref_only
+            .as_object_mut()
+            .unwrap()
+            .remove("client_secret_encrypted");
+        ref_only["client_secret_ref"] = json!("PROTECTED_OTHER_SECRET");
+        assert!(provider.validate_spec(&ref_only).await.is_err());
+    }
+    struct HttpsTokenServer {
+        url: String,
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for HttpsTokenServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn test_tls_acceptor() -> (openssl::ssl::SslAcceptor, reqwest::Certificate) {
+        use openssl::{
+            asn1::Asn1Time,
+            bn::BigNum,
+            hash::MessageDigest,
+            pkey::PKey,
+            rsa::Rsa,
+            ssl::{SslAcceptor, SslMethod},
+            x509::{
+                extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName},
+                X509NameBuilder, X509,
+            },
+        };
+        let ca_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut ca_name = X509NameBuilder::new().unwrap();
+        ca_name
+            .append_entry_by_text("CN", "Rise OAuth test CA")
+            .unwrap();
+        let ca_name = ca_name.build();
+        let mut ca = X509::builder().unwrap();
+        ca.set_version(2).unwrap();
+        ca.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        ca.set_subject_name(&ca_name).unwrap();
+        ca.set_issuer_name(&ca_name).unwrap();
+        ca.set_pubkey(&ca_key).unwrap();
+        let before = Asn1Time::days_from_now(0).unwrap();
+        let after = Asn1Time::days_from_now(1).unwrap();
+        ca.set_not_before(&before).unwrap();
+        ca.set_not_after(&after).unwrap();
+        ca.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+            .unwrap();
+        ca.append_extension(
+            KeyUsage::new()
+                .critical()
+                .key_cert_sign()
+                .crl_sign()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        ca.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let ca = ca.build();
+        let root = reqwest::Certificate::from_der(&ca.to_der().unwrap()).unwrap();
+        let leaf_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut leaf_name = X509NameBuilder::new().unwrap();
+        leaf_name.append_entry_by_text("CN", "localhost").unwrap();
+        let leaf_name = leaf_name.build();
+        let mut leaf = X509::builder().unwrap();
+        leaf.set_version(2).unwrap();
+        leaf.set_serial_number(&BigNum::from_u32(2).unwrap().to_asn1_integer().unwrap())
+            .unwrap();
+        leaf.set_subject_name(&leaf_name).unwrap();
+        leaf.set_issuer_name(&ca_name).unwrap();
+        leaf.set_pubkey(&leaf_key).unwrap();
+        leaf.set_not_before(&before).unwrap();
+        leaf.set_not_after(&after).unwrap();
+        leaf.append_extension(BasicConstraints::new().critical().build().unwrap())
+            .unwrap();
+        leaf.append_extension(
+            KeyUsage::new()
+                .digital_signature()
+                .key_encipherment()
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        leaf.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap())
+            .unwrap();
+        let san = SubjectAlternativeName::new()
+            .dns("localhost")
+            .ip("127.0.0.1")
+            .build(&leaf.x509v3_context(Some(&ca), None))
+            .unwrap();
+        leaf.append_extension(san).unwrap();
+        leaf.sign(&ca_key, MessageDigest::sha256()).unwrap();
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor.set_certificate(&leaf.build()).unwrap();
+        acceptor.set_private_key(&leaf_key).unwrap();
+        acceptor.add_extra_chain_cert(ca).unwrap();
+        acceptor.check_private_key().unwrap();
+        (acceptor.build(), root)
+    }
+
+    fn https_token_server(
+        acceptor: Arc<openssl::ssl::SslAcceptor>,
+        redirect: Option<String>,
+    ) -> HttpsTokenServer {
+        use std::{
+            io::{Read, Write},
+            sync::atomic::{AtomicBool, Ordering},
+            time::{Duration, Instant},
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = std::thread::spawn({
+            let stop = stop.clone();
+            let requests = requests.clone();
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    let stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("HTTPS fixture accept: {error}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut stream = acceptor.accept(stream).unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let read = stream.read(&mut buffer).unwrap();
+                        if read == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(header_end) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let headers = String::from_utf8_lossy(&request[..header_end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.split_once(':').and_then(|(key, value)| {
+                                        key.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().unwrap())
+                                    })
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= header_end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    let path = request
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap();
+                    let response = if let Some(target) = redirect
+                        .as_ref()
+                        .filter(|_| matches!(path, "/307" | "/308"))
+                    {
+                        let status = &path[1..];
+                        format!("HTTP/1.1 {status} Redirect\r\nLocation: {target}/direct\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        let body = r#"{"access_token":"access","token_type":"Bearer","refresh_token":"refresh"}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    };
+                    requests.lock().unwrap().push(request);
+                    stream.write_all(response.as_bytes()).unwrap();
+                }
+            }
+        });
+        HttpsTokenServer {
+            url,
+            requests,
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    #[tokio::test]
+    async fn code_exchange_and_refresh_never_send_bound_credentials_through_https_redirects() {
+        let (acceptor, root) = test_tls_acceptor();
+        let acceptor = Arc::new(acceptor);
+        let sink = https_token_server(acceptor.clone(), None);
+        let origin = https_token_server(acceptor, Some(sink.url.clone()));
+        let ssrf = crate::server::ssrf::SsrfConfig {
+            trusted_hosts: vec!["localhost".into()],
+            ..Default::default()
+        };
+        let encryption = Arc::new(
+            LocalEncryptionProvider::new("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").unwrap(),
+        );
+        let mut provider = OAuthProvider::new(OAuthProviderConfig {
+            db_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://test:test@localhost/test")
+                .unwrap(),
+            encryption_provider: encryption.clone(),
+            ssrf_config: ssrf.clone(),
+            api_domain: "https://rise.example.com".into(),
+        });
+        // The fixture uses the production redirect policy with its own CA and no local proxy.
+        provider.http_client = crate::server::ssrf::token_client_builder(&ssrf)
+            .no_proxy()
+            .tls_certs_only([root.clone()])
+            .build()
+            .unwrap();
+        let project = Uuid::new_v4();
+        let mut spec: OAuthExtensionSpec = serde_json::from_value(json!({"provider_name":"Fixture", "client_id":"client", "issuer_url":origin.url, "authorization_endpoint":format!("{}/authorize", origin.url), "token_endpoint":format!("{}/307", origin.url)})).unwrap();
+        // HTTPS-to-HTTPS 307 is followed by the discovery client's policy. HTTP would be refused.
+        let discovery_client = crate::server::ssrf::safe_client_builder(&ssrf)
+            .no_proxy()
+            .tls_certs_only([root])
+            .build()
+            .unwrap();
+        let response = upstream_token_request(
+            &discovery_client,
+            spec.token_endpoint.as_deref().unwrap(),
+            &spec,
+            "bound-secret",
+            &[("grant_type", "authorization_code")],
+        )
+        .send()
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        assert!(sink.requests.lock().unwrap()[0].contains("client_secret=bound-secret"));
+        sink.requests.lock().unwrap().clear();
+
+        for path in ["/307", "/308", "/direct"] {
+            let received_before = origin.requests.lock().unwrap().len();
+            let endpoint = format!("{}{path}", origin.url);
+            spec.token_endpoint = Some(endpoint.clone());
+            crate::server::ssrf::validate_url(&endpoint, &ssrf)
+                .await
+                .unwrap();
+            spec.client_secret_encrypted = Some(
+                encryption
+                    .encrypt(
+                        "bound-secret",
+                        &oauth_client_secret_context(project, "login", &spec, &endpoint).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let secret = provider
+                .resolve_oauth_client_secret(project, "login", &spec, &endpoint)
+                .await
+                .unwrap();
+            let exchange = provider
+                .request_tokens(
+                    &spec,
+                    &secret,
+                    &endpoint,
+                    &[
+                        ("grant_type", "authorization_code"),
+                        ("code", "code"),
+                        ("code_verifier", "verifier"),
+                    ],
+                )
+                .await;
+            let refresh = provider
+                .refresh_token(&spec, &secret, "refresh-token", &endpoint)
+                .await;
+            if path == "/direct" {
+                assert!(exchange.unwrap().status().is_success());
+                assert_eq!(refresh.unwrap().access_token, "access");
+            } else {
+                assert!(exchange
+                    .unwrap_err()
+                    .to_string()
+                    .contains("redirects are not permitted"));
+                assert!(refresh
+                    .unwrap_err()
+                    .to_string()
+                    .contains("redirects are not permitted"));
+            }
+            let received = origin.requests.lock().unwrap();
+            assert_eq!(received.len(), received_before + 2);
+            assert!(received[received_before..]
+                .iter()
+                .all(|request| request.contains("client_secret=bound-secret")));
+            drop(received);
+            assert!(
+                sink.requests.lock().unwrap().is_empty(),
+                "token credentials must not reach a second HTTPS origin"
+            );
+        }
     }
 }

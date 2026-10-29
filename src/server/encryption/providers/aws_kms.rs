@@ -4,7 +4,8 @@ use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::Client as KmsClient;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
-use crate::server::encryption::EncryptionProvider;
+use crate::server::encryption::{EncryptionContext, EncryptionProvider};
+use rise_backend_core::encryption::{decode_envelope, encode_envelope};
 
 /// AWS KMS encryption provider
 /// Uses AWS KMS for encryption/decryption operations
@@ -48,12 +49,9 @@ impl AwsKmsEncryptionProvider {
 
 #[async_trait]
 impl EncryptionProvider for AwsKmsEncryptionProvider {
-    async fn encrypt(&self, plaintext: &str) -> Result<String> {
+    async fn encrypt(&self, plaintext: &str, context: &EncryptionContext) -> Result<String> {
         let response = self
-            .client
-            .encrypt()
-            .key_id(&self.key_id)
-            .plaintext(Blob::new(plaintext.as_bytes()))
+            .encrypt_request(plaintext, context)
             .send()
             .await
             .with_context(|| {
@@ -71,38 +69,124 @@ impl EncryptionProvider for AwsKmsEncryptionProvider {
             .context("No ciphertext blob in KMS response")?;
 
         // Encode to base64 for storage in database
-        Ok(BASE64.encode(ciphertext_blob.as_ref()))
+        Ok(encode_envelope(ciphertext_blob.as_ref()))
     }
 
-    async fn decrypt(&self, ciphertext_base64: &str) -> Result<String> {
-        // Decode from base64
-        let ciphertext_bytes = BASE64
-            .decode(ciphertext_base64)
-            .context("Failed to decode ciphertext from base64")?;
+    async fn decrypt(&self, envelope: &str, context: &EncryptionContext) -> Result<String> {
+        self.decrypt_bytes(decode_envelope(envelope)?, Some(kms_context(context)))
+            .await
+    }
 
-        let response = self
-            .client
+    async fn decrypt_legacy_for_migration(&self, ciphertext: &str) -> Result<String> {
+        if ciphertext.starts_with("rise:") {
+            anyhow::bail!("Unsupported baseline ciphertext version");
+        }
+        self.decrypt_bytes(
+            BASE64
+                .decode(ciphertext)
+                .context("Invalid baseline encoding")?,
+            None,
+        )
+        .await
+    }
+}
+
+fn kms_context(context: &EncryptionContext) -> std::collections::HashMap<String, String> {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(context.authenticated_bytes());
+    std::collections::HashMap::from([("rise:context:v2".into(), BASE64.encode(hash))])
+}
+
+impl AwsKmsEncryptionProvider {
+    fn encrypt_request(
+        &self,
+        plaintext: &str,
+        context: &EncryptionContext,
+    ) -> aws_sdk_kms::operation::encrypt::builders::EncryptFluentBuilder {
+        self.client
+            .encrypt()
+            .key_id(&self.key_id)
+            .plaintext(Blob::new(plaintext.as_bytes()))
+            .set_encryption_context(Some(kms_context(context)))
+    }
+
+    fn decrypt_request(
+        &self,
+        ciphertext: Vec<u8>,
+        context: Option<std::collections::HashMap<String, String>>,
+    ) -> aws_sdk_kms::operation::decrypt::builders::DecryptFluentBuilder {
+        self.client
             .decrypt()
-            .ciphertext_blob(Blob::new(ciphertext_bytes))
+            .key_id(&self.key_id)
+            .ciphertext_blob(Blob::new(ciphertext))
+            .set_encryption_context(context)
+    }
+
+    async fn decrypt_bytes(
+        &self,
+        ciphertext: Vec<u8>,
+        context: Option<std::collections::HashMap<String, String>>,
+    ) -> Result<String> {
+        let response = self
+            .decrypt_request(ciphertext, context)
             .send()
             .await
-            .with_context(|| {
-                format!(
-                    "KMS decryption failed for key '{}'. Common causes: \
-                     1) No AWS credentials available, 2) Insufficient IAM permissions (kms:Decrypt), \
-                     3) Key is disabled or pending deletion, 4) Ciphertext was encrypted with a different key",
-                    self.key_id
-                )
-            })?;
-
-        let plaintext_blob = response
+            .context("KMS ciphertext authentication failed")?;
+        let plaintext = response
             .plaintext()
             .context("No plaintext in KMS response")?;
+        String::from_utf8(plaintext.clone().into_inner())
+            .context("Decrypted data is not valid UTF-8")
+    }
+}
 
-        // Convert to UTF-8 string
-        let plaintext = String::from_utf8(plaintext_blob.clone().into_inner())
-            .context("Decrypted data is not valid UTF-8")?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        Ok(plaintext)
+    #[test]
+    fn kms_requests_carry_the_same_context_and_pin_the_key() {
+        let config = aws_sdk_kms::config::Builder::new()
+            .behavior_version_latest()
+            .region(aws_sdk_kms::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_kms::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .build();
+        let provider = AwsKmsEncryptionProvider {
+            client: KmsClient::from_conf(config),
+            key_id: "alias/rise".into(),
+        };
+        let context = EncryptionContext::extension(
+            uuid::Uuid::new_v4(),
+            "oauth",
+            "login",
+            "/spec/client_secret_encrypted",
+        )
+        .with_binding("destination".into());
+        let encrypt = provider
+            .encrypt_request("secret", &context)
+            .as_input()
+            .clone()
+            .build()
+            .unwrap();
+        let decrypt = provider
+            .decrypt_request(vec![1], Some(kms_context(&context)))
+            .as_input()
+            .clone()
+            .build()
+            .unwrap();
+        assert_eq!(encrypt.encryption_context(), decrypt.encryption_context());
+        assert_eq!(encrypt.encryption_context(), Some(&kms_context(&context)));
+        assert_eq!(decrypt.key_id(), Some("alias/rise"));
+        assert_ne!(
+            kms_context(&context),
+            kms_context(&context.with_slot("/status/secret"))
+        );
+        assert!(provider
+            .decrypt_request(vec![1], None)
+            .as_input()
+            .get_encryption_context()
+            .is_none());
     }
 }

@@ -3,7 +3,7 @@ use super::models::{
     CreateTeamRequest, CreateTeamResponse, GetTeamParams, Team as ApiTeam, UpdateTeamRequest,
     UpdateTeamResponse, UserInfo,
 };
-use crate::db::models::TeamRole;
+use crate::db::models::{TeamRole, User};
 use crate::db::{projects as db_projects, service_accounts, teams as db_teams};
 use crate::server::auth::context::AuthContext;
 use crate::server::error::{ServerError, ServerErrorExt};
@@ -13,6 +13,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Refuse any service account among the given team principals.
@@ -202,9 +203,10 @@ pub async fn get_team(
     Path(id_or_name): Path<String>,
     Query(params): Query<GetTeamParams>,
 ) -> Result<Json<serde_json::Value>, ServerError> {
-    let _user = auth.user()?;
-    // Resolve team by ID or name
-    let team = resolve_team(&state, &id_or_name, params.by_id).await?;
+    let user = auth.user()?;
+    // Resolves only a team the caller may see, so its member and owner emails
+    // are disclosed exactly where `list_teams` would disclose them.
+    let team = resolve_team(&state, user, &id_or_name, params.by_id).await?;
 
     // Always resolve member/owner emails
     let members = db_teams::get_members(&state.db_pool, team.id)
@@ -232,7 +234,7 @@ pub async fn update_team(
 ) -> Result<Json<UpdateTeamResponse>, ServerError> {
     let user = auth.user()?;
     // Resolve team by ID or name
-    let team = resolve_team(&state, &id_or_name, params.by_id).await?;
+    let team = resolve_team(&state, user, &id_or_name, params.by_id).await?;
 
     // Check if user is an admin or owner of the team
     let is_admin = state.is_admin(user).await;
@@ -389,7 +391,7 @@ pub async fn delete_team(
 ) -> Result<StatusCode, ServerError> {
     let user = auth.user()?;
     // Resolve team by ID or name
-    let team = resolve_team(&state, &id_or_name, params.by_id).await?;
+    let team = resolve_team(&state, user, &id_or_name, params.by_id).await?;
 
     // Check if user is an admin or owner of the team
     let is_admin = state.is_admin(user).await;
@@ -450,16 +452,10 @@ pub async fn list_teams(
     auth: AuthContext,
 ) -> Result<Json<Vec<ApiTeam>>, ServerError> {
     let user = auth.user()?;
-    // Admins can see all teams; other users see all teams if allow_list_all_teams is enabled
-    let teams = if state.is_admin(user).await || state.auth_settings.allow_list_all_teams {
-        db_teams::list(&state.db_pool)
-            .await
-            .internal_err("Failed to list teams")?
-    } else {
-        db_teams::list_for_user(&state.db_pool, user.id)
-            .await
-            .internal_err("Failed to list teams")?
-    };
+    let sees_all = sees_all_teams(&state, user).await;
+    let teams = visible_teams(&state.db_pool, user.id, sees_all)
+        .await
+        .internal_err("Failed to list teams")?;
 
     let mut api_teams = Vec::new();
 
@@ -481,84 +477,116 @@ pub async fn list_teams(
     Ok(Json(api_teams))
 }
 
-/// Query team by ID
-async fn query_team_by_id(
-    state: &AppState,
-    team_id: &str,
-) -> Result<crate::db::models::Team, String> {
-    let uuid = Uuid::parse_str(team_id).map_err(|e| format!("Invalid team ID: {}", e))?;
+/// Whether `user` may see every team rather than only their own: admins
+/// always, everyone else when `auth.allow_list_all_teams` is set.
+async fn sees_all_teams(state: &AppState, user: &User) -> bool {
+    state.auth_settings.allow_list_all_teams || state.is_admin(user).await
+}
 
-    db_teams::find_by_id(&state.db_pool, uuid)
-        .await
-        .map_err(|e| format!("Team not found: {}", e))?
-        .ok_or_else(|| "Team not found".to_string())
+/// The teams a caller may see: every team when `sees_all`, otherwise the ones
+/// `user_id` belongs to.
+async fn visible_teams(
+    pool: &PgPool,
+    user_id: Uuid,
+    sees_all: bool,
+) -> anyhow::Result<Vec<crate::db::models::Team>> {
+    if sees_all {
+        db_teams::list(pool).await
+    } else {
+        db_teams::list_for_user(pool, user_id).await
+    }
+}
+
+/// Query team by ID
+async fn query_team_by_id(pool: &PgPool, team_id: &str) -> Option<crate::db::models::Team> {
+    let uuid = Uuid::parse_str(team_id).ok()?;
+    match db_teams::find_by_id(pool, uuid).await {
+        Ok(team) => team,
+        Err(e) => {
+            tracing::warn!("Failed to query team by id '{}': {:?}", team_id, e);
+            None
+        }
+    }
 }
 
 /// Query team by name
-async fn query_team_by_name(
-    state: &AppState,
-    team_name: &str,
-) -> Result<crate::db::models::Team, String> {
-    tracing::info!("Querying team by name: {}", team_name);
-
-    db_teams::find_by_name(&state.db_pool, team_name)
-        .await
-        .map_err(|e| format!("Failed to query team by name: {}", e))?
-        .ok_or_else(|| format!("Team '{}' not found", team_name))
+async fn query_team_by_name(pool: &PgPool, team_name: &str) -> Option<crate::db::models::Team> {
+    match db_teams::find_by_name(pool, team_name).await {
+        Ok(team) => team,
+        Err(e) => {
+            tracing::warn!("Failed to query team by name '{}': {:?}", team_name, e);
+            None
+        }
+    }
 }
 
-/// Resolve team by ID or name with fuzzy matching support
+/// Resolve a team `user` may see by ID or name.
+///
+/// A team the caller may not see answers exactly as a nonexistent one does,
+/// and the "did you mean" suggestions on that answer are drawn only from the
+/// teams the caller may see — otherwise either would disclose team names and
+/// member emails that `list_teams` withholds.
 async fn resolve_team(
     state: &AppState,
+    user: &User,
     id_or_name: &str,
     by_id: bool,
 ) -> Result<crate::db::models::Team, ServerError> {
-    tracing::info!("Resolving team '{}', by_id={}", id_or_name, by_id);
+    let sees_all = sees_all_teams(state, user).await;
+    resolve_team_for(&state.db_pool, user.id, sees_all, id_or_name, by_id).await
+}
 
-    let team = if by_id {
-        // Explicit ID lookup
-        tracing::info!("Using explicit ID lookup");
-        query_team_by_id(state, id_or_name)
-            .await
-            .map_err(ServerError::not_found)?
+/// [`resolve_team`] for a caller who sees every team (`sees_all`) or only the
+/// ones `user_id` belongs to.
+async fn resolve_team_for(
+    pool: &PgPool,
+    user_id: Uuid,
+    sees_all: bool,
+    id_or_name: &str,
+    by_id: bool,
+) -> Result<crate::db::models::Team, ServerError> {
+    let found = if by_id {
+        query_team_by_id(pool, id_or_name).await
     } else {
-        // Try name first, fallback to ID
-        tracing::info!("Trying name lookup first, will fallback to ID");
-        match query_team_by_name(state, id_or_name).await {
-            Ok(team) => team,
+        match query_team_by_name(pool, id_or_name).await {
+            Some(team) => Some(team),
+            None => query_team_by_id(pool, id_or_name).await,
+        }
+    };
+
+    if let Some(team) = found {
+        let visible = sees_all
+            || db_teams::is_member(pool, team.id, user_id)
+                .await
+                .internal_err("Failed to check team membership")?;
+        if visible {
+            return Ok(team);
+        }
+    }
+
+    let suggestions = if by_id {
+        None
+    } else {
+        match visible_teams(pool, user_id, sees_all).await {
+            Ok(teams) => {
+                let api_teams: Vec<ApiTeam> = teams
+                    .into_iter()
+                    .map(|t| convert_team(t, vec![], vec![]))
+                    .collect();
+                let similar = find_similar_teams(id_or_name, &api_teams, 0.85);
+                (!similar.is_empty()).then_some(similar)
+            }
             Err(e) => {
-                tracing::info!("Name lookup failed: {}, trying ID fallback", e);
-                query_team_by_id(state, id_or_name).await.map_err(|_e| {
-                    tracing::info!("Both lookups failed, generating fuzzy suggestions");
-                    // Both failed - provide fuzzy suggestions
-                    let all_teams = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(db_teams::list(&state.db_pool))
-                    });
-
-                    let suggestions = match all_teams {
-                        Ok(all_teams) => {
-                            let api_teams: Vec<ApiTeam> = all_teams
-                                .into_iter()
-                                .map(|t| convert_team(t, vec![], vec![]))
-                                .collect();
-                            let similar = find_similar_teams(id_or_name, &api_teams, 0.85);
-                            if similar.is_empty() {
-                                None
-                            } else {
-                                Some(similar)
-                            }
-                        }
-                        Err(_) => None,
-                    };
-
-                    ServerError::not_found(format!("Team '{}' not found", id_or_name))
-                        .with_suggestions(suggestions)
-                })?
+                tracing::warn!("Failed to list teams for suggestions: {:?}", e);
+                None
             }
         }
     };
 
-    Ok(team)
+    Err(
+        ServerError::not_found(format!("Team '{}' not found", id_or_name))
+            .with_suggestions(suggestions),
+    )
 }
 
 /// Convert a list of db users to UserInfo structs
@@ -586,5 +614,72 @@ fn convert_team(
         idp_managed: team.idp_managed,
         created: team.created_at.to_rfc3339(),
         updated: team.updated_at.to_rfc3339(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::users as db_users;
+
+    /// A team the caller may not see — no `allow_list_all_teams`, not an
+    /// admin, not a member — answers like a nonexistent one, so its member
+    /// and owner emails never reach `get_team`.
+    #[sqlx::test]
+    async fn a_team_the_caller_cannot_see_is_not_found(pool: PgPool) {
+        let member = db_users::create(&pool, "member@example.com").await.unwrap();
+        let outsider = db_users::create(&pool, "outsider@example.com")
+            .await
+            .unwrap();
+        let team = db_teams::create(&pool, "devops").await.unwrap();
+        db_teams::add_member(&pool, team.id, member.id, TeamRole::Member)
+            .await
+            .unwrap();
+
+        let error = resolve_team_for(&pool, outsider.id, false, "devops", false)
+            .await
+            .expect_err("hidden from a non-member");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.message, "Team 'devops' not found");
+        assert_eq!(error.suggestions, None);
+        let by_id = resolve_team_for(&pool, outsider.id, false, &team.id.to_string(), true)
+            .await
+            .expect_err("hidden by ID too");
+        assert_eq!(by_id.status, StatusCode::NOT_FOUND);
+
+        let seen = resolve_team_for(&pool, member.id, false, "devops", false)
+            .await
+            .expect("a member sees their team");
+        assert_eq!(seen.id, team.id);
+        let listed = resolve_team_for(&pool, outsider.id, true, "devops", false)
+            .await
+            .expect("every team is visible with allow_list_all_teams or as admin");
+        assert_eq!(listed.id, team.id);
+    }
+
+    /// "Did you mean" draws only on the teams the caller may see.
+    #[sqlx::test]
+    async fn suggestions_name_only_visible_teams(pool: PgPool) {
+        let user = db_users::create(&pool, "user@example.com").await.unwrap();
+        let own = db_teams::create(&pool, "devops").await.unwrap();
+        db_teams::create(&pool, "devopz").await.unwrap();
+        db_teams::add_member(&pool, own.id, user.id, TeamRole::Member)
+            .await
+            .unwrap();
+
+        let error = resolve_team_for(&pool, user.id, false, "devop", false)
+            .await
+            .expect_err("no team is named devop");
+        assert_eq!(error.suggestions, Some(vec!["devops".to_string()]));
+
+        let error = resolve_team_for(&pool, user.id, true, "devop", false)
+            .await
+            .expect_err("no team is named devop");
+        let mut suggestions = error.suggestions.expect("suggestions");
+        suggestions.sort();
+        assert_eq!(
+            suggestions,
+            vec!["devops".to_string(), "devopz".to_string()]
+        );
     }
 }

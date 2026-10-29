@@ -51,7 +51,7 @@ while read -r sha; do
       break
     fi
   done < <(git show -s --format='%B' "$sha" |
-    git interpret-trailers --parse |
+    git interpret-trailers --no-divider --parse |
     sed -nE 's/^signed-off-by:[[:space:]]*(.*)$/\1/Ip')
 
   if [ "$signed" -eq 0 ]; then

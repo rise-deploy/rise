@@ -291,6 +291,7 @@ mod tests {
                 stored_token: None,
                 backend_url,
                 identity: Some("demo+1@sa.rise.local".to_string()),
+                backend_url_from_project: false,
             },
         )
         .unwrap();

@@ -5,6 +5,7 @@ use crate::db::{env_vars as db_env_vars, environments as db_environments, projec
 use crate::server::auth::context::AuthContext;
 use crate::server::auth::session_scope::{MaybeSessionScope, SessionScope};
 use crate::server::deployment::models as deployment_models;
+use crate::server::encryption::EncryptionContext;
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::extensions::InjectedEnvVarValue;
 use crate::server::project::handlers::ensure_project_access_or_admin;
@@ -116,6 +117,8 @@ pub async fn set_project_env_var(
         ));
     }
 
+    let environment_id = resolve_environment_id(&state.db_pool, project.id, &params).await?;
+
     // Encrypt the value if it's a secret
     let value_to_store = if payload.is_secret {
         let provider = state
@@ -124,15 +127,15 @@ pub async fn set_project_env_var(
             .expect("Encryption provider checked above");
 
         provider
-            .encrypt(&payload.value)
+            .encrypt(
+                &payload.value,
+                &EncryptionContext::project_env(project.id, environment_id, &key),
+            )
             .await
             .internal_err("Failed to encrypt secret")?
     } else {
         payload.value.clone()
     };
-
-    // Resolve environment from query parameter
-    let environment_id = resolve_environment_id(&state.db_pool, project.id, &params).await?;
 
     let env_var = db_env_vars::upsert_project_env_var(
         &state.db_pool,
@@ -234,7 +237,14 @@ pub async fn list_project_env_vars(
             // Decrypt unprotected secret
             match &state.encryption_provider {
                 Some(provider) => provider
-                    .decrypt(&var.value)
+                    .decrypt(
+                        &var.value,
+                        &EncryptionContext::project_env(
+                            var.project_id,
+                            var.environment_id,
+                            &var.key,
+                        ),
+                    )
                     .await
                     .internal_err("Failed to decrypt secret")?,
                 None => {
@@ -425,12 +435,39 @@ pub async fn move_project_env_var(
         )));
     }
 
+    let source = existing_source.expect("source variable checked above");
+    let original_value = source.value.clone();
+    let moved_value = if source.is_secret {
+        let provider = state
+            .encryption_provider
+            .as_ref()
+            .ok_or_else(|| ServerError::internal("Encryption provider not configured"))?;
+        let plaintext = provider
+            .decrypt(
+                &source.value,
+                &EncryptionContext::project_env(project.id, from_env_id, &key),
+            )
+            .await
+            .internal_err("Failed to decrypt variable for move")?;
+        provider
+            .encrypt(
+                &plaintext,
+                &EncryptionContext::project_env(project.id, to_env_id, &key),
+            )
+            .await
+            .internal_err("Failed to encrypt moved variable")?
+    } else {
+        source.value
+    };
+
     let env_var = db_env_vars::update_env_var_environment(
         &state.db_pool,
         project.id,
         &key,
         from_env_id,
         to_env_id,
+        &moved_value,
+        &original_value,
     )
     .await
     .internal_err("Failed to move environment variable")?;
@@ -501,7 +538,10 @@ pub async fn list_deployment_env_vars(
             // Decrypt unprotected secret
             match &state.encryption_provider {
                 Some(provider) => provider
-                    .decrypt(&var.value)
+                    .decrypt(
+                        &var.value,
+                        &EncryptionContext::deployment_env(var.deployment_id, &var.key),
+                    )
                     .await
                     .internal_err("Failed to decrypt secret")?,
                 None => {
@@ -587,7 +627,14 @@ pub async fn get_project_env_var_value(
     // Decrypt the value
     let decrypted_value = match &state.encryption_provider {
         Some(provider) => provider
-            .decrypt(&env_var.value)
+            .decrypt(
+                &env_var.value,
+                &EncryptionContext::project_env(
+                    env_var.project_id,
+                    env_var.environment_id,
+                    &env_var.key,
+                ),
+            )
             .await
             .internal_err("Failed to decrypt secret")?,
         None => {
@@ -657,7 +704,10 @@ pub async fn get_deployment_env_var_value(
     // Decrypt the value
     let decrypted_value = match &state.encryption_provider {
         Some(provider) => provider
-            .decrypt(&env_var.value)
+            .decrypt(
+                &env_var.value,
+                &EncryptionContext::deployment_env(env_var.deployment_id, &env_var.key),
+            )
             .await
             .internal_err("Failed to decrypt secret")?,
         None => {
@@ -750,7 +800,14 @@ pub async fn preview_deployment_env_vars(
             // Unprotected secret — decrypt for preview
             let decrypted = match &state.encryption_provider {
                 Some(provider) => provider
-                    .decrypt(&var.value)
+                    .decrypt(
+                        &var.value,
+                        &EncryptionContext::project_env(
+                            var.project_id,
+                            var.environment_id,
+                            &var.key,
+                        ),
+                    )
                     .await
                     .internal_err("Failed to decrypt secret")?,
                 None => {
@@ -1103,6 +1160,7 @@ pub(crate) fn diff_env_vars(
 /// A variable as stored, before deciding whether to decrypt it.
 struct RawVar {
     value: String,
+    context: EncryptionContext,
     is_secret: bool,
     is_protected: bool,
     source: String,
@@ -1187,6 +1245,7 @@ pub async fn diff_deployment_env_vars(
             continue;
         }
         let raw = RawVar {
+            context: EncryptionContext::deployment_env(var.deployment_id, &var.key),
             value: var.value,
             is_secret: var.is_secret,
             is_protected: var.is_protected,
@@ -1197,6 +1256,7 @@ pub async fn diff_deployment_env_vars(
             config.push((
                 var.key.clone(),
                 RawVar {
+                    context: raw.context.clone(),
                     value: raw.value.clone(),
                     is_secret: raw.is_secret,
                     is_protected: raw.is_protected,
@@ -1220,6 +1280,7 @@ pub async fn diff_deployment_env_vars(
         .partition(|v| v.environment_id.is_some());
     let mut after: BTreeMap<String, RawVar> = BTreeMap::new();
     for var in global.into_iter().chain(scoped) {
+        let context = EncryptionContext::project_env(var.project_id, var.environment_id, &var.key);
         let scope_env = var.environment_id.and(target_env.clone());
         if !visibility.lists(scope_env.as_deref()) {
             continue;
@@ -1227,6 +1288,7 @@ pub async fn diff_deployment_env_vars(
         after.insert(
             var.key,
             RawVar {
+                context,
                 value: var.value,
                 is_secret: var.is_secret,
                 is_protected: var.is_protected,
@@ -1259,13 +1321,14 @@ pub async fn diff_deployment_env_vars(
     let decrypt = |raw: &RawVar| {
         let value = raw.value.clone();
         let is_secret = raw.is_secret;
+        let context = raw.context.clone();
         let state = &state;
         async move {
             if !is_secret {
                 return Some(value);
             }
             let provider = state.encryption_provider.as_ref()?;
-            match provider.decrypt(&value).await {
+            match provider.decrypt(&value, &context).await {
                 Ok(plain) => Some(plain),
                 Err(e) => {
                     tracing::warn!("Failed to decrypt a variable for comparison: {:?}", e);

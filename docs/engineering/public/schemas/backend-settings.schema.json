@@ -96,7 +96,7 @@
         },
         "admin_users": {
           "default": [],
-          "description": "List of admin user emails for the default organization. Admins do NOT\nimplicitly receive the Operator role — list the email in\n`operator_users` separately if needed.",
+          "description": "List of admin user emails for the default organization. Admins do NOT\nimplicitly receive the Operator role — list the email in\n`operator_users` separately if needed. Blank entries are filtered out\nso an unset `${VAR:-}` default collapses to an empty list.",
           "items": {
             "type": "string"
           },
@@ -104,12 +104,17 @@
         },
         "allow_list_all_teams": {
           "default": false,
-          "description": "Allow all users to list all teams (default: false).\nWhen false, non-admin users only see teams they are members of.",
+          "description": "Allow all users to list all teams (default: false).\nWhen false, non-admin users only see (list or fetch) teams they are\nmembers of; any other team answers as not found.",
+          "type": "boolean"
+        },
+        "allow_missing_email_verified": {
+          "default": false,
+          "description": "Accept ID tokens that carry no `email_verified` claim (default: false).\n\nRise matches users, `admin_users`, `operator_users`, and the\nplatform-access email allowlist by the ID token's `email`, so a login is\nrefused unless the IdP marks that address `email_verified: true`. Set\nthis only for an IdP that omits the claim yet guarantees every address\nit puts in `email` belongs to the signed-in user, such as one whose\naddresses are all assigned by its administrators. `email_verified:\nfalse` is refused regardless.",
           "type": "boolean"
         },
         "allow_raw_external_tokens": {
           "default": true,
-          "description": "Accept raw external OIDC tokens directly at request time (default: true).\n\nWhen `true`, a CI service account may present its external OIDC token\ndirectly to project-scoped endpoints, and Rise resolves the service\naccount per request (the legacy two-phase path). When `false`, callers\nmust first exchange their token at `POST /api/v1/auth/token` for a Rise\naccess token.\n\nLeaving this `true` keeps the legacy attack surface and forfeits the\nsecurity benefits of the exchange (no service-account DB lookups in the\nrequest hot path, and an authenticated `platform/capabilities`). While it\nis `true`, every *accepted* raw-token request emits one\n`rise::deprecation` `tracing` event carrying the validated `issuer`/`sub`,\nso operators can aggregate it in their log pipeline to see which workload\nidentities still need migrating. Defaults to `false` starting in 0.25.0;\nmigrate CI to pre-exchange before upgrading.",
+          "description": "Accept raw external OIDC tokens directly at request time (default: true).\n\nWhen `true`, a CI service account may present its external OIDC token\ndirectly to project-scoped endpoints, and Rise resolves the service\naccount per request (the legacy two-phase path). When `false`, callers\nmust first exchange their token at `POST /api/v1/auth/token` for a Rise\naccess token.\n\nLeaving this `true` keeps the legacy attack surface and forfeits the\nsecurity benefits of the exchange (no per-request service-account claim\nmatching, and an authenticated `platform/capabilities`). While it\nis `true`, every *accepted* raw-token request emits one\n`rise::deprecation` `tracing` event carrying the validated `issuer`/`sub`,\nso operators can aggregate it in their log pipeline to see which workload\nidentities still need migrating. Defaults to `false` starting in 0.25.0;\nmigrate CI to pre-exchange before upgrading.",
           "type": "boolean"
         },
         "allow_team_creation": {
@@ -135,6 +140,10 @@
           "default": "groups",
           "description": "Claim in the IdP ID token that contains group names (default: \"groups\").\nFor example, AWS Cognito commonly exposes groups as \"cognito:groups\".",
           "type": "string"
+        },
+        "idp_group_missing_claim_policy": {
+          "$ref": "#/$defs/MissingGroupClaimPolicy",
+          "description": "Missing/null group claim policy when group sync is enabled (default: refuse_login).\nSet treat_as_empty for an IdP that omits the claim when a user has no groups."
         },
         "idp_group_sync_enabled": {
           "default": true,
@@ -1176,6 +1185,14 @@
               "description": "Base64-encoded 32-byte encryption key\nGenerate with: openssl rand -base64 32",
               "type": "string"
             },
+            "migration_source_key": {
+              "default": null,
+              "description": "Key used only to read unbound ciphertext during the startup baseline migration.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "const": "aes-gcm-256",
               "type": "string"
@@ -1670,6 +1687,21 @@
       },
       "type": "object"
     },
+    "MissingGroupClaimPolicy": {
+      "description": "Policy for a missing or null group claim when IdP group sync is enabled.",
+      "oneOf": [
+        {
+          "const": "refuse_login",
+          "description": "Refuse login without an authoritative membership assertion.",
+          "type": "string"
+        },
+        {
+          "const": "treat_as_empty",
+          "description": "Interpret a missing/null assertion as no groups and remove mirrored memberships.",
+          "type": "string"
+        }
+      ]
+    },
     "NetworkPolicyConfig": {
       "description": "NetworkPolicy configuration for deployed apps\n\nUses Kubernetes NetworkPolicy types directly. Egress semantics:\n- null: policyTypes is [\"Ingress\"] only, Kubernetes does not restrict egress\n- Empty list: policyTypes includes \"Egress\" with no rules = deny all egress\n- Non-empty list: explicit egress rules enforced",
       "properties": {
@@ -2123,6 +2155,11 @@
     },
     "ServerSettings": {
       "properties": {
+        "allow_insecure_development_keys": {
+          "default": false,
+          "description": "Permit publicly known placeholder keys for an explicitly insecure development stack.\nNever enable this on an installation reachable by untrusted clients.",
+          "type": "boolean"
+        },
         "auth_token_max_ttl_seconds": {
           "default": 600,
           "description": "Lifetime in seconds of Rise access tokens minted by the auth\ntoken-exchange endpoint (`POST /api/v1/auth/token`). Kept short because an\nexchanged token cannot be revoked mid-life. Default: 600 (10 minutes).",

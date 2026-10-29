@@ -142,11 +142,15 @@ pub struct AppState {
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
     /// Rate limiter for the workload identity token-exchange endpoint.
     pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
+    /// Rate limiter for the generic resource API's `policy-audit` listing.
+    pub policy_audit_rate_limiter: Arc<crate::server::rate_limit::PolicyAuditRateLimiter>,
     pub access_classes:
         Arc<std::collections::HashMap<String, crate::server::settings::AccessClass>>,
     /// Project-name labels reserved for control-plane hosts. Normalized to
     /// lowercase at startup because DNS hostnames are case-insensitive.
     pub reserved_project_names: Arc<std::collections::HashSet<String>>,
+    /// Rise's own hosts, which no project custom domain may claim.
+    pub control_plane_hosts: Arc<Vec<String>>,
     /// Browser-facing base URL used to build the login redirect when the
     /// `ingress_auth` handler runs in Traefik mode (`signin_redirect=1`).
     /// Sourced from the Docker controller's `auth_signin_url` (falling back to
@@ -200,10 +204,16 @@ async fn init_encryption_provider(
 ) -> Result<Option<Arc<dyn EncryptionProvider>>> {
     if let Some(encryption_config) = encryption_settings {
         match encryption_config {
-            EncryptionSettings::Local { key } => {
+            EncryptionSettings::Local {
+                key,
+                migration_source_key,
+            } => {
                 use crate::server::encryption::providers::local::LocalEncryptionProvider;
-                let provider = LocalEncryptionProvider::new(key)
-                    .context("Failed to initialize local encryption provider")?;
+                let provider = LocalEncryptionProvider::new_with_migration_source_key(
+                    key,
+                    migration_source_key.as_deref(),
+                )
+                .context("Failed to initialize local encryption provider")?;
 
                 // Test encryption/decryption at startup
                 tracing::info!("Testing local encryption provider...");
@@ -265,12 +275,18 @@ async fn test_encryption_provider(provider: &dyn EncryptionProvider) -> Result<(
     const TEST_PLAINTEXT: &str = "rise-encryption-test-12345";
 
     let ciphertext = provider
-        .encrypt(TEST_PLAINTEXT)
+        .encrypt(
+            TEST_PLAINTEXT,
+            &rise_backend_core::EncryptionContext::internal("startup-test"),
+        )
         .await
         .context("Encryption test failed")?;
 
     let decrypted = provider
-        .decrypt(&ciphertext)
+        .decrypt(
+            &ciphertext,
+            &rise_backend_core::EncryptionContext::internal("startup-test"),
+        )
         .await
         .context("Decryption test failed")?;
 
@@ -302,6 +318,61 @@ async fn init_kubernetes_backend(
     tracing::info!("Kubernetes deployment backend initialized and connection tested");
 
     Ok(Arc::new(backend) as Arc<dyn DeploymentBackend>)
+}
+
+/// Rise's own hosts, which no project custom domain may claim: the public URL,
+/// the identity provider's issuer and endpoints, the registry, and the
+/// deployment controller's auth-backend and sign-in URLs.
+fn control_plane_hosts(
+    settings: &Settings,
+    registry_provider: &dyn RegistryProvider,
+    oauth_client: &OAuthClient,
+) -> Vec<String> {
+    let client_image = registry_provider.get_image_tag(
+        "reserved-host",
+        "reserved-host",
+        crate::server::registry::ImageTagType::ClientFacing,
+    );
+    let mut urls: Vec<&str> = vec![
+        &settings.server.public_url,
+        &settings.auth.issuer,
+        registry_provider.registry_host(),
+        registry_provider.registry_url(),
+        &client_image,
+        oauth_client.authorize_url(),
+        oauth_client.token_url(),
+    ];
+    urls.extend(settings.auth.authorize_url.as_deref());
+    urls.extend(settings.auth.token_url.as_deref());
+    use crate::server::settings::DeploymentControllerSettings;
+    match &settings.deployment_controller {
+        Some(DeploymentControllerSettings::Kubernetes {
+            auth_backend_url,
+            auth_signin_url,
+            ..
+        })
+        | Some(DeploymentControllerSettings::Docker {
+            auth_backend_url,
+            auth_signin_url,
+            ..
+        })
+        | Some(DeploymentControllerSettings::Ecs {
+            auth_backend_url,
+            auth_signin_url,
+            ..
+        }) => {
+            urls.push(auth_backend_url);
+            urls.push(auth_signin_url);
+        }
+        None => {}
+    }
+    let mut hosts: Vec<String> = urls
+        .into_iter()
+        .filter_map(rise_backend_core::control_plane_host)
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    hosts
 }
 
 /// Extract the bare host from an `auth_backend_url` like `http://rise:3000`
@@ -396,6 +467,7 @@ async fn init_ecs_backend(
     db_pool: PgPool,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
     public_url: &str,
+    control_plane_hosts: Vec<String>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(
     Arc<dyn DeploymentBackend>,
@@ -455,6 +527,7 @@ async fn init_ecs_backend(
         ingress_port: *ingress_port,
         ingress_schema: ingress_schema.clone(),
         registry_provider: registry_provider.clone(),
+        control_plane_hosts,
     });
 
     let aws_config = ecs_client::load(&ecs_client::AwsConfig {
@@ -591,6 +664,7 @@ async fn init_docker_backend(
     db_pool: PgPool,
     store: Arc<dyn rise_backend_core::DeploymentStore>,
     public_url: &str,
+    control_plane_hosts: Vec<String>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(
     Arc<dyn DeploymentBackend>,
@@ -644,6 +718,7 @@ async fn init_docker_backend(
         ingress_port: *ingress_port,
         ingress_schema: ingress_schema.clone(),
         registry_provider: registry_provider.clone(),
+        control_plane_hosts,
     });
 
     // Connect bollard.
@@ -1210,6 +1285,8 @@ impl AppState {
         }
 
         let public_url = settings.server.public_url.clone();
+        let control_plane_hosts =
+            control_plane_hosts(settings, registry_provider.as_ref(), oauth_client.as_ref());
         let reserved_project_names = Arc::new(
             settings
                 .reserved_project_names
@@ -1232,6 +1309,13 @@ impl AppState {
 
         // Initialize encryption provider
         let encryption_provider = init_encryption_provider(settings.encryption.as_ref()).await?;
+        crate::server::encryption::migration::migrate(
+            &db_pool,
+            encryption_provider.as_deref(),
+            settings,
+        )
+        .await
+        .context("Credential context migration failed; controllers have not started")?;
 
         // Initialize deployment backend
         #[cfg(not(feature = "backend"))]
@@ -1327,6 +1411,7 @@ impl AppState {
                         ingress_port: *ingress_port,
                         ingress_schema: ingress_schema.clone(),
                         registry_provider: registry_provider.clone(),
+                        control_plane_hosts: control_plane_hosts.clone(),
                     },
                     auth_backend_url: auth_backend_url.clone(),
                     auth_signin_url: auth_signin_url.clone(),
@@ -1528,6 +1613,7 @@ impl AppState {
                         db_pool.clone(),
                         deployment_store.clone(),
                         &public_url,
+                        control_plane_hosts.clone(),
                         shutdown.clone(),
                     )
                     .await?;
@@ -1549,6 +1635,7 @@ impl AppState {
                         db_pool.clone(),
                         deployment_store.clone(),
                         &public_url,
+                        control_plane_hosts.clone(),
                         shutdown.clone(),
                     )
                     .await?;
@@ -1811,7 +1898,7 @@ impl AppState {
             crate::server::extensions::providers::oauth::OAuthProviderConfig {
                 db_pool: db_pool.clone(),
                 encryption_provider: encryption_provider_for_oauth,
-                http_client: reqwest::Client::new(),
+                ssrf_config: settings.server.ssrf.clone(),
                 api_domain: public_url.clone(),
             },
         );
@@ -1922,6 +2009,9 @@ impl AppState {
             Arc::new(crate::server::rate_limit::WorkloadTokenRateLimiter::new(
                 &settings.server.workload_token_rate_limit,
             ));
+
+        let policy_audit_rate_limiter =
+            Arc::new(crate::server::rate_limit::PolicyAuditRateLimiter::new());
 
         // Initialize OAuth endpoint rate limiter
         let rl = &settings.server.oauth_rate_limit;
@@ -2090,8 +2180,10 @@ impl AppState {
             encrypt_rate_limiter,
             oauth_rate_limiter,
             workload_token_rate_limiter,
+            policy_audit_rate_limiter,
             access_classes,
             reserved_project_names,
+            control_plane_hosts: Arc::new(control_plane_hosts),
             signin_base_url,
             production_ingress_url_template,
             staging_ingress_url_template,
@@ -2158,5 +2250,70 @@ mod backend_host_tests {
         assert_eq!(backend_host_from_url(""), None);
         assert_eq!(backend_host_from_url("   "), None);
         assert_eq!(backend_host_from_url("http://"), None);
+    }
+}
+
+#[cfg(test)]
+mod control_plane_host_tests {
+    use super::*;
+    use crate::server::registry::models::OciClientAuthConfig;
+    use crate::server::registry::providers::docker::OciClientAuthProvider;
+
+    #[tokio::test]
+    async fn reserves_client_registry_and_effective_discovered_oidc_hosts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorization_endpoint": "https://login.identity.example/authorize",
+                    "token_endpoint": "https://tokens.identity.example/token"
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let oauth = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            OAuthClient::new(
+                issuer.clone(),
+                "client".into(),
+                "secret".into(),
+                None,
+                None,
+                vec![],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "server": {
+                "host": "127.0.0.1", "port": 3000,
+                "public_url": "https://rise.example",
+                "jwt_signing_secret": "test"
+            },
+            "auth": { "issuer": issuer, "client_id": "client", "client_secret": "secret" }
+        }))
+        .unwrap();
+        let registry = OciClientAuthProvider::new(OciClientAuthConfig {
+            registry_url: "registry.internal:5000".into(),
+            namespace: "rise".into(),
+            client_registry_url: Some("registry.public.example".into()),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        let hosts = control_plane_hosts(&settings, &registry, &oauth);
+        for host in [
+            "registry.internal",
+            "registry.public.example",
+            "login.identity.example",
+            "tokens.identity.example",
+        ] {
+            assert!(hosts.iter().any(|reserved| reserved == host), "{hosts:?}");
+            assert!(rise_backend_core::reject_control_plane_host(host, &hosts).is_err());
+        }
     }
 }

@@ -10,10 +10,36 @@ changes:
     stage: removed
     impact: breaking
     availability: |-
-      OAuth runtime flows require `client_secret_encrypted`; `client_secret_ref` is not a usable credential source. New and updated extension specs require the encrypted field. Existing stored specs containing only `client_secret_ref` are accepted for automatic migration by the OAuth reconciler while the referenced project environment variable remains available.
+      OAuth runtime flows require `client_secret_encrypted`; `client_secret_ref`
+      is not a usable credential source. New configurations require the encrypted
+      field. The [context-bound credential upgrade](/operator-docs/changelog/#change-credential-encryption-resource-purpose-binding)
+      imports existing reference-only specs once during startup while their
+      referenced global project variables remain available. After that import
+      completes, newly submitted reference-only specs are not migrated.
+      On versions before that upgrade, the OAuth reconciler performs the
+      conversion instead.
     details: |-
-      The OAuth reconciler reads the referenced environment variable, encrypts its value into `client_secret_encrypted`, removes `client_secret_ref` from the stored spec, and attempts to delete the environment variable. Direct runtime lookup through `client_secret_ref` is removed. See [#155](https://github.com/rise-deploy/rise/pull/155).
+      In 0.15.7, the OAuth reconciler reads the referenced environment variable, encrypts its value into `client_secret_encrypted`, removes `client_secret_ref` from the stored spec, and attempts to delete the environment variable. Direct runtime lookup through `client_secret_ref` is removed. See [#155](https://github.com/rise-deploy/rise/pull/155).
     migration: |-
-      1. For an existing stored extension with `client_secret_ref`, keep the referenced project environment variable available until the OAuth reconciler successfully migrates the spec. The reconciler attempts to delete that variable after migration; move any other consumers to their own secret first.
-      2. Verify that the extension spec contains `client_secret_encrypted` and test its OAuth flow. If migration fails, inspect the backend's `Failed to migrate client_secret_ref` log and restore the referenced variable or configure the client secret through the extension editor.
-      3. Use `client_secret_encrypted` for new configurations and automation. Do not submit a spec containing only `client_secret_ref`. See [OAuth configuration](/operator-docs/extensions/oauth/#configuration).
+      1. Before the context-bound credential upgrade, check for stored OAuth
+         specs containing only `client_secret_ref`. Keep each referenced global
+         project environment variable available through the first upgraded startup.
+      2. Startup imports the accepted baseline into context-bound
+         `client_secret_encrypted` and removes `client_secret_ref` from the spec.
+         It retains the source variable. If startup fails because a referenced
+         variable is missing, restore the required baseline value before retrying;
+         the upgraded API does not serve requests until migration succeeds.
+      3. Verify that the stored spec contains `client_secret_encrypted` and test
+         its OAuth flow. Remove a retained source variable only after checking
+         that no other consumers need it.
+      4. After startup import completes, use the extension editor or seal the
+         secret for its target context for new configurations. Reference-only
+         specs submitted later have no reconciler conversion path. See the
+         [credential migration instructions](/operator-docs/changelog/#change-credential-encryption-resource-purpose-binding)
+         and [OAuth configuration](/operator-docs/extensions/oauth/#configuration).
+
+      On releases before the context-bound upgrade, keep the variable available
+      until the OAuth reconciler converts the spec. That reconciler attempts to
+      delete the variable after conversion, so move other consumers to their own
+      secret first. Those releases log `Failed to migrate client_secret_ref` on
+      failure and allow correction through their extension editor.

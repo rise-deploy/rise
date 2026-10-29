@@ -13,9 +13,8 @@ dex:
     # defaults Rise can use (authorization_code, refresh_token, token-exchange;
     # Rise serves the device flow itself) plus `password`. The resource-owner password grant is CI-only: it lets the
     # rise-e2e harness mint OIDC id_tokens non-interactively for the static users
-    # (enablePasswordDB / staticPasswords / oauth2.passwordConnector come from the
-    # chart defaults and are deep-merged in). Mirrors dev/dex/config.yaml. Helm
-    # replaces list values, so the whole client must be reproduced here.
+    # below. Mirrors dev/dex/config.yaml. Helm replaces list values, so the
+    # whole client must be reproduced here.
     staticClients:
       - id: rise-backend
         redirectURIs:
@@ -35,6 +34,25 @@ dex:
           - refresh_token
           - "urn:ietf:params:oauth:grant-type:token-exchange"
           - password
+    # CI-only users with the well-known password "password". The chart ships
+    # none.
+    enablePasswordDB: true
+    staticPasswords:
+      - email: "admin@example.com"
+        hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+        username: "admin"
+        userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
+      - email: "dev@example.com"
+        hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+        username: "dev"
+        userID: "f4d1c5e1-3c6e-4d2a-9f4b-2e5d7c8e9f01"
+      - email: "user@example.com"
+        hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+        username: "user"
+        userID: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+    oauth2:
+      skipApprovalScreen: true
+      passwordConnector: local
 
 logs:
   backend: loki
@@ -63,7 +81,11 @@ config:
     issuer: http://rise-ci-chart-dex.rise-ci.svc.cluster.local:5556/dex
     client_id: rise-backend
     client_secret: rise-backend-secret
-    # The e2e CI bearer. Operator standing lets scenarios author resources
+    # The e2e CI bearer is an admin, so it bypasses ownership checks on the
+    # typed APIs.
+    admin_users:
+      - admin@example.com
+    # Operator standing lets scenarios author resources
     # through the generic resource API (`resource-token-exchange`).
     operator_users:
       - admin@example.com

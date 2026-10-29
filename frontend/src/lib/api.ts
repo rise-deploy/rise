@@ -428,10 +428,16 @@ class RiseAPI {
      * @param {string} plaintext - The plaintext secret to encrypt
      * @returns {Promise<{encrypted: string}>} The encrypted value
      */
-    async encryptSecret(plaintext) {
+    async encryptSecret(plaintext, scope) {
         return this.request('/encrypt', {
             method: 'POST',
-            body: JSON.stringify({ plaintext })
+            body: JSON.stringify({ plaintext, ...scope })
+        });
+    }
+
+    async oauthCredentialBinding(project, extension, spec) {
+        return this.request(`/projects/${encodeURIComponent(project)}/extensions/${encodeURIComponent(extension)}/oauth/credential-binding`, {
+            method: 'POST', body: JSON.stringify(spec),
         });
     }
 

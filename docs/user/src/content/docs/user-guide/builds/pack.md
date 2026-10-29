@@ -23,7 +23,7 @@ rise deploy --backend pack --builder heroku/builder:24
 
 ## How It Works
 
-Rise runs `pack build` with `--docker-host inherit --network host`. Environment variables are passed via `--env KEY=VALUE`. SSL certificates are volume-mounted to all common distro paths (Debian, RedHat, Alpine, etc.) with matching SSL environment variables set (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, etc.).
+Rise runs `pack build` with `--docker-host inherit --network host`. Environment variables are passed through an owner-only temporary env file outside the build context. Values that its line format cannot preserve are refused before the build starts; see [Build-Time Arguments](../builds#build-time-arguments). SSL certificates are volume-mounted to all common distro paths (Debian, RedHat, Alpine, etc.) with matching SSL environment variables set (`SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, etc.).
 
 ## Configuration
 

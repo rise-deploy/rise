@@ -1,6 +1,7 @@
 use crate::db::{projects, users};
 use crate::server::auth::session_scope::MaybeSessionScope;
 use crate::server::auth::{
+    browser_binding::BrowserProof,
     cookie_helpers,
     token_storage::{
         generate_code_challenge, generate_code_verifier, generate_state_token,
@@ -9,6 +10,7 @@ use crate::server::auth::{
     user_identity::{LoginError, LoginProfile, ResolvedIdentity, TokenStanding},
 };
 use crate::server::frontend::load_auth_template;
+use crate::server::middleware::url_for_log;
 use crate::server::state::AppState;
 use axum::{
     extract::{Query, State},
@@ -41,6 +43,28 @@ fn build_project_url(state: &AppState, project_name: &str) -> Option<String> {
         )),
         None => Some(format!("{}://{}{}", state.ingress_schema, host, path)),
     }
+}
+
+/// Resolve a sign-in target before its name contributes to URLs or trust lists.
+async fn resolve_signin_project(
+    pool: &sqlx::PgPool,
+    project_name: Option<&str>,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(name) = project_name else {
+        return Ok(None);
+    };
+    let project = projects::find_by_name(pool, name)
+        .await
+        .map_err(|error| {
+            tracing::error!(?error, "Failed to resolve sign-in project");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve project".to_string(),
+            )
+        })?
+        .filter(|project| project.status != crate::db::models::ProjectStatus::Deleting)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Project not found".to_string()))?;
+    Ok(Some(project.name))
 }
 
 /// Resolve the set of hostnames a post-login `redirect` may target for a given
@@ -116,8 +140,9 @@ async fn audience_admits_project(state: &AppState, project_name: &str, aud: &str
 /// active deployment's URL (default host + custom domains), across groups.
 /// Lookups are best-effort; a failed one leaves its URLs out.
 async fn project_app_urls(state: &AppState, project_name: &str) -> Vec<String> {
-    let mut urls: Vec<String> = build_project_url(state, project_name).into_iter().collect();
+    let mut urls = Vec::new();
     if let Ok(Some(project)) = projects::find_by_name(&state.db_pool, project_name).await {
+        urls.extend(build_project_url(state, &project.name));
         if let Ok(deployments) =
             crate::db::deployments::get_active_deployments_for_project(&state.db_pool, project.id)
                 .await
@@ -160,7 +185,9 @@ async fn project_app_urls(state: &AppState, project_name: &str) -> Vec<String> {
 /// A safe redirect URL, or "/" if the input is invalid
 ///
 /// # Security
-/// - Relative paths starting with "/" are always allowed
+/// - Relative paths are allowed only in the strict form
+///   [`crate::server::auth::redirect::is_safe_relative_path`] accepts
+/// - Backslashes, whitespace, and control characters are never allowed
 /// - Absolute URLs must be HTTPS (or HTTP for localhost/development)
 /// - Absolute URLs must match the Rise public domain or one of `allowed_hosts`
 /// - Host matching is exact (case-insensitive), never a string prefix, so
@@ -176,17 +203,31 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
         return SAFE_FALLBACK.to_string();
     }
 
-    // Allow relative paths that start with /
-    if redirect_url.starts_with('/') {
-        // Additional safety: ensure it doesn't start with // (protocol-relative URL)
-        if redirect_url.starts_with("//") {
-            tracing::warn!(
-                redirect_url = %redirect_url,
-                "Blocked protocol-relative URL in redirect"
-            );
-            return SAFE_FALLBACK.to_string();
+    // A relative path stays on the current host only in its strict form; see
+    // `is_safe_relative_path` for the shapes browsers resolve off-site.
+    if redirect_url.starts_with('/') || redirect_url.starts_with('\\') {
+        if crate::server::auth::redirect::is_safe_relative_path(redirect_url) {
+            return redirect_url.to_string();
         }
-        return redirect_url.to_string();
+        tracing::warn!(
+            redirect_url = %url_for_log(redirect_url),
+            "Blocked relative redirect that a browser could resolve to another host"
+        );
+        return SAFE_FALLBACK.to_string();
+    }
+
+    // The URL parser drops tabs and newlines and reads `\` as `/`, as browsers
+    // do, but the raw string is what gets returned. Refuse any URL carrying
+    // those characters so the checked URL and the returned one cannot differ.
+    if redirect_url
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        tracing::warn!(
+            redirect_url = %url_for_log(redirect_url),
+            "Blocked redirect URL containing backslashes, whitespace, or control characters"
+        );
+        return SAFE_FALLBACK.to_string();
     }
 
     // Try to parse as absolute URL
@@ -194,7 +235,7 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
         Ok(url) => url,
         Err(e) => {
             tracing::warn!(
-                redirect_url = %redirect_url,
+                redirect_url = %url_for_log(redirect_url),
                 error = ?e,
                 "Failed to parse redirect URL, using safe fallback"
             );
@@ -206,7 +247,7 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
     let scheme = parsed_redirect.scheme().to_lowercase();
     if !matches!(scheme.as_str(), "http" | "https") {
         tracing::warn!(
-            redirect_url = %redirect_url,
+            redirect_url = %url_for_log(redirect_url),
             scheme = %scheme,
             "Blocked dangerous URL scheme in redirect"
         );
@@ -231,7 +272,7 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
         Some(host) => host,
         None => {
             tracing::warn!(
-                redirect_url = %redirect_url,
+                redirect_url = %url_for_log(redirect_url),
                 "Redirect URL has no host, using safe fallback"
             );
             return SAFE_FALLBACK.to_string();
@@ -279,7 +320,7 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
 
     // All other external URLs are blocked
     tracing::warn!(
-        redirect_url = %redirect_url,
+        redirect_url = %url_for_log(redirect_url),
         redirect_host = %redirect_host,
         public_host = %public_host,
         "Blocked redirect to untrusted external domain"
@@ -288,88 +329,43 @@ fn validate_redirect_url(redirect_url: &str, public_url: &str, allowed_hosts: &[
     SAFE_FALLBACK.to_string()
 }
 
-/// Helper function to sync IdP groups after login
+/// Mirror the login's IdP groups onto `user_id`'s IdP-managed teams.
 ///
-/// This validates the token and syncs the user's team memberships from IdP groups.
-/// Should be called during login flows (code exchange, device exchange, OAuth callback).
-async fn sync_groups_after_login(
-    state: &AppState,
-    id_token: &str,
-) -> Result<(), (StatusCode, String)> {
-    // Only sync if enabled
-    if !state.auth_settings.idp_group_sync_enabled {
-        return Ok(());
-    }
+/// Admin, operator, and platform access granted by IdP group are read from
+/// those teams, so a login whose groups cannot be applied must not go on to
+/// issue a session: the teams would still hold whatever the IdP last
+/// asserted, including groups the user has since left. Every failure here is
+/// returned for the caller to refuse the login. Missing/null assertions follow
+/// the configured policy; an explicit empty claim removes mirrored memberships.
+async fn sync_login_groups(
+    pool: &sqlx::PgPool,
+    user_id: uuid::Uuid,
+    claims: &serde_json::Value,
+    group_claim: &str,
+    allowed_prefixes: &[String],
+    missing_claim_policy: crate::server::settings::MissingGroupClaimPolicy,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
 
-    // Build expected claims for validation
-    let mut expected_claims = HashMap::new();
-    expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
-
-    // Validate token to get claims
-    let claims_value = state
-        .jwt_validator
-        .validate(id_token, &state.auth_settings.issuer, &expected_claims)
+    let claims =
+        crate::server::auth::jwt::Claims::from_value_with_group_claim(claims.clone(), group_claim)
+            .context("Failed to parse ID token claims for group sync")?;
+    let groups = match claims.groups {
+        Some(groups) => groups,
+        None => match missing_claim_policy {
+            crate::server::settings::MissingGroupClaimPolicy::RefuseLogin => {
+                anyhow::bail!("ID token is missing the configured group claim")
+            }
+            crate::server::settings::MissingGroupClaimPolicy::TreatAsEmpty => Vec::new(),
+        },
+    };
+    tracing::debug!(
+        "Syncing {} IdP groups for user {} during login",
+        groups.len(),
+        user_id
+    );
+    crate::server::auth::group_sync::sync_user_groups(pool, user_id, &groups, allowed_prefixes)
         .await
-        .map_err(|e| {
-            tracing::warn!("Failed to validate token for group sync: {:#}", e);
-            (StatusCode::UNAUTHORIZED, format!("Invalid token: {}", e))
-        })?;
-
-    // Parse claims
-    let claims = crate::server::auth::jwt::Claims::from_value_with_group_claim(
-        claims_value,
-        &state.auth_settings.idp_group_claim,
-    )
-    .map_err(|e| {
-        tracing::warn!("Failed to parse claims for group sync: {:#}", e);
-        (
-            StatusCode::UNAUTHORIZED,
-            format!("Invalid token claims: {}", e),
-        )
-    })?;
-
-    // Get or create user. Always pairs the user row with a default-Org
-    // membership so bootstrap validation never observes a half-created user.
-    let user = users::find_or_create_with_default_organization(
-        &state.db_pool,
-        &claims.email,
-        state.default_organization_uid,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to find/create user for group sync: {:#}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Database error".to_string(),
-        )
-    })?;
-
-    // Sync groups if present in claims (including empty groups - user may have been removed from all groups)
-    if let Some(ref groups) = claims.groups {
-        tracing::debug!(
-            "Syncing {} IdP groups for user {} during login",
-            groups.len(),
-            user.email
-        );
-
-        if let Err(e) = crate::server::auth::group_sync::sync_user_groups(
-            &state.db_pool,
-            user.id,
-            groups,
-            &state.auth_settings.idp_group_sync_prefixes,
-        )
-        .await
-        {
-            // Log error but don't fail login
-            tracing::error!(
-                "Failed to sync IdP groups during login for user {}: {:#}",
-                user.email,
-                e
-            );
-        }
-    }
-
-    Ok(())
 }
 
 /// Why a validated upstream login did not produce a Rise session.
@@ -377,10 +373,15 @@ async fn sync_groups_after_login(
 enum LoginFailure {
     /// The ID token has no `email`, which the typed APIs key users on.
     MissingEmail,
+    /// The IdP does not vouch for the `email`: see [`verified_login_email`].
+    UnverifiedEmail,
     /// The exact identity mapping, or its User, is inactive (ADR-0001 §1).
     Disabled,
     /// The upstream `sub` cannot be recorded as a `UserIdentity` subject.
     InvalidSubject(String),
+    /// The login's IdP groups could not be applied; already logged. See
+    /// [`sync_login_groups`].
+    GroupSync,
     /// A database or signing failure; already logged.
     Internal,
 }
@@ -390,11 +391,21 @@ impl LoginFailure {
     fn response(&self) -> (StatusCode, String) {
         match self {
             Self::MissingEmail => (StatusCode::BAD_REQUEST, "Email claim missing".to_string()),
+            Self::UnverifiedEmail => (
+                StatusCode::FORBIDDEN,
+                "Your identity provider has not verified your email address.".to_string(),
+            ),
             Self::Disabled => (
                 StatusCode::FORBIDDEN,
                 "This account is disabled. Contact your Rise administrator.".to_string(),
             ),
             Self::InvalidSubject(reason) => (StatusCode::UNAUTHORIZED, reason.clone()),
+            Self::GroupSync => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Could not refresh your group memberships from the identity provider. \
+                 Please try again."
+                    .to_string(),
+            ),
             Self::Internal => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to process user".to_string(),
@@ -413,6 +424,38 @@ struct ResolvedLogin {
     identity: ResolvedIdentity,
 }
 
+/// The ID token's `email`, provided the IdP vouches for it.
+///
+/// Users, `auth.admin_users`, `auth.operator_users` and the platform-access
+/// allowlist all match on this address, so a self-asserted one would let its
+/// holder claim another person's account and roles. `email_verified` must be
+/// `true` (a JSON boolean, or the string `"true"` some IdPs send). An absent
+/// claim is accepted only when `auth.allow_missing_email_verified` says the IdP
+/// verifies every address it issues; `email_verified: false` never is.
+fn verified_login_email(
+    claims: &serde_json::Value,
+    allow_missing_email_verified: bool,
+) -> Result<&str, LoginFailure> {
+    let email = claims
+        .get("email")
+        .and_then(|v| v.as_str())
+        .ok_or(LoginFailure::MissingEmail)?;
+    let verified = match claims.get("email_verified") {
+        Some(serde_json::Value::Bool(verified)) => *verified,
+        Some(serde_json::Value::String(verified)) => verified.eq_ignore_ascii_case("true"),
+        Some(_) => false,
+        None => allow_missing_email_verified,
+    };
+    if !verified {
+        tracing::warn!(
+            email_verified = ?claims.get("email_verified"),
+            "Login refused: the ID token's email is not verified"
+        );
+        return Err(LoginFailure::UnverifiedEmail);
+    }
+    Ok(email)
+}
+
 /// Resolve an ID token already validated against `auth.issuer` to its typed
 /// user and its `User` resource.
 ///
@@ -422,10 +465,7 @@ async fn resolve_login(
     state: &AppState,
     claims: &serde_json::Value,
 ) -> Result<ResolvedLogin, LoginFailure> {
-    let email = claims
-        .get("email")
-        .and_then(|v| v.as_str())
-        .ok_or(LoginFailure::MissingEmail)?;
+    let email = verified_login_email(claims, state.auth_settings.allow_missing_email_verified)?;
     // `JwtValidator` verified the signature and `iss`; `sub` is required there
     // too, so an absent one is a malformed token rather than an unknown user.
     let subject = claims
@@ -470,6 +510,25 @@ async fn resolve_login(
         tracing::error!("Failed to find/create user: {:#}", e);
         LoginFailure::Internal
     })?;
+
+    if state.auth_settings.idp_group_sync_enabled {
+        sync_login_groups(
+            &state.db_pool,
+            user.id,
+            claims,
+            &state.auth_settings.idp_group_claim,
+            &state.auth_settings.idp_group_sync_prefixes,
+            state.auth_settings.idp_group_missing_claim_policy,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                user_id = %user.id,
+                "Login refused: failed to sync IdP groups: {e:?}"
+            );
+            LoginFailure::GroupSync
+        })?;
+    }
 
     // A cross-reference only: nothing authenticates through it, so losing a
     // race for it must not fail the login.
@@ -754,12 +813,6 @@ pub async fn code_exchange(
         }
     }
 
-    // Sync IdP groups after successful login
-    if let Err(e) = sync_groups_after_login(&state, &token_info.id_token).await {
-        tracing::warn!("Group sync failed during code exchange: {:?}", e);
-        // Don't fail the login if group sync fails
-    }
-
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
     expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());
@@ -917,8 +970,9 @@ pub async fn signin_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
-    Query(params): Query<SigninQuery>,
+    Query(mut params): Query<SigninQuery>,
 ) -> Result<Response, (StatusCode, String)> {
+    params.project = resolve_signin_project(&state.db_pool, params.project.as_deref()).await?;
     let project_name = params.project.as_deref().unwrap_or("Unknown");
     let raw_redirect_url = params
         .redirect
@@ -938,8 +992,8 @@ pub async fn signin_page(
     tracing::info!(
         project = %project_name,
         has_redirect = !redirect_url.is_empty(),
-        raw_redirect = %raw_redirect_url,
-        validated_redirect = %redirect_url,
+        raw_redirect = %url_for_log(&raw_redirect_url),
+        validated_redirect = %url_for_log(&redirect_url),
         "Signin page requested"
     );
 
@@ -1022,105 +1076,212 @@ fn extract_request_base_url(headers: &HeaderMap, state: &AppState) -> String {
     state.public_url.trim_end_matches('/').to_string()
 }
 
-/// Extract the host (with port if present) from a URL like `scheme://host:port/path`.
-fn url_host(url: &str) -> &str {
-    url.split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
+/// Whether a browser request reached the exact configured origin.
+fn request_matches_origin(headers: &HeaderMap, expected_url: &str) -> bool {
+    let Ok(expected) = url::Url::parse(expected_url) else {
+        return false;
+    };
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(actual) = url::Url::parse(&format!("{}://{}", expected.scheme(), host)) else {
+        return false;
+    };
+    actual.username().is_empty()
+        && actual.password().is_none()
+        && actual.path() == "/"
+        && actual.query().is_none()
+        && actual.fragment().is_none()
+        && actual.origin() == expected.origin()
 }
 
-/// Initiate OAuth2 login flow for ingress auth (start of OAuth flow)
-///
-/// This handler starts the OAuth2 authorization code flow with PKCE.
-/// It generates a PKCE verifier/challenge pair, stores the state, and
-/// redirects the user to the OIDC provider for authentication.
-#[instrument(skip(state, params, uri))]
+fn with_binding_cookie(
+    mut response: Response,
+    cookie: &str,
+) -> Result<Response, (StatusCode, String)> {
+    let value = HeaderValue::from_str(cookie).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to set sign-in cookie".into(),
+        )
+    })?;
+    response.headers_mut().append(header::SET_COOKIE, value);
+    Ok(response)
+}
+
+fn login_storage_error(error: anyhow::Error) -> (StatusCode, String) {
+    tracing::error!(?error, "Sign-in transaction storage failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to process sign-in transaction".into(),
+    )
+}
+
+fn invalid_browser_binding() -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        "Sign-in must finish in the browser that started it. Please start again.".into(),
+    )
+}
+
+/// Initiate browser login on its UI or app origin.
+#[instrument(skip(state, params, headers, uri))]
 pub async fn oauth_signin_start(
     State(state): State<AppState>,
     headers: HeaderMap,
     uri: Uri,
-    Query(params): Query<SigninQuery>,
+    Query(mut params): Query<SigninQuery>,
 ) -> Result<Response, (StatusCode, String)> {
-    // Prefer rd (full URL) over redirect (path only)
-    let raw_redirect_url = params.rd.as_ref().or(params.redirect.as_ref());
-
-    // Validate and sanitize redirect URL if provided. The redirect is scoped to
-    // this project's own hosts (not the parent domain).
+    params.project = resolve_signin_project(&state.db_pool, params.project.as_deref()).await?;
     let allowed_hosts = match params.project.as_deref() {
-        Some(p) => project_redirect_hosts(&state, p).await,
+        Some(project) => project_redirect_hosts(&state, project).await,
         None => Vec::new(),
     };
-    let redirect_url =
-        raw_redirect_url.map(|url| validate_redirect_url(url, &state.public_url, &allowed_hosts));
-
-    tracing::info!(
-        project = ?params.project,
-        has_redirect = redirect_url.is_some(),
-        raw_redirect = ?raw_redirect_url,
-        validated_redirect = ?redirect_url,
-        "OAuth signin initiated"
-    );
-
-    // Determine if this is via `/.rise/auth` path (Ingress routing)
-    let is_rise_path = uri.path().starts_with("/.rise/auth");
-
-    // Generate PKCE parameters
-    let code_verifier = generate_code_verifier();
-    let code_challenge = generate_code_challenge(&code_verifier);
-    let state_token = generate_state_token();
-
-    // For /.rise/auth paths, determine the app base URL for cookie setting after the callback.
-    // Only use the request host as the base URL when it's a *true* custom domain — i.e. when
-    // the request host doesn't match the standard ingress template host. On the template host
-    // we leave custom_domain_base_url as None and let build_project_url supply the canonical
-    // URL (configured scheme and port) in the callback handler.
-    let custom_domain_base_url = if is_rise_path {
-        let request_base_url = extract_request_base_url(&headers, &state);
-        let is_standard_ingress = params
-            .project
-            .as_deref()
-            .and_then(|p| build_project_url(&state, p))
-            .map(|template_url| url_host(&template_url) == url_host(&request_base_url))
-            .unwrap_or(false);
-        if is_standard_ingress {
-            None
-        } else {
-            Some(request_base_url)
-        }
-    } else {
-        None
-    };
-
-    // Store PKCE state with redirect URL, project name, and custom domain base URL
-    let oauth_state = OAuth2State {
-        code_verifier: code_verifier.clone(),
+    let redirect_url = params
+        .rd
+        .as_ref()
+        .or(params.redirect.as_ref())
+        .map(|target| validate_redirect_url(target, &state.public_url, &allowed_hosts));
+    let is_app_start = uri.path().starts_with("/.rise/auth");
+    let mut transaction = OAuth2State {
+        browser_proof: None,
+        app_browser_proof: None,
+        project_id: None,
+        code_verifier: generate_code_verifier(),
         redirect_url,
-        project_name: params.project.clone(), // For ingress auth flow
-        custom_domain_base_url,
+        project_name: params.project.clone(),
+        app_base_url: None,
     };
-    state
-        .token_store
-        .save(state_token.clone(), oauth_state)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to store PKCE state: {:?}", e);
+
+    if let Some(project_name) = params.project.as_deref() {
+        let app_urls = project_app_urls(&state, project_name).await;
+        let app_url = if is_app_start {
+            app_urls
+                .iter()
+                .find(|url| request_matches_origin(&headers, url))
+        } else {
+            if !request_matches_origin(&headers, &state.public_url) {
+                return Err(invalid_browser_binding());
+            }
+            transaction
+                .redirect_url
+                .as_ref()
+                .and_then(|target| url::Url::parse(target).ok())
+                .and_then(|target| {
+                    app_urls.iter().find(|url| {
+                        url::Url::parse(url).is_ok_and(|url| url.origin() == target.origin())
+                    })
+                })
+                .or_else(|| app_urls.first())
+        }
+        .ok_or_else(|| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to initiate login".to_string(),
+                StatusCode::BAD_REQUEST,
+                "This host does not serve the requested project".into(),
             )
         })?;
+        let app_url = url::Url::parse(app_url).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid project URL".into(),
+            )
+        })?;
+        let app_origin = app_url.origin().ascii_serialization();
+        if !is_app_start {
+            let mut target = url::Url::parse(&format!("{app_origin}/.rise/auth/signin/start"))
+                .map_err(|_| invalid_browser_binding())?;
+            target
+                .query_pairs_mut()
+                .append_pair("project", project_name);
+            if let Some(redirect) = &transaction.redirect_url {
+                target.query_pairs_mut().append_pair("redirect", redirect);
+            }
+            return Ok(Redirect::to(target.as_str()).into_response());
+        }
+        let project = projects::find_by_name(&state.db_pool, project_name)
+            .await
+            .map_err(login_storage_error)?
+            .filter(|project| project.status != crate::db::models::ProjectStatus::Deleting)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "Project not found".into()))?;
+        transaction.project_id = Some(project.id);
+        transaction.app_base_url = Some(app_origin);
+        let (proof, cookie) = BrowserProof::new("app", &state.cookie_settings, &headers);
+        transaction.app_browser_proof = Some(proof);
+        let handle = generate_state_token();
+        state
+            .token_store
+            .save(format!("app-start:{handle}"), transaction)
+            .await
+            .map_err(login_storage_error)?;
+        let begin = format!(
+            "{}/api/v1/auth/signin/begin?transaction={handle}",
+            state.public_url.trim_end_matches('/')
+        );
+        return with_binding_cookie(Redirect::to(&begin).into_response(), &cookie);
+    }
 
-    // Build OAuth2 authorization URL
-    // IdP callback always uses the main Rise domain (pre-registered with IdP)
-    // For custom domains, we'll redirect to them after the callback completes
+    if is_app_start || !request_matches_origin(&headers, &state.public_url) {
+        return Err(invalid_browser_binding());
+    }
+    start_central_oauth(&state, &headers, transaction).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BeginQuery {
+    pub transaction: String,
+}
+
+/// Establish central-host browser proof for an app-origin sign-in transaction.
+#[instrument(skip(state, headers, params))]
+pub async fn oauth_signin_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<BeginQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    if !request_matches_origin(&headers, &state.public_url) {
+        return Err(invalid_browser_binding());
+    }
+    let pending = state
+        .token_store
+        .claim(&format!("app-start:{}", params.transaction))
+        .await
+        .map_err(login_storage_error)?
+        .ok_or_else(invalid_browser_binding)?;
+    if pending.app_browser_proof.is_none()
+        || pending.browser_proof.is_some()
+        || pending.project_id.is_none()
+        || pending.project_name.is_none()
+        || pending.app_base_url.is_none()
+    {
+        pending.release().await.map_err(login_storage_error)?;
+        return Err(invalid_browser_binding());
+    }
+    let response = start_central_oauth(&state, &headers, pending.data().clone()).await?;
+    pending.finalize().await.map_err(login_storage_error)?;
+    Ok(response)
+}
+
+async fn start_central_oauth(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut transaction: OAuth2State,
+) -> Result<Response, (StatusCode, String)> {
+    let (proof, cookie) = BrowserProof::new("central", &state.cookie_settings, headers);
+    transaction.browser_proof = Some(proof);
+    let code_challenge = generate_code_challenge(&transaction.code_verifier);
+    let state_token = generate_state_token();
+    state
+        .token_store
+        .save(state_token.clone(), transaction)
+        .await
+        .map_err(login_storage_error)?;
     let callback_url = format!(
         "{}/api/v1/auth/callback",
         state.public_url.trim_end_matches('/')
     );
-
     let params = crate::server::auth::oauth::AuthorizeParams {
         client_id: &state.auth_settings.client_id,
         redirect_uri: &callback_url,
@@ -1130,11 +1291,10 @@ pub async fn oauth_signin_start(
         code_challenge_method: "S256",
         state: Some(&state_token),
     };
-
-    let auth_url = state.oauth_client.build_authorize_url(&params);
-
-    tracing::debug!("Redirecting to OIDC provider for authentication");
-    Ok(Redirect::to(&auth_url).into_response())
+    with_binding_cookie(
+        Redirect::to(&state.oauth_client.build_authorize_url(&params)).into_response(),
+        &cookie,
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1150,11 +1310,12 @@ pub struct CallbackQuery {
 ///
 /// For custom domain auth routing:
 /// - IdP always redirects to the main Rise domain (single pre-registered redirect URI)
-/// - If `custom_domain_callback_url` is set in state, we store a one-time token and redirect
-///   to the custom domain's `/.rise/auth/complete` endpoint to set cookies there
-#[instrument(skip(state, params))]
+/// - App sign-in carries proofs on both hosts and an exact app origin.
+///   Its one-time completion token requires the original app-host proof.
+#[instrument(skip(state, params, headers))]
 pub async fn oauth_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     tracing::info!("OAuth callback received");
@@ -1177,6 +1338,39 @@ pub async fn oauth_callback(
                 "Invalid or expired state token".to_string(),
             )
         })?;
+    let binding_valid = request_matches_origin(&headers, &state.public_url)
+        && claimed_state
+            .browser_proof
+            .as_ref()
+            .is_some_and(|proof| proof.matches(&headers));
+    if !binding_valid {
+        claimed_state.release().await.map_err(login_storage_error)?;
+        return Err(invalid_browser_binding());
+    }
+    if let Some(project_name) = claimed_state.project_name.as_deref() {
+        let project = projects::find_by_name(&state.db_pool, project_name)
+            .await
+            .map_err(login_storage_error)?;
+        let valid_project = project.as_ref().is_some_and(|project| {
+            Some(project.id) == claimed_state.project_id
+                && project.status != crate::db::models::ProjectStatus::Deleting
+        });
+        let valid_origin = if let Some(origin) = claimed_state.app_base_url.as_ref() {
+            project_app_urls(&state, project_name)
+                .await
+                .iter()
+                .any(|url| {
+                    url::Url::parse(url)
+                        .is_ok_and(|url| url.origin().ascii_serialization() == *origin)
+                })
+        } else {
+            false
+        };
+        if !valid_project || !valid_origin || claimed_state.app_browser_proof.is_none() {
+            claimed_state.release().await.map_err(login_storage_error)?;
+            return Err(invalid_browser_binding());
+        }
+    }
     // Build callback URL (must match the one used in signin)
     // IdP callback always uses the main Rise domain (pre-registered with IdP)
     let callback_url = format!(
@@ -1198,12 +1392,6 @@ pub async fn oauth_callback(
         })?;
 
     tracing::info!("Successfully exchanged code for tokens");
-
-    // Sync IdP groups after successful login
-    if let Err(e) = sync_groups_after_login(&state, &token_info.id_token).await {
-        tracing::warn!("Group sync failed during OAuth callback: {:?}", e);
-        // Don't fail the login if group sync fails
-    }
 
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
@@ -1248,15 +1436,10 @@ pub async fn oauth_callback(
             .map_err(|failure| failure.response())?
             .user;
 
-        // Issue Rise JWT with user's team memberships
-        // Use custom domain URL as audience when available, otherwise build from ingress template
-        let project_url = claimed_state
-            .data()
-            .custom_domain_base_url
-            .as_deref()
-            .map(|url| url.trim_end_matches('/').to_string())
-            .or_else(|| build_project_url(&state, project))
-            .unwrap_or_else(|| state.public_url.trim_end_matches('/').to_string());
+        let app_base_url = claimed_state
+            .app_base_url
+            .clone()
+            .ok_or_else(invalid_browser_binding)?;
 
         // Resolve the user's team memberships for the groups claim; on a DB
         // error, fall back to no groups rather than failing the login.
@@ -1266,7 +1449,7 @@ pub async fn oauth_callback(
 
         let rise_jwt = state
             .jwt_signer
-            .sign_ingress_jwt(&claims, groups, &project_url, None)
+            .sign_ingress_jwt(&claims, groups, &app_base_url, None)
             .map_err(|e| {
                 tracing::error!("Failed to sign Rise JWT: {:#}", e);
                 (
@@ -1275,28 +1458,14 @@ pub async fn oauth_callback(
                 )
             })?;
 
-        // Build the app base URL to redirect to for cookie setting.
-        // Use custom_domain_base_url if available, otherwise build from ingress template.
-        let app_base_url = claimed_state
-            .data()
-            .custom_domain_base_url
-            .clone()
-            .or_else(|| build_project_url(&state, project))
-            .ok_or_else(|| {
-                tracing::error!(
-                    "Cannot redirect to app for cookie setting: no ingress URL template configured"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Ingress URL template not configured".to_string(),
-                )
-            })?;
-
         // Always redirect to the app's domain to set the cookie there.
         // The /.rise/auth/complete handler sets the cookie scoped to the current host.
         let completion_token = generate_state_token();
 
         let completed_session = CompletedAuthSession {
+            browser_proof: claimed_state.app_browser_proof.clone(),
+            app_base_url: Some(app_base_url.clone()),
+            project_id: claimed_state.project_id,
             rise_jwt,
             max_age,
             redirect_url: redirect_url.clone(),
@@ -1322,15 +1491,13 @@ pub async fn oauth_callback(
 
         tracing::info!(
             "Redirecting to app domain for cookie setting: {}",
-            complete_url
+            crate::server::middleware::url_for_log(&complete_url)
         );
 
-        if let Err(e) = claimed_state.finalize().await {
-            tracing::warn!(
-                "Failed to finalize PKCE state (response already built, row will expire via TTL): {:?}",
-                e
-            );
-        }
+        claimed_state
+            .finalize()
+            .await
+            .map_err(login_storage_error)?;
         return Ok(Redirect::to(&complete_url).into_response());
     }
 
@@ -1348,17 +1515,15 @@ pub async fn oauth_callback(
 
     tracing::info!(
         "Setting Rise JWT cookie and redirecting to {}",
-        redirect_url
+        url_for_log(&redirect_url)
     );
 
     // Use success page with delayed redirect to ensure cookie is properly persisted
     let response = render_ui_login_success_page(&state, &redirect_url, &cookie).await?;
-    if let Err(e) = claimed_state.finalize().await {
-        tracing::warn!(
-            "Failed to finalize PKCE state (response already built, row will expire via TTL): {:?}",
-            e
-        );
-    }
+    claimed_state
+        .finalize()
+        .await
+        .map_err(login_storage_error)?;
     Ok(response)
 }
 
@@ -1469,7 +1634,7 @@ async fn render_ui_login_success_page(
 
     tracing::info!(
         "Setting UI JWT cookie and showing success page, redirecting to: {}",
-        redirect_url
+        url_for_log(redirect_url)
     );
 
     let response = build_cookie_response(state, StatusCode::OK, cookie, Html(html))?;
@@ -1486,9 +1651,10 @@ pub struct CompleteQuery {
 /// This handler is called on the custom domain after the IdP callback completes on the main domain.
 /// It receives a one-time token, retrieves the stored auth session, sets the cookie on the
 /// custom domain, and shows the success page.
-#[instrument(skip(state, params))]
+#[instrument(skip(state, params, headers))]
 pub async fn oauth_complete(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(params): Query<CompleteQuery>,
 ) -> Result<Response, (StatusCode, String)> {
     tracing::info!("Custom domain auth complete received");
@@ -1511,6 +1677,38 @@ pub async fn oauth_complete(
                 "Invalid or expired completion token. Please try logging in again.".to_string(),
             )
         })?;
+    let binding_valid = claimed_session
+        .browser_proof
+        .as_ref()
+        .is_some_and(|proof| proof.matches(&headers))
+        && claimed_session
+            .app_base_url
+            .as_ref()
+            .is_some_and(|origin| request_matches_origin(&headers, origin));
+    let project = projects::find_by_name(&state.db_pool, &claimed_session.project_name)
+        .await
+        .map_err(login_storage_error)?;
+    let valid_project = project.as_ref().is_some_and(|project| {
+        Some(project.id) == claimed_session.project_id
+            && project.status != crate::db::models::ProjectStatus::Deleting
+    });
+    let valid_origin = if let Some(origin) = claimed_session.app_base_url.as_ref() {
+        project_app_urls(&state, &claimed_session.project_name)
+            .await
+            .iter()
+            .any(|url| {
+                url::Url::parse(url).is_ok_and(|url| url.origin().ascii_serialization() == *origin)
+            })
+    } else {
+        false
+    };
+    if !binding_valid || !valid_project || !valid_origin {
+        claimed_session
+            .release()
+            .await
+            .map_err(login_storage_error)?;
+        return Err(invalid_browser_binding());
+    }
     let cookie = cookie_helpers::create_rise_jwt_cookie(
         &claimed_session.rise_jwt,
         &state.cookie_settings,
@@ -1524,12 +1722,10 @@ pub async fn oauth_complete(
         &cookie,
     )
     .await?;
-    if let Err(e) = claimed_session.finalize().await {
-        tracing::warn!(
-            "Failed to finalize completed session (response already built, row will expire via TTL): {:?}",
-            e
-        );
-    }
+    claimed_session
+        .finalize()
+        .await
+        .map_err(login_storage_error)?;
     Ok(response)
 }
 
@@ -1583,6 +1779,26 @@ fn allowlist_path(headers: &HeaderMap, traefik_mode: bool) -> Option<&str> {
         headers.get("x-auth-request-redirect")
     }
     .and_then(|v| v.to_str().ok())
+}
+
+/// Whether a request URI addresses the Rise-served `/.rise/*` tree and may pass
+/// the ingress gate without a session.
+///
+/// `uri` is the request URI as the proxy received it. ingress-nginx fills
+/// `x-auth-request-redirect` from the raw `$request_uri` but routes by the
+/// normalized path (percent-decoded, dot-segments resolved), so a raw
+/// `/.rise/../secret` or `/.rise/%2e%2e/secret` routes to the app at `/secret`.
+/// The check therefore fails closed on anything a proxy could normalize: the
+/// path (query stripped) must start with `/.rise/` and contain no `%` escape, no
+/// backslash, and no `.` or `..` segment. The Rise-served `/.rise/auth/*` paths
+/// need none of these.
+fn is_rise_allowlisted_path(uri: &str) -> bool {
+    let path = uri.split(['?', '#']).next().unwrap_or_default();
+    path.starts_with("/.rise/")
+        && !path.contains(['%', '\\'])
+        && !path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
 }
 
 /// Build the browser-facing login redirect URL for Traefik forwardAuth mode.
@@ -1674,8 +1890,10 @@ pub async fn ingress_auth(
     // request URI. Read ONLY the mode-appropriate header — reading the other would
     // trust a client-controllable value (e.g. under Traefik a client can spoof
     // `x-auth-request-redirect: /.rise/x` to bypass auth on an arbitrary path).
+    // Both headers carry the raw URI, which `is_rise_allowlisted_path` rejects
+    // whenever the proxy's normalized routing path could leave `/.rise/`.
     if let Some(redirect_path) = allowlist_path(&headers, params.signin_redirect) {
-        if redirect_path.starts_with("/.rise/") {
+        if is_rise_allowlisted_path(redirect_path) {
             tracing::debug!(
                 project = %params.project,
                 redirect_path = %redirect_path,
@@ -1948,10 +2166,19 @@ pub struct LogoutQuery {
     pub redirect: Option<String>,
 }
 
+/// Where logout sends the browser: `redirect` under the post-login redirect
+/// policy, without project hosts since logout is served on the control-plane
+/// host only. Anything the policy refuses, and no `redirect` at all, is `/`.
+fn logout_redirect_target(redirect: Option<&str>, public_url: &str) -> String {
+    redirect
+        .map(|url| validate_redirect_url(url, public_url, &[]))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 /// Logout endpoint
 ///
 /// Clears the session cookie and redirects the user.
-#[instrument(skip(state))]
+#[instrument(skip(state, params))]
 pub async fn oauth_logout(
     State(state): State<AppState>,
     Query(params): Query<LogoutQuery>,
@@ -1961,12 +2188,11 @@ pub async fn oauth_logout(
     // Clear the Rise JWT cookie
     let cookie = cookie_helpers::clear_rise_jwt_cookie(&state.cookie_settings);
 
-    // Determine redirect URL
-    let redirect_url = params.redirect.unwrap_or_else(|| "/".to_string());
+    let redirect_url = logout_redirect_target(params.redirect.as_deref(), &state.public_url);
 
     tracing::info!(
         "Clearing Rise JWT cookie and redirecting to {}",
-        redirect_url
+        url_for_log(&redirect_url)
     );
 
     // Build response with Set-Cookie header(s) and redirect
@@ -2113,6 +2339,35 @@ pub async fn openid_configuration(
 mod tests {
     use super::*;
 
+    #[sqlx::test]
+    async fn signin_requires_an_existing_project_before_constructing_urls(pool: sqlx::PgPool) {
+        for supplied in ["evil.example/", "evil.example%2F", "missing", ""] {
+            let error = resolve_signin_project(&pool, Some(supplied))
+                .await
+                .unwrap_err();
+            assert_eq!(error.0, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(resolve_signin_project(&pool, None).await.unwrap(), None);
+        let owner = users::create(&pool, "owner@example.com").await.unwrap();
+        let project = projects::create(
+            &pool,
+            "valid-project",
+            crate::db::models::ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(owner.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve_signin_project(&pool, Some(&project.name))
+                .await
+                .unwrap(),
+            Some(project.name)
+        );
+    }
+
     #[test]
     fn signin_redirect_url_reconstructs_from_forwarded_headers() {
         let mut headers = HeaderMap::new();
@@ -2137,9 +2392,9 @@ mod tests {
         headers.insert("x-forwarded-host", "app.rise.localhost".parse().unwrap());
         headers.insert("x-forwarded-uri", "/".parse().unwrap());
         let url = build_signin_redirect_url("http://rise.localhost:3000", "https", "app", &headers);
-        let signin_host = url_host(&url);
-        assert_eq!(signin_host, "app.rise.localhost");
-        assert_ne!(signin_host, "rise.localhost:3000");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.host_str(), Some("app.rise.localhost"));
+        assert_ne!(parsed.host_str(), Some("rise.localhost"));
         assert!(url.starts_with("https://app.rise.localhost/.rise/auth/signin?project=app"));
     }
 
@@ -2211,6 +2466,54 @@ mod tests {
     }
 
     #[test]
+    fn rise_allowlist_accepts_rise_served_paths() {
+        for uri in [
+            "/.rise/auth/signin",
+            "/.rise/auth/signin?project=app&redirect=https%3A%2F%2Fapp.rise.dev%2F..%2Fx",
+            "/.rise/auth/signin/start?project=app",
+            "/.rise/auth/complete?token=abc",
+            "/.rise/assets/app.v1.2.js",
+        ] {
+            assert!(is_rise_allowlisted_path(uri), "{uri} must be allowlisted");
+        }
+    }
+
+    #[test]
+    fn rise_allowlist_rejects_paths_a_proxy_normalizes_out_of_rise() {
+        for uri in [
+            "/secret",
+            "/.rise",
+            "/.risesecret",
+            "/x/.rise/auth/signin",
+            // Dot-segments: nginx routes these by the resolved path.
+            "/.rise/../secret",
+            "/.rise/./../secret",
+            "/.rise/auth/../../secret",
+            "/.rise/..",
+            "/.rise/.",
+            "/.rise//../secret",
+            "/.rise/../secret?x=/.rise/",
+            // Percent-encoded dots and slashes: nginx decodes before resolving.
+            "/.rise/%2e%2e/secret",
+            "/.rise/%2E%2E/secret",
+            "/.rise/.%2e/secret",
+            "/.rise/%2e./secret",
+            "/.rise/..%2fsecret",
+            "/.rise/..%2Fsecret",
+            "/.rise/%2e%2e%2fsecret",
+            "/.rise/%252e%252e/secret",
+            // Backslash separators.
+            "/.rise/..\\secret",
+            "/.rise/..%5csecret",
+        ] {
+            assert!(
+                !is_rise_allowlisted_path(uri),
+                "{uri} must not be allowlisted"
+            );
+        }
+    }
+
+    #[test]
     fn allowlist_path_ignores_spoofable_header_in_traefik_mode() {
         // In Traefik forwardAuth mode (signin_redirect=true) only the
         // authoritative `x-forwarded-uri` is trusted. A client spoofing
@@ -2263,6 +2566,216 @@ mod tests {
             validate_redirect_url("//evil.com/path", public_url, &[]),
             "/"
         );
+    }
+
+    #[test]
+    fn test_validate_redirect_url_rejects_paths_browsers_resolve_off_site() {
+        let public_url = "https://rise.dev";
+
+        for redirect in [
+            "/\\evil.com",
+            "/\\/evil.com",
+            "\\\\evil.com",
+            "\\/evil.com",
+            "/\t/evil.com",
+            "/%2F%2Fevil.com",
+            "/%5Cevil.com",
+            "https://evil.com\\@rise.dev/",
+            "https://rise.dev\t.evil.com/",
+        ] {
+            assert_eq!(
+                validate_redirect_url(redirect, public_url, &[]),
+                "/",
+                "{redirect:?} must fall back to /"
+            );
+        }
+    }
+
+    #[test]
+    fn logout_redirects_only_where_a_login_may() {
+        let public_url = "https://rise.dev";
+
+        assert_eq!(logout_redirect_target(None, public_url), "/");
+        for (redirect, expected) in [
+            ("https://evil.com/", "/"),
+            ("//evil.com", "/"),
+            ("/\\evil.com", "/"),
+            ("javascript:alert(1)", "/"),
+            ("/projects", "/projects"),
+            ("https://rise.dev/projects", "https://rise.dev/projects"),
+        ] {
+            assert_eq!(
+                logout_redirect_target(Some(redirect), public_url),
+                expected,
+                "logout redirect for {redirect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_email_must_be_verified_by_the_idp() {
+        use serde_json::json;
+
+        let verified = json!({"email": "a@example.com", "email_verified": true});
+        assert_eq!(
+            verified_login_email(&verified, false).unwrap(),
+            "a@example.com"
+        );
+        let verified_string = json!({"email": "a@example.com", "email_verified": "true"});
+        assert_eq!(
+            verified_login_email(&verified_string, false).unwrap(),
+            "a@example.com"
+        );
+
+        for unverified in [
+            json!({"email": "a@example.com", "email_verified": false}),
+            json!({"email": "a@example.com", "email_verified": "false"}),
+            json!({"email": "a@example.com", "email_verified": 1}),
+            json!({"email": "a@example.com", "email_verified": null}),
+        ] {
+            for allow_missing in [false, true] {
+                assert!(
+                    matches!(
+                        verified_login_email(&unverified, allow_missing),
+                        Err(LoginFailure::UnverifiedEmail)
+                    ),
+                    "{unverified} must be refused (allow_missing={allow_missing})"
+                );
+            }
+        }
+
+        let missing = json!({"email": "a@example.com"});
+        assert!(matches!(
+            verified_login_email(&missing, false),
+            Err(LoginFailure::UnverifiedEmail)
+        ));
+        assert_eq!(
+            verified_login_email(&missing, true).unwrap(),
+            "a@example.com"
+        );
+
+        assert!(matches!(
+            verified_login_email(&json!({"email_verified": true}), true),
+            Err(LoginFailure::MissingEmail)
+        ));
+    }
+
+    fn login_claims(groups: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "sub": "user123",
+            "email": "member@example.com",
+            "email_verified": true,
+            "iss": "https://issuer.example.com",
+            "aud": "rise",
+            "exp": 4102444800u64,
+            "iat": 1700000000u64,
+            "groups": groups,
+        })
+    }
+
+    #[sqlx::test]
+    async fn login_group_sync_reports_failure_so_the_login_is_refused(pool: sqlx::PgPool) {
+        // A user id with no row: adding the membership violates its foreign
+        // key, the way any database failure mid-sync would surface.
+        let missing_user = uuid::Uuid::new_v4();
+        let result = sync_login_groups(
+            &pool,
+            missing_user,
+            &login_claims(serde_json::json!(["platform-admins"])),
+            "groups",
+            &[],
+            crate::server::settings::MissingGroupClaimPolicy::RefuseLogin,
+        )
+        .await;
+        assert!(result.is_err(), "a failed sync must fail the login");
+    }
+
+    #[sqlx::test]
+    async fn login_group_sync_drops_groups_the_idp_no_longer_asserts(pool: sqlx::PgPool) {
+        let user = users::create(&pool, "member@example.com").await.unwrap();
+        sync_login_groups(
+            &pool,
+            user.id,
+            &login_claims(serde_json::json!(["platform-admins"])),
+            "groups",
+            &[],
+            crate::server::settings::MissingGroupClaimPolicy::RefuseLogin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::db::teams::get_team_names_for_user(&pool, user.id)
+                .await
+                .unwrap(),
+            vec!["platform-admins".to_string()]
+        );
+
+        sync_login_groups(
+            &pool,
+            user.id,
+            &login_claims(serde_json::json!([])),
+            "groups",
+            &[],
+            crate::server::settings::MissingGroupClaimPolicy::RefuseLogin,
+        )
+        .await
+        .unwrap();
+        assert!(crate::db::teams::get_team_names_for_user(&pool, user.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[sqlx::test]
+    async fn missing_group_claim_follows_policy_without_preserving_a_new_privileged_login(
+        pool: sqlx::PgPool,
+    ) {
+        use crate::server::settings::MissingGroupClaimPolicy::{RefuseLogin, TreatAsEmpty};
+        let user = users::create(&pool, "groups@example.com").await.unwrap();
+        for claim_name in ["groups", "custom:groups"] {
+            for missing in [true, false] {
+                for policy in [RefuseLogin, TreatAsEmpty] {
+                    let mut claims = login_claims(serde_json::json!(["platform-admins"]));
+                    claims[claim_name] = serde_json::json!(["platform-admins"]);
+                    sync_login_groups(&pool, user.id, &claims, claim_name, &[], policy)
+                        .await
+                        .unwrap();
+                    if missing {
+                        claims.as_object_mut().unwrap().remove(claim_name);
+                    } else {
+                        claims[claim_name] = serde_json::Value::Null;
+                    }
+                    let result =
+                        sync_login_groups(&pool, user.id, &claims, claim_name, &[], policy).await;
+                    match policy {
+                        RefuseLogin => assert!(result.is_err()),
+                        TreatAsEmpty => {
+                            result.unwrap();
+                            assert!(crate::db::teams::get_team_names_for_user(&pool, user.id)
+                                .await
+                                .unwrap()
+                                .is_empty());
+                        }
+                    }
+                }
+            }
+        }
+        for malformed in [
+            serde_json::json!(42),
+            serde_json::json!(["admins", 1]),
+            serde_json::json!({}),
+        ] {
+            assert!(sync_login_groups(
+                &pool,
+                user.id,
+                &login_claims(malformed),
+                "groups",
+                &[],
+                TreatAsEmpty
+            )
+            .await
+            .is_err());
+        }
     }
 
     #[test]

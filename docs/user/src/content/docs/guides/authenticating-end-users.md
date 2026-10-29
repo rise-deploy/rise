@@ -45,58 +45,70 @@ App URL ← Rise /callback  ←────────┘
 
 ## Step-by-step: Generic OAuth extension
 
-### 1. Encrypt the upstream client secret
+Create the project first. The extension can be sealed before it exists. Put the
+upstream configuration in `oauth.json`:
 
-```bash
-ENCRYPTED=$(rise encrypt "your_upstream_client_secret")
-echo "$ENCRYPTED"
+```json
+{
+  "provider_name": "Google",
+  "client_id": "123456789.apps.googleusercontent.com",
+  "issuer_url": "https://accounts.google.com",
+  "scopes": ["openid", "email", "profile"]
+}
 ```
 
-You can also pipe via stdin: `echo "your_upstream_client_secret" | rise encrypt`.
-
-### 2. Create the OAuth extension
+Seal the upstream secret for this project, extension name, slot, and OAuth
+configuration, then create the extension:
 
 ```bash
-rise extension create oauth-google -p my-app \
-  --type oauth \
-  --spec '{
-    "provider_name": "Google",
-    "description": "Sign in with Google",
-    "client_id": "123456789.apps.googleusercontent.com",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://accounts.google.com",
-    "scopes": ["openid", "email", "profile"]
-  }'
+ENCRYPTED=$(printf '%s' "your_client_secret" | rise encrypt \
+  --project my-app --extension-type oauth --extension oauth-google \
+  --slot /spec/client_secret_encrypted --oauth-spec oauth.json)
+
+rise extension create oauth-google -p my-app --type oauth \
+  --spec "$(jq --arg secret "$ENCRYPTED" '.client_secret_encrypted = $secret' oauth.json)"
 ```
+
+`--oauth-spec` resolves the effective token endpoint through Rise and binds the
+secret to the upstream client ID, issuer, explicit endpoints, authentication
+method, and resolved token destination. Token redirects are refused; use the
+provider's canonical final token URL. Re-enter and seal the secret when any
+of those change. A ciphertext sealed for another project, extension, or slot
+cannot be used here. Restoring the same extension name within the same project
+permits reuse when its OAuth configuration matches; recreating the project does
+not. The generic resource API carries ciphertext as an opaque value.
+
+`rise encrypt` reads plaintext from stdin when its optional plaintext argument
+is omitted. It permits 100 encryptions per hour per user and requires an
+unrestricted login plus access to the enclosing project.
 
 :::note[Verified spec fields]
 Required fields (validated in `src/server/extensions/providers/oauth/provider.rs`):
 - `provider_name` — display name
 - `client_id` — upstream OAuth client ID
-- `client_secret_encrypted` — output of `rise encrypt` (the `client_secret_ref` field is deprecated)
+- `client_secret_encrypted` — a `rise:enc:v2:` envelope sealed for this OAuth configuration
 - `issuer_url` — OIDC issuer URL
-- `scopes` — at least one scope required
+- `scopes` — provider-specific; use an empty array for providers without scopes
 
 Optional fields:
 - `authorization_endpoint` — only needed for non-OIDC providers (auto-discovered for OIDC-compliant providers like Google, Auth0, Dex)
 - `token_endpoint` — same: only for non-OIDC providers (e.g., GitHub, Snowflake)
 :::
 
-For a **non-OIDC provider** like GitHub, specify endpoints manually:
+For a **non-OIDC provider** such as GitHub, add both endpoints to `oauth.json`
+before sealing for the intended extension name:
 
-```bash
-rise extension create oauth-github -p my-app \
-  --type oauth \
-  --spec '{
-    "provider_name": "GitHub",
-    "client_id": "Iv1.abc123...",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://github.com",
-    "authorization_endpoint": "https://github.com/login/oauth/authorize",
-    "token_endpoint": "https://github.com/login/oauth/access_token",
-    "scopes": ["read:user", "user:email"]
-  }'
+```json
+{
+  "provider_name": "GitHub",
+  "client_id": "Iv1.abc123...",
+  "issuer_url": "https://github.com",
+  "authorization_endpoint": "https://github.com/login/oauth/authorize",
+  "token_endpoint": "https://github.com/login/oauth/access_token",
+  "scopes": ["read:user", "user:email"]
+}
 ```
+
 
 ### 3. Register the Rise callback URL upstream
 

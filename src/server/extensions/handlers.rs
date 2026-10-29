@@ -9,6 +9,23 @@ use axum::{
     Json,
 };
 
+/// Status responses expose provisioning metadata. Providers retain generated
+/// credential ciphertext in backend status; spec ciphertext remains opaque.
+fn redact_status(mut status: serde_json::Value) -> serde_json::Value {
+    fn redact(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.retain(|key, _| !key.ends_with("_encrypted"));
+                map.values_mut().for_each(redact);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+    redact(&mut status);
+    status
+}
+
 /// List all available extension types (registered providers)
 pub async fn list_extension_types(
     State(state): State<AppState>,
@@ -115,7 +132,7 @@ pub async fn create_extension(
             extension: ext_record.extension,
             extension_type: extension.extension_type().to_string(),
             spec: ext_record.spec,
-            status: ext_record.status,
+            status: redact_status(ext_record.status),
             status_summary,
             created: ext_record.created_at.to_rfc3339(),
             updated: ext_record.updated_at.to_rfc3339(),
@@ -199,7 +216,7 @@ pub async fn update_extension(
             extension: ext_record.extension,
             extension_type: extension.extension_type().to_string(),
             spec: ext_record.spec,
-            status: ext_record.status,
+            status: redact_status(ext_record.status),
             status_summary,
             created: ext_record.created_at.to_rfc3339(),
             updated: ext_record.updated_at.to_rfc3339(),
@@ -286,7 +303,7 @@ pub async fn patch_extension(
             extension: ext_record.extension,
             extension_type: extension.extension_type().to_string(),
             spec: ext_record.spec,
-            status: ext_record.status,
+            status: redact_status(ext_record.status),
             status_summary,
             created: ext_record.created_at.to_rfc3339(),
             updated: ext_record.updated_at.to_rfc3339(),
@@ -331,7 +348,7 @@ pub async fn list_extensions(
                 extension: e.extension,
                 extension_type: e.extension_type,
                 spec: e.spec,
-                status: e.status,
+                status: redact_status(e.status),
                 status_summary,
                 created: e.created_at.to_rfc3339(),
                 updated: e.updated_at.to_rfc3339(),
@@ -375,7 +392,7 @@ pub async fn get_extension(
         extension: ext.extension,
         extension_type: ext.extension_type,
         spec: ext.spec,
-        status: ext.status,
+        status: redact_status(ext.status),
         status_summary,
         created: ext.created_at.to_rfc3339(),
         updated: ext.updated_at.to_rfc3339(),
@@ -454,5 +471,34 @@ fn merge_json_with_nulls(
             // For non-objects, just replace with update value
             update.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_status;
+    use serde_json::json;
+
+    #[test]
+    fn redact_status_removes_nested_ciphertexts_and_keeps_the_rest() {
+        let status = json!({
+            "state": "Available",
+            "master_username": "rise",
+            "master_password_encrypted": "ct-master",
+            "databases": {
+                "app": {"user": "app", "password_encrypted": "ct-db", "status": "Ready"}
+            },
+            "keys": [{"iam_secret_access_key_encrypted": "ct-iam", "iam_access_key_id": "AKIA"}]
+        });
+
+        assert_eq!(
+            redact_status(status),
+            json!({
+                "state": "Available",
+                "master_username": "rise",
+                "databases": {"app": {"user": "app", "status": "Ready"}},
+                "keys": [{"iam_access_key_id": "AKIA"}]
+            })
+        );
     }
 }

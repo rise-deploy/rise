@@ -2,8 +2,6 @@
 ///
 /// This module provides fuzzy matching capabilities for project names, allowing
 /// helpful suggestions when users make typos.
-use super::models::Project;
-
 /// Calculate Jaro similarity between two strings
 ///
 /// Returns a score between 0.0 (no similarity) and 1.0 (identical)
@@ -104,20 +102,19 @@ pub fn jaro_winkler_distance(s1: &str, s2: &str) -> f64 {
 ///
 /// # Arguments
 /// * `input` - The input string to match against
-/// * `all_projects` - All available projects to search through
+/// * `names` - The project names to search through
 /// * `threshold` - Minimum similarity score (0.0-1.0). Recommended: 0.85
 ///
 /// # Returns
 /// Vector of project names sorted by similarity (descending)
-pub fn find_similar_projects(input: &str, all_projects: &[Project], threshold: f64) -> Vec<String> {
+pub fn find_similar_projects(input: &str, names: &[&str], threshold: f64) -> Vec<String> {
     let input_lower = input.to_lowercase();
 
-    let mut matches: Vec<(f64, String)> = all_projects
+    let mut matches: Vec<(f64, String)> = names
         .iter()
-        .map(|project| {
-            let project_name_lower = project.name.to_lowercase();
-            let score = jaro_winkler_distance(&input_lower, &project_name_lower);
-            (score, project.name.clone())
+        .map(|name| {
+            let score = jaro_winkler_distance(&input_lower, &name.to_lowercase());
+            (score, name.to_string())
         })
         .filter(|(score, _)| *score >= threshold)
         .collect();
@@ -168,8 +165,7 @@ mod tests {
 
     #[test]
     fn test_find_similar_projects_empty() {
-        let projects = vec![];
-        let similar = find_similar_projects("my-ap", &projects, 0.85);
+        let similar = find_similar_projects("my-ap", &[], 0.85);
         assert_eq!(similar.len(), 0);
     }
 }

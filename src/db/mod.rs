@@ -5,6 +5,7 @@ pub mod deployment_events;
 pub mod deployment_store;
 pub mod deployments;
 pub mod device_authorizations;
+pub mod encryption_migration;
 pub mod env_vars;
 pub mod environments;
 pub mod extensions;

@@ -43,11 +43,18 @@ Rise allows forwarding to any URL associated with the project (all deployment gr
   "provider_name": "Google",
   "description": "Sign in with Google",
   "client_id": "your-client-id",
-  "client_secret_encrypted": "rise_encrypted_secret",
+  "client_secret_encrypted": "rise:enc:v2:...",
   "issuer_url": "https://accounts.google.com",
   "scopes": ["openid", "email", "profile"]
 }
 ```
+
+Seal credentials with `rise encrypt --project PROJECT --extension-type oauth
+--extension NAME --slot /spec/client_secret_encrypted --oauth-spec oauth.json`.
+The OAuth configuration in `oauth.json` must match the destination and client
+settings used by the extension. Changing those settings requires resealing the
+secret. See the [OAuth user guide](/docs/user-guide/oauth/) for the complete
+stdin workflow.
 
 ## Optional Overrides
 

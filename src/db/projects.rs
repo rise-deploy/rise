@@ -744,6 +744,27 @@ pub async fn find_deleting(pool: &PgPool, limit: i64) -> Result<Vec<Project>> {
 
 // ==================== Finalizer Operations ====================
 
+#[cfg(feature = "backend")]
+pub async fn lock_active_with_finalizer(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: Uuid,
+    finalizer: &str,
+) -> Result<bool> {
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut **tx)
+        .await?;
+    let locked = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM projects WHERE id = $1 AND status NOT IN ('Deleting', 'Terminated') \
+         AND $2 = ANY(finalizers) FOR UPDATE",
+    )
+    .bind(id)
+    .bind(finalizer)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("Failed to lock active project cleanup obligation")?;
+    Ok(locked.is_some())
+}
+
 /// Add a finalizer to a project (idempotent - won't add if already exists)
 #[cfg(feature = "backend")]
 pub async fn add_finalizer(pool: &PgPool, id: Uuid, finalizer: &str) -> Result<()> {
@@ -867,6 +888,86 @@ mod tests {
     use crate::db::deployments::CreateDeploymentParams;
     use crate::db::models::{DeploymentStatus, ProjectStatus};
     use crate::server::deployment::models::DEFAULT_DEPLOYMENT_GROUP;
+
+    #[cfg(feature = "backend")]
+    #[sqlx::test]
+    async fn repository_binding_locks_only_the_active_managed_project(pool: PgPool) {
+        let user = crate::db::users::create(&pool, "ecr-owner@example.com")
+            .await
+            .unwrap();
+        let project = create(
+            &pool,
+            "ecr-owner",
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let finalizer = crate::server::ecr::ECR_FINALIZER;
+        let mut tx = pool.begin().await.unwrap();
+        assert!(!lock_active_with_finalizer(&mut tx, project.id, finalizer)
+            .await
+            .unwrap());
+        tx.rollback().await.unwrap();
+        add_finalizer(&pool, project.id, finalizer).await.unwrap();
+
+        let mut binding = pool.begin().await.unwrap();
+        assert!(
+            lock_active_with_finalizer(&mut binding, project.id, finalizer)
+                .await
+                .unwrap()
+        );
+        let mut deleting = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .execute(&mut *deleting)
+            .await
+            .unwrap();
+        let blocked = sqlx::query("UPDATE projects SET status = 'Deleting' WHERE id = $1")
+            .bind(project.id)
+            .execute(&mut *deleting)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            blocked.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        deleting.rollback().await.unwrap();
+        binding.commit().await.unwrap();
+
+        mark_deleting(&pool, project.id).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(!lock_active_with_finalizer(&mut tx, project.id, finalizer)
+            .await
+            .unwrap());
+        tx.rollback().await.unwrap();
+        delete(&pool, project.id).await.unwrap();
+        let replacement = create(
+            &pool,
+            &project.name,
+            ProjectStatus::Stopped,
+            "default".to_string(),
+            Some(user.id),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        add_finalizer(&pool, replacement.id, finalizer)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(!lock_active_with_finalizer(&mut tx, project.id, finalizer)
+            .await
+            .unwrap());
+        assert!(
+            lock_active_with_finalizer(&mut tx, replacement.id, finalizer)
+                .await
+                .unwrap()
+        );
+    }
 
     /// Test that project status is based on active deployment, not the latest deployment
     #[sqlx::test]

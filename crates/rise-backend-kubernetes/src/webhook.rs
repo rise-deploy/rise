@@ -101,6 +101,7 @@ pub struct FinalizeResponse {
 
 /// Duration after which image pull secret is refreshed (6 hours)
 const SECRET_REFRESH_HOURS: i64 = 6;
+const ANNOTATION_PULL_CREDENTIAL_SCOPE: &str = "rise.dev/pull-credential-scope";
 
 #[derive(Debug)]
 struct PreparedDeploymentEnvSecret {
@@ -1597,25 +1598,27 @@ async fn build_image_pull_secret(
     // Metacontroller keys namespaced children of cluster-scoped parents as "namespace/name"
     let secret_key = format!("{}/{}", namespace, IMAGE_PULL_SECRET_NAME);
 
-    // Check if existing secret is fresh enough
+    let provider = &resource_builder.url_builder.registry_provider;
+    let scope = provider
+        .project_pull_credential_scope(&project.name, project.id)
+        .await?;
     let needs_refresh = match observed.secrets.get(&secret_key) {
-        Some(secret_json) => {
-            let last_refresh = secret_json
-                .get("metadata")
-                .and_then(|m| m.get("annotations"))
+        Some(secret) => {
+            let annotations = secret.get("metadata").and_then(|m| m.get("annotations"));
+            let existing_scope = annotations
+                .and_then(|a| a.get(ANNOTATION_PULL_CREDENTIAL_SCOPE))
+                .and_then(|v| v.as_str());
+            let last_refresh = annotations
                 .and_then(|a| a.get(ANNOTATION_LAST_REFRESH))
                 .and_then(|v| v.as_str())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-
-            match last_refresh {
-                Some(ts) => {
-                    let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc));
-                    age > chrono::Duration::hours(SECRET_REFRESH_HOURS)
-                }
-                None => true, // No annotation → refresh
-            }
+            existing_scope != scope.as_deref()
+                || last_refresh.is_none_or(|ts| {
+                    Utc::now().signed_duration_since(ts.with_timezone(&Utc))
+                        > chrono::Duration::hours(SECRET_REFRESH_HOURS)
+                })
         }
-        None => true, // Not observed → create
+        None => true,
     };
 
     if !needs_refresh {
@@ -1635,6 +1638,9 @@ async fn build_image_pull_secret(
                 .unwrap_or_default();
             let mut annotations = std::collections::BTreeMap::new();
             annotations.insert(ANNOTATION_LAST_REFRESH.to_string(), last_refresh);
+            if let Some(scope) = &scope {
+                annotations.insert(ANNOTATION_PULL_CREDENTIAL_SCOPE.to_string(), scope.clone());
+            }
             return Ok(Some(Secret {
                 metadata: ObjectMeta {
                     name: Some(IMAGE_PULL_SECRET_NAME.to_string()),
@@ -1649,23 +1655,22 @@ async fn build_image_pull_secret(
         }
     }
 
-    // Fetch fresh pull credentials (scoped to this project's repository)
-    let credentials = resource_builder
-        .url_builder
-        .registry_provider
-        .get_k8s_pull_credentials(&project.name)
+    let (credentials, minted_scope) = provider
+        .get_project_pull_credentials_with_scope(&project.name, project.id)
         .await?;
-    let registry_host = resource_builder
-        .url_builder
-        .registry_provider
-        .registry_host();
-
-    let secret = resource_builder.create_dockerconfigjson_secret(
+    let mut secret = resource_builder.create_dockerconfigjson_secret(
         IMAGE_PULL_SECRET_NAME,
         namespace,
-        registry_host,
+        provider.registry_host(),
         &credentials,
     )?;
+    if let Some(scope) = minted_scope {
+        secret
+            .metadata
+            .annotations
+            .get_or_insert_default()
+            .insert(ANNOTATION_PULL_CREDENTIAL_SCOPE.to_string(), scope);
+    }
 
     Ok(Some(secret))
 }
@@ -2146,6 +2151,7 @@ mod tests {
         async fn get_credentials(
             &self,
             _repository: &str,
+            _project_id: uuid::Uuid,
             _tags: &[&str],
         ) -> Result<RegistryCredentials> {
             unreachable!("not used in these tests")
@@ -2166,6 +2172,133 @@ mod tests {
         fn get_image_tag(&self, repository: &str, tag: &str, _tag_type: ImageTagType) -> String {
             format!("registry.example.test/rise/{repository}:{tag}")
         }
+    }
+
+    struct RotatingRegistry {
+        project_id: uuid::Uuid,
+        scope: std::sync::Mutex<Option<String>>,
+        mints: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RegistryProvider for RotatingRegistry {
+        async fn get_credentials(
+            &self,
+            _: &str,
+            _: uuid::Uuid,
+            _: &[&str],
+        ) -> Result<RegistryCredentials> {
+            unreachable!()
+        }
+        async fn get_pull_credentials(&self) -> Result<(String, String)> {
+            unreachable!()
+        }
+        async fn get_project_pull_credentials(
+            &self,
+            _: &str,
+            project_id: uuid::Uuid,
+        ) -> Result<RegistryCredentials> {
+            assert_eq!(project_id, self.project_id);
+            self.mints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(RegistryCredentials {
+                registry_url: self.registry_host().into(),
+                username: "test".into(),
+                password: self
+                    .scope
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "unscoped".into()),
+                expires_in: None,
+                auth_method: Default::default(),
+            })
+        }
+        async fn project_pull_credential_scope(
+            &self,
+            _: &str,
+            project_id: uuid::Uuid,
+        ) -> Result<Option<String>> {
+            assert_eq!(project_id, self.project_id);
+            Ok(self.scope.lock().unwrap().clone())
+        }
+        fn registry_host(&self) -> &str {
+            "registry.example.test"
+        }
+        fn registry_url(&self) -> &str {
+            "registry.example.test/rise"
+        }
+        fn get_image_tag(&self, _: &str, _: &str, _: ImageTagType) -> String {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn image_pull_secret_refreshes_rotated_scope_and_preserves_other_providers() {
+        use std::sync::atomic::Ordering;
+        let project = test_project();
+        let provider = Arc::new(RotatingRegistry {
+            project_id: project.id,
+            scope: std::sync::Mutex::new(Some("first".into())),
+            mints: Default::default(),
+        });
+        let mut builder = test_resource_builder();
+        builder.url_builder.registry_provider = provider.clone();
+        let mut observed = ObservedChildren::default();
+        let first = build_image_pull_secret(&builder, &project, "demo", &observed)
+            .await
+            .unwrap()
+            .unwrap();
+        observed.secrets.insert(
+            format!("demo/{IMAGE_PULL_SECRET_NAME}"),
+            serde_json::to_value(&first).unwrap(),
+        );
+        let unchanged = build_image_pull_secret(&builder, &project, "demo", &observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.mints.load(Ordering::SeqCst), 1);
+        assert_eq!(unchanged.data, first.data);
+        *provider.scope.lock().unwrap() = Some("second".into());
+        let second = build_image_pull_secret(&builder, &project, "demo", &observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.mints.load(Ordering::SeqCst), 2);
+        assert_ne!(second.data, first.data);
+        assert_eq!(
+            second.metadata.annotations.as_ref().unwrap()[ANNOTATION_PULL_CREDENTIAL_SCOPE],
+            "second"
+        );
+        observed.secrets.insert(
+            format!("demo/{IMAGE_PULL_SECRET_NAME}"),
+            serde_json::to_value(&second).unwrap(),
+        );
+        *provider.scope.lock().unwrap() = None;
+        let unscoped = build_image_pull_secret(&builder, &project, "demo", &observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.mints.load(Ordering::SeqCst), 3);
+        assert!(!unscoped
+            .metadata
+            .annotations
+            .as_ref()
+            .unwrap()
+            .contains_key(ANNOTATION_PULL_CREDENTIAL_SCOPE));
+        observed.secrets.insert(
+            format!("demo/{IMAGE_PULL_SECRET_NAME}"),
+            serde_json::to_value(&unscoped).unwrap(),
+        );
+        // A provider using the default None contract reuses a fresh unscoped Secret.
+        builder.url_builder.registry_provider = Arc::new(TestRegistryProvider);
+        assert_eq!(
+            build_image_pull_secret(&builder, &project, "demo", &observed)
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            unscoped.data
+        );
     }
 
     // ── should_have_infrastructure ─────────────────────────────────────
@@ -2273,7 +2406,16 @@ mod tests {
         let mut encrypted_env_vars = Vec::new();
         for mut var in env_vars {
             if var.is_secret {
-                var.value = provider.encrypt(&var.value).await.unwrap();
+                var.value = provider
+                    .encrypt(
+                        &var.value,
+                        &rise_backend_core::EncryptionContext::deployment_env(
+                            var.deployment_id,
+                            &var.key,
+                        ),
+                    )
+                    .await
+                    .unwrap();
             }
             encrypted_env_vars.push(var);
         }
@@ -2444,6 +2586,7 @@ mod tests {
                 ingress_port: None,
                 ingress_schema: "https".to_string(),
                 registry_provider: Arc::new(TestRegistryProvider),
+                control_plane_hosts: Vec::new(),
             },
             auth_backend_url: "https://auth.example.test".to_string(),
             auth_signin_url: "https://signin.example.test".to_string(),
@@ -2582,7 +2725,13 @@ mod tests {
     async fn resolve_deployment_env_vars_trims_whitespace_from_secret_keys() {
         let provider = rise_backend_core::test_helpers::ReversibleEncryptionProvider;
         let raw_value = "secret-value";
-        let encrypted = provider.encrypt(raw_value).await.unwrap();
+        let encrypted = provider
+            .encrypt(
+                raw_value,
+                &rise_backend_core::EncryptionContext::internal("test"),
+            )
+            .await
+            .unwrap();
 
         let env_vars = vec![test_env_var(" SECRET_KEY", &encrypted, true, false)];
 

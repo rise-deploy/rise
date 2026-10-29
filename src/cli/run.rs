@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
+use std::io::Write as _;
 use std::process::{Command, Stdio};
 use tracing::{info, warn};
 
@@ -268,8 +269,21 @@ fn run_container(spec: RunContainerSpec<'_>) -> Result<()> {
         .arg(format!("{}:{}", spec.expose, spec.http_port))
         .arg("--add-host=host.docker.internal:host-gateway");
 
-    for (key, value) in spec.env {
-        cmd.arg("-e").arg(format!("{}={}", key, value));
+    // Values stay out of the argument list, which other local users can read:
+    // most go through an owner-only env file, the rest through this process's
+    // child environment.
+    let run_env = RunEnv::new(spec.env);
+    let mut env_file = tempfile::Builder::new()
+        .prefix("rise-run-")
+        .suffix(".env")
+        .tempfile()
+        .context("Failed to create temporary env file")?;
+    env_file
+        .write_all(run_env.env_file.as_bytes())
+        .context("Failed to write temporary env file")?;
+    cmd.arg("--env-file").arg(env_file.path());
+    for (key, value) in &run_env.inherited {
+        cmd.arg("-e").arg(key).env(key, value);
     }
 
     cmd.arg(spec.image_tag);
@@ -299,6 +313,42 @@ fn run_container(spec: RunContainerSpec<'_>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The container environment for `docker run`, split by how each value reaches
+/// the container CLI.
+#[derive(Debug, PartialEq, Eq)]
+struct RunEnv {
+    /// `KEY=VALUE` lines for `--env-file`, which reads each value verbatim up to
+    /// the end of its line.
+    env_file: String,
+    /// Variables named with a bare `-e KEY` and set on the container CLI's own
+    /// environment: values an env file cannot carry (line breaks) or that
+    /// Podman would unquote (a leading quote).
+    inherited: Vec<(String, String)>,
+}
+
+impl RunEnv {
+    /// Later entries for the same key win, matching repeated `-e` flags.
+    fn new(env: &[(String, String)]) -> Self {
+        let mut resolved: Vec<(&str, &str)> = Vec::new();
+        for (key, value) in env {
+            resolved.retain(|(k, _)| *k != key.as_str());
+            resolved.push((key, value));
+        }
+        let mut run_env = RunEnv {
+            env_file: String::new(),
+            inherited: Vec::new(),
+        };
+        for (key, value) in resolved {
+            if value.contains(['\n', '\r']) || value.starts_with(['"', '\'']) {
+                run_env.inherited.push((key.to_string(), value.to_string()));
+            } else {
+                run_env.env_file.push_str(&format!("{key}={value}\n"));
+            }
+        }
+        run_env
+    }
 }
 
 /// Decide which container `rise run` should run.
@@ -362,7 +412,7 @@ fn local_image_tag(project_name: Option<&str>, container: Option<&str>) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::optional_project_env_token;
+    use super::{optional_project_env_token, RunEnv};
     use crate::token_source::TokenSourceError;
 
     #[test]
@@ -386,5 +436,24 @@ mod tests {
         .to_string();
 
         assert!(err.contains("Failed to resolve token for project environment variables"));
+    }
+
+    #[test]
+    fn run_env_keeps_values_out_of_arguments() {
+        let env = [
+            ("TOKEN".to_string(), "first".to_string()),
+            ("PEM".to_string(), "-----BEGIN-----\nabc".to_string()),
+            ("QUOTED".to_string(), "\"x\"".to_string()),
+            ("TOKEN".to_string(), "s3cr3t with = and spaces ".to_string()),
+        ];
+        let run_env = RunEnv::new(&env);
+        assert_eq!(run_env.env_file, "TOKEN=s3cr3t with = and spaces \n");
+        assert_eq!(
+            run_env.inherited,
+            vec![
+                ("PEM".to_string(), "-----BEGIN-----\nabc".to_string()),
+                ("QUOTED".to_string(), "\"x\"".to_string()),
+            ]
+        );
     }
 }

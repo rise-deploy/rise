@@ -84,10 +84,11 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `RISE_IMAGE_TAG` | `0.23.0` | **Manual stable image pin** — bump on upgrade; set an exact published tag for a prerelease. There is no automatic "latest released" resolution. |
 | `RISE_IMAGE_REPOSITORY` | `ghcr.io/rise-deploy/rise` | Override for a fork/mirror. |
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
-| `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`. `openssl rand -base64 32`. |
-| `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key. `openssl rand -base64 32`. |
+| `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`; Rise refuses placeholder keys unless insecure development mode is explicitly enabled. `openssl rand -base64 32`. |
+| `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key; refused like the signing secret. `openssl rand -base64 32`. |
 | `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it.** Keep in sync with the Dex client secret in `dev/dex/config.yaml`. |
 | `OIDC_GROUP_CLAIM` | `groups` | ID-token claim containing group names. Set to `cognito:groups` for AWS Cognito. |
+| `RISE_AUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept ID tokens without an `email_verified` claim. See [`auth.allow_missing_email_verified`](/operator-docs/configuration/#auth-settings). |
 | `RISE_IDP_GROUP_SYNC_PREFIXES` | empty | Optional comma-separated prefixes limiting which canonical IdP groups become Rise teams. |
 | `ADMIN_EMAIL` | `admin@example.com` | Initial admin user. |
 | `RISE_PLATFORM_ACCESS_POLICY` | `allow_all` | Who may use the CLI/API/dashboard. `allow_all` = any authenticated user; `restrictive` = allowlist only (see [Platform access](#platform-access)). |

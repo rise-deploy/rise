@@ -140,7 +140,7 @@ output "rise_config" {
       security_groups         = [module.security.groups.apps]
       assign_public_ip        = false
       execution_role_arn      = var.execution_role_arn
-      task_role_arn           = local.workload_task_role_arn
+      task_role_arn           = var.workload_task_role_arn
       log_group               = module.cluster.logging.name
       resource_prefix         = var.resource_prefix
       ssm_parameter_prefix    = var.ssm_parameter_prefix

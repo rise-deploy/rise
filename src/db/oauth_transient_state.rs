@@ -29,10 +29,7 @@ impl<T> ClaimedState<T> {
         let affected = finalize(&self.pool, &self.lookup_key, self.claimant_id).await?;
         self.settled = true;
         if !affected {
-            anyhow::bail!(
-                "finalize affected 0 rows for lookup_key={}: claim may have expired or been stolen",
-                self.lookup_key
-            );
+            anyhow::bail!("finalize affected 0 rows: claim may have expired or been stolen");
         }
         Ok(())
     }
@@ -42,10 +39,7 @@ impl<T> ClaimedState<T> {
         let affected = release_claim(&self.pool, &self.lookup_key, self.claimant_id).await?;
         self.settled = true;
         if !affected {
-            anyhow::bail!(
-                "release affected 0 rows for lookup_key={}: claim may have expired or been stolen",
-                self.lookup_key
-            );
+            anyhow::bail!("release affected 0 rows: claim may have expired or been stolen");
         }
         Ok(())
     }
@@ -70,7 +64,6 @@ impl<T> Drop for ClaimedState<T> {
         let claimant_id = self.claimant_id;
 
         tracing::warn!(
-            lookup_key,
             claimant_id = %claimant_id,
             "claimed oauth transient state dropped without explicit settlement; releasing defensively"
         );
@@ -80,7 +73,6 @@ impl<T> Drop for ClaimedState<T> {
                 if let Err(error) = release_claim(&pool, &lookup_key, claimant_id).await {
                     tracing::warn!(
                         ?error,
-                        lookup_key,
                         claimant_id = %claimant_id,
                         "defensive release for dropped oauth transient state failed"
                     );
@@ -88,7 +80,6 @@ impl<T> Drop for ClaimedState<T> {
             });
         } else {
             tracing::warn!(
-                lookup_key,
                 claimant_id = %claimant_id,
                 "no tokio runtime available for defensive release of dropped oauth transient state"
             );
@@ -332,5 +323,52 @@ mod tests {
             "row should be claimable again after defensive release"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_faults {
+    use super::*;
+
+    pub async fn reject_deletes(pool: &PgPool) -> Result<()> {
+        sqlx::query(
+            "CREATE FUNCTION reject_oauth_transient_state_delete() RETURNS trigger
+             LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected transient state deletion failure'; END $$",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_oauth_transient_state_delete BEFORE DELETE ON oauth_transient_state
+             FOR EACH ROW EXECUTE FUNCTION reject_oauth_transient_state_delete()",
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn allow_deletes(pool: &PgPool) -> Result<()> {
+        sqlx::query("DROP TRIGGER reject_oauth_transient_state_delete ON oauth_transient_state")
+            .execute(pool)
+            .await?;
+        sqlx::query("DROP FUNCTION reject_oauth_transient_state_delete()")
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn wait_until_released(pool: &PgPool, lookup_key: &str) -> Result<()> {
+        for _ in 0..100 {
+            let released: bool = sqlx::query_scalar(
+                "SELECT claimed_by IS NULL FROM oauth_transient_state WHERE lookup_key = $1",
+            )
+            .bind(lookup_key)
+            .fetch_one(pool)
+            .await?;
+            if released {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("transient state claim was not released after deletion failure")
     }
 }

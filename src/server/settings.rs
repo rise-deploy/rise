@@ -319,6 +319,13 @@ pub struct ServerSettings {
     pub host: String,
     pub port: u16,
     pub public_url: String,
+    /// Permit publicly known placeholder keys for an explicitly insecure development stack.
+    /// Never enable this on an installation reachable by untrusted clients.
+    #[serde(
+        default,
+        deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+    )]
+    pub allow_insecure_development_keys: bool,
     /// Development-only frontend proxy target (for Vite), e.g. "http://localhost:5173"
     /// When set, non-API frontend routes are proxied to this URL instead of serving embedded assets.
     /// An empty/whitespace value (e.g. an unset `${VAR:-}` env default) is treated as `None`
@@ -709,6 +716,17 @@ fn default_oauth_scopes() -> Vec<String> {
     ]
 }
 
+/// Policy for a missing or null group claim when IdP group sync is enabled.
+#[derive(Debug, Default, Deserialize, Clone, Copy, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingGroupClaimPolicy {
+    /// Refuse login without an authoritative membership assertion.
+    #[default]
+    RefuseLogin,
+    /// Interpret a missing/null assertion as no groups and remove mirrored memberships.
+    TreatAsEmpty,
+}
+
 /// Supported active sync sources for pulling users and groups
 #[derive(Debug, Deserialize, Clone, JsonSchema, PartialEq)]
 pub enum ActiveSyncSource {
@@ -732,8 +750,9 @@ pub struct AuthSettings {
     pub client_secret: String,
     /// List of admin user emails for the default organization. Admins do NOT
     /// implicitly receive the Operator role — list the email in
-    /// `operator_users` separately if needed.
-    #[serde(default)]
+    /// `operator_users` separately if needed. Blank entries are filtered out
+    /// so an unset `${VAR:-}` default collapses to an empty list.
+    #[serde(default, deserialize_with = "deserialize_blank_filtered_list")]
     pub admin_users: Vec<String>,
     /// IdP groups whose members are admins, as an alternative to listing every
     /// admin email in `admin_users`. A user matches when they belong to an
@@ -765,8 +784,8 @@ pub struct AuthSettings {
     /// access token.
     ///
     /// Leaving this `true` keeps the legacy attack surface and forfeits the
-    /// security benefits of the exchange (no service-account DB lookups in the
-    /// request hot path, and an authenticated `platform/capabilities`). While it
+    /// security benefits of the exchange (no per-request service-account claim
+    /// matching, and an authenticated `platform/capabilities`). While it
     /// is `true`, every *accepted* raw-token request emits one
     /// `rise::deprecation` `tracing` event carrying the validated `issuer`/`sub`,
     /// so operators can aggregate it in their log pipeline to see which workload
@@ -779,7 +798,8 @@ pub struct AuthSettings {
     #[serde(default = "default_allow_team_creation")]
     pub allow_team_creation: bool,
     /// Allow all users to list all teams (default: false).
-    /// When false, non-admin users only see teams they are members of.
+    /// When false, non-admin users only see (list or fetch) teams they are
+    /// members of; any other team answers as not found.
     #[serde(default = "default_allow_list_all_teams")]
     pub allow_list_all_teams: bool,
     /// Optional custom authorize endpoint URL
@@ -792,6 +812,20 @@ pub struct AuthSettings {
     /// or default to {issuer}/token
     #[serde(default)]
     pub token_url: Option<String>,
+    /// Accept ID tokens that carry no `email_verified` claim (default: false).
+    ///
+    /// Rise matches users, `admin_users`, `operator_users`, and the
+    /// platform-access email allowlist by the ID token's `email`, so a login is
+    /// refused unless the IdP marks that address `email_verified: true`. Set
+    /// this only for an IdP that omits the claim yet guarantees every address
+    /// it puts in `email` belongs to the signed-in user, such as one whose
+    /// addresses are all assigned by its administrators. `email_verified:
+    /// false` is refused regardless.
+    #[serde(
+        default,
+        deserialize_with = "crate::server::ssrf::deserialize_bool_flexible"
+    )]
+    pub allow_missing_email_verified: bool,
     /// Enable IdP group synchronization (default: true).
     /// When enabled, user team memberships are synchronized from the configured
     /// IdP group claim on login.
@@ -801,6 +835,10 @@ pub struct AuthSettings {
     /// For example, AWS Cognito commonly exposes groups as "cognito:groups".
     #[serde(default = "default_idp_group_claim")]
     pub idp_group_claim: String,
+    /// Missing/null group claim policy when group sync is enabled (default: refuse_login).
+    /// Set treat_as_empty for an IdP that omits the claim when a user has no groups.
+    #[serde(default)]
+    pub idp_group_missing_claim_policy: MissingGroupClaimPolicy,
     /// Optional prefixes limiting which canonical IdP group names are mirrored
     /// into Rise teams during login. An empty list accepts every canonical
     /// group name.
@@ -1981,6 +2019,10 @@ pub enum EncryptionSettings {
         /// Base64-encoded 32-byte encryption key
         /// Generate with: openssl rand -base64 32
         key: String,
+        /// Key used only to read unbound ciphertext during the startup baseline migration.
+        // Remove once every environment has completed the v2 credential baseline migration.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        migration_source_key: Option<String>,
     },
     /// AWS KMS encryption
     #[serde(rename = "aws-kms")]
@@ -2010,7 +2052,9 @@ impl Settings {
         s: &str,
         env_lookup: &impl Fn(&str) -> Option<String>,
     ) -> String {
-        let re = regex::Regex::new(r"\$\{([^}:]+)(?::-([^}]*))?\}").unwrap();
+        // A default may contain `{placeholder}` groups, as the ingress URL
+        // templates' defaults do, so it runs to the brace that closes `${`.
+        let re = regex::Regex::new(r"\$\{([^}:]+)(?::-((?:[^{}]|\{[^{}]*\})*))?\}").unwrap();
 
         re.replace_all(s, |caps: &regex::Captures| {
             let var_name = &caps[1];
@@ -2220,8 +2264,29 @@ impl Settings {
         // Validate that JWT signing secret is set and valid
         if settings.server.jwt_signing_secret.is_empty() {
             return Err(ConfigError::Message(
-                "JWT signing secret not configured. Set RISE_SERVER__JWT_SIGNING_SECRET environment variable or [server] jwt_signing_secret in config. Generate with: openssl rand -base64 32".to_string()
+                "JWT signing secret not configured. Set server.jwt_signing_secret in config; the shipped configs read it from RISE_JWT_SIGNING_SECRET. Generate with: openssl rand -base64 32".to_string()
             ));
+        }
+
+        if !settings.server.allow_insecure_development_keys {
+            if is_all_zero_key(&settings.server.jwt_signing_secret) {
+                return Err(ConfigError::Message(
+                    "server.jwt_signing_secret is the all-zero placeholder. Set RISE_JWT_SIGNING_SECRET \
+                     (generate with openssl rand -base64 32). An isolated development stack may \
+                     explicitly set server.allow_insecure_development_keys=true".to_string(),
+                ));
+            }
+            if let Some(EncryptionSettings::Local { key, .. }) = &settings.encryption {
+                if is_all_zero_key(key) {
+                    return Err(ConfigError::Message(
+                        "encryption.key is the all-zero placeholder. Set RISE_ENCRYPTION_KEY \
+                         (generate with openssl rand -base64 32). An isolated development stack may \
+                         explicitly set server.allow_insecure_development_keys=true".to_string(),
+                    ));
+                }
+            }
+        } else {
+            tracing::warn!("Insecure development placeholder keys are explicitly permitted");
         }
 
         if settings.auth.idp_group_claim.trim().is_empty() {
@@ -2695,9 +2760,21 @@ impl Settings {
     }
 }
 
+/// Whether a base64 key decodes to nothing but zero bytes.
+fn is_all_zero_key(key: &str) -> bool {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(key.trim())
+        .is_ok_and(|bytes| !bytes.is_empty() && bytes.iter().all(|b| *b == 0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Non-placeholder base64 keys for loading shipped configs off localhost.
+    const TEST_JWT_SECRET: &str = "c2VjcmV0LWtleS1mb3ItdGVzdGluZy0xMjM0NTY3OA==";
+    const TEST_ENCRYPTION_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 
     fn minimal_settings_json() -> serde_json::Value {
         serde_json::json!({
@@ -2733,6 +2810,24 @@ mod tests {
         let settings: Settings = serde_json::from_value(json).unwrap();
 
         assert_eq!(settings.reserved_project_names, ["grafana", "prometheus"]);
+    }
+
+    #[test]
+    fn missing_group_policy_defaults_to_refusal_and_accepts_empty_policy() {
+        let mut json = minimal_settings_json();
+        let settings: Settings = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            settings.auth.idp_group_missing_claim_policy,
+            MissingGroupClaimPolicy::RefuseLogin
+        );
+        json["auth"]["idp_group_missing_claim_policy"] = serde_json::json!("treat_as_empty");
+        let settings: Settings = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            settings.auth.idp_group_missing_claim_policy,
+            MissingGroupClaimPolicy::TreatAsEmpty
+        );
+        json["auth"]["idp_group_missing_claim_policy"] = serde_json::json!("ignore");
+        assert!(serde_json::from_value::<Settings>(json).is_err());
     }
 
     #[test]
@@ -2934,6 +3029,21 @@ mod tests {
             &|name| (name == "OVERRIDE_VAR").then(|| "actual_value".to_string()),
         );
         assert_eq!(result, "actual_value");
+    }
+
+    #[test]
+    fn test_substitute_env_vars_in_string_default_with_placeholders() {
+        let template = "${TEMPLATE:-{project_name}--{deployment_group}.preview.rise.dev}";
+        assert_eq!(
+            Settings::substitute_env_vars_in_string_with(template, &|_| None),
+            "{project_name}--{deployment_group}.preview.rise.dev"
+        );
+        assert_eq!(
+            Settings::substitute_env_vars_in_string_with(template, &|_| {
+                Some("{project_name}-{deployment_group}.example.org".to_string())
+            }),
+            "{project_name}-{deployment_group}.example.org"
+        );
     }
 
     #[test]
@@ -3331,6 +3441,94 @@ auth:
         );
     }
 
+    fn load_with_public_url(
+        public_url: &str,
+        encryption: &str,
+        allow_insecure: bool,
+    ) -> Result<Settings, ConfigError> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("production.yaml"),
+            format!(
+                r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "{public_url}"
+  allow_insecure_development_keys: {allow_insecure}
+  jwt_signing_secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+{encryption}
+"#
+            ),
+        )
+        .unwrap();
+        Settings::new_with_env(temp_dir.path().to_str().unwrap(), "production", &|_| None)
+    }
+
+    #[test]
+    fn placeholder_keys_require_explicit_opt_in_even_for_local_hostnames() {
+        for url in [
+            "http://localhost:3000",
+            "http://rise.localhost:3000",
+            "http://rise.local:3000",
+            "http://127.0.0.1:3000",
+        ] {
+            assert!(
+                load_with_public_url(url, "", false).is_err(),
+                "{url} is no isolation proof"
+            );
+            load_with_public_url(url, "", true)
+                .unwrap_or_else(|e| panic!("explicit development opt-in rejected for {url}: {e}"));
+        }
+    }
+
+    #[test]
+    fn placeholder_jwt_secret_is_refused_off_localhost() {
+        let error = load_with_public_url("https://rise.example.com", "", false)
+            .expect_err("placeholder JWT secret must be refused");
+        assert!(error.to_string().contains("RISE_JWT_SIGNING_SECRET"));
+    }
+
+    #[test]
+    fn placeholder_encryption_key_is_refused_off_localhost() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("production.yaml"),
+            r#"
+server:
+  host: "0.0.0.0"
+  port: 3000
+  public_url: "https://rise.example.com"
+  jwt_signing_secret: "c2VjcmV0LWtleS1mb3ItdGVzdGluZy0xMjM0NTY3OA=="
+
+database:
+  url: "postgres://test@localhost/test"
+
+auth:
+  issuer: "http://localhost:5556"
+  client_id: "test"
+  client_secret: "test"
+
+encryption:
+  type: "aes-gcm-256"
+  key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+"#,
+        )
+        .unwrap();
+        let error =
+            Settings::new_with_env(temp_dir.path().to_str().unwrap(), "production", &|_| None)
+                .expect_err("placeholder encryption key must be refused");
+        assert!(error.to_string().contains("RISE_ENCRYPTION_KEY"));
+    }
+
     #[test]
     fn test_resource_gc_settings_defaults() {
         let s = ResourceGcSettings::default();
@@ -3538,7 +3736,11 @@ auth:
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let env_lookup = move |name: &str| owned.get(name).cloned();
+        let env_lookup = move |name: &str| {
+            owned.get(name).cloned().or_else(|| {
+                (name == "RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS").then(|| "true".to_string())
+            })
+        };
 
         Settings::new_with_env(temp_dir.path().to_str().unwrap(), "docker", &env_lookup)
     }
@@ -3577,7 +3779,11 @@ auth:
         if let Some(overlay) = overlay {
             owned.insert("RISE_LOCAL_CONFIG_YAML".to_string(), overlay.to_string());
         }
-        let env_lookup = move |name: &str| owned.get(name).cloned();
+        let env_lookup = move |name: &str| {
+            owned.get(name).cloned().or_else(|| {
+                (name == "RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS").then(|| "true".to_string())
+            })
+        };
 
         Settings::new_with_env(temp_dir.path().to_str().unwrap(), "ecs", &env_lookup)
     }
@@ -3685,6 +3891,8 @@ deployment_logs:
     fn ecs_local_config_yaml_supplies_the_local_layer() {
         let mut env = ecs_base_env();
         env.insert("OVERLAY_PUBLIC_URL", "https://control.example.com");
+        env.insert("RISE_JWT_SIGNING_SECRET", TEST_JWT_SECRET);
+        env.insert("RISE_ENCRYPTION_KEY", TEST_ENCRYPTION_KEY);
 
         let settings = load_shipped_ecs_config_with_overlay(
             &env,
@@ -3790,6 +3998,73 @@ server:
         env.insert("RISE_ECS_SECURITY_GROUPS", "sg-abc");
         env.insert("RISE_ECS_LOG_GROUP", "/rise-e2e");
         env
+    }
+
+    #[test]
+    fn shipped_ecs_config_names_no_admin_unless_admin_email_is_set() {
+        let settings = load_shipped_ecs_config(&ecs_base_env()).expect("ecs.yaml must load");
+        assert!(settings.auth.admin_users.is_empty());
+
+        let mut env = ecs_base_env();
+        env.insert("ADMIN_EMAIL", "ops@example.org");
+        let settings = load_shipped_ecs_config(&env).expect("ecs.yaml must load");
+        assert_eq!(settings.auth.admin_users, ["ops@example.org"]);
+    }
+
+    #[test]
+    fn shipped_production_config_names_no_admin_unless_admin_email_is_set() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let production_yaml = fs::read_to_string(format!("{manifest_dir}/config/production.yaml"))
+            .expect("config/production.yaml must exist");
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("production.yaml"), production_yaml).unwrap();
+
+        let load = |admin_email: Option<&str>| {
+            let admin_email = admin_email.map(str::to_string);
+            Settings::new_with_env(
+                temp_dir.path().to_str().unwrap(),
+                "production",
+                &move |name| match name {
+                    "DATABASE_URL" => Some("postgres://u@db/rise".to_string()),
+                    "RISE_JWT_SIGNING_SECRET" => {
+                        Some("c2VjcmV0LXNlY3JldC1zZWNyZXQtc2VjcmV0LTEyMzQ=".to_string())
+                    }
+                    "PUBLIC_URL" => Some("https://rise.example.org".to_string()),
+                    "OIDC_ISSUER" => Some("https://id.example.org".to_string()),
+                    "AWS_ACCOUNT_ID" => Some("123456789012".to_string()),
+                    "ECR_CONTROLLER_ROLE_ARN" => {
+                        Some("arn:aws:iam::123456789012:role/rise".to_string())
+                    }
+                    "ECR_PUSH_ROLE_ARN" => {
+                        Some("arn:aws:iam::123456789012:role/rise-push".to_string())
+                    }
+                    "KMS_KEY_ID" => Some("alias/rise".to_string()),
+                    "RISE_METACONTROLLER_POD_NAMESPACE" => Some("rise-system".to_string()),
+                    "RISE_AUTH_BACKEND_URL" => Some("http://rise.rise-system:3000".to_string()),
+                    "RISE_PRODUCTION_INGRESS_URL_TEMPLATE" => {
+                        Some("{project_name}.apps.example.org".to_string())
+                    }
+                    "RISE_STAGING_INGRESS_URL_TEMPLATE" => {
+                        Some("{project_name}--{deployment_group}.preview.example.org".to_string())
+                    }
+                    "RISE_ENVIRONMENT_INGRESS_URL_TEMPLATE" => {
+                        Some("{project_name}--{environment}.preview.example.org".to_string())
+                    }
+                    "ADMIN_EMAIL" => admin_email.clone(),
+                    _ => None,
+                },
+            )
+            .expect("production.yaml must load")
+        };
+
+        assert!(load(None).auth.admin_users.is_empty());
+        assert_eq!(
+            load(Some("ops@example.org")).auth.admin_users,
+            ["ops@example.org"]
+        );
     }
 
     #[test]
@@ -4150,6 +4425,7 @@ registry:
     fn shipped_docker_config_loads_with_prod_env() {
         // PROD: env vars flip the same file to https / le / the real domain.
         let mut env = std::collections::HashMap::new();
+        env.insert("RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS", "false");
         env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
         env.insert("PUBLIC_URL", "https://rise.example.com");
         env.insert("RISE_INGRESS_DOMAIN", "example.com");
@@ -4157,6 +4433,23 @@ registry:
         env.insert("RISE_CERTRESOLVER", "le");
         env.insert("RISE_TRAEFIK_ENTRYPOINT", "websecure");
         env.insert("RISE_COOKIE_SECURE", "true");
+
+        // Production forbids publicly known signing and encryption keys.
+        let error = load_shipped_docker_config(&env)
+            .expect_err("shipped docker.yaml must refuse its placeholder secrets off localhost");
+        assert!(
+            error.to_string().contains("RISE_JWT_SIGNING_SECRET"),
+            "unhelpful message: {error}"
+        );
+        env.insert("RISE_JWT_SIGNING_SECRET", TEST_JWT_SECRET);
+        let error = load_shipped_docker_config(&env)
+            .expect_err("shipped docker.yaml must refuse its placeholder encryption key");
+        assert!(
+            error.to_string().contains("RISE_ENCRYPTION_KEY"),
+            "unhelpful message: {error}"
+        );
+        env.insert("RISE_ENCRYPTION_KEY", TEST_ENCRYPTION_KEY);
+
         let settings = load_shipped_docker_config(&env)
             .expect("shipped docker.yaml must load with prod env set");
 
@@ -4286,6 +4579,46 @@ registry:
         classes.insert("private".to_string(), None);
 
         assert!(access_classes_missing_auth_backend_url(&classes, "").is_empty());
+    }
+    #[test]
+    fn migration_source_key_empty_defaults_to_none() {
+        let absent: EncryptionSettings = serde_json::from_value(
+            serde_json::json!({"type":"aes-gcm-256", "key":TEST_ENCRYPTION_KEY}),
+        )
+        .unwrap();
+        assert!(matches!(
+            absent,
+            EncryptionSettings::Local {
+                migration_source_key: None,
+                ..
+            }
+        ));
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("   "),
+        ] {
+            let config: EncryptionSettings = serde_json::from_value(serde_json::json!({"type":"aes-gcm-256", "key":TEST_ENCRYPTION_KEY, "migration_source_key":value})).unwrap();
+            assert!(matches!(
+                config,
+                EncryptionSettings::Local {
+                    migration_source_key: None,
+                    ..
+                }
+            ));
+        }
+        let mut value = minimal_settings_json();
+        value["server"]["public_url"] = serde_json::json!("https://rise.example.com");
+        value["server"]["jwt_signing_secret"] = serde_json::json!(TEST_JWT_SECRET);
+        value["database"] = serde_json::json!({"url":"postgres://test@localhost/test"});
+        value["encryption"] = serde_json::json!({"type":"aes-gcm-256", "key":TEST_ENCRYPTION_KEY, "migration_source_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("production.yaml"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .unwrap();
+        Settings::new_with_env(dir.path().to_str().unwrap(), "production", &|_| None).unwrap();
     }
 }
 

@@ -706,6 +706,11 @@ pub struct ProviderInputs {
     /// assume. When set, the selected token is exchanged for it; when unset, the
     /// token is used as-is.
     pub identity: Option<String>,
+    /// `backend_url` was chosen by the checked-out `rise.toml`. `RISE_TOKEN`,
+    /// `RISE_TOKEN_COMMAND` and GitHub Actions OIDC tokens are not bound to a
+    /// URL, so a repository could otherwise point them at a server it controls;
+    /// they are only sent to a URL the user names (`RISE_URL`, a profile).
+    pub backend_url_from_project: bool,
 }
 
 /// Pure precedence: pick a token source from already-resolved inputs, and — when
@@ -717,6 +722,38 @@ pub fn select_token_provider(
     // Capture the exchange context before the precedence consumes `inputs`.
     let identity = inputs.identity.clone().filter(|s| !s.trim().is_empty());
     let backend_url = inputs.backend_url.clone();
+
+    if inputs.backend_url_from_project {
+        let ambient = if inputs.rise_token.as_deref().is_some_and(|t| !t.is_empty()) {
+            Some("RISE_TOKEN")
+        } else if inputs
+            .rise_token_command
+            .as_deref()
+            .is_some_and(|c| !c.is_empty())
+        {
+            Some("RISE_TOKEN_COMMAND")
+        } else if inputs
+            .gha_request_url
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+            && inputs
+                .gha_request_token
+                .as_deref()
+                .is_some_and(|s| !s.is_empty())
+        {
+            Some("GitHub Actions OIDC")
+        } else {
+            None
+        };
+        if let Some(source) = ambient {
+            return Err(TokenSourceError::non_retryable(format!(
+                "Refusing to send the {source} token to '{backend_url}': that backend URL \
+                 comes from rise.toml [targets.default] in this checkout. Set \
+                 RISE_URL={backend_url} to confirm it."
+            ))
+            .into());
+        }
+    }
 
     let base: TokenProvider = if let Some(token) = inputs.rise_token.filter(|t| !t.is_empty()) {
         // 1. Explicit RISE_TOKEN wins (backward compatible).
@@ -796,6 +833,7 @@ pub fn resolve_token_provider(http: &reqwest::Client, config: &Config) -> Result
         stored_token: config.stored_token(),
         backend_url: config.get_backend_url(),
         identity: std::env::var("RISE_IDENTITY").ok(),
+        backend_url_from_project: Config::project_chosen_url().is_some(),
     };
     select_token_provider(http, inputs)
 }
@@ -832,7 +870,49 @@ mod tests {
             stored_token: None,
             backend_url: "https://rise.example".to_string(),
             identity: None,
+            backend_url_from_project: false,
         }
+    }
+
+    #[test]
+    fn project_chosen_url_withholds_unbound_tokens() {
+        type SetSource = fn(&mut ProviderInputs);
+        let cases: [(&str, SetSource); 3] = [
+            ("RISE_TOKEN", |i| i.rise_token = Some("tok".into())),
+            ("RISE_TOKEN_COMMAND", |i| {
+                i.rise_token_command = Some("echo x".into())
+            }),
+            ("GitHub Actions OIDC", |i| {
+                i.gha_request_url = Some("https://gha".into());
+                i.gha_request_token = Some("rt".into());
+                i.audience = Some("aud".into());
+            }),
+        ];
+        for (source, set) in cases {
+            let mut i = base_inputs();
+            i.backend_url_from_project = true;
+            i.stored_token = Some("stored".into());
+            set(&mut i);
+            let err = select_token_provider(&client(), i)
+                .err()
+                .unwrap_or_else(|| panic!("{source} must be withheld"));
+            assert!(is_non_retryable_token_error(&err));
+            let message = err.to_string();
+            assert!(message.contains(source), "{message}");
+            assert!(
+                message.contains("RISE_URL=https://rise.example"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn project_chosen_url_still_uses_its_stored_login() {
+        let mut i = base_inputs();
+        i.backend_url_from_project = true;
+        i.stored_token = Some("stored".into());
+        let p = select_token_provider(&client(), i).unwrap();
+        assert_eq!(p.describe(), "stored login token");
     }
 
     #[tokio::test]

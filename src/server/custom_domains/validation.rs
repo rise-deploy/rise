@@ -3,4 +3,4 @@
 //! The validator is backend-agnostic and lives in `rise-backend-core` so the
 //! `DeploymentUrlBuilder` can share it; re-exported here for the HTTP handlers.
 
-pub use rise_backend_core::validate_custom_domain;
+pub use rise_backend_core::{reject_control_plane_host, validate_custom_domain};

@@ -36,21 +36,30 @@ override_data {
 }
 
 variables {
-  name                = "rise"
-  ingress_domain      = "rise.example.com"
-  admin_email         = "ops@example.com"
-  rise_image_tag      = "0.23.0"
-  rise_cli_image_tag  = "0.23.0"
-  acme_email          = "ops@example.com"
-  controller_role_arn = "arn:aws:iam::123456789012:role/rise"
-  execution_role_arn  = "arn:aws:iam::123456789012:role/rise-ecs-execution"
-  ecr_push_role_arn   = "arn:aws:iam::123456789012:role/rise-ecr-push"
-  oidc_issuer         = "https://id.example.com"
-  oidc_client_secret  = "s3cret"
+  name                   = "rise"
+  ingress_domain         = "rise.example.com"
+  admin_email            = "ops@example.com"
+  rise_image_tag         = "0.23.0"
+  rise_cli_image_tag     = "0.23.0"
+  acme_email             = "ops@example.com"
+  controller_role_arn    = "arn:aws:iam::123456789012:role/rise"
+  workload_task_role_arn = "arn:aws:iam::123456789012:role/rise-ecs-workload"
+  execution_role_arn     = "arn:aws:iam::123456789012:role/rise-ecs-execution"
+  ecr_push_role_arn      = "arn:aws:iam::123456789012:role/rise-ecr-push"
+  oidc_issuer            = "https://id.example.com"
+  oidc_client_secret     = "s3cret"
 }
 
 run "creates_a_whole_install" {
   command = plan
+
+  assert {
+    condition = (
+      module.runtime.rise.health_check_grace_period_seconds == 1800 &&
+      module.runtime.rise.deployment_rollback
+    )
+    error_message = "Root startup-budget defaults must reach the runtime service."
+  }
 
   # The backend asserts registry account == ECS credentials' account at startup,
   # because Rise writes no ECR repository policy.
@@ -102,6 +111,29 @@ run "creates_a_whole_install" {
     ])
     error_message = "the identity exchange URL and TTL must keep Rise's defaults unless configured"
   }
+}
+
+run "maintenance_startup_settings_reach_runtime" {
+  command = plan
+  variables {
+    rise_health_check_grace_period_seconds = 5400
+    rise_deployment_rollback               = false
+  }
+  assert {
+    condition = (
+      module.runtime.rise.health_check_grace_period_seconds == 5400 &&
+      !module.runtime.rise.deployment_rollback
+    )
+    error_message = "The root module must pass explicit maintenance startup settings to the runtime service."
+  }
+}
+
+run "rejects_negative_startup_budget" {
+  command = plan
+  variables {
+    rise_health_check_grace_period_seconds = -1
+  }
+  expect_failures = [var.rise_health_check_grace_period_seconds]
 }
 
 run "loads_a_secret_local_config_overlay" {

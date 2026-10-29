@@ -70,9 +70,9 @@ distinguished from a Session token by its JWT header `typ` (`rise-access+jwt`).
 
 **Why it exists.** Without it, a CI service account presents its external OIDC
 token on *every* request and Rise re-resolves the service account per request
-(claim matching + DB lookups in the hot path). With token exchange, the caller
-resolves once, up front, and every subsequent request is a snap decision on the
-embedded principal.
+(issuer lookups, JWKS verification, and claim matching in the hot path). With
+token exchange, the caller resolves once, up front, and every subsequent request
+checks only that the embedded service account still stands as the token says.
 
 **Exchange endpoint:** `POST /api/v1/auth/token` (public — the subject token is
 the credential). It follows RFC 8693:
@@ -104,9 +104,10 @@ derived from the SA); without one, a **controller** identity. Every
 identity-dependent failure (unknown email, not an SA, wrong issuer, claim
 mismatch) returns the same coarse `invalid_grant` so SA emails cannot be
 enumerated. Lifetime is
-`server.auth_token_max_ttl_seconds` (default 600s) — deliberately short, because
-an exchanged token cannot be revoked mid-life (deleting the SA or tightening its
-environment restrictions only takes effect once it expires).
+`server.auth_token_max_ttl_seconds` (default 600s). Each request re-reads the
+service account the token names: deleting the SA, or changing its environment
+restriction, rejects its outstanding tokens immediately. A change to the SA's
+issuer or claims applies to the next exchange.
 
 > This STS-style endpoint is **distinct** from the OIDC `token_endpoint` (the
 > authorization-code exchange at `/api/v1/auth/code/exchange`); the discovery
@@ -228,6 +229,20 @@ applying per-identity claim constraints.
 Interactive login federates to your IdP via `auth.issuer` / `auth.client_id` /
 `auth.client_secret` / `auth.scopes`. On success Rise mints a **Session** token
 (above). This is how operators wire Rise to Dex, Okta, Entra ID, Google, etc.
+
+Browser sign-in uses a short-lived, host-only nonce cookie in addition
+to PKCE and single-use OAuth state. The central callback requires the proof before
+exchanging the code. App sign-in establishes an independent proof on the app host,
+then visits Rise's central host before the IdP redirect. The final
+`/.rise/auth/complete` step requires the app-host proof and the transaction's exact
+app origin. A callback or completion URL alone cannot establish a browser session.
+Rise must successfully consume the transaction in PostgreSQL before returning a
+session cookie or app completion redirect; a storage failure refuses the response.
+Each host reuses one nonce per stage across concurrent sign-ins and refreshes its
+ten-minute expiry on each start. Completing one transaction leaves the nonce
+available to other pending transactions. Browsers must accept the proof cookies;
+expired or interrupted sign-ins restart from the sign-in page. Simultaneous first
+starts without a nonce can require restarting one sign-in.
 
 Each login is resolved to a Rise `User` resource by the ID token's exact
 `(iss, sub)` pair, recorded in a `UserIdentity` child of the User (ADR-0001 §1):

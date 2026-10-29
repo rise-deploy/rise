@@ -228,6 +228,27 @@ pub async fn auth_middleware(
                     tracing::warn!("Auth middleware: access token audience mismatch");
                     return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
                 }
+                match access_principal_is_live(&state.db_pool, &claims).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            jti = %claims.jti,
+                            "Auth middleware: access token's service account no longer exists"
+                        );
+                        return Err((StatusCode::UNAUTHORIZED, "Invalid token".to_string()));
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            sub = %claims.sub,
+                            "Auth middleware: failed to check the access token's principal: {error:?}"
+                        );
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Database error".to_string(),
+                        ));
+                    }
+                }
                 tracing::debug!(
                     "Auth middleware: Rise access token accepted (principal={:?})",
                     claims.principal
@@ -382,6 +403,45 @@ pub async fn auth_middleware(
     }
 
     Ok(next.run(req).await)
+}
+
+/// Whether the principal an exchanged access token names still stands as the
+/// token describes it.
+///
+/// A service-account token is checked against its account on every request
+/// (one primary-key read): deleting the account, or changing its environment
+/// restriction, ends the tokens minted for it at once rather than at expiry.
+/// Controller principals are re-resolved where they are used (ADR-0001 §7).
+async fn access_principal_is_live(
+    pool: &sqlx::PgPool,
+    claims: &AccessClaims,
+) -> anyhow::Result<bool> {
+    match &claims.principal {
+        PrincipalClaims::ServiceAccount {
+            service_account_id,
+            synthetic_user_id,
+            project_id,
+            allowed_environment_ids,
+            ..
+        } => {
+            let Some(sa) = service_accounts::get_by_id(pool, *service_account_id).await? else {
+                return Ok(false);
+            };
+            let environment_set = |ids: Option<&[uuid::Uuid]>| {
+                ids.map(|ids| {
+                    ids.iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                })
+            };
+            Ok(sa.deleted_at.is_none()
+                && sa.project_id == *project_id
+                && sa.user_id == *synthetic_user_id
+                && environment_set(sa.allowed_environment_ids.as_deref())
+                    == environment_set(allowed_environment_ids.as_deref()))
+        }
+        PrincipalClaims::Controller { .. } | PrincipalClaims::User { .. } => Ok(true),
+    }
 }
 
 /// Optional authentication middleware - allows unauthenticated requests but injects User if token is present
@@ -663,6 +723,73 @@ mod tests {
             "/resources/rise.dev/v1alpha1/serviceaccounts/acme",
             None
         )));
+    }
+
+    #[sqlx::test]
+    async fn access_token_for_a_deleted_service_account_is_not_live(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        use crate::db::{models::ProjectStatus, projects};
+        use std::collections::HashMap;
+
+        let owner = users::create(&pool, "owner@example.com").await?;
+        let project = projects::create(
+            &pool,
+            "sa-project",
+            ProjectStatus::Stopped,
+            "public".to_string(),
+            Some(owner.id),
+            None,
+            None,
+        )
+        .await?;
+        let sa =
+            service_accounts::create(&pool, project.id, "https://ci.example.com", &HashMap::new())
+                .await?;
+        let claims = AccessClaims {
+            iss: "https://rise.example.com".into(),
+            aud: "https://rise.example.com".into(),
+            sub: format!("rise:sa:{}", sa.id),
+            iat: 0,
+            exp: u64::MAX,
+            jti: "jti".into(),
+            principal: PrincipalClaims::ServiceAccount {
+                service_account_id: sa.id,
+                synthetic_user_id: sa.user_id,
+                project_id: project.id,
+                project_name: project.name.clone(),
+                allowed_environment_ids: None,
+                scopes: vec![],
+            },
+        };
+
+        assert!(access_principal_is_live(&pool, &claims).await?);
+
+        // A token naming another binding than the account's is not its token.
+        let mut other_project = claims.clone();
+        if let PrincipalClaims::ServiceAccount { project_id, .. } = &mut other_project.principal {
+            *project_id = uuid::Uuid::new_v4();
+        }
+        assert!(!access_principal_is_live(&pool, &other_project).await?);
+
+        // Restricting the account's environments ends tokens minted without
+        // that restriction.
+        let environment = uuid::Uuid::new_v4();
+        service_accounts::update(&pool, sa.id, None, None, Some(Some(&[environment]))).await?;
+        assert!(!access_principal_is_live(&pool, &claims).await?);
+        let mut restricted = claims.clone();
+        if let PrincipalClaims::ServiceAccount {
+            allowed_environment_ids,
+            ..
+        } = &mut restricted.principal
+        {
+            *allowed_environment_ids = Some(vec![environment]);
+        }
+        assert!(access_principal_is_live(&pool, &restricted).await?);
+
+        service_accounts::soft_delete(&pool, sa.id).await?;
+        assert!(!access_principal_is_live(&pool, &restricted).await?);
+        Ok(())
     }
 
     #[test]

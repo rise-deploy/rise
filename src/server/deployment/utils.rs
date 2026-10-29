@@ -3,10 +3,33 @@ use tracing::error;
 
 use crate::db::deployments as db_deployments;
 use crate::db::env_vars as db_env_vars;
-use crate::db::models::{Deployment, Project};
+use crate::db::models::{Deployment, DeploymentStatus, Project};
 use crate::server::error::{ServerError, ServerErrorExt};
 use crate::server::extensions::InjectedEnvVarValue;
 use crate::server::state::AppState;
+
+/// Configuration and credentials must be complete before a deployment becomes runtime-eligible.
+pub const PREPARING_IMAGE_STATUS: DeploymentStatus = DeploymentStatus::Pushing;
+
+pub async fn publish_prepared_deployment(
+    pool: &sqlx::PgPool,
+    id: uuid::Uuid,
+) -> Result<(), ServerError> {
+    db_deployments::finish_preparation(pool, id, true)
+        .await
+        .internal_err("Failed to publish prepared deployment")?;
+    Ok(())
+}
+
+pub async fn finish_pending_preparation(
+    pool: &sqlx::PgPool,
+    id: uuid::Uuid,
+) -> Result<(), ServerError> {
+    db_deployments::finish_preparation(pool, id, false)
+        .await
+        .internal_err("Failed to finish deployment configuration")?;
+    Ok(())
+}
 
 /// Generate deployment ID in format YYYYMMDD-HHMMSS
 /// Note: Could have collisions if multiple deployments in same second
@@ -104,7 +127,7 @@ pub async fn create_deployment_with_hooks(
     let deployment_group = params.deployment_group.to_string();
 
     // Create the deployment record
-    let deployment = db_deployments::create(&state.db_pool, params)
+    let deployment = db_deployments::create_preparing(&state.db_pool, params)
         .await
         .internal_err("Failed to create deployment")?;
 
@@ -144,8 +167,27 @@ pub async fn create_deployment_with_hooks(
         for var in vars {
             let (value, is_secret, is_protected) = match var.value {
                 InjectedEnvVarValue::Plain(v) => (v, false, false),
-                InjectedEnvVarValue::Secret { encrypted, .. } => (encrypted, true, false),
-                InjectedEnvVarValue::Protected { encrypted, .. } => (encrypted, true, true),
+                InjectedEnvVarValue::Secret { decrypted } => (decrypted, true, false),
+                InjectedEnvVarValue::Protected { decrypted } => (decrypted, true, true),
+            };
+
+            let value = if is_secret {
+                let provider = state
+                    .encryption_provider
+                    .as_ref()
+                    .ok_or_else(|| ServerError::internal("Encryption provider not configured"))?;
+                provider
+                    .encrypt(
+                        &value,
+                        &rise_backend_core::EncryptionContext::deployment_env(
+                            deployment.id,
+                            &var.key,
+                        ),
+                    )
+                    .await
+                    .internal_err("Failed to encrypt extension deployment variable")?
+            } else {
+                value
             };
 
             if let Err(e) = db_env_vars::upsert_deployment_env_var(

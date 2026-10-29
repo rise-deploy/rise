@@ -86,9 +86,9 @@ pub async fn get_deployment_registry_credentials(
 
     let credentials = state
         .registry_provider
-        .get_credentials(&repository, &push_tag_refs)
+        .get_credentials(&repository, project.id, &push_tag_refs)
         .await
-        .internal_err("Failed to get registry credentials")
+        .map_err(|e| super::credentials_error(e, "Failed to get registry credentials"))
         .map_err(|e| {
             e.with_context("project_name", &project_name)
                 .with_context("repository", &repository)

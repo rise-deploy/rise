@@ -13,7 +13,10 @@ use tracing::{debug, error, info, warn};
 
 use super::models::{self, *};
 use super::state_machine;
-use super::utils::{create_deployment_with_hooks, generate_deployment_id};
+use super::utils::{
+    create_deployment_with_hooks, finish_pending_preparation, generate_deployment_id,
+    publish_prepared_deployment, PREPARING_IMAGE_STATUS,
+};
 use crate::db::models::DeploymentStatus as DbDeploymentStatus;
 use crate::db::{
     deployments as db_deployments, environments as db_environments, projects, service_accounts,
@@ -71,6 +74,7 @@ fn is_addressable_group_name(name: &str) -> bool {
 /// * `registry_provider` - Registry provider for credentials
 /// * `image_ref` - Image reference (e.g., "registry:5000/repo/app:tag" or "nginx:latest")
 /// * `project_name` - Project name for scoped pull credentials and cross-project validation
+/// * `project_id` - Immutable identity from the trusted project row
 ///
 /// # Returns
 /// Fully-qualified digest reference (e.g., "docker.io/library/nginx@sha256:abc123...")
@@ -83,56 +87,29 @@ async fn resolve_image_digest(
     registry_provider: &std::sync::Arc<dyn crate::server::registry::RegistryProvider>,
     image_ref: &str,
     project_name: &str,
+    project_id: uuid::Uuid,
 ) -> anyhow::Result<String> {
-    // Cross-project image validation: if the image is on the Rise registry,
-    // verify it belongs to this project (defense-in-depth).
-    // Use registry_url() (which includes namespace/repo_key) to correctly match
-    // Rise-managed images rather than just the hostname.
-    let registry_url = registry_provider.registry_url();
-    let prefix = format!("{}/", registry_url.trim_end_matches('/'));
-    let is_rise_image = if let Some(image_path) = image_ref.strip_prefix(&prefix) {
-        // After stripping the registry URL prefix, the first path segment is the project name.
-        let image_project = image_path.split([':', '/', '@']).next().unwrap_or("");
-        if image_project != project_name {
-            anyhow::bail!(
-                "Image belongs to a different Rise project '{}' — \
-                 deployments can only use images from their own project '{}'",
-                image_project,
-                project_name
-            );
-        }
-        true
-    } else {
-        false
-    };
+    let image_project = registry_provider.image_project(image_ref);
+    if let Some(image_project) = image_project {
+        anyhow::ensure!(
+            image_project == project_name,
+            "Image belongs to a different Rise project '{}' — deployments can only use images from their own project '{}'",
+            image_project,
+            project_name
+        );
+    }
 
-    // Only fetch scoped pull credentials for Rise-managed images.
-    // External images use anonymous auth.
     let mut credentials = crate::server::oci::RegistryCredentialsMap::new();
-
-    if is_rise_image {
-        let registry_host = registry_provider.registry_host();
-        match registry_provider
-            .get_k8s_pull_credentials(project_name)
+    if image_project.is_some() {
+        let creds = registry_provider
+            .get_project_pull_credentials(project_name, project_id)
             .await
-        {
-            Ok(creds) if !creds.username.is_empty() => {
-                debug!(
-                    "Adding project-scoped credentials for registry host: {}",
-                    registry_host
-                );
-                credentials.insert(registry_host.to_string(), (creds.username, creds.password));
-            }
-            Ok(_) => {
-                debug!("Registry provider returned empty credentials, using anonymous auth");
-            }
-            Err(e) => {
-                error!(
-                    "Failed to get pull credentials from registry provider: {:?}",
-                    e
-                );
-                // Continue with anonymous auth
-            }
+            .context("Project repository is unavailable for image pulls")?;
+        if !creds.username.is_empty() || !creds.password.is_empty() {
+            credentials.insert(
+                registry_provider.registry_host().to_string(),
+                (creds.username, creds.password),
+            );
         }
     }
 
@@ -362,8 +339,10 @@ struct ResolvedContainerPayload {
 /// unresolvable image, matching the single-container behaviour.
 #[cfg(feature = "backend")]
 async fn resolve_multi_container_images(
-    state: &AppState,
+    oci_client: &crate::server::oci::OciClient,
+    registry_provider: &std::sync::Arc<dyn crate::server::registry::RegistryProvider>,
     project_name: &str,
+    project_id: uuid::Uuid,
     deployment_id: &str,
     specs: &[crate::server::deployment::models::ContainerSpec],
 ) -> Result<ResolvedContainerPayload, ServerError> {
@@ -386,10 +365,11 @@ async fn resolve_multi_container_images(
                 // `spec.image` verbatim as the pod image, so persisting the
                 // pinned ref is all that's required.
                 let pinned = resolve_image_digest(
-                    &state.oci_client,
-                    &state.registry_provider,
+                    oci_client,
+                    registry_provider,
                     image,
                     project_name,
+                    project_id,
                 )
                 .await
                 .map_err(|e| {
@@ -404,14 +384,14 @@ async fn resolve_multi_container_images(
             _ => {
                 // Server-derived. Persist the internal tag (controller-facing,
                 // possibly cluster-local), return the client tag to the CLI.
-                let internal = state.registry_provider.get_image_tag(
+                let internal = registry_provider.get_image_tag(
                     project_name,
                     &tag_suffix,
                     ImageTagType::Internal,
                 );
                 resolved.image = Some(internal);
                 push_tags.push(tag_suffix.clone());
-                state.registry_provider.get_image_tag(
+                registry_provider.get_image_tag(
                     project_name,
                     &tag_suffix,
                     ImageTagType::ClientFacing,
@@ -531,7 +511,13 @@ async fn apply_env_overrides(
                 )
             })?;
             provider
-                .encrypt(&env_override.value)
+                .encrypt(
+                    &env_override.value,
+                    &rise_backend_core::EncryptionContext::deployment_env(
+                        deployment_id,
+                        &env_override.key,
+                    ),
+                )
                 .await
                 .internal_err(format!("Failed to encrypt secret '{}'", env_override.key))?
         } else {
@@ -1382,7 +1368,15 @@ pub async fn create_deployment(
     // single-container requests.
     let multi_container_resolved = match payload.containers.as_ref() {
         Some(specs) => Some(
-            resolve_multi_container_images(&state, &payload.project, &deployment_id, specs).await?,
+            resolve_multi_container_images(
+                &state.oci_client,
+                &state.registry_provider,
+                &payload.project,
+                project.id,
+                &deployment_id,
+                specs,
+            )
+            .await?,
         ),
         None => None,
     };
@@ -1570,7 +1564,7 @@ pub async fn create_deployment(
                 inherit_container_side_data_from_source(&source_deployment)
             };
 
-        // Create new deployment with Pushed status and invoke extension hooks
+        // Prepare the deployment before making it eligible for runtime reconciliation.
         // Copy image and image_digest from source - the helper function will determine the tag
         // For pre-built images: image_digest is copied, helper returns it
         // For build-from-source: rolled_back_from_deployment_id is used to find the original source deployment's image
@@ -1580,7 +1574,7 @@ pub async fn create_deployment(
                 deployment_id: &deployment_id,
                 project_id: project.id,
                 created_by_id: user.id,
-                status: DbDeploymentStatus::Pushed, // Start in Pushed state so controller picks it up
+                status: PREPARING_IMAGE_STATUS,
                 image: source_deployment.image.as_deref(), // Copy image from source if present
                 image_digest: source_deployment.image_digest.as_deref(), // Copy digest from source if present
                 rolled_back_from_deployment_id: Some(original_source_id), // Track original source for image tag calculation
@@ -1615,6 +1609,7 @@ pub async fn create_deployment(
                 &state.db_pool,
                 source_deployment.id,
                 new_deployment.id,
+                state.encryption_provider.as_deref(),
             )
             .await
             .internal_err("Failed to copy environment variables")?;
@@ -1627,6 +1622,7 @@ pub async fn create_deployment(
                 new_deployment.id,
                 new_deployment.environment_id,
                 &resolved_environment.name,
+                state.encryption_provider.as_deref(),
             )
             .await
             .internal_err("Failed to copy environment variables")?;
@@ -1636,6 +1632,7 @@ pub async fn create_deployment(
                 &state.db_pool,
                 source_deployment.id,
                 new_deployment.id,
+                state.encryption_provider.as_deref(),
             )
             .await
             .internal_err("Failed to copy rise.toml and CLI variables")?;
@@ -1665,6 +1662,7 @@ pub async fn create_deployment(
 
         // Insert Rise-provided environment variables
         insert_rise_env_vars(&state, &new_deployment, &project).await?;
+        publish_prepared_deployment(&state.db_pool, new_deployment.id).await?;
 
         // Use helper to determine image tag (for logging/response only)
         let image_tag = crate::server::deployment::utils::get_deployment_image_tag(
@@ -1764,9 +1762,11 @@ pub async fn create_deployment(
             // build-from-source branch below.
             let credentials = state
                 .registry_provider
-                .get_credentials(&payload.project, &[deployment_id.as_str()])
+                .get_credentials(&payload.project, project.id, &[deployment_id.as_str()])
                 .await
-                .internal_err("Failed to get credentials")?;
+                .map_err(|e| {
+                    crate::server::registry::credentials_error(e, "Failed to get credentials")
+                })?;
 
             let deployment = create_deployment_with_hooks(
                 &state,
@@ -1810,6 +1810,7 @@ pub async fn create_deployment(
                 deployment.id,
                 deployment.environment_id,
                 &resolved_environment.name,
+                state.encryption_provider.as_deref(),
             )
             .await
             .internal_err("Failed to copy environment variables")?;
@@ -1836,6 +1837,7 @@ pub async fn create_deployment(
             .internal_err("Failed to insert PORT env var")?;
 
             insert_rise_env_vars(&state, &deployment, &project).await?;
+            finish_pending_preparation(&state.db_pool, deployment.id).await?;
 
             return Ok(Json(CreateDeploymentResponse {
                 deployment_id,
@@ -1858,6 +1860,7 @@ pub async fn create_deployment(
             &state.registry_provider,
             user_image,
             &project.name,
+            project.id,
         )
         .await
         .map_err(|e| {
@@ -1873,7 +1876,7 @@ pub async fn create_deployment(
                 deployment_id: &deployment_id,
                 project_id: project.id,
                 created_by_id: user.id,
-                status: DbDeploymentStatus::Pushed,
+                status: PREPARING_IMAGE_STATUS,
                 image: Some(user_image),
                 image_digest: Some(&image_digest),
                 rolled_back_from_deployment_id: None,
@@ -1909,6 +1912,7 @@ pub async fn create_deployment(
             deployment.id,
             deployment.environment_id,
             &resolved_environment.name,
+            state.encryption_provider.as_deref(),
         )
         .await
         .internal_err("Failed to copy environment variables")?;
@@ -1938,6 +1942,7 @@ pub async fn create_deployment(
 
         // Insert Rise-provided environment variables
         insert_rise_env_vars(&state, &deployment, &project).await?;
+        publish_prepared_deployment(&state.db_pool, deployment.id).await?;
 
         // Trigger Metacontroller resync so the webhook picks up the new Pushed deployment
         if let Err(e) = state.deployment_backend.project_changed(&project).await {
@@ -1986,9 +1991,11 @@ pub async fn create_deployment(
             let tag_refs: Vec<&str> = owned_tags.iter().map(String::as_str).collect();
             state
                 .registry_provider
-                .get_credentials(&payload.project, &tag_refs)
+                .get_credentials(&payload.project, project.id, &tag_refs)
                 .await
-                .internal_err("Failed to get credentials")?
+                .map_err(|e| {
+                    crate::server::registry::credentials_error(e, "Failed to get credentials")
+                })?
         };
 
         debug!("Image tag: {}", image_tag);
@@ -2036,6 +2043,7 @@ pub async fn create_deployment(
             deployment.id,
             deployment.environment_id,
             &resolved_environment.name,
+            state.encryption_provider.as_deref(),
         )
         .await
         .internal_err("Failed to copy environment variables")?;
@@ -2065,6 +2073,7 @@ pub async fn create_deployment(
 
         // Insert Rise-provided environment variables
         insert_rise_env_vars(&state, &deployment, &project).await?;
+        finish_pending_preparation(&state.db_pool, deployment.id).await?;
 
         // Return response
         Ok(Json(CreateDeploymentResponse {
@@ -3719,6 +3728,136 @@ mod tests {
     use crate::server::deployment::models::{ContainerSpec, EnvOverride};
     use axum::http::StatusCode;
     use std::collections::BTreeMap;
+
+    struct UnavailableRepository;
+
+    #[async_trait::async_trait]
+    impl crate::server::registry::RegistryProvider for UnavailableRepository {
+        async fn get_credentials(
+            &self,
+            _repository: &str,
+            _project_id: uuid::Uuid,
+            _tags: &[&str],
+        ) -> anyhow::Result<crate::server::registry::models::RegistryCredentials> {
+            unreachable!()
+        }
+
+        async fn get_pull_credentials(&self) -> anyhow::Result<(String, String)> {
+            Ok((String::new(), String::new()))
+        }
+
+        async fn get_project_pull_credentials(
+            &self,
+            repository: &str,
+            project_id: uuid::Uuid,
+        ) -> anyhow::Result<crate::server::registry::models::RegistryCredentials> {
+            assert_eq!(repository, "app");
+            assert_eq!(project_id, uuid::Uuid::from_u128(1));
+            Err(crate::server::registry::RepositoryUnavailable("orphaned repository".into()).into())
+        }
+
+        fn registry_host(&self) -> &str {
+            "registry.invalid"
+        }
+
+        fn registry_url(&self) -> &str {
+            "registry.invalid/rise"
+        }
+
+        fn get_image_tag(
+            &self,
+            repository: &str,
+            tag: &str,
+            _tag_type: crate::server::registry::ImageTagType,
+        ) -> String {
+            format!("registry.invalid/rise/{repository}:{tag}")
+        }
+    }
+
+    #[tokio::test]
+    async fn prebuilt_images_refuse_unavailable_repositories_in_single_and_multi_container_flows() {
+        let registry: std::sync::Arc<dyn crate::server::registry::RegistryProvider> =
+            std::sync::Arc::new(UnavailableRepository);
+        let oci = crate::server::oci::OciClient::new().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for image in [
+                "registry.invalid/rise/app:retained",
+                "registry.invalid/rise/app@sha256:0123456789012345678901234567890123456789012345678901234567890123",
+            ] {
+                let error = super::resolve_image_digest(&oci, &registry, image, "app", uuid::Uuid::from_u128(1))
+                    .await
+                    .unwrap_err();
+                assert!(error.downcast_ref::<crate::server::registry::RepositoryUnavailable>().is_some());
+                let spec: ContainerSpec = serde_json::from_value(serde_json::json!({
+                    "name": "web", "image": image
+                })).unwrap();
+                let error = super::resolve_multi_container_images(
+                    &oci, &registry, "app", uuid::Uuid::from_u128(1), "deployment", &[spec],
+                ).await.err().expect("unavailable repository must reject the deployment");
+                assert!(error.message.contains("repository"), "{}", error.message);
+            }
+        }).await;
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prebuilt_ecr_literal_prefixes_reject_cross_project_images() {
+        use crate::server::registry::{
+            models::EcrConfig, providers::ecr::EcrProvider, RegistryProvider,
+        };
+        let oci = crate::server::oci::OciClient::new().unwrap();
+        for prefix in ["rise/", "rise-", "", "nested/rise/"] {
+            let registry: std::sync::Arc<dyn RegistryProvider> = std::sync::Arc::new(
+                EcrProvider::new(EcrConfig {
+                    region: "eu-west-1".into(),
+                    account_id: "123456789012".into(),
+                    access_key_id: Some("test".into()),
+                    secret_access_key: Some("test".into()),
+                    repo_prefix: prefix.into(),
+                    push_role_arn: "arn:aws:iam::123456789012:role/test".into(),
+                    auto_remove: false,
+                    registry_host: Some("registry.invalid".into()),
+                })
+                .await
+                .unwrap(),
+            );
+            for suffix in [
+                ":tag",
+                "@sha256:0123456789012345678901234567890123456789012345678901234567890123",
+            ] {
+                let image = format!("registry.invalid/{prefix}other{suffix}");
+                let error = super::resolve_image_digest(
+                    &oci,
+                    &registry,
+                    &image,
+                    "app",
+                    uuid::Uuid::from_u128(1),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("different Rise project"));
+                let spec: ContainerSpec =
+                    serde_json::from_value(serde_json::json!({"name":"web", "image":image}))
+                        .unwrap();
+                let error = super::resolve_multi_container_images(
+                    &oci,
+                    &registry,
+                    "app",
+                    uuid::Uuid::from_u128(1),
+                    "deployment",
+                    &[spec],
+                )
+                .await
+                .err()
+                .unwrap();
+                assert!(
+                    error.message.contains("different Rise project"),
+                    "{}",
+                    error.message
+                );
+            }
+        }
+    }
 
     #[test]
     fn group_names_normalize_injectively() {

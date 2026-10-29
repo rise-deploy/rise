@@ -1,5 +1,5 @@
 use crate::db::{extensions as db_extensions, projects as db_projects};
-use crate::server::encryption::EncryptionProvider;
+use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -409,7 +409,15 @@ impl AwsS3Provisioner {
                 // 7. Encrypt the secret key
                 let encrypted_secret = self
                     .encryption_provider
-                    .encrypt(&secret_access_key)
+                    .encrypt(
+                        &secret_access_key,
+                        &EncryptionContext::extension(
+                            project_id,
+                            self.extension_type(),
+                            extension_name,
+                            "/status/iam_secret_access_key_encrypted",
+                        ),
+                    )
                     .await
                     .context("Failed to encrypt IAM secret access key")?;
 
@@ -455,7 +463,11 @@ impl AwsS3Provisioner {
         Ok(())
     }
 
-    async fn handle_available(&self, status: &mut AwsS3Status) -> Result<()> {
+    async fn handle_available(
+        &self,
+        status: &mut AwsS3Status,
+        context: &EncryptionContext,
+    ) -> Result<()> {
         let bucket_name = match &status.bucket_name {
             Some(n) => n.clone(),
             None => {
@@ -536,7 +548,8 @@ impl AwsS3Provisioner {
                     "Access key missing for IAM user '{}', generating new key",
                     iam_user_name
                 );
-                self.rotate_access_key(status, &iam_user_name).await?;
+                self.rotate_access_key(status, &iam_user_name, context)
+                    .await?;
                 return Ok(());
             }
         };
@@ -560,7 +573,8 @@ impl AwsS3Provisioner {
                         "Access key '{}' no longer exists for IAM user '{}', generating new key",
                         access_key_id, iam_user_name
                     );
-                    self.rotate_access_key(status, &iam_user_name).await?;
+                    self.rotate_access_key(status, &iam_user_name, context)
+                        .await?;
                 }
             }
             Err(e) => {
@@ -574,7 +588,12 @@ impl AwsS3Provisioner {
         Ok(())
     }
 
-    async fn rotate_access_key(&self, status: &mut AwsS3Status, iam_user_name: &str) -> Result<()> {
+    async fn rotate_access_key(
+        &self,
+        status: &mut AwsS3Status,
+        iam_user_name: &str,
+        context: &EncryptionContext,
+    ) -> Result<()> {
         // Delete all existing keys first
         if let Ok(resp) = self
             .iam_client
@@ -610,7 +629,7 @@ impl AwsS3Provisioner {
 
                 let encrypted_secret = self
                     .encryption_provider
-                    .encrypt(key.secret_access_key())
+                    .encrypt(key.secret_access_key(), context)
                     .await
                     .context("Failed to encrypt new secret access key")?;
 
@@ -1037,7 +1056,16 @@ impl AwsS3Provisioner {
                 status.state = S3BucketState::Pending;
             }
             S3BucketState::Available => {
-                self.handle_available(&mut status).await?;
+                self.handle_available(
+                    &mut status,
+                    &EncryptionContext::extension(
+                        project.id,
+                        self.extension_type(),
+                        &project_extension.extension,
+                        "/status/iam_secret_access_key_encrypted",
+                    ),
+                )
+                .await?;
             }
             S3BucketState::Failed => {
                 info!(
@@ -1330,7 +1358,15 @@ impl Extension for AwsS3Provisioner {
 
         let secret_decrypted = self
             .encryption_provider
-            .decrypt(secret_encrypted)
+            .decrypt(
+                secret_encrypted,
+                &EncryptionContext::extension(
+                    project_id,
+                    self.extension_type(),
+                    &ext.extension,
+                    "/status/iam_secret_access_key_encrypted",
+                ),
+            )
             .await
             .context("Failed to decrypt IAM secret access key")?;
 
@@ -1347,7 +1383,6 @@ impl Extension for AwsS3Provisioner {
                 key: ENV_VAR_SECRET_ACCESS_KEY.to_string(),
                 value: InjectedEnvVarValue::Protected {
                     decrypted: secret_decrypted,
-                    encrypted: secret_encrypted.clone(),
                 },
             },
             InjectedEnvVar {

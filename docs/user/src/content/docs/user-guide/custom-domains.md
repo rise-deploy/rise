@@ -32,7 +32,12 @@ Aliases: `rise domain rm`, `rise domain del`
 
 ## DNS and TLS
 
-Any domain can be configured as a custom domain for your project.
+Any domain can be configured as a custom domain for your project, except:
+
+- a host Rise itself serves — its UI and API, the identity provider, the
+  container registry, the sign-in host — or any subdomain of one;
+- a host that Rise's own project URLs follow the pattern of (for example
+  `other-app.app.example.com`).
 
 > **Note:** Whether DNS resolution and TLS certificates work correctly depends on the Rise deployment configuration. Reach out to your Rise platform administrator to learn more.
 

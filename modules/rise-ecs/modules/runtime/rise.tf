@@ -71,7 +71,8 @@ resource "aws_ecs_service" "rise" {
   # reconciles.
   desired_count = var.control_plane.desired_count
 
-  enable_execute_command = var.control_plane.enable_execute_command
+  enable_execute_command            = var.control_plane.enable_execute_command
+  health_check_grace_period_seconds = var.control_plane.health_check_grace_period_seconds
 
   network_configuration {
     subnets          = var.network.control_plane.subnet_ids
@@ -83,11 +84,10 @@ resource "aws_ecs_service" "rise" {
     registry_arn = aws_service_discovery_service.rise.arn
   }
 
-  # A control plane that cannot start should roll back rather than sit in a
-  # restart loop while the previous version is already gone.
+  # Operators control rollback when database formats require a coordinated cutover.
   deployment_circuit_breaker {
     enable   = true
-    rollback = true
+    rollback = var.control_plane.deployment_rollback
   }
 
   propagate_tags = "SERVICE"

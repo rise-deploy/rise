@@ -1,11 +1,13 @@
 output "rise" {
-  description = "Rise service and discovery identifiers."
+  description = "Rise service and discovery identifiers and effective startup settings."
   value = {
-    service_name        = aws_ecs_service.rise.name
-    service_id          = aws_ecs_service.rise.id
-    task_definition_arn = aws_ecs_task_definition.rise.arn
-    discovery_name      = aws_service_discovery_service.rise.name
-    discovery_arn       = aws_service_discovery_service.rise.arn
+    service_name                      = aws_ecs_service.rise.name
+    service_id                        = aws_ecs_service.rise.id
+    health_check_grace_period_seconds = aws_ecs_service.rise.health_check_grace_period_seconds
+    deployment_rollback               = one(aws_ecs_service.rise.deployment_circuit_breaker).rollback
+    task_definition_arn               = aws_ecs_task_definition.rise.arn
+    discovery_name                    = aws_service_discovery_service.rise.name
+    discovery_arn                     = aws_service_discovery_service.rise.arn
   }
 }
 

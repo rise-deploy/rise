@@ -1,5 +1,5 @@
 use crate::db::{extensions as db_extensions, projects as db_projects};
-use crate::server::encryption::EncryptionProvider;
+use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::{Extension, InjectedEnvVar};
 use crate::server::settings::{PrivateKeySource, SnowflakeAuth};
 use anyhow::{anyhow, Context, Result};
@@ -756,6 +756,8 @@ impl SnowflakeOAuthProvisioner {
         &self,
         status: &mut SnowflakeOAuthProvisionerStatus,
         project_name: &str,
+        project_id: Uuid,
+        extension_name: &str,
     ) -> Result<()> {
         let integration_name = status
             .integration_name
@@ -797,7 +799,15 @@ impl SnowflakeOAuthProvisioner {
                     // Encrypt client secret
                     let client_secret_encrypted = self
                         .encryption_provider
-                        .encrypt(&client_secret)
+                        .encrypt(
+                            &client_secret,
+                            &EncryptionContext::extension(
+                                project_id,
+                                self.extension_type(),
+                                extension_name,
+                                "/status/oauth_client_secret_encrypted",
+                            ),
+                        )
                         .await
                         .context("Failed to encrypt client secret")?;
 
@@ -843,7 +853,7 @@ impl SnowflakeOAuthProvisioner {
         status: &mut SnowflakeOAuthProvisionerStatus,
         project_id: Uuid,
         project_name: &str,
-        _extension_name: &str,
+        extension_name: &str,
     ) -> Result<()> {
         let oauth_extension_name = status
             .oauth_extension_name
@@ -891,30 +901,57 @@ impl SnowflakeOAuthProvisioner {
         let effective_config = self.get_effective_config(spec);
 
         // Create OAuth extension spec
-        let oauth_spec = crate::server::extensions::providers::oauth::models::OAuthExtensionSpec {
-            provider_name: format!("Snowflake ({})", project_name),
-            description: format!("Auto-provisioned Snowflake OAuth for {}", project_name),
-            client_id: status
-                .oauth_client_id
-                .as_ref()
-                .ok_or_else(|| anyhow!("Client ID not set"))?
-                .clone(),
-            client_secret_ref: None,
-            client_secret_encrypted: Some(client_secret_encrypted),
-            // Snowflake doesn't support OIDC discovery, so we set the issuer_url to the Snowflake base
-            // and explicitly provide the authorization and token endpoints
-            issuer_url: format!("https://{}.snowflakecomputing.com", self.account),
-            authorization_endpoint: Some(format!(
-                "https://{}.snowflakecomputing.com/oauth/authorize",
-                self.account
-            )),
-            token_endpoint: Some(format!(
-                "https://{}.snowflakecomputing.com/oauth/token-request",
-                self.account
-            )),
-            token_endpoint_auth_method: Default::default(),
-            scopes: effective_config.scopes,
-        };
+        let mut oauth_spec =
+            crate::server::extensions::providers::oauth::models::OAuthExtensionSpec {
+                provider_name: format!("Snowflake ({})", project_name),
+                description: format!("Auto-provisioned Snowflake OAuth for {}", project_name),
+                client_id: status
+                    .oauth_client_id
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Client ID not set"))?
+                    .clone(),
+                client_secret_encrypted: None,
+                // Snowflake doesn't support OIDC discovery, so we set the issuer_url to the Snowflake base
+                // and explicitly provide the authorization and token endpoints
+                issuer_url: format!("https://{}.snowflakecomputing.com", self.account),
+                authorization_endpoint: Some(format!(
+                    "https://{}.snowflakecomputing.com/oauth/authorize",
+                    self.account
+                )),
+                token_endpoint: Some(format!(
+                    "https://{}.snowflakecomputing.com/oauth/token-request",
+                    self.account
+                )),
+                token_endpoint_auth_method: Default::default(),
+                scopes: effective_config.scopes,
+            };
+
+        let plaintext = self
+            .encryption_provider
+            .decrypt(
+                &client_secret_encrypted,
+                &EncryptionContext::extension(
+                    project_id,
+                    self.extension_type(),
+                    extension_name,
+                    "/status/oauth_client_secret_encrypted",
+                ),
+            )
+            .await?;
+        let context = super::oauth::provider::oauth_client_secret_context(
+            project_id,
+            oauth_extension_name,
+            &oauth_spec,
+            oauth_spec
+                .token_endpoint
+                .as_deref()
+                .expect("Snowflake endpoint is explicit"),
+        )?;
+        oauth_spec.client_secret_encrypted = Some(
+            self.encryption_provider
+                .encrypt(&plaintext, &context)
+                .await?,
+        );
 
         // Create OAuth extension
         db_extensions::create(
@@ -1249,8 +1286,13 @@ impl SnowflakeOAuthProvisioner {
                     .await?;
             }
             SnowflakeOAuthState::RetrievingCredentials => {
-                self.handle_retrieving_credentials(&mut status, &project.name)
-                    .await?;
+                self.handle_retrieving_credentials(
+                    &mut status,
+                    &project.name,
+                    project.id,
+                    &project_extension.extension,
+                )
+                .await?;
             }
             SnowflakeOAuthState::CreatingOAuthExtension => {
                 self.handle_creating_oauth_extension(

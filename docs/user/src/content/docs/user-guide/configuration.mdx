@@ -213,6 +213,12 @@ To use a local profile instead:
 profile = "work"
 ```
 
+A `url` target is chosen by whoever controls the repository, so the CLI sends it
+only the stored login for that URL. It refuses to send `RISE_TOKEN`,
+`RISE_TOKEN_COMMAND` or GitHub Actions OIDC tokens to it; in CI, set `RISE_URL`
+to the backend URL instead. A `profile` target resolves to a URL from your own
+configuration and has no such restriction.
+
 A referenced profile must exist locally. The CLI reads `rise.toml` (or
 `.rise.toml`) from the command's application directory: its `--path` or positional
 path when supported, otherwise the current directory. If the section or its

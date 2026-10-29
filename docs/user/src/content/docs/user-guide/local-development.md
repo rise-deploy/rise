@@ -157,6 +157,13 @@ rise compose generate -o my-compose.yaml
 Then run it yourself with `docker compose -f compose.yaml up` after the images
 are built (`rise compose up` builds them for you).
 
+The generated file contains no project environment values, so it is safe to
+commit. The project's environment variables, secrets included, are written to
+an owner-only env file at `~/.config/rise/compose/<project>[.<environment>].env`,
+outside the repository and the build context, and every app service loads it
+through `env_file: ${HOME}/.config/rise/compose/…`. Run `rise compose generate`
+again to refresh the values.
+
 ## Standalone Image Build
 
 Build an image without running it:

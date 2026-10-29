@@ -84,14 +84,17 @@ pub async fn add_custom_domain(
     let user = auth.user()?;
     ensure_project_access_or_admin(&state, user, &project).await?;
 
-    // Validate that the custom domain doesn't overlap with project default domain patterns
+    // A custom domain may claim neither a control-plane host nor a host the
+    // project default domain patterns produce.
+    validation::reject_control_plane_host(&payload.domain, &state.control_plane_hosts)
+        .map_err(ServerError::bad_request)?;
     if let Some(ref production_template) = state.production_ingress_url_template {
         if let Err(reason) = validation::validate_custom_domain(
             &payload.domain,
             production_template,
             state.staging_ingress_url_template.as_deref(),
             state.environment_ingress_url_template.as_deref(),
-            Some(&state.public_url),
+            &state.control_plane_hosts,
         ) {
             return Err(ServerError::bad_request(reason));
         }

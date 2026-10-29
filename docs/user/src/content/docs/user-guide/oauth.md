@@ -58,30 +58,42 @@ First register an OAuth application with the upstream provider. Use the Rise cal
 https://<rise-url>/oidc/<project>/<extension>/callback
 ```
 
-Then encrypt the upstream provider client secret and create the extension:
+Create the project first. The extension can be sealed before it exists. Put the
+upstream configuration in `oauth.json`:
 
-```bash
-ENCRYPTED=$(rise encrypt "your_client_secret_here")
-
-rise extension create oauth-google -p my-app \
-  --type oauth \
-  --spec '{
-    "provider_name": "Google",
-    "description": "Sign in with Google",
-    "client_id": "123456789.apps.googleusercontent.com",
-    "client_secret_encrypted": "'"$ENCRYPTED"'",
-    "issuer_url": "https://accounts.google.com",
-    "scopes": ["openid", "email", "profile"]
-  }'
+```json
+{
+  "provider_name": "Google",
+  "client_id": "123456789.apps.googleusercontent.com",
+  "issuer_url": "https://accounts.google.com",
+  "scopes": ["openid", "email", "profile"]
+}
 ```
 
-You can also encrypt via stdin:
+Seal the upstream secret for this project, extension name, slot, and OAuth
+configuration, then create the extension:
 
 ```bash
-echo "your_client_secret_here" | rise encrypt
+ENCRYPTED=$(printf '%s' "your_client_secret" | rise encrypt \
+  --project my-app --extension-type oauth --extension oauth-google \
+  --slot /spec/client_secret_encrypted --oauth-spec oauth.json)
+
+rise extension create oauth-google -p my-app --type oauth \
+  --spec "$(jq --arg secret "$ENCRYPTED" '.client_secret_encrypted = $secret' oauth.json)"
 ```
 
-The `rise encrypt` command is rate-limited to 100 requests per hour per user.
+`--oauth-spec` resolves the effective token endpoint through Rise and binds the
+secret to the upstream client ID, issuer, explicit endpoints, authentication
+method, and resolved token destination. Token redirects are refused; use the
+provider's canonical final token URL. Re-enter and seal the secret when any
+of those change. A ciphertext sealed for another project, extension, or slot
+cannot be used here. Restoring the same extension name within the same project
+permits reuse when its OAuth configuration matches; recreating the project does
+not. The generic resource API carries ciphertext as an opaque value.
+
+`rise encrypt` reads plaintext from stdin when its optional plaintext argument
+is omitted. It permits 100 encryptions per hour per user and requires an
+unrestricted login plus access to the enclosing project.
 
 ## Provider Configuration
 

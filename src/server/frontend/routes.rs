@@ -285,6 +285,7 @@ mod tests {
 
     fn docs_settings(docs_dir: String) -> ServerSettings {
         ServerSettings {
+            allow_insecure_development_keys: false,
             host: "127.0.0.1".to_string(),
             port: 3000,
             public_url: "http://localhost:3000".to_string(),

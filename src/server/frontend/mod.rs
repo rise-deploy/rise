@@ -103,6 +103,7 @@ mod tests {
             "cli-auth-success.html.tera",
             "auth-success.html.tera",
             "auth-signin.html.tera",
+            "auth-ui-success.html.tera",
         ] {
             let html = render(
                 template,
@@ -123,13 +124,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirect_script_keeps_a_json_string() {
-        let tera = load_auth_template(STATIC_DIR, "auth-ui-success.html.tera")
-            .await
-            .unwrap();
-        let mut context = tera::Context::new();
-        context.insert("redirect_url", "https://app.example.com/a?b=1&c=2");
-        let html = tera.render("auth-ui-success.html.tera", &context).unwrap();
-        assert!(html.contains(r#"const redirectUrl = "https://app.example.com/a?b=1&c=2";"#));
+    async fn success_pages_keep_the_redirect_out_of_script() {
+        for template in ["auth-success.html.tera", "auth-ui-success.html.tera"] {
+            let tera = load_auth_template(STATIC_DIR, template).await.unwrap();
+            let mut context = tera::Context::new();
+            context.insert("project_name", "app");
+            context.insert("redirect_url", "/</script><script>alert(1)//");
+            context.insert("success", &true);
+            let html = tera.render(template, &context).unwrap();
+            assert!(!html.contains("</script><script>"), "{template}");
+            assert!(
+                html.contains("getElementById('continue-link').href"),
+                "{template}"
+            );
+        }
     }
 }

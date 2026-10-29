@@ -41,11 +41,21 @@ use tower::ServiceBuilder;
 use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
 use tracing::{info, Span};
 
+fn http_request_span(request: &Request) -> Span {
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version()
+    )
+}
+
 /// Build the standard trace layer used for request logging on both the main
 /// server and the internal webhook listener.
 macro_rules! trace_layer {
     () => {
         TraceLayer::new_for_http()
+            .make_span_with(http_request_span)
             .on_request(|request: &Request, _span: &Span| {
                 let request_id = request
                     .extensions()
@@ -363,7 +373,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
                 .layer(axum_middleware::from_fn(
                     self::middleware::request_id_middleware,
                 )),
-        );
+        )
+        // Every page this listener serves — UI, sign-in, device approval, and
+        // the `/.rise/auth/*` pages on app hosts — refuses to be framed.
+        .layer(axum_middleware::from_fn(
+            self::middleware::frame_protection_middleware,
+        ));
 
     let addr = format!("{}:{}", settings.server.host, settings.server.port);
     info!("HTTP server listening on http://{}", addr);
@@ -557,6 +572,7 @@ async fn build_traefik_dynamic_config(
         ingress_port: state.ingress_port,
         ingress_schema: state.ingress_schema.clone(),
         registry_provider: state.registry_provider.clone(),
+        control_plane_hosts: state.control_plane_hosts.to_vec(),
     };
     let access_requirements = state
         .access_classes
@@ -731,5 +747,60 @@ async fn shutdown_signal() {
         _ = terminate => {
             info!("Received SIGTERM, shutting down gracefully");
         },
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    #[derive(Clone)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn http_spans_never_record_oauth_query_credentials() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = CapturedLog(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_span_events(FmtSpan::NEW)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            for uri in [
+                "/api/v1/auth/callback?code=code-secret&state=state-secret",
+                "/.rise/auth/complete?token=token-secret",
+            ] {
+                let request = Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let _span = http_request_span(&request);
+            }
+        });
+
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("/api/v1/auth/callback"), "{log}");
+        assert!(log.contains("/.rise/auth/complete"), "{log}");
+        for forbidden in ["code-secret", "state-secret", "token-secret", "uri="] {
+            assert!(!log.contains(forbidden), "{log}");
+        }
     }
 }

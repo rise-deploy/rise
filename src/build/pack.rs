@@ -1,6 +1,8 @@
 // Buildpacks implementation (pack CLI)
 
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info};
@@ -71,22 +73,15 @@ pub(crate) fn build_image_with_buildpacks(options: BuildpackBuildOptions<'_>) ->
         }
     }
 
-    // Add environment variables if specified
-    if !env.is_empty() {
-        info!("Using environment variables: {:?}", env);
-        for env_var in env {
-            cmd.arg("--env").arg(env_var);
-        }
+    let mut build_env = BTreeMap::new();
+    for entry in env {
+        let (key, value) = match entry.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (entry.clone(), std::env::var(entry).unwrap_or_default()),
+        };
+        build_env.insert(key, value);
     }
-
-    // Add proxy environment variables
-    let proxy_vars = super::proxy::read_and_transform_proxy_vars();
-    if !proxy_vars.is_empty() {
-        info!("Injecting proxy variables for pack build");
-        for arg in super::proxy::format_for_pack(&proxy_vars) {
-            cmd.arg("--env").arg(arg);
-        }
-    }
+    build_env.extend(super::proxy::read_and_transform_proxy_vars());
 
     // Never use --publish - always build locally and push separately
     // This avoids code bifurcation and allows CA certificate injection
@@ -131,8 +126,10 @@ pub(crate) fn build_image_with_buildpacks(options: BuildpackBuildOptions<'_>) ->
         // Set multiple SSL environment variables to ensure CA trust works across different
         // language ecosystems (Node.js, Python, Nix, AWS SDK, etc.)
         for ssl_env_name in SSL_ENV_VARS {
-            cmd.arg("--env")
-                .arg(format!("{ssl_env_name}=/etc/ssl/certs/ca-certificates.crt"));
+            build_env.insert(
+                ssl_env_name.to_string(),
+                "/etc/ssl/certs/ca-certificates.crt".into(),
+            );
         }
 
         info!(
@@ -141,7 +138,8 @@ pub(crate) fn build_image_with_buildpacks(options: BuildpackBuildOptions<'_>) ->
         );
     }
 
-    debug!("Executing command: {:?}", cmd);
+    let _env_file = attach_env_file(&mut cmd, &build_env)?;
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(cmd, "Failed to execute pack build", output)?;
 
@@ -150,4 +148,94 @@ pub(crate) fn build_image_with_buildpacks(options: BuildpackBuildOptions<'_>) ->
     }
 
     Ok(())
+}
+
+/// Pack reads env files one line at a time and trims each line. Reject values
+/// that cannot round-trip through that format instead of changing the value.
+fn attach_env_file(
+    command: &mut Command,
+    values: &BTreeMap<String, String>,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    for (key, value) in values {
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            bail!("Pack environment variable has an invalid name");
+        }
+        if value.contains(['\n', '\r', '\0']) || value.trim_end() != value {
+            bail!("Pack env files cannot represent multiline values, NUL bytes, or trailing whitespace");
+        }
+    }
+    let mut file = tempfile::Builder::new()
+        .prefix("rise-pack-env-")
+        .tempfile()
+        .context("Failed to create private Pack env file")?;
+    for (key, value) in values {
+        writeln!(file, "{key}={value}").context("Failed to write private Pack env file")?;
+    }
+    command.arg("--env-file").arg(file.path());
+    Ok(Some(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_env_file_keeps_values_out_of_argv_and_preserves_supported_values() {
+        let values = BTreeMap::from([
+            ("TOKEN".into(), "private=token#value".into()),
+            ("EMPTY".into(), String::new()),
+            ("SPACES".into(), " leading internal spaces".into()),
+        ]);
+        let mut command = Command::new("pack");
+        let file = attach_env_file(&mut command, &values).unwrap().unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args[0], "--env-file");
+        assert_eq!(args[1], file.path().as_os_str());
+        let line = super::super::command_for_log(&command);
+        assert!(!line.contains("private=token#value"));
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        let parsed: BTreeMap<String, String> = contents
+            .lines()
+            .map(|line| {
+                let (key, value) = line.trim().split_once('=').unwrap();
+                (key.to_string(), value.to_string())
+            })
+            .collect();
+        assert_eq!(parsed, values);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                file.as_file().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn pack_rejects_unrepresentable_values_without_exposing_them() {
+        for value in [
+            "first\nsecond",
+            "first\rsecond",
+            "secret ",
+            "secret\t",
+            "secret\0",
+        ] {
+            let mut command = Command::new("pack");
+            let error = attach_env_file(
+                &mut command,
+                &BTreeMap::from([("TOKEN".into(), value.into())]),
+            )
+            .unwrap_err();
+            assert!(!error.to_string().contains(value));
+            assert_eq!(command.get_args().count(), 0);
+        }
+    }
 }

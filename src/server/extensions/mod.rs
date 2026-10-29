@@ -15,28 +15,15 @@ pub mod providers;
 #[cfg(feature = "backend")]
 pub mod routes;
 
-/// Represents the value of an environment variable injected by an extension.
-///
-/// Extensions handle encryption internally (they have access to the encryption provider),
-/// so callers receive pre-encrypted values where applicable.
+/// Values remain in process until the deployment boundary seals its snapshot.
 pub enum InjectedEnvVarValue {
-    /// Plaintext, non-secret value.
     Plain(String),
-    /// Secret but not protected. Carries (decrypted, encrypted) so the caller can write
-    /// the pre-encrypted value to DB without re-encrypting.
-    // Only reached from `main` (through the extension registry), which is not a
-    // dead-code root when the binary is built for tests.
     #[cfg_attr(test, allow(dead_code))]
     Secret {
         decrypted: String,
-        encrypted: String,
     },
-    /// Protected secret. Carries (decrypted, encrypted). The API serialization layer
-    /// MUST mask the decrypted value before returning to callers.
     Protected {
-        #[allow(dead_code)]
         decrypted: String,
-        encrypted: String,
     },
 }
 

@@ -149,6 +149,7 @@ mise license:boundary:check
 mise resource:schema:check
 mise adr:conformance:check
 helm lint helm/rise
+python3 scripts/check-server-startup-probe.py
 mise terraform:check
 # Every crate whose tests need no database. Expressed as exclusions so a new
 # crate is covered by default; only the three that require Postgres opt out.
@@ -325,6 +326,7 @@ docker)
   #     gateway per container on both platforms).
   echo "Rise runs on the HOST; containers reach it at http://host.docker.internal:3000."
   RISE_CONFIG_RUN_MODE=docker \\
+  RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS=true \\
   DATABASE_URL=postgres://rise:rise123@localhost:5432/rise \\
   PUBLIC_URL=http://rise.localhost:3000 \\
   DEX_ISSUER=http://rise-dex:5556/dex \\

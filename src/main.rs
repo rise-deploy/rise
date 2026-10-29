@@ -207,6 +207,8 @@ enum Commands {
     Domain(DomainCommands),
     /// Encrypt a secret for use in extension specs
     Encrypt {
+        #[command(flatten)]
+        scope: cli::encrypt::EncryptScope,
         /// Secret to encrypt (or read from stdin if not provided)
         plaintext: Option<String>,
     },
@@ -1324,8 +1326,8 @@ async fn main() -> Result<()> {
             // Already handled above before config loading
             unreachable!("Backend commands should have been handled earlier")
         }
-        Commands::Encrypt { plaintext } => {
-            cli::encrypt::encrypt_command(&config, plaintext.clone()).await?;
+        Commands::Encrypt { plaintext, scope } => {
+            cli::encrypt::encrypt_command(&config, plaintext.clone(), scope).await?;
         }
         Commands::Profile(_) => unreachable!("Profile commands are handled before config loading"),
         Commands::Project(project_cmd) => match project_cmd {

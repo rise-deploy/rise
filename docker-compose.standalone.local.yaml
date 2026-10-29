@@ -95,6 +95,7 @@ services:
       - RISE_TRAEFIK_ENTRYPOINT=web
       - RISE_CLIENT_REGISTRY_URL=localhost:5000
       - RISE_COOKIE_SECURE=false
+      - RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS=true
       - DEX_ISSUER=http://rise-dex:5556/dex
       # LOCAL ONLY: open the SSRF guard so the backend can reach the internal
       # plain-HTTP http://rise-dex:5556 issuer (and other private-network

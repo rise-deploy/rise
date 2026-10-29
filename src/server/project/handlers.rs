@@ -141,6 +141,33 @@ where
         .map(|t| t.id)
 }
 
+/// Refuse assigning project ownership to a user other than the caller, unless the
+/// caller is an admin.
+///
+/// The owner holds full write access to the project and sees it listed as
+/// theirs, so naming someone else as owner is an admin act, as assigning a
+/// project to a team is reserved for that team's members.
+fn check_project_owner_user(owner: Uuid, caller: Uuid, is_admin: bool) -> Result<(), ServerError> {
+    if owner == caller || is_admin {
+        Ok(())
+    } else {
+        Err(ServerError::forbidden(
+            "Only admins can assign a project to another user",
+        ))
+    }
+}
+
+async fn resolve_project_owner_user(
+    pool: &sqlx::PgPool,
+    identifier: &str,
+    caller: Uuid,
+    is_admin: bool,
+) -> Result<Uuid, ServerError> {
+    let owner = resolve_user_identifier(pool, identifier).await?;
+    check_project_owner_user(owner, caller, is_admin)?;
+    Ok(owner)
+}
+
 pub async fn create_project(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -182,6 +209,7 @@ pub async fn create_project(
         ProjectOwner::User(user_id) => {
             let uuid =
                 Uuid::parse_str(user_id).server_err(StatusCode::BAD_REQUEST, "Invalid user ID")?;
+            check_project_owner_user(uuid, user.id, state.is_admin(user).await)?;
             (Some(uuid), None)
         }
         ProjectOwner::Team(team_id) => {
@@ -523,7 +551,7 @@ pub async fn get_project(
 ) -> Result<Json<serde_json::Value>, ServerError> {
     let user = auth.user()?;
     // Resolve project by ID or name
-    let project = resolve_project(&state, &id_or_name, params.by_id).await?;
+    let project = resolve_project(&state, user, &id_or_name, params.by_id).await?;
 
     // Check read permission
     let can_read = check_read_permission(&state, &project, user)
@@ -621,7 +649,7 @@ pub async fn update_project(
 ) -> Result<Json<UpdateProjectResponse>, ServerError> {
     let user = auth.user()?;
     // Resolve project by ID or name
-    let project = resolve_project(&state, &id_or_name, params.by_id).await?;
+    let project = resolve_project(&state, user, &id_or_name, params.by_id).await?;
 
     // Check write permission
     let can_write = check_write_permission(&state, &project, user)
@@ -648,24 +676,14 @@ pub async fn update_project(
     if let Some(owner) = payload.owner {
         let (owner_user_id, owner_team_id) = match owner {
             ProjectOwner::User(user_identifier) => {
-                // Try to resolve as email first, then as UUID
-                let user = if let Ok(uuid) = Uuid::parse_str(&user_identifier) {
-                    // Valid UUID - look up by ID
-                    db_users::find_by_id(&state.db_pool, uuid)
-                        .await
-                        .internal_err("Failed to verify user")?
-                } else {
-                    // Not a UUID - treat as email
-                    db_users::find_by_email(&state.db_pool, &user_identifier)
-                        .await
-                        .internal_err("Failed to verify user")?
-                };
-
-                let user = user.ok_or_else(|| {
-                    ServerError::not_found(format!("User '{}' not found", user_identifier))
-                })?;
-
-                (Some(user.id), None)
+                let owner = resolve_project_owner_user(
+                    &state.db_pool,
+                    &user_identifier,
+                    user.id,
+                    state.is_admin(user).await,
+                )
+                .await?;
+                (Some(owner), None)
             }
             ProjectOwner::Team(team_identifier) => {
                 // Try to resolve as name first, then as UUID
@@ -865,7 +883,7 @@ pub async fn delete_project(
 ) -> Result<StatusCode, ServerError> {
     let user = auth.user()?;
     // Resolve project by ID or name
-    let project = resolve_project(&state, &id_or_name, params.by_id).await?;
+    let project = resolve_project(&state, user, &id_or_name, params.by_id).await?;
 
     // Check write permission
     let can_write = check_write_permission(&state, &project, user)
@@ -922,7 +940,7 @@ pub async fn update_project_template_image(
     Json(payload): Json<crate::server::project::models::UpdateProjectTemplateImageRequest>,
 ) -> Result<Json<crate::server::project::models::UpdateProjectResponse>, ServerError> {
     let user = auth.user()?;
-    let project = resolve_project(&state, &id_or_name, params.by_id).await?;
+    let project = resolve_project(&state, user, &id_or_name, params.by_id).await?;
 
     let can_write = check_write_permission(&state, &project, user)
         .await
@@ -968,12 +986,12 @@ pub async fn update_project_template_image(
 
 /// Query project by ID
 async fn query_project_by_id(
-    state: &AppState,
+    pool: &sqlx::PgPool,
     project_id: &str,
 ) -> Result<crate::db::models::Project, String> {
     let uuid = Uuid::parse_str(project_id).map_err(|e| format!("Invalid project ID: {}", e))?;
 
-    projects::find_by_id(&state.db_pool, uuid)
+    projects::find_by_id(pool, uuid)
         .await
         .map_err(|e| format!("Project not found: {}", e))?
         .ok_or_else(|| "Project not found".to_string())
@@ -981,12 +999,12 @@ async fn query_project_by_id(
 
 /// Query project by name
 async fn query_project_by_name(
-    state: &AppState,
+    pool: &sqlx::PgPool,
     project_name: &str,
 ) -> Result<crate::db::models::Project, String> {
     tracing::info!("Querying project by name: {}", project_name);
 
-    projects::find_by_name(&state.db_pool, project_name)
+    projects::find_by_name(pool, project_name)
         .await
         .map_err(|e| format!("Failed to query project by name: {}", e))?
         .ok_or_else(|| format!("Project '{}' not found", project_name))
@@ -1022,59 +1040,63 @@ async fn resolve_owner_info(
     }
 }
 
-/// Resolve project by ID or name with fuzzy matching support
+/// Resolve a project by ID or name.
+///
+/// Access is the caller's to check on the project returned. The "did you
+/// mean" suggestions on a miss are drawn only from the projects `user` can
+/// access, so a miss never names a project the caller could not list.
 async fn resolve_project(
     state: &AppState,
+    user: &User,
     id_or_name: &str,
     by_id: bool,
 ) -> Result<crate::db::models::Project, ServerError> {
-    tracing::info!("Resolving project '{}', by_id={}", id_or_name, by_id);
+    let sees_all = state.is_admin(user).await;
+    resolve_project_for(&state.db_pool, user.id, sees_all, id_or_name, by_id).await
+}
 
-    let project = if by_id {
-        // Explicit ID lookup
-        tracing::info!("Using explicit ID lookup");
-        query_project_by_id(state, id_or_name)
+/// [`resolve_project`] for a caller who sees every project (`sees_all`) or
+/// only the ones `projects::list_accessible_by_user` returns for `user_id`.
+async fn resolve_project_for(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    sees_all: bool,
+    id_or_name: &str,
+    by_id: bool,
+) -> Result<crate::db::models::Project, ServerError> {
+    if by_id {
+        return query_project_by_id(pool, id_or_name)
             .await
-            .map_err(ServerError::not_found)?
+            .map_err(ServerError::not_found);
+    }
+    if let Ok(project) = query_project_by_name(pool, id_or_name).await {
+        return Ok(project);
+    }
+    if let Ok(project) = query_project_by_id(pool, id_or_name).await {
+        return Ok(project);
+    }
+
+    let candidates = if sees_all {
+        projects::list(pool, None).await
     } else {
-        // Try name first, fallback to ID
-        tracing::info!("Trying name lookup first, will fallback to ID");
-        match query_project_by_name(state, id_or_name).await {
-            Ok(project) => project,
-            Err(e) => {
-                tracing::info!("Name lookup failed: {}, trying ID fallback", e);
-                query_project_by_id(state, id_or_name).await.map_err(|_e| {
-                    tracing::info!("Both lookups failed, generating fuzzy suggestions");
-                    // Both failed - provide fuzzy suggestions
-                    let all_projects = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current()
-                            .block_on(projects::list(&state.db_pool, None))
-                    });
-
-                    let suggestions = match all_projects {
-                        Ok(all_projects) => {
-                            let api_projects: Vec<ApiProject> = all_projects
-                                .into_iter()
-                                .map(|p| convert_project(p, None, state))
-                                .collect();
-                            let similar = find_similar_projects(id_or_name, &api_projects, 0.85);
-                            if similar.is_empty() {
-                                None
-                            } else {
-                                Some(similar)
-                            }
-                        }
-                        Err(_) => None,
-                    };
-
-                    ServerError::not_found(format!("Project '{}' not found", id_or_name))
-                        .with_suggestions(suggestions)
-                })?
-            }
+        projects::list_accessible_by_user(pool, user_id).await
+    };
+    let suggestions = match candidates {
+        Ok(candidates) => {
+            let names: Vec<&str> = candidates.iter().map(|p| p.name.as_str()).collect();
+            let similar = find_similar_projects(id_or_name, &names, 0.85);
+            (!similar.is_empty()).then_some(similar)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to list projects for suggestions: {:?}", e);
+            None
         }
     };
 
-    Ok(project)
+    Err(
+        ServerError::not_found(format!("Project '{}' not found", id_or_name))
+            .with_suggestions(suggestions),
+    )
 }
 
 /// Load app users and teams for a project
@@ -1265,7 +1287,87 @@ pub async fn check_write_permission(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_project_name;
+    use super::{
+        check_project_owner_user, resolve_project_for, resolve_project_owner_user,
+        validate_project_name,
+    };
+    use crate::db::models::ProjectStatus;
+    use crate::db::{projects, users as db_users};
+    use axum::http::StatusCode;
+    use uuid::Uuid;
+
+    /// A non-admin may own a new project only themselves; an admin may name
+    /// any user.
+    #[test]
+    fn a_new_project_is_owned_by_its_creator_unless_an_admin_says_otherwise() {
+        let caller = Uuid::new_v4();
+        let someone_else = Uuid::new_v4();
+        assert!(check_project_owner_user(caller, caller, false).is_ok());
+        let refused = check_project_owner_user(someone_else, caller, false)
+            .expect_err("another user's ID is refused");
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert!(check_project_owner_user(someone_else, caller, true).is_ok());
+    }
+
+    #[sqlx::test]
+    async fn user_owner_transfer_requires_admin_for_email_and_uuid(pool: sqlx::PgPool) {
+        let caller = db_users::create(&pool, "caller@example.com").await.unwrap();
+        let other = db_users::create(&pool, "other@example.com").await.unwrap();
+        for identifier in [other.email.clone(), other.id.to_string()] {
+            let error = resolve_project_owner_user(&pool, &identifier, caller.id, false)
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+            assert_eq!(
+                resolve_project_owner_user(&pool, &identifier, caller.id, true)
+                    .await
+                    .unwrap(),
+                other.id
+            );
+        }
+        assert_eq!(
+            resolve_project_owner_user(&pool, &caller.email, caller.id, false)
+                .await
+                .unwrap(),
+            caller.id
+        );
+    }
+
+    /// "Did you mean" on a missing project names only projects the caller
+    /// can access, unless the caller sees every project.
+    #[sqlx::test]
+    async fn suggestions_name_only_accessible_projects(pool: sqlx::PgPool) {
+        let caller = db_users::create(&pool, "caller@example.com").await.unwrap();
+        let other = db_users::create(&pool, "other@example.com").await.unwrap();
+        for (name, owner) in [("my-app", caller.id), ("my-apq", other.id)] {
+            projects::create(
+                &pool,
+                name,
+                ProjectStatus::Stopped,
+                "public".to_string(),
+                Some(owner),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let error = resolve_project_for(&pool, caller.id, false, "my-ap", false)
+            .await
+            .expect_err("no project is named my-ap");
+        assert_eq!(error.suggestions, Some(vec!["my-app".to_string()]));
+
+        let error = resolve_project_for(&pool, caller.id, true, "my-ap", false)
+            .await
+            .expect_err("no project is named my-ap");
+        let mut suggestions = error.suggestions.expect("suggestions");
+        suggestions.sort();
+        assert_eq!(
+            suggestions,
+            vec!["my-app".to_string(), "my-apq".to_string()]
+        );
+    }
 
     fn reserved_project_names() -> std::collections::HashSet<String> {
         ["rise", "dex", "registry", "www"]

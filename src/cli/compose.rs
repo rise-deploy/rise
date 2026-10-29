@@ -11,16 +11,20 @@
 //!   on a single host port.
 //!
 //! `up`/`down` manage an ephemeral stack (no file left on disk); `generate`
-//! writes a `compose.yaml` users can customize and run themselves.
+//! writes a `compose.yaml` users can customize and run themselves. That file
+//! never holds project environment values: they go to an owner-only env file
+//! under the Rise config directory, outside the repository and the build
+//! context, which the Compose file references through `env_file`.
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::build::{self, BuildOptions};
@@ -45,6 +49,8 @@ struct Service {
     command: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     ports: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    env_file: Vec<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     environment: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -59,10 +65,17 @@ struct Service {
 ///
 /// `shared_env` is the project-level environment (e.g. the deployment preview
 /// vars); per-container `[containers.X.env]` overrides are layered on top.
+///
+/// With `shared_env_file`, the shared values are not written into the model:
+/// every app service lists that file under `env_file` instead, and the caller
+/// writes `shared_env` there. Compose gives `environment` precedence over
+/// `env_file`, so an injected host var the project env shadows is left out of
+/// `environment` to keep the project value winning.
 fn build_compose(
     project_name: &str,
     resolved: &ResolvedDeploy,
     shared_env: &BTreeMap<String, String>,
+    shared_env_file: Option<&str>,
     router_port: u16,
 ) -> ComposeFile {
     let mut services: BTreeMap<String, Service> = BTreeMap::new();
@@ -95,7 +108,16 @@ fn build_compose(
         // skips an injected host var when a global env var of the same name
         // already exists (see webhook.rs).
         let mut environment = host_vars.clone();
-        environment.extend(shared_env.clone());
+        let env_file = match shared_env_file {
+            Some(file) => {
+                environment.retain(|k, _| !shared_env.contains_key(k));
+                vec![file.to_string()]
+            }
+            None => {
+                environment.extend(shared_env.clone());
+                Vec::new()
+            }
+        };
         // Per-container overrides win over project-level vars.
         for (k, v) in &container.env {
             environment.insert(k.clone(), v.clone());
@@ -149,6 +171,7 @@ fn build_compose(
             container.name.clone(),
             Service {
                 image,
+                env_file,
                 environment,
                 labels,
                 ..Default::default()
@@ -513,10 +536,29 @@ pub async fn generate(
     let shared_env =
         fetch_shared_env(http_client, config, &res.project_name, options.environment).await?;
 
+    let env_file = if shared_env.is_empty() {
+        None
+    } else {
+        let path = shared_env_file_path(
+            &config.get_backend_url(),
+            &res.project_name,
+            options.environment,
+        )?;
+        write_env_file(&path, &shared_env)?;
+        info!(
+            "Wrote {} project environment variable(s) to {} (owner-only)",
+            shared_env.len(),
+            path.display()
+        );
+        Some(path)
+    };
+    let env_file_ref = env_file.as_deref().map(compose_path_reference);
+
     let compose = build_compose(
         &res.project_name,
         &res.resolved,
         &shared_env,
+        env_file_ref.as_deref(),
         options.router_port,
     );
     let yaml = serde_yaml::to_string(&compose).context("Failed to serialize compose file")?;
@@ -539,6 +581,107 @@ pub async fn generate(
         out_path.display()
     );
     Ok(())
+}
+
+/// Owner-only env file holding a project's environment for a generated
+/// Compose file, scoped to its backend, project and environment.
+///
+/// It lives outside the project directory so it is neither committed nor sent
+/// to a container build as part of the build context.
+fn shared_env_file_path(
+    backend_url: &str,
+    project_name: &str,
+    environment: Option<&str>,
+) -> Result<PathBuf> {
+    let dir = Config::compose_env_dir()?;
+    Ok(dir.join(shared_env_file_name(backend_url, project_name, environment)))
+}
+
+fn shared_env_file_name(
+    backend_url: &str,
+    project_name: &str,
+    environment: Option<&str>,
+) -> String {
+    let digest = Sha256::digest(backend_url.trim_end_matches('/').as_bytes());
+    let backend_hash: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    match environment {
+        Some(env) => format!(
+            "{}.{}.{}.env",
+            sanitize(project_name),
+            sanitize(env),
+            backend_hash
+        ),
+        None => format!("{}.{}.env", sanitize(project_name), backend_hash),
+    }
+}
+
+/// How the Compose file names `path`: relative to `$HOME` when it lies under
+/// it, so the generated file carries no user-specific absolute path.
+fn compose_path_reference(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return format!("${{HOME}}/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Write `vars` in Compose's env-file format, readable by the owner only.
+fn write_env_file(path: &Path, vars: &BTreeMap<String, String>) -> Result<()> {
+    let dir = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    // NamedTempFile is created 0600 on Unix; persist renames it over the destination.
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("Failed to create temporary file in {}", dir.display()))?;
+    file.write_all(render_env_file(vars).as_bytes())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    file.persist(path)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Render `vars` as `KEY=value` lines. Values are single-quoted, which Compose
+/// reads literally (no `$` interpolation, no escapes); a value containing a
+/// single quote or a line break is double-quoted with `\`, `"`, `$` and line
+/// breaks escaped.
+fn render_env_file(vars: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (key, value) in vars {
+        out.push_str(key);
+        out.push('=');
+        if value.contains(['\'', '\n', '\r']) {
+            out.push('"');
+            for c in value.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '$' => out.push_str("\\$"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        } else {
+            out.push('\'');
+            out.push_str(value);
+            out.push('\'');
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Options for `rise compose up`.
@@ -573,6 +716,7 @@ pub async fn up(http_client: &Client, config: &Config, options: UpOptions<'_>) -
         &res.project_name,
         &res.resolved,
         &shared_env,
+        None,
         options.router_port,
     );
     let yaml = serde_yaml::to_string(&compose).context("Failed to serialize compose file")?;
@@ -667,7 +811,13 @@ fn compose_file_for_existing_stack(
 ) -> Result<Option<tempfile::NamedTempFile>> {
     match load_compose_project(path, explicit_project, 8080) {
         Ok(res) => {
-            let compose = build_compose(&res.project_name, &res.resolved, &BTreeMap::new(), 8080);
+            let compose = build_compose(
+                &res.project_name,
+                &res.resolved,
+                &BTreeMap::new(),
+                None,
+                8080,
+            );
             write_temp_compose_file(&compose).map(Some)
         }
         Err(err) => {
@@ -877,7 +1027,7 @@ mod tests {
         let mut shared = BTreeMap::new();
         shared.insert("FOO".to_string(), "bar".to_string());
 
-        let compose = build_compose("my-app", &resolved, &shared, 8080);
+        let compose = build_compose("my-app", &resolved, &shared, None, 8080);
 
         // One service per container plus the router.
         assert_eq!(compose.services.len(), 4);
@@ -920,7 +1070,7 @@ mod tests {
             containers: vec![container("worker", None), container("other", None)],
             routes: vec![],
         };
-        let compose = build_compose("app", &resolved, &BTreeMap::new(), 8080);
+        let compose = build_compose("app", &resolved, &BTreeMap::new(), None, 8080);
         assert!(!compose.services.contains_key("rise-router"));
         assert_eq!(compose.services.len(), 2);
     }
@@ -960,6 +1110,7 @@ replicas = 2
             &loaded.project_name,
             &loaded.resolved,
             &BTreeMap::new(),
+            None,
             8080,
         );
         assert!(compose.services.contains_key("app"));
@@ -1007,7 +1158,7 @@ replicas = 2
             containers: vec![container("web", Some(3000)), redis],
             routes: vec![],
         };
-        let compose = build_compose("my-app", &resolved, &BTreeMap::new(), 8080);
+        let compose = build_compose("my-app", &resolved, &BTreeMap::new(), None, 8080);
         assert_eq!(compose.services["redis"].image, "redis:7-alpine");
         // The built container still gets the local tag.
         assert_eq!(compose.services["web"].image, "rise-local-my-app-web");
@@ -1023,7 +1174,7 @@ replicas = 2
         };
         let mut shared = BTreeMap::new();
         shared.insert("FOO".to_string(), "shared".to_string());
-        let compose = build_compose("app", &resolved, &shared, 8080);
+        let compose = build_compose("app", &resolved, &shared, None, 8080);
         // Per-container `[containers.X.env]` wins over project-level shared env.
         assert_eq!(compose.services["web"].environment["FOO"], "container");
     }
@@ -1051,7 +1202,7 @@ replicas = 2
             "RISE_CONTAINER_HOST__API".to_string(),
             "api.external:9999".to_string(),
         );
-        let compose = build_compose("app", &resolved, &shared, 8080);
+        let compose = build_compose("app", &resolved, &shared, None, 8080);
         assert_eq!(
             compose.services["web"].environment["RISE_CONTAINER_HOST__API"],
             "api.external:9999"
@@ -1126,5 +1277,103 @@ replicas = 2
         );
 
         reject_per_container_container_cli(&config, None).unwrap();
+    }
+
+    #[test]
+    fn shared_env_file_keeps_project_values_out_of_compose_file() {
+        let mut api = container("api", Some(8080));
+        api.env
+            .insert("OVERRIDE".to_string(), "per-container".to_string());
+        let resolved = ResolvedDeploy {
+            containers: vec![container("web", Some(3000)), api],
+            routes: vec![],
+        };
+        let shared = BTreeMap::from([
+            ("SECRET_TOKEN".to_string(), "s3cr3t".to_string()),
+            ("OVERRIDE".to_string(), "project".to_string()),
+            (
+                "RISE_CONTAINER_HOST__API".to_string(),
+                "api.external:9999".to_string(),
+            ),
+        ]);
+        let compose = build_compose(
+            "app",
+            &resolved,
+            &shared,
+            Some("${HOME}/.config/rise/compose/app.env"),
+            8080,
+        );
+
+        let yaml = serde_yaml::to_string(&compose).unwrap();
+        assert!(!yaml.contains("s3cr3t"), "{yaml}");
+        assert!(!yaml.contains("api.external"), "{yaml}");
+
+        let web = &compose.services["web"];
+        assert_eq!(web.env_file, vec!["${HOME}/.config/rise/compose/app.env"]);
+        assert!(!web.environment.contains_key("SECRET_TOKEN"));
+        // The project value in the env file must win over the injected host var,
+        // and `environment` takes precedence over `env_file` in Compose.
+        assert!(!web.environment.contains_key("RISE_CONTAINER_HOST__API"));
+        assert_eq!(web.environment["RISE_CONTAINER_HOST__WEB"], "web:3000");
+        // Per-container rise.toml env still overrides the project env.
+        assert_eq!(
+            compose.services["api"].environment["OVERRIDE"],
+            "per-container"
+        );
+    }
+
+    #[test]
+    fn env_file_rendering_is_literal() {
+        let vars = BTreeMap::from([
+            ("PLAIN".to_string(), "a $b \\c \"d\"".to_string()),
+            ("QUOTE".to_string(), "it's $x\nline\\".to_string()),
+        ]);
+        assert_eq!(
+            render_env_file(&vars),
+            "PLAIN='a $b \\c \"d\"'\nQUOTE=\"it's \\$x\\nline\\\\\"\n"
+        );
+    }
+
+    #[test]
+    fn generated_env_files_isolate_backends_with_the_same_project_and_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join(shared_env_file_name(
+            "https://rise.first.example",
+            "app",
+            Some("production"),
+        ));
+        let second = dir.path().join(shared_env_file_name(
+            "https://rise.second.example",
+            "app",
+            Some("production"),
+        ));
+        assert_ne!(first, second);
+        write_env_file(&first, &BTreeMap::from([("SECRET".into(), "first".into())])).unwrap();
+        write_env_file(
+            &second,
+            &BTreeMap::from([("SECRET".into(), "second".into())]),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "SECRET='first'\n");
+        assert_eq!(
+            std::fs::read_to_string(second).unwrap(),
+            "SECRET='second'\n"
+        );
+        assert_eq!(
+            shared_env_file_name("https://rise.first.example/", "app", Some("production")),
+            shared_env_file_name("https://rise.first.example", "app", Some("production"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.env");
+        write_env_file(&path, &BTreeMap::from([("K".into(), "v".into())])).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "K='v'\n");
     }
 }

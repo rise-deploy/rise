@@ -7,8 +7,14 @@
 # placeholders survive to the URL builder.
 #
 # See the ECS operator guide for the IAM policies the two roles need.
+#
+# The jwt_signing_secret and encryption.key defaults are all-zero placeholders
+# for a local stack. Rise requires fresh RISE_JWT_SIGNING_SECRET and
+# RISE_ENCRYPTION_KEY values (the rise-ecs module supplies them), or an explicit
+# RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS=true opt-in for isolated development.
 
 server:
+  allow_insecure_development_keys: "${RISE_ALLOW_INSECURE_DEVELOPMENT_KEYS:-false}"
   host: 0.0.0.0
   port: 3000
   public_url: "${PUBLIC_URL:-http://rise.localhost:3000}"
@@ -30,6 +36,7 @@ database:
 encryption:
   type: aes-gcm-256
   key: "${RISE_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}"
+  migration_source_key: "${RISE_ENCRYPTION_MIGRATION_SOURCE_KEY:-}"
 
 auth:
   issuer: "${DEX_ISSUER:-http://rise-dex:5556/dex}"
@@ -37,8 +44,12 @@ auth:
   client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
   idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
   idp_group_sync_prefixes: "${RISE_IDP_GROUP_SYNC_PREFIXES:-}"
+  idp_group_missing_claim_policy: "${RISE_IDP_GROUP_MISSING_CLAIM_POLICY:-refuse_login}"
+  # Accept ID tokens without an `email_verified` claim. Leave false unless the
+  # IdP omits the claim yet only ever issues addresses its users own.
+  allow_missing_email_verified: "${RISE_AUTH_ALLOW_MISSING_EMAIL_VERIFIED:-false}"
   admin_users:
-    - "${ADMIN_EMAIL:-admin@example.com}"
+    - "${ADMIN_EMAIL:-}"
   admin_idp_groups:
     - "${RISE_ADMIN_IDP_GROUP:-}"
   allow_team_creation: true

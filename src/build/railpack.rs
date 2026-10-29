@@ -110,6 +110,7 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
     // Read proxy vars and parse user-provided env vars before railpack prepare
     let mut all_secrets = proxy::read_and_transform_proxy_vars();
     let user_env_vars = proxy::parse_env_vars(options.env)?;
+    let user_env_keys: Vec<String> = user_env_vars.keys().cloned().collect();
     all_secrets.extend(user_env_vars);
 
     // Add SSL env vars before railpack prepare so they are declared in the plan
@@ -137,25 +138,13 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
         .arg("--info-out")
         .arg(&info_file);
 
-    for key in all_secrets.keys() {
-        cmd.arg("--env")
-            .arg(format!("{}={}", key, all_secrets[key]));
+    let prepare_env = prepare_env(&all_secrets, &user_env_keys);
+    for arg in prepare_env.args {
+        cmd.arg("--env").arg(arg);
     }
+    cmd.envs(prepare_env.child_env);
 
-    // Log command with redacted secret values
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let redacted_env: Vec<String> = all_secrets
-            .keys()
-            .map(|k| format!("--env {}=<redacted>", k))
-            .collect();
-        debug!(
-            "Executing: railpack prepare {} --plan-out {} --info-out {} {}",
-            options.app_path,
-            plan_file.display(),
-            info_file.display(),
-            redacted_env.join(" ")
-        );
-    }
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(cmd, "Failed to execute railpack prepare", options.output)?;
 
@@ -224,6 +213,53 @@ pub(crate) fn build_image_with_railpacks(options: RailpackBuildOptions) -> Resul
     }
 
     Ok(())
+}
+
+/// How `railpack prepare` receives the build environment.
+#[derive(Debug, PartialEq, Eq)]
+struct PrepareEnv {
+    /// `--env` values: a bare `KEY`, which railpack reads from its own
+    /// environment, or `KEY=VALUE` for values that are not secret.
+    args: Vec<String>,
+    /// Variables set on the `railpack prepare` process.
+    child_env: Vec<(String, String)>,
+}
+
+/// Split `vars` into `railpack prepare` arguments and child environment so no
+/// user-supplied value appears in the world-readable argument list.
+///
+/// - User-supplied variables (`user_keys`) travel through the child
+///   environment and are named with a bare `--env KEY`.
+/// - Proxy variables not overridden by the user are named bare as well and
+///   keep the host value railpack inherits: prepare only needs them declared,
+///   and the container-side `host.docker.internal` rewrite would break
+///   railpack's own requests through a local proxy.
+/// - Anything else is a fixed value Rise chooses (the in-container CA bundle
+///   path) and is passed inline, so it does not override railpack's own
+///   TLS configuration.
+fn prepare_env(vars: &HashMap<String, String>, user_keys: &[String]) -> PrepareEnv {
+    let mut keys: Vec<&String> = vars.keys().collect();
+    keys.sort();
+    let mut env = PrepareEnv {
+        args: Vec::new(),
+        child_env: Vec::new(),
+    };
+    for key in keys {
+        let value = &vars[key];
+        if user_keys.contains(key) {
+            if value.is_empty() {
+                env.args.push(format!("{key}="));
+            } else {
+                env.args.push(key.clone());
+                env.child_env.push((key.clone(), value.clone()));
+            }
+        } else if proxy::PROXY_VAR_NAMES.contains(&key.as_str()) {
+            env.args.push(key.clone());
+        } else {
+            env.args.push(format!("{key}={value}"));
+        }
+    }
+    env
 }
 
 /// Build with docker buildx
@@ -309,7 +345,7 @@ fn build_with_buildx(
 
     cmd.arg(app_path);
 
-    debug!("Executing command: {:?}", cmd);
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(
         cmd,
@@ -430,7 +466,7 @@ pub(crate) fn build_with_buildctl(
             image_tag, platform
         ));
 
-        debug!("Executing command: {:?}", cmd);
+        debug!("Executing command: {}", super::command_for_log(&cmd));
 
         let status = super::run_command(cmd, "Failed to execute buildctl build", output)?;
         if !status.success() {
@@ -445,7 +481,11 @@ pub(crate) fn build_with_buildctl(
         ));
         cmd.stdout(std::process::Stdio::piped());
 
-        debug!("Executing command: {:?} | {} load", cmd, container_cli);
+        debug!(
+            "Executing command: {} | {} load",
+            super::command_for_log(&cmd),
+            container_cli
+        );
 
         let mut buildctl_child = cmd.spawn().context("Failed to execute buildctl build")?;
         let buildctl_stdout = buildctl_child
@@ -473,4 +513,40 @@ pub(crate) fn build_with_buildctl(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepare_env_keeps_user_values_out_of_arguments() {
+        let vars = HashMap::from([
+            ("API_TOKEN".to_string(), "s3cr3t".to_string()),
+            ("EMPTY".to_string(), String::new()),
+            (
+                "HTTPS_PROXY".to_string(),
+                "http://user:pw@host.docker.internal:3128/".to_string(),
+            ),
+            (
+                "SSL_CERT_FILE".to_string(),
+                "/etc/ssl/certs/ca-certificates.crt".to_string(),
+            ),
+        ]);
+        let env = prepare_env(&vars, &["API_TOKEN".to_string(), "EMPTY".to_string()]);
+
+        assert_eq!(
+            env.args,
+            vec![
+                "API_TOKEN",
+                "EMPTY=",
+                "HTTPS_PROXY",
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+            ]
+        );
+        assert_eq!(
+            env.child_env,
+            vec![("API_TOKEN".to_string(), "s3cr3t".to_string())]
+        );
+    }
 }

@@ -33,12 +33,17 @@ variable "execution_role_arn" {
 
 variable "workload_task_role_arn" {
   description = <<-EOT
-    Task role for deployed workloads (deployment_controller.task_role_arn).
-    Defaults to controller_role_arn, which is what modules/rise-aws's
-    ecs_task_role_arn returns: per-project task roles are not implemented.
+    modules/rise-aws `ecs_task_role_arn` — the task role every deployed
+    workload runs as (deployment_controller.task_role_arn). Every app gets
+    this role's permissions, so it must not be the controller's role, which
+    can read every project's secrets.
   EOT
   type        = string
-  default     = null
+
+  validation {
+    condition     = var.workload_task_role_arn != var.controller_role_arn
+    error_message = "workload_task_role_arn must not be controller_role_arn: every deployed app would receive the control plane's permissions. Use modules/rise-aws `ecs_task_role_arn`."
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -583,6 +588,27 @@ variable "rise_desired_count" {
   description = "Control-plane replicas. Safe above 1: the reconcile loop is leader-elected through rise-runtime-sync."
   type        = number
   default     = 1
+}
+
+variable "rise_health_check_grace_period_seconds" {
+  description = "Startup budget before ECS acts on unhealthy control-plane container health checks."
+  type        = number
+  default     = 1800
+
+  validation {
+    condition = (
+      var.rise_health_check_grace_period_seconds >= 0 &&
+      var.rise_health_check_grace_period_seconds <= 2147483647 &&
+      floor(var.rise_health_check_grace_period_seconds) == var.rise_health_check_grace_period_seconds
+    )
+    error_message = "rise_health_check_grace_period_seconds must be an integer from 0 to 2147483647."
+  }
+}
+
+variable "rise_deployment_rollback" {
+  description = "Allow ECS to restore the last completed control-plane deployment after a failure."
+  type        = bool
+  default     = true
 }
 
 variable "cpu_architecture" {

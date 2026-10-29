@@ -51,6 +51,46 @@ pub(crate) fn origins_match(candidate: &Url, allowed: &Url) -> bool {
         && candidate.port_or_known_default() == allowed.port_or_known_default()
 }
 
+/// Returns whether `path` is a same-origin relative path a browser resolves
+/// against the current host.
+///
+/// Browsers treat `\` as `/` in special-scheme URLs and drop tabs and
+/// newlines, so `/\evil.com` and `/<TAB>/evil.com` both reach `evil.com` as a
+/// protocol-relative URL. The path must start with a single `/`, contain no
+/// backslash, whitespace, or control character, and keep that shape after
+/// percent-decoding, so a hop that decodes the value cannot turn it into an
+/// off-site target either.
+pub(crate) fn is_safe_relative_path(path: &str) -> bool {
+    fn rooted_once(path: &str) -> bool {
+        path.starts_with('/') && !matches!(path.as_bytes().get(1), Some(b'/' | b'\\'))
+    }
+
+    if !rooted_once(path)
+        || path
+            .chars()
+            .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+
+    // Decoding stops once a pass leaves the value unchanged; the bound keeps a
+    // deeply nested encoding from being accepted unexamined.
+    let mut current = path.to_string();
+    for _ in 0..4 {
+        let Ok(decoded) = urlencoding::decode(&current) else {
+            return false;
+        };
+        if decoded == current {
+            return true;
+        }
+        if !rooted_once(&decoded) || decoded.chars().any(|c| c == '\\' || c.is_control()) {
+            return false;
+        }
+        current = decoded.into_owned();
+    }
+    false
+}
+
 /// Returns whether a URL host is a loopback name or address.
 ///
 /// The entire `.localhost` namespace is reserved for loopback use by RFC 6761.
@@ -114,6 +154,47 @@ mod tests {
             &Url::parse("javascript://victim.example.com/cb").unwrap(),
             &allowed
         ));
+    }
+
+    #[test]
+    fn relative_paths_must_stay_on_the_current_host() {
+        for path in [
+            "/",
+            "/dashboard",
+            "/app/project/123?tab=logs#top",
+            "/search?q=a%20b",
+            "/.rise/auth/signin",
+        ] {
+            assert!(is_safe_relative_path(path), "expected {path:?} to be safe");
+        }
+
+        for path in [
+            "",
+            "dashboard",
+            "//evil.com",
+            "/\\evil.com",
+            "/\\/evil.com",
+            "\\\\evil.com",
+            "/foo\\bar",
+            "/\t/evil.com",
+            "/\n/evil.com",
+            "/ /evil.com",
+            "/%2fevil.com",
+            "/%2F%2Fevil.com",
+            "/%5cevil.com",
+            "/%5Cevil.com",
+            "/%252f%252fevil.com",
+            "/a%5cb",
+            "/a%0d%0aSet-Cookie:x=y",
+            "/%ff",
+            "https://evil.com",
+            "javascript:alert(1)",
+        ] {
+            assert!(
+                !is_safe_relative_path(path),
+                "expected {path:?} to be rejected"
+            );
+        }
     }
 
     #[test]

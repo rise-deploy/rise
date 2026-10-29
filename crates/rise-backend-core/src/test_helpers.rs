@@ -155,11 +155,19 @@ pub struct ReversibleEncryptionProvider;
 
 #[async_trait::async_trait]
 impl crate::EncryptionProvider for ReversibleEncryptionProvider {
-    async fn encrypt(&self, plaintext: &str) -> anyhow::Result<String> {
+    async fn encrypt(
+        &self,
+        plaintext: &str,
+        _context: &crate::EncryptionContext,
+    ) -> anyhow::Result<String> {
         Ok(format!("enc:{plaintext}"))
     }
 
-    async fn decrypt(&self, ciphertext: &str) -> anyhow::Result<String> {
+    async fn decrypt(
+        &self,
+        ciphertext: &str,
+        _context: &crate::EncryptionContext,
+    ) -> anyhow::Result<String> {
         ciphertext
             .strip_prefix("enc:")
             .map(str::to_string)
@@ -271,6 +279,7 @@ impl RegistryProvider for TestRegistryProvider {
     async fn get_credentials(
         &self,
         _repository: &str,
+        _project_id: uuid::Uuid,
         _tags: &[&str],
     ) -> anyhow::Result<RegistryCredentials> {
         unreachable!("test registry issues no credentials")
@@ -308,5 +317,6 @@ pub fn url_builder() -> DeploymentUrlBuilder {
         ingress_port: None,
         ingress_schema: "https".to_string(),
         registry_provider: Arc::new(TestRegistryProvider),
+        control_plane_hosts: Vec::new(),
     }
 }

@@ -196,7 +196,7 @@ Without `-E`, variables are global (apply to all environments). With `-E`, scope
 
 | Command | Description |
 |---------|-------------|
-| `rise encrypt [plaintext]` | Encrypt a secret for use in extension specs. Reads from stdin if no argument. Rate-limited: 100 requests/hour/user. |
+| `rise encrypt --project P --extension-type TYPE --extension NAME --slot POINTER [--binding VALUE / --oauth-spec FILE] [plaintext]` | Seal for one project/resource/slot and optional consumer binding. Reads plaintext from stdin if omitted. OAuth needs `--oauth-spec`. Rate limit: 100/hour/user. |
 
 ## CI / Token Environment Variables
 

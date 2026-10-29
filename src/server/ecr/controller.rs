@@ -72,7 +72,11 @@ impl EcrController {
             debug!("Provisioning ECR repository for project: {}", project.name);
 
             // Try to create the repository
-            match self.manager.create_repository(&project.name).await {
+            match self
+                .manager
+                .create_repository(&project.name, project.id)
+                .await
+            {
                 Ok(created) => {
                     if created {
                         info!("Created ECR repository for project: {}", project.name);
@@ -115,7 +119,11 @@ impl EcrController {
             // Perform cleanup based on auto_remove setting
             let cleanup_result = if self.manager.auto_remove() {
                 // Delete the repository
-                match self.manager.delete_repository(&project.name).await {
+                match self
+                    .manager
+                    .delete_repository(&project.name, project.id)
+                    .await
+                {
                     Ok(deleted) => {
                         if deleted {
                             info!("Deleted ECR repository for project: {}", project.name);
@@ -131,7 +139,11 @@ impl EcrController {
                 }
             } else {
                 // Tag as orphaned instead of deleting
-                match self.manager.tag_as_orphaned(&project.name).await {
+                match self
+                    .manager
+                    .tag_as_orphaned(&project.name, project.id)
+                    .await
+                {
                     Ok(tagged) => {
                         if tagged {
                             info!(
@@ -186,9 +198,9 @@ impl EcrController {
             }
 
             // Check if repository actually exists
-            match self.manager.repository_exists(&project.name).await {
-                Ok(exists) => {
-                    if !exists {
+            match self.manager.repository_access(&project.name).await {
+                Ok(access) => {
+                    if access.is_none() {
                         warn!(
                             "ECR repository drift detected for project {}: repository missing but finalizer present",
                             project.name
@@ -207,6 +219,21 @@ impl EcrController {
                             "Removed ECR finalizer from project {} to trigger repository recreation",
                             project.name
                         );
+                    } else if let Some(access) = access {
+                        election.assert_leader().await?;
+                        let result = if access.project_id.is_none() {
+                            self.bind_unbound_repository(&project).await
+                        } else {
+                            self.manager
+                                .ensure_project_access(&project.name, project.id, false)
+                                .await
+                        };
+                        if let Err(error) = result {
+                            warn!(
+                                "Failed to establish ECR repository ownership for project {}: {:?}",
+                                project.name, error
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -219,6 +246,25 @@ impl EcrController {
             }
         }
 
+        Ok(())
+    }
+
+    // Remove unbound repository import once every environment has applied.
+    async fn bind_unbound_repository(
+        &self,
+        project: &crate::db::models::Project,
+    ) -> anyhow::Result<()> {
+        let mut tx = self.state.db_pool.begin().await?;
+        if !db_projects::lock_active_with_finalizer(&mut tx, project.id, ECR_FINALIZER).await? {
+            return Ok(());
+        }
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.manager
+                .ensure_project_access(&project.name, project.id, true),
+        )
+        .await??;
+        tx.commit().await?;
         Ok(())
     }
 }

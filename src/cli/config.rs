@@ -186,6 +186,10 @@ pub struct Config {
 pub struct ResolvedTarget {
     pub profile: Option<String>,
     pub url: String,
+    /// The URL comes from `targets.default.url` in the checked-out `rise.toml`
+    /// rather than from the user's own configuration (flag, `RISE_URL`, or a
+    /// profile). Credentials not bound to a URL are withheld from such a target.
+    pub url_from_project: bool,
 }
 
 static PROFILE_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
@@ -243,6 +247,7 @@ impl Config {
             std::env::var("RISE_URL").ok()
         };
         let mut url = url.or(env_url.as_deref()).map(str::to_string);
+        let mut url_from_project = false;
         let profile = if let Some(profile) = explicit_profile {
             profile
         } else if url.is_some() {
@@ -251,6 +256,7 @@ impl Config {
             match target {
                 crate::rise_toml::TargetConfig::Url(value) => {
                     url = Some(value.clone());
+                    url_from_project = true;
                     None
                 }
                 crate::rise_toml::TargetConfig::Profile(name) => {
@@ -280,7 +286,19 @@ impl Config {
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             anyhow::bail!("Rise backend URL must be an absolute HTTP or HTTPS URL");
         }
-        Ok(ResolvedTarget { profile, url })
+        Ok(ResolvedTarget {
+            profile,
+            url,
+            url_from_project,
+        })
+    }
+
+    /// The backend URL, when it was chosen by the checked-out `rise.toml`.
+    pub fn project_chosen_url() -> Option<String> {
+        TARGET_OVERRIDE
+            .get()
+            .filter(|target| target.url_from_project)
+            .map(|target| target.url.clone())
     }
 
     pub fn active_profile() -> Result<Option<String>> {
@@ -492,6 +510,13 @@ impl Config {
         Ok(())
     }
 
+    /// Owner-only directory for the env files `rise compose generate` writes.
+    pub fn compose_env_dir() -> Result<PathBuf> {
+        let dir = Self::config_dir()?.join("compose");
+        ensure_config_dir(&dir)?;
+        Ok(dir)
+    }
+
     /// Credentials are shared by every alias pointing at the same normalized URL.
     pub fn credential_path(url: &str) -> Result<PathBuf> {
         use sha2::{Digest, Sha256};
@@ -700,6 +725,7 @@ mod tests {
         set_target_override(ResolvedTarget {
             profile: Some("work".into()),
             url: url.into(),
+            url_from_project: false,
         });
 
         let mut config = Config::load_for_login().unwrap();

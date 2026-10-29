@@ -77,6 +77,7 @@ impl RegistryProvider for OciClientAuthProvider {
     async fn get_credentials(
         &self,
         repository: &str,
+        _project_id: uuid::Uuid,
         _tags: &[&str],
     ) -> Result<RegistryCredentials> {
         tracing::info!("Returning OCI registry info for repository: {}", repository);
@@ -132,7 +133,7 @@ mod tests {
         let provider = OciClientAuthProvider::new(config("rise", "secret")).unwrap();
 
         let push = provider
-            .get_credentials("my-app", &["deployment-1"])
+            .get_credentials("my-app", uuid::Uuid::new_v4(), &["deployment-1"])
             .await
             .unwrap();
         assert_eq!(push.registry_url, "registry.example.com/rise-apps");
@@ -149,7 +150,7 @@ mod tests {
         let provider = OciClientAuthProvider::new(config("", "")).unwrap();
 
         let push = provider
-            .get_credentials("my-app", &["deployment-1"])
+            .get_credentials("my-app", uuid::Uuid::new_v4(), &["deployment-1"])
             .await
             .unwrap();
         assert!(push.username.is_empty());

@@ -12,3 +12,6 @@
 # unreleased and operators should not need to tune it yet.
 deployment_controller:
   identity_token_ttl_seconds: 60
+
+server:
+  allow_insecure_development_keys: true

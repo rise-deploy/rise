@@ -13,6 +13,11 @@ which owns their task definitions, ECS services, Cloud Map registrations, and
 routing configuration. This module supplies production infrastructure around
 that runtime. The ECS E2E workspace uses the same runtime with per-run fixtures.
 
+`rise_health_check_grace_period_seconds` gives the control plane a configurable
+startup budget (1800 seconds by default) before ECS acts on unhealthy container
+checks. `rise_deployment_rollback` defaults to `true`; set it to `false` when
+the last completed image cannot read the database's current format.
+
 ## Usage
 
 ```hcl

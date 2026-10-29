@@ -99,6 +99,8 @@ const prefix = `changelog-${releaseId ?? 'overview'}`;
 </section>
 
 <script>
+  import { matchesBackend } from '../../../../shared/changelog-filters.mjs';
+
   function initializeChangelogs() {
     for (const root of document.querySelectorAll<HTMLElement>('.rise-changelog')) {
       if (root.dataset.initialized) continue;
@@ -135,7 +137,7 @@ const prefix = `changelog-${releaseId ?? 'overview'}`;
           let releaseMatches = 0;
           for (const entry of release.querySelectorAll<HTMLElement>('[data-entry]')) {
             const supported = entry.dataset.backends!.split(' ');
-            const visible = inChannel && (impact.value === 'all' || entry.dataset.impact === impact.value) && (backend.value === 'all' || supported.includes(backend.value)) && (!query || searchable.get(entry)!.includes(query));
+            const visible = inChannel && (impact.value === 'all' || entry.dataset.impact === impact.value) && matchesBackend(supported, backend.value) && (!query || searchable.get(entry)!.includes(query));
             entry.hidden = !visible;
             if (visible) releaseMatches++;
           }

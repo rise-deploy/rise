@@ -33,6 +33,14 @@ securityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
 
+# OIDC client secret for the Rise backend, injected as OIDC_CLIENT_SECRET from
+# an existing Secret. Leave `name` empty to supply OIDC_CLIENT_SECRET through
+# `env` or `envFrom` instead.
+#   kubectl create secret generic rise-oidc --from-literal=client-secret=...
+oidcClientSecret:
+  name: ""
+  key: client-secret
+
 # Additional environment variables (key-value pairs)
 env: []
   # - name: RUST_LOG
@@ -69,6 +77,15 @@ ingress:
 
 # Server container resources
 server:
+  # Startup probes gate liveness/readiness while initialization completes.
+  # Increase the budget for large installations; null disables the probe.
+  startupProbe:
+    httpGet:
+      path: /health
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 180
   resources:
     limits:
       cpu: 1000m
@@ -143,6 +160,44 @@ metacontroller:
   # Multi-controller installs should set this explicitly to the same value
   # as `deployment_controller.controller_class_name` (typically `default`).
   controllerClass: ""
+
+# Metacontroller subchart values (metacontroller.install=true).
+metacontroller-operator:
+  # The subchart's own default allows every verb on every resource. These rules
+  # cover what the rise-project-controller CompositeController
+  # (templates/metacontroller.yaml) needs: its own CRDs, the RiseProject parent,
+  # and exactly the child kinds listed under childResources. Keep the child
+  # rules in step with that list. Another CompositeController or
+  # DecoratorController on the same Metacontroller needs its kinds added here.
+  clusterRole:
+    rules:
+      - apiGroups: ["metacontroller.k8s.io"]
+        resources: ["compositecontrollers", "decoratorcontrollers"]
+        verbs: ["get", "list", "watch"]
+      - apiGroups: ["metacontroller.k8s.io"]
+        resources: ["controllerrevisions"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      # Parent: Metacontroller adds and removes its finalizer and writes the
+      # sync hook's status.
+      - apiGroups: ["rise.dev"]
+        resources: ["riseprojects"]
+        verbs: ["get", "list", "watch", "update", "patch"]
+      - apiGroups: ["rise.dev"]
+        resources: ["riseprojects/status", "riseprojects/finalizers"]
+        verbs: ["get", "update", "patch"]
+      # Children.
+      - apiGroups: [""]
+        resources: ["namespaces", "secrets", "serviceaccounts", "services"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["apps"]
+        resources: ["deployments"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["networking.k8s.io"]
+        resources: ["ingresses", "networkpolicies"]
+        verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+      - apiGroups: ["", "events.k8s.io"]
+        resources: ["events"]
+        verbs: ["create", "patch"]
 
 # Runtime deployment logs.
 # The Rise API always enforces authorization and proxies log access; Loki is only
@@ -254,12 +309,18 @@ config:
   auth:
     issuer: "http://dex:5556/dex"
     client_id: "rise-backend"
-    client_secret: ""  # Override with Secret or environment variable
+    # client_secret is left unset: the image's production.yaml reads it from
+    # OIDC_CLIENT_SECRET, which `oidcClientSecret` injects from a Secret. A
+    # value set here overrides that variable and lands in a ConfigMap.
     # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
     idp_group_claim: "groups"
     # admin_users: []  # Optional: List of admin user emails with full permissions
     # admin_idp_groups: []  # Optional: IdP groups whose members are admins
     # operator_idp_groups: []  # Optional: IdP groups whose members hold the Operator role
+    # Logins need `email_verified: true` in the ID token. Set this only if your IdP
+    # omits the claim (Microsoft Entra ID does) and every address it issues
+    # belongs to the user signing in.
+    # allow_missing_email_verified: false
     # Optional: Custom OAuth2 endpoints (autodiscovered from issuer/.well-known/openid-configuration if not set)
     # For Entra ID/Azure AD:
     # authorize_url: "https://login.microsoftonline.com/{tenant-id}/oauth2/v2.0/authorize"
@@ -422,21 +483,17 @@ dex:
         name: "Rise Backend"
         secret: "rise-backend-secret"
 
-    enablePasswordDB: true
-    staticPasswords:
-      - email: "admin@example.com"
-        hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"  # password
-        username: "admin"
-        userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
-      - email: "dev@example.com"
-        hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"  # password
-        username: "dev"
-        userID: "f4d1c5e1-3c6e-4d2a-9f4b-2e5d7c8e9f01"
-      - email: "user@example.com"
-        hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"  # password
-        username: "user"
-        userID: "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+    # Dex ships no users. Add `connectors` for a real identity provider, or
+    # enable the password DB with users whose hashes you generate yourself:
+    #   htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
+    # enablePasswordDB: true
+    # staticPasswords:
+    #   - email: "you@example.org"
+    #     hash: "<bcrypt hash>"
+    #     username: "you"
+    #     userID: "<uuid>"
+    enablePasswordDB: false
+    staticPasswords: []
 
     oauth2:
       skipApprovalScreen: true
-      passwordConnector: local

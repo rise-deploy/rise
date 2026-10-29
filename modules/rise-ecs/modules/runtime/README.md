@@ -17,6 +17,13 @@ scope installations independently. Callers must mark credential inputs as
 sensitive; that sensitivity propagates into the task definition.
 `secret_environment` contains ECS `valueFrom` references.
 
+`control_plane.health_check_grace_period_seconds` defaults to 1800 seconds.
+During this startup budget, the ECS scheduler ignores unhealthy container
+health checks. ECS can still stop excess tasks when the running count exceeds
+the desired count. `control_plane.deployment_rollback` defaults to `true` and
+controls whether a failed deployment restores the last completed version. Set
+it to `false` when that version cannot read the database's current format.
+
 `load_balancer_targets` maps port strings (`80` or `443`) to target group ARNs.
 Its keys must be known during planning. `acme.enabled` must also be known during
 planning; EFS identifiers may come from resources created in the same apply.

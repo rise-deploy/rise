@@ -80,9 +80,9 @@
         <h1>Signed in</h1>
         <p>Signing you in to <span class="mono">{{ project_name }}</span>…</p>
         <div class="progress"><div id="progress-bar"></div></div>
-        <p><small>You'll be redirected shortly. <a href="{{ redirect_url }}" class="subtle-link">Continue now</a> if nothing happens.</small></p>
+        <p><small>You'll be redirected shortly. <a id="continue-link" href="{{ redirect_url }}" class="subtle-link">Continue now</a> if nothing happens.</small></p>
         <script>
-            const redirectUrl = {{ redirect_url | json_encode() | safe }};
+            const redirectUrl = document.getElementById('continue-link').href;
             const progressBar = document.getElementById('progress-bar');
             setTimeout(() => progressBar.style.width = '100%', 100);
             setTimeout(() => { window.location.href = redirectUrl; }, 1000);
@@ -95,7 +95,7 @@
         {% if error_message %}
         <div class="errbox">{{ error_message }}</div>
         {% endif %}
-        <a href="/api/v1/auth/signin?project={{ project_name }}{% if redirect_url %}&redirect={{ redirect_url | urlencode }}{% endif %}" class="btn">Try again</a>
+        <a href="/api/v1/auth/signin?project={{ project_name | urlencode }}{% if redirect_url %}&redirect={{ redirect_url | urlencode }}{% endif %}" class="btn">Try again</a>
         {% endif %}
     </div>
 </body>

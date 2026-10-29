@@ -57,11 +57,19 @@ pub fn is_terminable(status: &DeploymentStatus) -> bool {
 /// Check if a deployment can be used as the source for a new rollback/redeploy.
 ///
 /// A deployment is reusable once its image is known to be available:
-/// - digest-pinned images are reusable immediately
-/// - rollback deployments are reusable because they point at an earlier image
+/// - prepared digest-pinned images are reusable after the pre-push phases
+/// - prepared rollback deployments are reusable because they point at an earlier image
 /// - locally built images become reusable once they reached `Pushed`
 /// - failed/cancelled deployments are reusable only after rollout actually started
 pub fn can_create_from(deployment: &Deployment) -> bool {
+    if deployment.preparation_incomplete()
+        || matches!(
+            deployment.status,
+            DeploymentStatus::Pending | DeploymentStatus::Building | DeploymentStatus::Pushing
+        )
+    {
+        return false;
+    }
     if deployment.image_digest.is_some() || deployment.rolled_back_from_deployment_id.is_some() {
         return true;
     }
@@ -273,14 +281,27 @@ mod tests {
     }
 
     #[test]
-    fn test_can_create_from_allows_digest_and_rollback_sources_immediately() {
-        let mut digest_pinned = deployment(Pending);
-        digest_pinned.image_digest = Some("registry.example/app@sha256:abc".to_string());
-        assert!(can_create_from(&digest_pinned));
-
-        let mut rollback_source = deployment(Failed);
-        rollback_source.rolled_back_from_deployment_id = Some(Uuid::new_v4());
-        assert!(can_create_from(&rollback_source));
+    fn prepared_images_remain_retryable_but_incomplete_sources_are_refused() {
+        use crate::models::PREPARATION_INCOMPLETE_KEY;
+        for status in [Pending, Building, Pushing, Pushed, Failed, Cancelled] {
+            let mut d = deployment(status.clone());
+            d.image_digest = Some("registry.example/app@sha256:abc".into());
+            d.rolled_back_from_deployment_id = Some(Uuid::new_v4());
+            for value in [
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::Value::Null,
+            ] {
+                d.controller_metadata = serde_json::json!({(PREPARATION_INCOMPLETE_KEY): value});
+                assert!(!can_create_from(&d));
+                assert!(!crate::runtime::should_have_infrastructure(&d));
+            }
+            d.controller_metadata = serde_json::json!({});
+            assert_eq!(
+                can_create_from(&d),
+                !matches!(status, Pending | Building | Pushing)
+            );
+        }
     }
 
     #[test]

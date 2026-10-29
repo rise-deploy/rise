@@ -141,6 +141,17 @@ pub struct Deployment {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The control plane retains this marker until every deployment input is persisted.
+pub const PREPARATION_INCOMPLETE_KEY: &str = "rise:preparation-incomplete";
+
+impl Deployment {
+    pub fn preparation_incomplete(&self) -> bool {
+        self.controller_metadata
+            .get(PREPARATION_INCOMPLETE_KEY)
+            .is_some()
+    }
+}
+
 /// Deployment status enum - tracks lifecycle of deployment
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, PartialEq)]
 #[sqlx(type_name = "text")]

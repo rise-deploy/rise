@@ -48,7 +48,15 @@ rules:
     verbs: ["get", "patch"]
 ```
 
-**Note:** Metacontroller itself needs broad permissions to manage child resources (namespaces, deployments, services, secrets, ingresses, etc.). Those are configured in the Metacontroller operator's own RBAC, not in Rise's ClusterRole.
+Metacontroller manages the child resources (namespaces, secrets, service
+accounts, deployments, services, ingresses, network policies) through its own
+ClusterRole. The chart's bundled Metacontroller (`metacontroller.install: true`)
+gets `metacontroller-operator.clusterRole.rules` from `values.yaml`: its own
+CRDs, `riseprojects` with their `status` and `finalizers` subresources, those
+seven child kinds, and event writes. The rules are cluster-wide, since child
+namespaces are created on demand, so Metacontroller can read every Secret in
+the cluster. When you run Metacontroller yourself, grant it the same rules
+rather than its upstream default, which allows every verb on every resource.
 
 ## Troubleshooting
 

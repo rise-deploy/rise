@@ -49,8 +49,7 @@ locals {
   # --- Identity -------------------------------------------------------------
   oidc_issuer = var.deploy_dex ? "https://dex.${var.ingress_domain}/dex" : var.oidc_issuer
 
-  workload_task_role_arn = coalesce(var.workload_task_role_arn, var.controller_role_arn)
-  create_dns_records     = var.route53_zone != null
+  create_dns_records = var.route53_zone != null
   create_traefik_task_role = coalesce(
     var.create_traefik_task_role,
     var.traefik_task_role_arn == null,
@@ -107,7 +106,7 @@ module "control_plane_env" {
   security_group_ids     = [module.security.groups.apps]
   assign_public_ip       = false
   execution_role_arn     = var.execution_role_arn
-  workload_task_role_arn = local.workload_task_role_arn
+  workload_task_role_arn = var.workload_task_role_arn
   log_group_name         = module.cluster.logging.name
   log_retention_days     = var.log_retention_days
 

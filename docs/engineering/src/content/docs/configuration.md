@@ -27,7 +27,7 @@ Configuration values can reference environment variables using the syntax:
 
 ```yaml
 auth:
-  client_secret: "${RISE_AUTH_CLIENT_SECRET:-rise-backend-secret}"
+  client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
 registry:
   account_id: "${AWS_ACCOUNT_ID}"
 server:
@@ -36,7 +36,7 @@ server:
 
 ### Syntax
 
-- `${VAR_NAME}` - Use environment variable `VAR_NAME`, error if not set
+- `${VAR_NAME}` - Use environment variable `VAR_NAME`, or an empty string if it is not set
 - `${VAR_NAME:-default}` - Use `VAR_NAME` if set, otherwise use `default`
 
 ### How It Works
@@ -126,7 +126,7 @@ server:
 auth:
   issuer: "http://localhost:5556/dex"
   client_id: "rise-backend"
-  client_secret: "${RISE_AUTH_CLIENT_SECRET:-rise-backend-secret}"
+  client_secret: "${OIDC_CLIENT_SECRET:-rise-backend-secret}"
 ```
 
 ### Production with Environment Variables
@@ -229,13 +229,25 @@ auth:
   idp_group_claim: "groups"     # ID-token claim containing group names (default shown)
                                 # Use "cognito:groups" for AWS Cognito.
   idp_group_sync_prefixes: []   # Optional prefixes limiting groups mirrored as teams.
+  idp_group_missing_claim_policy: refuse_login  # Or treat_as_empty.
   admin_users: ["email@..."]    # Default-organization admin emails (array)
   admin_idp_groups: ["..."]     # IdP groups whose members are admins (array, optional)
   operator_users: ["ops@..."]   # Operator role allowlist (array, optional)
   operator_idp_groups: ["..."]  # IdP groups whose members are Operators (array, optional)
   allow_team_creation: true     # Allow regular users to create teams (default: true)
                                 # When false, only admins can create teams
+  allow_missing_email_verified: false
+                                # Accept ID tokens without `email_verified` (default: false)
 ```
+
+**Verified email addresses.** Users, `admin_users`, `operator_users`, and the
+platform-access email allowlist all match on the ID token's `email`, so a login
+is refused unless the IdP marks that address `email_verified: true` (a boolean,
+or the string `"true"`). An IdP that lets users type in an address it never
+checks would otherwise let them sign in as someone else. Some IdPs omit the
+claim entirely; set `allow_missing_email_verified: true` only if yours does and
+every address it issues belongs to the user signing in (for example, addresses
+its administrators assign). `email_verified: false` is refused either way.
 
 **Roles:**
 - `admin_users`: Admins of the default organization. Admins do **not** implicitly receive the Operator role.
@@ -272,6 +284,11 @@ Three consequences:
 - Membership refreshes at login. Removing a user from a group in the IdP takes
   effect on their next login (or on the next Entra active sync), not
   immediately. Revoke access that must take effect at once in the IdP itself.
+  A login whose groups cannot be synced is refused (`503`) rather than
+  admitted with the memberships of an earlier login.
+  Missing/null group claims follow `idp_group_missing_claim_policy`: the default
+  `refuse_login` rejects login, while `treat_as_empty` removes mirrored groups.
+  Use the latter only when the IdP omits the claim to assert no memberships.
 - Invalid or prefix-excluded claim values never create teams. Existing
   memberships outside the filtered claim are removed at the next login.
 

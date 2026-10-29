@@ -2,9 +2,102 @@ version: unreleased
 introduction: |-
   Changes merged to `develop` that are not yet in a full release. Release candidates may include these changes.
 groups:
+  - id: security-and-upgrade-guidance
+    title: Security and upgrade guidance
   - id: known-release-candidate-limitations
     title: Known release-candidate limitations
 changes:
+  - id: credential-encryption-resource-purpose-binding
+    title: Credentials are bound to their resource and purpose
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: breaking
+    details: |-
+      Startup automatically imports stored secrets into context-bound envelopes.
+      OAuth secrets also bind the client and token destination; use canonical
+      token URLs and reseal credentials when that configuration changes.
+    action: |-
+      A migration window with earlier instances stopped and a database backup
+      are recommended. Keep existing decryption keys available and allow enough
+      startup time. A binary rollback requires restoring the backup.
+    migration: |-
+      - Live A-to-B overlap is best effort: earlier versions remain vulnerable
+        to ciphertext substitution and cannot read migrated secrets. Concurrent
+        writes can cause failures or leave legacy values needing manual repair;
+        retire earlier instances promptly. Restarting does not import values
+        written after migration completes.
+      - Keep global variables referenced by existing OAuth `client_secret_ref`
+        specs until startup succeeds. The importer retains those variables;
+        newly submitted reference-only specs have no conversion path afterwards.
+      - Keep the KMS key ID unchanged and review encryption-context IAM rules.
+        Local AES can use `encryption.migration_source_key` to import an existing
+        baseline under a fresh target key; remove it after successful cutover.
+        Replace all-zero signing and target encryption keys for production.
+      - Only if you retain ciphertext outside Rise, update those copies from
+        the migrated specs or use `rise encrypt` with the target context.
+  - id: browser-sign-in-host-proof
+    title: Sign-in and administrator defaults are stricter
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: breaking
+    details: |-
+      Sign-in requires verified email and browser proof cookies; missing group
+      claims refuse login by default. Rise pages cannot be embedded in iframes.
+      There is no default administrator, and placeholder keys require explicit
+      development opt-in.
+    action: |-
+      Configure an administrator and real production keys. For an IdP omitting
+      verified-email assertions, use `auth.allow_missing_email_verified` only
+      where appropriate. If omitted groups legitimately mean no memberships,
+      set `auth.idp_group_missing_claim_policy: treat_as_empty`. Restart
+      unfinished sign-ins after upgrading.
+  - id: ecr-repository-generation-pull-scope
+    title: Project, registry, and custom-domain access is tightened
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: action-required
+    details: |-
+      ECR credentials bind the repository, project UUID, and credential generation;
+      orphaned images are not inherited.
+      Custom domains cannot overlap control-plane hosts. Policy-audit, project
+      ownership, team visibility, and deleting-parent checks enforce access.
+    action: |-
+      Managed ECR repositories receive ownership tags automatically; unbound
+      repositories without an ECR finalizer need operator review. Review
+      conflicting domains and retained ECR repositories. Grant
+      `(get, Organization, policy-audit)` where needed. Retry ECR requests while
+      generation metadata is provisioned; revoke existing AWS role sessions if
+      immediate credential revocation is required. See [ECR operations](/operator-docs/operator-registry-operations/aws-ecr/).
+  - id: pack-build-private-env-files
+    title: CLI secrets use safer files and logging
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: breaking
+    details: |-
+      Pack uses private env files and rejects CR/LF, NUL, and trailing-whitespace
+      values. Secret files are private, Compose files are backend-scoped, and
+      logs omit credential values. Docker build-argument argv exposure remains
+      deferred; avoid passing credentials through Docker build arguments.
+    action: |-
+      Regenerate persistent Compose files with `rise compose generate`, adjust
+      unsupported Pack inputs, and set `RISE_URL` explicitly in CI instead of
+      relying on a repository-selected backend URL.
+  - id: ecs-workload-task-role-required
+    title: Helm and ECS require explicit security configuration
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: breaking
+    backends: [kubernetes, ecs]
+    details: |-
+      ECS workloads require a dedicated task role. Helm injects the OIDC secret
+      from a Secret, ships no demo Dex users, and narrows Metacontroller rules.
+      Startup budgets accommodate credential migration.
+    action: |-
+      Set ECS `workload_task_role_arn` and grant application permissions before
+      its workload rollout. For Helm, set `oidcClientSecret.name`, remove inline
+      `config.auth.client_secret`, and configure Dex sign-in. Extend rules if
+      Metacontroller serves other controllers. Allow sufficient startup time
+      (30 minutes by default) and avoid automatic rollback to an incompatible image.
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-

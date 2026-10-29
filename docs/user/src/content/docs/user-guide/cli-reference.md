@@ -72,6 +72,11 @@ The CLI picks its backend bearer token from the first available of these sources
 
 Caveat: because GitHub Actions OIDC (3) is auto-detected and ranks above the stored login token (4), a workflow with `id-token: write` and no `RISE_TOKEN`/`RISE_TOKEN_COMMAND` will use OIDC and **error if `RISE_GHA_AUDIENCE` is unset** — it does not fall back to a stored token. Setting `RISE_TOKEN` overrides everything.
 
+Sources 1–3 are not tied to a backend URL, so the CLI refuses to use them when
+the URL comes from the project's `[targets.default] url` in `rise.toml`: a
+checked-out repository must not be able to redirect them to another server. Set
+`RISE_URL` (or select a profile) to name the backend yourself.
+
 After selecting a source, the CLI exchanges its token at `POST /api/v1/auth/token` when `RISE_IDENTITY` is nonblank. Without `RISE_IDENTITY`, it passes the token through unchanged. For external CI tokens, that uses the deprecated raw-token compatibility path; the current backend default permits it, and disabling it by default is planned for 0.25.0. Interactive `rise login` and other Rise-issued tokens used directly are unaffected. See [Service accounts](/docs/user-guide/service-accounts/) for setup and migration details.
 
 ### Token refresh policy

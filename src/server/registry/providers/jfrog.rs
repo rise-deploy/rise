@@ -210,6 +210,7 @@ impl RegistryProvider for JfrogProvider {
     async fn get_credentials(
         &self,
         repository: &str,
+        _project_id: uuid::Uuid,
         tags: &[&str],
     ) -> Result<RegistryCredentials> {
         if tags.is_empty() {
@@ -247,7 +248,11 @@ impl RegistryProvider for JfrogProvider {
         Ok((String::new(), String::new()))
     }
 
-    async fn get_k8s_pull_credentials(&self, repository: &str) -> Result<RegistryCredentials> {
+    async fn get_k8s_pull_credentials(
+        &self,
+        repository: &str,
+        _project_id: uuid::Uuid,
+    ) -> Result<RegistryCredentials> {
         let scope = self.artifact_scope(repository, &self.config.pull_permissions);
 
         // Check cache under read lock

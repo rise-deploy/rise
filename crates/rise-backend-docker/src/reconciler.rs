@@ -49,6 +49,33 @@ use rise_backend_core::EncryptionProvider;
 use rise_backend_core::RegistryProvider;
 use rise_backend_traefik::readiness::{replica_ready, service_names_for_spec, ReadyVerdict};
 
+async fn image_pull_credentials(
+    registry: &dyn RegistryProvider,
+    image: &str,
+    project: &str,
+    project_id: Uuid,
+) -> Result<Option<bollard::auth::DockerCredentials>> {
+    let Some(image_project) = registry.image_project(image) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        image_project == project,
+        "Image belongs to a different Rise project"
+    );
+    let credentials = registry
+        .get_project_pull_credentials(project, project_id)
+        .await?;
+    if credentials.username.is_empty() && credentials.password.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(bollard::auth::DockerCredentials {
+        username: Some(credentials.username),
+        password: Some(credentials.password),
+        serveraddress: Some(registry.registry_host().to_string()),
+        ..Default::default()
+    }))
+}
+
 /// Controller HARD cap on the number of replicas the Docker backend will run for
 /// a single container spec. A single-host daemon can run many containers behind
 /// one Traefik LB service, but we cap it to avoid a runaway spec exhausting the
@@ -1149,7 +1176,7 @@ impl DockerReconciler {
                         let identity = prepared_identity.get(&d.deployment_uuid);
                         // Plain create (no pre-pull) pulls the image itself.
                         if let Err(e) = self
-                            .create_container(&d, &builder_cfg, false, identity)
+                            .create_container(project, &d, &builder_cfg, false, identity)
                             .await
                         {
                             if is_terminal_image_pull_error(&e) {
@@ -1220,7 +1247,7 @@ impl DockerReconciler {
                         // replacement's name + `generation` label match the action.
                         let mut d = (*d).clone();
                         d.generation = *generation;
-                        if let Err(e) = self.pull_image(&d.image).await {
+                        if let Err(e) = self.pull_image(&d.image, project).await {
                             error!(
                                 project = %project.name,
                                 container = %name,
@@ -1248,7 +1275,7 @@ impl DockerReconciler {
                         // container already gone. The image is pulled exactly once.
                         let identity = prepared_identity.get(&d.deployment_uuid);
                         if let Err(e) = self
-                            .create_container(&d, &builder_cfg, true, identity)
+                            .create_container(project, &d, &builder_cfg, true, identity)
                             .await
                         {
                             error!(
@@ -1282,6 +1309,7 @@ impl DockerReconciler {
     /// plain Create path passes `false` so it still pulls here.
     async fn create_container(
         &self,
+        project: &Project,
         desired: &DesiredContainer,
         builder_cfg: &BuilderConfig<'_>,
         already_pulled: bool,
@@ -1294,7 +1322,7 @@ impl DockerReconciler {
         // Pull the image with registry auth (anonymous → None), unless the caller
         // already pulled it before a destructive remove.
         if !already_pulled {
-            self.pull_image(&desired.image).await?;
+            self.pull_image(&desired.image, project).await?;
         }
 
         self.docker
@@ -1730,28 +1758,16 @@ impl DockerReconciler {
             .map(|e| e.name))
     }
 
-    async fn pull_image(&self, image: &str) -> Result<()> {
-        use bollard::auth::DockerCredentials;
+    async fn pull_image(&self, image: &str, project: &Project) -> Result<()> {
         use bollard::query_parameters::CreateImageOptions;
 
-        let creds = match self.registry_provider.get_pull_credentials().await {
-            Ok((username, password)) if !username.is_empty() || !password.is_empty() => {
-                Some(DockerCredentials {
-                    username: Some(username),
-                    password: Some(password),
-                    serveraddress: Some(self.registry_provider.registry_host().to_string()),
-                    ..Default::default()
-                })
-            }
-            Ok(_) => None,
-            Err(e) => {
-                warn!(
-                    "Failed to obtain pull credentials, pulling anonymously: {:?}",
-                    e
-                );
-                None
-            }
-        };
+        let creds = image_pull_credentials(
+            self.registry_provider.as_ref(),
+            image,
+            &project.name,
+            project.id,
+        )
+        .await?;
 
         let options = Some(CreateImageOptions {
             from_image: Some(image.to_string()),
@@ -2625,6 +2641,84 @@ fn parse_docker_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc
 mod tests {
 
     use rise_backend_core::observation::ObservedState;
+
+    struct UnavailableRegistry;
+
+    #[async_trait::async_trait]
+    impl rise_backend_core::RegistryProvider for UnavailableRegistry {
+        async fn get_credentials(
+            &self,
+            _repository: &str,
+            _project_id: uuid::Uuid,
+            _tags: &[&str],
+        ) -> anyhow::Result<rise_backend_core::RegistryCredentials> {
+            unreachable!()
+        }
+
+        async fn get_pull_credentials(&self) -> anyhow::Result<(String, String)> {
+            panic!("runtime pulls require a project scope")
+        }
+
+        async fn get_project_pull_credentials(
+            &self,
+            repository: &str,
+            project_id: uuid::Uuid,
+        ) -> anyhow::Result<rise_backend_core::RegistryCredentials> {
+            assert_eq!(repository, "app");
+            assert_eq!(project_id, uuid::Uuid::from_u128(1));
+            anyhow::bail!("repository unavailable")
+        }
+
+        fn registry_host(&self) -> &str {
+            "registry.example"
+        }
+        fn registry_url(&self) -> &str {
+            "registry.example/rise"
+        }
+        fn get_image_tag(
+            &self,
+            repository: &str,
+            tag: &str,
+            _tag_type: rise_backend_core::ImageTagType,
+        ) -> String {
+            format!("registry.example/rise/{repository}:{tag}")
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_pull_checks_project_eligibility_and_keeps_external_images_anonymous() {
+        assert!(super::image_pull_credentials(
+            &UnavailableRegistry,
+            "registry.example/rise/app:tag",
+            "app",
+            uuid::Uuid::from_u128(1)
+        )
+        .await
+        .is_err());
+        assert!(super::image_pull_credentials(
+            &UnavailableRegistry,
+            "registry.example/rise/other:tag",
+            "app",
+            uuid::Uuid::from_u128(1)
+        )
+        .await
+        .is_err());
+        for image in [
+            "nginx:latest",
+            "other.example/rise/app:tag",
+            "registry.example/rise-other/app:tag",
+        ] {
+            assert!(super::image_pull_credentials(
+                &UnavailableRegistry,
+                image,
+                "app",
+                uuid::Uuid::from_u128(1)
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+    }
 
     fn inspected(status: &str, running: bool) -> InspectedContainer {
         InspectedContainer {

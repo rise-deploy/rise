@@ -33,17 +33,18 @@ override_data {
 }
 
 variables {
-  name                = "rise"
-  ingress_domain      = "rise.example.com"
-  admin_email         = "ops@example.com"
-  rise_image_tag      = "0.23.0"
-  rise_cli_image_tag  = "0.23.0"
-  acme_email          = "ops@example.com"
-  controller_role_arn = "arn:aws:iam::123456789012:role/rise"
-  execution_role_arn  = "arn:aws:iam::123456789012:role/rise-ecs-execution"
-  ecr_push_role_arn   = "arn:aws:iam::123456789012:role/rise-ecr-push"
-  oidc_issuer         = "https://id.example.com"
-  oidc_client_secret  = "s3cret"
+  name                   = "rise"
+  ingress_domain         = "rise.example.com"
+  admin_email            = "ops@example.com"
+  rise_image_tag         = "0.23.0"
+  rise_cli_image_tag     = "0.23.0"
+  acme_email             = "ops@example.com"
+  controller_role_arn    = "arn:aws:iam::123456789012:role/rise"
+  workload_task_role_arn = "arn:aws:iam::123456789012:role/rise-ecs-workload"
+  execution_role_arn     = "arn:aws:iam::123456789012:role/rise-ecs-execution"
+  ecr_push_role_arn      = "arn:aws:iam::123456789012:role/rise-ecr-push"
+  oidc_issuer            = "https://id.example.com"
+  oidc_client_secret     = "s3cret"
 }
 
 # ECS re-authenticates at every task start and cannot refresh a scoped token, so
@@ -267,4 +268,14 @@ run "rejects_a_vpc_without_public_subnets" {
     values = { vpc_id = "vpc-0123456789abcdef0" }
   }
   expect_failures = [var.vpc]
+}
+
+# Every deployed app runs as the workload role; the controller's role can read
+# every project's secrets.
+run "rejects_the_controller_role_as_workload_role" {
+  command = plan
+  variables {
+    workload_task_role_arn = "arn:aws:iam::123456789012:role/rise"
+  }
+  expect_failures = [var.workload_task_role_arn]
 }

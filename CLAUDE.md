@@ -186,7 +186,7 @@ cargo build --all-features     # Full build with CLI + backend
        - [x] Session-based token caching with automatic refresh
        - [x] Encrypted token storage (AES-GCM/KMS)
        - [x] Support for any OAuth 2.0 provider (Snowflake, Google, GitHub, custom SSO)
-       - [x] Client secret stored as encrypted environment variables
+       - [x] Client secret stored as a resource- and destination-bound encrypted envelope in the extension spec
      - [x] AWS RDS extension for database provisioning
      - [x] AWS S3 extension for bucket provisioning
      - [x] Snowflake OAuth provisioner for Snowflake security integrations
@@ -314,25 +314,28 @@ and drop whatever the migration created.
 
 ## Rollout Tracking
 
-Operator-facing change is recorded in the operator docs **Changelog**
-(`docs/engineering/src/content/docs/changelog/`): its
-[Upcoming releases](docs/engineering/src/content/docs/changelog/index.md) page
-plus one page per released version.
+Operator-facing changes are recorded in the operator docs [Changelog](docs/engineering/src/content/docs/changelog/index.mdx).
+Its source is [structured changelog data](docs/engineering/src/data/changelog/README.md),
+which also supplies release notes, Markdown exports, and the deprecation register.
 
-- A PR that is breaking, needs operator action, or adds or changes
-  configuration adds its entry under **Unreleased** on Upcoming releases in the
-  **same** PR, with the matching impact badge, and carries the
-  `operator-impact` label. CI fails a labelled PR that does not touch the page.
-- `scripts/tag-version.sh` feeds Unreleased into the AI release notes and, for a
-  full release, runs `scripts/changelog-release.sh`: it writes the version's
-  page (release notes plus the Unreleased entries as its upgrade notes) and
-  empties Unreleased. Release candidates get no page of their own.
-- Planned operator-facing change that has not merged — a deferred finalization
-  step (flip a default, drop a compat shim, tighten a constraint) or a known
-  limitation awaiting a fix — is filed as a `rollout-gate` issue **and** listed
-  under **Planned** on Upcoming releases, under its target release or "Not yet
-  scheduled". The PR that lands it moves the entry into Unreleased. Check both
-  when planning or reviewing large or breaking work.
+- A PR that is breaking, needs operator action, or adds or changes configuration
+  adds its entry to `docs/engineering/src/data/changelog/unreleased.yaml` in the
+  **same** PR and carries the `operator-impact` label. Use a stable descriptive
+  `id`, the matching `impact`, and applicable `backends`; put upgrade steps in
+  `action` and longer migration instructions in `migration`.
+- `scripts/tag-version.sh` feeds the rendered upcoming changes into release
+  notes. For full releases, `scripts/changelog-release.sh` writes the versioned
+  YAML and release page and clears `unreleased.yaml`. Release candidates have
+  no separate changelog document.
+- Planned operator-facing changes, deferred finalization, and known limitations
+  awaiting a fix are filed as `rollout-gate` issues and listed in
+  `docs/engineering/src/data/changelog/planned.yaml`. Set `targetVersion` only
+  for an intended full release. When the work merges, move its entry to
+  `unreleased.yaml`, retain its `id`, and remove `targetVersion`.
+- Deprecation lifecycle entries use `type: deprecation`, a stable `feature`, and
+  `stage`; the register is derived from these entries. Record only established
+  milestones and provide migration instructions. See the changelog data guide
+  for supported stages and release evidence.
 - `ROADMAP.md` owns the *why*, phase rationale, and milestone checkboxes for every
   in-flight architectural workstream (its numbered sections: generic resource and
   authorization foundation, Rise-issued authentication and token issuance,

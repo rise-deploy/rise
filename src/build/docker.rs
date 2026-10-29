@@ -232,7 +232,7 @@ pub(crate) fn build_image_with_dockerfile(options: DockerBuildOptions) -> Result
         options.push_mode == BuildPushMode::Inline
     };
 
-    debug!("Executing command: {:?}", cmd);
+    debug!("Executing command: {}", super::command_for_log(&cmd));
 
     let status = super::run_command(
         cmd,

@@ -219,6 +219,52 @@ impl WorkloadTokenRateLimiter {
     }
 }
 
+/// Budget for the generic resource API's `policy-audit` listing.
+///
+/// One run reads every binding, Role, Group and owner-label setter in its
+/// scope, so it is the most expensive read the API serves. Each caller gets a
+/// small per-window budget, counted before authorization so a refused caller
+/// cannot spin on the decision either; the replica-wide budget counts only runs
+/// that passed authorization, so refused callers cannot spend it for everyone.
+pub struct PolicyAuditRateLimiter {
+    per_actor: WindowCounter,
+    authorized: WindowCounter,
+}
+
+impl PolicyAuditRateLimiter {
+    const WINDOW_SECS: u64 = 60;
+    const PER_ACTOR_MAX: u32 = 6;
+    const AUTHORIZED_MAX: u32 = 30;
+    const ACTOR_MAX_CAPACITY: u64 = 10_000;
+
+    pub fn new() -> Self {
+        Self {
+            per_actor: WindowCounter::new(
+                Self::PER_ACTOR_MAX,
+                Self::WINDOW_SECS,
+                Self::ACTOR_MAX_CAPACITY,
+            ),
+            authorized: WindowCounter::new(Self::AUTHORIZED_MAX, Self::WINDOW_SECS, 1),
+        }
+    }
+
+    /// Count one request by `actor`: `Err(retry_after_secs)` once over its budget.
+    pub async fn requested(&self, actor: &str) -> Result<(), u64> {
+        self.per_actor.hit(actor).await
+    }
+
+    /// Count one authorized run against this replica's budget.
+    pub async fn authorized(&self) -> Result<(), u64> {
+        self.authorized.hit("policy-audit").await
+    }
+}
+
+impl Default for PolicyAuditRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Extract the client IP address from request headers.
 ///
 /// Checks `X-Real-IP` first (set by the reverse proxy to the actual client IP), then falls back

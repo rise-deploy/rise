@@ -29,14 +29,16 @@ module "runtime" {
     region     = local.region
   }
   control_plane = {
-    name                   = "${local.name}-control-plane"
-    discovery_name         = local.control_plane_discovery_name
-    image                  = local.rise_image_ref
-    cpu                    = var.rise_cpu
-    memory                 = var.rise_memory
-    desired_count          = var.rise_desired_count
-    enable_execute_command = var.enable_execute_command
-    labels                 = module.control_plane_env.docker_labels
+    name                              = "${local.name}-control-plane"
+    discovery_name                    = local.control_plane_discovery_name
+    image                             = local.rise_image_ref
+    cpu                               = var.rise_cpu
+    memory                            = var.rise_memory
+    desired_count                     = var.rise_desired_count
+    health_check_grace_period_seconds = var.rise_health_check_grace_period_seconds
+    deployment_rollback               = var.rise_deployment_rollback
+    enable_execute_command            = var.enable_execute_command
+    labels                            = module.control_plane_env.docker_labels
   }
   environment        = local.rise_environment
   secret_environment = local.control_plane_secret_environment

@@ -41,6 +41,66 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
     response
 }
 
+/// Middleware that forbids every page Rise serves from being framed.
+///
+/// The UI, the sign-in and device-approval pages, and the `/.rise/auth/*`
+/// pages on app hosts all act on the viewer's session with a click, so a page
+/// that frames them can trick a signed-in user into approving something.
+/// `frame-ancestors 'none'` is the CSP control; `X-Frame-Options: DENY` covers
+/// browsers that predate it. A `Content-Security-Policy` a handler already set
+/// is extended rather than replaced.
+pub async fn frame_protection_middleware(request: Request, next: Next) -> Response {
+    const FRAME_ANCESTORS: &str = "frame-ancestors 'none'";
+
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+
+    let csp = match headers
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(existing) if existing.contains("frame-ancestors") => None,
+        Some(existing) if !existing.trim().is_empty() => header::HeaderValue::from_str(&format!(
+            "{}; {FRAME_ANCESTORS}",
+            existing.trim().trim_end_matches(';')
+        ))
+        .ok(),
+        _ => Some(header::HeaderValue::from_static(FRAME_ANCESTORS)),
+    };
+    if let Some(csp) = csp {
+        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+
+    response
+}
+
+/// Render `url` for a log line without its query string or fragment.
+///
+/// Redirect URLs carry one-time credentials there (OAuth authorization codes,
+/// `state`, ingress completion tokens), so logs keep only scheme, host and path.
+pub fn url_for_log(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let had_query = parsed.query().is_some() || parsed.fragment().is_some();
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            if had_query {
+                format!("{parsed}?<redacted>")
+            } else {
+                parsed.to_string()
+            }
+        }
+        Err(_) => match url.find(['?', '#']) {
+            Some(index) => format!("{}?<redacted>", &url[..index]),
+            None => url.to_string(),
+        },
+    }
+}
+
 /// Helper for extracting request metadata for logging context
 ///
 /// # Example
@@ -91,6 +151,26 @@ impl RequestMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_for_log_withholds_query_and_fragment() {
+        assert_eq!(
+            url_for_log("https://app.example.com/callback?code=s3cr3t&state=xyz"),
+            "https://app.example.com/callback?<redacted>"
+        );
+        assert_eq!(
+            url_for_log("https://app.example.com/cb#access_token=s3cr3t"),
+            "https://app.example.com/cb?<redacted>"
+        );
+        assert_eq!(
+            url_for_log("https://app.example.com/path"),
+            "https://app.example.com/path"
+        );
+        assert_eq!(
+            url_for_log("/relative/path?token=s3cr3t"),
+            "/relative/path?<redacted>"
+        );
+    }
     use axum::{
         body::Body,
         http::{Request as HttpRequest, StatusCode},
@@ -126,6 +206,46 @@ mod tests {
 
         // Verify response is successful
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn frame_protection_denies_framing_on_every_response() {
+        async fn with_csp() -> impl axum::response::IntoResponse {
+            (
+                [(header::CONTENT_SECURITY_POLICY, "default-src 'self';")],
+                "page",
+            )
+        }
+
+        let app = Router::new()
+            .route("/", get(test_handler))
+            .route("/csp", get(with_csp))
+            .layer(axum::middleware::from_fn(frame_protection_middleware));
+
+        for (uri, expected_csp) in [
+            ("/", "frame-ancestors 'none'"),
+            ("/csp", "default-src 'self'; frame-ancestors 'none'"),
+            ("/missing", "frame-ancestors 'none'"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.headers().get(header::X_FRAME_OPTIONS).unwrap(),
+                "DENY",
+                "{uri}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .unwrap(),
+                expected_csp,
+                "{uri}"
+            );
+        }
     }
 
     #[tokio::test]

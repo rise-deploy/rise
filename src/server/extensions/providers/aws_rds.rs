@@ -2,12 +2,13 @@ use crate::db::{
     self, deployments as db_deployments, extensions as db_extensions, postgres_admin,
     projects as db_projects,
 };
-use crate::server::encryption::EncryptionProvider;
+use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use aws_sdk_rds::Client as RdsClient;
 use chrono::{DateTime, Duration, Utc};
+use rise_backend_core::encryption::pointer_segment;
 use rise_runtime_sync::{with_leader_election, LeaderElection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -345,6 +346,12 @@ impl AwsRdsProvisioner {
             .map(|db| db.status.clone())
             .collect();
 
+        let context = EncryptionContext::extension(
+            project.id,
+            self.extension_type(),
+            &project_extension.extension,
+            "",
+        );
         // Handle normal lifecycle
         match status.state {
             RdsState::Pending => {
@@ -358,13 +365,19 @@ impl AwsRdsProvisioner {
                 .await?;
             }
             RdsState::Creating => {
-                self.handle_creating(&mut status, &project.name, project.id)
+                self.handle_creating(&mut status, &project.name, &context)
                     .await?;
             }
             RdsState::Available => {
                 // Check if instance still exists and perform cleanup
-                self.verify_instance_available(&mut status, &project.name, project.id, &spec)
-                    .await?;
+                self.verify_instance_available(
+                    &mut status,
+                    &project.name,
+                    project.id,
+                    &spec,
+                    &context,
+                )
+                .await?;
             }
             RdsState::Failed => {
                 // Retry creation immediately
@@ -436,7 +449,15 @@ impl AwsRdsProvisioner {
         // Encrypt password
         let encrypted_password = self
             .encryption_provider
-            .encrypt(&master_password)
+            .encrypt(
+                &master_password,
+                &EncryptionContext::extension(
+                    project_id,
+                    self.extension_type(),
+                    extension_name,
+                    "/status/master_password_encrypted",
+                ),
+            )
             .await
             .context("Failed to encrypt master password")?;
 
@@ -545,7 +566,7 @@ impl AwsRdsProvisioner {
         &self,
         status: &mut AwsRdsStatus,
         project_name: &str,
-        _project_id: Uuid,
+        context: &EncryptionContext,
     ) -> Result<()> {
         let instance_id = status
             .instance_id
@@ -588,9 +609,17 @@ impl AwsRdsProvisioner {
                                             let password = self.generate_password();
                                             let encrypted = self
                                                 .encryption_provider
-                                                .encrypt(&password)
+                                                .encrypt(
+                                                    &password,
+                                                    &context.with_slot(&format!(
+                                                        "/status/databases/{}/password_encrypted",
+                                                        pointer_segment(&default_db_name)
+                                                    )),
+                                                )
                                                 .await
-                                                .unwrap_or(password.clone()); // Fallback if encryption fails
+                                                .context(
+                                                    "Failed to encrypt database credentials",
+                                                )?;
 
                                             status.databases.insert(
                                                 default_db_name.clone(),
@@ -604,7 +633,8 @@ impl AwsRdsProvisioner {
                                         }
 
                                         // Process databases (will handle Pending -> CreatingDatabase -> CreatingUser -> Available)
-                                        self.process_databases(status, address, port).await?;
+                                        self.process_databases(status, address, port, context)
+                                            .await?;
                                     }
                                 }
 
@@ -660,6 +690,7 @@ impl AwsRdsProvisioner {
         project_name: &str,
         project_id: Uuid,
         spec: &AwsRdsSpec,
+        context: &EncryptionContext,
     ) -> Result<()> {
         let instance_id = status
             .instance_id
@@ -690,7 +721,8 @@ impl AwsRdsProvisioner {
                                 if let (Some(address), Some(port)) =
                                     (endpoint.address(), endpoint.port())
                                 {
-                                    self.process_databases(status, address, port).await?;
+                                    self.process_databases(status, address, port, context)
+                                        .await?;
 
                                     // Cleanup: Mark orphaned databases for deletion (isolated mode only)
                                     if spec.database_isolation == DatabaseIsolation::Isolated {
@@ -700,6 +732,7 @@ impl AwsRdsProvisioner {
                                             project_name,
                                             spec,
                                             &format!("{}:{}", address, port),
+                                            context,
                                         )
                                         .await?;
                                     }
@@ -729,6 +762,7 @@ impl AwsRdsProvisioner {
         status: &mut AwsRdsStatus,
         address: &str,
         port: i32,
+        context: &EncryptionContext,
     ) -> Result<()> {
         // Process each database that's not in Available or Terminating state
         for (db_name, db_status) in status.databases.iter_mut() {
@@ -755,7 +789,14 @@ impl AwsRdsProvisioner {
                         }
                     };
 
-                    let master_password = match self.encryption_provider.decrypt(encrypted).await {
+                    let master_password = match self
+                        .encryption_provider
+                        .decrypt(
+                            encrypted,
+                            &context.with_slot("/status/master_password_encrypted"),
+                        )
+                        .await
+                    {
                         Ok(pwd) => pwd,
                         Err(e) => {
                             error!("Failed to decrypt master password: {}", e);
@@ -805,7 +846,14 @@ impl AwsRdsProvisioner {
                         }
                     };
 
-                    let master_password = match self.encryption_provider.decrypt(encrypted).await {
+                    let master_password = match self
+                        .encryption_provider
+                        .decrypt(
+                            encrypted,
+                            &context.with_slot("/status/master_password_encrypted"),
+                        )
+                        .await
+                    {
                         Ok(pwd) => pwd,
                         Err(e) => {
                             error!("Failed to decrypt master password: {}", e);
@@ -816,7 +864,13 @@ impl AwsRdsProvisioner {
 
                     let user_password = match self
                         .encryption_provider
-                        .decrypt(&db_status.password_encrypted)
+                        .decrypt(
+                            &db_status.password_encrypted,
+                            &context.with_slot(&format!(
+                                "/status/databases/{}/password_encrypted",
+                                pointer_segment(db_name)
+                            )),
+                        )
                         .await
                     {
                         Ok(pwd) => pwd,
@@ -913,6 +967,7 @@ impl AwsRdsProvisioner {
         project_name: &str,
         spec: &AwsRdsSpec,
         endpoint: &str,
+        context: &EncryptionContext,
     ) -> Result<()> {
         use std::collections::HashSet;
 
@@ -992,6 +1047,7 @@ impl AwsRdsProvisioner {
                         .master_password_encrypted
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("Master password not set"))?,
+                    &context.with_slot("/status/master_password_encrypted"),
                 )
                 .await
                 .context("Failed to decrypt master password")?;
@@ -1193,17 +1249,10 @@ impl AwsRdsProvisioner {
                     db_username, db_password, endpoint, database_name
                 );
 
-                let encrypted_database_url = self
-                    .encryption_provider
-                    .encrypt(&database_url)
-                    .await
-                    .context(format!("Failed to encrypt {}", env_var_name))?;
-
                 result.push(InjectedEnvVar {
                     key: env_var_name.clone(),
                     value: InjectedEnvVarValue::Protected {
                         decrypted: database_url,
-                        encrypted: encrypted_database_url,
                     },
                 });
             }
@@ -1225,17 +1274,10 @@ impl AwsRdsProvisioner {
             }
 
             // Only the password is a protected secret
-            let encrypted_password = self
-                .encryption_provider
-                .encrypt(db_password)
-                .await
-                .context("Failed to encrypt password")?;
-
             result.push(InjectedEnvVar {
                 key: "PGPASSWORD".to_string(),
                 value: InjectedEnvVarValue::Protected {
                     decrypted: db_password.to_string(),
-                    encrypted: encrypted_password,
                 },
             });
         }
@@ -1499,6 +1541,9 @@ impl Extension for AwsRdsProvisioner {
             );
         }
 
+        let context =
+            EncryptionContext::extension(project_id, self.extension_type(), &ext.extension, "");
+
         // Parse spec to get injection preferences
         let spec: AwsRdsSpec =
             serde_json::from_value(ext.spec.clone()).context("Failed to parse AWS RDS spec")?;
@@ -1540,7 +1585,10 @@ impl Extension for AwsRdsProvisioner {
         // Decrypt password
         let master_password = self
             .encryption_provider
-            .decrypt(encrypted_password)
+            .decrypt(
+                encrypted_password,
+                &context.with_slot("/status/master_password_encrypted"),
+            )
             .await
             .context("Failed to decrypt master password")?;
 
@@ -1653,7 +1701,13 @@ impl Extension for AwsRdsProvisioner {
 
             let password = self
                 .encryption_provider
-                .decrypt(&db_status.password_encrypted)
+                .decrypt(
+                    &db_status.password_encrypted,
+                    &context.with_slot(&format!(
+                        "/status/databases/{}/password_encrypted",
+                        pointer_segment(&database_name)
+                    )),
+                )
                 .await
                 .context("Failed to decrypt database user password")?;
 
@@ -1712,7 +1766,13 @@ impl Extension for AwsRdsProvisioner {
             // Store credentials in status
             let encrypted_password = self
                 .encryption_provider
-                .encrypt(&password)
+                .encrypt(
+                    &password,
+                    &context.with_slot(&format!(
+                        "/status/databases/{}/password_encrypted",
+                        pointer_segment(&database_name)
+                    )),
+                )
                 .await
                 .context("Failed to encrypt database user password")?;
 

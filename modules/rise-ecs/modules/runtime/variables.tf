@@ -59,15 +59,17 @@ variable "logging" {
 variable "control_plane" {
   description = "Rise service identity, image, resources, labels, and health-check timing."
   type = object({
-    name                   = string
-    discovery_name         = string
-    image                  = string
-    cpu                    = optional(string, "1024")
-    memory                 = optional(string, "2048")
-    desired_count          = optional(number, 1)
-    enable_execute_command = optional(bool, false)
-    log_stream_prefix      = optional(string, "rise")
-    labels                 = map(string)
+    name                              = string
+    discovery_name                    = string
+    image                             = string
+    cpu                               = optional(string, "1024")
+    memory                            = optional(string, "2048")
+    desired_count                     = optional(number, 1)
+    enable_execute_command            = optional(bool, false)
+    log_stream_prefix                 = optional(string, "rise")
+    health_check_grace_period_seconds = optional(number, 1800)
+    deployment_rollback               = optional(bool, true)
+    labels                            = map(string)
     health_check = optional(object({
       interval     = optional(number, 30)
       timeout      = optional(number, 5)
@@ -75,6 +77,15 @@ variable "control_plane" {
       start_period = optional(number, 60)
     }), {})
   })
+
+  validation {
+    condition = (
+      var.control_plane.health_check_grace_period_seconds >= 0 &&
+      var.control_plane.health_check_grace_period_seconds <= 2147483647 &&
+      floor(var.control_plane.health_check_grace_period_seconds) == var.control_plane.health_check_grace_period_seconds
+    )
+    error_message = "Control-plane health-check grace period must be an integer from 0 to 2147483647 seconds."
+  }
 }
 
 variable "environment" {

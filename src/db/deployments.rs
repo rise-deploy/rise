@@ -316,16 +316,38 @@ pub async fn find_by_deployment_id_unscoped(
     Ok(deployments)
 }
 
-/// Create a new deployment
+/// Create a prepared fixture without an asynchronous configuration handoff.
+#[cfg(test)]
 pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result<Deployment> {
+    create_with_initial_metadata(pool, params, &serde_json::json!({})).await
+}
+
+/// The preparation marker is visible from the row's first committed version.
+pub async fn create_preparing(
+    pool: &PgPool,
+    params: CreateDeploymentParams<'_>,
+) -> Result<Deployment> {
+    create_with_initial_metadata(
+        pool,
+        params,
+        &serde_json::json!({(rise_backend_core::models::PREPARATION_INCOMPLETE_KEY): true}),
+    )
+    .await
+}
+
+async fn create_with_initial_metadata(
+    pool: &PgPool,
+    params: CreateDeploymentParams<'_>,
+    metadata: &serde_json::Value,
+) -> Result<Deployment> {
     let status_str = params.status.to_string();
 
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
         WITH ins AS (
-            INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+            INSERT INTO deployments (deployment_id, project_id, created_by_id, status, image, image_digest, rolled_back_from_deployment_id, deployment_group, environment_id, expires_at, http_port, is_active, job_url, pull_request_url, git_repository_url, replicas, cpu, memory, identity_audiences, containers, routes, controller_metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $26)
             RETURNING *
         ),
         ev AS (
@@ -451,12 +473,48 @@ pub async fn create(pool: &PgPool, params: CreateDeploymentParams<'_>) -> Result
             .expiration_cap
             .map(|c| c.max_deployment_expiration.as_str()),
         params.expiration_cap.map(|c| c.environment.as_str()),
+        metadata,
     )
     .fetch_one(pool)
     .await
     .context("Failed to create deployment")?;
 
     Ok(deployment)
+}
+
+/// Only trusted preparation code may clear the marker and publish the configuration.
+/// The expected phase excludes cancellation and failure, including concurrent changes.
+pub async fn finish_preparation(
+    pool: &PgPool,
+    id: Uuid,
+    publish_image: bool,
+) -> Result<Deployment> {
+    let (expected, target) = if publish_image {
+        ("Pushing", "Pushed")
+    } else {
+        ("Pending", "Pending")
+    };
+    sqlx::query_as::<_, Deployment>(r#"
+        WITH prev AS (SELECT id, status FROM deployments WHERE id = $1 FOR UPDATE),
+        upd AS (
+            UPDATE deployments
+            SET status = $3, controller_metadata = controller_metadata - 'rise:preparation-incomplete'
+            FROM prev
+            WHERE deployments.id = prev.id AND deployments.status = $2
+              AND deployments.controller_metadata ? 'rise:preparation-incomplete'
+              AND is_valid_transition(deployments.status, $3)
+            RETURNING deployments.*, prev.status AS from_status
+        ),
+        ev AS (
+            INSERT INTO deployment_events(deployment_id, occurred_at, kind, severity, source, attributes)
+            SELECT id, NOW(), 'status_changed', 'info', 'control-plane',
+                jsonb_build_object('from', from_status, 'to', status)
+            FROM upd WHERE from_status IS DISTINCT FROM status
+        )
+        SELECT * FROM upd
+    "#).bind(id).bind(expected).bind(target).fetch_optional(pool).await
+        .context("Failed to finish deployment preparation")?
+        .context("Deployment preparation was cancelled, failed, or modified before completion")
 }
 
 /// Update deployment status
@@ -506,7 +564,11 @@ pub async fn update_status(
 
     let current = current.ok_or_else(|| anyhow::anyhow!("Deployment not found"))?;
 
-    // Validate state transition
+    anyhow::ensure!(
+        status != DeploymentStatus::Pushed || !current.preparation_incomplete(),
+        "Deployment configuration is not prepared"
+    );
+    // The SQL predicate repeats this check under the row lock.
     state_machine::validate_transition(&current.status, &status)?;
 
     // Perform the update
@@ -537,6 +599,7 @@ pub async fn update_status(
             FROM prev
             WHERE deployments.id = prev.id
               AND is_valid_transition(deployments.status, $2)
+              AND ($2 <> 'Pushed' OR NOT (deployments.controller_metadata ? 'rise:preparation-incomplete'))
             RETURNING deployments.*, prev.status AS from_status
         ),
         ev AS (
@@ -696,11 +759,18 @@ pub async fn update_controller_metadata(
     id: Uuid,
     metadata: &serde_json::Value,
 ) -> Result<Deployment> {
+    anyhow::ensure!(
+        metadata.is_object(),
+        "Controller metadata must be a JSON object"
+    );
     let deployment = sqlx::query_as!(
         Deployment,
         r#"
         UPDATE deployments
-        SET controller_metadata = $2
+        SET controller_metadata = ($2::jsonb - 'rise:preparation-incomplete') ||
+            CASE WHEN controller_metadata ? 'rise:preparation-incomplete'
+                THEN jsonb_build_object('rise:preparation-incomplete', controller_metadata->'rise:preparation-incomplete')
+                ELSE '{}'::jsonb END
         WHERE id = $1
         RETURNING
             id, deployment_id, project_id, created_by_id,
@@ -756,7 +826,9 @@ pub async fn mark_cancelled(pool: &PgPool, id: Uuid) -> Result<Option<Deployment
             SET
                 status = 'Cancelled',
                 termination_reason = 'Cancelled',
-                controller_metadata = '{}',
+                controller_metadata = CASE WHEN controller_metadata ? 'rise:preparation-incomplete'
+                    THEN jsonb_build_object('rise:preparation-incomplete', controller_metadata->'rise:preparation-incomplete')
+                    ELSE '{}'::jsonb END,
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
             FROM prev
@@ -824,7 +896,9 @@ pub async fn mark_stopped(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             SET
                 status = 'Stopped',
                 termination_reason = 'UserStopped',
-                controller_metadata = '{}',
+                controller_metadata = CASE WHEN controller_metadata ? 'rise:preparation-incomplete'
+                    THEN jsonb_build_object('rise:preparation-incomplete', controller_metadata->'rise:preparation-incomplete')
+                    ELSE '{}'::jsonb END,
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
             FROM prev
@@ -892,7 +966,9 @@ pub async fn mark_superseded(pool: &PgPool, id: Uuid) -> Result<Option<Deploymen
             SET
                 status = 'Superseded',
                 termination_reason = 'Superseded',
-                controller_metadata = '{}',
+                controller_metadata = CASE WHEN controller_metadata ? 'rise:preparation-incomplete'
+                    THEN jsonb_build_object('rise:preparation-incomplete', controller_metadata->'rise:preparation-incomplete')
+                    ELSE '{}'::jsonb END,
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
             FROM prev
@@ -975,7 +1051,9 @@ pub async fn mark_expired(pool: &PgPool, id: Uuid) -> Result<Option<Deployment>>
             SET
                 status = 'Expired',
                 termination_reason = 'Expired',
-                controller_metadata = '{}',
+                controller_metadata = CASE WHEN controller_metadata ? 'rise:preparation-incomplete'
+                    THEN jsonb_build_object('rise:preparation-incomplete', controller_metadata->'rise:preparation-incomplete')
+                    ELSE '{}'::jsonb END,
                 completed_at = COALESCE(completed_at, NOW()),
                 updated_at = NOW()
             FROM prev
@@ -3628,5 +3706,62 @@ mod tests {
         assert!(outcome.superseded.is_none());
         let other_row = find_by_id(&pool, other_group.id).await.unwrap().unwrap();
         assert_eq!(other_row.status, DeploymentStatus::Healthy);
+    }
+    #[sqlx::test]
+    async fn preparation_marker_survives_terminal_cleanup_and_builds_finish_without_publication(
+        pool: PgPool,
+    ) {
+        use rise_backend_core::models::PREPARATION_INCOMPLETE_KEY;
+        let (project, user) = seed_project_and_user(&pool).await;
+        for (name, state) in [
+            ("pending", DeploymentStatus::Pending),
+            ("cancelled", DeploymentStatus::Cancelling),
+            ("stopped", DeploymentStatus::Terminating),
+            ("superseded", DeploymentStatus::Terminating),
+            ("expired", DeploymentStatus::Terminating),
+        ] {
+            let d = seed_deployment(&pool, project, user, name, "default", state).await;
+            sqlx::query("UPDATE deployments SET controller_metadata = $2, image_digest = 'registry.example/app@sha256:abc' WHERE id = $1")
+                .bind(d.id).bind(serde_json::json!({(PREPARATION_INCOMPLETE_KEY): true, "runtime":"temporary"})).execute(&pool).await.unwrap();
+            if name == "pending" {
+                let ready = finish_preparation(&pool, d.id, false).await.unwrap();
+                assert_eq!(ready.status, DeploymentStatus::Pending);
+                assert!(!ready.preparation_incomplete());
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM deployment_events WHERE deployment_id = $1"
+                    )
+                    .bind(d.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                    1
+                );
+                update_status(&pool, d.id, DeploymentStatus::Building, None)
+                    .await
+                    .unwrap();
+                update_status(&pool, d.id, DeploymentStatus::Pushing, None)
+                    .await
+                    .unwrap();
+                let pushed = update_status(&pool, d.id, DeploymentStatus::Pushed, None)
+                    .await
+                    .unwrap();
+                assert!(rise_backend_core::should_have_infrastructure(&pushed));
+                continue;
+            }
+            let terminal = match name {
+                "cancelled" => mark_cancelled(&pool, d.id).await.unwrap().unwrap(),
+                "stopped" => mark_stopped(&pool, d.id).await.unwrap().unwrap(),
+                "superseded" => mark_superseded(&pool, d.id).await.unwrap().unwrap(),
+                "expired" => mark_expired(&pool, d.id).await.unwrap().unwrap(),
+                _ => unreachable!(),
+            };
+            assert!(terminal.preparation_incomplete());
+            assert!(!rise_backend_core::state_machine::can_create_from(
+                &terminal
+            ));
+            assert_eq!(terminal.controller_metadata.as_object().unwrap().len(), 1);
+            assert!(finish_preparation(&pool, d.id, true).await.is_err());
+        }
     }
 }

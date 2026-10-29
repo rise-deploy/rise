@@ -74,6 +74,8 @@ Each ResourceDefinition declares exactly one `parent` (or none, for root-scoped 
 
 `parent_uid IS NULL` always means root-scoped. There is no `Orphan` policy: a non-root resource can never become parentless, so the cascade-deletion machinery does not need to consider that case.
 
+A create is refused when its parent or any ancestor is missing or being deleted, for built-in and ResourceDefinition-registered kinds alike. A tombstoned ancestor's bindings no longer apply, so a child created beneath it would be authorized without that ancestor's Denies.
+
 The store caps parent-chain depth (and the `resolve_path` ancestor walk) at `MAX_PARENT_CHAIN_DEPTH = 32`. Registration also rejects cyclic parent graphs.
 
 ## Owner references

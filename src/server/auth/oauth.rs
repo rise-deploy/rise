@@ -49,7 +49,7 @@ pub struct AuthorizeParams<'a> {
 pub struct OAuthClient {
     client_id: String,
     client_secret: String,
-    http_client: HttpClient,
+    token_client: HttpClient,
     authorize_url: String,
     token_url: String,
     /// Space-separated OAuth2 scopes requested during login flows.
@@ -111,6 +111,10 @@ impl OAuthClient {
         scopes: Vec<String>,
     ) -> Result<Self> {
         let http_client = HttpClient::new();
+        let token_client = HttpClient::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("Failed to build OIDC token client")?;
 
         // If either URL is missing, attempt OIDC discovery
         let (final_authorize_url, final_token_url) = match (authorize_url, token_url) {
@@ -138,7 +142,7 @@ impl OAuthClient {
         Ok(Self {
             client_id,
             client_secret,
-            http_client,
+            token_client,
             authorize_url: final_authorize_url,
             token_url: final_token_url,
             scopes: scopes.join(" "),
@@ -166,7 +170,7 @@ impl OAuthClient {
         params.insert("code_verifier", code_verifier);
 
         let response = self
-            .http_client
+            .token_client
             .post(token_url)
             .header("Accept", "application/json")
             .basic_auth(&self.client_id, Some(&self.client_secret))
@@ -207,6 +211,10 @@ impl OAuthClient {
 
     pub fn authorize_url(&self) -> &str {
         &self.authorize_url
+    }
+
+    pub fn token_url(&self) -> &str {
+        &self.token_url
     }
 
     /// Build authorization URL with typed parameters
@@ -261,5 +269,141 @@ impl OAuthClient {
         } else {
             format!("{}?{}", self.authorize_url, query_string)
         }
+    }
+}
+
+#[cfg(test)]
+mod token_redirect_tests {
+    use super::*;
+    use axum::{
+        response::Response,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    async fn token_response() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "access_token": "access",
+            "id_token": "id",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }))
+    }
+
+    fn redirect_response(target: String) -> Response {
+        Response::builder()
+            .status(307)
+            .header("Location", target)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn operator_idp_token_exchange_refuses_redirects_without_restricting_private_http() {
+        let received = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink = format!("http://{}/sink", listener.local_addr().unwrap());
+        let sink_app = Router::new().route(
+            "/sink",
+            post({
+                let received = received.clone();
+                move || {
+                    let received = received.clone();
+                    async move {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        token_response().await
+                    }
+                }
+            }),
+        );
+        let sink_task = tokio::spawn(async move {
+            axum::serve(listener, sink_app).await.unwrap();
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let discovery_target = format!("{origin}/discovery");
+        let discovered_token = format!("{origin}/direct");
+        let discovered_authorize = format!("{origin}/authorize");
+        let origin_app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || {
+                    let target = discovery_target.clone();
+                    async move { redirect_response(target) }
+                }),
+            )
+            .route(
+                "/discovery",
+                get(move || {
+                    let token = discovered_token.clone();
+                    let authorize = discovered_authorize.clone();
+                    async move {
+                        Json(serde_json::json!({
+                            "authorization_endpoint": authorize,
+                            "token_endpoint": token,
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/redirect",
+                post(move || {
+                    let sink = sink.clone();
+                    async move { redirect_response(sink) }
+                }),
+            )
+            .route("/direct", post(token_response));
+        let origin_task = tokio::spawn(async move {
+            axum::serve(listener, origin_app).await.unwrap();
+        });
+        for endpoint in ["redirect", "direct"] {
+            let client = OAuthClient::new(
+                origin.clone(),
+                "client".into(),
+                "operator-secret".into(),
+                Some(format!("{origin}/authorize")),
+                Some(format!("{origin}/{endpoint}")),
+                vec!["openid".into()],
+            )
+            .await
+            .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.exchange_code_pkce("code", "verifier", "https://rise.example/callback"),
+            )
+            .await
+            .unwrap();
+            if endpoint == "redirect" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().id_token, "id");
+            }
+            assert_eq!(received.load(Ordering::SeqCst), 0);
+        }
+        let discovered = OAuthClient::new(
+            origin,
+            "client".into(),
+            "operator-secret".into(),
+            None,
+            None,
+            vec!["openid".into()],
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            discovered.exchange_code_pkce("code", "verifier", "https://rise.example/callback"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.id_token, "id");
+        assert_eq!(received.load(Ordering::SeqCst), 0);
+        origin_task.abort();
+        sink_task.abort();
     }
 }

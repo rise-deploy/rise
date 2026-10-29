@@ -138,9 +138,10 @@ def prepare(repo, work, baseline):
             )
         runs = ""
         for phase, command in [("baseline", "apply"), ("current", "plan")]:
-            # Inputs the current module requires that the baseline predates.
+            # Required inputs for the production module under test.
             added = (
-                'variables {\n    rise_cli_image_tag = "0.23.0"\n  }\n  '
+                'variables {\n    rise_cli_image_tag = "0.23.0"\n'
+                '    workload_task_role_arn = "arn:aws:iam::123456789012:role/rise-ecs-workload"\n  }\n  '
                 if phase == "current" and case != "e2e"
                 else ""
             )
@@ -155,19 +156,30 @@ def prepare(repo, work, baseline):
         )
 
 
-# Control-plane environment variables the current module adds on top of the
-# baseline. An upgrade that adds one re-registers the control plane's task
-# definition, and that must be the whole of the change.
+# Allowed environment additions and the fixture's dedicated workload identity.
 ADDED_CONTROL_PLANE_ENV = {"RISE_ECS_IDENTITY_AGENT_IMAGE"}
 CONTROL_PLANE_TASK = "module.runtime.aws_ecs_task_definition.rise"
+CONTROLLER_ROLE = "arn:aws:iam::123456789012:role/rise"
+WORKLOAD_ROLE = "arn:aws:iam::123456789012:role/rise-ecs-workload"
 
 
-def only_added_env(before, after):
-    """Whether two container_definitions differ only by ADDED_CONTROL_PLANE_ENV."""
+def normalize_workload_role(value):
+    return CONTROLLER_ROLE if value == WORKLOAD_ROLE else value
 
-    def strip(raw):
+
+def only_expected_control_plane_env(before, after):
+    """Allow the identity-agent input and the dedicated fixture workload role."""
+
+    def strip(raw, current):
         containers = json.loads(raw) if isinstance(raw, str) else raw
         for container in containers:
+            if current:
+                for entry in container.get("environment") or []:
+                    if (
+                        entry["name"] == "RISE_ECS_TASK_ROLE_ARN"
+                        and entry["value"] == WORKLOAD_ROLE
+                    ):
+                        entry["value"] = normalize_workload_role(entry["value"])
             container["environment"] = sorted(
                 (
                     e
@@ -178,7 +190,7 @@ def only_added_env(before, after):
             )
         return containers
 
-    return strip(before) == strip(after)
+    return strip(before, False) == strip(after, True)
 
 
 def only_updated_dex_callbacks(before, after):
@@ -217,7 +229,9 @@ def verify(log, repo):
         "module.runtime.aws_ecs_task_definition.traefik": {"container_definitions"},
         # Embeds dev/dex/config.yaml, which has changed since the baseline.
         "aws_ecs_task_definition.dex": {"container_definitions"},
-        "module.runtime.aws_ecs_service.rise": {"enable_execute_command"},
+        "module.runtime.aws_ecs_service.rise": {
+            "enable_execute_command", "health_check_grace_period_seconds"
+        },
         "module.runtime.aws_ecs_service.traefik": {
             "deployment_minimum_healthy_percent",
             "deployment_maximum_percent",
@@ -236,6 +250,9 @@ def verify(log, repo):
             "secrets.aws_secretsmanager_secret_version.jwt_signing_secret",
             "secrets.aws_secretsmanager_secret_version.oidc_client_secret",
         ]
+    }
+    secret_fields["module.runtime.aws_ecs_service.rise"] = {
+        "health_check_grace_period_seconds"
     }
     for line in log.read_text().splitlines():
         item = json.loads(line)
@@ -311,7 +328,7 @@ def verify(log, repo):
                     if delta["before"].get(k) != delta["after"].get(k)
                 }
                 == {"container_definitions"}
-                and only_added_env(
+                and only_expected_control_plane_env(
                     delta["before"]["container_definitions"],
                     delta["after"]["container_definitions"],
                 )
@@ -327,6 +344,10 @@ def verify(log, repo):
                 if before.get(key) != after.get(key)
             }
             assert fields <= allowed[address], (case, address, fields)
+            if address == "module.runtime.aws_ecs_service.rise":
+                assert after["health_check_grace_period_seconds"] == 1800, (
+                    case, "unexpected startup budget", after["health_check_grace_period_seconds"]
+                )
         for name, delta in item["test_plan"].get("output_changes", {}).items():
             if (
                 name == "rise_task_environment"
@@ -334,11 +355,23 @@ def verify(log, repo):
                 and isinstance(delta.get("before"), dict)
                 and isinstance(delta.get("after"), dict)
                 and {
-                    k: v
+                    k: normalize_workload_role(v) if k == "RISE_ECS_TASK_ROLE_ARN" else v
                     for k, v in delta["after"].items()
                     if k not in ADDED_CONTROL_PLANE_ENV
                 }
                 == delta["before"]
+            ):
+                continue
+            if (
+                name == "rise_config"
+                and delta["actions"] == ["update"]
+                and isinstance(delta.get("before"), dict)
+                and isinstance(delta.get("after"), dict)
+                and delta["after"].get("ecs", {}).get("task_role_arn") == WORKLOAD_ROLE
+                and {
+                    **delta["after"],
+                    "ecs": {**delta["after"]["ecs"], "task_role_arn": CONTROLLER_ROLE},
+                } == delta["before"]
             ):
                 continue
             # A new output changes nothing the baseline state already holds.
@@ -353,7 +386,7 @@ def verify(log, repo):
             + (
                 "only expected E2E task/service updates"
                 if case == "e2e"
-                else "only expected secret-version updates and allowed"
+                else "only expected secret-version, startup-budget,"
                 " control-plane environment and Dex callback updates"
             )
         )

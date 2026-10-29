@@ -297,10 +297,14 @@ services:
       # dev/dex/config.yaml.
       - RISE_JWT_SIGNING_SECRET
       - RISE_ENCRYPTION_KEY
+      - RISE_ENCRYPTION_MIGRATION_SOURCE_KEY
       - OIDC_CLIENT_SECRET
       # Optional ID-token claim containing group names. Defaults to `groups`;
       # AWS Cognito users can set OIDC_GROUP_CLAIM=cognito:groups.
       - OIDC_GROUP_CLAIM
+      - RISE_IDP_GROUP_MISSING_CLAIM_POLICY
+      # Accept ID tokens without an `email_verified` claim (default false).
+      - RISE_AUTH_ALLOW_MISSING_EMAIL_VERIFIED
       - ADMIN_EMAIL
       # Operator access to the generic resource API (/api/v1/resources). Defaults
       # to none — set RISE_OPERATOR_EMAIL to grant a single operator (mount a

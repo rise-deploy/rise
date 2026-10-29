@@ -29,8 +29,12 @@ auth:
   # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
   idp_group_claim: "${OIDC_GROUP_CLAIM:-groups}"
   idp_group_sync_prefixes: "${RISE_IDP_GROUP_SYNC_PREFIXES:-}"
+  idp_group_missing_claim_policy: "${RISE_IDP_GROUP_MISSING_CLAIM_POLICY:-refuse_login}"
+  # Accept ID tokens without an `email_verified` claim. Leave false unless the
+  # IdP omits the claim yet only ever issues addresses its users own.
+  allow_missing_email_verified: "${RISE_AUTH_ALLOW_MISSING_EMAIL_VERIFIED:-false}"
   admin_users:
-    - "${ADMIN_EMAIL:-admin@example.com}"
+    - "${ADMIN_EMAIL:-}"
   # Optional: enable active sync to pull users/groups from Entra ID.
   # Requires Microsoft Graph API permissions: Application.Read.All, GroupMember.Read.All, User.Read.All
   # active_sync_source: Entra

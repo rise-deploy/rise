@@ -103,6 +103,7 @@ impl RegistryProvider for GitLabRegistryProvider {
     async fn get_credentials(
         &self,
         repository: &str,
+        _project_id: uuid::Uuid,
         _tags: &[&str],
     ) -> Result<RegistryCredentials> {
         // JWT scope path: <namespace>[/<image_prefix>]/<repository>

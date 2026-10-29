@@ -36,7 +36,7 @@ config:
   auth:
     issuer: "https://dex.example.com/dex"
     client_id: "rise-backend"
-    client_secret: ""  # Provided via envFrom
+    # client_secret comes from OIDC_CLIENT_SECRET; see oidcClientSecret below.
     admin_users:
       - "admin@example.com"
     # Alternatively (or additionally), grant the admin role by IdP group:
@@ -76,7 +76,12 @@ ingress:
       hosts:
         - rise.example.com
 
-# Inject sensitive configuration via envFrom
+# OIDC client secret, injected as OIDC_CLIENT_SECRET
+oidcClientSecret:
+  name: rise-oidc
+  key: client-secret
+
+# Other sensitive configuration
 envFrom:
   - secretRef:
       name: rise-secrets
@@ -92,42 +97,41 @@ server:
       memory: 256Mi
 
 # Optional: Enable Dex for OIDC authentication
+# Optional: Enable Dex for OIDC authentication (see Dex Configuration below)
 dex:
   enabled: true
-  config: |
-    issuer: https://dex.example.com/dex
-
+  config:
+    issuer: "https://dex.example.com/dex"
     storage:
       type: kubernetes
       config:
         inCluster: true
-
     web:
-      http: 0.0.0.0:5556
-
+      http: "0.0.0.0:5556"
     staticClients:
-    - id: rise-backend
-      redirectURIs:
-      - 'https://rise.example.com/api/v1/auth/callback'
-      name: 'Rise Backend'
-      secret: your-client-secret-here
-
+      - id: rise-backend
+        redirectURIs:
+          - "https://rise.example.com/api/v1/auth/callback"
+        name: "Rise Backend"
+        secret: "<client secret>"
     connectors:
-    - type: github
-      id: github
-      name: GitHub
-      config:
-        clientID: $GITHUB_CLIENT_ID
-        clientSecret: $GITHUB_CLIENT_SECRET
-        redirectURI: https://dex.example.com/dex/callback
+      - type: github
+        id: github
+        name: GitHub
+        config:
+          clientID: $GITHUB_CLIENT_ID
+          clientSecret: $GITHUB_CLIENT_SECRET
+          redirectURI: https://dex.example.com/dex/callback
 ```
 
-Create the secret with required environment variables:
+Create the secrets:
 
 ```bash
+kubectl create secret generic rise-oidc \
+  --from-literal=client-secret=YOUR_CLIENT_SECRET
 kubectl create secret generic rise-secrets \
   --from-literal=DATABASE_URL=postgres://rise:YOUR_DB_PASSWORD@postgresql:5432/rise \
-  --from-literal=AUTH_CLIENT_SECRET=YOUR_CLIENT_SECRET
+  --from-literal=RISE_JWT_SIGNING_SECRET="$(openssl rand -base64 32)"
 ```
 
 Install the chart:
@@ -149,6 +153,8 @@ The following table lists the configurable parameters of the Rise chart and thei
 | `image.tag` | Image tag | `""` (uses Chart appVersion) |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `config` | Rise configuration in YAML format | See values.yaml |
+| `oidcClientSecret.name` | Secret injected as `OIDC_CLIENT_SECRET` (empty: supply it via `env`/`envFrom`) | `""` |
+| `oidcClientSecret.key` | Key inside that Secret | `client-secret` |
 | `logs.backend` | Runtime log backend (`kubernetes` or `loki`) | `kubernetes` |
 | `logs.loki.enabled` | Install bundled Grafana Loki subchart | `false` |
 | `logs.loki.externalUrl` | External Loki URL when not using bundled Loki | `""` |
@@ -217,11 +223,10 @@ alloy:
 | `dex.enabled` | Enable Dex deployment | `false` |
 | `dex.replicaCount` | Number of Dex replicas | `1` |
 | `dex.image.repository` | Dex image repository | `ghcr.io/dexidp/dex` |
-| `dex.image.tag` | Dex image tag | `v2.40.0` |
+| `dex.image.tag` | Dex image tag | `v2.45.1` |
 | `dex.service.port` | Dex HTTP port | `5556` |
 | `dex.service.grpcPort` | Dex gRPC port | `5557` |
-| `dex.issuerUrl` | OIDC issuer URL injected into Dex config | `http://dex:5556/dex` |
-| `dex.config` | Dex configuration in YAML format (empty = use default) | `""` |
+| `dex.config` | Dex configuration file, as YAML; ships no users | See values.yaml |
 
 ### PostgreSQL
 
@@ -318,7 +323,7 @@ When Kubernetes deployment is configured (via `config.kubernetes`), Rise require
 
 The `config` parameter is converted to YAML and mounted as `/etc/rise/local.yaml`. The backend loads required `production` (from `RISE_CONFIG_RUN_MODE=production`) and then applies optional `local` overrides, without requiring Helm chart updates for new options.
 
-**Sensitive Values:** For sensitive configuration like secrets and passwords, leave them empty in the config and provide them via `envFrom` instead. See [Environment Variables](#environment-variables) below.
+**Sensitive Values:** `config` is rendered into a ConfigMap. Leave secrets out of it entirely — an empty string still overrides the environment variable `production.yaml` reads — and provide them through `oidcClientSecret` or `envFrom`. See [Environment Variables](#environment-variables) below.
 
 Example:
 
@@ -332,7 +337,6 @@ config:
   auth:
     issuer: "https://dex.example.com/dex"
     client_id: "rise-backend"
-    client_secret: ""  # Provided via envFrom
 
   registry:
     type: "oci-client-auth"
@@ -342,62 +346,53 @@ config:
 
 ### Dex Configuration
 
-When Dex is enabled (`dex.enabled: true`), the chart provides sensible defaults for development and testing.
-
-#### Using the Default Configuration
-
-By default, `dex.config` is empty and the chart uses a pre-configured development setup that includes:
-- In-memory storage (data is lost on pod restart)
-- Static password authentication with test users (`admin@example.com`, `dev@example.com` and `user@example.com`, all with password "password")
-- Placeholder redirect URIs (`http://rise.example.com/` and `http://rise.example.com/auth/callback`)
-
-**Important:** The default configuration is for testing only. You must customize the redirect URIs to match your actual `public_url` for production deployments.
-
-To use the default config, simply set the issuer URL:
+With `dex.enabled: true` the chart runs Dex with `dex.config` as its
+configuration file. The default has in-memory storage, a `rise-backend` client
+with placeholder redirect URIs, and **no users**: add `connectors` for a real
+identity provider, or enable the password DB with users whose hashes you
+generate yourself.
 
 ```yaml
 dex:
   enabled: true
-  issuerUrl: "https://dex.example.com/dex"
-```
-
-The `issuerUrl` will be automatically injected into the Dex configuration, replacing the default `http://localhost:5556/dex`.
-
-#### Custom Configuration
-
-For production deployments, you can provide a complete custom configuration via `dex.config`:
-
-```yaml
-dex:
-  enabled: true
-  issuerUrl: "https://dex.example.com/dex"
-  config: |
+  config:
+    issuer: "https://dex.example.com/dex"
     storage:
       type: kubernetes
       config:
         inCluster: true
-
     web:
-      http: 0.0.0.0:5556
-
+      http: "0.0.0.0:5556"
     staticClients:
-    - id: rise-backend
-      redirectURIs:
-      - 'https://rise.example.com/api/v1/auth/callback'
-      name: 'Rise Backend'
-      secret: your-client-secret-here
-
+      - id: rise-backend
+        redirectURIs:
+          - "https://rise.example.com/api/v1/auth/callback"
+          - "http://127.0.0.1:8765/callback"
+          - "http://127.0.0.1:8766/callback"
+          - "http://127.0.0.1:8767/callback"
+        name: "Rise Backend"
+        secret: "<client secret>"
     connectors:
-    - type: github
-      id: github
-      name: GitHub
-      config:
-        clientID: $GITHUB_CLIENT_ID
-        clientSecret: $GITHUB_CLIENT_SECRET
-        redirectURI: https://dex.example.com/dex/callback
+      - type: github
+        id: github
+        name: GitHub
+        config:
+          clientID: $GITHUB_CLIENT_ID
+          clientSecret: $GITHUB_CLIENT_SECRET
+          redirectURI: https://dex.example.com/dex/callback
+    oauth2:
+      skipApprovalScreen: true
 ```
 
-**Note:** The `issuerUrl` is automatically injected as the `issuer:` field in the Dex config, so you don't need to specify it in the config YAML.
+For static users, set `enablePasswordDB: true` and list them under
+`staticPasswords`, each with a bcrypt hash of a password you chose:
+
+```bash
+htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
+```
+
+Helm replaces lists rather than merging them, so `staticClients`,
+`staticPasswords` and `connectors` must each be given in full.
 
 ### Environment Variables
 
@@ -426,28 +421,24 @@ The `envFrom` parameter allows you to inject environment variables from Secrets 
 - Database connection strings
 - Cloud provider credentials
 
+The image's `production.yaml` reads secrets from these variables:
+`DATABASE_URL`, `OIDC_CLIENT_SECRET` and `RISE_JWT_SIGNING_SECRET`. A key set
+under `config` overrides the variable, so leave those keys out of `config`.
+
 **Example:**
 
 ```yaml
 # values.yaml
-config:
-  auth:
-    issuer: "http://dex:5556/dex"
-    client_id: "rise-backend"
-    client_secret: ""  # Provided via environment variable
-
 envFrom:
   - secretRef:
       name: rise-secrets
 ```
 
 ```bash
-# Create secret with actual value
 kubectl create secret generic rise-secrets \
-  --from-literal=AUTH_CLIENT_SECRET=your-actual-secret
+  --from-literal=OIDC_CLIENT_SECRET=your-actual-secret \
+  --from-literal=RISE_JWT_SIGNING_SECRET="$(openssl rand -base64 32)"
 ```
-
-The backend reads `AUTH_CLIENT_SECRET` from the environment and uses it for the auth configuration.
 
 **Example: Using a Secret for AWS credentials**
 
@@ -485,7 +476,7 @@ envFrom:
       name: rise-overrides
 ```
 
-**Note:** The Rise backend automatically reads certain environment variables for sensitive configuration. Common examples include `DATABASE_URL`, `AUTH_CLIENT_SECRET`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`.
+**Note:** Besides the variables `production.yaml` names, the AWS SDK reads its usual variables, such as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`.
 
 ## Upgrading
 
