@@ -66,7 +66,10 @@ ingress:
 
 config:
   server:
+    # CI uses an isolated cluster and a fixed placeholder encryption key.
+    allow_insecure_development_keys: true
     public_url: http://rise.local
+    cookie_secure: false # CI serves plain HTTP.
     jwt_signing_secret: dGVzdC1qd3Qtc2VjcmV0LWtleS1mb3ItY2ktdGVzdGluZy1vbmx5LW5vdC1zZWN1cmU=
     # CI-only: the in-cluster Dex issuer is plain-HTTP on a private cluster IP
     # (rise-ci-chart-dex.rise-ci.svc.cluster.local). Relax the SSRF guard so OIDC

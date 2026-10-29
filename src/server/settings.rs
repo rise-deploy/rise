@@ -2868,6 +2868,40 @@ mod tests {
     }
 
     #[test]
+    fn helm_ci_configuration_explicitly_allows_its_placeholder_encryption_key() {
+        let values: serde_json::Value =
+            serde_yaml::from_str(include_str!("../../helm/rise/values-ci.yaml")).unwrap();
+        let mut config = values["config"].clone();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            temp_dir.path().join("production.yaml"),
+            include_str!("../../config/production.yaml"),
+        )
+        .unwrap();
+        for allowed in [true, false] {
+            if !allowed {
+                config["server"]["allow_insecure_development_keys"] = false.into();
+            }
+            std::fs::write(
+                temp_dir.path().join("local.yaml"),
+                serde_yaml::to_string(&config).unwrap(),
+            )
+            .unwrap();
+            let result =
+                Settings::new_with_env(temp_dir.path().to_str().unwrap(), "production", &|name| {
+                    (name == "DATABASE_URL").then(|| "postgres://test@localhost/test".into())
+                });
+            if allowed {
+                let settings = result.unwrap();
+                assert!(settings.server.allow_insecure_development_keys);
+                assert!(!settings.server.cookie_secure);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("encryption.key"));
+            }
+        }
+    }
+
+    #[test]
     fn idp_group_claim_defaults_to_groups() {
         let settings: Settings = serde_json::from_value(minimal_settings_json()).unwrap();
 
