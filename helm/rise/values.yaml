@@ -33,14 +33,6 @@ securityContext:
   readOnlyRootFilesystem: true
   allowPrivilegeEscalation: false
 
-# OIDC client secret for the Rise backend, injected as OIDC_CLIENT_SECRET from
-# an existing Secret. Leave `name` empty to supply OIDC_CLIENT_SECRET through
-# `env` or `envFrom` instead.
-#   kubectl create secret generic rise-oidc --from-literal=client-secret=...
-oidcClientSecret:
-  name: ""
-  key: client-secret
-
 # Additional environment variables (key-value pairs)
 env: []
   # - name: RUST_LOG
@@ -318,9 +310,9 @@ config:
   auth:
     issuer: "http://dex:5556/dex"
     client_id: "rise-backend"
-    # client_secret is left unset: the image's production.yaml reads it from
-    # OIDC_CLIENT_SECRET, which `oidcClientSecret` injects from a Secret. A
-    # value set here overrides that variable and lands in a ConfigMap.
+    # client_secret is unset so production.yaml reads OIDC_CLIENT_SECRET from
+    # env/envFrom. Use "${VAR}" to reference another environment variable;
+    # a literal value here lands in a ConfigMap. An empty value overrides the default.
     # ID-token claim containing group names. AWS Cognito uses "cognito:groups".
     idp_group_claim: "groups"
     # admin_users: []  # Optional: List of admin user emails with full permissions
