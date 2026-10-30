@@ -59,9 +59,39 @@ impl Browser {
     }
 }
 
-struct Backend;
+/// The stub deployment backend. It counts the hooks that act on the runtime,
+/// so a test can assert that a refused request never asked the backend to do
+/// anything.
+#[derive(Default)]
+pub(crate) struct Backend {
+    pub(crate) runtime_actions: AtomicUsize,
+}
 #[async_trait::async_trait]
 impl rise_backend_core::DeploymentBackend for Backend {
+    async fn cleanup_environment(
+        &self,
+        _: &crate::db::models::Project,
+        _: &str,
+    ) -> anyhow::Result<()> {
+        self.runtime_actions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn project_changed(&self, _: &crate::db::models::Project) -> anyhow::Result<()> {
+        self.runtime_actions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn project_created(&self, _: &crate::db::models::Project) -> anyhow::Result<()> {
+        self.runtime_actions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn project_deleting(&self, _: &crate::db::models::Project) -> anyhow::Result<()> {
+        self.runtime_actions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     async fn get_project_urls(
         &self,
         project: &crate::db::models::Project,
@@ -77,9 +107,10 @@ impl rise_backend_core::DeploymentBackend for Backend {
     }
 }
 
-struct Fixture {
-    state: AppState,
+pub(crate) struct Fixture {
+    pub(crate) state: AppState,
     exchanges: Arc<AtomicUsize>,
+    pub(crate) backend: Arc<Backend>,
     idp_server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -88,7 +119,8 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(pool: PgPool) -> Fixture {
+/// A fully wired `AppState` over `pool` with project `demo` and a local mock IdP.
+pub(crate) async fn fixture(pool: PgPool) -> Fixture {
     use crate::server::{
         auth::{jwt::JwtValidator, oauth::OAuthClient, user_identity::UserLogins},
         authz::{OperatorSelectors, ResourceAuthorizer},
@@ -143,6 +175,7 @@ async fn fixture(pool: PgPool) -> Fixture {
         pool.clone(),
     ));
     let empty = Arc::new(Vec::new());
+    let backend = Arc::new(Backend::default());
     let state = AppState {
         db_pool: pool.clone(),
         shutdown: tokio_util::sync::CancellationToken::new(),
@@ -215,7 +248,7 @@ async fn fixture(pool: PgPool) -> Fixture {
         },
         public_url: settings.server.public_url.clone(),
         encryption_provider: None,
-        deployment_backend: Arc::new(Backend),
+        deployment_backend: backend.clone(),
         deployment_store,
         runtime_log_backend: crate::server::deployment::logs::init_runtime_log_backend(
             &settings.deployment_logs,
@@ -304,6 +337,7 @@ async fn fixture(pool: PgPool) -> Fixture {
     Fixture {
         state,
         exchanges,
+        backend,
         idp_server,
     }
 }

@@ -34,6 +34,9 @@ pub mod state;
 pub mod team;
 pub mod workload_tokens;
 
+#[cfg(test)]
+mod platform_route_guard_tests;
+
 use anyhow::Result;
 use axum::{extract::Request, middleware as axum_middleware, response::Response, Router};
 use state::{AppState, ControllerState};
@@ -41,6 +44,64 @@ use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
 use tracing::{info, Span};
+
+/// Every route that sits behind authentication and platform access.
+///
+/// Authentication is two-phase for service accounts: `auth_middleware` admits a
+/// JWKS-valid external token without knowing which project it is for, so each
+/// handler here must resolve the caller itself (`AuthContext::user` or
+/// `AuthContext::resolve_for_project`) before it acts. The
+/// `platform_route_guard_tests` module drives an unresolvable external token
+/// through every route this function registers; add a route here and it fails
+/// until the new route is covered there.
+pub(crate) fn platform_route_tree() -> Router<AppState> {
+    Router::new()
+        .merge(auth::routes::platform_routes())
+        .merge(custom_domains::routes())
+        .merge(project::routes::routes())
+        .merge(team::routes::team_routes())
+        .merge(registry::routes::routes())
+        .merge(deployment::routes::deployment_routes())
+        .merge(service_accounts::routes::routes())
+        .merge(env_vars::routes::routes())
+        .merge(environments::routes::routes())
+        .merge(extensions::routes::routes())
+        .merge(encryption::routes::routes())
+        .merge(quickstart::routes::routes())
+}
+
+/// The platform routes with every layer they run behind (`auth_middleware`,
+/// then `platform_access_middleware`, then the scoped-session guard).
+pub(crate) fn platform_routes(state: &AppState) -> Router<AppState> {
+    layered_platform_routes(state, |routes| {
+        // Apply auth middleware (runs first)
+        routes.route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::middleware::auth_middleware,
+        ))
+    })
+}
+
+/// [`platform_routes`] with the outermost (authentication) layer supplied by
+/// the caller, so a test can stand in for `auth_middleware` and keep every
+/// other layer.
+pub(crate) fn layered_platform_routes(
+    state: &AppState,
+    authenticate: impl FnOnce(Router<AppState>) -> Router<AppState>,
+) -> Router<AppState> {
+    let routes = platform_route_tree()
+        // Scoped sessions (ADR-0006) are checked last, before the handler
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::session_scope::scope_guard,
+        ))
+        // Apply platform access middleware (runs second, after auth)
+        .route_layer(axum_middleware::from_fn_with_state(
+            state.clone(),
+            auth::middleware::platform_access_middleware,
+        ));
+    authenticate(routes)
+}
 
 fn http_request_span(request: &Request) -> Span {
     tracing::debug_span!(
@@ -321,36 +382,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         ));
 
     // Platform routes (require authentication AND platform access)
-    let platform_routes = Router::new()
-        .merge(auth::routes::platform_routes())
-        .merge(custom_domains::routes())
-        .merge(project::routes::routes())
-        .merge(team::routes::team_routes())
-        .merge(registry::routes::routes())
-        .merge(deployment::routes::deployment_routes())
-        .merge(service_accounts::routes::routes())
-        .merge(env_vars::routes::routes())
-        .merge(environments::routes::routes())
-        .merge(extensions::routes::routes())
-        .merge(encryption::routes::routes())
-        .merge(quickstart::routes::routes());
-
-    let platform_routes = platform_routes
-        // Scoped sessions (ADR-0006) are checked last, before the handler
-        .route_layer(axum_middleware::from_fn_with_state(
-            state.clone(),
-            auth::session_scope::scope_guard,
-        ))
-        // Apply platform access middleware (runs second, after auth)
-        .route_layer(axum_middleware::from_fn_with_state(
-            state.clone(),
-            auth::middleware::platform_access_middleware,
-        ))
-        // Apply auth middleware (runs first)
-        .route_layer(axum_middleware::from_fn_with_state(
-            state.clone(),
-            auth::middleware::auth_middleware,
-        ));
+    let platform_routes = platform_routes(&state);
 
     // Nest all API routes under /api/v1
     let api_routes = public_routes.merge(auth_only_routes).merge(platform_routes);
