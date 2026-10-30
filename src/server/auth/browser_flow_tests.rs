@@ -119,6 +119,7 @@ impl Drop for Fixture {
     }
 }
 
+/// A fully wired `AppState` over `pool` with project `demo` and a local mock IdP.
 pub(crate) async fn fixture(pool: PgPool) -> Fixture {
     use crate::server::{
         auth::{jwt::JwtValidator, oauth::OAuthClient, user_identity::UserLogins},
