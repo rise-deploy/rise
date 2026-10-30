@@ -324,3 +324,39 @@ run "rejects_an_unknown_client_ip_source" {
   }
   expect_failures = [var.client_ip]
 }
+
+# The wrapper is `exec /traefik "$@" <header flag>`, so every flag in `command`
+# -- including the client-address trust flags -- still reaches Traefik as an
+# argument and the header is appended after them.
+run "client_ip_flags_and_the_config_secret_coexist" {
+  command = plan
+  variables {
+    client_ip = { source = "proxy-protocol", trusted_cidrs = ["10.0.0.0/24"] }
+    traefik = {
+      name              = "rise-traefik"
+      discovery_name    = "rise-traefik"
+      image             = "traefik:v3.7.10"
+      config_secret_arn = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/traefik-config-secret-abc123"
+    }
+  }
+
+  assert {
+    condition = toset([
+      for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command :
+      flag if strcontains(flag, "trustedIPs")
+      ]) == toset([
+      "--entrypoints.web.proxyProtocol.trustedIPs=10.0.0.0/24",
+      "--entrypoints.websecure.proxyProtocol.trustedIPs=10.0.0.0/24",
+      "--entrypoints.ping.proxyProtocol.trustedIPs=10.0.0.0/24",
+    ])
+    error_message = "the trust flags must stay in command, where the wrapper passes them on as arguments"
+  }
+
+  assert {
+    condition = (
+      strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "exec /traefik \"$@\" ") &&
+      !anytrue([for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command : strcontains(flag, "headers.Authorization")])
+    )
+    error_message = "the wrapper must exec traefik with the command's arguments, and the header must not be in command"
+  }
+}
