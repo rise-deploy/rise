@@ -278,6 +278,21 @@ The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the u
 - A handle that does not unseal for this extension (tampered, or from another project or extension) is `invalid_grant`. If the encryption provider is temporarily unavailable (for example AWS KMS throttling), Rise answers `503` `server_error` and the request can be retried.
 - In the default `sealed` mode, handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid. Opt in to `rotating` mode (below) for single-use handles.
 
+#### Security profile
+
+| | `sealed` (default) | `rotating` |
+| --- | --- | --- |
+| Your app holds | an `rrt1.` handle | an `rrt2.` handle |
+| The upstream refresh token leaves Rise | no | no |
+| A leaked handle works through Rise | until the upstream provider stops honouring the token | until your app next refreshes; if the thief refreshed first, that refresh revokes the login |
+| Theft detection | none | reuse after the grace period revokes the login |
+| Lifetime bound set by Rise | none | `max_lifetime_seconds` |
+| Revoke every login at once | not per extension | switch to `sealed` or delete the extension |
+| Raw upstream refresh tokens | accepted for now (see the note below) | rejected |
+| Storage | none | one record per handle in Rise's database |
+
+`sealed` keeps the upstream token away from the browser but does not shorten the life of a leaked handle; use `rotating` when a stolen refresh token has to stop working. Within `grace_period_seconds` of a refresh, anyone presenting the spent handle gets the same successor, so the grace window is the one span in which a thief goes undetected.
+
 #### Rotating refresh tokens
 
 Set `refresh_token.mode` to `rotating` to make every refresh token single use:
