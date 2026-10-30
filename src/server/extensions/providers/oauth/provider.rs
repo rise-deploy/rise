@@ -1,6 +1,6 @@
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::providers::oauth::models::{
-    OAuthExtensionSpec, OAuthExtensionStatus, TokenEndpointAuthMethod, TokenResponse,
+    OAuthExtensionSpec, OAuthExtensionStatus, TokenEndpointAuthMethod,
 };
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
@@ -13,6 +13,32 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
+
+/// What the upstream token endpoint answered, unparsed.
+#[derive(Debug, Clone)]
+pub struct UpstreamReply {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+impl UpstreamReply {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    /// The upstream refused the refresh token for good: a 4xx whose JSON body
+    /// carries `error: "invalid_grant"` (RFC 6749 §5.2). Every other failure
+    /// says nothing certain about the token.
+    pub fn is_invalid_grant(&self) -> bool {
+        (400..500).contains(&self.status)
+            && serde_json::from_slice::<Value>(&self.body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+                .as_deref()
+                == Some("invalid_grant")
+    }
+}
 
 pub struct OAuthProviderConfig {
     pub db_pool: PgPool,
@@ -178,15 +204,18 @@ impl OAuthProvider {
         Ok(response)
     }
 
-    /// Refresh an expired token using refresh_token
-    #[allow(dead_code)]
-    pub async fn refresh_token(
+    /// Present `refresh_token` at the upstream token endpoint and return its
+    /// answer as received.
+    ///
+    /// An `Err` means no answer was obtained: the request failed, timed out,
+    /// was redirected, or its body could not be read.
+    pub async fn refresh_upstream(
         &self,
         spec: &OAuthExtensionSpec,
         client_secret: &str,
         refresh_token: &str,
         token_endpoint: &str,
-    ) -> Result<TokenResponse> {
+    ) -> Result<UpstreamReply> {
         debug!("Refreshing token with endpoint: {}", token_endpoint);
 
         let response = self
@@ -200,30 +229,29 @@ impl OAuthProvider {
                 ],
             )
             .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error response".to_string());
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .bytes()
+            .await
+            .context("Failed to read the token refresh response")?
+            .to_vec();
+        if !(200..300).contains(&status) {
             error!(
                 "Token refresh failed with status {}: {}",
-                status, error_text
-            );
-            return Err(anyhow!(
-                "Token refresh failed with status {}: {}",
                 status,
-                error_text
-            ));
+                String::from_utf8_lossy(&body)
+            );
         }
-
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .context("Failed to parse token refresh response")?;
-
-        Ok(token_response)
+        Ok(UpstreamReply {
+            status,
+            content_type,
+            body,
+        })
     }
 
     /// Handle deletion of an OAuth extension
@@ -1273,11 +1301,11 @@ mod credential_scope_tests {
                 )
                 .await;
             let refresh = provider
-                .refresh_token(&spec, &secret, "refresh-token", &endpoint)
+                .refresh_upstream(&spec, &secret, "refresh-token", &endpoint)
                 .await;
             if path == "/direct" {
                 assert!(exchange.unwrap().status().is_success());
-                assert_eq!(refresh.unwrap().access_token, "access");
+                assert!(String::from_utf8_lossy(&refresh.unwrap().body).contains("\"access\""));
             } else {
                 assert!(exchange
                     .unwrap_err()

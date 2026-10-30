@@ -5,7 +5,7 @@ use aws_sdk_kms::Client as KmsClient;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
-use rise_backend_core::encryption::{decode_envelope, encode_envelope};
+use rise_backend_core::encryption::{decode_envelope, encode_envelope, CiphertextRejected};
 
 /// AWS KMS encryption provider
 /// Uses AWS KMS for encryption/decryption operations
@@ -131,18 +131,65 @@ impl AwsKmsEncryptionProvider {
             .decrypt_request(ciphertext, context)
             .send()
             .await
-            .context("KMS ciphertext authentication failed")?;
+            .map_err(|e| {
+                let rejected = is_ciphertext_error(&e);
+                let error = anyhow::Error::new(e).context("KMS decryption failed");
+                if rejected {
+                    error.context(CiphertextRejected)
+                } else {
+                    error
+                }
+            })?;
         let plaintext = response
             .plaintext()
             .context("No plaintext in KMS response")?;
         String::from_utf8(plaintext.clone().into_inner())
             .context("Decrypted data is not valid UTF-8")
+            .context(CiphertextRejected)
     }
+}
+
+/// Whether KMS refused the ciphertext itself (malformed, or not produced under
+/// this key and context). Throttling, timeouts, network and permission errors
+/// are not.
+fn is_ciphertext_error(
+    error: &aws_sdk_kms::error::SdkError<aws_sdk_kms::operation::decrypt::DecryptError>,
+) -> bool {
+    error
+        .as_service_error()
+        .is_some_and(|e| e.is_invalid_ciphertext_exception() || e.is_incorrect_key_exception())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ciphertext_refusals_are_classified_as_rejections() {
+        use aws_sdk_kms::error::SdkError;
+        use aws_sdk_kms::operation::decrypt::DecryptError;
+        use aws_sdk_kms::types::error::{
+            IncorrectKeyException, InvalidCiphertextException, KmsInternalException,
+        };
+
+        let service = |e: DecryptError| {
+            SdkError::<DecryptError>::service_error(
+                e,
+                aws_sdk_kms::config::http::HttpResponse::new(400u16.try_into().unwrap(), "".into()),
+            )
+        };
+        assert!(is_ciphertext_error(&service(
+            DecryptError::InvalidCiphertextException(InvalidCiphertextException::builder().build())
+        )));
+        assert!(is_ciphertext_error(&service(
+            DecryptError::IncorrectKeyException(IncorrectKeyException::builder().build())
+        )));
+        assert!(!is_ciphertext_error(&service(
+            DecryptError::KmsInternalException(KmsInternalException::builder().build())
+        )));
+        assert!(!is_ciphertext_error(&SdkError::timeout_error("timed out")));
+        assert!(!is_ciphertext_error(&SdkError::construction_failure("bad")));
+    }
 
     #[test]
     fn kms_requests_carry_the_same_context_and_pin_the_key() {

@@ -117,9 +117,19 @@ changes:
       token endpoint still accepts them for now. This compatibility path will be
       removed in a later release.
 
-      With KMS, every refresh now costs one additional `kms:Decrypt` and, when
-      the upstream rotates its refresh token, one `kms:Encrypt` (authorization-code
-      exchanges seal one more handle). No configuration is added or changed.
+      Token responses are the upstream's own with only `refresh_token` replaced
+      (status, content type, other members and their order are kept), and
+      upstream errors other than `invalid_grant` are passed through. A refresh
+      with a legacy raw token returns a handle even if the upstream did not
+      rotate. A successful upstream response that cannot be rewritten but
+      appears to carry a refresh token is refused with 502.
+
+      With KMS, every refresh now costs one additional `kms:Decrypt` (the
+      handle) and one `kms:Encrypt` when the response carries a new handle (the
+      upstream rotated its token, or a legacy token is migrated).
+      Authorization-code exchanges seal one more handle (one `kms:Encrypt`).
+      Transient KMS failures (throttling, network) now answer 503 `server_error`
+      instead of `invalid_grant`. No configuration is added or changed.
     action: |-
       No operator action. Tell app owners whose apps parse refresh tokens or
       present them directly to the upstream provider to treat the value as

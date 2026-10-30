@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
-use rise_backend_core::encryption::{decode_envelope, encode_envelope};
+use rise_backend_core::encryption::{decode_envelope, encode_envelope, CiphertextRejected};
 
 /// Local encryption provider using AES-256-GCM
 /// Encrypts data using a symmetric key stored in backend configuration
@@ -113,10 +113,14 @@ impl LocalEncryptionProvider {
 
     fn decrypt_with_cipher(cipher: &Aes256Gcm, combined: &[u8], aad: &[u8]) -> Result<String> {
         if combined.len() < 28 {
-            bail!("Invalid ciphertext: too short");
+            return Err(
+                anyhow::anyhow!("Invalid ciphertext: too short").context(CiphertextRejected)
+            );
         }
         let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let nonce = Nonce::try_from(nonce_bytes).context("Invalid ciphertext nonce")?;
+        let nonce = Nonce::try_from(nonce_bytes)
+            .context("Invalid ciphertext nonce")
+            .context(CiphertextRejected)?;
         let plaintext = cipher
             .decrypt(
                 &nonce,
@@ -125,8 +129,12 @@ impl LocalEncryptionProvider {
                     aad,
                 },
             )
-            .map_err(|_| anyhow::anyhow!("Ciphertext authentication failed"))?;
-        String::from_utf8(plaintext).context("Decrypted data is not valid UTF-8")
+            .map_err(|_| {
+                anyhow::anyhow!("Ciphertext authentication failed").context(CiphertextRejected)
+            })?;
+        String::from_utf8(plaintext)
+            .context("Decrypted data is not valid UTF-8")
+            .context(CiphertextRejected)
     }
 }
 

@@ -101,19 +101,6 @@ pub struct OAuthState {
     pub client_code_challenge_method: Option<String>,
 }
 
-/// Token response from OAuth provider
-#[derive(Debug, Deserialize)]
-pub struct TokenResponse {
-    pub access_token: String,
-    pub token_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id_token: Option<String>,
-}
-
 /// OAuth callback request from provider
 #[derive(Debug, Deserialize)]
 pub struct CallbackRequest {
@@ -180,27 +167,6 @@ pub struct TokenRequest {
     pub client_secret: Option<String>,
     /// PKCE code verifier (for public clients)
     pub code_verifier: Option<String>,
-}
-
-/// OAuth2 token response (RFC 6749-compliant)
-#[derive(Debug, Serialize)]
-pub struct OAuth2TokenResponse {
-    /// Access token
-    pub access_token: String,
-    /// Token type (always "Bearer")
-    pub token_type: String,
-    /// Expires in seconds from now (not timestamp)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<i64>,
-    /// Refresh token (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_token: Option<String>,
-    /// Scope (space-delimited from spec.scopes)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-    /// ID token (optional, OIDC)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id_token: Option<String>,
 }
 
 /// OAuth2 error response (RFC 6749-compliant)
