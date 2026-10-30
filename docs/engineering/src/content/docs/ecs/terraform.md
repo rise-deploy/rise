@@ -216,6 +216,23 @@ install and a puzzling one, and the module derives both from Cloud Map:
   comes from Traefik's `serverStatus` with no fallback, so without it a project
   with a `health_check` never becomes Healthy.
 
+The two services also share a generated secret. Rise's HTTP-provider endpoint
+(`:3001/internal/traefik/config`, listing every deployment's hostnames and
+custom domains) answers only requests with `Authorization: Bearer <secret>`.
+The module stores the secret in Secrets Manager
+(`<name>/traefik-config-secret`) and injects it through the `secrets` block of
+both task definitions — as `RISE_TRAEFIK_CONFIG_SECRET` into Rise, and into
+Traefik, whose entry point is a small `/bin/sh` wrapper that appends
+`--providers.http.headers.Authorization="Bearer $RISE_TRAEFIK_CONFIG_SECRET"` at
+start. A wrapper is needed because Traefik accepts static configuration from
+only one of file, arguments or environment, and the task already uses
+arguments. The token therefore appears in neither task definition. The security
+group still keeps `:3001` private; the secret is defence in depth. The task
+execution role must be able to read the new secret: a prefix pattern such as
+`arn:aws:secretsmanager:<region>:<account>:secret:<name>/*` already covers it,
+and `secret_arns_for_execution_role` now lists it for exact-ARN setups. A Traefik
+image override must provide `/bin/sh`.
+
 Subnets and security groups are passed as comma-separated strings. The settings
 loader accepts a YAML list or a comma-separated string precisely so a Terraform
 output can travel through one environment variable.

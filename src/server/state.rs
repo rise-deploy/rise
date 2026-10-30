@@ -50,6 +50,8 @@ pub struct TraefikHttpProviderConfig {
     pub entrypoint: String,
     pub certresolver: Option<String>,
     pub auth_backend_url: String,
+    /// Bearer token the Traefik HTTP-provider endpoint requires, when set.
+    pub config_secret: Option<String>,
 }
 
 /// Full state for HTTP server
@@ -1528,6 +1530,7 @@ impl AppState {
                 traefik_entrypoint,
                 traefik_certresolver,
                 auth_backend_url,
+                traefik_config_secret,
                 ..
             }) => Some(TraefikHttpProviderConfig {
                 native_provider: "docker",
@@ -1538,6 +1541,7 @@ impl AppState {
                     traefik_certresolver.clone(),
                 ),
                 auth_backend_url: auth_backend_url.clone(),
+                config_secret: traefik_config_secret.clone(),
             }),
             Some(crate::server::settings::DeploymentControllerSettings::Ecs {
                 label_namespace,
@@ -1545,6 +1549,7 @@ impl AppState {
                 traefik_entrypoint,
                 traefik_certresolver,
                 auth_backend_url,
+                traefik_config_secret,
                 ..
             }) => Some(TraefikHttpProviderConfig {
                 native_provider: "ecs",
@@ -1555,6 +1560,7 @@ impl AppState {
                     traefik_certresolver.clone(),
                 ),
                 auth_backend_url: auth_backend_url.clone(),
+                config_secret: traefik_config_secret.clone(),
             }),
             _ => None,
         };

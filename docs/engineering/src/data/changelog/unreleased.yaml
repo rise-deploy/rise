@@ -1159,3 +1159,34 @@ changes:
       the client address correctly once its trusted-proxy list covers the VPC's
       private ranges. Review ALB-fronted applications for use of
       `X-Forwarded-Host` or `X-Real-Ip`.
+      private ranges.
+  - id: traefik-config-shared-secret
+    title: The Traefik HTTP-provider endpoint can require a shared secret
+    type: feature
+    impact: configuration
+    backends: [docker, ecs]
+    details: |-
+      *Config change.* `deployment_controller.traefik_config_secret`
+      (`RISE_TRAEFIK_CONFIG_SECRET`) protects `GET /internal/traefik/config` on port
+      3001, which lists every deployment's hostnames, custom domains and forwardAuth
+      addresses. When set, Rise answers `401` unless the request carries
+      `Authorization: Bearer <secret>`. Unset keeps today's unauthenticated behavior
+      and logs a startup warning (suppressed with
+      `allow_insecure_development_keys`). The secret must be at least 16 characters
+      without whitespace.
+
+      The standalone Compose files and the `rise-ecs` Terraform modules wire it on
+      both sides. Traefik reads static configuration from arguments or environment,
+      never both, so the header is passed as
+      `--providers.http.headers.Authorization="Bearer <secret>"`; on ECS a `/bin/sh`
+      entry point appends it from an injected Secrets Manager value so no task
+      definition contains the token.
+    action: |-
+      Recommended: enable it. Docker Compose: set `RISE_TRAEFIK_CONFIG_SECRET`
+      (`openssl rand -hex 32`) in the environment, then `docker compose up -d`.
+      ECS Terraform: apply `rise-ecs`; it generates the secret
+      (`<name>/traefik-config-secret`) and restarts both services. The task
+      execution role must be allowed to read it: a prefix `ecs_secret_arns` pattern
+      already covers it, but exact-ARN lists must add the new entry from
+      `secret_arns_for_execution_role` before the apply. Custom Traefik deployments
+      add the `Authorization` provider header themselves.

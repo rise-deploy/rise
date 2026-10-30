@@ -41,6 +41,16 @@ Rise's `http://<rise-discovery-name>.<namespace>:3001/internal/traefik/config`
 every five seconds for public routes. ECS catalog routers use the loopback
 entry point `127.0.0.1:8083`.
 
+When `traefik.config_secret_arn` is set, Rise answers that endpoint only to
+requests carrying `Authorization: Bearer <secret>` (inject the same secret into
+Rise as `RISE_TRAEFIK_CONFIG_SECRET`). The Traefik task resolves the secret
+through ECS `secrets` and appends `--providers.http.headers.Authorization=...`
+at start through a `/bin/sh` entry point, because Traefik accepts static
+configuration from only one of file, arguments or environment and the task
+already passes arguments. The token therefore appears in neither task
+definition; the Traefik image must provide `/bin/sh` (the official image does).
+`traefik_command` omits the header for the same reason.
+
 The caller's security groups must permit Traefik to reach Rise on TCP
 3000–3001 and deployed workloads on their application ports. Rise must reach
 Traefik's API on TCP 8080. The API and Rise's internal listener must remain

@@ -32,6 +32,9 @@ services:
       - "--providers.docker.network=rise_default"
       - "--providers.http.endpoint=http://rise:3001/internal/traefik/config"
       - "--providers.http.pollInterval=5s"
+      # Same shared secret as the base file; empty (the default) leaves the
+      # endpoint open, which suits local/e2e on an isolated network.
+      - "--providers.http.headers.Authorization=Bearer ${RISE_TRAEFIK_CONFIG_SECRET:-}"
       # Keep Traefik's API enabled internally (:8080, NOT published) so the
       # backend's rolling serverStatus gate works in local/e2e too; the
       # command is replaced wholesale on override, so it must be re-added here.

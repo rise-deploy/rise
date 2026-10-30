@@ -1595,6 +1595,16 @@ pub enum DeploymentControllerSettings {
         #[schemars(with = "bool")]
         publish_app_ports: bool,
 
+        /// Shared secret protecting the Traefik HTTP-provider endpoint
+        /// (`GET /internal/traefik/config` on port 3001). When set, requests must
+        /// carry `Authorization: Bearer <secret>` and are answered `401` otherwise;
+        /// configure Traefik with
+        /// `--providers.http.headers.Authorization="Bearer <secret>"`. When unset
+        /// the endpoint is unauthenticated and must be kept off untrusted
+        /// networks. At least 16 characters, no whitespace.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        traefik_config_secret: Option<String>,
+
         /// Base URL of Traefik's API (e.g. `http://rise-traefik:8080` in-network
         /// or `http://localhost:8090` for a host-run dev backend). Read to learn
         /// per-server health status (the top-level `serverStatus` map) from
@@ -1775,6 +1785,16 @@ pub enum DeploymentControllerSettings {
         /// Optional Traefik certresolver name for automatic TLS.
         #[serde(default)]
         traefik_certresolver: Option<String>,
+
+        /// Shared secret protecting the Traefik HTTP-provider endpoint
+        /// (`GET /internal/traefik/config` on port 3001). When set, requests must
+        /// carry `Authorization: Bearer <secret>` and are answered `401` otherwise;
+        /// configure Traefik with
+        /// `--providers.http.headers.Authorization="Bearer <secret>"`. When unset
+        /// the endpoint is unauthenticated and must be kept off untrusted
+        /// networks. At least 16 characters, no whitespace.
+        #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
+        traefik_config_secret: Option<String>,
 
         /// Base URL of Traefik's API. Read for per-server `serverStatus`, the
         /// authoritative readiness signal (no fallback), so this is **required
@@ -2463,6 +2483,7 @@ impl Settings {
             ref staging_ingress_url_template,
             ref environment_ingress_url_template,
             ref controller_class_name,
+            ref traefik_config_secret,
             ..
         }) = settings.deployment_controller
         {
@@ -2476,6 +2497,8 @@ impl Settings {
                 controller_class_name,
                 "deployment_controller.controller_class_name",
             )?;
+
+            Self::validate_traefik_config_secret(traefik_config_secret.as_deref())?;
         }
 
         // Validate the ECS deployment controller variant with the same contract
@@ -2496,9 +2519,12 @@ impl Settings {
             ref execution_role_arn,
             ref repository_credentials_secret_arn,
             ref identity_agent_image,
+            ref traefik_config_secret,
             ..
         }) = settings.deployment_controller
         {
+            Self::validate_traefik_config_secret(traefik_config_secret.as_deref())?;
+
             Self::validate_ingress_templates(
                 production_ingress_url_template,
                 staging_ingress_url_template.as_deref(),
@@ -2711,6 +2737,30 @@ impl Settings {
                  '{{project_name}}.apps.example.com', with no scheme, port or path; \
                  path-based app URLs are not supported. Got: '{template}'"
             )));
+        }
+        Ok(())
+    }
+
+    /// The Traefik HTTP-provider shared secret travels as a bearer token in an
+    /// HTTP header, so it must be header-safe, and long enough that guessing it
+    /// is not a realistic attack.
+    fn validate_traefik_config_secret(secret: Option<&str>) -> Result<(), ConfigError> {
+        const MIN_LEN: usize = 16;
+        let Some(secret) = secret else {
+            return Ok(());
+        };
+        if secret.len() < MIN_LEN {
+            return Err(ConfigError::Message(format!(
+                "deployment_controller.traefik_config_secret must be at least {MIN_LEN} \
+                 characters (generate with: openssl rand -hex 32)"
+            )));
+        }
+        if secret.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(ConfigError::Message(
+                "deployment_controller.traefik_config_secret must not contain whitespace \
+                 or control characters"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -4007,6 +4057,89 @@ auth:
                 retention_hint: Some(ref hint)
             } if hint == "30d"
         ));
+    }
+
+    const TEST_TRAEFIK_SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The HTTP-provider secret reaches both Traefik-fronted controllers
+    /// through `RISE_TRAEFIK_CONFIG_SECRET`, and an empty value means unset.
+    #[test]
+    fn shipped_configs_read_the_traefik_config_secret_from_the_environment() {
+        let docker_secret = |env: &std::collections::HashMap<&'static str, &'static str>| {
+            match load_shipped_docker_config(env)
+                .expect("shipped docker.yaml must load")
+                .deployment_controller
+            {
+                Some(DeploymentControllerSettings::Docker {
+                    traefik_config_secret,
+                    ..
+                }) => traefik_config_secret,
+                other => panic!("expected the docker controller, got {other:?}"),
+            }
+        };
+        let ecs_secret = |env: &std::collections::HashMap<&'static str, &'static str>| {
+            match load_shipped_ecs_config(env)
+                .expect("shipped ecs.yaml must load")
+                .deployment_controller
+            {
+                Some(DeploymentControllerSettings::Ecs {
+                    traefik_config_secret,
+                    ..
+                }) => traefik_config_secret,
+                other => panic!("expected the ecs controller, got {other:?}"),
+            }
+        };
+
+        let mut docker_env = std::collections::HashMap::new();
+        docker_env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+        let mut ecs_env = ecs_base_env();
+
+        assert_eq!(docker_secret(&docker_env), None);
+        assert_eq!(ecs_secret(&ecs_env), None);
+
+        docker_env.insert("RISE_TRAEFIK_CONFIG_SECRET", "");
+        ecs_env.insert("RISE_TRAEFIK_CONFIG_SECRET", "");
+        assert_eq!(docker_secret(&docker_env), None);
+        assert_eq!(ecs_secret(&ecs_env), None);
+
+        docker_env.insert("RISE_TRAEFIK_CONFIG_SECRET", TEST_TRAEFIK_SECRET);
+        ecs_env.insert("RISE_TRAEFIK_CONFIG_SECRET", TEST_TRAEFIK_SECRET);
+        assert_eq!(
+            docker_secret(&docker_env).as_deref(),
+            Some(TEST_TRAEFIK_SECRET)
+        );
+        assert_eq!(ecs_secret(&ecs_env).as_deref(), Some(TEST_TRAEFIK_SECRET));
+    }
+
+    #[test]
+    fn traefik_config_secret_must_be_long_and_header_safe() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("DATABASE_URL", "postgres://u@rise-postgres/rise");
+
+        env.insert("RISE_TRAEFIK_CONFIG_SECRET", "short");
+        let err = load_shipped_docker_config(&env).expect_err("short secret must fail");
+        assert!(
+            err.to_string().contains("traefik_config_secret"),
+            "should name the setting: {err}"
+        );
+
+        env.insert(
+            "RISE_TRAEFIK_CONFIG_SECRET",
+            "0123456789abcdef 0123456789abcdef",
+        );
+        let err = load_shipped_docker_config(&env).expect_err("whitespace must fail");
+        assert!(
+            err.to_string().contains("whitespace"),
+            "unhelpful message: {err}"
+        );
+
+        let mut ecs_env = ecs_base_env();
+        ecs_env.insert("RISE_TRAEFIK_CONFIG_SECRET", "short");
+        let err = load_shipped_ecs_config(&ecs_env).expect_err("short secret must fail");
+        assert!(
+            err.to_string().contains("traefik_config_secret"),
+            "should name the setting: {err}"
+        );
     }
 
     #[test]

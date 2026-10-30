@@ -390,7 +390,7 @@ variable "acm_certificate_arn" {
 }
 
 variable "traefik_image" {
-  description = "Traefik image. Pinned by default; Traefik's ECS provider and label vocabulary are version-sensitive."
+  description = "Traefik image. Pinned by default; Traefik's ECS provider and label vocabulary are version-sensitive. Must provide /bin/sh: the task's entry point appends the HTTP-provider Authorization header from an injected secret."
   type        = string
   default     = "traefik:v3.7.10"
 }
@@ -569,10 +569,11 @@ variable "control_plane_secret_environment" {
         "RISE_JWT_SIGNING_SECRET",
         "RISE_ENCRYPTION_KEY",
         "OIDC_CLIENT_SECRET",
+        "RISE_TRAEFIK_CONFIG_SECRET",
         "RISE_LOCAL_CONFIG_YAML",
       ]),
     )) == 0
-    error_message = "control_plane_secret_environment cannot override DATABASE_URL, RISE_JWT_SIGNING_SECRET, RISE_ENCRYPTION_KEY, OIDC_CLIENT_SECRET or RISE_LOCAL_CONFIG_YAML."
+    error_message = "control_plane_secret_environment cannot override DATABASE_URL, RISE_JWT_SIGNING_SECRET, RISE_ENCRYPTION_KEY, OIDC_CLIENT_SECRET, RISE_TRAEFIK_CONFIG_SECRET or RISE_LOCAL_CONFIG_YAML."
   }
 
   validation {

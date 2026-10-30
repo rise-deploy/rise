@@ -89,6 +89,10 @@ services:
       - "--providers.docker.network=rise_default"
       - "--providers.http.endpoint=http://host.docker.internal:3001/internal/traefik/config"
       - "--providers.http.pollInterval=5s"
+      # Optional: export RISE_TRAEFIK_CONFIG_SECRET before both `docker compose up`
+      # and the host-run backend to require `Authorization: Bearer <secret>` on
+      # the provider endpoint. Unset (the default) leaves it open.
+      - "--providers.http.headers.Authorization=Bearer ${RISE_TRAEFIK_CONFIG_SECRET:-}"
       # File provider: routes /.rise/* on app hosts to the host-run Rise backend
       # (see dev/traefik/dynamic/rise-dotrise.yml). The backend isn't a container
       # here, so a Docker-provider label can't target it.

@@ -100,8 +100,15 @@ resource "aws_ecs_task_definition" "traefik" {
     }
   }
 
+  # Traefik reads its static configuration from exactly one of file, arguments
+  # or environment, and `command` already supplies arguments -- so the header
+  # cannot arrive as TRAEFIK_PROVIDERS_HTTP_HEADERS_*. ECS resolves the secret
+  # into an environment variable, and this wrapper appends the header flag at
+  # start so the token never appears in the task definition. `command` becomes
+  # the wrapper's "$@". Requires /bin/sh in the image, which the official
+  # (Alpine-based) Traefik image has.
   container_definitions = jsonencode([
-    {
+    merge(concat([{
       name      = "traefik"
       image     = var.traefik.image
       essential = true
@@ -141,7 +148,19 @@ resource "aws_ecs_task_definition" "traefik" {
           "awslogs-stream-prefix" = var.traefik.log_stream_prefix
         }
       }
-    }
+      }], [
+      for _ in var.traefik.config_secret_arn == null ? [] : [1] : {
+        entryPoint = [
+          "/bin/sh",
+          "-c",
+          "exec /traefik \"$@\" \"--providers.http.headers.Authorization=Bearer $${RISE_TRAEFIK_CONFIG_SECRET}\"",
+          "traefik",
+        ]
+        secrets = [
+          { name = "RISE_TRAEFIK_CONFIG_SECRET", valueFrom = var.traefik.config_secret_arn },
+        ]
+      }
+    ])...)
   ])
 
   tags = var.tags

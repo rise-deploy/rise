@@ -393,6 +393,19 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         Some(settings::DeploymentControllerSettings::Docker { .. })
             | Some(settings::DeploymentControllerSettings::Ecs { .. })
     ) {
+        if state
+            .traefik_http_provider
+            .as_ref()
+            .is_some_and(|provider| provider.config_secret.is_none())
+            && !settings.server.allow_insecure_development_keys
+        {
+            tracing::warn!(
+                "deployment_controller.traefik_config_secret is not set: the Traefik \
+                 configuration endpoint serves every deployment's routing topology \
+                 without authentication. Set it (and the matching Traefik provider \
+                 header) unless port 3001 is reachable only by Traefik."
+            );
+        }
         let config_app = Router::new()
             .route(
                 "/internal/traefik/config",
@@ -537,10 +550,46 @@ async fn version_info() -> axum::Json<serde_json::Value> {
     }))
 }
 
+/// Whether a request may read the Traefik HTTP-provider snapshot.
+///
+/// With no secret configured every request is admitted. Otherwise the request
+/// must carry `Authorization: Bearer <secret>`; the comparison is constant-time
+/// in the token's contents.
+#[cfg(feature = "backend")]
+fn traefik_config_request_authorized(
+    expected_secret: Option<&str>,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let Some(expected) = expected_secret else {
+        return true;
+    };
+    let Some(value) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Some((scheme, presented)) = value.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("bearer")
+        && bool::from(presented.as_bytes().ct_eq(expected.as_bytes()))
+}
+
 #[cfg(feature = "backend")]
 async fn traefik_dynamic_config(
     axum::extract::State(state): axum::extract::State<state::AppState>,
+    headers: axum::http::HeaderMap,
 ) -> Result<axum::Json<rise_backend_traefik::dynamic::DynamicConfig>, axum::http::StatusCode> {
+    let expected_secret = state
+        .traefik_http_provider
+        .as_ref()
+        .and_then(|provider| provider.config_secret.as_deref());
+    if !traefik_config_request_authorized(expected_secret, &headers) {
+        return Err(axum::http::StatusCode::UNAUTHORIZED);
+    }
     build_traefik_dynamic_config(&state)
         .await
         .map(axum::Json)
@@ -802,5 +851,65 @@ mod trace_tests {
         for forbidden in ["code-secret", "state-secret", "token-secret", "uri="] {
             assert!(!log.contains(forbidden), "{log}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "backend"))]
+mod traefik_config_auth_tests {
+    use super::traefik_config_request_authorized;
+    use axum::http::{header::AUTHORIZATION, HeaderMap, HeaderValue};
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    fn with_authorization(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn unset_secret_admits_every_request() {
+        assert!(traefik_config_request_authorized(None, &HeaderMap::new()));
+        assert!(traefik_config_request_authorized(
+            None,
+            &with_authorization("Bearer anything")
+        ));
+    }
+
+    #[test]
+    fn configured_secret_rejects_a_missing_header() {
+        assert!(!traefik_config_request_authorized(
+            Some(SECRET),
+            &HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn configured_secret_rejects_wrong_credentials() {
+        for value in [
+            "Bearer wrong".to_string(),
+            "Bearer ".to_string(),
+            format!("Bearer {SECRET}x"),
+            format!("Bearer {}", &SECRET[..SECRET.len() - 1]),
+            format!("Basic {SECRET}"),
+            SECRET.to_string(),
+        ] {
+            assert!(
+                !traefik_config_request_authorized(Some(SECRET), &with_authorization(&value)),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_secret_admits_the_matching_bearer_token() {
+        assert!(traefik_config_request_authorized(
+            Some(SECRET),
+            &with_authorization(&format!("Bearer {SECRET}"))
+        ));
+        assert!(traefik_config_request_authorized(
+            Some(SECRET),
+            &with_authorization(&format!("bearer {SECRET}"))
+        ));
     }
 }
