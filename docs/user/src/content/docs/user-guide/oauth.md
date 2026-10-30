@@ -288,8 +288,8 @@ The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the u
 | A leaked handle works through Rise | until the upstream provider stops honouring the token | until your app next refreshes; if the thief refreshed first, that refresh revokes the login |
 | Theft detection | none | reuse after the grace period revokes the login |
 | Lifetime bound set by Rise | none | `max_lifetime_seconds` |
-| Revoke every login at once | not per extension | switch to `sealed` or delete the extension |
-| Survives extension recreate or upstream change | no | no |
+| Revoke every login at once | delete or recreate the extension, or change its `issuer_url`, `token_endpoint` override or `client_id` (no per-handle revocation) | switch to `sealed`, delete or recreate the extension, or change its `issuer_url`, `token_endpoint` override or `client_id` |
+| Survives extension recreate or upstream change | no (raw tokens from before handles: yes) | no |
 | Raw upstream refresh tokens | accepted for now (see the note below) | rejected |
 | Storage | none | one record per handle in Rise's database |
 
