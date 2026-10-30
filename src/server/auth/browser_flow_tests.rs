@@ -77,8 +77,8 @@ impl rise_backend_core::DeploymentBackend for Backend {
     }
 }
 
-struct Fixture {
-    state: AppState,
+pub(crate) struct Fixture {
+    pub(crate) state: AppState,
     exchanges: Arc<AtomicUsize>,
     idp_server: tokio::task::JoinHandle<()>,
 }
@@ -88,7 +88,7 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(pool: PgPool) -> Fixture {
+pub(crate) async fn fixture(pool: PgPool) -> Fixture {
     use crate::server::{
         auth::{jwt::JwtValidator, oauth::OAuthClient, user_identity::UserLogins},
         authz::{OperatorSelectors, ResourceAuthorizer},

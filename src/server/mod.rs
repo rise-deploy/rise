@@ -33,6 +33,9 @@ pub mod state;
 pub mod team;
 pub mod workload_tokens;
 
+#[cfg(test)]
+mod platform_route_guard_tests;
+
 use anyhow::Result;
 use axum::{extract::Request, middleware as axum_middleware, response::Response, Router};
 use state::{AppState, ControllerState};
@@ -40,6 +43,31 @@ use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
 use tracing::{info, Span};
+
+/// Every route that sits behind authentication and platform access.
+///
+/// Authentication is two-phase for service accounts: `auth_middleware` admits a
+/// JWKS-valid external token without knowing which project it is for, so each
+/// handler here must resolve the caller itself (`AuthContext::user` or
+/// `AuthContext::resolve_for_project`) before it acts. The
+/// `platform_route_guard_tests` module drives an unresolvable external token
+/// through every route this function registers; add a route here and it fails
+/// until the new route is covered there.
+pub(crate) fn platform_route_tree() -> Router<AppState> {
+    Router::new()
+        .merge(auth::routes::platform_routes())
+        .merge(custom_domains::routes())
+        .merge(project::routes::routes())
+        .merge(team::routes::team_routes())
+        .merge(registry::routes::routes())
+        .merge(deployment::routes::deployment_routes())
+        .merge(service_accounts::routes::routes())
+        .merge(env_vars::routes::routes())
+        .merge(environments::routes::routes())
+        .merge(extensions::routes::routes())
+        .merge(encryption::routes::routes())
+        .merge(quickstart::routes::routes())
+}
 
 fn http_request_span(request: &Request) -> Span {
     tracing::debug_span!(
@@ -320,19 +348,7 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         ));
 
     // Platform routes (require authentication AND platform access)
-    let platform_routes = Router::new()
-        .merge(auth::routes::platform_routes())
-        .merge(custom_domains::routes())
-        .merge(project::routes::routes())
-        .merge(team::routes::team_routes())
-        .merge(registry::routes::routes())
-        .merge(deployment::routes::deployment_routes())
-        .merge(service_accounts::routes::routes())
-        .merge(env_vars::routes::routes())
-        .merge(environments::routes::routes())
-        .merge(extensions::routes::routes())
-        .merge(encryption::routes::routes())
-        .merge(quickstart::routes::routes());
+    let platform_routes = platform_route_tree();
 
     let platform_routes = platform_routes
         // Scoped sessions (ADR-0006) are checked last, before the handler

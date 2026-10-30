@@ -21,4 +21,4 @@ pub mod token_storage;
 pub mod user_identity;
 
 #[cfg(test)]
-mod browser_flow_tests;
+pub(crate) mod browser_flow_tests;
