@@ -56,6 +56,24 @@ impl EncryptionContext {
         }
     }
 
+    /// Like [`Self::extension`], additionally bound to one incarnation of the
+    /// extension: `created_at_micros` is the creation time of its row in unix
+    /// microseconds. Deleting an extension and creating one of the same name
+    /// yields a different incarnation, so a value sealed under this context
+    /// does not decrypt for the new one.
+    pub fn extension_instance(
+        project: Uuid,
+        kind: &str,
+        name: &str,
+        created_at_micros: i64,
+        slot: &str,
+    ) -> Self {
+        let mut context = Self::extension(project, kind, name, slot);
+        context.scope.push("created-at-micros".into());
+        context.scope.push(created_at_micros.to_string());
+        context
+    }
+
     pub fn project_env(project: Uuid, environment: Option<Uuid>, key: &str) -> Self {
         Self {
             scope: vec![
@@ -140,5 +158,22 @@ mod tests {
         let envelope = encode_envelope(b"cipher");
         assert_eq!(decode_envelope(&envelope).unwrap(), b"cipher");
         assert!(!is_ciphertext_rejection(&anyhow::anyhow!("throttled")));
+    }
+
+    #[test]
+    fn extension_instance_contexts_differ_by_incarnation_and_from_the_plain_context() {
+        let project = Uuid::from_u128(1);
+        let plain = EncryptionContext::extension(project, "oauth", "login", "/slot");
+        let a = EncryptionContext::extension_instance(project, "oauth", "login", 10, "/slot");
+        let b = EncryptionContext::extension_instance(project, "oauth", "login", 11, "/slot");
+        assert_ne!(a.authenticated_bytes(), b.authenticated_bytes());
+        assert_ne!(a.authenticated_bytes(), plain.authenticated_bytes());
+        assert_eq!(
+            a.authenticated_bytes(),
+            EncryptionContext::extension_instance(project, "oauth", "login", 10, "/slot")
+                .authenticated_bytes()
+        );
+        // The plain context is unchanged, so values sealed under it keep decrypting.
+        assert_eq!(plain.scope.len(), 5);
     }
 }
