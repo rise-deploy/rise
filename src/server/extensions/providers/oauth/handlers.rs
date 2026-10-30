@@ -448,6 +448,127 @@ fn redirect_uri_is_allowed(redirect: &Url, public_url: &Url, app_origins: &[Url]
             .any(|allowed| origins_match(redirect, allowed))
 }
 
+/// Whether a redirect target is on the Rise public origin, i.e. the Rise UI's
+/// "test OAuth" flow rather than an end-user app flow.
+///
+/// Compared by parsed origin; a string prefix would accept lookalike hosts
+/// (`https://rise.example.com.evil.com`) and userinfo tricks
+/// (`https://rise.example.com@evil.com`). An unparseable URL is never a match.
+fn redirect_targets_rise_origin(redirect_uri: &str, public_url: &str) -> bool {
+    match (Url::parse(redirect_uri), Url::parse(public_url)) {
+        (Ok(redirect), Ok(public)) => origins_match(&redirect, &public),
+        _ => false,
+    }
+}
+
+/// Authenticate the browser starting a test flow and return the initiating
+/// user's id.
+///
+/// The test flow writes the extension's stored status, so it is reserved for
+/// a signed-in user with access to the project. The Rise UI starts it as a
+/// navigation carrying the `rise_jwt` session cookie; only that cookie is
+/// accepted, and a scoped (CLI) session is refused because it is not a UI
+/// session.
+async fn authenticate_test_flow_initiator(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: &crate::db::models::Project,
+) -> Result<Uuid, (StatusCode, String)> {
+    use crate::server::auth::{cookie_helpers, user_identity::TokenStanding};
+
+    let unauthenticated = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            "Redirecting to the Rise UI requires signing in to Rise as a user with access to this project"
+                .to_string(),
+        )
+    };
+
+    let token = cookie_helpers::extract_rise_jwt_cookie(headers).ok_or_else(unauthenticated)?;
+    let claims = state
+        .jwt_signer
+        .verify_user_jwt(&token, &state.public_url)
+        .map_err(|_| unauthenticated())?;
+
+    if claims.authorization_details.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "A scoped session cannot start an OAuth test flow".to_string(),
+        ));
+    }
+
+    let uids = claims.rise_uid.zip(claims.rise_identity_uid);
+    match state.user_logins.check_token(&claims.sub, uids).await {
+        Ok(TokenStanding::Active(_)) => {}
+        Ok(TokenStanding::Rejected(_)) => return Err(unauthenticated()),
+        Err(error) => {
+            error!("Failed to re-resolve the session's User: {:?}", error);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to verify session".to_string(),
+            ));
+        }
+    }
+
+    let user = crate::db::users::find_or_create_with_default_organization(
+        &state.db_pool,
+        &claims.email,
+        state.default_organization_uid,
+    )
+    .await
+    .map_err(|error| {
+        error!("Failed to find/create user: {:?}", error);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to verify session".to_string(),
+        )
+    })?;
+
+    crate::server::project::handlers::ensure_project_access_or_admin(state, &user, project)
+        .await
+        .map_err(|e| (e.status, e.message))?;
+
+    Ok(user.id)
+}
+
+/// Longest stored upstream error code / description, in characters.
+const MAX_STORED_ERROR_CODE_CHARS: usize = 100;
+const MAX_STORED_ERROR_DESCRIPTION_CHARS: usize = 200;
+
+fn bounded_text(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max_chars)
+        .collect()
+}
+
+/// The status text stored when a test flow's token exchange fails.
+///
+/// Only the RFC 6749 §5.2 `error` / `error_description` fields of a JSON body
+/// are kept, each bounded; anything else in the upstream response (HTML pages,
+/// stack traces, echoed request data) is dropped.
+fn token_exchange_failure_summary(status: reqwest::StatusCode, body: &str) -> String {
+    let mut summary = format!("Token exchange failed with status {status}");
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_str::<serde_json::Value>(body)
+    else {
+        return summary;
+    };
+    let field = |name: &str, max_chars: usize| {
+        fields
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(|text| bounded_text(text, max_chars))
+            .filter(|text| !text.trim().is_empty())
+    };
+    if let Some(code) = field("error", MAX_STORED_ERROR_CODE_CHARS) {
+        summary.push_str(&format!(": {code}"));
+        if let Some(description) = field("error_description", MAX_STORED_ERROR_DESCRIPTION_CHARS) {
+            summary.push_str(&format!(" ({description})"));
+        }
+    }
+    summary
+}
+
 /// Validate redirect URI against allowed origins
 async fn validate_redirect_uri(
     pool: &sqlx::PgPool,
@@ -682,6 +803,15 @@ pub async fn authorize(
         }
     };
 
+    // A redirect to the Rise UI is the test flow, which writes the extension's
+    // status: only a signed-in user with access to the project may start it.
+    let test_flow_initiator =
+        if redirect_targets_rise_origin(&final_redirect_uri, &state.public_url) {
+            Some(authenticate_test_flow_initiator(&state, &headers, &project).await?)
+        } else {
+            None
+        };
+
     // Generate CSRF state token
     let state_token = generate_state_token();
 
@@ -699,6 +829,7 @@ pub async fn authorize(
         created_at: Utc::now(),
         client_code_challenge: req.code_challenge,
         client_code_challenge_method: req.code_challenge_method,
+        test_flow_initiator,
     };
 
     // Store state in DB (10-minute TTL)
@@ -882,7 +1013,25 @@ pub async fn callback(
         }
     };
 
-    let is_test_flow = final_redirect_uri.starts_with(&state.public_url);
+    // The test flow is the one that returns to the Rise UI, and only a state
+    // minted for an authenticated project member may run it. A Rise-origin
+    // state without an initiator is refused rather than treated as an app flow.
+    let is_test_flow = if redirect_targets_rise_origin(&final_redirect_uri, &state.public_url) {
+        if claimed_state.test_flow_initiator.is_none() {
+            warn!(
+                project = %project_name,
+                extension = %extension_name,
+                "Refusing OAuth callback: Rise-origin redirect without an authenticated initiator"
+            );
+            if let Err(e) = claimed_state.finalize().await {
+                warn!("Failed to finalize refused OAuth callback state: {:?}", e);
+            }
+            return Err((StatusCode::BAD_REQUEST, "Invalid state token".to_string()));
+        }
+        true
+    } else {
+        false
+    };
 
     debug!(
         "OAuth callback: flow_type={}, final_redirect_uri={}",
@@ -1040,16 +1189,14 @@ pub async fn callback(
                 .unwrap_or_else(|_| "Unable to read error response".to_string());
             error!(
                 "Token exchange failed with status {}: {}",
-                status, error_text
+                status,
+                bounded_text(&error_text, 500)
             );
 
             // Update extension status with error
             let mut ext_status: OAuthExtensionStatus =
                 serde_json::from_value(extension.status.clone()).unwrap_or_default();
-            ext_status.error = Some(format!(
-                "Token exchange failed with status {}: {}",
-                status, error_text
-            ));
+            ext_status.error = Some(token_exchange_failure_summary(status, &error_text));
             ext_status.auth_verified = false;
 
             db_extensions::update_status(
@@ -2317,4 +2464,334 @@ pub async fn credential_binding(
         &endpoints.token_endpoint,
     );
     Ok(Json(serde_json::json!({"binding": binding})))
+}
+
+#[cfg(test)]
+mod test_flow_tests {
+    use super::*;
+    use crate::server::auth::browser_flow_tests::{fixture, rise_ui_session_headers, Fixture};
+    use serde_json::json;
+    use sqlx::PgPool;
+
+    const PUBLIC_URL: &str = "https://rise.example.com";
+
+    #[test]
+    fn rise_origin_is_matched_by_parsed_origin() {
+        for redirect in [
+            "https://rise.example.com/",
+            "https://rise.example.com/projects/demo#extensions",
+            "https://rise.example.com:443/x",
+            "https://RISE.EXAMPLE.COM/x",
+            "https://rise.example.com./x",
+        ] {
+            assert!(
+                redirect_targets_rise_origin(redirect, PUBLIC_URL),
+                "{redirect} should be the Rise origin"
+            );
+        }
+    }
+
+    #[test]
+    fn lookalike_origins_are_not_the_rise_origin() {
+        for redirect in [
+            // String-prefix lookalikes.
+            "https://rise.example.com.evil.com/x",
+            "https://rise.example.comevil.com/x",
+            "https://rise.example.com-evil.com/x",
+            // Userinfo makes the string start with the public URL.
+            "https://rise.example.com@evil.com/x",
+            "https://rise.example.com:pw@evil.com/x",
+            // Different subdomain, parent domain, scheme, or port.
+            "https://app.rise.example.com/x",
+            "https://example.com/x",
+            "http://rise.example.com/x",
+            "https://rise.example.com:8443/x",
+            // Not an HTTP(S) origin, or not a URL at all.
+            "javascript://rise.example.com/%0Aalert(1)",
+            "ftp://rise.example.com/x",
+            "//rise.example.com/x",
+            "/projects/demo",
+            "",
+        ] {
+            assert!(
+                !redirect_targets_rise_origin(redirect, PUBLIC_URL),
+                "{redirect} must not be the Rise origin"
+            );
+        }
+        assert!(!redirect_targets_rise_origin(
+            "https://rise.example.com/x",
+            "not a url"
+        ));
+    }
+
+    #[test]
+    fn rise_origin_with_explicit_port_and_http_scheme() {
+        let public = "http://rise.localhost:3000";
+        assert!(redirect_targets_rise_origin(
+            "http://rise.localhost:3000/x",
+            public
+        ));
+        assert!(!redirect_targets_rise_origin(
+            "http://rise.localhost:3001/x",
+            public
+        ));
+        assert!(!redirect_targets_rise_origin(
+            "http://rise.localhost/x",
+            public
+        ));
+        assert!(!redirect_targets_rise_origin(
+            "https://rise.localhost:3000/x",
+            public
+        ));
+    }
+
+    #[test]
+    fn token_exchange_failure_summary_keeps_only_bounded_oauth_error_fields() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+
+        assert_eq!(
+            token_exchange_failure_summary(
+                status,
+                r#"{"error":"invalid_grant","error_description":"code expired","trace":"secret"}"#
+            ),
+            "Token exchange failed with status 400 Bad Request: invalid_grant (code expired)"
+        );
+        // Non-JSON bodies and JSON without an `error` code contribute nothing.
+        for body in [
+            "<html><body>attacker text</body></html>",
+            r#"{"message":"attacker text"}"#,
+            r#"["error"]"#,
+            "",
+        ] {
+            assert_eq!(
+                token_exchange_failure_summary(status, body),
+                "Token exchange failed with status 400 Bad Request"
+            );
+        }
+
+        let long = "x".repeat(10_000);
+        let summary = token_exchange_failure_summary(
+            status,
+            &json!({"error": long, "error_description": long}).to_string(),
+        );
+        assert!(
+            summary.chars().count()
+                <= "Token exchange failed with status 400 Bad Request: ".len()
+                    + MAX_STORED_ERROR_CODE_CHARS
+                    + MAX_STORED_ERROR_DESCRIPTION_CHARS
+                    + 4
+        );
+
+        let summary =
+            token_exchange_failure_summary(status, &json!({"error": "bad\nline\u{7}"}).to_string());
+        assert!(!summary.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn oauth_state_without_initiator_field_deserializes() {
+        let state: OAuthState = serde_json::from_value(json!({
+            "redirect_uri": "https://rise.example.com/x",
+            "application_state": null,
+            "project_name": "demo",
+            "extension_name": "ext",
+            "code_verifier": "v",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(state.test_flow_initiator, None);
+    }
+
+    async fn demo_project(fixture: &Fixture) -> crate::db::models::Project {
+        db_projects::find_by_name(&fixture.state.db_pool, "demo")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn create_extension(fixture: &Fixture) {
+        let project = demo_project(fixture).await;
+        db_extensions::create(
+            &fixture.state.db_pool,
+            project.id,
+            "ext",
+            "oauth",
+            &json!({
+                "provider_name": "Test",
+                "client_id": "client",
+                "issuer_url": "https://idp.example.com",
+                "authorization_endpoint": "https://idp.example.com/authorize",
+                "token_endpoint": "https://idp.example.com/token",
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn authorize_to_rise_ui(
+        fixture: &Fixture,
+        headers: HeaderMap,
+    ) -> Result<Response, (StatusCode, String)> {
+        authorize(
+            State(fixture.state.clone()),
+            Path(("demo".to_string(), "ext".to_string())),
+            headers,
+            Query(AuthorizeFlowQuery {
+                redirect_uri: Some(format!("{PUBLIC_URL}/projects/demo")),
+                state: None,
+                code_challenge: None,
+                code_challenge_method: None,
+            }),
+        )
+        .await
+    }
+
+    async fn transient_state_count(fixture: &Fixture) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_transient_state")
+            .fetch_one(&fixture.state.db_pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn anonymous_authorize_to_rise_origin_is_refused(pool: PgPool) {
+        let fixture = fixture(pool).await;
+        create_extension(&fixture).await;
+
+        let (status, _) = authorize_to_rise_ui(&fixture, HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let mut forged = HeaderMap::new();
+        forged.insert(header::COOKIE, "rise_jwt=not.a.jwt".parse().unwrap());
+        let (status, _) = authorize_to_rise_ui(&fixture, forged).await.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            transient_state_count(&fixture).await,
+            0,
+            "a refused authorize must not mint a state token"
+        );
+    }
+
+    #[sqlx::test]
+    async fn authorize_to_rise_origin_requires_project_access(pool: PgPool) {
+        let mut fixture = fixture(pool).await;
+        create_extension(&fixture).await;
+        let headers = rise_ui_session_headers(&fixture).await;
+
+        // The session user is a configured admin, so it may start the flow.
+        let response = authorize_to_rise_ui(&fixture, headers.clone())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(transient_state_count(&fixture).await, 1);
+
+        // Without the admin bypass the same session is neither owner nor
+        // member of the project.
+        fixture.state.admin_users = Arc::new(Vec::new());
+        let (status, _) = authorize_to_rise_ui(&fixture, headers).await.unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(transient_state_count(&fixture).await, 1);
+    }
+
+    #[sqlx::test]
+    async fn authorize_records_the_initiating_user_only_for_the_test_flow(pool: PgPool) {
+        let fixture = fixture(pool).await;
+        create_extension(&fixture).await;
+        let headers = rise_ui_session_headers(&fixture).await;
+
+        let response = authorize_to_rise_ui(&fixture, headers.clone())
+            .await
+            .unwrap();
+        let location = response.headers()[header::LOCATION].to_str().unwrap();
+        let state_token = Url::parse(location)
+            .unwrap()
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        let stored = oauth_transient_state::claim::<OAuthState>(
+            &fixture.state.db_pool,
+            &state_token,
+            Uuid::new_v4(),
+            oauth_transient_state::CLAIM_GRACE_TTL,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .data()
+        .clone();
+        assert!(stored.test_flow_initiator.is_some());
+
+        // An end-user app flow needs no session and records no initiator.
+        let response = authorize(
+            State(fixture.state.clone()),
+            Path(("demo".to_string(), "ext".to_string())),
+            HeaderMap::new(),
+            Query(AuthorizeFlowQuery {
+                redirect_uri: Some("https://demo.apps.example.com/cb".to_string()),
+                state: None,
+                code_challenge: None,
+                code_challenge_method: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[sqlx::test]
+    async fn callback_never_mutates_status_for_a_rise_origin_state_without_initiator(pool: PgPool) {
+        let fixture = fixture(pool).await;
+        create_extension(&fixture).await;
+        let project = demo_project(&fixture).await;
+        let state = OAuthState {
+            redirect_uri: Some(format!("{PUBLIC_URL}/projects/demo")),
+            application_state: None,
+            project_name: "demo".into(),
+            extension_name: "ext".into(),
+            code_verifier: "verifier".into(),
+            created_at: Utc::now(),
+            client_code_challenge: None,
+            client_code_challenge_method: None,
+            test_flow_initiator: None,
+        };
+        oauth_transient_state::insert(
+            &fixture.state.db_pool,
+            "attacker-state",
+            &state,
+            StdDuration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let before =
+            db_extensions::find_by_project_and_name(&fixture.state.db_pool, project.id, "ext")
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+
+        let (status, _) = callback(
+            State(fixture.state.clone()),
+            Path(("demo".to_string(), "ext".to_string())),
+            HeaderMap::new(),
+            Query(CallbackRequest {
+                code: "junk".into(),
+                state: "attacker-state".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let after =
+            db_extensions::find_by_project_and_name(&fixture.state.db_pool, project.id, "ext")
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+        assert_eq!(before, after);
+    }
 }
