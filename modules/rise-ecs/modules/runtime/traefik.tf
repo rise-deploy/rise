@@ -106,7 +106,9 @@ resource "aws_ecs_task_definition" "traefik" {
   # into an environment variable, and this wrapper appends the header flag at
   # start so the token never appears in the task definition. `command` becomes
   # the wrapper's "$@". Requires /bin/sh in the image, which the official
-  # (Alpine-based) Traefik image has.
+  # (Alpine-based) Traefik image has. The binary is resolved through PATH (the
+  # library image installs it at /usr/local/bin/traefik, and the in-task health
+  # check already runs it by name), never by an absolute path.
   container_definitions = jsonencode([
     merge(concat([{
       name      = "traefik"
@@ -153,7 +155,7 @@ resource "aws_ecs_task_definition" "traefik" {
         entryPoint = [
           "/bin/sh",
           "-c",
-          "exec /traefik \"$@\" \"--providers.http.headers.Authorization=Bearer $${RISE_TRAEFIK_CONFIG_SECRET}\"",
+          "exec traefik \"$@\" \"--providers.http.headers.Authorization=Bearer $${RISE_TRAEFIK_CONFIG_SECRET}\"",
           "traefik",
         ]
         secrets = [

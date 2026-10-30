@@ -1159,9 +1159,9 @@ changes:
       the client address correctly once its trusted-proxy list covers the VPC's
       private ranges. Review ALB-fronted applications for use of
       `X-Forwarded-Host` or `X-Real-Ip`.
-      private ranges.
   - id: traefik-config-shared-secret
     title: The Traefik HTTP-provider endpoint can require a shared secret
+    group: security-and-upgrade-guidance
     type: feature
     impact: configuration
     backends: [docker, ecs]
@@ -1184,9 +1184,26 @@ changes:
     action: |-
       Recommended: enable it. Docker Compose: set `RISE_TRAEFIK_CONFIG_SECRET`
       (`openssl rand -hex 32`) in the environment, then `docker compose up -d`.
-      ECS Terraform: apply `rise-ecs`; it generates the secret
-      (`<name>/traefik-config-secret`) and restarts both services. The task
-      execution role must be allowed to read it: a prefix `ecs_secret_arns` pattern
-      already covers it, but exact-ARN lists must add the new entry from
-      `secret_arns_for_execution_role` before the apply. Custom Traefik deployments
-      add the `Authorization` provider header themselves.
+      Custom Traefik deployments add the `Authorization` provider header
+      themselves. For ECS see the rollout entry below.
+  - id: ecs-traefik-config-secret-rollout
+    title: "ECS: the Rise and Traefik tasks read a new Secrets Manager secret"
+    group: security-and-upgrade-guidance
+    type: change
+    impact: action-required
+    backends: [ ecs ]
+    details: |-
+      `rise-ecs` generates a `<name>/traefik-config-secret` secret and injects it
+      through the `secrets` block of both the Rise and the Traefik task
+      definitions, and the Traefik task now starts through a `/bin/sh` entry point
+      that appends the provider's `Authorization` header. Both tasks share the ECS
+      execution role. If that role's Secrets Manager permission is an exact-ARN
+      `ecs_secret_arns` list that does not yet include the new ARN, **both tasks
+      fail at secret resolution** and neither starts. A Traefik image override must
+      provide `/bin/sh` and `traefik` on its `PATH`.
+    action: |-
+      With a prefix pattern such as `arn:aws:secretsmanager:<region>:<account>:secret:<name>/*`
+      nothing is needed. With exact ARNs, add the new entry from the
+      `secret_arns_for_execution_role` output to `ecs_secret_arns` and apply the IAM
+      change (`modules/rise-aws`) **before** applying `rise-ecs`. The Traefik task
+      is replaced, so expect a brief interruption of ingress.

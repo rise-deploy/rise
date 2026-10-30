@@ -50,7 +50,7 @@ TRAEFIK_CONFIG_SECRET_ENV = "RISE_TRAEFIK_CONFIG_SECRET"
 TRAEFIK_CONFIG_ENTRYPOINT = [
     "/bin/sh",
     "-c",
-    'exec /traefik "$@" "--providers.http.headers.Authorization=Bearer ${%s}"'
+    'exec traefik "$@" "--providers.http.headers.Authorization=Bearer ${%s}"'
     % TRAEFIK_CONFIG_SECRET_ENV,
     "traefik",
 ]

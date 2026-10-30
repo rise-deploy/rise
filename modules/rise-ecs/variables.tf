@@ -390,7 +390,7 @@ variable "acm_certificate_arn" {
 }
 
 variable "traefik_image" {
-  description = "Traefik image. Pinned by default; Traefik's ECS provider and label vocabulary are version-sensitive. Must provide /bin/sh: the task's entry point appends the HTTP-provider Authorization header from an injected secret."
+  description = "Traefik image. Pinned by default; Traefik's ECS provider and label vocabulary are version-sensitive. Must provide /bin/sh and `traefik` on its PATH: the task's entry point appends the HTTP-provider Authorization header from an injected secret."
   type        = string
   default     = "traefik:v3.7.10"
 }

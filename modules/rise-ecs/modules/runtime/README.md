@@ -48,7 +48,7 @@ through ECS `secrets` and appends `--providers.http.headers.Authorization=...`
 at start through a `/bin/sh` entry point, because Traefik accepts static
 configuration from only one of file, arguments or environment and the task
 already passes arguments. The token therefore appears in neither task
-definition; the Traefik image must provide `/bin/sh` (the official image does).
+definition; the Traefik image must provide `/bin/sh` and `traefik` on its `PATH` (the official image does, at `/usr/local/bin/traefik`).
 `traefik_command` omits the header for the same reason.
 
 The caller's security groups must permit Traefik to reach Rise on TCP

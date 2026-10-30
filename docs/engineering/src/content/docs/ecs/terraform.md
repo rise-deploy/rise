@@ -231,7 +231,7 @@ group still keeps `:3001` private; the secret is defence in depth. The task
 execution role must be able to read the new secret: a prefix pattern such as
 `arn:aws:secretsmanager:<region>:<account>:secret:<name>/*` already covers it,
 and `secret_arns_for_execution_role` now lists it for exact-ARN setups. A Traefik
-image override must provide `/bin/sh`.
+image override must provide `/bin/sh` and a `traefik` binary on its `PATH`.
 
 Subnets and security groups are passed as comma-separated strings. The settings
 loader accepts a YAML list or a comma-separated string precisely so a Terraform

@@ -325,7 +325,7 @@ run "rejects_an_unknown_client_ip_source" {
   expect_failures = [var.client_ip]
 }
 
-# The wrapper is `exec /traefik "$@" <header flag>`, so every flag in `command`
+# The wrapper is `exec traefik "$@" <header flag>`, so every flag in `command`
 # -- including the client-address trust flags -- still reaches Traefik as an
 # argument and the header is appended after them.
 run "client_ip_flags_and_the_config_secret_coexist" {
@@ -354,9 +354,10 @@ run "client_ip_flags_and_the_config_secret_coexist" {
 
   assert {
     condition = (
-      strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "exec /traefik \"$@\" ") &&
+      strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "exec traefik \"$@\" ") &&
+      !strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "exec /") &&
       !anytrue([for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command : strcontains(flag, "headers.Authorization")])
     )
-    error_message = "the wrapper must exec traefik with the command's arguments, and the header must not be in command"
+    error_message = "the wrapper must exec traefik through PATH (the image keeps it at /usr/local/bin, not /traefik) with the command's arguments, and the header must not be in command"
   }
 }
