@@ -140,6 +140,47 @@ variable "load_balancer_targets" {
   }
 }
 
+variable "client_ip" {
+  description = <<-EOT
+    How the real client address reaches Traefik from the load balancer in front
+    of it, and which peers may be believed.
+
+    - "none": Traefik trusts no one. It discards inbound X-Forwarded-* headers
+      and records its direct peer -- the load balancer node -- as the client.
+    - "forwarded-headers": an L7 load balancer (ALB) adds X-Forwarded-For and
+      X-Forwarded-Proto. Traefik's `web` entrypoint keeps them when the peer is
+      in `trusted_cidrs`.
+    - "proxy-protocol": an L4 load balancer (NLB with IP targets and TCP, which
+      does not preserve the client address) prepends a PROXY protocol v2 header.
+      The `web`, `websecure` and `ping` entrypoints read it from peers in
+      `trusted_cidrs`; `ping` carries the load balancer's health check, which
+      the load balancer prefixes with the header too.
+
+    `trusted_cidrs` is the load balancer's address range, never the whole
+    internet: a trusted peer can claim any client address.
+  EOT
+  type = object({
+    source        = optional(string, "none")
+    trusted_cidrs = optional(list(string), [])
+  })
+  default = {}
+
+  validation {
+    condition     = contains(["none", "forwarded-headers", "proxy-protocol"], var.client_ip.source)
+    error_message = "client_ip.source must be \"none\", \"forwarded-headers\" or \"proxy-protocol\"."
+  }
+
+  validation {
+    condition     = var.client_ip.source == "none" || length(var.client_ip.trusted_cidrs) > 0
+    error_message = "client_ip.trusted_cidrs must name the load balancer's address ranges when client_ip.source is not \"none\"."
+  }
+
+  validation {
+    condition     = alltrue([for cidr in var.client_ip.trusted_cidrs : can(cidrhost(cidr, 0)) && !contains(["0.0.0.0/0", "::/0"], cidr)])
+    error_message = "client_ip.trusted_cidrs must be valid CIDR blocks and must not be 0.0.0.0/0 or ::/0."
+  }
+}
+
 variable "cpu_architecture" {
   description = "Fargate task CPU architecture."
   type        = string
