@@ -1377,9 +1377,55 @@ async fn a_rotating_replay_within_grace_is_refused_for_a_changed_upstream_too(po
     let h = Harness::new(pool, rotating()).await;
     h.upstream.answer(200, "application/json", ROTATING_BODY);
     let first = rotating_login(&h, "upstream-rt").await;
-    assert_eq!(h.refresh(&first).await.0, StatusCode::OK);
+    let (status, _, body) = h.refresh(&first).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = handle_of(&body);
+    let original = h.spec().await;
+
     h.edit_spec(json!({"client_id": "attacker-client"})).await;
     assert_refused(&h, &first).await;
+    assert_eq!(h.upstream.request_count(), 1);
+
+    // The refusal revoked nothing: with the identity back, the replay is served
+    // from the recorded response and the successor refreshes.
+    h.edit_spec(json!({"client_id": original.client_id})).await;
+    assert_eq!(family_count(&h).await, 1);
+    assert_eq!(h.refresh(&first).await.0, StatusCode::OK);
+    assert_eq!(
+        h.upstream.request_count(),
+        1,
+        "the replay calls no upstream"
+    );
+    assert_eq!(h.refresh(&second).await.0, StatusCode::OK);
+    assert_eq!(h.upstream.request_count(), 2);
+}
+
+#[sqlx::test]
+async fn a_spent_rotating_handle_past_grace_revokes_its_family_even_for_a_changed_upstream(
+    pool: PgPool,
+) {
+    let h = Harness::new(pool, rotating()).await;
+    h.upstream.answer(200, "application/json", ROTATING_BODY);
+    let first = rotating_login(&h, "upstream-rt").await;
+    let (status, _, body) = h.refresh(&first).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second = handle_of(&body);
+    let original = h.spec().await;
+    sqlx::query("UPDATE oauth_refresh_tokens SET grace_until = NOW() - INTERVAL '1 second' WHERE handle_hash = $1")
+        .bind(handle_hash(&first))
+        .execute(h.pool())
+        .await
+        .unwrap();
+
+    // The spent handle is presented while the extension is repointed: refused
+    // without an upstream request, and still recognised as reuse.
+    h.edit_spec(json!({"client_id": "attacker-client"})).await;
+    assert_refused(&h, &first).await;
+    assert_eq!(h.upstream.request_count(), 1);
+
+    // With the identity back, the family's live handle is gone too.
+    h.edit_spec(json!({"client_id": original.client_id})).await;
+    assert_refused(&h, &second).await;
     assert_eq!(h.upstream.request_count(), 1);
 }
 
@@ -1454,20 +1500,19 @@ async fn changing_the_upstream_deletes_the_rotating_families_and_other_edits_kee
 }
 
 #[sqlx::test]
-async fn a_rotating_code_is_bound_to_the_upstream_and_extension_it_was_obtained_from(pool: PgPool) {
+async fn a_rotating_code_obtained_from_another_upstream_starts_no_family(pool: PgPool) {
     let h = Harness::new(pool, rotating()).await;
     h.upstream.answer(200, "application/json", ROTATING_BODY);
 
-    // Repointed between the callback and the code exchange: the family is
-    // started for the upstream the token came from, and cannot refresh.
+    // Repointed between the callback and the code exchange (after the update
+    // hook has swept the families): a family started now would hold an upstream
+    // token that no refresh could claim.
     let code = h
         .stored_code_response(200, "application/json", ROTATING_BODY)
         .await;
     h.edit_spec(json!({"client_id": "attacker-client"})).await;
-    let (status, _, body) = h.exchange_code(&code).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_refused(&h, &handle_of(&body)).await;
-    assert_eq!(h.upstream.request_count(), 0);
+    assert_code_refused_before_decrypt(&h, &code).await;
+    assert_eq!(family_count(&h).await, 0);
 }
 
 #[sqlx::test]
@@ -1477,10 +1522,7 @@ async fn a_rotating_code_from_before_the_extension_was_recreated_starts_no_famil
         .stored_code_response(200, "application/json", ROTATING_BODY)
         .await;
     h.recreate_extension().await;
-    let (status, _, body) = h.exchange_code(&code).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(json_body(&body)["error"], "invalid_grant");
-    assert!(!body.contains("rotated-rt"));
+    assert_code_refused_before_decrypt(&h, &code).await;
     assert_eq!(family_count(&h).await, 0);
 }
 
