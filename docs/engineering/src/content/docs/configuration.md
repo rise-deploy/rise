@@ -677,12 +677,19 @@ To inspect claims from the *client* side — the token the `rise` CLI presents
 **Inspecting Token Claims** in the user troubleshooting guide, or use the
 `rise::auth::idtoken` target described below.
 
-### Raw ID-token claims
+### Decoded token claims
 
-To see the raw token header and payload, enable the dedicated
-`rise::auth::idtoken` target at `trace`. The same target covers the IdP ID token
-the backend receives during browser login (`rise backend server`) and the token
-the CLI presents (`rise login`, `rise deploy`, ...):
+To see the decoded header and payload of the tokens Rise handles during login,
+enable the dedicated `rise::auth::idtoken` target at `trace`. It covers:
+
+- **`rise backend server`:** the IdP ID token received when a login completes,
+  whether through the browser sign-in callback (UI login and device-flow
+  approval) or the `rise login` PKCE code exchange. Machine-credential exchanges
+  (service-account token exchange, workload and resource-API token exchange) are
+  not traced.
+- **CLI commands** (`rise login`, `rise deploy`, ...): the token the CLI
+  presents or receives — a stored login, `RISE_TOKEN`, `RISE_TOKEN_COMMAND`,
+  GitHub Actions OIDC, or the login response.
 
 ```bash
 RUST_LOG=info,rise::auth::idtoken=trace rise backend server

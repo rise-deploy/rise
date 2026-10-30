@@ -1379,6 +1379,8 @@ pub async fn oauth_callback(
 
     tracing::info!("Successfully exchanged code for tokens");
 
+    crate::token_trace::trace_token("IdP ID token", &token_info.id_token);
+
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
     expected_claims.insert("aud".to_string(), state.auth_settings.client_id.clone());

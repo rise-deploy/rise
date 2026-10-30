@@ -146,8 +146,8 @@ account configuration (`rise sa list -p <project>`). They must match exactly —
 `iss` (e.g. a trailing slash) or a missing claim is the usual cause of
 [`No service account matched the token claims`](#no-service-account-matched-the-token-claims).
 
-Setting the target at `trace` isolates just the token line; `RUST_LOG=trace` also
-works but is much noisier. Keep the output out of shared logs and CI artifacts
+Enabling only this target adds the token lines on top of your normal log level;
+`RUST_LOG=trace` also shows them but is much noisier. Keep the output out of shared logs and CI artifacts
 unless you have checked it for sensitive claims.
 
 The line is emitted whether the token is static or **minted on demand through
