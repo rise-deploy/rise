@@ -21,6 +21,7 @@
 //! of being skipped.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::Ordering;
 
 use axum::{
     body::Body,
@@ -39,8 +40,6 @@ use uuid::Uuid;
 use crate::db;
 use crate::server::auth::browser_flow_tests::fixture;
 use crate::server::auth::context::VerifiedExternalToken;
-use crate::server::auth::middleware::platform_access_middleware;
-use crate::server::auth::session_scope::scope_guard;
 use crate::server::state::AppState;
 
 /// Status of the router fallback in the harness. No handler produces it, so a
@@ -125,12 +124,49 @@ const ROUTE_MODULES: &[RouteModule] = &[
 
 const SERVER_MOD_SOURCE: &str = include_str!("mod.rs");
 
+/// `source` without its `//` comments. A `//` inside a string literal (a URL,
+/// say) is kept. Constructs this scanner cannot read reliably (block comments,
+/// raw strings, a `'"'` character literal) panic rather than risk dropping or
+/// keeping the wrong text.
 fn strip_line_comments(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| line.find("//").map_or(line, |at| &line[..at]))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut in_string = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+        if in_string {
+            out.push(ch);
+            if ch == '\\' {
+                out.extend(next);
+                i += 1;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        } else if ch == '/' && next == Some('*') {
+            panic!("block comments are not supported by the route source scanner");
+        } else if ch == '\'' && next == Some('"') && chars.get(i + 2) == Some(&'\'') {
+            panic!("a '\"' character literal is not supported by the route source scanner");
+        } else if ch == 'r'
+            && matches!(next, Some('"' | '#'))
+            && !chars
+                .get(i.wrapping_sub(1))
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+        {
+            panic!("raw strings are not supported by the route source scanner");
+        } else {
+            out.push(ch);
+            in_string = ch == '"';
+        }
+        i += 1;
+    }
+    out
 }
 
 /// The text between the braces of `fn <name>(..) .. { .. }`.
@@ -259,20 +295,57 @@ fn route_parser_refuses_registrations_it_cannot_enumerate() {
     registered_routes(r#"Router::new().nest("/x", inner()).route("/y", get(h))"#);
 }
 
+/// Refuse any call that adds routes or reshapes the router.
+fn assert_no_route_registration(what: &str, text: &str) {
+    let registering = Regex::new(
+        r"\.(route|route_service|nest|nest_service|merge|fallback|fallback_service|with_state)\s*\(",
+    )
+    .unwrap();
+    assert!(
+        !registering.is_match(text),
+        "{what} registers routes of its own, which the platform route guard test does not \
+         cover; put them in a route module merged by `platform_route_tree`: {text}"
+    );
+}
+
+#[test]
+fn route_source_scanner_keeps_urls_in_strings_and_refuses_what_it_cannot_read() {
+    let stripped = strip_line_comments(
+        "let a = \"https://example.com\"; // trailing\n// whole line\n.route(\"/x\", get(h))",
+    );
+    assert!(stripped.contains("\"https://example.com\";"), "{stripped}");
+    assert!(!stripped.contains("trailing") && !stripped.contains("whole line"));
+    assert!(stripped.contains(".route(\"/x\", get(h))"));
+
+    for unreadable in ["/* block */", "let r = r#\"raw\"#;", "let q = '\"';"] {
+        let result = std::panic::catch_unwind(|| strip_line_comments(unreadable));
+        assert!(result.is_err(), "{unreadable} was accepted");
+    }
+}
+
 #[test]
 fn route_modules_match_platform_route_tree() {
     let body = function_body(SERVER_MOD_SOURCE, "platform_route_tree");
-    let merged: BTreeSet<String> = {
-        let mut exprs = BTreeSet::new();
-        for (at, _) in body.match_indices(".merge(") {
-            exprs.insert(
-                balanced_parens(&body, at + ".merge".len())
-                    .split_whitespace()
-                    .collect::<String>(),
-            );
-        }
-        exprs
-    };
+    let mut remainder = body.clone();
+    let mut merged = BTreeSet::new();
+    let mut merge_calls = 0;
+    while let Some(at) = remainder.find(".merge(") {
+        let open = at + ".merge".len();
+        let expr = balanced_parens(&remainder, open).to_string();
+        merged.insert(expr.split_whitespace().collect::<String>());
+        merge_calls += 1;
+        let end = open + expr.len() + 2;
+        remainder.replace_range(at..end, "");
+    }
+    // Everything but the `.merge(..)` calls must be the empty router they
+    // start from: a `.route(..)` (or anything else) written in the tree itself
+    // would otherwise be invisible to the route parser.
+    assert_eq!(
+        remainder.split_whitespace().collect::<String>(),
+        "Router::new()",
+        "platform_route_tree must consist of `Router::new()` and `.merge(..)` calls only; \
+         register routes in a route module and merge it"
+    );
     let known: BTreeSet<String> = ROUTE_MODULES
         .iter()
         .map(|module| module.merge_expr.to_string())
@@ -282,10 +355,47 @@ fn route_modules_match_platform_route_tree() {
         "platform_route_tree merges different route modules than ROUTE_MODULES lists; \
          add the new module to ROUTE_MODULES and its routes to `cases()`"
     );
+    assert_eq!(merge_calls, known.len(), "a route module is merged twice");
+}
+
+/// The tree reaches the server through `platform_routes` only, and nothing
+/// adds routes to it on the way.
+#[test]
+fn platform_route_tree_reaches_the_server_unchanged() {
+    let source = strip_line_comments(SERVER_MOD_SOURCE);
+    // The definition and the one use inside `layered_platform_routes`.
     assert_eq!(
-        body.matches(".merge(").count(),
-        known.len(),
-        "a route module is merged twice"
+        source.matches("platform_route_tree()").count(),
+        2,
+        "platform_route_tree() must be used only by layered_platform_routes"
+    );
+    for name in ["layered_platform_routes", "platform_routes"] {
+        let body = function_body(SERVER_MOD_SOURCE, name);
+        assert_no_route_registration(&format!("`{name}`"), &body);
+    }
+    assert!(
+        function_body(SERVER_MOD_SOURCE, "layered_platform_routes")
+            .contains("platform_route_tree()"),
+        "layered_platform_routes must build on platform_route_tree()"
+    );
+
+    // `run_server` takes the layered routes as they are.
+    let run = function_body(SERVER_MOD_SOURCE, "run_server");
+    let call = run
+        .find("platform_routes(&state)")
+        .expect("run_server must use platform_routes(&state)");
+    assert_eq!(run.matches("platform_routes(").count(), 1);
+    let statement = &run[call..call + run[call..].find(';').expect("statement end")];
+    assert_eq!(
+        statement.trim(),
+        "platform_routes(&state)",
+        "run_server must not chain anything onto platform_routes(&state)"
+    );
+    assert!(
+        !Regex::new(r"\bplatform_routes\s*\.")
+            .unwrap()
+            .is_match(&run),
+        "run_server must not chain anything onto the platform routes"
     );
 }
 
@@ -300,6 +410,8 @@ struct Seed {
 }
 
 const ACCEPTED_ISSUER: &str = "https://ci.example.com";
+/// A valid user code (the alphabet has no vowels) of the seeded device login.
+const DEVICE_USER_CODE: &str = "BCDF-GHJK";
 const OTHER_PROJECT_ISSUER: &str = "https://other-ci.example.com";
 
 /// Seed a target project (`demo`, created by the fixture) that has a service
@@ -357,6 +469,23 @@ async fn seed(pool: &PgPool) -> Seed {
     .await
     .unwrap();
     db::teams::create(pool, "guard-team").await.unwrap();
+    // A pending device login, so the `/auth/device*` requests name a code that
+    // exists and would be found, approved or denied if the handler acted.
+    let created = db::device_authorizations::create(
+        pool,
+        &db::device_authorizations::NewDeviceAuthorization {
+            device_code_hash: b"guard-test-device-code-hash",
+            user_code: DEVICE_USER_CODE,
+            client_name: Some("guard test"),
+            client_ip: None,
+            requested_access: None,
+            interval_seconds: 5,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(created);
 
     Seed {
         sa_id: sa.id,
@@ -419,7 +548,7 @@ fn cases(seed: &Seed) -> Vec<Case> {
         case(Method::PATCH, pattern, uri, Some(body))
     };
 
-    let device_decision = json!({"user_code": "ABCD-EFGH", "access": {"kind": "full"}});
+    let device_decision = json!({"user_code": DEVICE_USER_CODE, "access": {"kind": "full"}});
     let deployment_status = json!({"status": "Failed", "error_message": "tampered"});
     let oauth_spec = json!({
         "provider_name": "Attacker IdP",
@@ -434,7 +563,10 @@ fn cases(seed: &Seed) -> Vec<Case> {
             "/users/lookup",
             json!({"emails": ["owner@example.com"]}),
         ),
-        get("/auth/device", "/auth/device?user_code=ABCD-EFGH"),
+        get(
+            "/auth/device",
+            &format!("/auth/device?user_code={DEVICE_USER_CODE}"),
+        ),
         post(
             "/auth/device/approve",
             "/auth/device/approve",
@@ -745,13 +877,9 @@ fn platform_router(state: &AppState, token: Option<VerifiedExternalToken>) -> Ro
             next.run(req).await
         }
     };
-    let tree = crate::server::platform_route_tree()
-        .route_layer(middleware::from_fn_with_state(state.clone(), scope_guard))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            platform_access_middleware,
-        ))
-        .route_layer(middleware::from_fn(stamp));
+    let tree = crate::server::layered_platform_routes(state, |routes| {
+        routes.route_layer(middleware::from_fn(stamp))
+    });
     Router::new()
         .nest("/api/v1", tree)
         .fallback(|| async { NOT_ROUTED.into_response() })
@@ -807,42 +935,73 @@ async fn external_token_matching_no_service_account_is_refused_by_every_platform
         ),
     ];
 
-    // Control: the harness must be able to tell acceptance from refusal. A
-    // token that does match answers a read, so the refusals below are the
-    // handlers' own and not an artifact of how the token is stamped.
+    // Control pass. The same requests from a token that does match `demo`'s
+    // service account, against the same seeded data. It exists for the
+    // refusals a stranger can only tell from success by status: several
+    // handlers answer 404 where they mean "not yours" (and a handler with its
+    // check removed would answer 404 for an unknown code or row just as well).
+    // A 403/404 for a stranger counts only if the matching service account got
+    // past it on that very request, so the seeded data really does make the
+    // request succeed for an authorized caller and the 404 is the auth check.
+    // Run before the snapshot because the requests that succeed change state.
+    assert!(
+        db::device_authorizations::find_pending_by_user_code(&pool, DEVICE_USER_CODE)
+            .await
+            .unwrap()
+            .is_some(),
+        "the seeded device login must be pending"
+    );
     let matching = platform_router(state, Some(token(seed.accepted_issuer, "repo:acme/app")));
-    let read_deployments = cases
-        .iter()
-        .find(|case| {
-            case.pattern == "/projects/{project_name}/deployments" && case.method == Method::GET
-        })
-        .unwrap();
-    let response = send(&matching, read_deployments).await;
-    let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "control: a token matching the project's service account must be accepted: {}",
-        String::from_utf8_lossy(&body)
+    let mut controls = Vec::new();
+    for case in &cases {
+        controls.push(send(&matching, case).await.status());
+    }
+    let accepted = |status: StatusCode| {
+        !matches!(
+            status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+        )
+    };
+    assert!(
+        cases
+            .iter()
+            .zip(&controls)
+            .any(
+                |(case, status)| case.pattern == "/projects/{project_name}/deployments"
+                    && *status == StatusCode::OK
+            ),
+        "control: a token matching the project's service account must be accepted: {controls:?}"
     );
 
     let before = database_snapshot(&pool).await;
+    let runtime_actions_before = fixture.backend.runtime_actions.load(Ordering::SeqCst);
     let mut failures = Vec::new();
+    let mut masked = 0;
     for (label, stranger) in strangers {
         let router = platform_router(state, Some(stranger));
-        for case in &cases {
+        for (case, control) in cases.iter().zip(&controls) {
             let response = send(&router, case).await;
             let status = response.status();
-            if !matches!(
-                status,
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-            ) || status == NOT_ROUTED
-            {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            let explicit_refusal = status == StatusCode::UNAUTHORIZED
+                && [
+                    // `AuthContext::user`
+                    "does not support service account authentication",
+                    // `AuthContext::resolve_for_project`
+                    "No service accounts configured for issuer",
+                    "Token claims do not match any service account",
+                ]
+                .iter()
+                .any(|message| body.contains(message));
+            let masked_refusal = matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND)
+                && accepted(*control);
+            masked += usize::from(masked_refusal);
+            if !(explicit_refusal || masked_refusal) {
                 failures.push(format!(
-                    "[{label}] {} {} -> {status}",
+                    "[{label}] {} {} -> {status} {body} (matching service account: {control})",
                     case.method, case.uri
                 ));
             }
@@ -850,16 +1009,23 @@ async fn external_token_matching_no_service_account_is_refused_by_every_platform
     }
     assert!(
         failures.is_empty(),
-        "an external token no service account of the project accepts was not refused with \
-         401/403/404 (a 2xx means the handler acted on it; 400/415/422 means the request \
-         never reached the handler and the case needs a valid body; 418 means the route is \
-         not registered):\n{}",
+        "an external token no service account of the project accepts was not refused. A refusal \
+         is a 401 saying the endpoint takes no service account or that no service account \
+         matches, or a 403/404 on a request the matching service account got past. A 2xx means \
+         the handler acted on the token; 400/415/422 means the request never reached the \
+         handler and the case needs a valid body; 418 means the route is not registered:\n{}",
         failures.join("\n")
     );
+    assert!(masked > 0, "no request relied on a masked 404/403");
 
     assert_eq!(
         before,
         database_snapshot(&pool).await,
         "a refused external-token request changed the database"
+    );
+    assert_eq!(
+        runtime_actions_before,
+        fixture.backend.runtime_actions.load(Ordering::SeqCst),
+        "a refused external-token request reached the deployment backend"
     );
 }
