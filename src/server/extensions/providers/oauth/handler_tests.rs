@@ -164,6 +164,72 @@ impl Harness {
         }
     }
 
+    async fn row(&self) -> crate::db::models::ProjectExtension {
+        extensions::find_by_project_and_name(self.pool(), self.project, "login")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// The `login` extension's spec as stored now.
+    pub async fn spec(&self) -> OAuthExtensionSpec {
+        serde_json::from_value(self.row().await.spec).unwrap()
+    }
+
+    /// The scope handles are bound to for the extension as stored now.
+    pub async fn scope(&self) -> refresh_handle::HandleScope<'static> {
+        let row = self.row().await;
+        let spec = serde_json::from_value(row.spec).unwrap();
+        refresh_handle::HandleScope::of(self.project, "login", row.created_at, &spec)
+    }
+
+    /// Change members of the stored spec in place, as an editor of the extension
+    /// would; a `null` removes the member. The upstream client secret is sealed
+    /// again for the edited spec, which editing the credential's binding requires.
+    pub async fn edit_spec(&self, changes: Value) {
+        let mut spec = self.row().await.spec;
+        for (name, value) in changes.as_object().unwrap() {
+            if value.is_null() {
+                spec.as_object_mut().unwrap().remove(name);
+            } else {
+                spec[name] = value.clone();
+            }
+        }
+        let parsed: OAuthExtensionSpec = serde_json::from_value(spec.clone()).unwrap();
+        let token_endpoint = parsed
+            .token_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/token", self.upstream.url));
+        spec["client_secret_encrypted"] = json!(self
+            .encryption
+            .encrypt(
+                "upstream-secret",
+                &oauth_client_secret_context(self.project, "login", &parsed, &token_endpoint)
+                    .unwrap(),
+            )
+            .await
+            .unwrap());
+        extensions::update_spec(self.pool(), self.project, "login", &spec)
+            .await
+            .unwrap();
+    }
+
+    /// Delete the extension and create one of the same name and spec.
+    pub async fn recreate_extension(&self) {
+        let row = self.row().await;
+        extensions::delete_permanently(self.pool(), self.project, "login")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let created = extensions::create(self.pool(), self.project, "login", "oauth", &row.spec)
+            .await
+            .unwrap();
+        extensions::update_status(self.pool(), self.project, "login", &row.status)
+            .await
+            .unwrap();
+        assert_ne!(created.created_at, row.created_at);
+    }
+
     pub fn state(&self) -> AppState {
         self.fixture.state.clone()
     }
@@ -210,8 +276,7 @@ impl Harness {
     pub async fn sealed_handle(&self, upstream_token: &str) -> String {
         refresh_handle::seal(
             self.encryption.as_ref(),
-            self.project,
-            "login",
+            &self.scope().await,
             upstream_token,
             1,
         )
@@ -226,7 +291,20 @@ impl Harness {
         content_type: &str,
         body: &str,
     ) -> String {
+        self.store_code(status, content_type, body, true).await
+    }
+
+    /// Like [`Self::stored_code_response`]; `bound: false` stores the code
+    /// without the extension binding.
+    pub async fn store_code(
+        &self,
+        status: u16,
+        content_type: &str,
+        body: &str,
+        bound: bool,
+    ) -> String {
         let code = format!("code-{}", Uuid::new_v4());
+        let scope = self.scope().await;
         let encrypted = self
             .encryption
             .encrypt(
@@ -253,6 +331,8 @@ impl Harness {
                 token_response_encrypted: encrypted,
                 content_type: content_type.into(),
                 status_code: status,
+                extension_created_at: bound.then_some(scope.extension_created_at),
+                upstream_identity: bound.then(|| scope.upstream.fingerprint().to_string()),
             },
             std::time::Duration::from_secs(60),
         )
@@ -284,7 +364,7 @@ pub(super) fn member_positions(text: &str, names: &[&str]) -> Vec<usize> {
 }
 
 async fn unseal(h: &Harness, handle: &str) -> String {
-    refresh_handle::unseal(h.encryption.as_ref(), h.project, "login", handle)
+    refresh_handle::unseal(h.encryption.as_ref(), &h.scope().await, handle)
         .await
         .unwrap()
         .upstream_refresh_token
@@ -517,9 +597,19 @@ async fn handles_of_other_schemes_or_scopes_are_never_forwarded(pool: PgPool) {
         "rrt2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
         "rrt9.whatever".to_string(),
         "rrt1.not-a-ciphertext".to_string(),
-        refresh_handle::seal(h.encryption.as_ref(), h.project, "other", "rt", 1)
-            .await
-            .unwrap(),
+        refresh_handle::seal(
+            h.encryption.as_ref(),
+            &refresh_handle::HandleScope::of(
+                h.project,
+                "other",
+                h.scope().await.extension_created_at,
+                &h.spec().await,
+            ),
+            "rt",
+            1,
+        )
+        .await
+        .unwrap(),
     ] {
         let (status, _, body) = h.refresh(&token).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{token}");
@@ -555,4 +645,143 @@ async fn transient_encryption_failures_are_503_and_not_invalid_grant(pool: PgPoo
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(json_body(&body)["error"], "server_error");
     assert_eq!(h.upstream.request_count(), 0);
+}
+
+const ROTATING_BODY: &str =
+    r#"{"access_token":"at","token_type":"Bearer","refresh_token":"rotated-rt"}"#;
+
+/// Assert that refreshing with `handle` is refused as `invalid_grant`.
+async fn assert_refused(h: &Harness, handle: &str) {
+    let (status, _, body) = h.refresh(handle).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json_body(&body)["error"], "invalid_grant");
+    assert!(!body.contains("rotated-rt") && !body.contains("upstream-rt"));
+}
+
+#[sqlx::test]
+async fn a_handle_does_not_survive_the_extension_being_recreated(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    h.upstream.answer(200, "application/json", ROTATING_BODY);
+    let handle = h.sealed_handle("upstream-rt").await;
+    assert_eq!(h.refresh(&handle).await.0, StatusCode::OK);
+    assert_eq!(h.upstream.request_count(), 1);
+
+    h.recreate_extension().await;
+    assert_refused(&h, &handle).await;
+    assert_eq!(h.upstream.request_count(), 1, "no upstream request");
+
+    // Handles issued by the new extension work.
+    let fresh = h.sealed_handle("upstream-rt").await;
+    assert_eq!(h.refresh(&fresh).await.0, StatusCode::OK);
+    assert_eq!(h.upstream.request_count(), 2);
+}
+
+#[sqlx::test]
+async fn editing_the_upstream_identity_invalidates_handles_without_an_upstream_request(
+    pool: PgPool,
+) {
+    let h = Harness::new(pool, json!({})).await;
+    let evil = Upstream::start().await;
+    evil.answer(200, "application/json", ROTATING_BODY);
+    h.upstream.answer(200, "application/json", ROTATING_BODY);
+    let handle = h.sealed_handle("upstream-rt").await;
+    let original = h.spec().await;
+
+    let edits = [
+        // Repointed at another server: through the override, or through
+        // discovery by moving the issuer and dropping the override.
+        json!({"token_endpoint": format!("{}/token", evil.url)}),
+        json!({"issuer_url": evil.url, "token_endpoint": null}),
+        json!({"issuer_url": format!("{}/", original.issuer_url)}),
+        json!({"client_id": "attacker-client"}),
+    ];
+    for edit in edits {
+        h.edit_spec(edit.clone()).await;
+        assert_refused(&h, &handle).await;
+        assert_eq!(h.upstream.request_count(), 0, "{edit}");
+        assert_eq!(evil.request_count(), 0, "{edit}");
+        // Put the identity back: the handle is valid again, nothing was consumed.
+        h.edit_spec(json!({
+            "issuer_url": original.issuer_url,
+            "token_endpoint": original.token_endpoint,
+            "client_id": original.client_id,
+        }))
+        .await;
+        assert_eq!(h.refresh(&handle).await.0, StatusCode::OK, "{edit}");
+        h.upstream.requests.lock().unwrap().clear();
+    }
+}
+
+#[sqlx::test]
+async fn editing_unrelated_settings_keeps_handles_valid(pool: PgPool) {
+    let h = Harness::new(pool, json!({"scopes": ["openid"]})).await;
+    h.upstream.answer(200, "application/json", ROTATING_BODY);
+    let handle = h.sealed_handle("upstream-rt").await;
+    h.edit_spec(json!({
+        "scopes": ["openid", "profile", "offline_access"],
+        "description": "edited",
+        "provider_name": "Renamed",
+        "authorization_endpoint": format!("{}/authorize-v2", h.upstream.url),
+        "token_endpoint_auth_method": "client_secret_basic",
+    }))
+    .await;
+    let (status, _, body) = h.refresh(&handle).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(h.upstream.request_count(), 1);
+    assert!(h
+        .upstream
+        .last_request()
+        .contains("refresh_token=upstream-rt"));
+}
+
+#[sqlx::test]
+async fn a_code_issues_a_handle_for_the_upstream_it_was_obtained_from(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    let evil = Upstream::start().await;
+    let code = h
+        .stored_code_response(200, "application/json", ROTATING_BODY)
+        .await;
+    // The extension is repointed after the callback stored the code, before the
+    // app redeems it.
+    h.edit_spec(json!({"token_endpoint": format!("{}/token", evil.url)}))
+        .await;
+    let (status, _, body) = h.exchange_code(&code).await;
+    assert_eq!(status, StatusCode::OK);
+    let handle = json_body(&body)["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_refused(&h, &handle).await;
+    assert_eq!((h.upstream.request_count(), evil.request_count()), (0, 0));
+}
+
+#[sqlx::test]
+async fn a_code_stored_before_the_extension_was_recreated_issues_a_stale_handle(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    let code = h
+        .stored_code_response(200, "application/json", ROTATING_BODY)
+        .await;
+    h.recreate_extension().await;
+    // The code belongs to the old extension's callback (the new row has the same
+    // name, so the code still redeems), and so does the handle it yields.
+    let (status, _, body) = h.exchange_code(&code).await;
+    assert_eq!(status, StatusCode::OK);
+    let handle = json_body(&body)["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_refused(&h, &handle).await;
+    assert_eq!(h.upstream.request_count(), 0);
+}
+
+#[sqlx::test]
+async fn a_code_stored_without_the_extension_binding_is_refused(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    let code = h
+        .store_code(200, "application/json", ROTATING_BODY, false)
+        .await;
+    let (status, _, body) = h.exchange_code(&code).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(json_body(&body)["error"], "invalid_grant");
+    assert!(!body.contains("rotated-rt"));
 }

@@ -267,16 +267,18 @@ Token responses use the RFC 6749 shape:
 
 #### Refresh-token handles
 
-The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the upstream provider's refresh token. The upstream token is sealed inside the handle with Rise's encryption provider and bound to the project and extension, so a handle works only at that extension's Rise token endpoint and cannot be used directly against the upstream provider. Treat it as an opaque string and do not parse it.
+The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the upstream provider's refresh token. The upstream token is sealed inside the handle with Rise's encryption provider and bound to the project, to that incarnation of the extension and to the upstream it talks to, so a handle works only at that extension's Rise token endpoint and cannot be used directly against the upstream provider. Treat it as an opaque string and do not parse it.
 
 - Both grants return the upstream's response with only the `refresh_token` replaced: the status, the `Content-Type`, every other member (including `scope`) and the member order are the upstream's own. A successful response whose body is not a JSON object is relayed as-is, unless it appears to carry a refresh token (for example a form-encoded `refresh_token=` pair), in which case Rise answers `502` rather than return it.
 - A refresh response contains a new handle only if the upstream provider rotated its refresh token. Otherwise it has no `refresh_token`; keep using the handle you already have.
 - An upstream error (any non-2xx other than `invalid_grant`) is passed through with its status and body, so retry or back off as you would against the provider. If the upstream answers a 4xx with a JSON `error` of `invalid_grant`, Rise answers `invalid_grant`: the refresh token is dead and the user must sign in again. If the upstream cannot be reached or times out, Rise answers `502`.
-- A handle that does not unseal for this extension (tampered, or from another project or extension) is `invalid_grant`. If the encryption provider is temporarily unavailable (for example AWS KMS throttling), Rise answers `503` `server_error` and the request can be retried.
+- A handle that does not unseal for this extension (tampered, or from another project or extension) is `invalid_grant`. So is a handle issued before the extension was deleted and created again under the same name, and one issued before the extension's `issuer_url`, `token_endpoint` or `client_id` changed: the handle names the upstream it was issued for, and Rise refuses it, without contacting any upstream, once the extension no longer points there. Users with such handles sign in again. Editing anything else (`scopes`, `authorization_endpoint`, `description`, the client authentication method) leaves handles valid. The comparison is exact, so even a trailing slash added to `issuer_url` counts as a change. If the encryption provider is temporarily unavailable (for example AWS KMS throttling), Rise answers `503` `server_error` and the request can be retried.
 - Handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid.
 
 :::note[Refresh tokens issued before handles]
 Refresh tokens issued before handles were introduced are raw upstream tokens. For now the token endpoint still accepts them and refreshes them upstream. The response to that first refresh carries a handle, wrapping the upstream's rotated token or, if it did not rotate, the token you presented, so clients move to handles on their first refresh. This compatibility path will be removed in a later release, after which only handles are accepted.
+
+A raw token names no upstream, so Rise cannot tell whether the extension has been repointed since it was issued. Until the compatibility path is removed, a raw token is sent to whatever upstream the extension currently uses.
 :::
 
 ### Discovery and JWKS
