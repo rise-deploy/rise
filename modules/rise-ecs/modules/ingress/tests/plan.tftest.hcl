@@ -53,3 +53,30 @@ run "the_traefik_role_grants_what_its_ecs_provider_actually_calls" {
     error_message = "the Traefik task role is missing an action its ECS provider calls"
   }
 }
+
+run "nlb_target_groups_carry_the_client_in_proxy_protocol" {
+  command = plan
+
+  assert {
+    condition     = alltrue([for group in aws_lb_target_group.traefik : group.proxy_protocol_v2])
+    error_message = "NLB IP targets do not preserve the client address; PROXY protocol v2 must carry it"
+  }
+
+  assert {
+    condition = alltrue([
+      for group in aws_lb_target_group.traefik :
+      group.health_check[0].protocol == "HTTP" && group.health_check[0].port == "8082" && group.health_check[0].path == "/ping"
+    ])
+    error_message = "health checks must keep targeting Traefik's ping entrypoint"
+  }
+}
+
+run "alb_target_group_does_not_use_proxy_protocol" {
+  command = plan
+  variables { edge = { mode = "alb-acm", acm_certificate_arn = "arn:aws:acm:eu-central-1:123456789012:certificate/abc", deletion_protection = true } }
+
+  assert {
+    condition     = !coalesce(aws_lb_target_group.traefik["80"].proxy_protocol_v2, false)
+    error_message = "the ALB reports the client as X-Forwarded-For, not PROXY protocol"
+  }
+}

@@ -1,4 +1,6 @@
 locals {
+  client_ip_trusted = join(",", var.client_ip.trusted_cidrs)
+
   traefik_command = concat(
     [
       "--providers.ecs=true",
@@ -47,6 +49,17 @@ locals {
       "--api.insecure=true",
       "--log.level=INFO",
     ],
+    # A peer in the trusted range keeps the client address it reports. Without
+    # this Traefik rewrites X-Forwarded-For to the load balancer node's address,
+    # and Rise sees every request as coming from inside the VPC.
+    var.client_ip.source == "forwarded-headers" ? [
+      "--entrypoints.web.forwardedHeaders.trustedIPs=${local.client_ip_trusted}",
+    ] : [],
+    var.client_ip.source == "proxy-protocol" ? [
+      "--entrypoints.web.proxyProtocol.trustedIPs=${local.client_ip_trusted}",
+      "--entrypoints.websecure.proxyProtocol.trustedIPs=${local.client_ip_trusted}",
+      "--entrypoints.ping.proxyProtocol.trustedIPs=${local.client_ip_trusted}",
+    ] : [],
     var.acme.enabled ? [
       "--certificatesresolvers.letsencrypt.acme.email=${var.acme.email}",
       "--certificatesresolvers.letsencrypt.acme.storage=/acme/acme.json",

@@ -137,6 +137,39 @@ between the control plane, Traefik and the database, and nothing addresses a
 project through it — so an existing namespace like `platform.internal` is
 passed as `cloud_map_namespace_id` and left alone.
 
+## Client addresses
+
+The module hands Traefik the real client address, so the load balancer's view of
+the client reaches Rise. With `alb-acm` the ALB appends the client to
+`X-Forwarded-For` and Traefik's `web` entrypoint trusts it from the public
+subnets only. With `nlb-traefik-acme` the NLB's IP targets see the NLB's own
+address, so the target groups enable PROXY protocol v2 and Traefik reads it on
+`web`, `websecure` and `ping` (the NLB prefixes its health check with the header
+too), again from the public subnets only. No security group changes: Traefik
+still admits only the edge group.
+
+**The client is the rightmost untrusted entry of `X-Forwarded-For`, not the
+first.** Behind the ALB the leftmost entries are whatever the client sent, so
+reading the first hop gives a spoofable value. Rise resolves the real client by
+walking the header from the right and skipping its trusted proxies; that needs
+its trusted-proxy list to cover the VPC's private ranges, and this change must
+be deployed together with that resolution.
+
+**ALB only: Traefik now also keeps `X-Forwarded-Host` and `X-Real-Ip` as
+received.** Trusting a peer makes Traefik stop discarding the `X-Forwarded-*`
+headers (and `X-Real-Ip`) it sends. The ALB sets only `X-Forwarded-For`,
+`-Proto` and `-Port`, so on this path `X-Forwarded-Host` and `X-Real-Ip` reach
+the app exactly as the client wrote them. Kubernetes (nginx) and Docker
+overwrite both, and so does the NLB mode, where no forwarded header is trusted.
+An app on ECS behind the ALB must therefore not build URLs from
+`X-Forwarded-Host` or read the client from `X-Real-Ip`: use the `Host` header
+(preserved by Traefik) and the rightmost untrusted `X-Forwarded-For` entry.
+Rise itself is unaffected. Traefik's `headers` middleware could strip them
+(`customRequestHeaders` with an empty value), but Traefik can only attach it
+through dynamic configuration on every router Rise renders, which the module
+does not do. The difference is recorded in the
+[feature matrix](/operator-docs/deployment-backends/).
+
 ## Several installs in one cluster
 
 Supported, and it takes two settings rather than one. Give each install its own

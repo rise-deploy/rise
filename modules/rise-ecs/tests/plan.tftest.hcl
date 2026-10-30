@@ -373,11 +373,11 @@ run "brings_an_existing_vpc_and_cluster" {
 
   override_data {
     target = module.network.data.aws_subnet.brought["subnet-0aaa"]
-    values = { vpc_id = "vpc-0123456789abcdef0" }
+    values = { vpc_id = "vpc-0123456789abcdef0", cidr_block = "10.20.0.0/24" }
   }
   override_data {
     target = module.network.data.aws_subnet.brought["subnet-0bbb"]
-    values = { vpc_id = "vpc-0123456789abcdef0" }
+    values = { vpc_id = "vpc-0123456789abcdef0", cidr_block = "10.20.1.0/24" }
   }
   override_data {
     target = module.network.data.aws_subnet.brought["subnet-0ccc"]
@@ -391,6 +391,12 @@ run "brings_an_existing_vpc_and_cluster" {
   assert {
     condition     = local.vpc_id == "vpc-0123456789abcdef0"
     error_message = "should deploy into the given VPC"
+  }
+
+  # The edge's trust list is the brought public subnets' own ranges.
+  assert {
+    condition     = contains(module.runtime.traefik_command, "--entrypoints.web.proxyProtocol.trustedIPs=10.20.0.0/24,10.20.1.0/24")
+    error_message = "Traefik must trust the load balancer's subnets of a brought VPC"
   }
 
   assert {
@@ -423,5 +429,40 @@ run "points_rise_at_another_ecr_registry_host" {
   assert {
     condition     = local.rise_environment["RISE_ECR_REGISTRY_HOST"] == "123456789012.dkr.ecr.eu-central-1.localhost:4566"
     error_message = "ecr_registry_host must reach the control plane as RISE_ECR_REGISTRY_HOST"
+  }
+}
+
+run "nlb_mode_reads_the_client_from_proxy_protocol" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for entrypoint in ["web", "websecure", "ping"] :
+      contains(module.runtime.traefik_command, "--entrypoints.${entrypoint}.proxyProtocol.trustedIPs=10.42.0.0/24,10.42.1.0/24")
+    ])
+    error_message = "NLB mode must trust PROXY protocol from the public subnets only, on every entrypoint the NLB reaches."
+  }
+
+  assert {
+    condition     = !anytrue([for flag in module.runtime.traefik_command : strcontains(flag, "forwardedHeaders")])
+    error_message = "NLB mode forwards no X-Forwarded-For; trusting it would only let clients spoof their address."
+  }
+}
+
+run "alb_mode_trusts_forwarded_headers_from_the_alb_subnets" {
+  command = plan
+  variables {
+    edge_mode           = "alb-acm"
+    acm_certificate_arn = "arn:aws:acm:eu-central-1:123456789012:certificate/abc"
+  }
+
+  assert {
+    condition     = contains(module.runtime.traefik_command, "--entrypoints.web.forwardedHeaders.trustedIPs=10.42.0.0/24,10.42.1.0/24")
+    error_message = "ALB mode must trust X-Forwarded-* from the public subnets the ALB lives in."
+  }
+
+  assert {
+    condition     = !anytrue([for flag in module.runtime.traefik_command : strcontains(flag, "proxyProtocol")])
+    error_message = "The ALB speaks HTTP, not PROXY protocol; Traefik must not expect the header."
   }
 }

@@ -24,7 +24,7 @@ mock_provider "aws" {
   mock_data "aws_region" { defaults = { id = "eu-central-1", region = "eu-central-1" } }
   mock_data "aws_partition" { defaults = { partition = "aws" } }
   mock_data "aws_availability_zones" { defaults = { names = ["eu-central-1a", "eu-central-1b"] } }
-  mock_data "aws_subnet" { defaults = { vpc_id = "vpc-0123456789abcdef0" } }
+  mock_data "aws_subnet" { defaults = { vpc_id = "vpc-0123456789abcdef0", cidr_block = "10.0.0.0/24" } }
   mock_data "aws_ecs_cluster" { defaults = { arn = "arn:aws:ecs:eu-central-1:123456789012:cluster/existing", status = "ACTIVE" } }
   mock_data "aws_iam_policy_document" { defaults = { json = "{}" } }
   mock_resource "aws_eip" { defaults = { public_ip = "192.0.2.10" } }
@@ -212,6 +212,27 @@ def only_updated_dex_callbacks(before, after):
     return containers == json.loads(after)
 
 
+def changed_fields(delta):
+    return {
+        k
+        for k in delta["before"].keys() | delta["after"].keys()
+        if delta["before"].get(k) != delta["after"].get(k)
+    }
+
+
+def only_added_client_ip_trust(before, after):
+    """Allow only Traefik's client-address trust flags to be added to its command."""
+    before, after = json.loads(before), json.loads(after)
+    for container in after:
+        if container["name"] == "traefik":
+            container["command"] = [
+                flag
+                for flag in container["command"]
+                if ".trustedIPs=" not in flag
+            ]
+    return before == after
+
+
 def verify(log, repo):
     checked = set()
     destinations_by_path = {
@@ -334,6 +355,26 @@ def verify(log, repo):
                 )
             ):
                 continue
+            if (
+                case != "e2e"
+                and address == "module.runtime.aws_ecs_task_definition.traefik"
+                and delta["actions"] == ["update"]
+                and changed_fields(delta) == {"container_definitions"}
+                and only_added_client_ip_trust(
+                    delta["before"]["container_definitions"],
+                    delta["after"]["container_definitions"],
+                )
+            ):
+                continue
+            # NLB target groups start carrying the client in PROXY protocol v2.
+            if (
+                address.startswith("module.ingress.aws_lb_target_group.traefik[")
+                and delta["after"]["protocol"] == "TCP"
+                and delta["actions"] == ["update"]
+                and changed_fields(delta) == {"proxy_protocol_v2"}
+                and delta["after"]["proxy_protocol_v2"] is True
+            ):
+                continue
             allowed = e2e_fields if case == "e2e" else secret_fields
             assert address in allowed, (case, address, delta["actions"])
             assert delta["actions"] == ["update"], (case, address, delta["actions"])
@@ -387,7 +428,8 @@ def verify(log, repo):
                 "only expected E2E task/service updates"
                 if case == "e2e"
                 else "only expected secret-version, startup-budget,"
-                " control-plane environment and Dex callback updates"
+                " control-plane environment, Dex callback and client-address"
+                " trust updates"
             )
         )
     assert checked == {"nlb", "alb", "brought", "dex", "endpoints", "e2e"}, (
