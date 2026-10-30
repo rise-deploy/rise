@@ -129,7 +129,7 @@ function Sidebar({ route, user, onLogout, onOpenPalette, summary, theme, onToggl
         <aside className="r-side">
             <button type="button" className="r-brand" onClick={() => navigate('/home')} aria-label="Go to home">
                 <span className="r-brand-mark" aria-hidden="true" />
-                <div className="r-brand-name">Rise</div>
+                <div className="r-brand-name">rise<span>.</span></div>
             </button>
 
             {current ? (
