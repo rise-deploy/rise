@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oauth_refresh_families WHERE project_id = $1 AND extension = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6e3c32a47c93fe8361ccc7b05c54ba7d46ac8b9f92924e2c929cc969b39b5bfc"
+}

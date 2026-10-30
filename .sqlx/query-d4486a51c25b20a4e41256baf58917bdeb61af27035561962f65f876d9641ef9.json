@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_refresh_tokens\n         SET successor_response_encrypted = NULL\n         WHERE successor_response_encrypted IS NOT NULL AND grace_until < NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "d4486a51c25b20a4e41256baf58917bdeb61af27035561962f65f876d9641ef9"
+}

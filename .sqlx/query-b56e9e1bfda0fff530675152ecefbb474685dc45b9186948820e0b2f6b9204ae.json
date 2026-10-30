@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_refresh_tokens\n         SET claimed_by = NULL, claim_expires_at = NULL\n         WHERE handle_hash = $1 AND claimed_by = $2 AND rotated_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b56e9e1bfda0fff530675152ecefbb474685dc45b9186948820e0b2f6b9204ae"
+}

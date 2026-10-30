@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO oauth_refresh_tokens (handle_hash, family_id, project_id, extension, upstream_token_encrypted)\n         VALUES ($1, $2, $3, $4, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9e91a70257063a60737b30b4456d4ec2512adff7d3967b983fad81ef7d9f5122"
+}

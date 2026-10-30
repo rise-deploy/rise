@@ -23,7 +23,8 @@ const DEPLOYMENT_DELETE_BATCH: i64 = 500;
 /// - **Deletion** (every 5s): advances projects in `Deleting` status toward
 ///   removal — cancelling/terminating their deployments, then deleting the
 ///   project once all are terminal and no finalizers/extensions remain.
-/// - **Cleanup** (hourly): drops expired OAuth transient-state rows.
+/// - **Cleanup** (hourly): drops expired OAuth transient-state rows and expired
+///   OAuth refresh-token families.
 pub struct ProjectController {
     state: Arc<ControllerState>,
 }
@@ -67,12 +68,17 @@ impl ProjectController {
         .await
     }
 
-    /// Clean up expired OAuth transient state and device login rows
+    /// Clean up expired OAuth transient state, expired OAuth refresh-token
+    /// families and device login rows
     /// (leader-gated, hourly).
     async fn cleanup_expired_transient_state(&self) -> anyhow::Result<()> {
         let n = crate::db::oauth_transient_state::delete_expired(&self.state.db_pool).await?;
         if n > 0 {
             debug!("Cleaned up {} expired OAuth transient state rows", n);
+        }
+        let n = crate::db::oauth_refresh_tokens::delete_expired(&self.state.db_pool).await?;
+        if n > 0 {
+            debug!("Cleaned up {} expired OAuth refresh token families", n);
         }
         let n = crate::db::device_authorizations::delete_expired(&self.state.db_pool).await?;
         if n > 0 {

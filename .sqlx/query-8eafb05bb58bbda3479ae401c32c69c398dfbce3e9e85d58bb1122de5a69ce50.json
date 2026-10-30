@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_refresh_families SET revoked_at = NOW()\n         WHERE family_id = $1 AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8eafb05bb58bbda3479ae401c32c69c398dfbce3e9e85d58bb1122de5a69ce50"
+}

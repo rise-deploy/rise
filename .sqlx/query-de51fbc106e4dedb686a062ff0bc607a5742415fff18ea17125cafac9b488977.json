@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oauth_refresh_families WHERE expires_at <= NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "de51fbc106e4dedb686a062ff0bc607a5742415fff18ea17125cafac9b488977"
+}
