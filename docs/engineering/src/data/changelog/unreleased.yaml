@@ -99,6 +99,32 @@ changes:
       reference, and configure sign-in with your OIDC provider. Extend rules if
       Metacontroller serves other controllers. Allow sufficient startup time
       (30 minutes by default) and avoid automatic rollback to an incompatible image.
+  - id: oauth-extension-sealed-refresh-handles
+    title: OAuth extension apps receive refresh-token handles, not upstream tokens
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: breaking
+    details: |-
+      The OAuth extension's token endpoint no longer returns the upstream
+      provider's `refresh_token` to the app. It returns an opaque handle (prefix
+      `rrt1.`) sealed with the configured encryption provider (local AES-GCM or
+      AWS KMS) and bound to the project and extension; only that extension's
+      Rise token endpoint redeems it. The rest of the upstream response is
+      unchanged. A stolen handle is therefore useless against the upstream
+      provider and at any other project or extension.
+
+      Refresh tokens issued before this change are raw upstream tokens, and the
+      token endpoint still accepts them for now. This compatibility path will be
+      removed in a later release.
+
+      With KMS, every refresh now costs one additional `kms:Decrypt` and, when
+      the upstream rotates its refresh token, one `kms:Encrypt` (authorization-code
+      exchanges seal one more handle). No configuration is added or changed.
+    action: |-
+      No operator action. Tell app owners whose apps parse refresh tokens or
+      present them directly to the upstream provider to treat the value as
+      opaque and refresh through the Rise token endpoint. The same encryption
+      key must stay available: handles do not unseal if it is changed.
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-

@@ -2,6 +2,7 @@ use super::models::{
     AuthorizeFlowQuery, CallbackRequest, OAuth2ErrorResponse, OAuth2TokenResponse, OAuthCodeState,
     OAuthExtensionSpec, OAuthExtensionStatus, OAuthState, TokenRequest,
 };
+use super::refresh_handle;
 use crate::db::{extensions as db_extensions, oauth_transient_state, projects as db_projects};
 use crate::server::auth::redirect::{is_loopback_host, origins_match};
 use crate::server::encryption::EncryptionContext;
@@ -1777,12 +1778,28 @@ async fn handle_authorization_code_grant(
             oauth2_error("server_error", Some("Internal server error".to_string()))
         })?;
 
+    // The upstream refresh token never reaches the app: a 2xx JSON response has it
+    // replaced by a sealed handle. Everything else is relayed untouched.
+    let token_response_body = refresh_handle::seal_in_token_response(
+        encryption_provider.as_ref(),
+        project.id,
+        &extension_name,
+        code_state.status_code,
+        token_response_body,
+        Utc::now().timestamp(),
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to seal refresh token handle: {:?}", e);
+        oauth2_error("server_error", Some("Internal server error".to_string()))
+    })?;
+
     info!(
         "Authorization code grant successful for project {} extension {}",
         project.name, extension_name
     );
 
-    // Return raw response with original status code and Content-Type (NO parsing)
+    // Return the upstream response with its original status code and Content-Type
     use axum::body::Body;
     let response = Response::builder()
         .status(StatusCode::from_u16(code_state.status_code).unwrap_or(StatusCode::OK))
@@ -1815,15 +1832,35 @@ async fn handle_refresh_token_grant(
         )
     })?;
 
+    let encryption_provider = state.encryption_provider.clone().ok_or_else(|| {
+        error!("Encryption provider not configured");
+        oauth2_error("server_error", Some("Internal server error".to_string()))
+    })?;
+
+    // A Rise handle must unseal for this project and extension; it is never
+    // forwarded as-is. A token without the handle scheme was issued before
+    // handles existed and is a raw upstream token, which is forwarded as before.
+    let presented = refresh_handle::present(
+        encryption_provider.as_ref(),
+        project.id,
+        &extension_name,
+        &refresh_token,
+    )
+    .await
+    .map_err(|e| {
+        warn!(
+            "Rejected refresh token handle for project {} extension {}: {:?}",
+            project.name, extension_name, e
+        );
+        oauth2_error("invalid_grant", Some("Invalid refresh token".to_string()))
+    })?;
+
     // Call OAuth provider's refresh_token method
     use super::provider::{OAuthProvider, OAuthProviderConfig};
 
     let oauth_provider = OAuthProvider::new(OAuthProviderConfig {
         db_pool: state.db_pool.clone(),
-        encryption_provider: state.encryption_provider.clone().ok_or_else(|| {
-            error!("Encryption provider not configured");
-            oauth2_error("server_error", Some("Internal server error".to_string()))
-        })?,
+        encryption_provider: encryption_provider.clone(),
         ssrf_config: state.server_settings.ssrf.clone(),
         api_domain: state.public_url.clone(),
     });
@@ -1864,7 +1901,7 @@ async fn handle_refresh_token_grant(
         .refresh_token(
             &spec,
             &client_secret,
-            &refresh_token,
+            presented.upstream_token(),
             &endpoints.token_endpoint,
         )
         .await
@@ -1883,6 +1920,22 @@ async fn handle_refresh_token_grant(
         Some(spec.scopes.join(" "))
     };
 
+    // A rotated upstream refresh token is returned as a fresh handle. When the
+    // upstream returns none, the response carries none and the client keeps the
+    // handle it presented, which still wraps a valid upstream token.
+    let refresh_token = refresh_handle::seal_rotated(
+        encryption_provider.as_ref(),
+        project.id,
+        &extension_name,
+        token_response.refresh_token.as_deref(),
+        Utc::now().timestamp(),
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to seal refresh token handle: {:?}", e);
+        oauth2_error("server_error", Some("Internal server error".to_string()))
+    })?;
+
     info!(
         "Refresh token grant successful for project {} extension {}",
         project.name, extension_name
@@ -1892,7 +1945,7 @@ async fn handle_refresh_token_grant(
         access_token: token_response.access_token,
         token_type: token_response.token_type,
         expires_in,
-        refresh_token: token_response.refresh_token,
+        refresh_token,
         scope,
         id_token: token_response.id_token,
     }))

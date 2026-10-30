@@ -27,7 +27,7 @@ App URL <- Rise callback  <-------+
 - A stable provider callback URL per project and extension.
 - OAuth 2.0 authorization-code flow for backend applications.
 - PKCE support for browser applications and public clients.
-- Token refresh through the Rise token endpoint.
+- Token refresh through the Rise token endpoint, with opaque refresh-token handles in place of the upstream refresh token.
 - OIDC discovery and JWKS proxying when the upstream provider supports it.
 - Encrypted storage for upstream provider client secrets.
 - Local development support through `rise run --project`.
@@ -40,7 +40,7 @@ Rise is a proxy, not a session store for your application. After the code exchan
 | --- | --- | --- | --- |
 | Authorization code with PKCE | Browser apps and public clients | `client_id` plus `code_verifier` | No client secret in the browser. Uses RFC 7636 PKCE. |
 | Authorization code with client secret | Backend apps | `client_id` plus `client_secret` | Token exchange happens server-side. Store resulting tokens in an HttpOnly session or backend store. |
-| Refresh token | Backend apps or trusted clients | `client_id` plus `client_secret` | Proxies `grant_type=refresh_token` to the upstream provider. |
+| Refresh token | Backend apps or trusted clients | `client_id` plus `client_secret` | Exchanges a Rise refresh-token handle for fresh tokens by refreshing at the upstream provider. |
 
 The Rise client ID is deterministic:
 
@@ -248,7 +248,7 @@ Refresh-token parameters:
 | Parameter | Required | Description |
 | --- | --- | --- |
 | `grant_type` | Yes | `refresh_token` |
-| `refresh_token` | Yes | Refresh token from a previous token response. |
+| `refresh_token` | Yes | The refresh-token handle from a previous token response. |
 | `client_id` | Yes | Rise client ID. |
 | `client_secret` | Yes | Rise client secret. |
 
@@ -259,11 +259,23 @@ Token responses use the RFC 6749 shape:
   "access_token": "eyJhbGc...",
   "token_type": "Bearer",
   "expires_in": 3600,
-  "refresh_token": "eyJhbGc...",
+  "refresh_token": "rrt1.AbCd...",
   "scope": "email profile",
   "id_token": "eyJhbGc..."
 }
 ```
+
+#### Refresh-token handles
+
+The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the upstream provider's refresh token. The upstream token is sealed inside the handle with Rise's encryption provider and bound to the project and extension, so a handle works only at that extension's Rise token endpoint and cannot be used directly against the upstream provider. Treat it as an opaque string and do not parse it.
+
+- The rest of the response is the upstream response, unchanged. Responses that are not successful JSON, or that carry no refresh token, are relayed as-is.
+- A refresh response contains a new handle only if the upstream provider rotated its refresh token. Otherwise it has no `refresh_token`; keep using the handle you already have.
+- Handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid.
+
+:::note[Refresh tokens issued before handles]
+Refresh tokens issued before handles were introduced are raw upstream tokens. For now the token endpoint still accepts them and refreshes them upstream, and every response from then on carries a handle. This compatibility path will be removed in a later release, after which only handles are accepted.
+:::
 
 ### Discovery and JWKS
 
@@ -297,6 +309,7 @@ GET /oidc/{project}/{extension}/jwks
 - OAuth state tokens protect against CSRF and expire after 10 minutes.
 - PKCE proves that a public client initiated the authorization flow.
 - Secret validation uses constant-time comparison.
+- Applications never receive the upstream refresh token. They hold a sealed handle that only the Rise token endpoint can redeem, for the project and extension it was issued for.
 - Applications own token storage and refresh behavior after exchange.
 
 ## Troubleshooting
