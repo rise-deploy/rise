@@ -33,7 +33,9 @@ pub enum HandleState {
     /// The family is revoked or past its maximum lifetime.
     FamilyEnded,
     /// The family was started for another upstream than the extension's
-    /// current one.
+    /// current one. Not reported for a spent handle past its grace window:
+    /// that is [`Self::Rotated`], so reuse is detected whatever the extension
+    /// points at.
     UpstreamChanged,
     /// The handle was exchanged for a successor.
     Rotated {
@@ -190,6 +192,14 @@ pub async fn state(
     Ok(match row {
         None => HandleState::Unknown,
         Some(row) if row.family_ended => HandleState::FamilyEnded,
+        // A spent handle past its grace window is reuse whatever the extension
+        // points at now, so it must revoke its family; a replay inside the
+        // window is refused for a changed upstream instead of served.
+        Some(row) if row.rotated && !row.within_grace => HandleState::Rotated {
+            family_id: row.family_id,
+            within_grace: false,
+            response_encrypted: row.successor_response_encrypted,
+        },
         Some(row) if row.upstream_changed => HandleState::UpstreamChanged,
         Some(row) if row.rotated => HandleState::Rotated {
             family_id: row.family_id,
@@ -1026,5 +1036,53 @@ mod tests {
         .await
         .unwrap()
         .is_some());
+    }
+
+    #[sqlx::test]
+    async fn a_spent_handle_past_grace_is_reuse_even_for_a_changed_upstream(pool: PgPool) {
+        let project = project_with_extension(&pool, "reuse-identity", "login").await;
+        create_family(
+            &pool,
+            project,
+            "login",
+            IDENTITY,
+            Duration::from_secs(600),
+            &hash(1),
+            "enc",
+        )
+        .await
+        .unwrap();
+        rotate(&pool, project, 1, 2, Duration::from_secs(30)).await;
+
+        // Inside the grace window a changed upstream refuses the replay.
+        assert_eq!(
+            state(&pool, &hash(1), project, "login", "identity-b")
+                .await
+                .unwrap(),
+            HandleState::UpstreamChanged
+        );
+
+        sqlx::query("UPDATE oauth_refresh_tokens SET grace_until = NOW() - INTERVAL '1 second' WHERE handle_hash = $1")
+            .bind(hash(1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Past it the handle is spent: reuse, which revokes the family.
+        assert!(matches!(
+            state(&pool, &hash(1), project, "login", "identity-b")
+                .await
+                .unwrap(),
+            HandleState::Rotated {
+                within_grace: false,
+                ..
+            }
+        ));
+        // A live handle of the same family is still just refused for the upstream.
+        assert_eq!(
+            state(&pool, &hash(2), project, "login", "identity-b")
+                .await
+                .unwrap(),
+            HandleState::UpstreamChanged
+        );
     }
 }
