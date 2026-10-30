@@ -1323,10 +1323,10 @@ pub async fn dispatch_post(
     State(state): State<AppState>,
     Path(raw): Path<String>,
     auth: MaybeAuth,
-    headers: axum::http::HeaderMap,
+    client_ip: crate::server::client_ip::ClientIp,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ServerError> {
-    let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+    let client_ip = client_ip.to_string();
     dispatch_post_any(
         &ResourceApiCtx::from_state(&state),
         raw,

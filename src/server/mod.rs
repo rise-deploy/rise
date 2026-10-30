@@ -3,6 +3,7 @@ pub mod auth;
 pub mod authz;
 #[cfg(feature = "backend")]
 pub mod bootstrap;
+pub mod client_ip;
 pub mod custom_domains;
 pub mod deployment;
 #[cfg(feature = "backend")]
@@ -378,6 +379,12 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         // the `/.rise/auth/*` pages on app hosts — refuses to be framed.
         .layer(axum_middleware::from_fn(
             self::middleware::frame_protection_middleware,
+        ))
+        // Resolves the client address once per request from the TCP peer and
+        // `server.trusted_proxies`; handlers read it as `ClientIp`.
+        .layer(axum_middleware::from_fn_with_state(
+            Arc::new(settings.server.trusted_proxies.clone()),
+            client_ip::client_ip_middleware,
         ));
 
     let addr = format!("{}:{}", settings.server.host, settings.server.port);
@@ -448,12 +455,15 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
 
     // Graceful shutdown driven off the shared token (cancelled by the signal
     // watcher above), so the HTTP drain and lease release run concurrently.
-    axum::serve(listener, app)
-        .with_graceful_shutdown({
-            let shutdown = shutdown.clone();
-            async move { shutdown.cancelled().await }
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown({
+        let shutdown = shutdown.clone();
+        async move { shutdown.cancelled().await }
+    })
+    .await?;
 
     #[cfg(feature = "backend")]
     if let Some(handle) = webhook_handle {

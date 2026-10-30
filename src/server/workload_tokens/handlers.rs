@@ -5,8 +5,9 @@ use crate::db::{
     models::Project, projects as db_projects,
 };
 use crate::server::auth::middleware::extract_bearer_token;
+use crate::server::client_ip::ClientIp;
 use crate::server::error::{ServerError, ServerErrorExt};
-use crate::server::rate_limit::{extract_client_ip, rate_limit_response};
+use crate::server::rate_limit::rate_limit_response;
 use crate::server::state::AppState;
 use crate::server::workload_tokens::models::{ExchangeTokenRequest, ExchangeTokenResponse};
 use crate::server::workload_tokens::{sha256_hex, workload_subject, NO_ENVIRONMENT};
@@ -34,9 +35,10 @@ impl CredentialSubject {
 /// reported as a rejected credential, so a caller cannot distinguish the two.
 async fn authenticate_credential(
     state: &AppState,
+    client_ip: ClientIp,
     headers: &HeaderMap,
 ) -> Result<Result<CredentialSubject, Response>, ServerError> {
-    let ip = extract_client_ip(headers);
+    let ip = client_ip.to_string();
 
     let credential = extract_bearer_token(headers)
         .map(|c| c.trim().to_string())
@@ -116,6 +118,7 @@ fn capped_ttl(requested: Option<u64>, cap: u64) -> u64 {
 /// writing the `[identity]` token files.
 pub async fn exchange_token(
     State(state): State<AppState>,
+    client_ip: ClientIp,
     headers: HeaderMap,
     Json(req): Json<ExchangeTokenRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -127,7 +130,7 @@ pub async fn exchange_token(
         return Err(ServerError::bad_request("audience value too long"));
     }
 
-    let subject = match authenticate_credential(&state, &headers).await? {
+    let subject = match authenticate_credential(&state, client_ip, &headers).await? {
         Ok(subject) => subject,
         Err(rate_limited) => return Ok(rate_limited),
     };

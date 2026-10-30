@@ -4635,6 +4635,7 @@ dependencies = [
  "config",
  "dirs",
  "futures",
+ "ipnet",
  "jsonwebtoken 11.1.0",
  "k8s-openapi",
  "kube",

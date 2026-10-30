@@ -9,6 +9,7 @@ use crate::server::auth::{
     },
     user_identity::{LoginError, LoginProfile, ResolvedIdentity, TokenStanding},
 };
+use crate::server::client_ip::ClientIp;
 use crate::server::frontend::load_auth_template;
 use crate::server::middleware::url_for_log;
 use crate::server::state::AppState;
@@ -645,10 +646,10 @@ const DEVICE_START_RATE_LIMIT_BUCKET: &str = "auth-device-start";
 ///
 /// The device flow is served by Rise itself (see [`super::device`]): the user
 /// confirms the code on Rise's `/device` page, not at the IdP.
-#[instrument(skip(state, headers))]
+#[instrument(skip(state, client_ip))]
 pub async fn authorize(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    client_ip: ClientIp,
     Json(payload): Json<AuthorizeRequest>,
 ) -> Result<Json<AuthorizeResponse>, (StatusCode, String)> {
     match payload.flow.as_str() {
@@ -703,7 +704,7 @@ pub async fn authorize(
             }))
         }
         "device" => {
-            let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+            let client_ip = client_ip.to_string();
             // Unauthenticated, and each start stores a row until it expires.
             state
                 .oauth_rate_limiter
