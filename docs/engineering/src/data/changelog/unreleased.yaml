@@ -7,6 +7,25 @@ groups:
   - id: known-release-candidate-limitations
     title: Known release-candidate limitations
 changes:
+  - id: trusted-proxy-client-ip
+    title: Forwarded client addresses are honoured only from trusted proxies
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: breaking
+    details: |-
+      IP-keyed rate limits on unauthenticated endpoints (device-login start,
+      token exchange, OAuth extension endpoints, workload-token rejections) no
+      longer trust `X-Real-IP` / `X-Forwarded-For` from arbitrary callers. Rise
+      reads them only when the TCP peer is inside the new `server.trusted_proxies`
+      list, and resolves the client from `X-Forwarded-For` right to left, skipping
+      trusted hops. The default list is loopback, RFC 1918 and IPv6 unique-local
+      space.
+    action: |-
+      If your reverse proxy or load balancer connects to Rise from a public
+      address, add its CIDR to `server.trusted_proxies`; otherwise all clients
+      share the proxy's rate-limit bucket. Do not expose Rise's port directly
+      to untrusted networks. Deployments behind ingress-nginx or an in-VPC
+      ALB/Traefik chain need no change.
   - id: credential-encryption-resource-purpose-binding
     title: Credentials are bound to their resource and purpose
     group: security-and-upgrade-guidance

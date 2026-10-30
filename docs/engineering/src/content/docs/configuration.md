@@ -199,6 +199,8 @@ server:
   rs256_private_key_pem: "..."  # Optional: RS256 private key (persists JWTs across restarts)
   rs256_public_key_pem: "..."   # Optional: RS256 public key (derived if not provided)
   docs_dir: "/var/rise/docs"   # Optional: directory containing built static documentation
+  trusted_proxies:             # Optional: proxies whose forwarded-address headers are believed
+    - "10.0.0.0/8"
 ```
 
 **Documentation Serving (`docs_dir`):**
@@ -206,6 +208,15 @@ server:
 - In the container image, bundled user docs are copied to `/var/rise/docs`
 - In development, build `docs/user` and set this to the generated `docs/user/dist` directory if you want the backend to serve local docs
 - If not set, documentation endpoints return 404
+
+**Client address and trusted proxies (`trusted_proxies`):**
+- IP-keyed rate limits (device-login start, token exchange, OAuth extension endpoints, workload-token rejections) use the client address Rise resolves for each request.
+- `X-Forwarded-For` and `X-Real-IP` are plain request headers that any caller can send. Rise honours them only when the TCP peer that delivered the request is inside `trusted_proxies`; a request from any other peer is attributed to that peer and its forwarded headers are ignored.
+- `trusted_proxies` is a list of CIDRs (IPv4 or IPv6); a bare address means a single host. The default is loopback, RFC 1918 and IPv6 unique-local space: `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`. Arrays are replaced, not merged, so an explicit list drops the defaults; `[]` trusts no proxy.
+- For a request from a trusted peer, `X-Forwarded-For` is read from right to left, skipping trusted addresses; the first untrusted address is the client. If every entry is trusted, the leftmost is used. Without a usable `X-Forwarded-For`, a valid `X-Real-IP` is used, and then the peer itself. Entries may carry a port or `[v6]` brackets; an entry that is not an IP address ends the walk. IPv4-mapped IPv6 addresses are treated as IPv4.
+- Typical chains resolve correctly with the default: ingress-nginx (`peer 10.x`, `X-Forwarded-For: client`) and ALB -> Traefik -> Rise (`X-Forwarded-For: client, 10.0.1.5`).
+- If your reverse proxy reaches Rise from a **public** address, add that address to `trusted_proxies`; otherwise every client is attributed to the proxy and shares one rate-limit bucket. Conversely, do not publish Rise's port directly to untrusted networks while the default is in place and the traffic arrives from a private-range address (for example through a Docker port mapping's bridge gateway): narrow `trusted_proxies` to the proxy's own address instead.
+- The Metacontroller webhook and Traefik configuration listeners are separate and do not use this setting.
 
 **JWT Configuration:**
 - `jwt_signing_secret`: Base64-encoded secret for HS256 JWT signing (generate with `openssl rand -base64 32`)
