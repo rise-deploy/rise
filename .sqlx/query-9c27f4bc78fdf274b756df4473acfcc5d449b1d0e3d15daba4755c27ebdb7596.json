@@ -1,0 +1,78 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT t.family_id,\n                  (f.revoked_at IS NOT NULL OR f.expires_at <= NOW()) AS \"family_ended!\",\n                  f.upstream_identity <> $4 AS \"upstream_changed!\",\n                  t.rotated_at IS NOT NULL AS \"rotated!\",\n                  COALESCE(t.grace_until >= NOW(), FALSE) AS \"within_grace!\",\n                  t.successor_response_encrypted,\n                  (t.claimed_by IS NOT NULL AND t.claim_expires_at >= NOW()) AS \"claimed!\"\n           FROM oauth_refresh_tokens t\n           JOIN oauth_refresh_families f ON f.family_id = t.family_id\n           WHERE t.handle_hash = $1 AND t.project_id = $2 AND t.extension = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "family_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "oauth_refresh_tokens",
+            "name": "family_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "family_ended!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "upstream_changed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "rotated!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "within_grace!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "successor_response_encrypted",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_refresh_tokens",
+            "name": "successor_response_encrypted"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "claimed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null,
+      null,
+      true,
+      null
+    ]
+  },
+  "hash": "9c27f4bc78fdf274b756df4473acfcc5d449b1d0e3d15daba4755c27ebdb7596"
+}

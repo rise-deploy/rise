@@ -270,12 +270,12 @@ Token responses use the RFC 6749 shape:
 
 #### Refresh-token handles
 
-The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the upstream provider's refresh token. The upstream token is sealed inside the handle with Rise's encryption provider and bound to the project and extension, so a handle works only at that extension's Rise token endpoint and cannot be used directly against the upstream provider. Treat it as an opaque string and do not parse it.
+The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the upstream provider's refresh token. The upstream token is sealed inside the handle with Rise's encryption provider and bound to the project, to that incarnation of the extension and to the upstream it talks to, so a handle works only at that extension's Rise token endpoint and cannot be used directly against the upstream provider. Treat it as an opaque string and do not parse it.
 
 - Both grants return the upstream's response with only the `refresh_token` replaced: the status, the `Content-Type`, every other member (including `scope`) and the member order are the upstream's own. A successful response whose body is not a JSON object is relayed as-is, unless it appears to carry a refresh token (for example a form-encoded `refresh_token=` pair), in which case Rise answers `502` rather than return it.
 - A refresh response contains a new handle only if the upstream provider rotated its refresh token. Otherwise it has no `refresh_token`; keep using the handle you already have.
 - An upstream error (any non-2xx other than `invalid_grant`) is passed through with its status and body, so retry or back off as you would against the provider. If the upstream answers a 4xx with a JSON `error` of `invalid_grant`, Rise answers `invalid_grant`: the refresh token is dead and the user must sign in again. If the upstream cannot be reached or times out, Rise answers `502`.
-- A handle that does not unseal for this extension (tampered, or from another project or extension) is `invalid_grant`. If the encryption provider is temporarily unavailable (for example AWS KMS throttling), Rise answers `503` `server_error` and the request can be retried.
+- A handle that does not unseal for this extension (tampered, or from another project or extension) is `invalid_grant`. So is a handle issued before the extension was deleted and created again under the same name, and one issued before the extension's `issuer_url`, `token_endpoint` or `client_id` changed: the handle names the upstream it was issued for, and Rise refuses it, without contacting any upstream, once the extension no longer points there. Users with such handles sign in again. Editing anything else (`scopes`, `authorization_endpoint`, `description`, the client authentication method) leaves handles valid. The comparison is exact, so even a trailing slash added to `issuer_url` counts as a change. If the encryption provider is temporarily unavailable (for example AWS KMS throttling), Rise answers `503` `server_error` and the request can be retried.
 - In the default `sealed` mode, handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid. Opt in to `rotating` mode (below) for single-use handles.
 
 #### Security profile
@@ -288,6 +288,7 @@ The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the u
 | Theft detection | none | reuse after the grace period revokes the login |
 | Lifetime bound set by Rise | none | `max_lifetime_seconds` |
 | Revoke every login at once | not per extension | switch to `sealed` or delete the extension |
+| Survives extension recreate or upstream change | no | no |
 | Raw upstream refresh tokens | accepted for now (see the note below) | rejected |
 | Storage | none | one record per handle in Rise's database |
 
@@ -330,9 +331,10 @@ Whenever the token endpoint answers `invalid_grant` for a refresh token, discard
 
 Switching an existing extension:
 
-- `sealed` to `rotating`: `rrt1.` handles that users already hold keep working. The first refresh accepts one, refreshes upstream, and returns an `rrt2.` handle that starts a new login. Nobody is signed out. An `rrt1.` handle issued longer ago than `max_lifetime_seconds` is no longer accepted (`invalid_grant`), and an `rrt1.` handle is stateless, so until it is exchanged it can be presented any number of times (presenting one twice starts two logins). Raw refresh tokens from before handles existed are not accepted in `rotating` mode (`invalid_grant`); users holding one sign in again, so migrate them in `sealed` mode first if you want to keep those sessions.
+- `sealed` to `rotating`: `rrt1.` handles that users already hold keep working, as long as the extension still points at the upstream they were issued for. The first refresh accepts one, refreshes upstream, and returns an `rrt2.` handle that starts a new login. Nobody is signed out. An `rrt1.` handle issued longer ago than `max_lifetime_seconds` is no longer accepted (`invalid_grant`), and an `rrt1.` handle is stateless, so until it is exchanged it can be presented any number of times (presenting one twice starts two logins). Raw refresh tokens from before handles existed are not accepted in `rotating` mode (`invalid_grant`); users holding one sign in again, so migrate them in `sealed` mode first if you want to keep those sessions.
 - `rotating` to `sealed`: `rrt2.` handles are rejected with `invalid_grant`, so users sign in again. Rise also deletes the stored state of the extension's rotating logins.
 - Deleting the extension deletes its stored state.
+- Changing `issuer_url`, `token_endpoint` (including removing it) or `client_id` signs every user out, in both modes: Rise deletes the extension's rotating logins, and an `rrt1.` handle is refused (`invalid_grant`) without any request to an upstream. Each login records the upstream it was started for and is refused once the extension is configured differently, so repointing an extension never sends users' stored upstream tokens to the new server. Other edits (`scopes`, `authorization_endpoint`, `description`, the client authentication method, the rotation settings) leave logins alone.
 
 Changing `max_lifetime_seconds` does not affect logins that already started; they keep the lifetime they started with.
 
@@ -340,6 +342,8 @@ Rotating mode makes each refresh write to Rise's database, and keeps one small r
 
 :::note[Refresh tokens issued before handles]
 Refresh tokens issued before handles were introduced are raw upstream tokens. For now the token endpoint still accepts them and refreshes them upstream. The response to that first refresh carries a handle, wrapping the upstream's rotated token or, if it did not rotate, the token you presented, so clients move to handles on their first refresh. This compatibility path will be removed in a later release, after which only handles are accepted.
+
+A raw token names no upstream, so Rise cannot tell whether the extension has been repointed since it was issued. Until the compatibility path is removed, a raw token is sent to whatever upstream the extension currently uses.
 :::
 
 ### Discovery and JWKS

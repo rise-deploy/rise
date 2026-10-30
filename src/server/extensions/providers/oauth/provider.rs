@@ -1,3 +1,4 @@
+use super::refresh_handle::UpstreamIdentity;
 use crate::db::oauth_refresh_tokens as db_refresh_tokens;
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::providers::oauth::models::{
@@ -349,15 +350,22 @@ impl Extension for OAuthProvider {
         // Handles issued in `rotating` mode are not accepted in `sealed` mode.
         // Dropping their state now keeps them from coming back to life if the
         // extension is switched to `rotating` again later.
-        if refresh_mode(old_spec) == RefreshTokenMode::Rotating
-            && refresh_mode(new_spec) != RefreshTokenMode::Rotating
-        {
+        //
+        // Families are also bound to the upstream they were started for (the
+        // issuer, token endpoint override and client). Once the extension talks
+        // to another one their handles are refused anyway; dropping the state now
+        // also erases the stored upstream tokens.
+        let left_rotating = refresh_mode(old_spec) == RefreshTokenMode::Rotating
+            && refresh_mode(new_spec) != RefreshTokenMode::Rotating;
+        let upstream_changed = UpstreamIdentity::of_stored_spec(old_spec)
+            != UpstreamIdentity::of_stored_spec(new_spec);
+        if left_rotating || upstream_changed {
             let n =
                 db_refresh_tokens::delete_extension_families(db_pool, project_id, extension_name)
                     .await?;
             info!(
-                "Dropped {} rotating refresh token families of {}/{}",
-                n, project_id, extension_name
+                "Dropped {} rotating refresh token families of {}/{} (left rotating mode: {}, upstream changed: {})",
+                n, project_id, extension_name, left_rotating, upstream_changed
             );
         }
 

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO oauth_refresh_families (family_id, project_id, extension, upstream_identity, expires_at)\n         VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second'))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Text",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2ea5756dc42dc0fc72a810bc555f18b49fb0b50c9e30ce0903d7b568b9e579dd"
+}

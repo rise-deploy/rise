@@ -32,6 +32,9 @@ pub enum HandleState {
     Unknown,
     /// The family is revoked or past its maximum lifetime.
     FamilyEnded,
+    /// The family was started for another upstream than the extension's
+    /// current one.
+    UpstreamChanged,
     /// The handle was exchanged for a successor.
     Rotated {
         family_id: Uuid,
@@ -68,11 +71,13 @@ pub enum RotationOutcome {
     FamilyEnded,
 }
 
-/// Start a family whose only handle is `handle_hash`.
+/// Start a family whose only handle is `handle_hash`, for the upstream
+/// identified by `upstream_identity`.
 pub async fn create_family(
     pool: &PgPool,
     project_id: Uuid,
     extension: &str,
+    upstream_identity: &str,
     max_lifetime: Duration,
     handle_hash: &[u8],
     upstream_token_encrypted: &str,
@@ -80,11 +85,12 @@ pub async fn create_family(
     let family_id = Uuid::new_v4();
     let mut tx = pool.begin().await?;
     sqlx::query!(
-        "INSERT INTO oauth_refresh_families (family_id, project_id, extension, expires_at)
-         VALUES ($1, $2, $3, NOW() + ($4 * INTERVAL '1 second'))",
+        "INSERT INTO oauth_refresh_families (family_id, project_id, extension, upstream_identity, expires_at)
+         VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second'))",
         family_id,
         project_id,
         extension,
+        upstream_identity,
         max_lifetime.as_secs_f64(),
     )
     .execute(&mut *tx)
@@ -109,20 +115,22 @@ pub async fn create_family(
 /// Atomically claim a live, unrotated handle of `project_id`/`extension`.
 ///
 /// One conditional `UPDATE ... RETURNING`: of any number of concurrent callers
-/// exactly one gets the row, and only while the family is live, the handle has
-/// not been rotated, and no other claim lease is running.
+/// exactly one gets the row, and only while the family is live, was started for
+/// `upstream_identity`, the handle has not been rotated, and no other claim
+/// lease is running.
 pub async fn claim(
     pool: &PgPool,
     handle_hash: &[u8],
     project_id: Uuid,
     extension: &str,
+    upstream_identity: &str,
     claimant: Uuid,
     lease: Duration,
 ) -> Result<Option<ClaimedHandle>> {
     let row = sqlx::query!(
         r#"UPDATE oauth_refresh_tokens t
-           SET claimed_by = $4,
-               claim_expires_at = NOW() + ($5 * INTERVAL '1 second')
+           SET claimed_by = $5,
+               claim_expires_at = NOW() + ($6 * INTERVAL '1 second')
            FROM oauth_refresh_families f
            WHERE t.handle_hash = $1
              AND t.project_id = $2
@@ -130,6 +138,7 @@ pub async fn claim(
              AND f.family_id = t.family_id
              AND f.revoked_at IS NULL
              AND f.expires_at > NOW()
+             AND f.upstream_identity = $4
              AND t.rotated_at IS NULL
              AND t.upstream_token_encrypted IS NOT NULL
              AND (t.claimed_by IS NULL OR t.claim_expires_at < NOW())
@@ -137,6 +146,7 @@ pub async fn claim(
         handle_hash,
         project_id,
         extension,
+        upstream_identity,
         claimant,
         lease.as_secs_f64(),
     )
@@ -149,16 +159,19 @@ pub async fn claim(
     }))
 }
 
-/// Read why a handle could not be claimed.
+/// Read why a handle could not be claimed, given the extension's current
+/// `upstream_identity`.
 pub async fn state(
     pool: &PgPool,
     handle_hash: &[u8],
     project_id: Uuid,
     extension: &str,
+    upstream_identity: &str,
 ) -> Result<HandleState> {
     let row = sqlx::query!(
         r#"SELECT t.family_id,
                   (f.revoked_at IS NOT NULL OR f.expires_at <= NOW()) AS "family_ended!",
+                  f.upstream_identity <> $4 AS "upstream_changed!",
                   t.rotated_at IS NOT NULL AS "rotated!",
                   COALESCE(t.grace_until >= NOW(), FALSE) AS "within_grace!",
                   t.successor_response_encrypted,
@@ -169,6 +182,7 @@ pub async fn state(
         handle_hash,
         project_id,
         extension,
+        upstream_identity,
     )
     .fetch_optional(pool)
     .await
@@ -176,6 +190,7 @@ pub async fn state(
     Ok(match row {
         None => HandleState::Unknown,
         Some(row) if row.family_ended => HandleState::FamilyEnded,
+        Some(row) if row.upstream_changed => HandleState::UpstreamChanged,
         Some(row) if row.rotated => HandleState::Rotated {
             family_id: row.family_id,
             within_grace: row.within_grace,
@@ -366,16 +381,27 @@ mod tests {
         project.id
     }
 
+    /// The upstream identity of the families the tests start.
+    const IDENTITY: &str = "identity-a";
+
     fn hash(n: u8) -> Vec<u8> {
         vec![n; 32]
     }
 
     async fn rotate(pool: &PgPool, project: Uuid, from: u8, to: u8, grace: Duration) -> Uuid {
         let claimant = Uuid::new_v4();
-        let claimed = claim(pool, &hash(from), project, "login", claimant, CLAIM_LEASE)
-            .await
-            .unwrap()
-            .expect("claimable");
+        let claimed = claim(
+            pool,
+            &hash(from),
+            project,
+            "login",
+            IDENTITY,
+            claimant,
+            CLAIM_LEASE,
+        )
+        .await
+        .unwrap()
+        .expect("claimable");
         let outcome = record_rotation(
             pool,
             &Rotation {
@@ -401,6 +427,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -415,6 +442,7 @@ mod tests {
                     &hash(1),
                     project,
                     "login",
+                    IDENTITY,
                     Uuid::new_v4(),
                     CLAIM_LEASE,
                 )
@@ -430,7 +458,9 @@ mod tests {
             .count();
         assert_eq!(wins, 1);
         assert_eq!(
-            state(&pool, &hash(1), project, "login").await.unwrap(),
+            state(&pool, &hash(1), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::InFlight
         );
     }
@@ -442,6 +472,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -449,14 +480,24 @@ mod tests {
         .await
         .unwrap();
         let first = Uuid::new_v4();
-        claim(&pool, &hash(1), project, "login", first, CLAIM_LEASE)
-            .await
-            .unwrap()
-            .unwrap();
+        claim(
+            &pool,
+            &hash(1),
+            project,
+            "login",
+            IDENTITY,
+            first,
+            CLAIM_LEASE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(release_claim(&pool, &hash(1), first).await.unwrap());
         assert!(!release_claim(&pool, &hash(1), first).await.unwrap());
         assert_eq!(
-            state(&pool, &hash(1), project, "login").await.unwrap(),
+            state(&pool, &hash(1), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Available
         );
 
@@ -465,6 +506,7 @@ mod tests {
             &hash(1),
             project,
             "login",
+            IDENTITY,
             Uuid::new_v4(),
             CLAIM_LEASE,
         )
@@ -482,6 +524,7 @@ mod tests {
             &hash(1),
             project,
             "login",
+            IDENTITY,
             Uuid::new_v4(),
             CLAIM_LEASE
         )
@@ -499,6 +542,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -507,7 +551,10 @@ mod tests {
         .unwrap();
         rotate(&pool, project, 1, 2, Duration::from_secs(30)).await;
 
-        match state(&pool, &hash(1), project, "login").await.unwrap() {
+        match state(&pool, &hash(1), project, "login", IDENTITY)
+            .await
+            .unwrap()
+        {
             HandleState::Rotated {
                 within_grace: true,
                 response_encrypted: Some(response),
@@ -516,7 +563,9 @@ mod tests {
             other => panic!("unexpected state {other:?}"),
         }
         assert_eq!(
-            state(&pool, &hash(2), project, "login").await.unwrap(),
+            state(&pool, &hash(2), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Available
         );
         // The old handle cannot be claimed again, and no longer holds the
@@ -526,6 +575,7 @@ mod tests {
             &hash(1),
             project,
             "login",
+            IDENTITY,
             Uuid::new_v4(),
             CLAIM_LEASE
         )
@@ -545,6 +595,7 @@ mod tests {
             &hash(2),
             project,
             "login",
+            IDENTITY,
             Uuid::new_v4(),
             CLAIM_LEASE,
         )
@@ -561,6 +612,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -574,7 +626,9 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            state(&pool, &hash(1), project, "login").await.unwrap(),
+            state(&pool, &hash(1), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Rotated {
                 within_grace: false,
                 response_encrypted: Some(_),
@@ -584,7 +638,9 @@ mod tests {
 
         assert_eq!(delete_expired(&pool).await.unwrap(), 0);
         assert!(matches!(
-            state(&pool, &hash(1), project, "login").await.unwrap(),
+            state(&pool, &hash(1), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Rotated {
                 within_grace: false,
                 response_encrypted: None,
@@ -600,6 +656,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -630,7 +687,9 @@ mod tests {
         );
         for handle in [1, 2] {
             assert_eq!(
-                state(&pool, &hash(handle), project, "login").await.unwrap(),
+                state(&pool, &hash(handle), project, "login", IDENTITY)
+                    .await
+                    .unwrap(),
                 HandleState::FamilyEnded
             );
             assert!(claim(
@@ -638,6 +697,7 @@ mod tests {
                 &hash(handle),
                 project,
                 "login",
+                IDENTITY,
                 Uuid::new_v4(),
                 CLAIM_LEASE
             )
@@ -650,6 +710,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(3),
             "enc",
@@ -661,7 +722,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            state(&pool, &hash(3), project, "login").await.unwrap(),
+            state(&pool, &hash(3), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::FamilyEnded
         );
         assert!(claim(
@@ -669,6 +732,7 @@ mod tests {
             &hash(3),
             project,
             "login",
+            IDENTITY,
             Uuid::new_v4(),
             CLAIM_LEASE
         )
@@ -678,7 +742,9 @@ mod tests {
         // Housekeeping deletes ended-by-lifetime families and their handles.
         assert_eq!(delete_expired(&pool).await.unwrap(), 1);
         assert_eq!(
-            state(&pool, &hash(3), project, "login").await.unwrap(),
+            state(&pool, &hash(3), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Unknown
         );
     }
@@ -690,6 +756,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -697,10 +764,18 @@ mod tests {
         .await
         .unwrap();
         let claimant = Uuid::new_v4();
-        let claimed = claim(&pool, &hash(1), project, "login", claimant, CLAIM_LEASE)
-            .await
-            .unwrap()
-            .unwrap();
+        let claimed = claim(
+            &pool,
+            &hash(1),
+            project,
+            "login",
+            IDENTITY,
+            claimant,
+            CLAIM_LEASE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         revoke_family(&pool, claimed.family_id).await.unwrap();
         let outcome = record_rotation(
             &pool,
@@ -718,7 +793,9 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, RotationOutcome::FamilyEnded);
         assert_eq!(
-            state(&pool, &hash(2), project, "login").await.unwrap(),
+            state(&pool, &hash(2), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Unknown
         );
     }
@@ -730,6 +807,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -737,10 +815,18 @@ mod tests {
         .await
         .unwrap();
         let slow = Uuid::new_v4();
-        let claimed = claim(&pool, &hash(1), project, "login", slow, CLAIM_LEASE)
-            .await
-            .unwrap()
-            .unwrap();
+        let claimed = claim(
+            &pool,
+            &hash(1),
+            project,
+            "login",
+            IDENTITY,
+            slow,
+            CLAIM_LEASE,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         sqlx::query(
             "UPDATE oauth_refresh_tokens SET claim_expires_at = NOW() - INTERVAL '1 second'",
         )
@@ -752,6 +838,7 @@ mod tests {
             &hash(1),
             project,
             "login",
+            IDENTITY,
             Uuid::new_v4(),
             CLAIM_LEASE,
         )
@@ -774,7 +861,9 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, RotationOutcome::ClaimLost);
         assert_eq!(
-            state(&pool, &hash(2), project, "login").await.unwrap(),
+            state(&pool, &hash(2), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Unknown
         );
     }
@@ -790,6 +879,7 @@ mod tests {
             &pool,
             project,
             "login",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(1),
             "enc",
@@ -797,20 +887,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            state(&pool, &hash(1), project, "other").await.unwrap(),
+            state(&pool, &hash(1), project, "other", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Unknown
         );
         assert_eq!(
-            state(&pool, &hash(1), other_project, "login")
+            state(&pool, &hash(1), other_project, "login", IDENTITY)
                 .await
                 .unwrap(),
             HandleState::Unknown
         );
         for (p, e) in [(project, "other"), (other_project, "login")] {
-            assert!(claim(&pool, &hash(1), p, e, Uuid::new_v4(), CLAIM_LEASE)
-                .await
-                .unwrap()
-                .is_none());
+            assert!(
+                claim(&pool, &hash(1), p, e, IDENTITY, Uuid::new_v4(), CLAIM_LEASE)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 
@@ -825,6 +919,7 @@ mod tests {
                 &pool,
                 project,
                 ext,
+                IDENTITY,
                 Duration::from_secs(600),
                 &hash(n),
                 "enc",
@@ -836,11 +931,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            state(&pool, &hash(1), project, "login").await.unwrap(),
+            state(&pool, &hash(1), project, "login", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Unknown
         );
         assert_eq!(
-            state(&pool, &hash(2), project, "other").await.unwrap(),
+            state(&pool, &hash(2), project, "other", IDENTITY)
+                .await
+                .unwrap(),
             HandleState::Available
         );
 
@@ -854,6 +953,7 @@ mod tests {
             &pool,
             project,
             "other",
+            IDENTITY,
             Duration::from_secs(600),
             &hash(3),
             "enc",
@@ -868,5 +968,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[sqlx::test]
+    async fn a_family_is_only_claimable_for_the_upstream_it_was_started_for(pool: PgPool) {
+        let project = project_with_extension(&pool, "identity", "login").await;
+        create_family(
+            &pool,
+            project,
+            "login",
+            IDENTITY,
+            Duration::from_secs(600),
+            &hash(1),
+            "enc",
+        )
+        .await
+        .unwrap();
+
+        let claimant = Uuid::new_v4();
+        assert!(
+            claim(
+                &pool,
+                &hash(1),
+                project,
+                "login",
+                "identity-b",
+                claimant,
+                CLAIM_LEASE
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a different upstream identity never claims"
+        );
+        assert_eq!(
+            state(&pool, &hash(1), project, "login", "identity-b")
+                .await
+                .unwrap(),
+            HandleState::UpstreamChanged
+        );
+        // Nothing was claimed or consumed: the original identity still works.
+        assert_eq!(
+            state(&pool, &hash(1), project, "login", IDENTITY)
+                .await
+                .unwrap(),
+            HandleState::Available
+        );
+        assert!(claim(
+            &pool,
+            &hash(1),
+            project,
+            "login",
+            IDENTITY,
+            claimant,
+            CLAIM_LEASE
+        )
+        .await
+        .unwrap()
+        .is_some());
     }
 }

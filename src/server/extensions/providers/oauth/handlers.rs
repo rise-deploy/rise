@@ -1225,6 +1225,15 @@ pub async fn callback(
             token_response_encrypted,
             content_type,
             status_code,
+            // The spec and row this callback exchanged the code with: a handle
+            // issued for this code stands for exactly that upstream, however the
+            // extension is edited before the app redeems the code.
+            extension_created_at: Some(extension.created_at),
+            upstream_identity: Some(
+                refresh_handle::UpstreamIdentity::of(&spec)
+                    .fingerprint()
+                    .to_string(),
+            ),
         };
 
         // Store authorization code in DB (5-minute TTL, single-use via consume)
@@ -1615,6 +1624,7 @@ async fn token_endpoint_inner(
                 state.clone(),
                 project,
                 extension_name.to_string(),
+                extension.created_at,
                 spec,
                 req,
             )
@@ -1625,6 +1635,7 @@ async fn token_endpoint_inner(
                 state.clone(),
                 project,
                 extension_name.to_string(),
+                extension.created_at,
                 spec,
                 req,
             )
@@ -1642,6 +1653,7 @@ async fn handle_authorization_code_grant(
     state: AppState,
     project: crate::db::models::Project,
     extension_name: String,
+    extension_created_at: chrono::DateTime<Utc>,
     spec: OAuthExtensionSpec,
     req: TokenRequest,
 ) -> Result<Response, (StatusCode, Json<OAuth2ErrorResponse>)> {
@@ -1791,12 +1803,45 @@ async fn handle_authorization_code_grant(
     // The upstream refresh token never reaches the app: a 2xx JSON response has it
     // replaced by a handle, sealed or stored server-side depending on the
     // extension's refresh-token mode. Everything else is relayed untouched.
+    let (Some(code_extension_created_at), Some(upstream_identity)) = (
+        code_state.extension_created_at,
+        code_state.upstream_identity.clone(),
+    ) else {
+        warn!(
+            "Authorization code of project {} extension {} carries no extension binding; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    };
+    // Rotating families live and die with the extension row, so a code from
+    // another incarnation of the extension (deleted and created again under the
+    // same name) must not start one.
+    if spec.refresh_token.mode == RefreshTokenMode::Rotating
+        && code_extension_created_at != extension_created_at
+    {
+        warn!(
+            "Authorization code of project {} extension {} was issued for another incarnation of the extension; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    }
+    let handle_scope = refresh_handle::HandleScope {
+        project: project.id,
+        extension: &extension_name,
+        extension_created_at: code_extension_created_at,
+        upstream: refresh_handle::UpstreamIdentity::from_fingerprint(upstream_identity),
+    };
     let token_response_body = match spec.refresh_token.mode {
         RefreshTokenMode::Sealed => {
             refresh_handle::seal_in_token_response(
                 encryption_provider.as_ref(),
-                project.id,
-                &extension_name,
+                &handle_scope,
                 code_state.status_code,
                 token_response_body,
                 Utc::now().timestamp(),
@@ -1810,6 +1855,7 @@ async fn handle_authorization_code_grant(
                 project.id,
                 &extension_name,
                 spec.refresh_token,
+                handle_scope.upstream.clone(),
             )
             .issue_in_token_response(code_state.status_code, token_response_body)
             .await
@@ -2042,6 +2088,7 @@ async fn handle_refresh_token_grant(
     state: AppState,
     project: crate::db::models::Project,
     extension_name: String,
+    extension_created_at: chrono::DateTime<Utc>,
     spec: OAuthExtensionSpec,
     req: TokenRequest,
 ) -> Result<Response, (StatusCode, Json<OAuth2ErrorResponse>)> {
@@ -2058,12 +2105,16 @@ async fn handle_refresh_token_grant(
         oauth2_error("server_error", Some("Internal server error".to_string()))
     })?;
 
-    // A Rise handle must be valid for this project and extension; it is never
-    // forwarded as-is. In `sealed` mode a token without a handle scheme was
-    // issued before handles existed and is a raw upstream token, which is
-    // forwarded as before; in `rotating` mode it is refused, since it could be
-    // a token stolen before handles existed. Server-side-state (`rrt2.`)
-    // handles are only accepted in `rotating` mode.
+    // A Rise handle must be valid for this project, extension row and upstream
+    // configuration; it is never forwarded as-is, and the check precedes any
+    // discovery or upstream request. In `sealed` mode a token without a handle
+    // scheme was issued before handles existed and is a raw upstream token,
+    // which carries no upstream identity and is forwarded as before; in
+    // `rotating` mode it is refused, since it could be a token stolen before
+    // handles existed. Server-side-state (`rrt2.`) handles are only accepted in
+    // `rotating` mode.
+    let handle_scope =
+        refresh_handle::HandleScope::of(project.id, &extension_name, extension_created_at, &spec);
     enum Presented {
         Rotating,
         Upstream(refresh_handle::PresentedRefreshToken),
@@ -2073,14 +2124,9 @@ async fn handle_refresh_token_grant(
         Presented::Rotating
     } else {
         Presented::Upstream(
-            refresh_handle::present(
-                encryption_provider.as_ref(),
-                project.id,
-                &extension_name,
-                &refresh_token,
-            )
-            .await
-            .map_err(|e| handle_error_response(e, &project.name, &extension_name))?,
+            refresh_handle::present(encryption_provider.as_ref(), &handle_scope, &refresh_token)
+                .await
+                .map_err(|e| handle_error_response(e, &project.name, &extension_name))?,
         )
     };
 
@@ -2091,6 +2137,7 @@ async fn handle_refresh_token_grant(
             project.id,
             &extension_name,
             spec.refresh_token,
+            handle_scope.upstream.clone(),
         );
         let call = |upstream_token: String| {
             let (state, project, extension_name, spec) = (&state, &project, &extension_name, &spec);
@@ -2158,8 +2205,7 @@ async fn handle_refresh_token_grant(
 
     let reply = refresh_handle::seal_refresh_response(
         encryption_provider.as_ref(),
-        project.id,
-        &extension_name,
+        &handle_scope,
         &presented,
         upstream,
         Utc::now().timestamp(),

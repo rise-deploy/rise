@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_refresh_tokens t\n           SET claimed_by = $5,\n               claim_expires_at = NOW() + ($6 * INTERVAL '1 second')\n           FROM oauth_refresh_families f\n           WHERE t.handle_hash = $1\n             AND t.project_id = $2\n             AND t.extension = $3\n             AND f.family_id = t.family_id\n             AND f.revoked_at IS NULL\n             AND f.expires_at > NOW()\n             AND f.upstream_identity = $4\n             AND t.rotated_at IS NULL\n             AND t.upstream_token_encrypted IS NOT NULL\n             AND (t.claimed_by IS NULL OR t.claim_expires_at < NOW())\n           RETURNING t.family_id, t.upstream_token_encrypted AS \"upstream_token_encrypted!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "family_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "oauth_refresh_tokens",
+            "name": "family_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "upstream_token_encrypted!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "oauth_refresh_tokens",
+            "name": "upstream_token_encrypted"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "f70d8e4bfca20ded93542518e98287e795c9fc8782edb62d665ac2438e6c8ca8"
+}

@@ -8,6 +8,10 @@ CREATE TABLE oauth_refresh_families (
     family_id UUID PRIMARY KEY,
     project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     extension VARCHAR NOT NULL,
+    -- Fingerprint of the upstream (issuer_url, token_endpoint override,
+    -- client_id) the family's upstream token was issued by. Handles of the
+    -- family are refused once the extension is configured differently.
+    upstream_identity TEXT NOT NULL,
     -- Absolute end of the family: creation + the extension's max lifetime.
     expires_at TIMESTAMPTZ NOT NULL,
     revoked_at TIMESTAMPTZ,

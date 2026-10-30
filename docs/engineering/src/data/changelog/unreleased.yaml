@@ -113,9 +113,23 @@ changes:
       unchanged. A stolen handle is therefore useless against the upstream
       provider and at any other project or extension.
 
+      A handle is also bound to the extension row (its `created_at`) and to the
+      upstream identity the extension had when the handle was issued: the
+      `issuer_url`, the `token_endpoint` override and the `client_id`. Deleting
+      an extension and creating one of the same name, or editing one of those
+      three settings, makes every earlier handle answer `invalid_grant` without
+      any request to an upstream, so an editor of an extension cannot repoint it
+      at a server of their choosing to receive users' upstream refresh tokens.
+      Other edits (scopes, `authorization_endpoint`, client authentication
+      method, ...) keep handles valid. Authorization codes carry the same
+      binding from the callback that stored them, and a code stored by an
+      earlier version is refused.
+
       Refresh tokens issued before this change are raw upstream tokens, and the
       token endpoint still accepts them for now. This compatibility path will be
-      removed in a later release.
+      removed in a later release. A raw token names no upstream, so it is not
+      covered by the upstream check and is sent to whatever upstream the
+      extension currently uses.
 
       Token responses are the upstream's own with only `refresh_token` replaced
       (status, content type, other members and their order are kept), and
@@ -135,6 +149,11 @@ changes:
       present them directly to the upstream provider to treat the value as
       opaque and refresh through the Rise token endpoint. The same encryption
       key must stay available: handles do not unseal if it is changed.
+
+      Warn editors of OAuth extensions that changing `issuer_url`,
+      `token_endpoint` or `client_id`, or recreating the extension, signs all
+      its users out. Authorization codes issued by a callback before the upgrade
+      and redeemed after it are refused (they live five minutes).
   - id: oauth-extension-rotating-refresh-tokens
     title: OAuth extensions can issue single-use rotating refresh tokens
     group: security-and-upgrade-guidance
@@ -151,6 +170,15 @@ changes:
       at most 10 years). Rise keeps the upstream refresh token encrypted in
       PostgreSQL. Rotation settings are rejected unless the mode is `rotating`.
 
+      Each rotating login records the upstream it was started for (a
+      fingerprint of `issuer_url`, the `token_endpoint` override and
+      `client_id`, as for `rrt1.` handles) and is refused with `invalid_grant`,
+      before any upstream request, once the extension is configured
+      differently. Changing one of those three settings also deletes the
+      extension's rotating logins, so an editor cannot repoint an extension to
+      receive users' stored upstream tokens. Authorization codes stored before
+      the extension was recreated start no rotating login.
+
       A migration adds the `oauth_refresh_families` and `oauth_refresh_tokens`
       tables. Expired rows are removed by the existing hourly leader-gated
       cleanup. Extensions that stay in `sealed` mode do not touch them. With KMS,
@@ -165,7 +193,8 @@ changes:
       to `rotating` keeps sessions that hold an `rrt1.` handle younger than
       `max_lifetime_seconds`; raw refresh tokens from before handles existed
       are rejected in `rotating` mode, so migrate them in `sealed` mode first
-      if those sessions matter.
+      if those sessions matter. Changing `issuer_url`, `token_endpoint` or
+      `client_id` signs all users of the extension out in either mode.
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-

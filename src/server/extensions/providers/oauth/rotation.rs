@@ -9,6 +9,11 @@
 //! only its SHA-256 is stored. Everything stored for a handle is encrypted
 //! under a context bound to the project, the extension and that handle's hash.
 //!
+//! A family is started for one [`UpstreamIdentity`] (the extension's
+//! `issuer_url`, `token_endpoint` override and `client_id`) and refuses to
+//! refresh once the extension is configured differently, before anything is
+//! claimed or sent upstream.
+//!
 //! Refreshing, in short (the SQL is in `db::oauth_refresh_tokens`):
 //! 1. One request atomically *claims* the handle and calls the upstream.
 //! 2. On success it records the successor and the exact response it returns:
@@ -27,7 +32,7 @@ use super::models::RefreshTokenSettings;
 use super::provider::UpstreamReply;
 use super::refresh_handle::{
     classify_decrypt_error, parse_response_body, HandleError, ResponseBody, TokenReply,
-    UnsealedRefreshToken,
+    UnsealedRefreshToken, UpstreamIdentity,
 };
 use crate::db::oauth_refresh_tokens::{self as store, HandleState, RotationOutcome};
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
@@ -116,7 +121,8 @@ pub enum UpstreamFailure {
 /// Why a rotating-mode request did not produce a token response.
 #[derive(Debug)]
 pub enum RotationError {
-    /// The handle is unknown, expired, revoked, reused or unreadable.
+    /// The handle is unknown, expired, revoked, reused, unreadable, or was
+    /// issued for another upstream than the extension's current one.
     InvalidGrant,
     /// A concurrent refresh of the same handle did not finish in time.
     TemporarilyUnavailable,
@@ -145,6 +151,9 @@ pub struct Rotation<'a> {
     pub project: Uuid,
     pub extension: &'a str,
     pub settings: RefreshTokenSettings,
+    /// The upstream families are started for, and the one they are checked
+    /// against when refreshed.
+    pub upstream: UpstreamIdentity,
     /// How long to wait for a concurrent refresh of the same handle.
     pub wait: Duration,
     /// Upper bound for one upstream refresh call.
@@ -158,6 +167,7 @@ impl<'a> Rotation<'a> {
         project: Uuid,
         extension: &'a str,
         settings: RefreshTokenSettings,
+        upstream: UpstreamIdentity,
     ) -> Self {
         Self {
             pool,
@@ -165,6 +175,7 @@ impl<'a> Rotation<'a> {
             project,
             extension,
             settings,
+            upstream,
             wait: WAIT_FOR_CONCURRENT_REFRESH,
             upstream_timeout: UPSTREAM_TIMEOUT,
         }
@@ -185,6 +196,7 @@ impl<'a> Rotation<'a> {
             self.pool,
             self.project,
             self.extension,
+            self.upstream.fingerprint(),
             self.settings.max_lifetime(),
             &hash,
             &encrypted,
@@ -258,6 +270,7 @@ impl<'a> Rotation<'a> {
                 &hash,
                 self.project,
                 self.extension,
+                self.upstream.fingerprint(),
                 claimant,
                 store::CLAIM_LEASE,
             )
@@ -268,12 +281,27 @@ impl<'a> Rotation<'a> {
                 return self.rotate(&hash, claimant, claimed, upstream).await;
             }
 
-            match store::state(self.pool, &hash, self.project, self.extension)
-                .await
-                .map_err(internal)?
+            match store::state(
+                self.pool,
+                &hash,
+                self.project,
+                self.extension,
+                self.upstream.fingerprint(),
+            )
+            .await
+            .map_err(internal)?
             {
                 HandleState::Unknown | HandleState::FamilyEnded => {
                     return Err(RotationError::InvalidGrant)
+                }
+                HandleState::UpstreamChanged => {
+                    warn!(
+                        project_id = %self.project,
+                        extension = self.extension,
+                        outcome = "upstream_changed",
+                        "rotating refresh token was issued for another upstream than the extension's current one"
+                    );
+                    return Err(RotationError::InvalidGrant);
                 }
                 HandleState::Rotated {
                     within_grace: true,
@@ -682,13 +710,33 @@ mod tests {
         }
     }
 
+    /// The upstream identity of the extension in most tests.
+    pub(super) fn identity() -> UpstreamIdentity {
+        UpstreamIdentity::from_parts(
+            "https://idp.example.com",
+            Some("https://idp.example.com/token"),
+            "upstream-client",
+        )
+    }
+
+    /// The scope `rrt1.` handles are sealed under in the tests.
+    fn handle_scope(project: Uuid) -> refresh_handle::HandleScope<'static> {
+        refresh_handle::HandleScope {
+            project,
+            extension: "login",
+            extension_created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            upstream: identity(),
+        }
+    }
+
     fn rotation<'a>(
         pool: &'a PgPool,
         encryption: &'a LocalEncryptionProvider,
         project: Uuid,
         extension: &'a str,
     ) -> Rotation<'a> {
-        let mut rotation = Rotation::new(pool, encryption, project, extension, settings());
+        let mut rotation =
+            Rotation::new(pool, encryption, project, extension, settings(), identity());
         rotation.wait = Duration::from_millis(400);
         rotation
     }
@@ -1066,6 +1114,7 @@ mod tests {
             &hash_handle(&first),
             project,
             "login",
+            identity().fingerprint(),
             Uuid::new_v4(),
             crate::db::oauth_refresh_tokens::CLAIM_LEASE,
         )
@@ -1437,10 +1486,15 @@ mod tests {
         project: Uuid,
         issued_at: i64,
     ) -> UnsealedRefreshToken {
-        let handle = refresh_handle::seal(provider, project, "login", "upstream-sealed", issued_at)
-            .await
-            .unwrap();
-        refresh_handle::unseal(provider, project, "login", &handle)
+        let handle = refresh_handle::seal(
+            provider,
+            &handle_scope(project),
+            "upstream-sealed",
+            issued_at,
+        )
+        .await
+        .unwrap();
+        refresh_handle::unseal(provider, &handle_scope(project), &handle)
             .await
             .unwrap()
     }
@@ -1572,7 +1626,7 @@ mod tests {
         let handle = login(&rotation, "upstream-1").await;
         assert!(refresh_handle::is_handle(&handle));
         assert!(
-            refresh_handle::present(&provider, project, "login", &handle)
+            refresh_handle::present(&provider, &handle_scope(project), &handle)
                 .await
                 .is_err()
         );
@@ -1597,7 +1651,7 @@ mod tests {
         let healthy = rotation(&pool, &provider, project, "login");
         let first = login(&healthy, "upstream-1").await;
         let throttled = Throttled;
-        let degraded = Rotation::new(&pool, &throttled, project, "login", settings());
+        let degraded = Rotation::new(&pool, &throttled, project, "login", settings(), identity());
         let upstream = FakeUpstream::default();
         assert!(matches!(
             degraded
@@ -1639,9 +1693,15 @@ mod tests {
         assert!(upstream.calls().is_empty());
         // The failed attempt did not leave the handle claimed.
         assert!(matches!(
-            crate::db::oauth_refresh_tokens::state(&pool, &hash_handle(&b), project, "login")
-                .await
-                .unwrap(),
+            crate::db::oauth_refresh_tokens::state(
+                &pool,
+                &hash_handle(&b),
+                project,
+                "login",
+                identity().fingerprint(),
+            )
+            .await
+            .unwrap(),
             HandleState::Available
         ));
     }

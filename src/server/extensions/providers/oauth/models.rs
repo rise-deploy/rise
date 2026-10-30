@@ -228,6 +228,16 @@ pub struct OAuthCodeState {
     pub content_type: String,
     /// HTTP status code from upstream provider (preserved for accurate passthrough)
     pub status_code: u16,
+    /// `created_at` of the extension row the upstream token was obtained
+    /// through. The refresh-token handle issued for this code is bound to it.
+    /// A code stored without it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_created_at: Option<DateTime<Utc>>,
+    /// Fingerprint of the upstream (`issuer_url`, `token_endpoint`,
+    /// `client_id`) the token was obtained from, as configured when the
+    /// callback ran. A code stored without it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_identity: Option<String>,
 }
 
 /// OAuth authorization request parameters

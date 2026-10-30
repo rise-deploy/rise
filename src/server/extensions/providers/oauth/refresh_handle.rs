@@ -8,10 +8,20 @@
 //!
 //! A handle is `rrt1.` followed by the base64url ciphertext of the configured
 //! [`EncryptionProvider`], sealed under
-//! `EncryptionContext::extension(project, "oauth", extension, "/tokens/refresh")`.
-//! The context is authenticated by the provider, so a handle only unseals for
-//! the project and extension that issued it. The ciphertext carries a small
-//! versioned JSON payload (`v`, `upstream`, `iat`).
+//! `EncryptionContext::extension_instance(project, "oauth", extension,
+//! created_at, "/tokens/refresh")`. The context is authenticated by the
+//! provider, so a handle only unseals for the project and the extension row
+//! that issued it: deleting the extension and creating one of the same name
+//! gives the row a new `created_at`, and the old handles stop unsealing.
+//!
+//! The ciphertext carries a small versioned JSON payload (`v`, `upstream`,
+//! `iat`, `identity`). `identity` is the [`UpstreamIdentity`] of the extension
+//! at issue time, a fingerprint of the `issuer_url`, the `token_endpoint`
+//! override and the `client_id`. [`unseal`] rejects a handle whose identity
+//! differs from the extension's current one, so editing the extension to point
+//! at another upstream never sends a sealed upstream token there. Other spec
+//! edits (scopes, redirect URIs, `authorization_endpoint`, the client
+//! authentication method) leave handles valid.
 //!
 //! The leading `rrt<N>.` is the handle *scheme*. This module only unseals
 //! `rrt1.`; any other scheme is recognised by [`is_handle`] and rejected, so a
@@ -22,9 +32,12 @@
 //! Responses are the upstream's own with only the `refresh_token` replaced:
 //! status, content type, the other members and their order are kept.
 
+use super::models::OAuthExtensionSpec;
 use super::provider::UpstreamReply;
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, Utc};
 use rise_backend_core::encryption::{is_ciphertext_rejection, ENVELOPE_PREFIX};
 use serde::{
     de::{MapAccess, Visitor},
@@ -32,6 +45,7 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Scheme prefix of the stateless sealed handle.
@@ -51,6 +65,100 @@ struct Payload {
     upstream: String,
     /// Unix seconds at which Rise issued the handle.
     iat: i64,
+    /// Fingerprint of the [`UpstreamIdentity`] the token was issued by.
+    identity: String,
+}
+
+/// Which upstream an extension talks to, as far as a sealed token is
+/// concerned: the `issuer_url`, the `token_endpoint` override (absent when the
+/// endpoint comes from discovery) and the `client_id`.
+///
+/// Compared by exact string equality, so even a cosmetic edit of one of the
+/// three (a trailing slash) invalidates the handles issued before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamIdentity(String);
+
+impl UpstreamIdentity {
+    pub fn of(spec: &OAuthExtensionSpec) -> Self {
+        Self::from_parts(
+            &spec.issuer_url,
+            spec.token_endpoint.as_deref(),
+            &spec.client_id,
+        )
+    }
+
+    /// The identity of a stored spec, read without requiring the rest of it to
+    /// be valid. Equal to [`Self::of`] for every spec that parses.
+    pub fn of_stored_spec(spec: &serde_json::Value) -> Self {
+        let text = |member: &str| spec.get(member).and_then(serde_json::Value::as_str);
+        Self::from_parts(
+            text("issuer_url").unwrap_or_default(),
+            text("token_endpoint"),
+            text("client_id").unwrap_or_default(),
+        )
+    }
+
+    pub fn from_parts(issuer_url: &str, token_endpoint: Option<&str>, client_id: &str) -> Self {
+        // A JSON array is an unambiguous encoding: no choice of values makes two
+        // different triples serialize alike.
+        let canonical = serde_json::json!([
+            "rise-oauth-upstream-v1",
+            issuer_url,
+            token_endpoint,
+            client_id
+        ])
+        .to_string();
+        Self(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+    }
+
+    /// The stable textual form, for storage next to what it guards.
+    pub fn fingerprint(&self) -> &str {
+        &self.0
+    }
+
+    pub fn from_fingerprint(fingerprint: String) -> Self {
+        Self(fingerprint)
+    }
+}
+
+/// What a handle is bound to: the extension row (project, name and `created_at`)
+/// and the upstream it talks to. The same value seals a handle and checks one
+/// that is presented.
+#[derive(Debug, Clone)]
+pub struct HandleScope<'a> {
+    pub project: Uuid,
+    pub extension: &'a str,
+    /// `created_at` of the extension's row.
+    pub extension_created_at: DateTime<Utc>,
+    pub upstream: UpstreamIdentity,
+}
+
+impl<'a> HandleScope<'a> {
+    /// The scope of the extension row `created_at`, as configured by `spec`.
+    pub fn of(
+        project: Uuid,
+        extension: &'a str,
+        extension_created_at: DateTime<Utc>,
+        spec: &OAuthExtensionSpec,
+    ) -> Self {
+        Self {
+            project,
+            extension,
+            extension_created_at,
+            upstream: UpstreamIdentity::of(spec),
+        }
+    }
+
+    fn context(&self) -> EncryptionContext {
+        EncryptionContext::extension_instance(
+            self.project,
+            "oauth",
+            self.extension,
+            // Canonical form of the row's timestamp; PostgreSQL stores microseconds.
+            self.extension_created_at.timestamp_micros(),
+            SLOT,
+        )
+    }
 }
 
 /// What a handle stands for once unsealed.
@@ -91,15 +199,10 @@ pub fn is_handle(token: &str) -> bool {
         .is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_digit()))
 }
 
-fn context(project: Uuid, extension: &str) -> EncryptionContext {
-    EncryptionContext::extension(project, "oauth", extension, SLOT)
-}
-
-/// Seal `upstream_refresh_token` into a handle for `project`/`extension`.
+/// Seal `upstream_refresh_token` into a handle bound to `scope`.
 pub async fn seal(
     provider: &dyn EncryptionProvider,
-    project: Uuid,
-    extension: &str,
+    scope: &HandleScope<'_>,
     upstream_refresh_token: &str,
     issued_at: i64,
 ) -> Result<String> {
@@ -107,11 +210,10 @@ pub async fn seal(
         v: PAYLOAD_VERSION,
         upstream: upstream_refresh_token.to_string(),
         iat: issued_at,
+        identity: scope.upstream.fingerprint().to_string(),
     })
     .context("Failed to serialize refresh handle payload")?;
-    let envelope = provider
-        .encrypt(&payload, &context(project, extension))
-        .await?;
+    let envelope = provider.encrypt(&payload, &scope.context()).await?;
     // The envelope is `rise:enc:v2:<base64url>`; the handle reuses its
     // base64url body under its own scheme prefix.
     let body = envelope
@@ -124,7 +226,8 @@ pub async fn seal(
 #[derive(Debug)]
 pub enum HandleError {
     /// Not a handle this extension accepts: another scheme, malformed,
-    /// tampered with, or issued for another project or extension.
+    /// tampered with, or issued for another project, extension row or
+    /// upstream.
     Rejected(anyhow::Error),
     /// The encryption provider could not answer (throttling, network, ...);
     /// says nothing about the handle.
@@ -151,14 +254,14 @@ pub fn classify_decrypt_error(error: anyhow::Error) -> HandleError {
     }
 }
 
-/// Unseal a handle issued for `project`/`extension`.
+/// Unseal a handle issued for `scope`.
 ///
 /// Fails for anything that is not a handle, was tampered with, or was issued
-/// for another project or extension.
+/// for another project, another incarnation of the extension, or an extension
+/// that talked to another upstream.
 pub async fn unseal(
     provider: &dyn EncryptionProvider,
-    project: Uuid,
-    extension: &str,
+    scope: &HandleScope<'_>,
     handle: &str,
 ) -> Result<UnsealedRefreshToken, HandleError> {
     let Some(body) = handle.strip_prefix(SEALED_HANDLE_PREFIX) else {
@@ -167,10 +270,7 @@ pub async fn unseal(
         )));
     };
     let plaintext = provider
-        .decrypt(
-            &format!("{ENVELOPE_PREFIX}{body}"),
-            &context(project, extension),
-        )
+        .decrypt(&format!("{ENVELOPE_PREFIX}{body}"), &scope.context())
         .await
         .map_err(classify_decrypt_error)?;
     let payload: Payload = serde_json::from_str(&plaintext)
@@ -180,6 +280,11 @@ pub async fn unseal(
         return Err(HandleError::Rejected(anyhow!(
             "Unsupported refresh handle payload version {}",
             payload.v
+        )));
+    }
+    if payload.identity != scope.upstream.fingerprint() {
+        return Err(HandleError::Rejected(anyhow!(
+            "Refresh handle was issued for a different upstream configuration"
         )));
     }
     Ok(UnsealedRefreshToken {
@@ -192,15 +297,15 @@ pub async fn unseal(
 ///
 /// Anything carrying a handle scheme must unseal, otherwise it is rejected
 /// (it is never forwarded upstream). Anything else is treated as a legacy raw
-/// upstream token.
+/// upstream token, which carries no upstream identity and so cannot be checked
+/// against the extension's current one.
 pub async fn present(
     provider: &dyn EncryptionProvider,
-    project: Uuid,
-    extension: &str,
+    scope: &HandleScope<'_>,
     token: &str,
 ) -> Result<PresentedRefreshToken, HandleError> {
     if is_handle(token) {
-        unseal(provider, project, extension, token)
+        unseal(provider, scope, token)
             .await
             .map(PresentedRefreshToken::Handle)
     } else {
@@ -341,8 +446,7 @@ fn is_success(status: u16) -> bool {
 /// byte-for-byte.
 pub async fn seal_in_token_response(
     provider: &dyn EncryptionProvider,
-    project: Uuid,
-    extension: &str,
+    scope: &HandleScope<'_>,
     status: u16,
     body: String,
     issued_at: i64,
@@ -357,7 +461,7 @@ pub async fn seal_in_token_response(
             let Some(upstream) = members.refresh_token() else {
                 return Ok(body);
             };
-            let handle = seal(provider, project, extension, &upstream, issued_at)
+            let handle = seal(provider, scope, &upstream, issued_at)
                 .await
                 .map_err(|e| ReplyError::Seal(HandleError::Unavailable(e)))?;
             members
@@ -382,8 +486,7 @@ pub async fn seal_in_token_response(
 ///   presented, which still wraps a valid upstream token.
 pub async fn seal_refresh_response(
     provider: &dyn EncryptionProvider,
-    project: Uuid,
-    extension: &str,
+    scope: &HandleScope<'_>,
     presented: &PresentedRefreshToken,
     upstream: UpstreamReply,
     issued_at: i64,
@@ -406,7 +509,7 @@ pub async fn seal_refresh_response(
             match to_seal {
                 None => body,
                 Some(token) => {
-                    let handle = seal(provider, project, extension, &token, issued_at)
+                    let handle = seal(provider, scope, &token, issued_at)
                         .await
                         .map_err(unavailable)?;
                     members.set_refresh_token(&handle).map_err(unavailable)?;
@@ -424,6 +527,7 @@ pub async fn seal_refresh_response(
 
 #[cfg(test)]
 mod tests {
+    use super::super::models::TokenEndpointAuthMethod;
     use super::*;
     use crate::server::encryption::providers::local::LocalEncryptionProvider;
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -433,9 +537,38 @@ mod tests {
         LocalEncryptionProvider::new(&STANDARD.encode([7u8; 32])).unwrap()
     }
 
+    /// `created_at` of the extension row in most tests.
+    fn created() -> DateTime<Utc> {
+        DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap()
+    }
+
+    fn spec() -> OAuthExtensionSpec {
+        serde_json::from_value(json!({
+            "provider_name": "Mock",
+            "client_id": "upstream-client",
+            "issuer_url": "https://idp.example.com",
+            "token_endpoint": "https://idp.example.com/token",
+            "scopes": ["openid"],
+        }))
+        .unwrap()
+    }
+
+    fn scope_with(
+        project: Uuid,
+        extension: &'static str,
+        created_at: DateTime<Utc>,
+        spec: &OAuthExtensionSpec,
+    ) -> HandleScope<'static> {
+        HandleScope::of(project, extension, created_at, spec)
+    }
+
+    fn scope(project: Uuid) -> HandleScope<'static> {
+        scope_with(project, "login", created(), &spec())
+    }
+
     async fn seal_body(status: u16, body: &str) -> (Uuid, String) {
         let project = Uuid::new_v4();
-        let out = seal_in_token_response(&provider(), project, "login", status, body.into(), 42)
+        let out = seal_in_token_response(&provider(), &scope(project), status, body.into(), 42)
             .await
             .unwrap();
         (project, out)
@@ -444,15 +577,13 @@ mod tests {
     #[tokio::test]
     async fn handle_round_trips_with_issued_at() {
         let project = Uuid::new_v4();
-        let handle = seal(&provider(), project, "login", "upstream-rt", 1_700_000_000)
+        let handle = seal(&provider(), &scope(project), "upstream-rt", 1_700_000_000)
             .await
             .unwrap();
         assert!(handle.starts_with("rrt1."));
         assert!(!handle.contains("upstream-rt"));
         assert!(!handle.contains(ENVELOPE_PREFIX));
-        let unsealed = unseal(&provider(), project, "login", &handle)
-            .await
-            .unwrap();
+        let unsealed = unseal(&provider(), &scope(project), &handle).await.unwrap();
         assert_eq!(unsealed.upstream_refresh_token, "upstream-rt");
         assert_eq!(unsealed.issued_at, 1_700_000_000);
     }
@@ -460,54 +591,190 @@ mod tests {
     #[tokio::test]
     async fn handles_are_unique_per_issue() {
         let project = Uuid::new_v4();
-        let a = seal(&provider(), project, "login", "rt", 1).await.unwrap();
-        let b = seal(&provider(), project, "login", "rt", 1).await.unwrap();
+        let a = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
+        let b = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
         assert_ne!(a, b);
     }
 
     #[tokio::test]
     async fn handle_is_bound_to_project_and_extension() {
         let project = Uuid::new_v4();
-        let handle = seal(&provider(), project, "login", "rt", 1).await.unwrap();
-        assert!(unseal(&provider(), project, "other", &handle)
+        let handle = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
+        assert!(unseal(
+            &provider(),
+            &scope_with(project, "other", created(), &spec()),
+            &handle
+        )
+        .await
+        .is_err());
+        assert!(unseal(&provider(), &scope(Uuid::new_v4()), &handle)
             .await
             .is_err());
-        assert!(unseal(&provider(), Uuid::new_v4(), "login", &handle)
+        assert!(present(
+            &provider(),
+            &scope_with(project, "other", created(), &spec()),
+            &handle
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_is_bound_to_the_extension_row_it_was_issued_for() {
+        let project = Uuid::new_v4();
+        let handle = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
+        // The same name, project and spec, but another incarnation of the extension.
+        for other in [
+            created() + chrono::Duration::microseconds(1),
+            created() - chrono::Duration::seconds(1),
+            DateTime::from_timestamp_micros(0).unwrap(),
+        ] {
+            let recreated = scope_with(project, "login", other, &spec());
+            assert!(matches!(
+                unseal(&provider(), &recreated, &handle).await,
+                Err(HandleError::Rejected(_))
+            ));
+            assert!(matches!(
+                present(&provider(), &recreated, &handle).await,
+                Err(HandleError::Rejected(_))
+            ));
+        }
+        // A context that omits the row's timestamp does not unseal it either.
+        let plain = provider()
+            .encrypt(
+                &serde_json::to_string(&Payload {
+                    v: PAYLOAD_VERSION,
+                    upstream: "rt".into(),
+                    iat: 1,
+                    identity: UpstreamIdentity::of(&spec()).fingerprint().into(),
+                })
+                .unwrap(),
+                &EncryptionContext::extension(project, "oauth", "login", SLOT),
+            )
             .await
-            .is_err());
-        assert!(present(&provider(), project, "other", &handle)
-            .await
-            .is_err());
+            .unwrap();
+        let forged = format!("rrt1.{}", plain.strip_prefix(ENVELOPE_PREFIX).unwrap());
+        assert!(unseal(&provider(), &scope(project), &forged).await.is_err());
+        // The timestamp is compared at the microsecond the database stores.
+        let same_instant = scope_with(project, "login", created(), &spec());
+        assert!(unseal(&provider(), &same_instant, &handle).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_handle_is_rejected_once_the_upstream_identity_changes() {
+        let project = Uuid::new_v4();
+        let handle = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
+        let edited = |change: &dyn Fn(&mut OAuthExtensionSpec)| {
+            let mut changed = spec();
+            change(&mut changed);
+            scope_with(project, "login", created(), &changed)
+        };
+        for scope in [
+            edited(&|s| s.issuer_url = "https://evil.example.com".into()),
+            edited(&|s| s.issuer_url.push('/')),
+            edited(&|s| s.token_endpoint = Some("https://evil.example.com/token".into())),
+            edited(&|s| s.token_endpoint = None),
+            edited(&|s| s.client_id = "other-client".into()),
+        ] {
+            assert!(matches!(
+                unseal(&provider(), &scope, &handle).await,
+                Err(HandleError::Rejected(_))
+            ));
+            assert!(matches!(
+                present(&provider(), &scope, &handle).await,
+                Err(HandleError::Rejected(_))
+            ));
+        }
+        // Everything else a spec carries may change without invalidating handles.
+        let unrelated = edited(&|s| {
+            s.scopes = vec!["profile".into(), "email".into()];
+            s.description = "changed".into();
+            s.provider_name = "Renamed".into();
+            s.authorization_endpoint = Some("https://idp.example.com/authorize".into());
+            s.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretBasic;
+            s.client_secret_encrypted = Some("rise:enc:v2:other".into());
+        });
+        assert!(unseal(&provider(), &unrelated, &handle).await.is_ok());
+    }
+
+    #[test]
+    fn the_identity_of_a_stored_spec_is_that_of_its_parsed_form() {
+        for value in [
+            json!({"issuer_url": "https://a", "client_id": "c", "provider_name": "P"}),
+            json!({"issuer_url": "https://a", "client_id": "c", "provider_name": "P", "token_endpoint": "https://a/t"}),
+            json!({"issuer_url": "https://a", "client_id": "c", "provider_name": "P", "token_endpoint": null}),
+            json!({"issuer_url": "https://a", "client_id": "c", "provider_name": "P", "token_endpoint": ""}),
+        ] {
+            let parsed: OAuthExtensionSpec = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(
+                UpstreamIdentity::of_stored_spec(&value),
+                UpstreamIdentity::of(&parsed),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_identity_is_unambiguous_and_distinguishes_unset_from_empty() {
+        let id = |issuer: &str, endpoint: Option<&str>, client: &str| {
+            UpstreamIdentity::from_parts(issuer, endpoint, client)
+        };
+        let base = id("https://a", Some("https://a/token"), "c");
+        assert_eq!(base, id("https://a", Some("https://a/token"), "c"));
+        for other in [
+            id("https://a", None, "c"),
+            id("https://a", Some(""), "c"),
+            id("https://a", Some("https://a/token"), "c2"),
+            id("https://b", Some("https://a/token"), "c"),
+            // Moving a character across a field boundary changes the identity.
+            id("https://a", Some("https://a/tokenc"), ""),
+            id("https://a", Some("https://a/token\",\"c"), ""),
+        ] {
+            assert_ne!(base, other);
+        }
+        assert_ne!(id("a", None, ""), id("a", Some(""), ""));
+        assert_eq!(base.fingerprint().len(), 43);
+        assert_eq!(
+            UpstreamIdentity::from_fingerprint(base.fingerprint().into()),
+            base
+        );
     }
 
     #[tokio::test]
     async fn tampered_or_foreign_handles_do_not_unseal() {
         let project = Uuid::new_v4();
-        let handle = seal(&provider(), project, "login", "rt", 1).await.unwrap();
+        let handle = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
         let mut tampered = handle.clone();
         tampered.pop();
         tampered.push(if handle.ends_with('A') { 'B' } else { 'A' });
-        assert!(unseal(&provider(), project, "login", &tampered)
+        assert!(unseal(&provider(), &scope(project), &tampered)
             .await
             .is_err());
-        assert!(unseal(&provider(), project, "login", "rrt1.%%%")
+        assert!(unseal(&provider(), &scope(project), "rrt1.%%%")
             .await
             .is_err());
-        assert!(unseal(&provider(), project, "login", "rrt2.abcd")
+        assert!(unseal(&provider(), &scope(project), "rrt2.abcd")
             .await
             .is_err());
         // A ciphertext sealed for another slot is not a refresh handle.
         let other_slot = provider()
             .encrypt(
-                r#"{"v":1,"upstream":"rt","iat":1}"#,
-                &EncryptionContext::extension(project, "oauth", "login", "/tokens/other"),
+                &format!(
+                    r#"{{"v":1,"upstream":"rt","iat":1,"identity":"{}"}}"#,
+                    UpstreamIdentity::of(&spec()).fingerprint()
+                ),
+                &EncryptionContext::extension_instance(
+                    project,
+                    "oauth",
+                    "login",
+                    created().timestamp_micros(),
+                    "/tokens/other",
+                ),
             )
             .await
             .unwrap();
         let forged = format!("rrt1.{}", other_slot.strip_prefix(ENVELOPE_PREFIX).unwrap());
-        assert!(unseal(&provider(), project, "login", &forged)
-            .await
-            .is_err());
+        assert!(unseal(&provider(), &scope(project), &forged).await.is_err());
     }
 
     #[test]
@@ -532,7 +799,7 @@ mod tests {
     async fn a_handle_of_another_scheme_is_rejected_not_forwarded() {
         let project = Uuid::new_v4();
         assert!(matches!(
-            present(&provider(), project, "login", "rrt2.abcd").await,
+            present(&provider(), &scope(project), "rrt2.abcd").await,
             Err(HandleError::Rejected(_))
         ));
     }
@@ -540,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_raw_token_is_forwarded_unchanged() {
         let project = Uuid::new_v4();
-        let presented = present(&provider(), project, "login", "raw-upstream-rt")
+        let presented = present(&provider(), &scope(project), "raw-upstream-rt")
             .await
             .unwrap();
         assert_eq!(
@@ -553,8 +820,8 @@ mod tests {
     #[tokio::test]
     async fn presented_handle_yields_upstream_token() {
         let project = Uuid::new_v4();
-        let handle = seal(&provider(), project, "login", "rt", 5).await.unwrap();
-        let presented = present(&provider(), project, "login", &handle)
+        let handle = seal(&provider(), &scope(project), "rt", 5).await.unwrap();
+        let presented = present(&provider(), &scope(project), &handle)
             .await
             .unwrap();
         assert_eq!(presented.upstream_token(), "rt");
@@ -568,8 +835,7 @@ mod tests {
     ) -> Result<TokenReply, ReplyError> {
         seal_refresh_response(
             &provider(),
-            PROJECT,
-            "login",
+            &scope(PROJECT),
             presented,
             UpstreamReply {
                 status,
@@ -584,10 +850,10 @@ mod tests {
     const PROJECT: Uuid = Uuid::from_u128(1);
 
     async fn presented_handle(upstream: &str) -> PresentedRefreshToken {
-        let handle = seal(&provider(), PROJECT, "login", upstream, 1)
+        let handle = seal(&provider(), &scope(PROJECT), upstream, 1)
             .await
             .unwrap();
-        present(&provider(), PROJECT, "login", &handle)
+        present(&provider(), &scope(PROJECT), &handle)
             .await
             .unwrap()
     }
@@ -610,7 +876,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let unsealed = unseal(&provider(), PROJECT, "login", &new_handle)
+        let unsealed = unseal(&provider(), &scope(PROJECT), &new_handle)
             .await
             .unwrap();
         assert_eq!(unsealed.upstream_refresh_token, "new-rt");
@@ -640,7 +906,7 @@ mod tests {
             assert!(handle.starts_with("rrt1."));
             assert!(!String::from_utf8_lossy(&reply.body).contains("raw-rt"));
             assert_eq!(value["scope"], "a");
-            let unsealed = unseal(&provider(), PROJECT, "login", handle).await.unwrap();
+            let unsealed = unseal(&provider(), &scope(PROJECT), handle).await.unwrap();
             assert_eq!(unsealed.upstream_refresh_token, "raw-rt");
         }
         // A token the upstream rotated wins over the legacy one.
@@ -655,9 +921,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let unsealed = unseal(&provider(), PROJECT, "login", &handle)
-            .await
-            .unwrap();
+        let unsealed = unseal(&provider(), &scope(PROJECT), &handle).await.unwrap();
         assert_eq!(unsealed.upstream_refresh_token, "rotated");
         // A body that is not a JSON object cannot take a handle and passes through.
         let reply = refresh(&legacy, 200, "ok").await.unwrap();
@@ -713,8 +977,7 @@ mod tests {
         // The same for a code-grant response.
         let out = seal_in_token_response(
             &provider(),
-            Uuid::new_v4(),
-            "login",
+            &scope(Uuid::new_v4()),
             200,
             "access_token=at&refresh_token=rt".into(),
             1,
@@ -763,28 +1026,28 @@ mod tests {
     async fn only_ciphertext_failures_reject_a_handle_and_other_failures_are_unavailable() {
         use rise_backend_core::encryption::CiphertextRejected;
         let project = Uuid::new_v4();
-        let handle = seal(&provider(), project, "login", "rt", 1).await.unwrap();
+        let handle = seal(&provider(), &scope(project), "rt", 1).await.unwrap();
 
         let rejecting =
             FailingProvider(|| anyhow!("authentication failed").context(CiphertextRejected));
         assert!(matches!(
-            unseal(&rejecting, project, "login", &handle).await,
+            unseal(&rejecting, &scope(project), &handle).await,
             Err(HandleError::Rejected(_))
         ));
         let throttled = FailingProvider(|| anyhow!("ThrottlingException"));
         assert!(matches!(
-            unseal(&throttled, project, "login", &handle).await,
+            unseal(&throttled, &scope(project), &handle).await,
             Err(HandleError::Unavailable(_))
         ));
         assert!(matches!(
-            present(&throttled, project, "login", &handle).await,
+            present(&throttled, &scope(project), &handle).await,
             Err(HandleError::Unavailable(_))
         ));
         // A raw token is never decrypted, so a failing provider is irrelevant.
-        assert!(present(&throttled, project, "login", "raw").await.is_ok());
+        assert!(present(&throttled, &scope(project), "raw").await.is_ok());
         // Things that are not handles at all are rejected before any provider call.
         assert!(matches!(
-            unseal(&throttled, project, "login", "rrt2.abc").await,
+            unseal(&throttled, &scope(project), "rrt2.abc").await,
             Err(HandleError::Rejected(_))
         ));
         // A real provider rejects tampering with the typed marker.
@@ -794,7 +1057,7 @@ mod tests {
         let error = provider()
             .decrypt(
                 &format!("{ENVELOPE_PREFIX}{}", &tampered["rrt1.".len()..]),
-                &context(project, "login"),
+                &scope(project).context(),
             )
             .await
             .unwrap_err();
@@ -812,7 +1075,7 @@ mod tests {
         let handle = value["refresh_token"].as_str().unwrap();
         assert!(is_handle(handle));
         assert!(!out.contains("upstream-rt"));
-        let unsealed = unseal(&provider(), project, "login", handle).await.unwrap();
+        let unsealed = unseal(&provider(), &scope(project), handle).await.unwrap();
         assert_eq!(unsealed.upstream_refresh_token, "upstream-rt");
         assert_eq!(unsealed.issued_at, 42);
         let mut expected = json!({
