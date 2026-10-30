@@ -13,6 +13,8 @@ mod cli;
 
 #[cfg(any(feature = "cli", feature = "backend"))]
 mod rise_toml;
+#[cfg(any(feature = "cli", feature = "backend"))]
+mod token_trace;
 
 #[cfg(feature = "backend")]
 mod db;

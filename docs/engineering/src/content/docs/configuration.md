@@ -674,15 +674,19 @@ This surfaces:
 
 To inspect claims from the *client* side — the token the `rise` CLI presents
 (`RISE_TOKEN`, a `RISE_TOKEN_COMMAND`, or GitHub Actions OIDC) — see
-**Inspecting Token Claims** in the user troubleshooting guide.
+**Inspecting Token Claims** in the user troubleshooting guide, or use the
+`rise::auth::idtoken` target described below.
 
-### Raw IdP ID-token claims
+### Raw ID-token claims
 
-To see the raw ID-token header and payload the IdP returned during browser
-login, enable the dedicated `rise::auth::idtoken` target at `trace`:
+To see the raw token header and payload, enable the dedicated
+`rise::auth::idtoken` target at `trace`. The same target covers the IdP ID token
+the backend receives during browser login (`rise backend server`) and the token
+the CLI presents (`rise login`, `rise deploy`, ...):
 
 ```bash
 RUST_LOG=info,rise::auth::idtoken=trace rise backend server
+RUST_LOG=info,rise::auth::idtoken=trace rise login
 ```
 
 This is strictly opt-in: `RUST_LOG=debug` (or `rise=debug`) does not turn it on.
