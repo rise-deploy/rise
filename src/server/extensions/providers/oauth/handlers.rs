@@ -574,7 +574,7 @@ pub async fn authorize(
 
     // Get OAuth extension
     let extension =
-        db_extensions::find_by_project_and_name(&state.db_pool, project.id, &extension_name)
+        db_extensions::find_active_by_project_and_name(&state.db_pool, project.id, &extension_name)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or((
@@ -900,7 +900,7 @@ pub async fn callback(
 
     // Get OAuth extension
     let extension =
-        db_extensions::find_by_project_and_name(&state.db_pool, project.id, &extension_name)
+        db_extensions::find_active_by_project_and_name(&state.db_pool, project.id, &extension_name)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or((
@@ -1504,7 +1504,7 @@ async fn token_endpoint_inner(
 
     // Get OAuth extension
     let extension =
-        db_extensions::find_by_project_and_name(&state.db_pool, project.id, extension_name)
+        db_extensions::find_active_by_project_and_name(&state.db_pool, project.id, extension_name)
             .await
             .map_err(|e| {
                 error!("Database error: {:?}", e);
@@ -2332,7 +2332,7 @@ pub async fn oidc_discovery(
 
     // Get OAuth extension
     let extension =
-        db_extensions::find_by_project_and_name(&state.db_pool, project.id, &extension_name)
+        db_extensions::find_active_by_project_and_name(&state.db_pool, project.id, &extension_name)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or((
@@ -2529,7 +2529,7 @@ pub async fn oidc_jwks(
 
     // Get OAuth extension
     let extension =
-        db_extensions::find_by_project_and_name(&state.db_pool, project.id, &extension_name)
+        db_extensions::find_active_by_project_and_name(&state.db_pool, project.id, &extension_name)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or((

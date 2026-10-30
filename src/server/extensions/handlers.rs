@@ -417,9 +417,31 @@ pub async fn delete_extension(
         return Err(ServerError::forbidden("Access denied"));
     }
 
-    db_extensions::mark_deleted(&state.db_pool, project.id, &extension_name)
+    let ext = db_extensions::mark_deleted(&state.db_pool, project.id, &extension_name)
         .await
         .internal_err("Failed to delete extension")?;
+
+    // The row stays until the provider's reconciler removes it. An OAuth
+    // extension's rotating logins hold upstream tokens, which are erased now
+    // rather than left stored behind a deleted extension. The extension is
+    // already refused at its end-user endpoints, so a failure here leaves the
+    // deletion in effect; the reconciler's removal of the row erases the rest.
+    if ext.extension_type == "oauth" {
+        if let Err(e) = crate::db::oauth_refresh_tokens::delete_extension_families(
+            &state.db_pool,
+            project.id,
+            &extension_name,
+        )
+        .await
+        {
+            tracing::error!(
+                "Failed to erase the refresh token families of deleted extension {}/{}: {:?}",
+                project.id,
+                extension_name,
+                e
+            );
+        }
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }

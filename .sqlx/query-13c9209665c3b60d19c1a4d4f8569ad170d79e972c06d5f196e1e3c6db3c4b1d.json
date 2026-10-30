@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT project_id, extension, extension_type,\n               spec as \"spec: Value\",\n               status as \"status: Value\",\n               created_at, updated_at, deleted_at\n        FROM project_extensions\n        WHERE project_id = $1 AND extension = $2 AND deleted_at IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "extension",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "extension"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "extension_type",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "extension_type"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "spec: Value",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "spec"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status: Value",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "project_extensions",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "13c9209665c3b60d19c1a4d4f8569ad170d79e972c06d5f196e1e3c6db3c4b1d"
+}
