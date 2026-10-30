@@ -924,6 +924,7 @@ impl SnowflakeOAuthProvisioner {
                 )),
                 token_endpoint_auth_method: Default::default(),
                 scopes: effective_config.scopes,
+                refresh_token: Default::default(),
             };
 
         let plaintext = self

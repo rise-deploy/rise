@@ -1,6 +1,8 @@
+use crate::db::oauth_refresh_tokens as db_refresh_tokens;
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::providers::oauth::models::{
-    OAuthExtensionSpec, OAuthExtensionStatus, TokenEndpointAuthMethod, TokenResponse,
+    OAuthExtensionSpec, OAuthExtensionStatus, RefreshTokenMode, TokenEndpointAuthMethod,
+    TokenResponse,
 };
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
@@ -13,6 +15,52 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
+
+/// The upstream provider rejected a refresh token as `invalid_grant`
+/// (RFC 6749 §5.2): the token is revoked, expired or otherwise dead for good.
+/// Attached as context to the error [`OAuthProvider::refresh_token`] returns;
+/// look for it with `downcast_ref`.
+#[derive(Debug)]
+pub struct UpstreamInvalidGrant;
+
+impl std::fmt::Display for UpstreamInvalidGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream rejected the refresh token as invalid_grant")
+    }
+}
+
+impl std::error::Error for UpstreamInvalidGrant {}
+
+/// The upstream answered a refresh with 2xx but without a usable token
+/// response (not a JSON object, or no `access_token`). Attached as context to
+/// the error [`OAuthProvider::refresh_token`] returns.
+#[derive(Debug)]
+pub struct UpstreamMalformedResponse;
+
+impl std::fmt::Display for UpstreamMalformedResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("upstream returned a malformed token response")
+    }
+}
+
+impl std::error::Error for UpstreamMalformedResponse {}
+
+fn is_invalid_grant(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+            .as_deref()
+            == Some("invalid_grant")
+}
+
+/// The refresh-token mode of a stored spec; `Sealed` when it is absent or unreadable.
+pub(super) fn refresh_mode(spec: &Value) -> RefreshTokenMode {
+    spec.get("refresh_token")
+        .and_then(|v| v.get("mode"))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
 
 pub struct OAuthProviderConfig {
     pub db_pool: PgPool,
@@ -211,17 +259,27 @@ impl OAuthProvider {
                 "Token refresh failed with status {}: {}",
                 status, error_text
             );
-            return Err(anyhow!(
+            let failure = anyhow!(
                 "Token refresh failed with status {}: {}",
                 status,
                 error_text
-            ));
+            );
+            return Err(if is_invalid_grant(status, &error_text) {
+                failure.context(UpstreamInvalidGrant)
+            } else {
+                failure
+            });
         }
 
-        let token_response: TokenResponse = response
-            .json()
-            .await
-            .context("Failed to parse token refresh response")?;
+        let token_response: TokenResponse = response.json().await.map_err(|e| {
+            let malformed = e.is_decode();
+            let e = anyhow::Error::new(e).context("Failed to parse token refresh response");
+            if malformed {
+                e.context(UpstreamMalformedResponse)
+            } else {
+                e
+            }
+        })?;
 
         Ok(token_response)
     }
@@ -281,6 +339,8 @@ impl Extension for OAuthProvider {
         // Validate issuer_url
         Url::parse(&spec.issuer_url).context("Invalid issuer_url URL")?;
 
+        spec.refresh_token.validate().map_err(|e| anyhow!(e))?;
+
         // Validate optional endpoint URLs if provided
         if let Some(ref auth_endpoint) = spec.authorization_endpoint {
             if !auth_endpoint.is_empty() {
@@ -306,6 +366,21 @@ impl Extension for OAuthProvider {
     ) -> Result<()> {
         use crate::db::{extensions as db_extensions, projects};
         use chrono::Utc;
+
+        // Handles issued in `rotating` mode are not accepted in `sealed` mode.
+        // Dropping their state now keeps them from coming back to life if the
+        // extension is switched to `rotating` again later.
+        if refresh_mode(old_spec) == RefreshTokenMode::Rotating
+            && refresh_mode(new_spec) != RefreshTokenMode::Rotating
+        {
+            let n =
+                db_refresh_tokens::delete_extension_families(db_pool, project_id, extension_name)
+                    .await?;
+            info!(
+                "Dropped {} rotating refresh token families of {}/{}",
+                n, project_id, extension_name
+            );
+        }
 
         // Get project name for redirect URI
         let project = projects::find_by_id(db_pool, project_id)
@@ -825,6 +900,33 @@ const authUrl = 'https://api.rise.dev/oidc/my-app/oauth-provider/authorize?redir
                     },
                     "description": "OAuth scopes to request. Leave empty for providers without scopes (e.g. Notion).",
                     "example": ["openid", "email", "profile"]
+                },
+                "refresh_token": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "Refresh tokens returned to the app are always Rise-issued handles, never the upstream token. mode 'sealed' (default) issues stateless handles that can be reused until the upstream token expires; 'rotating' issues single-use handles stored by Rise: every refresh returns a new refresh_token the app must save, and replaying an old one revokes the login.",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["sealed", "rotating"],
+                            "default": "sealed"
+                        },
+                        "grace_period_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 300,
+                            "default": 30,
+                            "description": "rotating mode only: how long a just-used refresh token still returns the same successor (multiple tabs, retried requests)."
+                        },
+                        "max_lifetime_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 315360000,
+                            "default": 2592000,
+                            "description": "rotating mode only: absolute lifetime of a login from sign-in, after which the user must sign in again. At least the grace period."
+                        }
+                    },
+                    "example": {"mode": "rotating", "grace_period_seconds": 30, "max_lifetime_seconds": 2592000}
                 }
             }
         })
@@ -1299,5 +1401,144 @@ mod credential_scope_tests {
                 "token credentials must not reach a second HTTPS origin"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod refresh_token_setting_tests {
+    use super::*;
+    use crate::server::encryption::providers::local::LocalEncryptionProvider;
+
+    fn provider() -> OAuthProvider {
+        OAuthProvider::new(OAuthProviderConfig {
+            db_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://test:test@localhost/test")
+                .unwrap(),
+            encryption_provider: Arc::new(
+                LocalEncryptionProvider::new("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+                    .unwrap(),
+            ),
+            ssrf_config: crate::server::ssrf::SsrfConfig::default(),
+            api_domain: "https://rise.example.com".into(),
+        })
+    }
+
+    fn spec(refresh_token: Option<Value>) -> Value {
+        let mut spec = json!({
+            "provider_name": "Example",
+            "client_id": "client",
+            "client_secret_encrypted": "rise:enc:v2:abc",
+            "issuer_url": "https://idp.example.com",
+        });
+        if let Some(refresh_token) = refresh_token {
+            spec["refresh_token"] = refresh_token;
+        }
+        spec
+    }
+
+    #[tokio::test]
+    async fn refresh_token_settings_are_bounds_checked() {
+        let provider = provider();
+        for valid in [
+            None,
+            Some(json!({})),
+            Some(json!({"mode": "sealed"})),
+            Some(json!({"mode": "rotating"})),
+            Some(json!({"mode": "rotating", "grace_period_seconds": 1, "max_lifetime_seconds": 1})),
+            Some(
+                json!({"mode": "rotating", "grace_period_seconds": 300, "max_lifetime_seconds": 300}),
+            ),
+            Some(json!({"mode": "rotating", "max_lifetime_seconds": 315_360_000})),
+        ] {
+            provider
+                .validate_spec(&spec(valid.clone()))
+                .await
+                .unwrap_or_else(|e| panic!("{valid:?} should be valid: {e:?}"));
+        }
+        for invalid in [
+            json!({"mode": "stateful"}),
+            json!({"mode": "rotating", "grace_period_seconds": 301}),
+            json!({"mode": "rotating", "grace_period_seconds": 0}),
+            json!({"mode": "rotating", "grace_period_seconds": -1}),
+            json!({"mode": "rotating", "grace_period_seconds": 60, "max_lifetime_seconds": 59}),
+            // The 30 second default grace period applies when none is given.
+            json!({"mode": "rotating", "max_lifetime_seconds": 29}),
+            json!({"mode": "rotating", "max_lifetime_seconds": 315_360_001}),
+            json!({"mode": "rotating", "max_lifetime_seconds": 0}),
+            // Rotation settings are rejected outside rotating mode.
+            json!({"grace_period_seconds": 10}),
+            json!({"mode": "sealed", "max_lifetime_seconds": 3600}),
+            json!({"mode": "rotating", "gracePeriod": 5}),
+            json!("rotating"),
+        ] {
+            assert!(
+                provider
+                    .validate_spec(&spec(Some(invalid.clone())))
+                    .await
+                    .is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn default_refresh_token_settings_are_not_serialized_and_mode_is_read_from_stored_specs() {
+        let parsed: OAuthExtensionSpec = serde_json::from_value(spec(None)).unwrap();
+        assert_eq!(parsed.refresh_token.mode, RefreshTokenMode::Sealed);
+        assert_eq!(
+            parsed.refresh_token.grace_period(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            parsed.refresh_token.max_lifetime(),
+            std::time::Duration::from_secs(2_592_000)
+        );
+        assert!(serde_json::to_value(&parsed)
+            .unwrap()
+            .get("refresh_token")
+            .is_none());
+
+        let rotating = spec(Some(
+            json!({"mode": "rotating", "grace_period_seconds": 10}),
+        ));
+        let parsed: OAuthExtensionSpec = serde_json::from_value(rotating.clone()).unwrap();
+        assert_eq!(parsed.refresh_token.mode, RefreshTokenMode::Rotating);
+        assert_eq!(
+            parsed.refresh_token.grace_period(),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            parsed.refresh_token.max_lifetime(),
+            std::time::Duration::from_secs(2_592_000)
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap()["refresh_token"]["mode"],
+            "rotating"
+        );
+
+        assert_eq!(refresh_mode(&rotating), RefreshTokenMode::Rotating);
+        assert_eq!(refresh_mode(&spec(None)), RefreshTokenMode::Sealed);
+        assert_eq!(
+            refresh_mode(&json!({"refresh_token": "junk"})),
+            RefreshTokenMode::Sealed
+        );
+    }
+
+    #[test]
+    fn only_a_400_invalid_grant_error_is_a_dead_refresh_token() {
+        use reqwest::StatusCode;
+        let invalid = r#"{"error":"invalid_grant","error_description":"expired"}"#;
+        assert!(is_invalid_grant(StatusCode::BAD_REQUEST, invalid));
+        assert!(!is_invalid_grant(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            invalid
+        ));
+        assert!(!is_invalid_grant(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_client"}"#
+        ));
+        assert!(!is_invalid_grant(StatusCode::BAD_REQUEST, "invalid_grant"));
+        let failure = anyhow!("failed").context(UpstreamInvalidGrant);
+        assert!(failure.downcast_ref::<UpstreamInvalidGrant>().is_some());
     }
 }

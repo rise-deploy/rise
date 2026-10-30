@@ -109,8 +109,11 @@ OIDC-compliant providers expose an OpenID configuration document, so Rise can di
 | `token_endpoint` | Auto-discovered | Required |
 | `token_endpoint_auth_method` | Optional, `client_secret_post` by default | Optional, `client_secret_post` by default |
 | `scopes` | Provider-specific | Provider-specific; `[]` for providers without scopes |
+| `refresh_token` | Optional, [`sealed` mode](#refresh-token-handles) by default | Optional, `sealed` mode by default |
 
 `token_endpoint_auth_method` sets how Rise authenticates to the upstream token endpoint: `client_secret_post` sends `client_id` and `client_secret` in the request body, `client_secret_basic` sends them as an HTTP Basic `Authorization` header (RFC 6749 §2.3.1). Query parameters in `authorization_endpoint` are kept on the authorization request.
+
+`refresh_token` selects how the refresh tokens your app receives behave; see [Refresh-token handles](#refresh-token-handles).
 
 Examples:
 
@@ -271,7 +274,52 @@ The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the u
 
 - The rest of the response is the upstream response, unchanged. Responses that are not successful JSON, or that carry no refresh token, are relayed as-is.
 - A refresh response contains a new handle only if the upstream provider rotated its refresh token. Otherwise it has no `refresh_token`; keep using the handle you already have.
-- Handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid.
+- In the default `sealed` mode, handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid. Opt in to `rotating` mode (below) for single-use handles.
+
+#### Rotating refresh tokens
+
+Set `refresh_token.mode` to `rotating` to make every refresh token single use:
+
+```json
+{
+  "refresh_token": {
+    "mode": "rotating",
+    "grace_period_seconds": 30,
+    "max_lifetime_seconds": 2592000
+  }
+}
+```
+
+| Field | Default | Bounds | Meaning |
+| --- | --- | --- | --- |
+| `mode` | `sealed` | `sealed`, `rotating` | `sealed`: stateless `rrt1.` handles. `rotating`: stateful, single-use `rrt2.` handles stored by Rise. |
+| `grace_period_seconds` | `30` | 1 to 300 | How long after a refresh the same handle still returns the same new refresh token. |
+| `max_lifetime_seconds` | `2592000` (30 days) | Grace period to 315360000 (10 years) | Absolute lifetime of a login, counted from the original sign-in. |
+
+`grace_period_seconds` and `max_lifetime_seconds` are rejected unless `mode` is `rotating`.
+
+In `rotating` mode:
+
+- Every successful refresh response contains a `refresh_token`: a new handle. **Your app must store it after every refresh and use it for the next one.** The handle you just used is spent. This holds even if the upstream provider does not rotate its own refresh token; Rise keeps the upstream token server-side and never returns it.
+- Presenting the same handle again within `grace_period_seconds` of its use returns the same response, including the same new `refresh_token`. Several browser tabs, or a request retried after a timeout, therefore agree on one successor instead of locking each other out. Rise does not call the upstream provider again for these requests.
+- Presenting a spent handle after the grace period is treated as token theft or a broken client. Rise revokes the whole login (every refresh token derived from the same sign-in) and answers `invalid_grant`.
+- A login ends `max_lifetime_seconds` after the user signed in, however actively it is refreshed. The next refresh answers `invalid_grant`.
+- If the upstream provider answers a refresh with `invalid_grant`, Rise revokes the login as well. A failure that is not `invalid_grant` (network error, upstream outage) leaves the handle usable so the request can be retried.
+- If a refresh of the same handle is still in progress when a second request arrives, the second request waits for up to about five seconds for it to finish and receives the same response; if it does not finish in time the endpoint answers `503` with `temporarily_unavailable` and `Retry-After: 1`, and the request can be retried.
+- A refresh that fails because the upstream is unreachable, times out (after 30 seconds) or answers with an error other than `invalid_grant` leaves the handle usable; if the upstream answers success without a valid token response, the endpoint answers `502` and the handle also stays usable. A failure of Rise's own storage answers `503` `server_error`.
+- A refresh that hangs for more than 60 seconds releases its hold on the handle, so a crashed or frozen Rise process cannot lock a login out; the next request takes over.
+
+Whenever the token endpoint answers `invalid_grant` for a refresh token, discard your stored tokens and send the user through the authorization flow again.
+
+Switching an existing extension:
+
+- `sealed` to `rotating`: handles that users already hold (`rrt1.` handles, and raw tokens from before handles) keep working. The first refresh accepts one, refreshes upstream, and returns an `rrt2.` handle that starts a new login with a fresh `max_lifetime_seconds`. Nobody is signed out. `rrt1.` handles are stateless, so until they are exchanged they can be presented any number of times.
+- `rotating` to `sealed`: `rrt2.` handles are rejected with `invalid_grant`, so users sign in again. Rise also deletes the stored state of the extension's rotating logins.
+- Deleting the extension deletes its stored state.
+
+Changing `max_lifetime_seconds` does not affect logins that already started; they keep the lifetime they started with.
+
+Rotating mode makes each refresh write to Rise's database, and keeps one small record per handle until the login ends; sealed mode needs no storage. With KMS, a rotating-mode refresh costs one `kms:Decrypt` and two `kms:Encrypt` calls (a replay within the grace period costs one `kms:Decrypt`), and the authorization-code exchange one `kms:Encrypt`.
 
 :::note[Refresh tokens issued before handles]
 Refresh tokens issued before handles were introduced are raw upstream tokens. For now the token endpoint still accepts them and refreshes them upstream, and every response from then on carries a handle. This compatibility path will be removed in a later release, after which only handles are accepted.
@@ -309,7 +357,7 @@ GET /oidc/{project}/{extension}/jwks
 - OAuth state tokens protect against CSRF and expire after 10 minutes.
 - PKCE proves that a public client initiated the authorization flow.
 - Secret validation uses constant-time comparison.
-- Applications never receive the upstream refresh token. They hold a sealed handle that only the Rise token endpoint can redeem, for the project and extension it was issued for.
+- Applications never receive the upstream refresh token. They hold a handle that only the Rise token endpoint can redeem, for the project and extension it was issued for. In `rotating` mode a handle can be redeemed once, and its reuse revokes the login.
 - Applications own token storage and refresh behavior after exchange.
 
 ## Troubleshooting

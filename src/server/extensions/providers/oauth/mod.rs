@@ -6,6 +6,8 @@ pub mod handlers;
 #[cfg(feature = "backend")]
 pub mod refresh_handle;
 #[cfg(feature = "backend")]
+pub mod rotation;
+#[cfg(feature = "backend")]
 pub mod routes;
 
 pub use provider::*;

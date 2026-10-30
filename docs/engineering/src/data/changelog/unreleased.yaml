@@ -125,6 +125,31 @@ changes:
       present them directly to the upstream provider to treat the value as
       opaque and refresh through the Rise token endpoint. The same encryption
       key must stay available: handles do not unseal if it is changed.
+  - id: oauth-extension-rotating-refresh-tokens
+    title: OAuth extensions can issue single-use rotating refresh tokens
+    group: security-and-upgrade-guidance
+    type: feature
+    impact: configuration
+    details: |-
+      The OAuth extension spec gains a `refresh_token` setting. `mode: sealed`
+      (the default, unchanged) keeps the stateless `rrt1.` handles. `mode: rotating`
+      issues stateful, single-use `rrt2.` handles: each refresh returns a new
+      refresh token the app must store, a handle presented again within
+      `grace_period_seconds` (default 30, at most 300) returns the same
+      response, a later reuse revokes the login, and a login ends after
+      `max_lifetime_seconds` (default 30 days). Rise keeps the upstream refresh
+      token encrypted in PostgreSQL.
+
+      A migration adds the `oauth_refresh_families` and `oauth_refresh_tokens`
+      tables. Expired rows are removed by the existing hourly leader-gated
+      cleanup. Extensions that stay in `sealed` mode do not touch them. With KMS,
+      a rotating-mode refresh costs one `kms:Decrypt` and two `kms:Encrypt` calls.
+    action: |-
+      The database migration runs on startup; no other operator action. Opt
+      extensions in per spec when their apps store the refresh token returned by
+      every refresh. Switching an extension from `rotating` back to `sealed`
+      rejects `rrt2.` handles, so users sign in again. Switching from `sealed`
+      to `rotating` keeps existing sessions.
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-

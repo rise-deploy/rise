@@ -13,10 +13,11 @@
 //! the project and extension that issued it. The ciphertext carries a small
 //! versioned JSON payload (`v`, `upstream`, `iat`).
 //!
-//! The leading `rrt<N>.` is the handle *scheme*. [`unseal`] dispatches on it,
-//! which keeps room for further schemes (for example server-side-state
-//! handles) next to this one; a token that carries no known scheme is not a
-//! handle.
+//! The leading `rrt<N>.` is the handle *scheme*. This module only unseals
+//! `rrt1.`; any other scheme (`rrt2.` is the server-side-state handle of
+//! `rotating` mode, see the `rotation` module) is recognised by [`is_handle`]
+//! and rejected here, so it is never mistaken for a raw upstream token.
+//! A token that carries no scheme is not a handle.
 
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use anyhow::{bail, Context, Result};
@@ -70,9 +71,13 @@ impl PresentedRefreshToken {
     }
 }
 
-/// Whether `token` carries a Rise handle scheme (it may still fail to unseal).
+/// Whether `token` carries a Rise handle scheme, `rrt<N>.` (it may still fail
+/// to unseal, or belong to a scheme this extension does not accept).
 pub fn is_handle(token: &str) -> bool {
-    token.starts_with(SEALED_HANDLE_PREFIX)
+    token
+        .strip_prefix("rrt")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(scheme, _)| !scheme.is_empty() && scheme.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn context(project: Uuid, extension: &str) -> EncryptionContext {
@@ -190,19 +195,42 @@ pub async fn seal_in_token_response(
     body: String,
     issued_at: i64,
 ) -> Result<String> {
-    if !(200..300).contains(&status) {
+    let Some((mut members, upstream)) = split_refresh_token(status, &body) else {
         return Ok(body);
-    }
-    let Ok(serde_json::Value::Object(mut members)) = serde_json::from_str(&body) else {
-        return Ok(body);
-    };
-    let upstream = match members.get("refresh_token") {
-        Some(serde_json::Value::String(token)) if !token.is_empty() => token.clone(),
-        _ => return Ok(body),
     };
     let handle = seal(provider, project, extension, &upstream, issued_at).await?;
+    replace_refresh_token(&mut members, handle)
+}
+
+/// The members of a token response whose `refresh_token` is to be replaced,
+/// with that token. `None` unless this is a 2xx response whose body is a JSON
+/// object with a non-empty string `refresh_token`.
+pub(super) fn split_refresh_token(
+    status: u16,
+    body: &str,
+) -> Option<(serde_json::Map<String, serde_json::Value>, String)> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let Ok(serde_json::Value::Object(members)) = serde_json::from_str(body) else {
+        return None;
+    };
+    match members.get("refresh_token") {
+        Some(serde_json::Value::String(token)) if !token.is_empty() => {
+            let token = token.clone();
+            Some((members, token))
+        }
+        _ => None,
+    }
+}
+
+/// Serialize `members` with `handle` as their `refresh_token`.
+pub(super) fn replace_refresh_token(
+    members: &mut serde_json::Map<String, serde_json::Value>,
+    handle: String,
+) -> Result<String> {
     members.insert("refresh_token".into(), serde_json::Value::String(handle));
-    serde_json::to_string(&members).context("Failed to serialize token response")
+    serde_json::to_string(members).context("Failed to serialize token response")
 }
 
 #[cfg(test)]
@@ -290,6 +318,32 @@ mod tests {
             .unwrap();
         let forged = format!("rrt1.{}", other_slot.strip_prefix(ENVELOPE_PREFIX).unwrap());
         assert!(unseal(&provider(), project, "login", &forged)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn any_handle_scheme_is_recognised_and_raw_tokens_are_not() {
+        for handle in ["rrt1.abc", "rrt2.abc", "rrt10.x", "rrt9."] {
+            assert!(is_handle(handle), "{handle}");
+        }
+        for raw in [
+            "",
+            "rrt",
+            "rrt.abc",
+            "rrta.abc",
+            "rrt1abc",
+            "xrrt1.abc",
+            "ghr_abc.def",
+        ] {
+            assert!(!is_handle(raw), "{raw}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handle_of_another_scheme_is_rejected_not_forwarded() {
+        let project = Uuid::new_v4();
+        assert!(present(&provider(), project, "login", "rrt2.abcd")
             .await
             .is_err());
     }

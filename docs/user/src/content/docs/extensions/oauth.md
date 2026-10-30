@@ -55,6 +55,7 @@ stdin workflow.
 - `authorization_endpoint`: explicit authorization endpoint for non-OIDC providers.
 - `token_endpoint`: explicit token endpoint for non-OIDC providers.
 - `token_endpoint_auth_method`: `client_secret_post` (default) sends the client credentials in the token request body; `client_secret_basic` sends them as an HTTP Basic `Authorization` header, as Notion requires.
+- `refresh_token`: how refresh tokens behave. `{"mode": "rotating"}` makes them single use, with `grace_period_seconds` and `max_lifetime_seconds` tuning; the default is `sealed`. See [Refresh-token handles](/docs/user-guide/oauth/#refresh-token-handles).
 - `scopes`: may be `[]` for providers without scopes; the authorization request then carries no `scope` parameter.
 
 ## Setup Checklist

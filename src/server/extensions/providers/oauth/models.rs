@@ -34,6 +34,99 @@ pub struct OAuthExtensionSpec {
     /// in which case the authorization request carries no `scope` parameter.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// How the refresh tokens handed to the app behave.
+    #[serde(default, skip_serializing_if = "RefreshTokenSettings::is_default")]
+    pub refresh_token: RefreshTokenSettings,
+}
+
+/// Handling of the refresh tokens an app receives from the token endpoint.
+///
+/// The upstream provider's refresh token never reaches the app in either mode;
+/// the app gets a Rise-issued handle for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefreshTokenSettings {
+    #[serde(default)]
+    pub mode: RefreshTokenMode,
+    /// `rotating` mode only: how long after a refresh the same handle still
+    /// returns the same successor (multiple tabs, retried requests). A handle
+    /// presented later is treated as stolen and ends the whole login.
+    /// 1 second to 5 minutes, 30 seconds by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_period_seconds: Option<u64>,
+    /// `rotating` mode only: absolute lifetime of a login, counted from the
+    /// sign-in, after which the user has to sign in again. From the grace
+    /// period to 10 years, 30 days by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lifetime_seconds: Option<u64>,
+}
+
+/// Which kind of refresh-token handle the extension issues.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshTokenMode {
+    /// Stateless `rrt1.` handles: the upstream token sealed under the extension's key.
+    #[default]
+    Sealed,
+    /// Stateful, single-use `rrt2.` handles with reuse detection.
+    Rotating,
+}
+
+impl RefreshTokenSettings {
+    pub const DEFAULT_GRACE_PERIOD_SECONDS: u64 = 30;
+    pub const MIN_GRACE_PERIOD_SECONDS: u64 = 1;
+    pub const MAX_GRACE_PERIOD_SECONDS: u64 = 5 * 60;
+    pub const DEFAULT_MAX_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+    pub const MAX_MAX_LIFETIME_SECONDS: u64 = 10 * 365 * 24 * 60 * 60;
+
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn grace_period(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.grace_period_seconds
+                .unwrap_or(Self::DEFAULT_GRACE_PERIOD_SECONDS),
+        )
+    }
+
+    pub fn max_lifetime(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.max_lifetime_seconds
+                .unwrap_or(Self::DEFAULT_MAX_LIFETIME_SECONDS),
+        )
+    }
+
+    /// Check the settings: the numeric ones belong to `rotating` mode and are
+    /// bounds-checked there.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode != RefreshTokenMode::Rotating {
+            if self.grace_period_seconds.is_some() || self.max_lifetime_seconds.is_some() {
+                return Err(
+                    "refresh_token.grace_period_seconds and refresh_token.max_lifetime_seconds \
+                     require refresh_token.mode \"rotating\""
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        let grace = self.grace_period().as_secs();
+        if !(Self::MIN_GRACE_PERIOD_SECONDS..=Self::MAX_GRACE_PERIOD_SECONDS).contains(&grace) {
+            return Err(format!(
+                "refresh_token.grace_period_seconds must be between {} and {}",
+                Self::MIN_GRACE_PERIOD_SECONDS,
+                Self::MAX_GRACE_PERIOD_SECONDS
+            ));
+        }
+        let lifetime = self.max_lifetime().as_secs();
+        if !(grace..=Self::MAX_MAX_LIFETIME_SECONDS).contains(&lifetime) {
+            return Err(format!(
+                "refresh_token.max_lifetime_seconds must be between the grace period ({grace}) and {}",
+                Self::MAX_MAX_LIFETIME_SECONDS
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Client authentication at the upstream token endpoint (RFC 6749 §2.3.1).
