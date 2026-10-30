@@ -137,6 +137,18 @@ between the control plane, Traefik and the database, and nothing addresses a
 project through it — so an existing namespace like `platform.internal` is
 passed as `cloud_map_namespace_id` and left alone.
 
+## Client addresses
+
+The module hands Traefik the real client address, so it reaches Rise as the
+first hop of `X-Forwarded-For`. With `alb-acm` the ALB sets the header and
+Traefik's `web` entrypoint trusts it from the public subnets only. With
+`nlb-traefik-acme` the NLB's IP targets see the NLB's own address, so the target
+groups enable PROXY protocol v2 and Traefik reads it on `web`, `websecure` and
+`ping` (the NLB prefixes its health check with the header too), again from the
+public subnets only. No security group changes: Traefik still admits only the
+edge group. Rise reads the client from that header only when its trusted-proxy
+list covers the VPC's private ranges.
+
 ## Several installs in one cluster
 
 Supported, and it takes two settings rather than one. Give each install its own
