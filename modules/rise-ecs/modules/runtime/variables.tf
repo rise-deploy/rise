@@ -158,6 +158,11 @@ variable "client_ip" {
 
     `trusted_cidrs` is the load balancer's address range, never the whole
     internet: a trusted peer can claim any client address.
+
+    This must match the ingress module's mode: an NLB there enables PROXY
+    protocol v2 on its target groups and requires "proxy-protocol" here, or
+    Traefik fails every connection (health checks included). `rise-ecs` couples
+    them; callers composing the submodules directly must do so themselves.
   EOT
   type = object({
     source        = optional(string, "none")

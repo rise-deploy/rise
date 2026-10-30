@@ -49,7 +49,8 @@ restricted to their intended callers. Port 8082 serves Traefik's ping check.
 `client_ip` says how the load balancer reports the client: `forwarded-headers`
 (ALB) trusts `X-Forwarded-*` on `web`, and `proxy-protocol` (NLB) reads PROXY
 protocol v2 on `web`, `websecure` and `ping`, each only from `trusted_cidrs` --
-the load balancer's subnets. The default, `none`, is for Traefik reached
+the load balancer's subnets. It must match the ingress module: an NLB there
+sends PROXY protocol v2 and needs `proxy-protocol` here. The default, `none`, is for Traefik reached
 directly, where its peer is the client. A trusted peer can claim any address, so
 the CIDRs are never `0.0.0.0/0`.
 

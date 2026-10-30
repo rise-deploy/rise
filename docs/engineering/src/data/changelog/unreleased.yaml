@@ -1116,6 +1116,7 @@ changes:
       from it.
   - id: ecs-client-ip-propagation
     title: ECS Traefik receives the real client address
+    group: security-and-upgrade-guidance
     type: fix
     impact: action-required
     backends: [ ecs ]
@@ -1126,17 +1127,35 @@ changes:
       request as coming from inside the VPC.
 
       - `alb-acm`: Traefik's `web` entrypoint trusts `X-Forwarded-For` and
-        `X-Forwarded-Proto` from the public subnets. Forwarded protocol is now
-        `https` for TLS-terminated requests.
+        `X-Forwarded-Proto` from the public subnets; applications now see the
+        ALB's `X-Forwarded-Proto` (`https` for TLS-terminated requests).
       - `nlb-traefik-acme`: the NLB target groups enable PROXY protocol v2, and
         Traefik reads it on `web`, `websecure` and `ping` from the public
         subnets. ACME HTTP-01 and the `ping` health check keep working.
 
+      The client is the **rightmost untrusted** entry of `X-Forwarded-For`; the
+      leftmost entries behind the ALB are client-supplied. Rise resolves it that
+      way through its trusted-proxy list.
+
+      **Ship this together with the trusted-proxy client-address resolution.**
+      Before it, Rise prefers `X-Real-IP`, which Traefik now passes through from
+      the client on the ALB path, so this change alone opens a spoofing window.
+
+      **ALB only, applications:** trusting the ALB also leaves the
+      client-supplied `X-Forwarded-Host` and `X-Real-Ip` intact (the ALB sets
+      neither); Traefik previously overwrote both, as Kubernetes nginx and Docker
+      still do. Applications that build URLs from `X-Forwarded-Host` become
+      host-header-injectable on ECS behind an ALB. Use the `Host` header instead.
+      Rise itself is unaffected. The NLB mode trusts no forwarded header and is
+      unaffected.
+
       Security groups are unchanged. The new `client_ip` input of the `runtime`
       submodule defaults to `none`, so direct deployments are unaffected.
     action: |-
-      Run `terraform apply`. It changes the Traefik task definition (a
-      single-replica service, so expect a brief interruption while it is
-      replaced) and, for the NLB, the target-group attribute. Rise reports the
-      client address correctly once its trusted-proxy list covers the VPC's
-      private ranges.
+      Upgrade Rise to the version with trusted-proxy client resolution first (or
+      together), then run `terraform apply`. It changes the Traefik task
+      definition (a single-replica service, so expect a brief interruption while
+      it is replaced) and, for the NLB, the target-group attribute. Rise reports
+      the client address correctly once its trusted-proxy list covers the VPC's
+      private ranges. Review ALB-fronted applications for use of
+      `X-Forwarded-Host` or `X-Real-Ip`.
