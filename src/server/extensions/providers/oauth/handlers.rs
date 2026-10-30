@@ -4,6 +4,7 @@ use super::models::{
 };
 use crate::db::{extensions as db_extensions, oauth_transient_state, projects as db_projects};
 use crate::server::auth::redirect::{is_loopback_host, origins_match};
+use crate::server::client_ip::ClientIp;
 use crate::server::encryption::EncryptionContext;
 use crate::server::state::AppState;
 use axum::{
@@ -539,6 +540,7 @@ async fn validate_redirect_uri(
 pub async fn authorize(
     State(state): State<AppState>,
     Path((project_name, extension_name)): Path<(String, String)>,
+    client_ip: ClientIp,
     headers: HeaderMap,
     Query(req): Query<AuthorizeFlowQuery>,
 ) -> Result<Response, (StatusCode, String)> {
@@ -548,11 +550,11 @@ pub async fn authorize(
     );
 
     // Rate limiting (keyed per project+IP so different projects have independent budgets)
-    let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+    let rate_key = client_ip.rate_limit_key();
     let session_key = crate::server::rate_limit::extract_session_key(&headers);
     if let Err(retry_after) = state
         .oauth_rate_limiter
-        .increment_and_check(&client_ip, session_key.as_deref(), &project_name)
+        .increment_and_check(&rate_key, session_key.as_deref(), &project_name)
         .await
     {
         tracing::warn!(
@@ -822,6 +824,7 @@ fn upstream_authorization_url(
 pub async fn callback(
     State(state): State<AppState>,
     Path((project_name, extension_name)): Path<(String, String)>,
+    client_ip: ClientIp,
     headers: HeaderMap,
     Query(req): Query<CallbackRequest>,
 ) -> Result<Response, (StatusCode, String)> {
@@ -831,11 +834,11 @@ pub async fn callback(
     );
 
     // Rate limiting (keyed per project+IP so different projects have independent budgets)
-    let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+    let rate_key = client_ip.rate_limit_key();
     let session_key = crate::server::rate_limit::extract_session_key(&headers);
     if let Err(retry_after) = state
         .oauth_rate_limiter
-        .increment_and_check(&client_ip, session_key.as_deref(), &project_name)
+        .increment_and_check(&rate_key, session_key.as_deref(), &project_name)
         .await
     {
         tracing::warn!(
@@ -1347,6 +1350,7 @@ fn oauth2_error(
 pub async fn token_endpoint(
     State(state): State<AppState>,
     Path((project_name, extension_name)): Path<(String, String)>,
+    client_ip: ClientIp,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Response {
@@ -1363,11 +1367,11 @@ pub async fn token_endpoint(
 
     // Rate limiting: count all attempts (including invalid ones) to thwart brute-force
     // Keyed per project+IP so different projects have independent budgets.
-    let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
+    let rate_key = client_ip.rate_limit_key();
     let session_key = crate::server::rate_limit::extract_session_key(&headers);
     if let Err(retry_after) = state
         .oauth_rate_limiter
-        .increment_and_check(&client_ip, session_key.as_deref(), &project_name)
+        .increment_and_check(&rate_key, session_key.as_deref(), &project_name)
         .await
     {
         tracing::warn!(

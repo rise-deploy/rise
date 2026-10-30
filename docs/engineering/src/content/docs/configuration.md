@@ -199,6 +199,8 @@ server:
   rs256_private_key_pem: "..."  # Optional: RS256 private key (persists JWTs across restarts)
   rs256_public_key_pem: "..."   # Optional: RS256 public key (derived if not provided)
   docs_dir: "/var/rise/docs"   # Optional: directory containing built static documentation
+  trusted_proxies:             # Optional: proxies whose forwarded-address headers are believed
+    - "10.0.0.0/8"
 ```
 
 **Documentation Serving (`docs_dir`):**
@@ -206,6 +208,20 @@ server:
 - In the container image, bundled user docs are copied to `/var/rise/docs`
 - In development, build `docs/user` and set this to the generated `docs/user/dist` directory if you want the backend to serve local docs
 - If not set, documentation endpoints return 404
+
+**Client address and trusted proxies (`trusted_proxies`):**
+- IP-keyed rate limits (device-login start, token exchange, OAuth extension endpoints, workload-token rejections) use the client address Rise resolves for each request. IPv6 clients are counted per /64, since a host with a /64 can rotate addresses within it; the device-login confirmation page still shows the full address.
+- `X-Forwarded-For` and `X-Real-IP` are plain request headers that any caller can send. Rise honours them only when the TCP peer that delivered the request is inside `trusted_proxies`; a request from any other peer is attributed to that peer and its forwarded headers are ignored.
+- `trusted_proxies` is a list of CIDRs (IPv4 or IPv6); a bare address means a single host. The default is loopback, RFC 1918 and IPv6 unique-local space: `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`. Arrays are replaced, not merged, so an explicit list drops the defaults; `[]` trusts no proxy.
+- For a request from a trusted peer that carries `X-Forwarded-For`, the header is read right to left, skipping trusted addresses; the first untrusted address is the client. If every entry is trusted, the leftmost is used. Each comma-separated entry is judged on its own, so garbage to the left of an entry a trusted proxy appended cannot affect it. Blank entries are skipped; entries may carry a port or `[v6]` brackets. An entry that is not UTF-8 or not an IP address ends the walk where it stands and the client is the peer, as does a chain of more than 32 entries. IPv4-mapped IPv6 addresses are treated as IPv4.
+- `X-Real-IP` is consulted only when there is no `X-Forwarded-For` header at all (and then only if it is a valid IP address); otherwise the peer is the client. It is never a fallback for an unusable `X-Forwarded-For`, because a proxy may pass a client-supplied `X-Real-IP` through.
+- Typical chains resolve correctly with the default: ingress-nginx (`peer 10.x`, `X-Forwarded-For: client`) and ALB -> Traefik -> Rise (`X-Forwarded-For: client, 10.0.1.5`), the latter provided Traefik is configured to trust the ALB and keep its forwarded headers (rise-deploy/rise#598).
+- If your reverse proxy reaches Rise from a **public** address, add that address to `trusted_proxies`; otherwise every client is attributed to the proxy and shares one rate-limit bucket.
+- **Co-tenant workloads are inside the default trust set.** Anything that can open a connection to Rise's port from a private address can set `X-Forwarded-For` and pick its rate-limit bucket:
+  - Docker: deployed apps share the `rise_default` network with `rise-backend`, so any app can call `rise-backend:3000` from a `172.x` address. Narrow `trusted_proxies` to Traefik's address (for example a single `/32`), or run Rise on a network deployed apps cannot join.
+  - Kubernetes: by default the chart's NetworkPolicy lets every pod in the cluster reach port 3000. Restrict `networkPolicy.httpIngressFrom` to the ingress controller (see `helm/rise/values.yaml`), and narrow `trusted_proxies` if the ingress controller's pod range is smaller than the private ranges.
+- Publishing Rise's port directly to untrusted networks is not covered by this setting. A published port can present a private source address to Rise: Docker's userland proxy (loopback traffic, rootless Docker, Docker Desktop, IPv6 without `ip6tables`) shows the bridge gateway as the peer, whereas rootful iptables DNAT keeps the client's source address. Put a proxy in front and narrow `trusted_proxies` to it.
+- The Metacontroller webhook and Traefik configuration listeners are separate and do not use this setting.
 
 **JWT Configuration:**
 - `jwt_signing_secret`: Base64-encoded secret for HS256 JWT signing (generate with `openssl rand -base64 32`)
