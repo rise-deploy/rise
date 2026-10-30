@@ -188,6 +188,13 @@ deployment_controller:
   # health-checked deployment never becomes Healthy. May be empty only when no
   # project uses health checks (ready-when-running gates on run-state alone).
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-http://rise-traefik:8080}"
+  # Shared secret for Traefik's HTTP provider endpoint (:3001
+  # /internal/traefik/config). When set, Rise requires `Authorization: Bearer
+  # <secret>` there and Traefik must send the same value
+  # (`--providers.http.headers.Authorization="Bearer <secret>"`). Empty leaves
+  # the endpoint unauthenticated, which is only safe while port 3001 is reachable
+  # by Traefik alone.
+  traefik_config_secret: "${RISE_TRAEFIK_CONFIG_SECRET:-}"
   access_classes:
     public:
       display_name: Public

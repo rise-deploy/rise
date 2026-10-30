@@ -60,6 +60,11 @@
 #   * PERSIST + BACK UP VOLUMES. The named volumes below are local; use durable
 #     storage and a backup strategy for `postgres_data`, `registry_data` and
 #     `traefik_acme`.
+#   * SET RISE_TRAEFIK_CONFIG_SECRET. Rise's Traefik provider endpoint (:3001)
+#     lists every deployment's hostnames and custom domains. With this variable
+#     set (`openssl rand -hex 32`), Rise requires it as a bearer token and the
+#     traefik service sends it; unset leaves the endpoint unauthenticated and
+#     reachable by anything on the rise_default network.
 #   * PORTS STAY INTERNAL. Only Traefik publishes host ports (80/443); Postgres,
 #     Dex, the registry and the backend are not exposed to the host — all ingress
 #     goes through Traefik. (The local overlay re-publishes them on 127.0.0.1 for
@@ -192,6 +197,11 @@ services:
       - "--providers.docker.network=rise_default"
       - "--providers.http.endpoint=http://rise:3001/internal/traefik/config"
       - "--providers.http.pollInterval=5s"
+      # Shared secret for the Rise HTTP-provider endpoint (:3001). Traefik sends it
+      # as `Authorization: Bearer <secret>` and the `rise` service requires it
+      # (RISE_TRAEFIK_CONFIG_SECRET, the same variable). Unset leaves the endpoint
+      # open. Traefik takes static config from args XOR env, so it must be a flag.
+      - "--providers.http.headers.Authorization=Bearer ${RISE_TRAEFIK_CONFIG_SECRET:-}"
       # Enable Traefik's API/dashboard on :8080 for INTERNAL use only: the Rise
       # backend reads per-server health and HTTP-router targets here to gate
       # deployment cutover (traefik_api_url=http://rise-traefik:8080 in
@@ -271,6 +281,10 @@ services:
       - RISE_INGRESS_SCHEME=https
       - RISE_CERTRESOLVER=le
       - RISE_TRAEFIK_ENTRYPOINT=websecure
+      # Bearer token Traefik must present on the provider endpoint (:3001). The
+      # `traefik` service reads the same variable. Generate with
+      # `openssl rand -hex 32` (16+ chars, no whitespace); empty disables the check.
+      - RISE_TRAEFIK_CONFIG_SECRET=${RISE_TRAEFIK_CONFIG_SECRET:-}
       - RISE_CLIENT_REGISTRY_URL=registry.${RISE_DOMAIN}
       # Registry URL the backend PULLS from (host Docker daemon). Defaults to
       # rise-registry:5000 (config/docker.yaml); override to a host-published

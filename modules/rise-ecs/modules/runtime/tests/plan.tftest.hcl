@@ -106,6 +106,52 @@ run "routing_and_discovery_contract" {
   }
 }
 
+run "traefik_without_a_config_secret_sends_no_header" {
+  command = plan
+
+  assert {
+    condition = (
+      !contains(keys(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0]), "entryPoint") &&
+      !contains(keys(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0]), "secrets")
+    )
+    error_message = "Without a config secret Traefik must start with its image entrypoint and no secret injection."
+  }
+}
+
+run "traefik_presents_the_config_secret_without_exposing_it" {
+  command = plan
+
+  variables {
+    traefik = {
+      name              = "rise-traefik"
+      discovery_name    = "rise-traefik"
+      image             = "traefik:v3.7.10"
+      config_secret_arn = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/traefik-config-secret-abc123"
+    }
+  }
+
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].secrets == [
+        { name = "RISE_TRAEFIK_CONFIG_SECRET", valueFrom = var.traefik.config_secret_arn }
+      ] &&
+      !contains(keys(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0]), "environment")
+    )
+    error_message = "The config secret must reach Traefik through ECS secret injection, not a plain environment value."
+  }
+
+  # The flag is appended by the wrapper from the injected variable, so the
+  # command (and the task definition) never contain the token.
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[0] == "/bin/sh" &&
+      strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "--providers.http.headers.Authorization=Bearer $${RISE_TRAEFIK_CONFIG_SECRET}") &&
+      contains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command, "--providers.http.endpoint=http://rise-control-plane.rise.internal:3001/internal/traefik/config")
+    )
+    error_message = "Traefik must append the Authorization header flag from the injected secret and keep its own flags."
+  }
+}
+
 run "control_plane_maintenance_startup_policy" {
   command = plan
   variables {
@@ -277,4 +323,41 @@ run "rejects_an_unknown_client_ip_source" {
     client_ip = { source = "x-real-ip", trusted_cidrs = ["10.0.0.0/24"] }
   }
   expect_failures = [var.client_ip]
+}
+
+# The wrapper is `exec traefik "$@" <header flag>`, so every flag in `command`
+# -- including the client-address trust flags -- still reaches Traefik as an
+# argument and the header is appended after them.
+run "client_ip_flags_and_the_config_secret_coexist" {
+  command = plan
+  variables {
+    client_ip = { source = "proxy-protocol", trusted_cidrs = ["10.0.0.0/24"] }
+    traefik = {
+      name              = "rise-traefik"
+      discovery_name    = "rise-traefik"
+      image             = "traefik:v3.7.10"
+      config_secret_arn = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/traefik-config-secret-abc123"
+    }
+  }
+
+  assert {
+    condition = toset([
+      for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command :
+      flag if strcontains(flag, "trustedIPs")
+      ]) == toset([
+      "--entrypoints.web.proxyProtocol.trustedIPs=10.0.0.0/24",
+      "--entrypoints.websecure.proxyProtocol.trustedIPs=10.0.0.0/24",
+      "--entrypoints.ping.proxyProtocol.trustedIPs=10.0.0.0/24",
+    ])
+    error_message = "the trust flags must stay in command, where the wrapper passes them on as arguments"
+  }
+
+  assert {
+    condition = (
+      strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "exec traefik \"$@\" ") &&
+      !strcontains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].entryPoint[2], "exec /") &&
+      !anytrue([for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command : strcontains(flag, "headers.Authorization")])
+    )
+    error_message = "the wrapper must exec traefik through PATH (the image keeps it at /usr/local/bin, not /traefik) with the command's arguments, and the header must not be in command"
+  }
 }
