@@ -20,7 +20,8 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::config::Config;
-use crate::login::token_utils::{log_token_debug, read_token_exp};
+use crate::login::token_utils::read_token_exp;
+use crate::token_trace::trace_token;
 
 /// Re-mint cached JWTs before two thirds of their observed lifetime has elapsed
 /// and once they are within this many seconds of expiry, so a request issued
@@ -120,7 +121,7 @@ pub async fn token_with_retry(provider: &TokenProvider) -> Result<String> {
                 // confirm what identity a command (e.g. `rise deploy` from CI)
                 // is presenting — the OIDC token in RISE_TOKEN, a minted GitHub
                 // Actions OIDC token, etc. Signature is never logged.
-                log_token_debug(&token, provider.describe());
+                trace_token(provider.describe(), &token);
                 return Ok(token);
             }
             Err(e) if is_non_retryable_token_error(&e) => return Err(e),

@@ -18,7 +18,6 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
-use base64::Engine;
 use rise_backend_auth::session_scope::AccessRequest;
 use rise_backend_auth::{SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
@@ -798,20 +797,7 @@ pub async fn code_exchange(
         token_info.expires_in
     );
 
-    // Decode and log token claims for debugging (without validating yet)
-    if let Ok(header) = jsonwebtoken::decode_header(&token_info.id_token) {
-        tracing::debug!("ID token header: {:?}", header);
-    }
-
-    // Try to decode payload for logging (this doesn't validate signature)
-    let parts: Vec<&str> = token_info.id_token.split('.').collect();
-    if parts.len() == 3 {
-        if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
-            if let Ok(claims_str) = String::from_utf8(decoded) {
-                tracing::debug!("ID token claims: {}", claims_str);
-            }
-        }
-    }
+    crate::token_trace::trace_token("IdP ID token", &token_info.id_token);
 
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
@@ -1392,6 +1378,8 @@ pub async fn oauth_callback(
         })?;
 
     tracing::info!("Successfully exchanged code for tokens");
+
+    crate::token_trace::trace_token("IdP ID token", &token_info.id_token);
 
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
