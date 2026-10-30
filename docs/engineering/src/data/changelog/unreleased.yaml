@@ -99,6 +99,22 @@ changes:
       reference, and configure sign-in with your OIDC provider. Extend rules if
       Metacontroller serves other controllers. Allow sufficient startup time
       (30 minutes by default) and avoid automatic rollback to an incompatible image.
+  - id: idtoken-claims-trace-target
+    title: Decoded token claims are logged only on the opt-in rise::auth::idtoken target
+    group: security-and-upgrade-guidance
+    type: change
+    impact: configuration
+    details: |-
+      The backend no longer logs the IdP ID-token payload at `debug`, and the CLI
+      no longer logs the decoded claims of the token it presents at `debug`. Both
+      emit the decoded header and claims at `trace` on the `rise::auth::idtoken`
+      target, which `RUST_LOG=debug` does not enable. The payload contains
+      personal data such as email, name and groups; the signature is never logged.
+    action: |-
+      To see the claims again while debugging a login, set
+      `RUST_LOG=info,rise::auth::idtoken=trace`. Directives such as
+      `rise::server::auth=debug` or `rise::cli::login::token_utils=debug` no longer
+      show them.
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-
