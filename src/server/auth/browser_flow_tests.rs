@@ -77,8 +77,8 @@ impl rise_backend_core::DeploymentBackend for Backend {
     }
 }
 
-struct Fixture {
-    state: AppState,
+pub(crate) struct Fixture {
+    pub(crate) state: AppState,
     exchanges: Arc<AtomicUsize>,
     idp_server: tokio::task::JoinHandle<()>,
 }
@@ -88,7 +88,8 @@ impl Drop for Fixture {
     }
 }
 
-async fn fixture(pool: PgPool) -> Fixture {
+/// A fully wired `AppState` over `pool` with project `demo` and a local mock IdP.
+pub(crate) async fn fixture(pool: PgPool) -> Fixture {
     use crate::server::{
         auth::{jwt::JwtValidator, oauth::OAuthClient, user_identity::UserLogins},
         authz::{OperatorSelectors, ResourceAuthorizer},
@@ -329,6 +330,34 @@ fn signin(project: Option<&str>) -> SigninQuery {
         redirect: Some("/dashboard".into()),
         rd: None,
     }
+}
+
+/// Request headers of a browser signed in to the Rise UI as the fixture's
+/// IdP user (`member@example.com`, a configured admin).
+pub(crate) async fn rise_ui_session_headers(fixture: &Fixture) -> HeaderMap {
+    let mut browser = Browser::default();
+    let response = oauth_signin_start(
+        State(fixture.state.clone()),
+        browser.headers("rise.example.com"),
+        Uri::from_static("/api/v1/auth/signin/start"),
+        axum::extract::Query(signin(None)),
+    )
+    .await
+    .unwrap();
+    browser.receive("rise.example.com", &response);
+    let state = query(&location(&response), "state");
+    let response = oauth_callback(
+        State(fixture.state.clone()),
+        browser.headers("rise.example.com"),
+        axum::extract::Query(CallbackQuery {
+            code: "test-code".into(),
+            state,
+        }),
+    )
+    .await
+    .unwrap();
+    browser.receive("rise.example.com", &response);
+    browser.headers("rise.example.com")
 }
 
 async fn start_app(fixture: &Fixture, browser: &mut Browser, host: &str) -> String {
