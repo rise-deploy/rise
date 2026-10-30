@@ -1,10 +1,9 @@
 use super::models::{
-    AuthorizeFlowQuery, CallbackRequest, OAuth2ErrorResponse, OAuth2TokenResponse, OAuthCodeState,
-    OAuthExtensionSpec, OAuthExtensionStatus, OAuthState, RefreshTokenMode, TokenRequest,
+    AuthorizeFlowQuery, CallbackRequest, OAuth2ErrorResponse, OAuthCodeState, OAuthExtensionSpec,
+    OAuthExtensionStatus, OAuthState, RefreshTokenMode, TokenRequest,
 };
-use super::provider::{UpstreamInvalidGrant, UpstreamMalformedResponse};
 use super::refresh_handle;
-use super::rotation::{self, Refreshed, Rotation, RotationError, UpstreamError};
+use super::rotation::{self, Rotation, RotationError, UpstreamFailure};
 use crate::db::{extensions as db_extensions, oauth_transient_state, projects as db_projects};
 use crate::server::auth::redirect::{is_loopback_host, origins_match};
 use crate::server::encryption::EncryptionContext;
@@ -1622,23 +1621,14 @@ async fn token_endpoint_inner(
             .await
         }
         "refresh_token" => {
-            // Returns the JSON response body
-            let json_body = handle_refresh_token_grant(
+            handle_refresh_token_grant(
                 state.clone(),
                 project,
                 extension_name.to_string(),
                 spec,
                 req,
             )
-            .await?;
-
-            use axum::body::Body;
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json_body))
-                .unwrap();
-            Ok(response)
+            .await
         }
         _ => Err(oauth2_error(
             "unsupported_grant_type",
@@ -1791,7 +1781,11 @@ async fn handle_authorization_code_grant(
         .await
         .map_err(|e| {
             error!("Failed to decrypt token response: {:?}", e);
-            oauth2_error("server_error", Some("Internal server error".to_string()))
+            if rise_backend_core::encryption::is_ciphertext_rejection(&e) {
+                oauth2_error("server_error", Some("Internal server error".to_string()))
+            } else {
+                crypto_unavailable()
+            }
         })?;
 
     // The upstream refresh token never reaches the app: a 2xx JSON response has it
@@ -1821,10 +1815,7 @@ async fn handle_authorization_code_grant(
             .await
         }
     }
-    .map_err(|e| {
-        error!("Failed to issue refresh token handle: {:?}", e);
-        oauth2_error("server_error", Some("Internal server error".to_string()))
-    })?;
+    .map_err(|e| reply_error_response(e, &project.name, &extension_name))?;
 
     info!(
         "Authorization code grant successful for project {} extension {}",
@@ -1848,14 +1839,212 @@ async fn handle_authorization_code_grant(
     Ok(response)
 }
 
-/// Handle refresh_token grant type; returns the JSON response body.
+/// Present `upstream_refresh_token` at the extension's upstream token
+/// endpoint. Everything this needs (endpoint discovery, the SSRF check, the
+/// client secret) is done here, so a request that never reaches the upstream
+/// does none of it.
+async fn refresh_upstream(
+    state: &AppState,
+    project: &crate::db::models::Project,
+    extension_name: &str,
+    spec: &OAuthExtensionSpec,
+    upstream_refresh_token: &str,
+) -> Result<super::provider::UpstreamReply, UpstreamFailure> {
+    use super::provider::{OAuthProvider, OAuthProviderConfig};
+
+    let encryption_provider = state
+        .encryption_provider
+        .clone()
+        .ok_or_else(|| UpstreamFailure::Misconfigured(anyhow::anyhow!("No encryption provider")))?;
+    let oauth_provider = OAuthProvider::new(OAuthProviderConfig {
+        db_pool: state.db_pool.clone(),
+        encryption_provider,
+        ssrf_config: state.server_settings.ssrf.clone(),
+        api_domain: state.public_url.clone(),
+    });
+    let endpoints = resolve_oauth_endpoints(spec, &state.server_settings.ssrf)
+        .await
+        .map_err(|e| {
+            UpstreamFailure::Misconfigured(anyhow::anyhow!(
+                "Failed to resolve OAuth endpoints: {e}"
+            ))
+        })?;
+    crate::server::ssrf::validate_url(&endpoints.token_endpoint, &state.server_settings.ssrf)
+        .await
+        .map_err(|e| {
+            UpstreamFailure::Misconfigured(anyhow::anyhow!(
+                "OAuth token endpoint is not permitted: {e}"
+            ))
+        })?;
+
+    // Resolve the credential for this extension and the effective upstream destination.
+    let client_secret = oauth_provider
+        .resolve_oauth_client_secret(project.id, extension_name, spec, &endpoints.token_endpoint)
+        .await
+        .map_err(|e| {
+            if rise_backend_core::encryption::is_ciphertext_rejection(&e) {
+                UpstreamFailure::Misconfigured(e.context("Failed to resolve OAuth client secret"))
+            } else {
+                UpstreamFailure::Unavailable(e.context("Failed to resolve OAuth client secret"))
+            }
+        })?;
+
+    oauth_provider
+        .refresh_upstream(
+            spec,
+            &client_secret,
+            upstream_refresh_token,
+            &endpoints.token_endpoint,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to refresh token with upstream provider: {:?}", e);
+            UpstreamFailure::Unreachable(e)
+        })
+}
+
+/// The error an upstream call that produced no answer is reported with.
+fn upstream_failure_response(
+    failure: UpstreamFailure,
+    project_name: &str,
+    extension_name: &str,
+) -> (StatusCode, Json<OAuth2ErrorResponse>) {
+    match failure {
+        UpstreamFailure::Unreachable(_) => bad_gateway("The OAuth provider could not be reached"),
+        UpstreamFailure::Misconfigured(e) => {
+            error!(
+                "OAuth extension {} of project {} cannot call its provider: {:?}",
+                extension_name, project_name, e
+            );
+            oauth2_error("server_error", Some("Internal server error".to_string()))
+        }
+        UpstreamFailure::Unavailable(e) => {
+            error!(
+                "Encryption provider unavailable for project {} extension {}: {:?}",
+                project_name, extension_name, e
+            );
+            crypto_unavailable()
+        }
+    }
+}
+
+/// The error a failed rotating-mode request is answered with.
+fn rotation_error_response(
+    error: RotationError,
+    project_name: &str,
+    extension_name: &str,
+) -> Result<Response, (StatusCode, Json<OAuth2ErrorResponse>)> {
+    Err(match error {
+        RotationError::InvalidGrant => {
+            oauth2_error("invalid_grant", Some("Invalid refresh token".to_string()))
+        }
+        RotationError::TemporarilyUnavailable => oauth2_error(
+            "temporarily_unavailable",
+            Some("The refresh token is being used by another request; retry shortly".to_string()),
+        ),
+        RotationError::Passthrough(reply) => {
+            return Ok(token_reply_response(refresh_handle::TokenReply {
+                status: reply.status,
+                content_type: reply.content_type,
+                body: reply.body,
+            }))
+        }
+        RotationError::Unreachable(e) => {
+            debug!(
+                "Upstream refresh failed for project {} extension {}: {:?}",
+                project_name, extension_name, e
+            );
+            bad_gateway("The OAuth provider could not be reached")
+        }
+        RotationError::Malformed(e) => {
+            error!(
+                "Upstream returned an unusable refresh response for project {} extension {}: {:?}",
+                project_name, extension_name, e
+            );
+            bad_gateway("The OAuth provider returned an unsupported token response")
+        }
+        RotationError::Misconfigured(e) => {
+            error!(
+                "OAuth extension {} of project {} cannot call its provider: {:?}",
+                extension_name, project_name, e
+            );
+            oauth2_error("server_error", Some("Internal server error".to_string()))
+        }
+        RotationError::Internal(e) => {
+            error!(
+                "Rotating refresh token store failure for project {} extension {}: {:?}",
+                project_name, extension_name, e
+            );
+            crypto_unavailable()
+        }
+    })
+}
+
+/// The error for a failure of the encryption provider that is not the client's
+/// doing: retryable.
+fn crypto_unavailable() -> (StatusCode, Json<OAuth2ErrorResponse>) {
+    let (_, body) = oauth2_error("server_error", Some("Internal server error".to_string()));
+    (StatusCode::SERVICE_UNAVAILABLE, body)
+}
+
+/// The error for an upstream failure that produced no usable answer.
+fn bad_gateway(description: &str) -> (StatusCode, Json<OAuth2ErrorResponse>) {
+    let (_, body) = oauth2_error("server_error", Some(description.to_string()));
+    (StatusCode::BAD_GATEWAY, body)
+}
+
+/// A token response made of the upstream's status, content type and body.
+fn token_reply_response(reply: refresh_handle::TokenReply) -> Response {
+    use axum::body::Body;
+    let mut response = Response::builder()
+        .status(StatusCode::from_u16(reply.status).unwrap_or(StatusCode::BAD_GATEWAY));
+    if let Some(content_type) = reply
+        .content_type
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        response = response.header(header::CONTENT_TYPE, content_type);
+    }
+    response
+        .body(Body::from(reply.body))
+        .expect("status and content type are valid")
+}
+
+/// The error a failed handle check is answered with.
+fn handle_error_response(
+    error: refresh_handle::HandleError,
+    project_name: &str,
+    extension_name: &str,
+) -> (StatusCode, Json<OAuth2ErrorResponse>) {
+    match error {
+        refresh_handle::HandleError::Rejected(e) => {
+            warn!(
+                "Rejected refresh token handle for project {} extension {}: {:?}",
+                project_name, extension_name, e
+            );
+            oauth2_error("invalid_grant", Some("Invalid refresh token".to_string()))
+        }
+        refresh_handle::HandleError::Unavailable(e) => {
+            error!(
+                "Encryption provider unavailable for project {} extension {}: {:?}",
+                project_name, extension_name, e
+            );
+            crypto_unavailable()
+        }
+    }
+}
+
+/// Handle refresh_token grant type.
+///
+/// The response is the upstream's own (status, content type, body) with only
+/// the `refresh_token` replaced by a handle.
 async fn handle_refresh_token_grant(
     state: AppState,
     project: crate::db::models::Project,
     extension_name: String,
     spec: OAuthExtensionSpec,
     req: TokenRequest,
-) -> Result<String, (StatusCode, Json<OAuth2ErrorResponse>)> {
+) -> Result<Response, (StatusCode, Json<OAuth2ErrorResponse>)> {
     // Validate required parameters
     let refresh_token = req.refresh_token.ok_or_else(|| {
         oauth2_error(
@@ -1870,9 +2059,11 @@ async fn handle_refresh_token_grant(
     })?;
 
     // A Rise handle must be valid for this project and extension; it is never
-    // forwarded as-is. A token without a handle scheme was issued before
-    // handles existed and is a raw upstream token, which is forwarded as before.
-    // Server-side-state (`rrt2.`) handles are only accepted in `rotating` mode.
+    // forwarded as-is. In `sealed` mode a token without a handle scheme was
+    // issued before handles existed and is a raw upstream token, which is
+    // forwarded as before; in `rotating` mode it is refused, since it could be
+    // a token stolen before handles existed. Server-side-state (`rrt2.`)
+    // handles are only accepted in `rotating` mode.
     enum Presented {
         Rotating,
         Upstream(refresh_handle::PresentedRefreshToken),
@@ -1889,102 +2080,11 @@ async fn handle_refresh_token_grant(
                 &refresh_token,
             )
             .await
-            .map_err(|e| {
-                warn!(
-                    "Rejected refresh token handle for project {} extension {}: {:?}",
-                    project.name, extension_name, e
-                );
-                oauth2_error("invalid_grant", Some("Invalid refresh token".to_string()))
-            })?,
+            .map_err(|e| handle_error_response(e, &project.name, &extension_name))?,
         )
     };
 
-    // Call OAuth provider's refresh_token method
-    use super::provider::{OAuthProvider, OAuthProviderConfig};
-
-    let oauth_provider = OAuthProvider::new(OAuthProviderConfig {
-        db_pool: state.db_pool.clone(),
-        encryption_provider: encryption_provider.clone(),
-        ssrf_config: state.server_settings.ssrf.clone(),
-        api_domain: state.public_url.clone(),
-    });
-
-    let endpoints = resolve_oauth_endpoints(&spec, &state.server_settings.ssrf)
-        .await
-        .map_err(|_| {
-            oauth2_error(
-                "server_error",
-                Some("Failed to resolve OAuth endpoints".into()),
-            )
-        })?;
-    crate::server::ssrf::validate_url(&endpoints.token_endpoint, &state.server_settings.ssrf)
-        .await
-        .map_err(|_| {
-            oauth2_error(
-                "server_error",
-                Some("OAuth token endpoint is not permitted".into()),
-            )
-        })?;
-
-    // Resolve the credential for this extension and the effective upstream destination.
-    let client_secret = oauth_provider
-        .resolve_oauth_client_secret(
-            project.id,
-            &extension_name,
-            &spec,
-            &endpoints.token_endpoint,
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to resolve OAuth client secret: {:?}", e);
-            oauth2_error("server_error", Some("Internal server error".to_string()))
-        })?;
-
-    // Build scope
-    let scope = if spec.scopes.is_empty() {
-        None
-    } else {
-        Some(spec.scopes.join(" "))
-    };
-
-    // Refresh tokens with upstream provider
-    let upstream = |upstream_refresh_token: String| {
-        let (oauth_provider, spec, client_secret, token_endpoint, scope) = (
-            &oauth_provider,
-            &spec,
-            &client_secret,
-            &endpoints.token_endpoint,
-            scope.clone(),
-        );
-        async move {
-            let token_response = oauth_provider
-                .refresh_token(spec, client_secret, &upstream_refresh_token, token_endpoint)
-                .await
-                .map_err(|e| {
-                    error!("Failed to refresh token with upstream provider: {:?}", e);
-                    if e.downcast_ref::<UpstreamInvalidGrant>().is_some() {
-                        UpstreamError::InvalidGrant
-                    } else if e.downcast_ref::<UpstreamMalformedResponse>().is_some() {
-                        UpstreamError::MalformedResponse(e)
-                    } else {
-                        UpstreamError::Failed(e)
-                    }
-                })?;
-            Ok(Refreshed {
-                new_upstream_refresh_token: token_response.refresh_token,
-                response: OAuth2TokenResponse {
-                    access_token: token_response.access_token,
-                    token_type: token_response.token_type,
-                    expires_in: token_response.expires_in,
-                    refresh_token: None,
-                    scope,
-                    id_token: token_response.id_token,
-                },
-            })
-        }
-    };
-
-    let body = if rotating {
+    if rotating {
         let rotation = Rotation::new(
             &state.db_pool,
             encryption_provider.as_ref(),
@@ -1992,100 +2092,105 @@ async fn handle_refresh_token_grant(
             &extension_name,
             spec.refresh_token,
         );
-        match presented {
-            Presented::Rotating => rotation.refresh(&refresh_token, upstream).await,
-            // An `rrt1.` handle or a raw token on an extension that has since
-            // been switched to `rotating`: refresh it and move the app onto a
-            // rotating handle.
-            Presented::Upstream(token) => {
+        let call = |upstream_token: String| {
+            let (state, project, extension_name, spec) = (&state, &project, &extension_name, &spec);
+            async move { refresh_upstream(state, project, extension_name, spec, &upstream_token).await }
+        };
+        let reply = match presented {
+            Presented::Rotating => rotation.refresh(&refresh_token, call).await,
+            // An `rrt1.` handle on an extension that has since been switched to
+            // `rotating`: refresh it and move the app onto a rotating handle.
+            Presented::Upstream(refresh_handle::PresentedRefreshToken::Handle(sealed)) => {
                 rotation
-                    .refresh_unsealed(token.upstream_token().to_string(), upstream)
+                    .refresh_sealed(&sealed, Utc::now().timestamp(), call)
                     .await
             }
-        }
-        .map_err(|e| rotation_error_response(e, &project.name, &extension_name))?
-    } else {
-        let Presented::Upstream(token) = presented else {
-            return Err(oauth2_error(
-                "invalid_grant",
-                Some("Invalid refresh token".to_string()),
-            ));
+            Presented::Upstream(refresh_handle::PresentedRefreshToken::Legacy(_)) => {
+                warn!(
+                    "Rejected raw refresh token for rotating extension {} of project {}",
+                    extension_name, project.name
+                );
+                Err(RotationError::InvalidGrant)
+            }
         };
-        let refreshed = upstream(token.upstream_token().to_string())
-            .await
-            .map_err(|_| {
-                oauth2_error("invalid_grant", Some("Failed to refresh token".to_string()))
-            })?;
-        // A rotated upstream refresh token is returned as a fresh handle. When
-        // the upstream returns none, the response carries none and the client
-        // keeps the handle it presented, which still wraps a valid upstream
-        // token.
-        let mut response = refreshed.response;
-        response.refresh_token = refresh_handle::seal_rotated(
-            encryption_provider.as_ref(),
-            project.id,
-            &extension_name,
-            refreshed.new_upstream_refresh_token.as_deref(),
-            Utc::now().timestamp(),
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to seal refresh token handle: {:?}", e);
-            oauth2_error("server_error", Some("Internal server error".to_string()))
-        })?;
-        serde_json::to_string(&response).map_err(|e| {
-            error!("Failed to serialize token response: {:?}", e);
-            oauth2_error("server_error", Some("Internal server error".to_string()))
-        })?
+        return match reply {
+            Ok(reply) => {
+                info!(
+                    "Refresh token grant successful for project {} extension {}",
+                    project.name, extension_name
+                );
+                Ok(token_reply_response(reply))
+            }
+            Err(e) => rotation_error_response(e, &project.name, &extension_name),
+        };
+    }
+
+    let Presented::Upstream(presented) = presented else {
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid refresh token".to_string()),
+        ));
     };
+    let upstream = refresh_upstream(
+        &state,
+        &project,
+        &extension_name,
+        &spec,
+        presented.upstream_token(),
+    )
+    .await
+    .map_err(|f| upstream_failure_response(f, &project.name, &extension_name))?;
+
+    if upstream.is_invalid_grant() {
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Failed to refresh token".to_string()),
+        ));
+    }
+    if !upstream.is_success() {
+        // Not a verdict on the token: pass the upstream's answer through.
+        return Ok(token_reply_response(refresh_handle::TokenReply {
+            status: upstream.status,
+            content_type: upstream.content_type,
+            body: upstream.body,
+        }));
+    }
+
+    let reply = refresh_handle::seal_refresh_response(
+        encryption_provider.as_ref(),
+        project.id,
+        &extension_name,
+        &presented,
+        upstream,
+        Utc::now().timestamp(),
+    )
+    .await
+    .map_err(|e| reply_error_response(e, &project.name, &extension_name))?;
 
     info!(
         "Refresh token grant successful for project {} extension {}",
         project.name, extension_name
     );
 
-    Ok(body)
+    Ok(token_reply_response(reply))
 }
 
-/// The OAuth error a failed rotating-mode request is answered with.
-fn rotation_error_response(
-    error: RotationError,
+/// The error a response that could not be rewritten is answered with.
+fn reply_error_response(
+    error: refresh_handle::ReplyError,
     project_name: &str,
     extension_name: &str,
 ) -> (StatusCode, Json<OAuth2ErrorResponse>) {
     match error {
-        RotationError::InvalidGrant => {
-            oauth2_error("invalid_grant", Some("Invalid refresh token".to_string()))
-        }
-        RotationError::TemporarilyUnavailable => oauth2_error(
-            "temporarily_unavailable",
-            Some("The refresh token is being used by another request; retry shortly".to_string()),
-        ),
-        RotationError::Upstream(e) => {
-            debug!(
-                "Upstream refresh failed for project {} extension {}: {:?}",
-                project_name, extension_name, e
-            );
-            oauth2_error("invalid_grant", Some("Failed to refresh token".to_string()))
-        }
-        RotationError::UpstreamMalformed(e) => {
+        refresh_handle::ReplyError::Unparseable => {
             error!(
-                "Upstream returned a malformed refresh response for project {} extension {}: {:?}",
-                project_name, extension_name, e
+                "Upstream token response of project {} extension {} carries a refresh token that cannot be replaced; refusing to return it",
+                project_name, extension_name
             );
-            let (_, body) = oauth2_error(
-                "server_error",
-                Some("The OAuth provider returned an invalid token response".to_string()),
-            );
-            (StatusCode::BAD_GATEWAY, body)
+            bad_gateway("The OAuth provider returned an unsupported token response")
         }
-        RotationError::Internal(e) => {
-            error!(
-                "Rotating refresh token store failure for project {} extension {}: {:?}",
-                project_name, extension_name, e
-            );
-            let (_, body) = oauth2_error("server_error", Some("Internal server error".to_string()));
-            (StatusCode::SERVICE_UNAVAILABLE, body)
+        refresh_handle::ReplyError::Seal(e) => {
+            handle_error_response(e, project_name, extension_name)
         }
     }
 }

@@ -253,7 +253,7 @@ Refresh-token parameters:
 | `grant_type` | Yes | `refresh_token` |
 | `refresh_token` | Yes | The refresh-token handle from a previous token response. |
 | `client_id` | Yes | Rise client ID. |
-| `client_secret` | Yes | Rise client secret. |
+| `client_secret` | Confidential clients | Rise client secret. Public clients refresh with `client_id` alone. |
 
 Token responses use the RFC 6749 shape:
 
@@ -272,8 +272,10 @@ Token responses use the RFC 6749 shape:
 
 The `refresh_token` Rise returns is an opaque handle (prefix `rrt1.`), not the upstream provider's refresh token. The upstream token is sealed inside the handle with Rise's encryption provider and bound to the project and extension, so a handle works only at that extension's Rise token endpoint and cannot be used directly against the upstream provider. Treat it as an opaque string and do not parse it.
 
-- The rest of the response is the upstream response, unchanged. Responses that are not successful JSON, or that carry no refresh token, are relayed as-is.
+- Both grants return the upstream's response with only the `refresh_token` replaced: the status, the `Content-Type`, every other member (including `scope`) and the member order are the upstream's own. A successful response whose body is not a JSON object is relayed as-is, unless it appears to carry a refresh token (for example a form-encoded `refresh_token=` pair), in which case Rise answers `502` rather than return it.
 - A refresh response contains a new handle only if the upstream provider rotated its refresh token. Otherwise it has no `refresh_token`; keep using the handle you already have.
+- An upstream error (any non-2xx other than `invalid_grant`) is passed through with its status and body, so retry or back off as you would against the provider. If the upstream answers a 4xx with a JSON `error` of `invalid_grant`, Rise answers `invalid_grant`: the refresh token is dead and the user must sign in again. If the upstream cannot be reached or times out, Rise answers `502`.
+- A handle that does not unseal for this extension (tampered, or from another project or extension) is `invalid_grant`. If the encryption provider is temporarily unavailable (for example AWS KMS throttling), Rise answers `503` `server_error` and the request can be retried.
 - In the default `sealed` mode, handles do not expire on their own and are not revoked by Rise; the upstream provider still decides whether the wrapped token is valid. Opt in to `rotating` mode (below) for single-use handles.
 
 #### Rotating refresh tokens
@@ -300,29 +302,29 @@ Set `refresh_token.mode` to `rotating` to make every refresh token single use:
 
 In `rotating` mode:
 
-- Every successful refresh response contains a `refresh_token`: a new handle. **Your app must store it after every refresh and use it for the next one.** The handle you just used is spent. This holds even if the upstream provider does not rotate its own refresh token; Rise keeps the upstream token server-side and never returns it.
+- Every successful refresh response is the upstream's response with `refresh_token` set to a new handle (added if the upstream returned none). **Your app must store it after every refresh and use it for the next one.** The handle you just used is spent. This holds even if the upstream provider does not rotate its own refresh token; Rise keeps the upstream token server-side and never returns it.
 - Presenting the same handle again within `grace_period_seconds` of its use returns the same response, including the same new `refresh_token`. Several browser tabs, or a request retried after a timeout, therefore agree on one successor instead of locking each other out. Rise does not call the upstream provider again for these requests.
-- Presenting a spent handle after the grace period is treated as token theft or a broken client. Rise revokes the whole login (every refresh token derived from the same sign-in) and answers `invalid_grant`.
+- Presenting a spent handle after the grace period is treated as token theft or a broken client. Rise revokes the whole login (every refresh token derived from the same sign-in), erases the upstream tokens it stored for it, and answers `invalid_grant`. A login that is revoked while one of its refreshes is in flight answers `invalid_grant` too, not tokens.
 - A login ends `max_lifetime_seconds` after the user signed in, however actively it is refreshed. The next refresh answers `invalid_grant`.
-- If the upstream provider answers a refresh with `invalid_grant`, Rise revokes the login as well. A failure that is not `invalid_grant` (network error, upstream outage) leaves the handle usable so the request can be retried.
+- If the upstream provider answers a refresh with a 4xx and a JSON `error` of `invalid_grant`, Rise revokes the login as well. Any other upstream failure leaves the handle usable so the request can be retried.
 - If a refresh of the same handle is still in progress when a second request arrives, the second request waits for up to about five seconds for it to finish and receives the same response; if it does not finish in time the endpoint answers `503` with `temporarily_unavailable` and `Retry-After: 1`, and the request can be retried.
-- A refresh that fails because the upstream is unreachable, times out (after 30 seconds) or answers with an error other than `invalid_grant` leaves the handle usable; if the upstream answers success without a valid token response, the endpoint answers `502` and the handle also stays usable. A failure of Rise's own storage answers `503` `server_error`.
+- An upstream error other than `invalid_grant` is passed through with its status and body (the handle stays usable); an unreachable upstream or a timeout (after 30 seconds) answers `502` `server_error`. If the upstream answers 2xx with something that is not a JSON object token response, the endpoint answers `502` and the handle stays usable. A failure of Rise's own storage, or a transient failure of the encryption provider, answers `503` `server_error`; a stored record that no longer decrypts is `invalid_grant`.
 - A refresh that hangs for more than 60 seconds releases its hold on the handle, so a crashed or frozen Rise process cannot lock a login out; the next request takes over.
 
 Whenever the token endpoint answers `invalid_grant` for a refresh token, discard your stored tokens and send the user through the authorization flow again.
 
 Switching an existing extension:
 
-- `sealed` to `rotating`: handles that users already hold (`rrt1.` handles, and raw tokens from before handles) keep working. The first refresh accepts one, refreshes upstream, and returns an `rrt2.` handle that starts a new login with a fresh `max_lifetime_seconds`. Nobody is signed out. `rrt1.` handles are stateless, so until they are exchanged they can be presented any number of times.
+- `sealed` to `rotating`: `rrt1.` handles that users already hold keep working. The first refresh accepts one, refreshes upstream, and returns an `rrt2.` handle that starts a new login. Nobody is signed out. An `rrt1.` handle issued longer ago than `max_lifetime_seconds` is no longer accepted (`invalid_grant`), and an `rrt1.` handle is stateless, so until it is exchanged it can be presented any number of times (presenting one twice starts two logins). Raw refresh tokens from before handles existed are not accepted in `rotating` mode (`invalid_grant`); users holding one sign in again, so migrate them in `sealed` mode first if you want to keep those sessions.
 - `rotating` to `sealed`: `rrt2.` handles are rejected with `invalid_grant`, so users sign in again. Rise also deletes the stored state of the extension's rotating logins.
 - Deleting the extension deletes its stored state.
 
 Changing `max_lifetime_seconds` does not affect logins that already started; they keep the lifetime they started with.
 
-Rotating mode makes each refresh write to Rise's database, and keeps one small record per handle until the login ends; sealed mode needs no storage. With KMS, a rotating-mode refresh costs one `kms:Decrypt` and two `kms:Encrypt` calls (a replay within the grace period costs one `kms:Decrypt`), and the authorization-code exchange one `kms:Encrypt`.
+Rotating mode makes each refresh write to Rise's database, and keeps one small record per handle until the login ends; sealed mode needs no storage. With KMS, a rotating-mode refresh costs two `kms:Decrypt` calls (the stored upstream token and the extension's client secret) and two `kms:Encrypt` calls (the successor's upstream token and the recorded response). A replay within the grace period costs one `kms:Decrypt` (the recorded response) and no upstream request, and the authorization-code exchange costs one more `kms:Encrypt` for the new login.
 
 :::note[Refresh tokens issued before handles]
-Refresh tokens issued before handles were introduced are raw upstream tokens. For now the token endpoint still accepts them and refreshes them upstream, and every response from then on carries a handle. This compatibility path will be removed in a later release, after which only handles are accepted.
+Refresh tokens issued before handles were introduced are raw upstream tokens. For now the token endpoint still accepts them and refreshes them upstream. The response to that first refresh carries a handle, wrapping the upstream's rotated token or, if it did not rotate, the token you presented, so clients move to handles on their first refresh. This compatibility path will be removed in a later release, after which only handles are accepted.
 :::
 
 ### Discovery and JWKS

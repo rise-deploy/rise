@@ -117,9 +117,19 @@ changes:
       token endpoint still accepts them for now. This compatibility path will be
       removed in a later release.
 
-      With KMS, every refresh now costs one additional `kms:Decrypt` and, when
-      the upstream rotates its refresh token, one `kms:Encrypt` (authorization-code
-      exchanges seal one more handle). No configuration is added or changed.
+      Token responses are the upstream's own with only `refresh_token` replaced
+      (status, content type, other members and their order are kept), and
+      upstream errors other than `invalid_grant` are passed through. A refresh
+      with a legacy raw token returns a handle even if the upstream did not
+      rotate. A successful upstream response that cannot be rewritten but
+      appears to carry a refresh token is refused with 502.
+
+      With KMS, every refresh now costs one additional `kms:Decrypt` (the
+      handle) and one `kms:Encrypt` when the response carries a new handle (the
+      upstream rotated its token, or a legacy token is migrated).
+      Authorization-code exchanges seal one more handle (one `kms:Encrypt`).
+      Transient KMS failures (throttling, network) now answer 503 `server_error`
+      instead of `invalid_grant`. No configuration is added or changed.
     action: |-
       No operator action. Tell app owners whose apps parse refresh tokens or
       present them directly to the upstream provider to treat the value as
@@ -135,21 +145,27 @@ changes:
       (the default, unchanged) keeps the stateless `rrt1.` handles. `mode: rotating`
       issues stateful, single-use `rrt2.` handles: each refresh returns a new
       refresh token the app must store, a handle presented again within
-      `grace_period_seconds` (default 30, at most 300) returns the same
-      response, a later reuse revokes the login, and a login ends after
-      `max_lifetime_seconds` (default 30 days). Rise keeps the upstream refresh
-      token encrypted in PostgreSQL.
+      `grace_period_seconds` (default 30, 1 to 300) returns the same
+      response, a later reuse revokes the login and erases its stored upstream
+      tokens, and a login ends after `max_lifetime_seconds` (default 30 days,
+      at most 10 years). Rise keeps the upstream refresh token encrypted in
+      PostgreSQL. Rotation settings are rejected unless the mode is `rotating`.
 
       A migration adds the `oauth_refresh_families` and `oauth_refresh_tokens`
       tables. Expired rows are removed by the existing hourly leader-gated
       cleanup. Extensions that stay in `sealed` mode do not touch them. With KMS,
-      a rotating-mode refresh costs one `kms:Decrypt` and two `kms:Encrypt` calls.
+      a rotating-mode refresh costs two `kms:Decrypt` (stored upstream token,
+      client secret) and two `kms:Encrypt` calls; a replay within the grace
+      period costs one `kms:Decrypt` and no upstream request.
     action: |-
       The database migration runs on startup; no other operator action. Opt
       extensions in per spec when their apps store the refresh token returned by
       every refresh. Switching an extension from `rotating` back to `sealed`
       rejects `rrt2.` handles, so users sign in again. Switching from `sealed`
-      to `rotating` keeps existing sessions.
+      to `rotating` keeps sessions that hold an `rrt1.` handle younger than
+      `max_lifetime_seconds`; raw refresh tokens from before handles existed
+      are rejected in `rotating` mode, so migrate them in `sealed` mode first
+      if those sessions matter.
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-

@@ -35,7 +35,6 @@ CREATE TABLE oauth_refresh_tokens (
     -- Set when the handle has been exchanged for its successor.
     rotated_at TIMESTAMPTZ,
     grace_until TIMESTAMPTZ,
-    successor_hash BYTEA REFERENCES oauth_refresh_tokens(handle_hash) ON DELETE SET NULL,
     -- Exact token response returned for the rotation, replayed to duplicate
     -- requests within the grace window and cleared after it.
     successor_response_encrypted TEXT,

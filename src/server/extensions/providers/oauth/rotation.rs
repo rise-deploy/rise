@@ -11,22 +11,30 @@
 //!
 //! Refreshing, in short (the SQL is in `db::oauth_refresh_tokens`):
 //! 1. One request atomically *claims* the handle and calls the upstream.
-//! 2. On success it records the successor and the exact response it returns.
-//!    Until the grace period is over, the same handle returns that same
-//!    response, so parallel tabs and retried requests agree on one successor.
+//! 2. On success it records the successor and the exact response it returns:
+//!    the upstream's own response with only `refresh_token` replaced by the
+//!    successor. Until the grace period is over, the same handle returns that
+//!    same response, so parallel tabs and retried requests agree on one
+//!    successor, and nothing is asked of the upstream (or of anything the
+//!    upstream call needs, such as endpoint discovery or the client secret).
 //! 3. A handle presented after its grace period is reuse: the whole family is
-//!    revoked.
+//!    revoked and its stored secrets are erased.
 //!
 //! The upstream call is a parameter ([`Rotation::refresh`] takes a closure),
 //! so the state machine runs without an HTTP server.
 
-use super::models::{OAuth2TokenResponse, RefreshTokenSettings};
-use super::refresh_handle::{replace_refresh_token, split_refresh_token};
+use super::models::RefreshTokenSettings;
+use super::provider::UpstreamReply;
+use super::refresh_handle::{
+    classify_decrypt_error, parse_response_body, HandleError, ResponseBody, TokenReply,
+    UnsealedRefreshToken,
+};
 use crate::db::oauth_refresh_tokens::{self as store, HandleState, RotationOutcome};
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::future::Future;
@@ -84,41 +92,44 @@ fn context(project: Uuid, extension: &str, handle_hash: &[u8], slot: Slot) -> En
     )
 }
 
-/// What the upstream returned for a refresh.
-#[derive(Debug)]
-pub struct Refreshed {
-    /// The upstream's new refresh token, if it rotated its own.
-    pub new_upstream_refresh_token: Option<String>,
-    /// The response for the app. Its `refresh_token` is replaced by the
-    /// successor handle.
-    pub response: OAuth2TokenResponse,
+/// A token response as kept for the grace window.
+#[derive(Serialize, Deserialize)]
+struct StoredReply {
+    status: u16,
+    content_type: Option<String>,
+    body: String,
 }
 
-/// Why the upstream refresh failed.
+/// Why the upstream call could not produce an answer. Raised by the closure
+/// given to [`Rotation::refresh`]; the claim on the handle is released.
 #[derive(Debug)]
-pub enum UpstreamError {
-    /// The upstream rejected the refresh token for good (`invalid_grant`).
-    InvalidGrant,
-    /// A 2xx answer that is not a usable token response. The token may still
-    /// be good.
-    MalformedResponse(anyhow::Error),
-    /// Anything else (network, timeout, upstream 4xx/5xx). The token may still
-    /// be good.
-    Failed(anyhow::Error),
+pub enum UpstreamFailure {
+    /// The request failed or timed out.
+    Unreachable(anyhow::Error),
+    /// Rise could not set the call up (unresolvable or forbidden endpoint, an
+    /// unreadable client secret): a configuration problem.
+    Misconfigured(anyhow::Error),
+    /// A transient encryption-provider failure while setting the call up.
+    Unavailable(anyhow::Error),
 }
 
 /// Why a rotating-mode request did not produce a token response.
 #[derive(Debug)]
 pub enum RotationError {
-    /// The handle is unknown, expired, revoked, or was reused.
+    /// The handle is unknown, expired, revoked, reused or unreadable.
     InvalidGrant,
     /// A concurrent refresh of the same handle did not finish in time.
     TemporarilyUnavailable,
-    /// The upstream refresh failed; the handle stays usable.
-    Upstream(anyhow::Error),
-    /// The upstream answered 2xx with something that is not a token response;
-    /// the handle stays usable.
-    UpstreamMalformed(anyhow::Error),
+    /// The upstream answered with an error that is no verdict on the token;
+    /// it is passed on as it is. The handle stays usable.
+    Passthrough(UpstreamReply),
+    /// The upstream could not be reached or timed out; the handle stays usable.
+    Unreachable(anyhow::Error),
+    /// The upstream answered 2xx with something that is not a JSON object token
+    /// response; the handle stays usable.
+    Malformed(anyhow::Error),
+    /// The extension could not be called (endpoint or credential problem).
+    Misconfigured(anyhow::Error),
     /// The store or the encryption provider failed.
     Internal(anyhow::Error),
 }
@@ -185,33 +196,57 @@ impl<'a> Rotation<'a> {
     /// Replace the upstream `refresh_token` of a code-grant response by the
     /// first handle of a new family.
     ///
-    /// The same body rules as the sealed mode apply: only a 2xx JSON object
-    /// with a non-empty string `refresh_token` is rewritten, everything else is
-    /// returned untouched.
-    pub async fn issue_in_token_response(&self, status: u16, body: String) -> Result<String> {
-        let Some((mut members, upstream)) = split_refresh_token(status, &body) else {
+    /// The body rules are those of the sealed mode, except that a 2xx response
+    /// must end up carrying a handle: a body that is not a JSON object with a
+    /// refresh token is passed on only if it shows no sign of one.
+    pub async fn issue_in_token_response(
+        &self,
+        status: u16,
+        body: String,
+    ) -> Result<String, super::refresh_handle::ReplyError> {
+        use super::refresh_handle::ReplyError;
+        if !(200..300).contains(&status) {
             return Ok(body);
-        };
-        let (handle, family) = self.start_family(&upstream).await?;
-        info!(
-            family_id = %family,
-            project_id = %self.project,
-            extension = self.extension,
-            outcome = "family_started",
-            "rotating refresh token family issued"
-        );
-        replace_refresh_token(&mut members, handle)
+        }
+        match parse_response_body(body.as_bytes()) {
+            ResponseBody::Opaque => Ok(body),
+            ResponseBody::Unparseable => Err(ReplyError::Unparseable),
+            ResponseBody::Object(mut members) => {
+                let Some(upstream) = members.refresh_token() else {
+                    return Ok(body);
+                };
+                let unavailable = |e: anyhow::Error| ReplyError::Seal(classify_decrypt_error(e));
+                let (handle, family) = self.start_family(&upstream).await.map_err(unavailable)?;
+                info!(
+                    family_id = %family,
+                    project_id = %self.project,
+                    extension = self.extension,
+                    outcome = "family_started",
+                    "rotating refresh token family issued"
+                );
+                members
+                    .set_refresh_token(&handle)
+                    .and_then(|()| members.to_body())
+                    .map_err(|e| ReplyError::Seal(HandleError::Unavailable(e)))
+                    .map(|body| String::from_utf8(body).expect("serde_json writes UTF-8"))
+            }
+        }
     }
 
     /// Refresh with a handle previously issued by this mode.
     ///
-    /// Returns the JSON token response for the app. `upstream` is called with
-    /// the upstream refresh token when this request wins the claim on the
-    /// handle, and not otherwise.
-    pub async fn refresh<F, Fut>(&self, handle: &str, upstream: F) -> Result<String, RotationError>
+    /// Returns the token response for the app. `upstream` is called with the
+    /// upstream refresh token when this request wins the claim on the handle,
+    /// and not otherwise: replays and requests waiting for the winner do no
+    /// upstream work, including whatever the closure sets up.
+    pub async fn refresh<F, Fut>(
+        &self,
+        handle: &str,
+        upstream: F,
+    ) -> Result<TokenReply, RotationError>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = Result<Refreshed, UpstreamError>>,
+        Fut: Future<Output = Result<UpstreamReply, UpstreamFailure>>,
     {
         let hash = hash_handle(handle);
         let claimant = Uuid::new_v4();
@@ -247,7 +282,7 @@ impl<'a> Rotation<'a> {
                 } => {
                     let encrypted = response_encrypted
                         .ok_or_else(|| internal(anyhow!("recorded refresh response is missing")))?;
-                    let body = self
+                    let stored = self
                         .encryption
                         .decrypt(
                             &encrypted,
@@ -255,6 +290,8 @@ impl<'a> Rotation<'a> {
                         )
                         .await
                         .map_err(|e| self.unreadable(family_id, e))?;
+                    let reply = serde_json::from_str::<StoredReply>(&stored)
+                        .map_err(|e| self.unreadable(family_id, e.into()))?;
                     info!(
                         family_id = %family_id,
                         project_id = %self.project,
@@ -262,7 +299,11 @@ impl<'a> Rotation<'a> {
                         outcome = "grace_replay",
                         "rotating refresh token replayed within grace period"
                     );
-                    return Ok(body);
+                    return Ok(TokenReply {
+                        status: reply.status,
+                        content_type: reply.content_type,
+                        body: reply.body.into_bytes(),
+                    });
                 }
                 HandleState::Rotated { family_id, .. } => {
                     self.revoke(family_id, "reuse_detected").await;
@@ -291,10 +332,10 @@ impl<'a> Rotation<'a> {
         claimant: Uuid,
         claimed: store::ClaimedHandle,
         upstream: F,
-    ) -> Result<String, RotationError>
+    ) -> Result<TokenReply, RotationError>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = Result<Refreshed, UpstreamError>>,
+        Fut: Future<Output = Result<UpstreamReply, UpstreamFailure>>,
     {
         let family_id = claimed.family_id;
         let upstream_token = match self
@@ -312,27 +353,66 @@ impl<'a> Rotation<'a> {
             }
         };
 
-        let refreshed = match self.call_upstream(upstream, upstream_token.clone()).await {
-            Ok(refreshed) => refreshed,
-            Err(UpstreamError::InvalidGrant) => {
-                self.revoke(family_id, "upstream_invalid_grant").await;
-                return Err(RotationError::InvalidGrant);
-            }
-            Err(UpstreamError::Failed(e)) => {
+        let reply = match self.call_upstream(upstream, upstream_token.clone()).await {
+            Ok(reply) => reply,
+            Err(failure) => {
                 self.release(hash, claimant).await;
-                return Err(RotationError::Upstream(e));
+                return Err(match failure {
+                    UpstreamFailure::Unreachable(e) => RotationError::Unreachable(e),
+                    UpstreamFailure::Misconfigured(e) => RotationError::Misconfigured(e),
+                    UpstreamFailure::Unavailable(e) => RotationError::Internal(e),
+                });
             }
-            Err(UpstreamError::MalformedResponse(e)) => {
+        };
+        if reply.is_invalid_grant() {
+            self.revoke(family_id, "upstream_invalid_grant").await;
+            return Err(RotationError::InvalidGrant);
+        }
+        if !reply.is_success() {
+            // No verdict on the token: pass the answer on and let a retry use it.
+            self.release(hash, claimant).await;
+            return Err(RotationError::Passthrough(reply));
+        }
+        let ResponseBody::Object(mut members) = parse_response_body(&reply.body) else {
+            self.release(hash, claimant).await;
+            return Err(RotationError::Malformed(anyhow!(
+                "upstream 2xx token response is not a JSON object"
+            )));
+        };
+
+        // The upstream's new token if it rotated its own, otherwise the one it
+        // just accepted, which stays valid.
+        let next_upstream = members.refresh_token().unwrap_or(upstream_token);
+        let successor = new_handle();
+        let successor_hash = hash_handle(&successor);
+        let built = members
+            .set_refresh_token(&successor)
+            .and_then(|()| members.to_body())
+            .map(|body| TokenReply {
+                status: reply.status,
+                content_type: reply.content_type.clone(),
+                body,
+            });
+        let reply = match built {
+            Ok(reply) => reply,
+            Err(e) => {
                 self.release(hash, claimant).await;
-                return Err(RotationError::UpstreamMalformed(e));
+                return Err(internal(e));
             }
         };
 
-        let committed = self
-            .record_successor(hash, claimant, family_id, upstream_token, refreshed)
-            .await;
-        match committed {
-            Ok((RotationOutcome::Recorded, body)) => {
+        match self
+            .record_successor(
+                hash,
+                claimant,
+                family_id,
+                &next_upstream,
+                &successor_hash,
+                &reply,
+            )
+            .await
+        {
+            Ok(RotationOutcome::Recorded) => {
                 info!(
                     family_id = %family_id,
                     project_id = %self.project,
@@ -340,10 +420,11 @@ impl<'a> Rotation<'a> {
                     outcome = "rotated",
                     "rotating refresh token rotated"
                 );
-                Ok(body)
+                Ok(reply)
             }
-            Ok((RotationOutcome::FamilyEnded, _)) => Err(RotationError::InvalidGrant),
-            Ok((RotationOutcome::ClaimLost, _)) => {
+            // Revoked while the upstream request ran: no tokens for a dead login.
+            Ok(RotationOutcome::FamilyEnded) => Err(RotationError::InvalidGrant),
+            Ok(RotationOutcome::ClaimLost) => {
                 warn!(
                     family_id = %family_id,
                     project_id = %self.project,
@@ -365,30 +446,23 @@ impl<'a> Rotation<'a> {
         hash: &[u8; 32],
         claimant: Uuid,
         family_id: Uuid,
-        upstream_token: String,
-        refreshed: Refreshed,
-    ) -> Result<(RotationOutcome, String)> {
-        // The upstream's new token if it rotated its own, otherwise the one it
-        // just accepted, which stays valid.
-        let next_upstream = match refreshed.new_upstream_refresh_token {
-            Some(token) if !token.is_empty() => token,
-            _ => upstream_token,
-        };
-        let successor = new_handle();
-        let successor_hash = hash_handle(&successor);
-        let mut response = refreshed.response;
-        response.refresh_token = Some(successor);
-        let body =
-            serde_json::to_string(&response).context("Failed to serialize token response")?;
-
+        next_upstream: &str,
+        successor_hash: &[u8; 32],
+        reply: &TokenReply,
+    ) -> Result<RotationOutcome> {
+        let stored = serde_json::to_string(&StoredReply {
+            status: reply.status,
+            content_type: reply.content_type.clone(),
+            body: String::from_utf8(reply.body.clone()).context("Token response is not UTF-8")?,
+        })?;
         let upstream_encrypted = self
             .encryption
             .encrypt(
-                &next_upstream,
+                next_upstream,
                 &context(
                     self.project,
                     self.extension,
-                    &successor_hash,
+                    successor_hash,
                     Slot::UpstreamToken,
                 ),
             )
@@ -396,55 +470,80 @@ impl<'a> Rotation<'a> {
         let response_encrypted = self
             .encryption
             .encrypt(
-                &body,
+                &stored,
                 &context(self.project, self.extension, hash, Slot::Response),
             )
             .await?;
-        let outcome = store::record_rotation(
+        store::record_rotation(
             self.pool,
             &store::Rotation {
                 claimed_handle: hash,
                 claimant,
                 family_id,
                 grace: self.settings.grace_period(),
-                successor_handle: &successor_hash,
+                successor_handle: successor_hash,
                 successor_upstream_token_encrypted: &upstream_encrypted,
                 response_encrypted: &response_encrypted,
             },
         )
-        .await?;
-        Ok((outcome, body))
+        .await
     }
 
-    /// Refresh with an upstream token that is not a `rotating` handle (an
-    /// `rrt1.` handle or a raw token, already unsealed by the caller) and start
-    /// a family from the result. This is how an extension moves from `sealed`
-    /// to `rotating` without signing anyone out.
-    pub async fn refresh_unsealed<F, Fut>(
+    /// Refresh with an `rrt1.` handle that has been unsealed by the caller, and
+    /// start a family from the result. This is how an extension moves from
+    /// `sealed` to `rotating` without signing anyone out.
+    ///
+    /// The login's absolute lifetime counts from the handle's issue time: one
+    /// that is older than `max_lifetime_seconds` at `now` (Unix seconds) is not
+    /// accepted.
+    pub async fn refresh_sealed<F, Fut>(
         &self,
-        upstream_refresh_token: String,
+        sealed: &UnsealedRefreshToken,
+        now: i64,
         upstream: F,
-    ) -> Result<String, RotationError>
+    ) -> Result<TokenReply, RotationError>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = Result<Refreshed, UpstreamError>>,
+        Fut: Future<Output = Result<UpstreamReply, UpstreamFailure>>,
     {
-        let refreshed = match self
-            .call_upstream(upstream, upstream_refresh_token.clone())
+        let lifetime = i64::try_from(self.settings.max_lifetime().as_secs()).unwrap_or(i64::MAX);
+        if sealed.issued_at.saturating_add(lifetime) <= now {
+            info!(
+                project_id = %self.project,
+                extension = self.extension,
+                outcome = "sealed_handle_past_max_lifetime",
+                "sealed refresh handle is older than the maximum login lifetime"
+            );
+            return Err(RotationError::InvalidGrant);
+        }
+        let reply = match self
+            .call_upstream(upstream, sealed.upstream_refresh_token.clone())
             .await
         {
-            Ok(refreshed) => refreshed,
-            Err(UpstreamError::InvalidGrant) => return Err(RotationError::InvalidGrant),
-            Err(UpstreamError::Failed(e)) => return Err(RotationError::Upstream(e)),
-            Err(UpstreamError::MalformedResponse(e)) => {
-                return Err(RotationError::UpstreamMalformed(e))
+            Ok(reply) => reply,
+            Err(UpstreamFailure::Unreachable(e)) => return Err(RotationError::Unreachable(e)),
+            Err(UpstreamFailure::Misconfigured(e)) => return Err(RotationError::Misconfigured(e)),
+            Err(UpstreamFailure::Unavailable(e)) => return Err(RotationError::Internal(e)),
+        };
+        if reply.is_invalid_grant() {
+            return Err(RotationError::InvalidGrant);
+        }
+        if !reply.is_success() {
+            return Err(RotationError::Passthrough(reply));
+        }
+        let ResponseBody::Object(mut members) = parse_response_body(&reply.body) else {
+            return Err(RotationError::Malformed(anyhow!(
+                "upstream 2xx token response is not a JSON object"
+            )));
+        };
+        let next_upstream = members
+            .refresh_token()
+            .unwrap_or_else(|| sealed.upstream_refresh_token.clone());
+        let (handle, family) = self.start_family(&next_upstream).await.map_err(|e| {
+            match classify_decrypt_error(e) {
+                HandleError::Rejected(e) | HandleError::Unavailable(e) => internal(e),
             }
-        };
-        let next_upstream = match refreshed.new_upstream_refresh_token {
-            Some(token) if !token.is_empty() => token,
-            _ => upstream_refresh_token,
-        };
-        let (handle, family) = self.start_family(&next_upstream).await.map_err(internal)?;
+        })?;
         info!(
             family_id = %family,
             project_id = %self.project,
@@ -452,44 +551,56 @@ impl<'a> Rotation<'a> {
             outcome = "family_started_from_sealed",
             "rotating refresh token family started from a sealed handle"
         );
-        let mut response = refreshed.response;
-        response.refresh_token = Some(handle);
-        serde_json::to_string(&response)
-            .context("Failed to serialize token response")
+        members
+            .set_refresh_token(&handle)
+            .and_then(|()| members.to_body())
             .map_err(internal)
+            .map(|body| TokenReply {
+                status: reply.status,
+                content_type: reply.content_type,
+                body,
+            })
     }
 
     async fn call_upstream<F, Fut>(
         &self,
         upstream: F,
         upstream_refresh_token: String,
-    ) -> Result<Refreshed, UpstreamError>
+    ) -> Result<UpstreamReply, UpstreamFailure>
     where
         F: FnOnce(String) -> Fut,
-        Fut: Future<Output = Result<Refreshed, UpstreamError>>,
+        Fut: Future<Output = Result<UpstreamReply, UpstreamFailure>>,
     {
         tokio::time::timeout(self.upstream_timeout, upstream(upstream_refresh_token))
             .await
             .unwrap_or_else(|_| {
-                Err(UpstreamError::Failed(anyhow!(
+                Err(UpstreamFailure::Unreachable(anyhow!(
                     "upstream refresh timed out after {:?}",
                     self.upstream_timeout
                 )))
             })
     }
 
-    /// A stored value that does not decrypt for its handle was tampered with
-    /// (or moved between rows): the handle is not usable.
+    /// A stored value that does not decrypt for its handle. If the ciphertext
+    /// was rejected the record was tampered with (or moved between rows): the
+    /// handle is not usable. Anything else says nothing about the record and
+    /// is a retryable failure.
     fn unreadable(&self, family_id: Uuid, error: anyhow::Error) -> RotationError {
-        error!(
-            security_event = "refresh_token_record_unreadable",
-            family_id = %family_id,
-            project_id = %self.project,
-            extension = self.extension,
-            "stored rotating refresh token record did not decrypt: {:?}",
-            error
-        );
-        RotationError::InvalidGrant
+        if rise_backend_core::encryption::is_ciphertext_rejection(&error)
+            || error.downcast_ref::<serde_json::Error>().is_some()
+        {
+            error!(
+                security_event = "refresh_token_record_unreadable",
+                family_id = %family_id,
+                project_id = %self.project,
+                extension = self.extension,
+                "stored rotating refresh token record is unreadable: {:?}",
+                error
+            );
+            RotationError::InvalidGrant
+        } else {
+            internal(error)
+        }
     }
 
     async fn revoke(&self, family_id: Uuid, reason: &'static str) {
@@ -582,18 +693,22 @@ mod tests {
         rotation
     }
 
-    fn refreshed(access_token: &str, new_upstream: Option<&str>) -> Refreshed {
-        Refreshed {
-            new_upstream_refresh_token: new_upstream.map(str::to_string),
-            response: OAuth2TokenResponse {
-                access_token: access_token.into(),
-                token_type: "Bearer".into(),
-                expires_in: Some(3600),
-                refresh_token: None,
-                scope: None,
-                id_token: None,
-            },
+    fn upstream_json(status: u16, body: Value) -> UpstreamReply {
+        UpstreamReply {
+            status,
+            content_type: Some("application/json".into()),
+            body: body.to_string().into_bytes(),
         }
+    }
+
+    /// A 2xx token response, with the upstream's own refresh token if it rotated.
+    fn ok(access_token: &str, new_upstream: Option<&str>) -> UpstreamReply {
+        let mut body =
+            json!({"access_token": access_token, "token_type": "Bearer", "scope": "upstream"});
+        if let Some(token) = new_upstream {
+            body["refresh_token"] = json!(token);
+        }
+        upstream_json(200, body)
     }
 
     /// Records the upstream refresh tokens it is called with.
@@ -603,6 +718,9 @@ mod tests {
         delay: Duration,
     }
 
+    type Answer =
+        std::pin::Pin<Box<dyn Future<Output = Result<UpstreamReply, UpstreamFailure>> + Send>>;
+
     impl FakeUpstream {
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
@@ -610,12 +728,8 @@ mod tests {
 
         fn answer(
             &self,
-            reply: Result<Refreshed, UpstreamError>,
-        ) -> impl FnOnce(
-            String,
-        ) -> std::pin::Pin<
-            Box<dyn Future<Output = Result<Refreshed, UpstreamError>> + Send>,
-        > {
+            reply: Result<UpstreamReply, UpstreamFailure>,
+        ) -> impl FnOnce(String) -> Answer {
             let this = self.clone();
             move |token| {
                 Box::pin(async move {
@@ -627,8 +741,8 @@ mod tests {
         }
     }
 
-    fn token(body: &str) -> (Value, String) {
-        let value: Value = serde_json::from_str(body).unwrap();
+    fn token(reply: &TokenReply) -> (Value, String) {
+        let value: Value = serde_json::from_slice(&reply.body).unwrap();
         let handle = value["refresh_token"].as_str().unwrap().to_string();
         (value, handle)
     }
@@ -643,7 +757,10 @@ mod tests {
             )
             .await
             .unwrap();
-        token(&body).1
+        serde_json::from_str::<Value>(&body).unwrap()["refresh_token"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     async fn expire_grace(pool: &PgPool) {
@@ -651,6 +768,15 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+    }
+
+    async fn stored_secrets(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oauth_refresh_tokens WHERE upstream_token_encrypted IS NOT NULL OR successor_response_encrypted IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     #[sqlx::test]
@@ -661,16 +787,19 @@ mod tests {
         let body = rotation
             .issue_in_token_response(
                 200,
-                r#"{"access_token":"at","token_type":"Bearer","refresh_token":"upstream-rt","scope":"a b","extra":[1]}"#.into(),
+                r#"{"zeta":1,"access_token":"at","token_type":"Bearer","refresh_token":"upstream-rt","scope":"a b","extra":[1]}"#.into(),
             )
             .await
             .unwrap();
-        let (value, handle) = token(&body);
+        let value: Value = serde_json::from_str(&body).unwrap();
+        let handle = value["refresh_token"].as_str().unwrap().to_string();
         assert!(is_rotating_handle(&handle));
         assert_eq!(handle.len(), "rrt2.".len() + 43);
         assert!(!body.contains("upstream-rt"));
         assert_eq!(value["scope"], "a b");
         assert_eq!(value["extra"], json!([1]));
+        assert!(body.find("zeta").unwrap() < body.find("access_token").unwrap());
+        assert!(body.find("access_token").unwrap() < body.find("refresh_token").unwrap());
 
         // Only the hash of the handle is stored, and the stored token is ciphertext.
         let (hash, stored): (Vec<u8>, String) = sqlx::query_as(
@@ -707,6 +836,13 @@ mod tests {
                 body
             );
         }
+        // A body that is not an object but carries a refresh token is refused.
+        assert!(matches!(
+            rotation
+                .issue_in_token_response(200, "access_token=at&refresh_token=rt".into())
+                .await,
+            Err(super::super::refresh_handle::ReplyError::Unparseable)
+        ));
         let families: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_refresh_families")
             .fetch_one(&pool)
             .await
@@ -722,26 +858,32 @@ mod tests {
         let first = login(&rotation, "upstream-1").await;
 
         let upstream = FakeUpstream::default();
-        let body = rotation
-            .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+        let reply = rotation
+            .refresh(&first, upstream.answer(Ok(ok("at1", None))))
             .await
             .unwrap();
-        let (value, second) = token(&body);
+        let (value, second) = token(&reply);
         assert_eq!(value["access_token"], "at1");
+        assert_eq!(
+            value["scope"], "upstream",
+            "the upstream's members are kept"
+        );
         assert!(is_rotating_handle(&second));
         assert_ne!(
             second, first,
             "a successor is issued even if upstream did not rotate"
         );
-        assert!(!body.contains("upstream-1"));
+        assert!(!String::from_utf8_lossy(&reply.body).contains("upstream-1"));
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.content_type.as_deref(), Some("application/json"));
         assert_eq!(upstream.calls(), ["upstream-1"]);
 
         // The successor still wraps the same upstream token.
-        let body = rotation
-            .refresh(&second, upstream.answer(Ok(refreshed("at2", None))))
+        let reply = rotation
+            .refresh(&second, upstream.answer(Ok(ok("at2", None))))
             .await
             .unwrap();
-        assert_ne!(token(&body).1, second);
+        assert_ne!(token(&reply).1, second);
         assert_eq!(upstream.calls(), ["upstream-1", "upstream-1"]);
     }
 
@@ -753,26 +895,73 @@ mod tests {
         let first = login(&rotation, "upstream-1").await;
 
         let upstream = FakeUpstream::default();
-        let body = rotation
-            .refresh(
-                &first,
-                upstream.answer(Ok(refreshed("at1", Some("upstream-2")))),
-            )
+        let reply = rotation
+            .refresh(&first, upstream.answer(Ok(ok("at1", Some("upstream-2")))))
             .await
             .unwrap();
-        assert!(!body.contains("upstream-2"));
-        let second = token(&body).1;
-        let body = rotation
-            .refresh(&second, upstream.answer(Ok(refreshed("at2", Some("")))))
+        assert!(!String::from_utf8_lossy(&reply.body).contains("upstream-2"));
+        let second = token(&reply).1;
+        let reply = rotation
+            .refresh(&second, upstream.answer(Ok(ok("at2", Some("")))))
             .await
             .unwrap();
-        let third = token(&body).1;
+        let third = token(&reply).1;
         // An empty upstream token counts as "not rotated".
         rotation
-            .refresh(&third, upstream.answer(Ok(refreshed("at3", None))))
+            .refresh(&third, upstream.answer(Ok(ok("at3", None))))
             .await
             .unwrap();
         assert_eq!(upstream.calls(), ["upstream-1", "upstream-2", "upstream-2"]);
+    }
+
+    #[sqlx::test]
+    async fn the_upstream_answer_is_relayed_with_only_the_refresh_token_replaced(pool: PgPool) {
+        let project = project(&pool, "relay", &["login"]).await;
+        let provider = encryption();
+        let rotation = rotation(&pool, &provider, project, "login");
+        let first = login(&rotation, "upstream-1").await;
+        let upstream = FakeUpstream::default();
+        let body = r#"{"id_token":"idt","access_token":"at","extra":{"b":[1,2.50],"a":null},"refresh_token":"upstream-2","expires_in":60}"#;
+        let reply = rotation
+            .refresh(
+                &first,
+                upstream.answer(Ok(UpstreamReply {
+                    status: 200,
+                    content_type: Some("application/json;charset=UTF-8".into()),
+                    body: body.as_bytes().to_vec(),
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.content_type.as_deref(),
+            Some("application/json;charset=UTF-8")
+        );
+        let text = String::from_utf8(reply.body.clone()).unwrap();
+        let positions: Vec<usize> = [
+            "id_token",
+            "access_token",
+            "extra",
+            "refresh_token",
+            "expires_in",
+        ]
+        .iter()
+        .map(|name| text.find(&format!("\"{name}\"")).unwrap())
+        .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{text}");
+        assert!(
+            text.contains(r#""extra":{"b":[1,2.50],"a":null}"#),
+            "{text}"
+        );
+
+        // A response without a refresh token gets the successor appended.
+        let (_, second) = token(&reply);
+        let reply = rotation
+            .refresh(&second, upstream.answer(Ok(ok("at2", None))))
+            .await
+            .unwrap();
+        let text = String::from_utf8(reply.body).unwrap();
+        assert!(text.rfind("refresh_token").unwrap() > text.find("scope").unwrap());
     }
 
     #[sqlx::test]
@@ -786,11 +975,11 @@ mod tests {
         let upstream = FakeUpstream::default();
 
         let a = rotation
-            .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+            .refresh(&first, upstream.answer(Ok(ok("at1", None))))
             .await
             .unwrap();
         let b = rotation
-            .refresh(&first, upstream.answer(Ok(refreshed("never", None))))
+            .refresh(&first, upstream.answer(Ok(ok("never", None))))
             .await
             .unwrap();
         assert_eq!(a, b, "the exact response is replayed");
@@ -800,16 +989,46 @@ mod tests {
         // replayable for the whole grace window.
         let (_, second) = token(&a);
         rotation
-            .refresh(&second, upstream.answer(Ok(refreshed("at2", None))))
+            .refresh(&second, upstream.answer(Ok(ok("at2", None))))
             .await
             .unwrap();
         assert_eq!(
             rotation
-                .refresh(&first, upstream.answer(Ok(refreshed("never", None))))
+                .refresh(&first, upstream.answer(Ok(ok("never", None))))
                 .await
                 .unwrap(),
             a
         );
+    }
+
+    #[sqlx::test]
+    async fn replays_and_waiting_requests_do_not_run_the_upstream_setup(pool: PgPool) {
+        let project = project(&pool, "setup", &["login"]).await;
+        let provider = encryption();
+        let mut rotation = rotation(&pool, &provider, project, "login");
+        rotation.wait = Duration::from_secs(5);
+        let first = login(&rotation, "upstream-1").await;
+        let setups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slow = |setups: Arc<std::sync::atomic::AtomicUsize>| {
+            move |_token: String| {
+                setups.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok::<_, UpstreamFailure>(ok("at1", None))
+                }
+            }
+        };
+        let results = futures::future::join_all(
+            (0..3).map(|_| rotation.refresh(&first, slow(setups.clone()))),
+        )
+        .await;
+        assert!(results.iter().all(Result::is_ok));
+        // A replay after the winner finished does not set anything up either.
+        rotation
+            .refresh(&first, slow(setups.clone()))
+            .await
+            .unwrap();
+        assert_eq!(setups.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[sqlx::test]
@@ -824,18 +1043,14 @@ mod tests {
             ..Default::default()
         };
 
-        let attempts = (0..4).map(|n| {
-            rotation.refresh(
-                &first,
-                upstream.answer(Ok(refreshed(&format!("at{n}"), None))),
-            )
-        });
-        let bodies: Vec<String> = futures::future::join_all(attempts)
+        let attempts = (0..4)
+            .map(|n| rotation.refresh(&first, upstream.answer(Ok(ok(&format!("at{n}"), None)))));
+        let replies: Vec<TokenReply> = futures::future::join_all(attempts)
             .await
             .into_iter()
             .map(Result::unwrap)
             .collect();
-        assert!(bodies.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(replies.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(upstream.calls().len(), 1);
     }
 
@@ -860,14 +1075,14 @@ mod tests {
 
         let upstream = FakeUpstream::default();
         let result = rotation
-            .refresh(&first, upstream.answer(Ok(refreshed("never", None))))
+            .refresh(&first, upstream.answer(Ok(ok("never", None))))
             .await;
         assert!(matches!(result, Err(RotationError::TemporarilyUnavailable)));
         assert!(upstream.calls().is_empty());
     }
 
     #[sqlx::test]
-    async fn reuse_after_the_grace_period_revokes_the_whole_family(pool: PgPool) {
+    async fn reuse_after_the_grace_period_revokes_the_family_and_erases_its_secrets(pool: PgPool) {
         let project = project(&pool, "reuse", &["login"]).await;
         let provider = encryption();
         let rotation = rotation(&pool, &provider, project, "login");
@@ -875,34 +1090,37 @@ mod tests {
         let upstream = FakeUpstream::default();
         let second = token(
             &rotation
-                .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+                .refresh(&first, upstream.answer(Ok(ok("at1", None))))
                 .await
                 .unwrap(),
         )
         .1;
         let third = token(
             &rotation
-                .refresh(&second, upstream.answer(Ok(refreshed("at2", None))))
+                .refresh(&second, upstream.answer(Ok(ok("at2", None))))
                 .await
                 .unwrap(),
         )
         .1;
+        assert!(stored_secrets(&pool).await > 0);
         expire_grace(&pool).await;
 
         // Replaying the oldest handle is reuse.
         assert!(matches!(
             rotation
-                .refresh(&first, upstream.answer(Ok(refreshed("never", None))))
+                .refresh(&first, upstream.answer(Ok(ok("never", None))))
                 .await,
             Err(RotationError::InvalidGrant)
         ));
-        // It ended the login: the current handle is dead as well.
+        // It ended the login: the current handle is dead as well, and nothing
+        // of the family's secrets is left.
         assert!(matches!(
             rotation
-                .refresh(&third, upstream.answer(Ok(refreshed("never", None))))
+                .refresh(&third, upstream.answer(Ok(ok("never", None))))
                 .await,
             Err(RotationError::InvalidGrant)
         ));
+        assert_eq!(stored_secrets(&pool).await, 0);
         assert_eq!(upstream.calls().len(), 2, "upstream was not called again");
         let revoked: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM oauth_refresh_families WHERE revoked_at IS NOT NULL",
@@ -922,19 +1140,19 @@ mod tests {
         let upstream = FakeUpstream::default();
         let second = token(
             &rotation
-                .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+                .refresh(&first, upstream.answer(Ok(ok("at1", None))))
                 .await
                 .unwrap(),
         )
         .1;
         // Refreshing does not extend the family: it ends when it was set to.
-        let extended: bool = sqlx::query_scalar(
+        let not_extended: bool = sqlx::query_scalar(
             "SELECT expires_at <= NOW() + INTERVAL '3600 seconds' FROM oauth_refresh_families",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert!(extended);
+        assert!(not_extended);
 
         sqlx::query("UPDATE oauth_refresh_families SET expires_at = NOW() - INTERVAL '1 second'")
             .execute(&pool)
@@ -942,7 +1160,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rotation
-                .refresh(&second, upstream.answer(Ok(refreshed("never", None))))
+                .refresh(&second, upstream.answer(Ok(ok("never", None))))
                 .await,
             Err(RotationError::InvalidGrant)
         ));
@@ -950,32 +1168,160 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn an_upstream_failure_releases_the_claim_for_a_retry(pool: PgPool) {
+    async fn failures_that_are_no_verdict_release_the_claim_for_a_retry(pool: PgPool) {
         let project = project(&pool, "failure", &["login"]).await;
         let provider = encryption();
         let rotation = rotation(&pool, &provider, project, "login");
         let first = login(&rotation, "upstream-1").await;
         let upstream = FakeUpstream::default();
 
-        let result = rotation
-            .refresh(
-                &first,
-                upstream.answer(Err(UpstreamError::Failed(anyhow!("503 from upstream")))),
-            )
-            .await;
-        assert!(matches!(result, Err(RotationError::Upstream(_))));
+        let outage = upstream_json(503, json!({"error": "temporarily_unavailable"}));
+        let result = rotation.refresh(&first, upstream.answer(Ok(outage))).await;
+        let Err(RotationError::Passthrough(passed)) = result else {
+            panic!("an upstream 503 is passed through");
+        };
+        assert_eq!(passed.status, 503);
+        // A 4xx that is not invalid_grant, and invalid_grant with a 5xx status or
+        // a non-JSON body, are no verdict either.
+        for answer in [
+            upstream_json(400, json!({"error": "invalid_client"})),
+            upstream_json(500, json!({"error": "invalid_grant"})),
+            UpstreamReply {
+                status: 400,
+                content_type: Some("text/plain".into()),
+                body: b"error=invalid_grant".to_vec(),
+            },
+        ] {
+            assert!(matches!(
+                rotation.refresh(&first, upstream.answer(Ok(answer))).await,
+                Err(RotationError::Passthrough(_))
+            ));
+        }
+        for failure in [
+            UpstreamFailure::Unreachable(anyhow!("connection refused")),
+            UpstreamFailure::Misconfigured(anyhow!("no endpoint")),
+            UpstreamFailure::Unavailable(anyhow!("throttled")),
+        ] {
+            assert!(rotation
+                .refresh(&first, upstream.answer(Err(failure)))
+                .await
+                .is_err());
+        }
 
         // Same handle, immediately usable again, without waiting for a lease.
-        let body = rotation
-            .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+        let reply = rotation
+            .refresh(&first, upstream.answer(Ok(ok("at1", None))))
             .await
             .unwrap();
-        assert_eq!(token(&body).0["access_token"], "at1");
-        assert_eq!(upstream.calls(), ["upstream-1", "upstream-1"]);
+        assert_eq!(token(&reply).0["access_token"], "at1");
+        assert_eq!(upstream.calls().len(), 8);
     }
 
     #[sqlx::test]
-    async fn an_upstream_invalid_grant_revokes_the_family(pool: PgPool) {
+    async fn a_malformed_2xx_answer_releases_the_claim(pool: PgPool) {
+        let project = project(&pool, "malformed", &["login"]).await;
+        let provider = encryption();
+        let rotation = rotation(&pool, &provider, project, "login");
+        let first = login(&rotation, "upstream-1").await;
+        let upstream = FakeUpstream::default();
+        for body in [
+            "access_token=at&refresh_token=leaky&token_type=bearer",
+            "ok",
+            "[1]",
+        ] {
+            let result = rotation
+                .refresh(
+                    &first,
+                    upstream.answer(Ok(UpstreamReply {
+                        status: 200,
+                        content_type: Some("application/x-www-form-urlencoded".into()),
+                        body: body.as_bytes().to_vec(),
+                    })),
+                )
+                .await;
+            assert!(matches!(result, Err(RotationError::Malformed(_))), "{body}");
+        }
+        rotation
+            .refresh(&first, upstream.answer(Ok(ok("at1", None))))
+            .await
+            .unwrap();
+        assert_eq!(upstream.calls().len(), 4);
+    }
+
+    #[sqlx::test]
+    async fn an_upstream_call_that_times_out_releases_the_claim(pool: PgPool) {
+        let project = project(&pool, "timeout", &["login"]).await;
+        let provider = encryption();
+        let mut rotation = rotation(&pool, &provider, project, "login");
+        rotation.upstream_timeout = Duration::from_millis(100);
+        let first = login(&rotation, "upstream-1").await;
+        let slow = FakeUpstream {
+            delay: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let result = rotation
+            .refresh(&first, slow.answer(Ok(ok("late", None))))
+            .await;
+        assert!(matches!(result, Err(RotationError::Unreachable(_))));
+        let fast = FakeUpstream::default();
+        rotation
+            .refresh(&first, fast.answer(Ok(ok("at1", None))))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn a_stale_claim_is_taken_over_and_the_late_claimant_cannot_overwrite_the_result(
+        pool: PgPool,
+    ) {
+        let project = project(&pool, "lease", &["login"]).await;
+        let provider = encryption();
+        let rotation = rotation(&pool, &provider, project, "login");
+        let first = login(&rotation, "upstream-1").await;
+        let slow = FakeUpstream {
+            delay: Duration::from_millis(600),
+            ..Default::default()
+        };
+        let fast = FakeUpstream::default();
+
+        let original = rotation.refresh(&first, slow.answer(Ok(ok("original", None))));
+        let takeover = async {
+            // The original claimant is frozen past its lease.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            sqlx::query("UPDATE oauth_refresh_tokens SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE claimed_by IS NOT NULL")
+                .execute(&pool)
+                .await
+                .unwrap();
+            rotation
+                .refresh(&first, fast.answer(Ok(ok("takeover", None))))
+                .await
+        };
+        let (original, takeover) = tokio::join!(original, takeover);
+
+        let takeover = takeover.unwrap();
+        assert_eq!(token(&takeover).0["access_token"], "takeover");
+        assert!(matches!(
+            original,
+            Err(RotationError::TemporarilyUnavailable)
+        ));
+        // The takeover's response is what the handle replays, and only its
+        // successor exists.
+        let replay = rotation
+            .refresh(&first, fast.answer(Ok(ok("never", None))))
+            .await
+            .unwrap();
+        assert_eq!(replay, takeover);
+        assert_eq!(slow.calls().len(), 1);
+        assert_eq!(fast.calls().len(), 1);
+        let handles: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_refresh_tokens")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(handles, 2);
+    }
+
+    #[sqlx::test]
+    async fn only_an_upstream_4xx_invalid_grant_revokes_the_family_and_erases_it(pool: PgPool) {
         let project = project(&pool, "dead", &["login"]).await;
         let provider = encryption();
         let rotation = rotation(&pool, &provider, project, "login");
@@ -983,27 +1329,57 @@ mod tests {
         let upstream = FakeUpstream::default();
         let second = token(
             &rotation
-                .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+                .refresh(&first, upstream.answer(Ok(ok("at1", None))))
                 .await
                 .unwrap(),
         )
         .1;
 
+        let dead = upstream_json(400, json!({"error": "invalid_grant"}));
         assert!(matches!(
-            rotation
-                .refresh(&second, upstream.answer(Err(UpstreamError::InvalidGrant)))
-                .await,
+            rotation.refresh(&second, upstream.answer(Ok(dead))).await,
             Err(RotationError::InvalidGrant)
         ));
+        assert_eq!(stored_secrets(&pool).await, 0);
         for handle in [&first, &second] {
             assert!(matches!(
                 rotation
-                    .refresh(handle, upstream.answer(Ok(refreshed("never", None))))
+                    .refresh(handle, upstream.answer(Ok(ok("never", None))))
                     .await,
                 Err(RotationError::InvalidGrant)
             ));
         }
         assert_eq!(upstream.calls().len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn a_login_revoked_while_the_refresh_is_in_flight_answers_invalid_grant(pool: PgPool) {
+        let project = project(&pool, "inflight", &["login"]).await;
+        let provider = encryption();
+        let rotation = rotation(&pool, &provider, project, "login");
+        let first = login(&rotation, "upstream-1").await;
+        let family: Uuid = sqlx::query_scalar("SELECT family_id FROM oauth_refresh_families")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let slow = FakeUpstream {
+            delay: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let refresh = rotation.refresh(&first, slow.answer(Ok(ok("at1", None))));
+        let revoke = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            crate::db::oauth_refresh_tokens::revoke_family(&pool, family)
+                .await
+                .unwrap();
+        };
+        let (result, ()) = tokio::join!(refresh, revoke);
+        assert!(matches!(result, Err(RotationError::InvalidGrant)));
+        assert_eq!(
+            stored_secrets(&pool).await,
+            0,
+            "no successor survives the revocation"
+        );
     }
 
     #[sqlx::test]
@@ -1024,7 +1400,7 @@ mod tests {
         ] {
             assert!(matches!(
                 foreign
-                    .refresh(&first, upstream.answer(Ok(refreshed("never", None))))
+                    .refresh(&first, upstream.answer(Ok(ok("never", None))))
                     .await,
                 Err(RotationError::InvalidGrant)
             ));
@@ -1033,7 +1409,7 @@ mod tests {
 
         // The owner can still use it: a foreign presenter cannot end the login.
         rotation_a
-            .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
+            .refresh(&first, upstream.answer(Ok(ok("at1", None))))
             .await
             .unwrap();
         assert_eq!(upstream.calls(), ["upstream-1"]);
@@ -1048,7 +1424,7 @@ mod tests {
         for handle in [new_handle().as_str(), "rrt2.", "rrt2.!!!", "rrt2.AAAA"] {
             assert!(matches!(
                 rotation
-                    .refresh(handle, upstream.answer(Ok(refreshed("never", None))))
+                    .refresh(handle, upstream.answer(Ok(ok("never", None))))
                     .await,
                 Err(RotationError::InvalidGrant)
             ));
@@ -1056,62 +1432,66 @@ mod tests {
         assert!(upstream.calls().is_empty());
     }
 
+    async fn sealed(
+        provider: &LocalEncryptionProvider,
+        project: Uuid,
+        issued_at: i64,
+    ) -> UnsealedRefreshToken {
+        let handle = refresh_handle::seal(provider, project, "login", "upstream-sealed", issued_at)
+            .await
+            .unwrap();
+        refresh_handle::unseal(provider, project, "login", &handle)
+            .await
+            .unwrap()
+    }
+
     #[sqlx::test]
-    async fn an_rrt1_handle_or_raw_token_starts_a_new_family(pool: PgPool) {
+    async fn an_rrt1_handle_starts_a_new_family(pool: PgPool) {
         let project = project(&pool, "migrate", &["login"]).await;
         let provider = encryption();
         let rotation = rotation(&pool, &provider, project, "login");
         let upstream = FakeUpstream::default();
+        let now = 1_000_000;
 
-        // A sealed handle issued while the extension was in sealed mode.
-        let sealed = refresh_handle::seal(&provider, project, "login", "upstream-sealed", 1)
-            .await
-            .unwrap();
-        let presented = refresh_handle::present(&provider, project, "login", &sealed)
-            .await
-            .unwrap();
-        let body = rotation
-            .refresh_unsealed(
-                presented.upstream_token().to_string(),
-                upstream.answer(Ok(refreshed("at1", None))),
+        let reply = rotation
+            .refresh_sealed(
+                &sealed(&provider, project, now - 10).await,
+                now,
+                upstream.answer(Ok(ok("at1", None))),
             )
             .await
             .unwrap();
-        let (value, handle) = token(&body);
+        let (value, handle) = token(&reply);
         assert_eq!(value["access_token"], "at1");
         assert!(is_rotating_handle(&handle));
-        assert!(!body.contains("upstream-sealed"));
+        assert!(!String::from_utf8_lossy(&reply.body).contains("upstream-sealed"));
         assert_eq!(upstream.calls(), ["upstream-sealed"]);
 
         // The new handle is a normal member of a new family wrapping the same upstream token.
-        let body = rotation
+        let reply = rotation
             .refresh(
                 &handle,
-                upstream.answer(Ok(refreshed("at2", Some("upstream-new")))),
+                upstream.answer(Ok(ok("at2", Some("upstream-new")))),
             )
             .await
             .unwrap();
-        assert_ne!(token(&body).1, handle);
+        assert_ne!(token(&reply).1, handle);
         assert_eq!(upstream.calls(), ["upstream-sealed", "upstream-sealed"]);
 
-        // A raw pre-handle token migrates the same way, taking the upstream's
-        // rotated token when there is one.
-        let presented = refresh_handle::present(&provider, project, "login", "raw-upstream")
-            .await
-            .unwrap();
-        let body = rotation
-            .refresh_unsealed(
-                presented.upstream_token().to_string(),
-                upstream.answer(Ok(refreshed("at3", Some("raw-rotated")))),
+        // The upstream's rotated token is what the family wraps.
+        let reply = rotation
+            .refresh_sealed(
+                &sealed(&provider, project, now).await,
+                now,
+                upstream.answer(Ok(ok("at3", Some("rotated")))),
             )
             .await
             .unwrap();
-        let handle = token(&body).1;
         rotation
-            .refresh(&handle, upstream.answer(Ok(refreshed("at4", None))))
+            .refresh(&token(&reply).1, upstream.answer(Ok(ok("at4", None))))
             .await
             .unwrap();
-        assert_eq!(upstream.calls()[2..], ["raw-upstream", "raw-rotated"]);
+        assert_eq!(upstream.calls()[2..], ["upstream-sealed", "rotated"]);
 
         let families: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_refresh_families")
             .fetch_one(&pool)
@@ -1121,17 +1501,58 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn a_failed_migration_refresh_creates_nothing(pool: PgPool) {
+    async fn an_rrt1_handle_past_the_max_lifetime_is_refused_before_any_upstream_call(
+        pool: PgPool,
+    ) {
+        let project = project(&pool, "old-handle", &["login"]).await;
+        let provider = encryption();
+        let rotation = rotation(&pool, &provider, project, "login");
+        let upstream = FakeUpstream::default();
+        let now = 1_000_000;
+        // max_lifetime_seconds is 3600 in these tests.
+        for issued_at in [now - 3600, now - 100_000] {
+            assert!(matches!(
+                rotation
+                    .refresh_sealed(
+                        &sealed(&provider, project, issued_at).await,
+                        now,
+                        upstream.answer(Ok(ok("never", None))),
+                    )
+                    .await,
+                Err(RotationError::InvalidGrant)
+            ));
+        }
+        assert!(rotation
+            .refresh_sealed(
+                &sealed(&provider, project, now - 3599).await,
+                now,
+                upstream.answer(Ok(ok("at", None))),
+            )
+            .await
+            .is_ok());
+        assert_eq!(upstream.calls().len(), 1);
+    }
+
+    #[sqlx::test]
+    async fn failed_migration_refreshes_create_nothing(pool: PgPool) {
         let project = project(&pool, "migrate-fail", &["login"]).await;
         let provider = encryption();
         let rotation = rotation(&pool, &provider, project, "login");
         let upstream = FakeUpstream::default();
-        for failure in [
-            UpstreamError::InvalidGrant,
-            UpstreamError::Failed(anyhow!("down")),
+        let now = 5;
+        let handle = sealed(&provider, project, now).await;
+        for answer in [
+            Ok(upstream_json(400, json!({"error": "invalid_grant"}))),
+            Ok(upstream_json(503, json!({}))),
+            Ok(UpstreamReply {
+                status: 200,
+                content_type: None,
+                body: b"refresh_token=x".to_vec(),
+            }),
+            Err(UpstreamFailure::Unreachable(anyhow!("down"))),
         ] {
             assert!(rotation
-                .refresh_unsealed("upstream".into(), upstream.answer(Err(failure)))
+                .refresh_sealed(&handle, now, upstream.answer(answer))
                 .await
                 .is_err());
         }
@@ -1140,99 +1561,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0);
-    }
-
-    #[sqlx::test]
-    async fn a_malformed_upstream_answer_releases_the_claim(pool: PgPool) {
-        let project = project(&pool, "malformed", &["login"]).await;
-        let provider = encryption();
-        let rotation = rotation(&pool, &provider, project, "login");
-        let first = login(&rotation, "upstream-1").await;
-        let upstream = FakeUpstream::default();
-        let result = rotation
-            .refresh(
-                &first,
-                upstream.answer(Err(UpstreamError::MalformedResponse(anyhow!("not json")))),
-            )
-            .await;
-        assert!(matches!(result, Err(RotationError::UpstreamMalformed(_))));
-        rotation
-            .refresh(&first, upstream.answer(Ok(refreshed("at1", None))))
-            .await
-            .unwrap();
-        assert_eq!(upstream.calls().len(), 2);
-    }
-
-    #[sqlx::test]
-    async fn an_upstream_call_that_times_out_releases_the_claim(pool: PgPool) {
-        let project = project(&pool, "timeout", &["login"]).await;
-        let provider = encryption();
-        let mut rotation = rotation(&pool, &provider, project, "login");
-        rotation.upstream_timeout = Duration::from_millis(100);
-        let first = login(&rotation, "upstream-1").await;
-        let slow = FakeUpstream {
-            delay: Duration::from_millis(500),
-            ..Default::default()
-        };
-        let result = rotation
-            .refresh(&first, slow.answer(Ok(refreshed("late", None))))
-            .await;
-        assert!(matches!(result, Err(RotationError::Upstream(_))));
-        let fast = FakeUpstream::default();
-        rotation
-            .refresh(&first, fast.answer(Ok(refreshed("at1", None))))
-            .await
-            .unwrap();
-    }
-
-    #[sqlx::test]
-    async fn a_stale_claim_is_taken_over_and_the_late_claimant_cannot_overwrite_the_result(
-        pool: PgPool,
-    ) {
-        let project = project(&pool, "lease", &["login"]).await;
-        let provider = encryption();
-        let rotation = rotation(&pool, &provider, project, "login");
-        let first = login(&rotation, "upstream-1").await;
-        let slow = FakeUpstream {
-            delay: Duration::from_millis(600),
-            ..Default::default()
-        };
-        let fast = FakeUpstream::default();
-
-        let original = rotation.refresh(&first, slow.answer(Ok(refreshed("original", None))));
-        let takeover = async {
-            // The original claimant is frozen past its lease.
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            sqlx::query("UPDATE oauth_refresh_tokens SET claim_expires_at = NOW() - INTERVAL '1 second' WHERE claimed_by IS NOT NULL")
-                .execute(&pool)
-                .await
-                .unwrap();
-            rotation
-                .refresh(&first, fast.answer(Ok(refreshed("takeover", None))))
-                .await
-        };
-        let (original, takeover) = tokio::join!(original, takeover);
-
-        let takeover = takeover.unwrap();
-        assert_eq!(token(&takeover).0["access_token"], "takeover");
-        assert!(matches!(
-            original,
-            Err(RotationError::TemporarilyUnavailable)
-        ));
-        // The takeover's response is what the handle replays, and only its
-        // successor exists.
-        let replay = rotation
-            .refresh(&first, fast.answer(Ok(refreshed("never", None))))
-            .await
-            .unwrap();
-        assert_eq!(replay, takeover);
-        assert_eq!(slow.calls().len(), 1);
-        assert_eq!(fast.calls().len(), 1);
-        let handles: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oauth_refresh_tokens")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(handles, 2);
     }
 
     #[sqlx::test]
@@ -1250,8 +1578,43 @@ mod tests {
         );
     }
 
+    struct Throttled;
+
+    #[async_trait::async_trait]
+    impl EncryptionProvider for Throttled {
+        async fn encrypt(&self, _: &str, _: &EncryptionContext) -> Result<String> {
+            Err(anyhow!("ThrottlingException"))
+        }
+        async fn decrypt(&self, _: &str, _: &EncryptionContext) -> Result<String> {
+            Err(anyhow!("ThrottlingException"))
+        }
+    }
+
     #[sqlx::test]
-    async fn stored_values_are_bound_to_their_handle_and_unreadable_ones_are_invalid_grant(
+    async fn transient_encryption_failures_are_retryable_and_release_the_claim(pool: PgPool) {
+        let project = project(&pool, "throttled", &["login"]).await;
+        let provider = encryption();
+        let healthy = rotation(&pool, &provider, project, "login");
+        let first = login(&healthy, "upstream-1").await;
+        let throttled = Throttled;
+        let degraded = Rotation::new(&pool, &throttled, project, "login", settings());
+        let upstream = FakeUpstream::default();
+        assert!(matches!(
+            degraded
+                .refresh(&first, upstream.answer(Ok(ok("never", None))))
+                .await,
+            Err(RotationError::Internal(_))
+        ));
+        assert!(upstream.calls().is_empty());
+        // The claim was released: the handle is usable once the provider recovers.
+        healthy
+            .refresh(&first, upstream.answer(Ok(ok("at1", None))))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn stored_values_are_bound_to_their_handle_and_tampered_ones_are_invalid_grant(
         pool: PgPool,
     ) {
         // Moving a ciphertext to another row must not let it decrypt there.
@@ -1269,7 +1632,7 @@ mod tests {
         let upstream = FakeUpstream::default();
         assert!(matches!(
             rotation
-                .refresh(&b, upstream.answer(Ok(refreshed("never", None))))
+                .refresh(&b, upstream.answer(Ok(ok("never", None))))
                 .await,
             Err(RotationError::InvalidGrant)
         ));

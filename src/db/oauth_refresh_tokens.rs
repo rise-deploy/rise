@@ -240,16 +240,14 @@ pub async fn record_rotation(pool: &PgPool, rotation: &Rotation<'_>) -> Result<R
     let updated = sqlx::query!(
         "UPDATE oauth_refresh_tokens
          SET rotated_at = NOW(),
-             grace_until = NOW() + ($4 * INTERVAL '1 second'),
-             successor_hash = $3,
-             successor_response_encrypted = $5,
+             grace_until = NOW() + ($3 * INTERVAL '1 second'),
+             successor_response_encrypted = $4,
              upstream_token_encrypted = NULL,
              claimed_by = NULL,
              claim_expires_at = NULL
-         WHERE handle_hash = $1 AND claimed_by = $2 AND rotated_at IS NULL AND family_id = $6",
+         WHERE handle_hash = $1 AND claimed_by = $2 AND rotated_at IS NULL AND family_id = $5",
         rotation.claimed_handle,
         rotation.claimant,
-        rotation.successor_handle,
         rotation.grace.as_secs_f64(),
         rotation.response_encrypted,
         rotation.family_id,
@@ -274,16 +272,32 @@ pub async fn record_rotation(pool: &PgPool, rotation: &Rotation<'_>) -> Result<R
     Ok(RotationOutcome::Recorded)
 }
 
-/// Revoke a family: none of its handles can be refreshed any more.
+/// Revoke a family: none of its handles can be refreshed any more, and what
+/// they stored is erased (the upstream tokens and the recorded responses).
+///
+/// The family flag is set first and the erasure runs as a separate statement,
+/// after any `record_rotation` holding the family row has committed, so a
+/// successor stored by that rotation is erased too.
 pub async fn revoke_family(pool: &PgPool, family_id: Uuid) -> Result<bool> {
+    let mut tx = pool.begin().await?;
     let result = sqlx::query!(
         "UPDATE oauth_refresh_families SET revoked_at = NOW()
          WHERE family_id = $1 AND revoked_at IS NULL",
         family_id,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("Failed to revoke refresh token family")?;
+    sqlx::query!(
+        "UPDATE oauth_refresh_tokens
+         SET upstream_token_encrypted = NULL, successor_response_encrypted = NULL
+         WHERE family_id = $1",
+        family_id,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("Failed to erase revoked refresh tokens")?;
+    tx.commit().await?;
     Ok(result.rows_affected() == 1)
 }
 
@@ -593,8 +607,27 @@ mod tests {
         .await
         .unwrap();
         let family = rotate(&pool, project, 1, 2, Duration::from_secs(30)).await;
+        let stored = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM oauth_refresh_tokens
+                 WHERE upstream_token_encrypted IS NOT NULL OR successor_response_encrypted IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(
+            stored().await,
+            2,
+            "the live successor's token and the recorded response"
+        );
         assert!(revoke_family(&pool, family).await.unwrap());
         assert!(!revoke_family(&pool, family).await.unwrap());
+        assert_eq!(
+            stored().await,
+            0,
+            "revocation erases every stored secret of the family"
+        );
         for handle in [1, 2] {
             assert_eq!(
                 state(&pool, &hash(handle), project, "login").await.unwrap(),

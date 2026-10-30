@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_refresh_tokens\n         SET upstream_token_encrypted = NULL, successor_response_encrypted = NULL\n         WHERE family_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7885bc46a014809add40191e11d001ea821cb0454a8b89c178cd8ec951640b7d"
+}

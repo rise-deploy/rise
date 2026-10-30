@@ -2,7 +2,6 @@ use crate::db::oauth_refresh_tokens as db_refresh_tokens;
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::providers::oauth::models::{
     OAuthExtensionSpec, OAuthExtensionStatus, RefreshTokenMode, TokenEndpointAuthMethod,
-    TokenResponse,
 };
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
@@ -16,42 +15,30 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-/// The upstream provider rejected a refresh token as `invalid_grant`
-/// (RFC 6749 §5.2): the token is revoked, expired or otherwise dead for good.
-/// Attached as context to the error [`OAuthProvider::refresh_token`] returns;
-/// look for it with `downcast_ref`.
-#[derive(Debug)]
-pub struct UpstreamInvalidGrant;
-
-impl std::fmt::Display for UpstreamInvalidGrant {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("upstream rejected the refresh token as invalid_grant")
-    }
+/// What the upstream token endpoint answered, unparsed.
+#[derive(Debug, Clone)]
+pub struct UpstreamReply {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
 }
 
-impl std::error::Error for UpstreamInvalidGrant {}
-
-/// The upstream answered a refresh with 2xx but without a usable token
-/// response (not a JSON object, or no `access_token`). Attached as context to
-/// the error [`OAuthProvider::refresh_token`] returns.
-#[derive(Debug)]
-pub struct UpstreamMalformedResponse;
-
-impl std::fmt::Display for UpstreamMalformedResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("upstream returned a malformed token response")
+impl UpstreamReply {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
     }
-}
 
-impl std::error::Error for UpstreamMalformedResponse {}
-
-fn is_invalid_grant(status: reqwest::StatusCode, body: &str) -> bool {
-    status == reqwest::StatusCode::BAD_REQUEST
-        && serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
-            .as_deref()
-            == Some("invalid_grant")
+    /// The upstream refused the refresh token for good: a 4xx whose JSON body
+    /// carries `error: "invalid_grant"` (RFC 6749 §5.2). Every other failure
+    /// says nothing certain about the token.
+    pub fn is_invalid_grant(&self) -> bool {
+        (400..500).contains(&self.status)
+            && serde_json::from_slice::<Value>(&self.body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+                .as_deref()
+                == Some("invalid_grant")
+    }
 }
 
 /// The refresh-token mode of a stored spec; `Sealed` when it is absent or unreadable.
@@ -226,15 +213,18 @@ impl OAuthProvider {
         Ok(response)
     }
 
-    /// Refresh an expired token using refresh_token
-    #[allow(dead_code)]
-    pub async fn refresh_token(
+    /// Present `refresh_token` at the upstream token endpoint and return its
+    /// answer as received.
+    ///
+    /// An `Err` means no answer was obtained: the request failed, timed out,
+    /// was redirected, or its body could not be read.
+    pub async fn refresh_upstream(
         &self,
         spec: &OAuthExtensionSpec,
         client_secret: &str,
         refresh_token: &str,
         token_endpoint: &str,
-    ) -> Result<TokenResponse> {
+    ) -> Result<UpstreamReply> {
         debug!("Refreshing token with endpoint: {}", token_endpoint);
 
         let response = self
@@ -248,40 +238,29 @@ impl OAuthProvider {
                 ],
             )
             .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error response".to_string());
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .bytes()
+            .await
+            .context("Failed to read the token refresh response")?
+            .to_vec();
+        if !(200..300).contains(&status) {
             error!(
                 "Token refresh failed with status {}: {}",
-                status, error_text
-            );
-            let failure = anyhow!(
-                "Token refresh failed with status {}: {}",
                 status,
-                error_text
+                String::from_utf8_lossy(&body)
             );
-            return Err(if is_invalid_grant(status, &error_text) {
-                failure.context(UpstreamInvalidGrant)
-            } else {
-                failure
-            });
         }
-
-        let token_response: TokenResponse = response.json().await.map_err(|e| {
-            let malformed = e.is_decode();
-            let e = anyhow::Error::new(e).context("Failed to parse token refresh response");
-            if malformed {
-                e.context(UpstreamMalformedResponse)
-            } else {
-                e
-            }
-        })?;
-
-        Ok(token_response)
+        Ok(UpstreamReply {
+            status,
+            content_type,
+            body,
+        })
     }
 
     /// Handle deletion of an OAuth extension
@@ -1375,11 +1354,11 @@ mod credential_scope_tests {
                 )
                 .await;
             let refresh = provider
-                .refresh_token(&spec, &secret, "refresh-token", &endpoint)
+                .refresh_upstream(&spec, &secret, "refresh-token", &endpoint)
                 .await;
             if path == "/direct" {
                 assert!(exchange.unwrap().status().is_success());
-                assert_eq!(refresh.unwrap().access_token, "access");
+                assert!(String::from_utf8_lossy(&refresh.unwrap().body).contains("\"access\""));
             } else {
                 assert!(exchange
                     .unwrap_err()
@@ -1523,22 +1502,29 @@ mod refresh_token_setting_tests {
             RefreshTokenMode::Sealed
         );
     }
+}
+
+#[cfg(test)]
+mod upstream_reply_tests {
+    use super::*;
+
+    fn reply(status: u16, body: &str) -> UpstreamReply {
+        UpstreamReply {
+            status,
+            content_type: Some("application/json".into()),
+            body: body.as_bytes().to_vec(),
+        }
+    }
 
     #[test]
-    fn only_a_400_invalid_grant_error_is_a_dead_refresh_token() {
-        use reqwest::StatusCode;
+    fn only_a_4xx_json_invalid_grant_error_is_a_dead_refresh_token() {
         let invalid = r#"{"error":"invalid_grant","error_description":"expired"}"#;
-        assert!(is_invalid_grant(StatusCode::BAD_REQUEST, invalid));
-        assert!(!is_invalid_grant(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            invalid
-        ));
-        assert!(!is_invalid_grant(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":"invalid_client"}"#
-        ));
-        assert!(!is_invalid_grant(StatusCode::BAD_REQUEST, "invalid_grant"));
-        let failure = anyhow!("failed").context(UpstreamInvalidGrant);
-        assert!(failure.downcast_ref::<UpstreamInvalidGrant>().is_some());
+        assert!(reply(400, invalid).is_invalid_grant());
+        assert!(reply(401, invalid).is_invalid_grant());
+        assert!(!reply(500, invalid).is_invalid_grant());
+        assert!(!reply(200, invalid).is_invalid_grant());
+        assert!(!reply(400, r#"{"error":"invalid_client"}"#).is_invalid_grant());
+        assert!(!reply(400, "error=invalid_grant").is_invalid_grant());
+        assert!(!reply(400, "invalid_grant").is_invalid_grant());
     }
 }
