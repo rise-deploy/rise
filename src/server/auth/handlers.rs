@@ -704,11 +704,14 @@ pub async fn authorize(
             }))
         }
         "device" => {
-            let client_ip = client_ip.to_string();
             // Unauthenticated, and each start stores a row until it expires.
             state
                 .oauth_rate_limiter
-                .increment_and_check(&client_ip, None, DEVICE_START_RATE_LIMIT_BUCKET)
+                .increment_and_check(
+                    &client_ip.rate_limit_key(),
+                    None,
+                    DEVICE_START_RATE_LIMIT_BUCKET,
+                )
                 .await
                 .map_err(|retry_after| {
                     (
@@ -716,7 +719,8 @@ pub async fn authorize(
                         format!("Too many device logins started; retry in {retry_after}s"),
                     )
                 })?;
-            let client_ip = (client_ip != "unknown").then_some(client_ip);
+            // The approver sees the full address, not the limiter's key.
+            let client_ip = client_ip.addr().map(|ip| ip.to_string());
             // Only the shape is checked here: the endpoint is unauthenticated,
             // so whether the named projects exist is the approver's to see.
             if let Some(access) = &payload.access {

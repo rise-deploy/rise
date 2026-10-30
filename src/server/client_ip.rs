@@ -13,14 +13,22 @@
 //!    driving the router directly): [`ClientIp::UNKNOWN`]. Headers are never
 //!    trusted without a peer to vouch for them.
 //! 2. Peer not trusted: the peer. Forwarded headers are ignored.
-//! 3. Peer trusted: walk `X-Forwarded-For` right to left, skipping addresses
-//!    that are themselves trusted proxies. The first untrusted address is the
-//!    client. When every entry is trusted, the leftmost entry is the client.
-//!    Blank entries are skipped. An entry that is not an IP address (after
-//!    accepting `[v6]`, `ip:port` and `[v6]:port` forms) ends the walk without
-//!    a result, because the chain cannot be followed past it.
-//! 4. No usable `X-Forwarded-For`: `X-Real-IP` if it parses as an IP address.
-//! 5. Otherwise the peer itself.
+//! 3. Peer trusted and `X-Forwarded-For` present (on any number of header
+//!    lines): walk its entries right to left, skipping addresses that are
+//!    themselves trusted proxies. The first untrusted address is the client.
+//!    When every entry is trusted, the leftmost entry is the client. The
+//!    header's raw bytes are split on `,` and each entry is judged on its own,
+//!    so garbage left of an entry a trusted proxy appended never affects it.
+//!    Blank entries are skipped. An entry that is not UTF-8 or not an IP
+//!    address (after accepting `[v6]`, `ip:port` and `[v6]:port` forms) ends
+//!    the walk where it stands: the chain cannot be followed past it, and the
+//!    client resolves to the peer. A chain of more than [`MAX_FORWARDED_ENTRIES`]
+//!    entries is treated the same way.
+//! 4. Peer trusted and no `X-Forwarded-For` header at all: `X-Real-IP` if it
+//!    parses as an IP address, otherwise the peer. `X-Real-IP` is never
+//!    consulted when `X-Forwarded-For` is present, usable or not: a proxy that
+//!    keeps a client-supplied `X-Real-IP` would otherwise let a client choose
+//!    its own address by making `X-Forwarded-For` unusable.
 //!
 //! IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are normalized to IPv4
 //! before matching and keying, so one client does not get two rate-limit
@@ -28,7 +36,7 @@
 
 use std::convert::Infallible;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
@@ -48,6 +56,28 @@ pub struct ClientIp(Option<IpAddr>);
 impl ClientIp {
     /// No address could be established.
     pub const UNKNOWN: ClientIp = ClientIp(None);
+
+    /// The full address, if one was established.
+    pub fn addr(&self) -> Option<IpAddr> {
+        self.0
+    }
+
+    /// The key IP-keyed rate limits count this client under.
+    ///
+    /// IPv4 clients are keyed by address. IPv6 clients are keyed by their /64,
+    /// because a single host or subscriber typically controls a whole /64 and
+    /// can rotate addresses within it at will. Unknown clients share the
+    /// `unknown` key. Use [`Display`](fmt::Display) for the full address (logs,
+    /// audit records).
+    pub fn rate_limit_key(&self) -> String {
+        match self.0 {
+            Some(IpAddr::V6(v6)) => {
+                let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+                format!("{}/64", Ipv6Addr::from(prefix))
+            }
+            _ => self.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for ClientIp {
@@ -131,21 +161,35 @@ impl TrustedProxies {
         if !self.contains(peer) {
             return ClientIp(Some(peer));
         }
-        let forwarded = self
-            .resolve_forwarded_for(headers)
-            .or_else(|| parse_ip(header_text(headers, "x-real-ip")?.as_str()));
-        ClientIp(Some(forwarded.unwrap_or(peer)))
+        let client = if headers.contains_key("x-forwarded-for") {
+            self.resolve_forwarded_for(headers)
+        } else {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| parse_ip(std::str::from_utf8(v.as_bytes()).ok()?))
+        };
+        ClientIp(Some(client.unwrap_or(peer)))
     }
 
+    /// Walk `X-Forwarded-For` right to left. `None` when the chain is unusable
+    /// (see the module docs).
     fn resolve_forwarded_for(&self, headers: &HeaderMap) -> Option<IpAddr> {
-        let joined = header_text(headers, "x-forwarded-for")?;
+        let mut entries: Vec<&[u8]> = Vec::new();
+        for value in headers.get_all("x-forwarded-for") {
+            for entry in value.as_bytes().split(|&b| b == b',') {
+                if entries.len() == MAX_FORWARDED_ENTRIES {
+                    return None;
+                }
+                entries.push(entry);
+            }
+        }
         let mut leftmost_trusted = None;
-        for entry in joined.rsplit(',') {
-            let entry = entry.trim();
+        for entry in entries.into_iter().rev() {
+            let entry = entry.trim_ascii();
             if entry.is_empty() {
                 continue;
             }
-            let ip = parse_ip(entry)?;
+            let ip = parse_ip(std::str::from_utf8(entry).ok()?)?;
             if !self.contains(ip) {
                 return Some(ip);
             }
@@ -168,17 +212,6 @@ impl<'de> Deserialize<'de> for TrustedProxies {
     }
 }
 
-/// All values of a header joined with commas (a header may be repeated, and a
-/// repeated `X-Forwarded-For` is one list). `None` when absent or not text.
-fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
-    let values = headers
-        .get_all(name)
-        .iter()
-        .map(|v| v.to_str().ok())
-        .collect::<Option<Vec<_>>>()?;
-    (!values.is_empty()).then(|| values.join(","))
-}
-
 /// Strictly parse one forwarded address, normalizing IPv4-mapped IPv6.
 fn parse_ip(text: &str) -> Option<IpAddr> {
     let text = text.trim();
@@ -194,6 +227,11 @@ fn parse_ip(text: &str) -> Option<IpAddr> {
         })?;
     Some(ip.to_canonical())
 }
+
+/// Longest `X-Forwarded-For` chain (entries across all header lines) that is
+/// followed. Real chains are a handful of hops; a longer one is treated as
+/// unusable rather than walked.
+pub const MAX_FORWARDED_ENTRIES: usize = 32;
 
 /// Resolve the client address of every request and store it as a [`ClientIp`]
 /// extension. The peer comes from axum's `ConnectInfo`, so the listener must
@@ -344,34 +382,128 @@ mod tests {
     }
 
     #[test]
-    fn malformed_xff_falls_back_to_real_ip_then_peer() {
+    fn present_xff_never_defers_to_real_ip() {
+        // A proxy that keeps a client-supplied X-Real-IP must not let the
+        // client pick its address by spoiling X-Forwarded-For.
         let out = resolve(
             "10.0.2.7",
             &[("x-forwarded-for", "bogus"), ("x-real-ip", "198.51.100.23")],
         );
-        assert_eq!(out, "198.51.100.23");
+        assert_eq!(out, "10.0.2.7");
         let out = resolve(
             "10.0.2.7",
-            &[("x-forwarded-for", "bogus"), ("x-real-ip", "also bogus")],
+            &[("x-forwarded-for", ""), ("x-real-ip", "198.51.100.23")],
         );
         assert_eq!(out, "10.0.2.7");
+        let out = resolve(
+            "10.0.2.7",
+            &[
+                ("x-forwarded-for", "203.0.113.5"),
+                ("x-real-ip", "198.51.100.23"),
+            ],
+        );
+        assert_eq!(out, "203.0.113.5");
+    }
+
+    #[test]
+    fn non_utf8_xff_never_defers_to_real_ip() {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_bytes(b"\x80").unwrap());
+        h.insert("x-real-ip", HeaderValue::from_static("198.51.100.23"));
+        let out = TrustedProxies::default().resolve(Some("10.0.2.7".parse().unwrap()), &h);
+        assert_eq!(out.to_string(), "10.0.2.7");
+    }
+
+    #[test]
+    fn invalid_real_ip_is_the_peer() {
+        assert_eq!(
+            resolve("10.0.2.7", &[("x-real-ip", "also bogus")]),
+            "10.0.2.7"
+        );
+    }
+
+    #[test]
+    fn non_utf8_entry_ends_the_walk_at_that_entry() {
+        // The rightmost entry is not text: the chain is broken, so the peer.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"198.51.100.23, \xff").unwrap(),
+        );
+        let out = TrustedProxies::default().resolve(Some("10.0.2.7".parse().unwrap()), &h);
+        assert_eq!(out.to_string(), "10.0.2.7");
+    }
+
+    #[test]
+    fn non_utf8_entry_left_of_a_proxy_appended_entry_cannot_poison_it() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff\x80, 198.51.100.23, 10.0.1.5").unwrap(),
+        );
+        let out = TrustedProxies::default().resolve(Some("10.0.2.7".parse().unwrap()), &h);
+        assert_eq!(out.to_string(), "198.51.100.23");
+    }
+
+    #[test]
+    fn non_utf8_value_on_an_earlier_header_line_is_not_reached() {
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_bytes(b"\x80").unwrap());
+        h.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.23, 10.0.1.5"),
+        );
+        let out = TrustedProxies::default().resolve(Some("10.0.2.7".parse().unwrap()), &h);
+        assert_eq!(out.to_string(), "198.51.100.23");
+    }
+
+    #[test]
+    fn overlong_chain_resolves_to_the_peer() {
+        let at_cap = std::iter::repeat_n("10.0.1.5", MAX_FORWARDED_ENTRIES - 1)
+            .chain(["198.51.100.23"])
+            .rev()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", HeaderValue::from_str(&at_cap).unwrap());
+        let t = TrustedProxies::default();
+        let peer = Some("10.0.2.7".parse().unwrap());
+        assert_eq!(t.resolve(peer, &h).to_string(), "198.51.100.23");
+
+        let over = format!("6.6.6.6, {at_cap}");
+        h.insert("x-forwarded-for", HeaderValue::from_str(&over).unwrap());
+        assert_eq!(t.resolve(peer, &h).to_string(), "10.0.2.7");
+
+        // The cap counts entries across header lines.
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_str(&at_cap).unwrap());
+        h.append("x-forwarded-for", HeaderValue::from_static("6.6.6.6"));
+        assert_eq!(t.resolve(peer, &h).to_string(), "10.0.2.7");
+    }
+
+    #[test]
+    fn rate_limit_key_groups_ipv6_by_64() {
+        let key = |ip: &str| {
+            TrustedProxies::default()
+                .resolve(Some(ip.parse().unwrap()), &HeaderMap::new())
+                .rate_limit_key()
+        };
+        assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
+        assert_eq!(ClientIp::UNKNOWN.rate_limit_key(), "unknown");
+        // Display keeps the full address.
+        let full = TrustedProxies::default()
+            .resolve(Some("2001:db8:1:2::1".parse().unwrap()), &HeaderMap::new());
+        assert_eq!(full.to_string(), "2001:db8:1:2::1");
     }
 
     #[test]
     fn blank_entries_are_skipped() {
         let out = resolve("10.0.2.7", &[("x-forwarded-for", "198.51.100.23,, ")]);
         assert_eq!(out, "198.51.100.23");
-    }
-
-    #[test]
-    fn non_text_header_is_unusable() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-forwarded-for",
-            HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
-        );
-        let out = TrustedProxies::default().resolve(Some("10.0.2.7".parse().unwrap()), &h);
-        assert_eq!(out.to_string(), "10.0.2.7");
     }
 
     #[test]

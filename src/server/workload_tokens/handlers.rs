@@ -38,7 +38,7 @@ async fn authenticate_credential(
     client_ip: ClientIp,
     headers: &HeaderMap,
 ) -> Result<Result<CredentialSubject, Response>, ServerError> {
-    let ip = client_ip.to_string();
+    let ip = client_ip.rate_limit_key();
 
     let credential = extract_bearer_token(headers)
         .map(|c| c.trim().to_string())

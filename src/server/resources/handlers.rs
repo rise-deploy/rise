@@ -1326,7 +1326,7 @@ pub async fn dispatch_post(
     client_ip: crate::server::client_ip::ClientIp,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ServerError> {
-    let client_ip = client_ip.to_string();
+    let client_ip = client_ip.rate_limit_key();
     dispatch_post_any(
         &ResourceApiCtx::from_state(&state),
         raw,

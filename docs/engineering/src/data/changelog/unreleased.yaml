@@ -18,14 +18,21 @@ changes:
       longer trust `X-Real-IP` / `X-Forwarded-For` from arbitrary callers. Rise
       reads them only when the TCP peer is inside the new `server.trusted_proxies`
       list, and resolves the client from `X-Forwarded-For` right to left, skipping
-      trusted hops. The default list is loopback, RFC 1918 and IPv6 unique-local
-      space.
+      trusted hops. `X-Real-IP` is used only when there is no `X-Forwarded-For`.
+      IPv6 clients are rate-limited per /64. The default list is loopback,
+      RFC 1918 and IPv6 unique-local space, which also contains co-tenant
+      workloads: any app or pod that can reach Rise's port from a private
+      address can set `X-Forwarded-For` and choose its rate-limit bucket.
     action: |-
       If your reverse proxy or load balancer connects to Rise from a public
       address, add its CIDR to `server.trusted_proxies`; otherwise all clients
-      share the proxy's rate-limit bucket. Do not expose Rise's port directly
-      to untrusted networks. Deployments behind ingress-nginx or an in-VPC
-      ALB/Traefik chain need no change.
+      share the proxy's rate-limit bucket. Narrow the trust set so co-tenants
+      are excluded: on Kubernetes restrict `networkPolicy.httpIngressFrom` to
+      the ingress controller; on Docker set `trusted_proxies` to Traefik's
+      address or run Rise on a network deployed apps cannot join. Do not
+      expose Rise's port directly to untrusted networks. Deployments behind
+      ingress-nginx need no other change; an in-VPC ALB -> Traefik chain also
+      needs rise-deploy/rise#598 (Traefik trusting the ALB) to be applied.
   - id: credential-encryption-resource-purpose-binding
     title: Credentials are bound to their resource and purpose
     group: security-and-upgrade-guidance

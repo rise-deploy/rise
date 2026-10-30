@@ -59,7 +59,7 @@ async fn exchange_inner(
     client_ip: ClientIp,
     req: ExchangeRequest,
 ) -> Result<ExchangeResponse, ExchangeError> {
-    let ip = client_ip.to_string();
+    let ip = client_ip.rate_limit_key();
 
     // 0. Input validation (cheap, pre-rate-limit).
     if req.grant_type != GRANT_TYPE_TOKEN_EXCHANGE {
