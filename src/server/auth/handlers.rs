@@ -758,6 +758,32 @@ pub async fn authorize(
     }
 }
 
+/// Log the raw, undecoded IdP ID token header and payload (never the signature).
+///
+/// The payload carries PII (email, name, groups, `sub`, IdP-specific claims), so
+/// this is emitted at `trace` on the dedicated `rise::auth::idtoken` target and
+/// is strictly opt-in: `RUST_LOG=debug` does not enable it, only a directive that
+/// names the target does (e.g. `RUST_LOG=info,rise::auth::idtoken=trace`).
+fn trace_idp_id_token(id_token: &str) {
+    if !tracing::enabled!(target: "rise::auth::idtoken", tracing::Level::TRACE) {
+        return;
+    }
+
+    if let Ok(header) = jsonwebtoken::decode_header(id_token) {
+        tracing::trace!(target: "rise::auth::idtoken", "ID token header: {:?}", header);
+    }
+
+    // The payload is decoded without validating the signature.
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() == 3 {
+        if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
+            if let Ok(claims_str) = String::from_utf8(decoded) {
+                tracing::trace!(target: "rise::auth::idtoken", "ID token claims: {}", claims_str);
+            }
+        }
+    }
+}
+
 /// Exchange authorization code for token (OAuth2 PKCE flow)
 #[instrument(skip(state, payload))]
 pub async fn code_exchange(
@@ -798,20 +824,7 @@ pub async fn code_exchange(
         token_info.expires_in
     );
 
-    // Decode and log token claims for debugging (without validating yet)
-    if let Ok(header) = jsonwebtoken::decode_header(&token_info.id_token) {
-        tracing::debug!("ID token header: {:?}", header);
-    }
-
-    // Try to decode payload for logging (this doesn't validate signature)
-    let parts: Vec<&str> = token_info.id_token.split('.').collect();
-    if parts.len() == 3 {
-        if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
-            if let Ok(claims_str) = String::from_utf8(decoded) {
-                tracing::debug!("ID token claims: {}", claims_str);
-            }
-        }
-    }
+    trace_idp_id_token(&token_info.id_token);
 
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
@@ -2986,5 +2999,24 @@ mod tests {
             validate_redirect_url("https://rise.dev/dashboard", public_url, &[]),
             "https://rise.dev/dashboard"
         );
+    }
+
+    fn idtoken_trace_enabled(rust_log: &str) -> bool {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(rust_log));
+        tracing::subscriber::with_default(
+            subscriber,
+            || tracing::enabled!(target: "rise::auth::idtoken", tracing::Level::TRACE),
+        )
+    }
+
+    #[test]
+    fn idp_id_token_trace_is_opt_in_by_target() {
+        assert!(!idtoken_trace_enabled("info"));
+        assert!(!idtoken_trace_enabled("debug"));
+        assert!(!idtoken_trace_enabled("rise=debug"));
+        assert!(idtoken_trace_enabled("info,rise::auth::idtoken=trace"));
     }
 }

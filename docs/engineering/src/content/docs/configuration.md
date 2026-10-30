@@ -661,8 +661,6 @@ RUST_LOG=info,rise::server::auth=debug,rise::server::workload_tokens=debug \
 
 This surfaces:
 
-- `rise::server::auth::handlers` — the OIDC ID-token claims during browser login
-  (`ID token claims: {...}`)
 - `rise::server::auth::middleware` — the issuer the backend peeked at and the
   JWKS-validation outcome for an incoming token
 - `rise::server::auth::context` — per-service-account claim-mismatch reasons
@@ -677,6 +675,20 @@ This surfaces:
 To inspect claims from the *client* side — the token the `rise` CLI presents
 (`RISE_TOKEN`, a `RISE_TOKEN_COMMAND`, or GitHub Actions OIDC) — see
 **Inspecting Token Claims** in the user troubleshooting guide.
+
+### Raw IdP ID-token claims
+
+To see the raw ID-token header and payload the IdP returned during browser
+login, enable the dedicated `rise::auth::idtoken` target at `trace`:
+
+```bash
+RUST_LOG=info,rise::auth::idtoken=trace rise backend server
+```
+
+This is strictly opt-in: `RUST_LOG=debug` (or `rise=debug`) does not turn it on.
+The payload contains personal data (email, name, groups, `sub`, IdP-specific
+claims), so enable it only while debugging a login and keep the resulting logs
+out of shared or long-retention sinks. The signature is never logged.
 
 ## Quickstart Templates
 
