@@ -113,9 +113,23 @@ changes:
       unchanged. A stolen handle is therefore useless against the upstream
       provider and at any other project or extension.
 
+      A handle is also bound to the extension row (its `created_at`) and to the
+      upstream identity the extension had when the handle was issued: the
+      `issuer_url`, the `token_endpoint` override and the `client_id`. Deleting
+      an extension and creating one of the same name, or editing one of those
+      three settings, makes every earlier handle answer `invalid_grant` without
+      any request to an upstream, so an editor of an extension cannot repoint it
+      at a server of their choosing to receive users' upstream refresh tokens.
+      Other edits (scopes, `authorization_endpoint`, client authentication
+      method, ...) keep handles valid. Authorization codes carry the same
+      binding from the callback that stored them, and a code stored by an
+      earlier version is refused.
+
       Refresh tokens issued before this change are raw upstream tokens, and the
       token endpoint still accepts them for now. This compatibility path will be
-      removed in a later release.
+      removed in a later release. A raw token names no upstream, so it is not
+      covered by the upstream check and is sent to whatever upstream the
+      extension currently uses.
 
       Token responses are the upstream's own with only `refresh_token` replaced
       (status, content type, other members and their order are kept), and
@@ -135,6 +149,10 @@ changes:
       present them directly to the upstream provider to treat the value as
       opaque and refresh through the Rise token endpoint. The same encryption
       key must stay available: handles do not unseal if it is changed.
+      Warn editors of OAuth extensions that changing `issuer_url`,
+      `token_endpoint` or `client_id`, or recreating the extension, signs all
+      its users out. Authorization codes issued by a callback before the upgrade
+      and redeemed after it are refused (they live five minutes).
   - id: upcoming-001
     title: Path-based app URLs are no longer supported.
     action: |-
