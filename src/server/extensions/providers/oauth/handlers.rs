@@ -1613,8 +1613,14 @@ async fn token_endpoint_inner(
     match req.grant_type.as_str() {
         "authorization_code" => {
             // Returns Response directly (raw passthrough)
-            handle_authorization_code_grant(state.clone(), project, extension_name.to_string(), req)
-                .await
+            handle_authorization_code_grant(
+                state.clone(),
+                project,
+                extension_name.to_string(),
+                extension.created_at,
+                req,
+            )
+            .await
         }
         "refresh_token" => {
             handle_refresh_token_grant(
@@ -1639,6 +1645,7 @@ async fn handle_authorization_code_grant(
     state: AppState,
     project: crate::db::models::Project,
     extension_name: String,
+    current_extension_created_at: chrono::DateTime<Utc>,
     req: TokenRequest,
 ) -> Result<Response, (StatusCode, Json<OAuth2ErrorResponse>)> {
     // Validate required parameters
@@ -1758,6 +1765,35 @@ async fn handle_authorization_code_grant(
 
     // Note: For non-PKCE flows, client_secret was already validated in token_endpoint()
 
+    // The code must stand for this extension row and carry the upstream identity
+    // its callback exchanged it with. It is refused before anything is decrypted,
+    // so a refused code costs no KMS call. A code from an earlier incarnation of
+    // the extension (same name, another row) would only yield a handle that can
+    // never unseal.
+    let (Some(extension_created_at), Some(upstream_identity)) = (
+        code_state.extension_created_at,
+        code_state.upstream_identity.clone(),
+    ) else {
+        warn!(
+            "Authorization code of project {} extension {} carries no extension binding; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    };
+    if extension_created_at != current_extension_created_at {
+        warn!(
+            "Authorization code of project {} extension {} was issued for an earlier incarnation of the extension; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    }
+
     // Decrypt raw token response from code_state (Rise acts as passthrough proxy)
     let encryption_provider = state.encryption_provider.as_ref().ok_or_else(|| {
         error!("Encryption provider not configured");
@@ -1786,19 +1822,6 @@ async fn handle_authorization_code_grant(
 
     // The upstream refresh token never reaches the app: a 2xx JSON response has it
     // replaced by a sealed handle. Everything else is relayed untouched.
-    let (Some(extension_created_at), Some(upstream_identity)) = (
-        code_state.extension_created_at,
-        code_state.upstream_identity.clone(),
-    ) else {
-        warn!(
-            "Authorization code of project {} extension {} carries no extension binding; refusing it",
-            project.name, extension_name
-        );
-        return Err(oauth2_error(
-            "invalid_grant",
-            Some("Invalid or expired authorization code".to_string()),
-        ));
-    };
     let handle_scope = refresh_handle::HandleScope {
         project: project.id,
         extension: &extension_name,
