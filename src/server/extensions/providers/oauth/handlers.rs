@@ -1653,7 +1653,7 @@ async fn handle_authorization_code_grant(
     state: AppState,
     project: crate::db::models::Project,
     extension_name: String,
-    extension_created_at: chrono::DateTime<Utc>,
+    current_extension_created_at: chrono::DateTime<Utc>,
     spec: OAuthExtensionSpec,
     req: TokenRequest,
 ) -> Result<Response, (StatusCode, Json<OAuth2ErrorResponse>)> {
@@ -1774,6 +1774,52 @@ async fn handle_authorization_code_grant(
 
     // Note: For non-PKCE flows, client_secret was already validated in token_endpoint()
 
+    // The code must stand for this extension row and carry the upstream identity
+    // its callback exchanged it with. It is refused before anything is decrypted,
+    // so a refused code costs no KMS call. A code from an earlier incarnation of
+    // the extension (same name, another row) would only yield a handle for the
+    // old row, which no refresh could ever redeem.
+    let (Some(extension_created_at), Some(upstream_identity)) = (
+        code_state.extension_created_at,
+        code_state.upstream_identity.clone(),
+    ) else {
+        warn!(
+            "Authorization code of project {} extension {} carries no extension binding; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    };
+    if extension_created_at != current_extension_created_at {
+        warn!(
+            "Authorization code of project {} extension {} was issued for an earlier incarnation of the extension; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    }
+
+    // A rotating family is created for the upstream this code was obtained from.
+    // If the extension has been repointed since, the sweep that retired the old
+    // families has already run, and a family started now could never be claimed
+    // by the current extension while holding an upstream token until it expires.
+    if spec.refresh_token.mode == RefreshTokenMode::Rotating
+        && upstream_identity != refresh_handle::UpstreamIdentity::of(&spec).fingerprint()
+    {
+        warn!(
+            "Authorization code of project {} extension {} was obtained from an upstream the extension no longer points at; refusing it",
+            project.name, extension_name
+        );
+        return Err(oauth2_error(
+            "invalid_grant",
+            Some("Invalid or expired authorization code".to_string()),
+        ));
+    }
+
     // Decrypt raw token response from code_state (Rise acts as passthrough proxy)
     let encryption_provider = state.encryption_provider.as_ref().ok_or_else(|| {
         error!("Encryption provider not configured");
@@ -1803,38 +1849,10 @@ async fn handle_authorization_code_grant(
     // The upstream refresh token never reaches the app: a 2xx JSON response has it
     // replaced by a handle, sealed or stored server-side depending on the
     // extension's refresh-token mode. Everything else is relayed untouched.
-    let (Some(code_extension_created_at), Some(upstream_identity)) = (
-        code_state.extension_created_at,
-        code_state.upstream_identity.clone(),
-    ) else {
-        warn!(
-            "Authorization code of project {} extension {} carries no extension binding; refusing it",
-            project.name, extension_name
-        );
-        return Err(oauth2_error(
-            "invalid_grant",
-            Some("Invalid or expired authorization code".to_string()),
-        ));
-    };
-    // Rotating families live and die with the extension row, so a code from
-    // another incarnation of the extension (deleted and created again under the
-    // same name) must not start one.
-    if spec.refresh_token.mode == RefreshTokenMode::Rotating
-        && code_extension_created_at != extension_created_at
-    {
-        warn!(
-            "Authorization code of project {} extension {} was issued for another incarnation of the extension; refusing it",
-            project.name, extension_name
-        );
-        return Err(oauth2_error(
-            "invalid_grant",
-            Some("Invalid or expired authorization code".to_string()),
-        ));
-    }
     let handle_scope = refresh_handle::HandleScope {
         project: project.id,
         extension: &extension_name,
-        extension_created_at: code_extension_created_at,
+        extension_created_at,
         upstream: refresh_handle::UpstreamIdentity::from_fingerprint(upstream_identity),
     };
     let token_response_body = match spec.refresh_token.mode {

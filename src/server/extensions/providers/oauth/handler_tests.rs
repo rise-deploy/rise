@@ -1163,23 +1163,34 @@ async fn a_code_issues_a_handle_for_the_upstream_it_was_obtained_from(pool: PgPo
     assert_eq!((h.upstream.request_count(), evil.request_count()), (0, 0));
 }
 
+/// Redeem `code` while the encryption provider is unavailable: a code that is
+/// refused before anything is decrypted still answers `invalid_grant`, where one
+/// that reached the decrypt would answer 503.
+async fn assert_code_refused_before_decrypt(h: &Harness, code: &str) {
+    let mut state = h.state();
+    state.encryption_provider = Some(Arc::new(Throttled));
+    let (status, _, body) = h
+        .token_with(
+            state,
+            &[("grant_type", "authorization_code"), ("code", code)],
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json_body(&body)["error"], "invalid_grant");
+    assert!(!body.contains("rotated-rt"));
+    assert_eq!(h.upstream.request_count(), 0);
+}
+
 #[sqlx::test]
-async fn a_code_stored_before_the_extension_was_recreated_issues_a_stale_handle(pool: PgPool) {
+async fn a_code_stored_before_the_extension_was_recreated_is_refused(pool: PgPool) {
     let h = Harness::new(pool, json!({})).await;
     let code = h
         .stored_code_response(200, "application/json", ROTATING_BODY)
         .await;
     h.recreate_extension().await;
-    // The code belongs to the old extension's callback (the new row has the same
-    // name, so the code still redeems), and so does the handle it yields.
-    let (status, _, body) = h.exchange_code(&code).await;
-    assert_eq!(status, StatusCode::OK);
-    let handle = json_body(&body)["refresh_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert_refused(&h, &handle).await;
-    assert_eq!(h.upstream.request_count(), 0);
+    // The new row has the same name, so the code still claims, but it belongs to
+    // the old extension's callback.
+    assert_code_refused_before_decrypt(&h, &code).await;
 }
 
 #[sqlx::test]
@@ -1188,9 +1199,118 @@ async fn a_code_stored_without_the_extension_binding_is_refused(pool: PgPool) {
     let code = h
         .store_code(200, "application/json", ROTATING_BODY, false)
         .await;
-    let (status, _, body) = h.exchange_code(&code).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(json_body(&body)["error"], "invalid_grant");
+    assert_code_refused_before_decrypt(&h, &code).await;
+}
+
+/// The Rise-side URL's query parameter `name`.
+fn query_param(url: &str, name: &str) -> String {
+    url::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == name)
+        .unwrap_or_else(|| panic!("no {name} in {url}"))
+        .1
+        .into_owned()
+}
+
+fn location(response: &Response) -> String {
+    response
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+#[sqlx::test]
+async fn the_real_login_flow_issues_a_handle_that_refreshes(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    h.upstream.answer(
+        200,
+        "application/json",
+        r#"{"access_token":"login-at","token_type":"Bearer","refresh_token":"upstream-rt"}"#,
+    );
+
+    // authorize: the upstream authorization request carries the state to return.
+    let authorized = authorize(
+        State(h.state()),
+        project_and_extension(),
+        HeaderMap::new(),
+        Query(AuthorizeFlowQuery {
+            redirect_uri: None,
+            state: Some("app-state".into()),
+            code_challenge: None,
+            code_challenge_method: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let state_token = query_param(&location(&authorized), "state");
+
+    // callback: the upstream code is exchanged and Rise's own code handed to the app.
+    let called_back = callback(
+        State(h.state()),
+        project_and_extension(),
+        HeaderMap::new(),
+        Query(CallbackRequest {
+            code: "upstream-code".into(),
+            state: state_token,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(h.upstream.last_request().contains("code=upstream-code"));
+    let redirect = location(&called_back);
+    assert_eq!(query_param(&redirect, "state"), "app-state");
+    let code = query_param(&redirect, "code");
+
+    // The callback recorded the binding of the row and spec it exchanged with.
+    let recorded = oauth_transient_state::claim::<OAuthCodeState>(
+        h.pool(),
+        &code,
+        Uuid::new_v4(),
+        oauth_transient_state::CLAIM_GRACE_TTL,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let scope = h.scope().await;
+    assert_eq!(
+        recorded.extension_created_at,
+        Some(scope.extension_created_at)
+    );
+    assert_eq!(
+        recorded.upstream_identity.as_deref(),
+        Some(scope.upstream.fingerprint())
+    );
+    recorded.release().await.unwrap();
+
+    // code exchange: the app receives a handle, never the upstream token.
+    let app_redirect = redirect.split('?').next().unwrap();
+    let (status, _, body) = h
+        .token(&[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", app_redirect),
+        ])
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("upstream-rt"));
+    let handle = json_body(&body)["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(handle.starts_with("rrt1."));
+
+    // refresh: the handle works and reaches the upstream with the upstream token.
+    h.upstream.answer(200, "application/json", ROTATING_BODY);
+    let (status, _, body) = h.refresh(&handle).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(h
+        .upstream
+        .last_request()
+        .contains("refresh_token=upstream-rt"));
     assert!(!body.contains("rotated-rt"));
 }
 
