@@ -4,22 +4,28 @@
 //! fixture) and a mock upstream token endpoint on 127.0.0.1, which the
 //! fixture's SSRF settings allow.
 
-use super::handlers::token_endpoint;
-use super::models::{OAuthCodeState, OAuthExtensionSpec, OAuthExtensionStatus};
+use super::handlers::{authorize, callback, oidc_discovery, oidc_jwks, token_endpoint};
+use super::models::{
+    AuthorizeFlowQuery, CallbackRequest, OAuthCodeState, OAuthExtensionSpec, OAuthExtensionStatus,
+    OAuthState,
+};
 use super::provider::oauth_client_secret_context;
 use super::refresh_handle;
+use crate::db::models::User;
 use crate::db::{extensions, oauth_transient_state};
 use crate::server::auth::browser_flow_tests::{fixture, Fixture};
+use crate::server::auth::context::AuthContext;
 use crate::server::encryption::providers::local::LocalEncryptionProvider;
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
+use crate::server::extensions::handlers::get_extension;
 use crate::server::state::AppState;
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::Response,
     routing::post,
-    Router,
+    Json, Router,
 };
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -784,4 +790,152 @@ async fn a_code_stored_without_the_extension_binding_is_refused(pool: PgPool) {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json_body(&body)["error"], "invalid_grant");
     assert!(!body.contains("rotated-rt"));
+}
+
+/// Soft-delete the `login` extension through the path the management API takes.
+async fn delete_extension(h: &Harness) {
+    extensions::mark_deleted(h.pool(), h.project, "login")
+        .await
+        .unwrap();
+}
+
+fn project_and_extension() -> Path<(String, String)> {
+    Path(("demo".to_string(), "login".to_string()))
+}
+
+#[sqlx::test]
+async fn a_deleted_extension_refuses_refresh_without_an_upstream_request(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    h.upstream.answer(200, "application/json", ROTATING_BODY);
+    let handle = h.sealed_handle("upstream-rt").await;
+    assert_eq!(h.refresh(&handle).await.0, StatusCode::OK);
+    assert_eq!(h.upstream.request_count(), 1);
+
+    delete_extension(&h).await;
+
+    // The same refusal as for an extension that was never configured.
+    let (status, _, body) = h.refresh(&handle).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json_body(&body)["error"], "invalid_request");
+    assert!(!body.contains("rotated-rt") && !body.contains("upstream-rt"));
+    assert_eq!(h.upstream.request_count(), 1, "no upstream request");
+}
+
+#[sqlx::test]
+async fn a_deleted_extension_refuses_code_exchange(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    let code = h
+        .stored_code_response(200, "application/json", ROTATING_BODY)
+        .await;
+    delete_extension(&h).await;
+
+    let (status, _, body) = h.exchange_code(&code).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(json_body(&body)["error"], "invalid_request");
+    assert!(!body.contains("rotated-rt"));
+    assert_eq!(h.upstream.request_count(), 0);
+}
+
+#[sqlx::test]
+async fn a_deleted_extension_refuses_authorize_callback_and_discovery(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+
+    // While the extension exists, authorize proceeds past the lookup.
+    let query = || AuthorizeFlowQuery {
+        redirect_uri: None,
+        state: None,
+        code_challenge: None,
+        code_challenge_method: None,
+    };
+    let live = authorize(
+        State(h.state()),
+        project_and_extension(),
+        HeaderMap::new(),
+        Query(query()),
+    )
+    .await;
+    assert_ne!(
+        live.err().map(|(status, _)| status),
+        Some(StatusCode::NOT_FOUND)
+    );
+
+    delete_extension(&h).await;
+
+    let (status, message) = authorize(
+        State(h.state()),
+        project_and_extension(),
+        HeaderMap::new(),
+        Query(query()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(message, "OAuth extension not configured");
+
+    // A callback carrying a state issued before the deletion.
+    let state_token = format!("state-{}", Uuid::new_v4());
+    oauth_transient_state::insert(
+        h.pool(),
+        &state_token,
+        &OAuthState {
+            redirect_uri: Some("http://localhost:3000/".into()),
+            application_state: None,
+            project_name: "demo".into(),
+            extension_name: "login".into(),
+            code_verifier: "verifier".into(),
+            created_at: chrono::Utc::now(),
+            client_code_challenge: None,
+            client_code_challenge_method: None,
+        },
+        std::time::Duration::from_secs(60),
+    )
+    .await
+    .unwrap();
+    let (status, message) = callback(
+        State(h.state()),
+        project_and_extension(),
+        HeaderMap::new(),
+        Query(CallbackRequest {
+            code: "upstream-code".into(),
+            state: state_token,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(message, "OAuth extension not configured");
+
+    let (status, _) = oidc_discovery(State(h.state()), project_and_extension())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = oidc_jwks(State(h.state()), project_and_extension())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    assert_eq!(h.upstream.request_count(), 0);
+}
+
+#[sqlx::test]
+async fn management_still_shows_a_deleted_extension_as_deleted(pool: PgPool) {
+    let h = Harness::new(pool, json!({})).await;
+    delete_extension(&h).await;
+
+    let admin = AuthContext::User(
+        User {
+            id: Uuid::new_v4(),
+            email: "member@example.com".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        },
+        None,
+    );
+    let Json(shown) = get_extension(State(h.state()), admin, project_and_extension())
+        .await
+        .unwrap();
+    assert_eq!(shown.extension, "login");
+    assert!(shown.deleted);
 }

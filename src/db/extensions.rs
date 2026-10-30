@@ -102,6 +102,34 @@ pub async fn find_by_project_and_name(
     .context("Failed to find project extension")
 }
 
+/// Get an extension by project and name, treating a soft-deleted one as absent.
+///
+/// For endpoints that act on behalf of an extension's end users, which must stop
+/// working the moment the extension is deleted rather than when its row is
+/// finally removed. Management paths use [`find_by_project_and_name`].
+pub async fn find_active_by_project_and_name(
+    pool: &PgPool,
+    project_id: Uuid,
+    extension: &str,
+) -> Result<Option<ProjectExtension>> {
+    sqlx::query_as!(
+        ProjectExtension,
+        r#"
+        SELECT project_id, extension, extension_type,
+               spec as "spec: Value",
+               status as "status: Value",
+               created_at, updated_at, deleted_at
+        FROM project_extensions
+        WHERE project_id = $1 AND extension = $2 AND deleted_at IS NULL
+        "#,
+        project_id,
+        extension
+    )
+    .fetch_optional(pool)
+    .await
+    .context("Failed to find active project extension")
+}
+
 /// Mark extension for deletion
 pub async fn mark_deleted(
     pool: &PgPool,
