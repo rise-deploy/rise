@@ -1,25 +1,26 @@
 //! HTTP clients for the relay's upstream discovery, JWKS and token requests.
 
 use crate::server::ssrf::{self, SsrfConfig};
-use oauthrelay_core::{ClientAssertionHttpClient, OutboundDenied, OutboundPolicy, OutboundPurpose};
+use oauthrelay_core::{
+    ClientAssertionHttpClient, OutboundDenied, OutboundPolicy, OutboundRequest, UpstreamHttpClient,
+};
 use url::Url;
 
 /// The relay's client for every upstream request: discovery, JWKS and the
 /// credential-bearing token requests.
 ///
-/// It is Rise's OAuth token client: 5 s connect and 10 s total timeouts, and no
-/// redirects, because the same client carries the upstream client secret and a
-/// redirect would forward it to a destination the secret is not bound to. No
-/// redirects also means [`SsrfOutboundPolicy`], which sees only the first URL,
-/// sees every URL. The client refuses plain http unless allowed and filters
-/// blocked addresses when it resolves a host name.
-pub fn relay_http_client(ssrf: &SsrfConfig) -> reqwest::Client {
-    ssrf::token_client(ssrf)
+/// It is built like Rise's OAuth token client: 5 s connect and 10 s total
+/// timeouts, plain http refused unless `server.ssrf` allows it, and host names
+/// resolved through [`ssrf::SsrfResolver`], which drops blocked addresses when
+/// connecting. oauthrelay never follows redirects with it, so
+/// [`SsrfOutboundPolicy`] sees every URL that is requested, and the upstream
+/// client secret goes only to the token endpoint it is bound to.
+pub fn relay_http_client(ssrf: &SsrfConfig) -> Result<UpstreamHttpClient, reqwest::Error> {
+    UpstreamHttpClient::new(ssrf::token_client_builder(ssrf))
 }
 
-/// The client for `private_key_jwt` client-assertion metadata. Rise relays
-/// never use that client authentication, so it only needs Rise's timeouts and
-/// redirect-free policy.
+/// The client for `private_key_jwt` client-assertion metadata, built the same
+/// way. Rise relays never use that client authentication.
 pub fn client_assertion_http_client(
     ssrf: &SsrfConfig,
 ) -> Result<ClientAssertionHttpClient, reqwest::Error> {
@@ -44,12 +45,29 @@ impl SsrfOutboundPolicy {
     }
 }
 
+impl SsrfOutboundPolicy {
+    /// Whether `url` may be requested; resolves nothing.
+    fn allows(&self, url: &Url) -> Result<(), ssrf::SsrfError> {
+        ssrf::validate_url_without_dns(url, &self.ssrf)
+    }
+}
+
 #[async_trait::async_trait]
 impl OutboundPolicy for SsrfOutboundPolicy {
-    async fn check(&self, url: &Url, purpose: OutboundPurpose) -> Result<(), OutboundDenied> {
-        ssrf::validate_url_without_dns(url, &self.ssrf).map_err(|e| {
-            tracing::warn!(%purpose, url = %url, "OAuth relay request refused: {e}");
-            OutboundDenied::new(format!("{purpose} request to {url} refused: {e}"))
+    async fn check(&self, request: &OutboundRequest<'_>) -> Result<(), OutboundDenied> {
+        self.allows(request.url).map_err(|e| {
+            // Only the origin: paths and queries may carry secrets.
+            let origin = request.url.origin().ascii_serialization();
+            tracing::warn!(
+                purpose = %request.purpose,
+                relay = ?request.relay,
+                %origin,
+                "OAuth relay request refused: {e}"
+            );
+            OutboundDenied::new(format!(
+                "{} request to {origin} refused: {e}",
+                request.purpose
+            ))
         })
     }
 }
@@ -60,8 +78,7 @@ mod tests {
 
     async fn allowed(ssrf: &SsrfConfig, url: &str) -> bool {
         SsrfOutboundPolicy::new(ssrf.clone())
-            .check(&url.parse().unwrap(), OutboundPurpose::Jwks)
-            .await
+            .allows(&url.parse().unwrap())
             .is_ok()
     }
 

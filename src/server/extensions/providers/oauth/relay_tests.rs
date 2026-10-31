@@ -8,7 +8,7 @@ use axum::{
     body::Body,
     extract::State,
     http::{header, HeaderMap, Request, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -152,6 +152,11 @@ async fn mock_token(
             .into_response()
     };
     match form.get("grant_type").map(String::as_str) {
+        Some("authorization_code")
+            if form.get("code").map(String::as_str) == Some("redirect-code") =>
+        {
+            Redirect::temporary("http://169.254.169.254/latest/meta-data").into_response()
+        }
         Some("authorization_code") if form.get("code").map(String::as_str) == Some("bad-code") => {
             invalid_grant()
         }
@@ -1792,4 +1797,30 @@ async fn the_test_flow_keeps_concurrent_changes(pool: PgPool) {
         .await
         .get("auth_verified")
         .is_none());
+}
+
+#[sqlx::test]
+async fn an_upstream_redirect_is_never_followed(pool: PgPool) {
+    let fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(true).await;
+    create_extension(&fixture, &upstream, Client::Confidential, false).await;
+    let app = app(&fixture);
+
+    let response = get_path(
+        &app,
+        &authorize_uri(&[("redirect_uri", APP_REDIRECT)]),
+        &HeaderMap::new(),
+    )
+    .await;
+    let to_upstream = location(&response);
+    let callback = format!(
+        "/oidc/demo/ext/callback?code=redirect-code&state={}",
+        url::form_urlencoded::byte_serialize(query(&to_upstream, "state").unwrap().as_bytes())
+            .collect::<String>()
+    );
+    // The token endpoint redirects to the metadata service: the relay answers
+    // 502 instead of following it or handing the redirect to the app.
+    let response = get_path(&app, &callback, &HeaderMap::new()).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(upstream.token_requests().len(), 1);
 }

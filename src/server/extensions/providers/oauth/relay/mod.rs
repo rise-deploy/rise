@@ -114,16 +114,18 @@ impl OAuthRelay {
             deps.ssrf.clone(),
             deps.resolution_ttl,
         );
-        let config = RelayConfig {
-            public_url: relay_url,
-            sealer: deps.sealer,
-            store: Some(deps.store.clone()),
-            http: http::relay_http_client(&deps.ssrf),
-            client_assertion_http: http::client_assertion_http_client(&deps.ssrf)
-                .context("failed to build the OAuth relay's client assertion HTTP client")?,
-            redirect,
-            outbound: Some(Arc::new(http::SsrfOutboundPolicy::new(deps.ssrf.clone()))),
-        };
+        let config = RelayConfig::new(relay_url, deps.sealer)
+            .with_store(deps.store.clone())
+            .with_http(
+                http::relay_http_client(&deps.ssrf)
+                    .context("failed to build the OAuth relay's HTTP client")?,
+            )
+            .with_client_assertion_http(
+                http::client_assertion_http_client(&deps.ssrf)
+                    .context("failed to build the OAuth relay's client assertion HTTP client")?,
+            )
+            .with_redirect(redirect)
+            .with_outbound(Arc::new(http::SsrfOutboundPolicy::new(deps.ssrf.clone())));
         let router =
             oauthrelay_core::router(Arc::new(resolver), config, Arc::new(layout::RiseLayout));
         Ok(Self {

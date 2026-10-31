@@ -3705,7 +3705,7 @@ dependencies = [
 [[package]]
 name = "oauthrelay-core"
 version = "0.5.0"
-source = "git+https://github.com/rise-deploy/oauthrelay?rev=8d6dfa0c11e453933c7814104d037b06295cf05a#8d6dfa0c11e453933c7814104d037b06295cf05a"
+source = "git+https://github.com/rise-deploy/oauthrelay?rev=d2a6957c5cd6f77a5248be221dc3bffe3b5d31e9#d2a6957c5cd6f77a5248be221dc3bffe3b5d31e9"
 dependencies = [
  "anyhow",
  "arc-swap",
