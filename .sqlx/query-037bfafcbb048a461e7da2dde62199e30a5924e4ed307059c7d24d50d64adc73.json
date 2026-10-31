@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM oauth_relay_store\n             WHERE key IN (\n                 SELECT key FROM oauth_relay_store\n                 WHERE expires_at <= now()\n                 LIMIT $1\n                 FOR UPDATE SKIP LOCKED\n             )\n             AND expires_at <= now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "037bfafcbb048a461e7da2dde62199e30a5924e4ed307059c7d24d50d64adc73"
+}
