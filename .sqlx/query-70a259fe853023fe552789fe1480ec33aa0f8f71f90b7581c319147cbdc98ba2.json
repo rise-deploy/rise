@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT value,\n                  GREATEST(EXTRACT(EPOCH FROM expires_at - now()), 0)::float8 AS \"expires_in!\"\n           FROM oauth_relay_store\n           WHERE key = $1 AND expires_at > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "value",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "oauth_relay_store",
+            "name": "value"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "expires_in!",
+        "type_info": "Float8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "70a259fe853023fe552789fe1480ec33aa0f8f71f90b7581c319147cbdc98ba2"
+}
