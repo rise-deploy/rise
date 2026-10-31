@@ -6,6 +6,8 @@ import { useToast } from '../components/toast';
 import { Avatar, Button, Field, Input, Panel, PanelBody, PanelHead, Pill, Segmented, colorFor } from '../components/r-ui';
 
 export type TokenEndpointAuthMethod = 'client_secret_post' | 'client_secret_basic';
+export type ClientType = 'confidential' | 'public';
+export type RefreshTokenMode = 'sealed' | 'rotating';
 
 export interface OAuthSpec {
     provider_name?: string;
@@ -17,6 +19,8 @@ export interface OAuthSpec {
     token_endpoint?: string;
     token_endpoint_auth_method?: TokenEndpointAuthMethod;
     scopes?: string[];
+    client_type?: ClientType;
+    refresh_token_mode?: RefreshTokenMode;
     [key: string]: unknown;
 }
 
@@ -131,6 +135,19 @@ const AUTH_METHOD_OPTIONS: { value: TokenEndpointAuthMethod; label: string }[] =
     { value: 'client_secret_basic', label: 'HTTP Basic header' },
 ];
 
+const CLIENT_TYPE_OPTIONS: { value: ClientType; label: string }[] = [
+    { value: 'confidential', label: 'Confidential' },
+    { value: 'public', label: 'Public' },
+];
+
+const REFRESH_MODE_OPTIONS: { value: RefreshTokenMode; label: string }[] = [
+    { value: 'sealed', label: 'Sealed' },
+    { value: 'rotating', label: 'Rotating' },
+];
+
+// Public clients always rotate, so the choice is locked to a single option.
+const ROTATING_ONLY_OPTIONS = REFRESH_MODE_OPTIONS.filter(o => o.value === 'rotating');
+
 // Keys this form owns; every other key in the spec is passed through untouched.
 const MANAGED_KEYS = [
     'provider_name',
@@ -142,6 +159,8 @@ const MANAGED_KEYS = [
     'token_endpoint',
     'token_endpoint_auth_method',
     'scopes',
+    'client_type',
+    'refresh_token_mode',
 ];
 
 /** The template an existing spec was built from, matched on its endpoints. */
@@ -205,6 +224,9 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
     const [tokenEndpoint, setTokenEndpoint] = useState(spec.token_endpoint || '');
     const [authMethod, setAuthMethod] = useState<TokenEndpointAuthMethod>(spec.token_endpoint_auth_method || 'client_secret_post');
     const [scopes, setScopes] = useState((spec.scopes || []).join(' '));
+    const [clientType, setClientType] = useState<ClientType>(spec.client_type === 'public' ? 'public' : 'confidential');
+    const [refreshMode, setRefreshMode] = useState<RefreshTokenMode>(spec.refresh_token_mode === 'rotating' ? 'rotating' : 'sealed');
+    const isPublic = clientType === 'public';
 
     const passthroughRef = useRef<OAuthSpec>(
         Object.fromEntries(Object.entries(spec).filter(([k]) => !MANAGED_KEYS.includes(k))),
@@ -330,9 +352,13 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
             if (tokenEndpoint.trim() !== '') next.token_endpoint = tokenEndpoint.trim();
         }
         if (authMethod !== 'client_secret_post') next.token_endpoint_auth_method = authMethod;
+        // Defaults stay out of the spec: confidential clients seal refresh
+        // tokens, and public clients always rotate them.
+        if (isPublic) next.client_type = 'public';
+        else if (refreshMode === 'rotating') next.refresh_token_mode = 'rotating';
         lastSpecRef.current = next;
         onChangeRef.current(next);
-    }, [providerName, description, clientId, clientSecretEncrypted, secretPending, endpointMode, issuerUrl, authorizationEndpoint, tokenEndpoint, authMethod, scopes]);
+    }, [providerName, description, clientId, clientSecretEncrypted, secretPending, endpointMode, issuerUrl, authorizationEndpoint, tokenEndpoint, authMethod, scopes, isPublic, refreshMode]);
 
     const copyRedirectUri = async () => {
         try {
@@ -392,7 +418,7 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
                 <PanelBody>
                     <Field
                         label="Redirect URI"
-                        hint="Register this as the only callback URL. Rise forwards to your app's URLs and localhost from here."
+                        hint="Register this as the only callback URL. Rise forwards to your app's deployment URLs and to localhost from here."
                     >
                         <div style={{ display: 'flex', gap: 8 }}>
                             <Input readOnly value={redirectUri} className="mono" onFocus={e => e.currentTarget.select()} />
@@ -489,6 +515,36 @@ export function OAuthExtensionUI({ spec: initialSpec, onChange, projectName, ins
                                 : 'Rise sends the client ID and secret in the token request body (client_secret_post). Switch to HTTP Basic if the provider answers invalid_client.'}
                         >
                             <Segmented<TokenEndpointAuthMethod> value={authMethod} onChange={setAuthMethod} options={AUTH_METHOD_OPTIONS} />
+                        </Field>
+                    </div>
+                </PanelBody>
+            </Panel>
+
+            <Panel>
+                <PanelHead title="Your app's client" sub="How your application authenticates to Rise's token endpoint." />
+                <PanelBody>
+                    <div className="r-stack">
+                        <Field
+                            label="Client type"
+                            hint={isPublic
+                                ? 'For browser and native apps that cannot keep a secret. PKCE is required and Rise issues no client secret.'
+                                : 'For apps with a backend. Rise injects a client secret that the app must send on every token request, code and refresh.'}
+                        >
+                            <Segmented<ClientType> value={clientType} onChange={setClientType} options={CLIENT_TYPE_OPTIONS} />
+                        </Field>
+                        <Field
+                            label="Refresh tokens"
+                            hint={isPublic
+                                ? 'Public clients always get single-use refresh tokens that rotate on every refresh.'
+                                : refreshMode === 'rotating'
+                                    ? 'Single-use handles: reuse after a 30 second grace period revokes the session, and every login expires after 30 days.'
+                                    : 'Stateless handles that hide the provider\'s refresh token from your app. Choose Rotating to make them single-use.'}
+                        >
+                            <Segmented<RefreshTokenMode>
+                                value={isPublic ? 'rotating' : refreshMode}
+                                onChange={setRefreshMode}
+                                options={isPublic ? ROTATING_ONLY_OPTIONS : REFRESH_MODE_OPTIONS}
+                            />
                         </Field>
                     </div>
                 </PanelBody>
