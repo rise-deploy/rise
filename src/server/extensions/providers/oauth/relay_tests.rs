@@ -1351,3 +1351,170 @@ async fn the_test_flow_refuses_an_extension_recreated_meanwhile(pool: PgPool) {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(before, extension_status(&fixture).await);
 }
+
+// ---------------------------------------------------------------------------
+// Production store and sealer
+// ---------------------------------------------------------------------------
+
+/// Replaces the fixture's in-process store and sealer with the production
+/// `PgTransientStore` and `RiseSealer` over `LocalEncryptionProvider`.
+fn use_production_store_and_sealer(fixture: &mut Fixture) {
+    use super::relay::{sealer::RiseSealer, store::PgTransientStore, OAuthRelay, OAuthRelayDeps};
+    let state = &mut fixture.state;
+    let encryption_provider = state.encryption_provider.clone().unwrap();
+    state.oauth_relay = Arc::new(
+        OAuthRelay::new(OAuthRelayDeps {
+            pool: state.db_pool.clone(),
+            deployment_backend: state.deployment_backend.clone(),
+            sealer: Arc::new(RiseSealer::new(encryption_provider.clone())),
+            store: Arc::new(PgTransientStore::new(state.db_pool.clone())),
+            encryption_provider,
+            public_url: state.public_url.clone(),
+            ssrf: state.server_settings.ssrf.clone(),
+        })
+        .unwrap(),
+    );
+}
+
+async fn relay_store_rows(fixture: &Fixture) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM oauth_relay_store")
+        .fetch_one(&fixture.state.db_pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn flows_run_through_the_postgres_store_and_the_rise_sealer(pool: PgPool) {
+    let mut fixture = fixture(pool).await;
+    use_production_store_and_sealer(&mut fixture);
+    let upstream = MockUpstream::start(true).await;
+    create_extension(&fixture, &upstream, Client::Confidential, false).await;
+    let app = app(&fixture);
+
+    // Confidential: a sealed single-use code and a sealed handle.
+    let code = app_code(&app, &upstream, false).await;
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", APP_REDIRECT),
+        ("client_id", RISE_CLIENT_ID),
+        ("client_secret", RISE_CLIENT_SECRET),
+    ];
+    let (status, tokens) = token(&app, &form).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    let handle = tokens["refresh_token"].as_str().unwrap().to_owned();
+    assert!(handle.starts_with("rrt1."), "{handle}");
+    // The code's replay marker lives in Postgres.
+    assert!(relay_store_rows(&fixture).await >= 1);
+    let (status, body) = token(&app, &form).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_grant");
+    let (status, refreshed) = token(
+        &app,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &handle),
+            ("client_id", RISE_CLIENT_ID),
+            ("client_secret", RISE_CLIENT_SECRET),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{refreshed}");
+    assert_eq!(refreshed["access_token"], "upstream-access-refreshed");
+
+    // The test flow keeps its single-use record in the same store.
+    let session = rise_ui_session_headers(&fixture).await;
+    let started = start_test(&app, &session).await.unwrap();
+    let callback = through_relay(&app, &upstream, &started, &[("code", "upstream-code")]).await;
+    let headers = with_flow_cookie(&session, &started.cookie);
+    let response = get_path(&app, &callback, &headers).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(extension_status(&fixture).await["auth_verified"], true);
+    assert_eq!(
+        get_path(&app, &callback, &headers).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    // Public: rotating handles are families in Postgres.
+    let project = project_id(&fixture).await;
+    db_extensions::delete_permanently(&fixture.state.db_pool, project, "ext")
+        .await
+        .unwrap();
+    create_extension(&fixture, &upstream, Client::Public, false).await;
+    let code = app_code(&app, &upstream, true).await;
+    let (status, tokens) = token(
+        &app,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", APP_REDIRECT),
+            ("client_id", RISE_CLIENT_ID),
+            ("code_verifier", PKCE_VERIFIER),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    let first = tokens["refresh_token"].as_str().unwrap().to_owned();
+    let refresh = |handle: String| {
+        let app = app.clone();
+        async move {
+            token(
+                &app,
+                &[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", &handle),
+                    ("client_id", RISE_CLIENT_ID),
+                ],
+            )
+            .await
+        }
+    };
+    let (status, rotated) = refresh(first.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{rotated}");
+    let second = rotated["refresh_token"].as_str().unwrap().to_owned();
+    assert_ne!(first, second);
+    let (status, duplicate) = refresh(first).await;
+    assert_eq!(status, StatusCode::OK, "{duplicate}");
+    assert_eq!(duplicate["refresh_token"], second.as_str());
+}
+
+#[sqlx::test]
+async fn a_public_url_with_a_path_serves_the_relay_below_it(pool: PgPool) {
+    let mut fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(true).await;
+    create_extension(&fixture, &upstream, Client::Confidential, false).await;
+    let state = &mut fixture.state;
+    state.oauth_relay = Arc::new(
+        super::relay::OAuthRelay::new(super::relay::OAuthRelayDeps {
+            pool: state.db_pool.clone(),
+            deployment_backend: state.deployment_backend.clone(),
+            encryption_provider: state.encryption_provider.clone().unwrap(),
+            public_url: format!("{PUBLIC_URL}/rise/"),
+            ssrf: state.server_settings.ssrf.clone(),
+            sealer: Arc::new(oauthrelay_core::XChaChaSealer::new(&[7; 32], None).unwrap()),
+            store: Arc::new(oauthrelay_core::MemoryStore::default()),
+        })
+        .unwrap(),
+    );
+    let app = app(&fixture);
+
+    let response = get_path(
+        &app,
+        "/oidc/demo/ext/.well-known/openid-configuration",
+        &HeaderMap::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let doc = body_json(response).await;
+    assert_eq!(
+        doc["authorization_endpoint"],
+        format!("{PUBLIC_URL}/rise/oidc/demo/ext/authorize")
+    );
+    // In-process calls address the relay's own path.
+    let response = fixture
+        .state
+        .oauth_relay
+        .token("demo", "ext", &[("grant_type", "refresh_token")])
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

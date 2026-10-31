@@ -20,10 +20,6 @@ pub(crate) struct OidcDiscoveryDocument {
 pub(crate) struct ResolvedEndpoints {
     pub(crate) authorization_endpoint: String,
     pub(crate) token_endpoint: String,
-    /// The JWKS from the discovery document; `None` when discovery did not run
-    /// (both endpoints explicit) or the document names none.
-    #[allow(dead_code)]
-    pub(crate) jwks_uri: Option<String>,
 }
 
 /// The issuer's OIDC discovery URL.
@@ -87,7 +83,6 @@ pub(crate) async fn resolve_oauth_endpoints(
         return Ok(ResolvedEndpoints {
             authorization_endpoint: auth.clone(),
             token_endpoint: token.clone(),
-            jwks_uri: None,
         });
     }
 
@@ -109,7 +104,6 @@ pub(crate) async fn resolve_oauth_endpoints(
     Ok(ResolvedEndpoints {
         authorization_endpoint,
         token_endpoint,
-        jwks_uri: discovery.jwks_uri,
     })
 }
 

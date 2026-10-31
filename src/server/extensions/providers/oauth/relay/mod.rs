@@ -11,11 +11,7 @@ pub mod http;
 pub mod layout;
 pub mod rate_limit;
 pub mod resolver;
-// Allow the placeholder sealer and store until their implementations land;
-// drop both attributes at integration.
-#[allow(dead_code)]
 pub mod sealer;
-#[allow(dead_code)]
 pub mod store;
 
 use std::sync::Arc;
