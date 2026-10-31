@@ -3705,7 +3705,7 @@ dependencies = [
 [[package]]
 name = "oauthrelay-core"
 version = "0.5.0"
-source = "git+https://github.com/rise-deploy/oauthrelay?rev=ffafde9c0066b7d9792f79f6ecba8b4e951e7313#ffafde9c0066b7d9792f79f6ecba8b4e951e7313"
+source = "git+https://github.com/rise-deploy/oauthrelay?rev=e048dbe60341dad08cfb0360758be899a914a817#e048dbe60341dad08cfb0360758be899a914a817"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3716,7 +3716,8 @@ dependencies = [
  "jsonwebtoken 9.3.1",
  "postcard",
  "rand 0.9.5",
- "reqwest 0.12.28",
+ "reqwest 0.13.5",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
@@ -3727,6 +3728,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

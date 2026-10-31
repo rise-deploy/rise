@@ -152,7 +152,7 @@ backend = [
 
 [dependencies]
 # Workspace crates (backend only)
-oauthrelay-core = { git = "https://github.com/rise-deploy/oauthrelay", rev = "ffafde9c0066b7d9792f79f6ecba8b4e951e7313", optional = true }
+oauthrelay-core = { git = "https://github.com/rise-deploy/oauthrelay", rev = "e048dbe60341dad08cfb0360758be899a914a817", optional = true }
 rise-authz = { path = "crates/rise-authz", optional = true }
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }
