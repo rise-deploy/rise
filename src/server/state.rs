@@ -140,6 +140,8 @@ pub struct AppState {
     pub encrypt_rate_limiter: Arc<moka::future::Cache<String, u32>>,
     /// Rate limiter for OAuth endpoints (token, authorize, callback)
     pub oauth_rate_limiter: Arc<crate::server::rate_limit::OAuthRateLimiter>,
+    /// The OAuth extension relay serving `/oidc/{project}/{extension}/*`.
+    pub oauth_relay: Arc<crate::server::extensions::providers::oauth::relay::OAuthRelay>,
     /// Rate limiter for the workload identity token-exchange endpoint.
     pub workload_token_rate_limiter: Arc<crate::server::rate_limit::WorkloadTokenRateLimiter>,
     /// Rate limiter for the generic resource API's `policy-audit` listing.
@@ -2024,6 +2026,24 @@ impl AppState {
             "Initialized OAuth endpoint rate limiter",
         );
 
+        let oauth_relay = {
+            use crate::server::extensions::providers::oauth::relay::{
+                sealer::RiseSealer, store::PgTransientStore, OAuthRelay, OAuthRelayDeps,
+            };
+            let encryption_provider = encryption_provider.clone().ok_or_else(|| {
+                anyhow::anyhow!("Encryption provider required for the OAuth extension relay")
+            })?;
+            Arc::new(OAuthRelay::new(OAuthRelayDeps {
+                pool: db_pool.clone(),
+                deployment_backend: deployment_backend.clone(),
+                sealer: Arc::new(RiseSealer::new(encryption_provider.clone())),
+                store: Arc::new(PgTransientStore::new(db_pool.clone())),
+                encryption_provider,
+                public_url: public_url.clone(),
+                ssrf: settings.server.ssrf.clone(),
+            })?)
+        };
+
         // Extract access_classes from deployment controller settings
         // Filter out null values (used to remove inherited access classes)
         let (
@@ -2179,6 +2199,7 @@ impl AppState {
             extension_registry,
             encrypt_rate_limiter,
             oauth_rate_limiter,
+            oauth_relay,
             workload_token_rate_limiter,
             policy_audit_rate_limiter,
             access_classes,

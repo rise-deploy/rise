@@ -144,6 +144,26 @@ pub(crate) async fn fixture(pool: PgPool) -> Fixture {
         pool.clone(),
     ));
     let empty = Arc::new(Vec::new());
+    let encryption_provider: Arc<dyn crate::server::encryption::EncryptionProvider> = Arc::new(
+        crate::server::encryption::providers::local::LocalEncryptionProvider::new(KEY).unwrap(),
+    );
+    let deployment_backend: Arc<dyn crate::server::deployment::controller::DeploymentBackend> =
+        Arc::new(Backend);
+    // The relay uses oauthrelay's in-process store and sealer.
+    let oauth_relay = Arc::new(
+        crate::server::extensions::providers::oauth::relay::OAuthRelay::new(
+            crate::server::extensions::providers::oauth::relay::OAuthRelayDeps {
+                pool: pool.clone(),
+                deployment_backend: deployment_backend.clone(),
+                encryption_provider: encryption_provider.clone(),
+                public_url: settings.server.public_url.clone(),
+                ssrf: settings.server.ssrf.clone(),
+                sealer: Arc::new(oauthrelay_core::XChaChaSealer::new(&[7; 32], None).unwrap()),
+                store: Arc::new(oauthrelay_core::MemoryStore::default()),
+            },
+        )
+        .unwrap(),
+    );
     let state = AppState {
         db_pool: pool.clone(),
         shutdown: tokio_util::sync::CancellationToken::new(),
@@ -215,8 +235,8 @@ pub(crate) async fn fixture(pool: PgPool) -> Fixture {
             cookie_domain: None,
         },
         public_url: settings.server.public_url.clone(),
-        encryption_provider: None,
-        deployment_backend: Arc::new(Backend),
+        encryption_provider: Some(encryption_provider),
+        deployment_backend,
         deployment_store,
         runtime_log_backend: crate::server::deployment::logs::init_runtime_log_backend(
             &settings.deployment_logs,
@@ -232,6 +252,7 @@ pub(crate) async fn fixture(pool: PgPool) -> Fixture {
         oauth_rate_limiter: Arc::new(crate::server::rate_limit::OAuthRateLimiter::new(
             &settings.server.oauth_rate_limit,
         )),
+        oauth_relay,
         workload_token_rate_limiter: Arc::new(
             crate::server::rate_limit::WorkloadTokenRateLimiter::new(
                 &settings.server.workload_token_rate_limit,

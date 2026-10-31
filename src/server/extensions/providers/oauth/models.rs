@@ -34,6 +34,54 @@ pub struct OAuthExtensionSpec {
     /// in which case the authorization request carries no `scope` parameter.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Whether the app authenticates to Rise's token endpoint with the Rise
+    /// client secret (`confidential`) or holds no secret and must use PKCE
+    /// (`public`).
+    #[serde(default, skip_serializing_if = "ClientType::is_default")]
+    pub client_type: ClientType,
+    /// How refresh tokens are handed to the app. `None` means `sealed` for
+    /// confidential clients and `rotating` for public clients, which always
+    /// rotate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_mode: Option<RefreshTokenMode>,
+}
+
+/// How an app authenticates to Rise's token endpoint for this extension.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientType {
+    /// The app holds the Rise client secret and sends it on every token request.
+    #[default]
+    Confidential,
+    /// The app holds no secret (a browser or native app); PKCE is required.
+    Public,
+}
+
+impl ClientType {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Form of the refresh tokens Rise hands to the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshTokenMode {
+    /// A sealed handle around the provider's refresh token, reusable until
+    /// the provider revokes it.
+    Sealed,
+    /// A single-use handle; every refresh returns its successor.
+    Rotating,
+}
+
+impl OAuthExtensionSpec {
+    /// The refresh-token mode in effect: public clients always rotate.
+    pub fn effective_refresh_token_mode(&self) -> RefreshTokenMode {
+        match self.client_type {
+            ClientType::Public => RefreshTokenMode::Rotating,
+            ClientType::Confidential => self.refresh_token_mode.unwrap_or(RefreshTokenMode::Sealed),
+        }
+    }
 }
 
 /// Client authentication at the upstream token endpoint (RFC 6749 §2.3.1).
@@ -78,6 +126,7 @@ pub struct OAuthExtensionStatus {
     pub rise_client_secret: Option<String>,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// OAuth state stored temporarily during authorization flow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthState {
@@ -105,6 +154,7 @@ pub struct OAuthState {
     pub test_flow_initiator: Option<Uuid>,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// Token response from OAuth provider
 #[derive(Debug, Deserialize)]
 pub struct TokenResponse {
@@ -118,6 +168,7 @@ pub struct TokenResponse {
     pub id_token: Option<String>,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// OAuth callback request from provider
 #[derive(Debug, Deserialize)]
 pub struct CallbackRequest {
@@ -127,6 +178,7 @@ pub struct CallbackRequest {
     pub state: String,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// Authorization code state for OAuth 2.0 flow
 /// Stores encrypted raw token response from upstream provider for single-use exchange
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +206,7 @@ pub struct OAuthCodeState {
     pub status_code: u16,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// OAuth authorization request parameters
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeFlowQuery {
@@ -167,6 +220,7 @@ pub struct AuthorizeFlowQuery {
     pub code_challenge_method: Option<String>,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// Token request (RFC 6749-compliant)
 #[derive(Debug, Deserialize)]
 pub struct TokenRequest {
@@ -186,6 +240,7 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// OAuth2 token response (RFC 6749-compliant)
 #[derive(Debug, Serialize)]
 pub struct OAuth2TokenResponse {
@@ -207,6 +262,7 @@ pub struct OAuth2TokenResponse {
     pub id_token: Option<String>,
 }
 
+// Serves the handlers in `handlers.rs` only. Removed in R2.
 /// OAuth2 error response (RFC 6749-compliant)
 #[derive(Debug, Serialize)]
 pub struct OAuth2ErrorResponse {
