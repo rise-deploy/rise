@@ -21,13 +21,11 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-/// OIDC Discovery document (partial)
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct OidcDiscoveryDocument {
-    authorization_endpoint: Option<String>,
-    token_endpoint: Option<String>,
-    jwks_uri: Option<String>,
-}
+use super::endpoints::{fetch_oidc_discovery, resolve_oauth_endpoints};
+use super::test_flow::{
+    authenticate_test_flow_initiator, bounded_text, redirect_targets_rise_origin,
+    token_exchange_failure_summary,
+};
 
 #[cfg(test)]
 mod redirect_tests {
@@ -191,94 +189,6 @@ mod authorization_url_tests {
 
         assert!(pairs.contains(&("scope".into(), "openid email".into())));
     }
-}
-
-/// Resolved OAuth endpoints from spec or OIDC discovery
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedEndpoints {
-    pub(crate) authorization_endpoint: String,
-    pub(crate) token_endpoint: String,
-}
-
-/// Fetch OIDC discovery document from issuer URL
-async fn fetch_oidc_discovery(
-    issuer_url: &str,
-    ssrf_config: &crate::server::ssrf::SsrfConfig,
-) -> Result<OidcDiscoveryDocument, String> {
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer_url.trim_end_matches('/')
-    );
-
-    // SSRF-validate the discovery URL before fetching
-    crate::server::ssrf::validate_url(&discovery_url, ssrf_config)
-        .await
-        .map_err(|e| {
-            error!("OIDC discovery URL failed SSRF validation: {}", e);
-            format!("OIDC discovery URL failed SSRF validation: {}", e)
-        })?;
-
-    let http_client = crate::server::ssrf::safe_client(ssrf_config);
-    let response = http_client.get(&discovery_url).send().await.map_err(|e| {
-        error!(
-            "Failed to fetch OIDC discovery from {}: {:?}",
-            discovery_url, e
-        );
-        format!("Failed to fetch OIDC discovery: {}", e)
-    })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unable to read error response".to_string());
-        error!(
-            "OIDC discovery failed with status {}: {}",
-            status, error_text
-        );
-        return Err(format!("OIDC discovery failed: {}", status));
-    }
-
-    response.json().await.map_err(|e| {
-        error!("Failed to parse OIDC discovery response: {:?}", e);
-        format!("Failed to parse OIDC discovery: {}", e)
-    })
-}
-
-/// Resolve OAuth endpoints from spec, falling back to OIDC discovery
-pub(crate) async fn resolve_oauth_endpoints(
-    spec: &OAuthExtensionSpec,
-    ssrf_config: &crate::server::ssrf::SsrfConfig,
-) -> Result<ResolvedEndpoints, String> {
-    // If both endpoints are provided in spec, use them directly
-    if let (Some(auth), Some(token)) = (&spec.authorization_endpoint, &spec.token_endpoint) {
-        return Ok(ResolvedEndpoints {
-            authorization_endpoint: auth.clone(),
-            token_endpoint: token.clone(),
-        });
-    }
-
-    // Fetch OIDC discovery document
-    let discovery = fetch_oidc_discovery(&spec.issuer_url, ssrf_config).await?;
-
-    // Use spec override if provided, otherwise use discovery
-    let authorization_endpoint = spec
-        .authorization_endpoint
-        .clone()
-        .or(discovery.authorization_endpoint)
-        .ok_or_else(|| "No authorization_endpoint in spec or OIDC discovery".to_string())?;
-
-    let token_endpoint = spec
-        .token_endpoint
-        .clone()
-        .or(discovery.token_endpoint)
-        .ok_or_else(|| "No token_endpoint in spec or OIDC discovery".to_string())?;
-
-    Ok(ResolvedEndpoints {
-        authorization_endpoint,
-        token_endpoint,
-    })
 }
 
 /// Generate a random state token for CSRF protection
@@ -447,6 +357,29 @@ fn redirect_uri_is_allowed(redirect: &Url, public_url: &Url, app_origins: &[Url]
         || app_origins
             .iter()
             .any(|allowed| origins_match(redirect, allowed))
+}
+
+/// The extension status after a token exchange in the end-user flow, or `None`
+/// when the status must stay as it is.
+///
+/// That flow is reachable without a session, so only an exchange the upstream
+/// accepted may mark the extension configured; a failed one (a stranger's junk
+/// code) never clears an error or flips `auth_verified`.
+fn real_flow_status_update(
+    current: &serde_json::Value,
+    exchange_succeeded: bool,
+    redirect_uri: String,
+) -> Option<OAuthExtensionStatus> {
+    if !exchange_succeeded {
+        return None;
+    }
+    let mut status: OAuthExtensionStatus =
+        serde_json::from_value(current.clone()).unwrap_or_default();
+    status.redirect_uri = Some(redirect_uri);
+    status.configured_at = Some(Utc::now());
+    status.auth_verified = true;
+    status.error = None;
+    Some(status)
 }
 
 /// Validate redirect URI against allowed origins
@@ -684,6 +617,15 @@ pub async fn authorize(
         }
     };
 
+    // A redirect to the Rise UI is the test flow, which writes the extension's
+    // status: only a signed-in user with access to the project may start it.
+    let test_flow_initiator =
+        if redirect_targets_rise_origin(&final_redirect_uri, &state.public_url) {
+            Some(authenticate_test_flow_initiator(&state, &headers, &project).await?)
+        } else {
+            None
+        };
+
     // Generate CSRF state token
     let state_token = generate_state_token();
 
@@ -701,6 +643,7 @@ pub async fn authorize(
         created_at: Utc::now(),
         client_code_challenge: req.code_challenge,
         client_code_challenge_method: req.code_challenge_method,
+        test_flow_initiator,
     };
 
     // Store state in DB (10-minute TTL)
@@ -885,7 +828,31 @@ pub async fn callback(
         }
     };
 
-    let is_test_flow = final_redirect_uri.starts_with(&state.public_url);
+    // The test flow is the one that returns to the Rise UI, and only a state
+    // minted for an authenticated project member may run it. A Rise-origin
+    // state without an initiator is refused rather than treated as an app flow.
+    let test_flow_initiator = if redirect_targets_rise_origin(
+        &final_redirect_uri,
+        &state.public_url,
+    ) {
+        match claimed_state.test_flow_initiator {
+            Some(initiator) => Some(initiator),
+            None => {
+                warn!(
+                    project = %project_name,
+                    extension = %extension_name,
+                    "Refusing OAuth callback: Rise-origin redirect without an authenticated initiator"
+                );
+                if let Err(e) = claimed_state.finalize().await {
+                    warn!("Failed to finalize refused OAuth callback state: {:?}", e);
+                }
+                return Err((StatusCode::BAD_REQUEST, "Invalid state token".to_string()));
+            }
+        }
+    } else {
+        None
+    };
+    let is_test_flow = test_flow_initiator.is_some();
 
     debug!(
         "OAuth callback: flow_type={}, final_redirect_uri={}",
@@ -898,6 +865,31 @@ pub async fn callback(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Project not found".to_string()))?;
+
+    // The test flow must be completed by the browser session that started it:
+    // a leaked state token is useless to anyone else. This runs before the
+    // code exchange, so a refused callback writes no status.
+    if let Some(initiator) = test_flow_initiator {
+        let completer = authenticate_test_flow_initiator(&state, &headers, &project).await;
+        if !matches!(&completer, Ok(user_id) if *user_id == initiator) {
+            warn!(
+                project = %project_name,
+                extension = %extension_name,
+                initiator = %initiator,
+                "Refusing OAuth test callback: the session is not the one that started the flow"
+            );
+            if let Err(e) = claimed_state.finalize().await {
+                warn!("Failed to finalize refused OAuth callback state: {:?}", e);
+            }
+            return Err(match completer {
+                Err(refusal) => refusal,
+                Ok(_) => (
+                    StatusCode::FORBIDDEN,
+                    "This OAuth test was started by a different user".to_string(),
+                ),
+            });
+        }
+    }
 
     // Get OAuth extension
     let extension =
@@ -1030,6 +1022,7 @@ pub async fn callback(
     if is_test_flow {
         // ===== TEST FLOW: Simplified path (no token parsing/encryption) =====
         info!(
+            initiator = ?test_flow_initiator,
             "Processing test OAuth flow for project {} extension {}",
             project_name, extension_name
         );
@@ -1043,16 +1036,14 @@ pub async fn callback(
                 .unwrap_or_else(|_| "Unable to read error response".to_string());
             error!(
                 "Token exchange failed with status {}: {}",
-                status, error_text
+                status,
+                bounded_text(&error_text, 500)
             );
 
             // Update extension status with error
             let mut ext_status: OAuthExtensionStatus =
                 serde_json::from_value(extension.status.clone()).unwrap_or_default();
-            ext_status.error = Some(format!(
-                "Token exchange failed with status {}: {}",
-                status, error_text
-            ));
+            ext_status.error = Some(token_exchange_failure_summary(status, &error_text));
             ext_status.auth_verified = false;
 
             db_extensions::update_status(
@@ -1192,28 +1183,26 @@ pub async fn callback(
         );
 
         // Update extension status (preserve credentials from existing status)
-        let mut ext_status: OAuthExtensionStatus =
-            serde_json::from_value(extension.status.clone()).unwrap_or_default();
-
-        ext_status.redirect_uri = Some(redirect_uri);
-        ext_status.configured_at = Some(Utc::now());
-        ext_status.auth_verified = true;
-        ext_status.error = None;
-
-        db_extensions::update_status(
-            &state.db_pool,
-            project.id,
-            &extension_name,
-            &serde_json::to_value(&ext_status).unwrap(),
-        )
-        .await
-        .map_err(|e| {
-            warn!("Failed to update extension status: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to update status: {}", e),
+        if let Some(ext_status) = real_flow_status_update(
+            &extension.status,
+            (200..300).contains(&status_code),
+            redirect_uri,
+        ) {
+            db_extensions::update_status(
+                &state.db_pool,
+                project.id,
+                &extension_name,
+                &serde_json::to_value(&ext_status).unwrap(),
             )
-        })?;
+            .await
+            .map_err(|e| {
+                warn!("Failed to update extension status: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to update status: {}", e),
+                )
+            })?;
+        }
 
         // Store encrypted raw token response in authorization code state (5-minute TTL, single-use)
         let code_state = OAuthCodeState {
@@ -2295,30 +2284,42 @@ pub async fn oidc_jwks(
     }
 }
 
-/// Derive an opaque upstream binding for clients sealing a not-yet-created OAuth extension.
-pub async fn credential_binding(
-    State(state): State<AppState>,
-    auth: crate::server::auth::context::AuthContext,
-    Path((project_name, _extension_name)): Path<(String, String)>,
-    Json(spec): Json<OAuthExtensionSpec>,
-) -> Result<Json<serde_json::Value>, crate::server::error::ServerError> {
-    use crate::server::error::{ServerError, ServerErrorExt};
-    let user = auth.user()?;
-    let project = crate::db::projects::find_by_name(&state.db_pool, &project_name)
-        .await
-        .internal_err("Failed to find project")?
-        .ok_or_else(|| ServerError::not_found("Project not found"))?;
-    crate::server::project::handlers::ensure_project_access_or_admin(&state, user, &project)
-        .await?;
-    let endpoints = resolve_oauth_endpoints(&spec, &state.server_settings.ssrf)
-        .await
-        .map_err(|_| ServerError::bad_request("Failed to resolve OAuth endpoints"))?;
-    crate::server::ssrf::validate_url(&endpoints.token_endpoint, &state.server_settings.ssrf)
-        .await
-        .map_err(|_| ServerError::bad_request("OAuth token endpoint is not permitted"))?;
-    let binding = rise_deployment_spec::credential_binding::oauth_credential_binding(
-        &serde_json::to_value(spec).internal_err("Invalid OAuth spec")?,
-        &endpoints.token_endpoint,
-    );
-    Ok(Json(serde_json::json!({"binding": binding})))
+#[cfg(test)]
+mod legacy_flow_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn oauth_state_without_initiator_field_deserializes() {
+        let state: OAuthState = serde_json::from_value(json!({
+            "redirect_uri": "https://rise.example.com/x",
+            "application_state": null,
+            "project_name": "demo",
+            "extension_name": "ext",
+            "code_verifier": "v",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(state.test_flow_initiator, None);
+    }
+
+    #[test]
+    fn end_user_flow_only_marks_the_extension_configured_after_a_successful_exchange() {
+        let current = json!({
+            "auth_verified": false,
+            "error": "Token exchange failed with status 400 Bad Request: invalid_client",
+            "rise_client_id": "demo-ext",
+        });
+
+        // The upstream rejected the code: nothing is written.
+        assert!(real_flow_status_update(&current, false, "https://rise/cb".into()).is_none());
+
+        let updated = real_flow_status_update(&current, true, "https://rise/cb".into()).unwrap();
+        assert!(updated.auth_verified);
+        assert_eq!(updated.error, None);
+        assert_eq!(updated.redirect_uri.as_deref(), Some("https://rise/cb"));
+        assert!(updated.configured_at.is_some());
+        // Credentials already in the status survive the update.
+        assert_eq!(updated.rise_client_id.as_deref(), Some("demo-ext"));
+    }
 }

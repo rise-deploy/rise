@@ -94,6 +94,143 @@ changes:
       `(get, Organization, policy-audit)` where needed. Retry ECR requests while
       generation metadata is provisioned; revoke existing AWS role sessions if
       immediate credential revocation is required. See [ECR operations](/operator-docs/operator-registry-operations/aws-ecr/).
+  - id: oauth-extension-test-flow-requires-member
+    title: OAuth extension test requires a signed-in project member
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: none
+    details: |-
+      "Test OAuth" in the Rise UI now requires a signed-in browser session of a
+      user with platform access and access to the project, and the callback must
+      complete in that same session. Only a test run this way updates the
+      extension's stored status; its failure text is limited to the upstream's
+      OAuth `error` and `error_description`. A failed end-user login no longer
+      marks the extension configured or clears its error.
+    action: |-
+      Test states started before the upgrade are refused; re-run "Test OAuth".
+  - id: oauth-extension-relay
+    title: OAuth extension apps must change before upgrading
+    group: security-and-upgrade-guidance
+    type: change
+    impact: breaking
+    details: |-
+      The OAuth extension is served by an embedded OAuth relay. URLs stay
+      `/oidc/{project}/{extension}/…` and `{EXT}_ISSUER` is unchanged. Behavior
+      changes:
+
+      1. `redirect_uri` is required at authorize and must be repeated identically
+         at the token request. The fallback to the project's main URL is gone.
+      2. Allowed targets are the origin of any active deployment (default URLs,
+         custom domains, all deployment groups), `http` on `127.0.0.1`, `[::1]`,
+         `localhost` and `*.localhost` (any port and path), and `http` deployment
+         origins only when Rise itself is served over `http`. Rise's own origin is
+         no longer a target.
+      3. Confidential clients (the default) must send `client_secret` on every
+         token request, code and refresh. Unauthenticated refresh is gone. PKCE is
+         optional and enforced when used; a `code_verifier` for a code issued
+         without a challenge is rejected.
+      4. Apps that authenticate with PKCE only (SPAs) must set
+         `client_type: public`. Public clients must use PKCE, receive no secret
+         (`{EXT}_CLIENT_SECRET` is not injected and a presented secret is
+         `invalid_client`), and get single-use rotating refresh tokens.
+      5. `refresh_token` is a Rise handle (`rrt1.` sealed, `rrt2.` rotating), no
+         longer the provider's token. Apps never see raw provider refresh tokens,
+         and the provider's revocation and introspection endpoints are not
+         advertised. Rotating handles are single use with a 30 second grace
+         period, reuse revokes the family, and a family lasts at most 30 days.
+         Rotating handles are stored in the database, so storage grows with
+         active sessions.
+      6. Discovery changes: `issuer` is the upstream issuer, not
+         `{EXT}_ISSUER`, and `jwks_uri` is the upstream's. Clients that compare
+         the discovery `issuer` with the URL they fetched it from must be
+         configured with manual endpoints. OAuth 2.0-only providers (GitHub,
+         Notion, Snowflake) get a document without `jwks_uri`.
+      7. Authorization codes are encrypted, single-use and several kilobytes
+         long. Authorize forwards unknown parameters such as `prompt` and
+         `login_hint`, accepts a `scope` that narrows the configured scopes, and
+         rejects `request`, `request_uri` and non-`query` response modes.
+      8. Only "Test OAuth" updates the extension's status; end-user logins never
+         mark it configured.
+      9. A deleted extension stops serving within 5 seconds (resolutions are
+         reused that long). Deleting and recreating an extension, or changing
+         its issuer, client ID or token endpoint, invalidates its refresh tokens.
+      10. Codes, flow state and refresh handles are sealed under a data key that
+          the configured encryption provider wraps. Changing the KMS key or the
+          local encryption key invalidates them all: every end user signs in
+          again.
+      11. The new `oauth_relay_store` table holds single-use markers and
+          rotating refresh-token families. The existing hourly cleanup removes
+          expired rows.
+      12. `/oidc/{project}/{extension}/…` answers `404` for an extension that is
+          not of type `oauth` (was `400`).
+      13. `invalid_client` is `401`, with `WWW-Authenticate` when the client
+          used HTTP Basic. A `429` from the rate limiter carries no CORS
+          headers, so browsers report it as a network error.
+      14. Discovery and JWKS are limited to 600 requests per minute per client
+          address.
+      15. Requests to the upstream are refused (`502`) when their URL is not
+          allowed by `server.ssrf`, including a `jwks_uri` the upstream's
+          discovery document names.
+    action: |-
+      Before upgrading, app owners must add `redirect_uri` to authorize and token
+      requests, make confidential apps send the client secret on refresh, and set
+      `client_type: public` on SPAs while removing their client secret. Announce
+      this to app owners: every end user signs in once more after the upgrade,
+      because refresh tokens and in-flight logins issued before it are rejected.
+    migration: |-
+      Backend app (confidential, default):
+
+      ```text
+      GET  {EXT_ISSUER}/authorize?redirect_uri=https://app.example.com/callback&state=...
+      POST {EXT_ISSUER}/token  grant_type=authorization_code, code, redirect_uri,
+                               client_id, client_secret
+      POST {EXT_ISSUER}/token  grant_type=refresh_token, refresh_token,
+                               client_id, client_secret
+      ```
+
+      SPA (set `"client_type": "public"` in the extension spec):
+
+      ```text
+      GET  {EXT_ISSUER}/authorize?redirect_uri=...&code_challenge=...&code_challenge_method=S256&state=...
+      POST {EXT_ISSUER}/token  grant_type=authorization_code, code, redirect_uri,
+                               client_id, code_verifier
+      POST {EXT_ISSUER}/token  grant_type=refresh_token, refresh_token, client_id
+      ```
+
+      Store the `refresh_token` of every public-client response; the previous one
+      is spent.
+  - id: oauth-extension-client-types
+    title: OAuth extensions have client types and refresh-token modes
+    type: feature
+    impact: configuration
+    details: |-
+      The `oauth` extension spec gains `client_type` (`confidential`, the default,
+      or `public`) and `refresh_token_mode` (`sealed`, the default for
+      confidential clients, or `rotating`, always used for public clients). Public
+      with `sealed` is rejected. Neither field affects the sealed upstream secret.
+      The Rise UI configures both and shows only the relevant client secret.
+    action: |-
+      Existing extensions behave as `confidential` with `sealed` refresh tokens.
+      Set `client_type: public` for apps that use PKCE without a secret.
+  - id: ssrf-connect-time-address-filter
+    title: Server-side requests filter blocked addresses when connecting
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: none
+    details: |-
+      Rise's server-side HTTP clients (OIDC discovery and JWKS of trusted and
+      service-account issuers, OAuth extension upstreams) now resolve host names
+      through a filter that drops loopback, private, link-local, CGNAT and
+      unspecified addresses, unless `server.ssrf.allow_private_networks` is set
+      or the host is in `server.ssrf.trusted_hosts`. A name that resolves to a
+      blocked address when Rise connects is refused even if it passed the
+      earlier check (DNS rebinding). The clients also refuse plain `http`
+      unless `server.ssrf.allow_http` is set. Hosts that already passed Rise's
+      checks are unaffected.
+    action: |-
+      If Rise reaches the internet through an egress proxy (`HTTPS_PROXY`), the
+      proxy resolves target names, so this filter does not apply to them; block
+      internal destinations at the proxy.
   - id: pack-build-private-env-files
     title: CLI secrets use safer files and logging
     group: security-and-upgrade-guidance

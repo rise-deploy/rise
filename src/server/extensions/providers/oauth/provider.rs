@@ -1,6 +1,7 @@
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
 use crate::server::extensions::providers::oauth::models::{
-    OAuthExtensionSpec, OAuthExtensionStatus, TokenEndpointAuthMethod, TokenResponse,
+    ClientType, OAuthExtensionSpec, OAuthExtensionStatus, RefreshTokenMode,
+    TokenEndpointAuthMethod, TokenResponse,
 };
 use crate::server::extensions::{Extension, InjectedEnvVar, InjectedEnvVarValue};
 use anyhow::{anyhow, Context, Result};
@@ -100,6 +101,15 @@ fn basic_client_credentials(client_id: &str, client_secret: &str) -> String {
     )
 }
 
+/// Rejects anything but an absolute `http(s)` URL with a host.
+fn validate_http_url(field: &str, value: &str) -> Result<()> {
+    let url = Url::parse(value).with_context(|| format!("Invalid {field} URL"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(anyhow!("{field} must be an absolute http(s) URL"));
+    }
+    Ok(())
+}
+
 /// Generate a secure random token for Rise client secret (32 bytes, base64url encoded)
 // Only reached from `main` (through the extension registry), which is not a
 // dead-code root when the binary is built for tests.
@@ -111,6 +121,78 @@ fn generate_rise_client_secret() -> String {
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..32).map(|_| rng.random()).collect();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Gives the extension the Rise client credentials its client type needs: a
+/// client ID (`{project}-{extension}`) always, and a client secret only for a
+/// confidential client. Switching to `public` removes the secret, and switching
+/// back generates a new one.
+fn apply_client_credentials(
+    status: &mut OAuthExtensionStatus,
+    client_type: ClientType,
+    project_name: &str,
+    extension_name: &str,
+    generate_secret: impl FnOnce() -> String,
+) {
+    if status.rise_client_id.is_none() {
+        status.rise_client_id = Some(format!("{project_name}-{extension_name}"));
+    }
+    match client_type {
+        ClientType::Confidential if status.rise_client_secret.is_none() => {
+            info!(
+                "Generating a Rise client secret for OAuth extension {}/{}",
+                project_name, extension_name
+            );
+            status.rise_client_secret = Some(generate_secret());
+        }
+        ClientType::Confidential => {}
+        ClientType::Public => status.rise_client_secret = None,
+    }
+}
+
+/// The env vars an app gets for one OAuth extension: `{EXT}_CLIENT_ID`,
+/// `{EXT}_ISSUER` and, for a confidential client, `{EXT}_CLIENT_SECRET`
+/// (`{EXT}` is the extension name, uppercased with `-` as `_`). `None` while
+/// the Rise client credentials the client type needs are not generated yet.
+fn oauth_env_vars(
+    api_domain: &str,
+    project_name: &str,
+    ext: &crate::db::models::ProjectExtension,
+) -> Option<Vec<InjectedEnvVar>> {
+    let status: OAuthExtensionStatus =
+        serde_json::from_value(ext.status.clone()).unwrap_or_default();
+    let client_type = serde_json::from_value::<OAuthExtensionSpec>(ext.spec.clone())
+        .map(|spec| spec.client_type)
+        .unwrap_or_default();
+    let rise_client_id = status.rise_client_id?;
+    let rise_client_secret = match client_type {
+        ClientType::Confidential => Some(status.rise_client_secret?),
+        ClientType::Public => None,
+    };
+
+    let normalized_name = ext.extension.to_uppercase().replace('-', "_");
+    let mut vars = vec![InjectedEnvVar {
+        key: format!("{normalized_name}_CLIENT_ID"),
+        value: InjectedEnvVarValue::Plain(rise_client_id),
+    }];
+    // CLIENT_SECRET is retrievable; the deployment boundary encrypts its snapshot.
+    if let Some(decrypted) = rise_client_secret {
+        vars.push(InjectedEnvVar {
+            key: format!("{normalized_name}_CLIENT_SECRET"),
+            value: InjectedEnvVarValue::Secret { decrypted },
+        });
+    }
+    // The relay's issuer URL for this extension.
+    vars.push(InjectedEnvVar {
+        key: format!("{normalized_name}_ISSUER"),
+        value: InjectedEnvVarValue::Plain(format!(
+            "{}/oidc/{}/{}",
+            api_domain.trim_end_matches('/'),
+            project_name,
+            ext.extension
+        )),
+    });
+    Some(vars)
 }
 
 impl OAuthProvider {
@@ -278,19 +360,33 @@ impl Extension for OAuthProvider {
             return Err(anyhow!("issuer_url is required"));
         }
 
-        // Validate issuer_url
-        Url::parse(&spec.issuer_url).context("Invalid issuer_url URL")?;
+        // The relay accepts only absolute http(s) URLs with a host, so a stored
+        // spec never fails at request time.
+        validate_http_url("issuer_url", &spec.issuer_url)?;
+        // An empty endpoint counts as unset.
+        if let Some(auth_endpoint) = spec.explicit_authorization_endpoint() {
+            validate_http_url("authorization_endpoint", auth_endpoint)?;
+        }
+        if let Some(token_endpoint) = spec.explicit_token_endpoint() {
+            validate_http_url("token_endpoint", token_endpoint)?;
+        }
 
-        // Validate optional endpoint URLs if provided
-        if let Some(ref auth_endpoint) = spec.authorization_endpoint {
-            if !auth_endpoint.is_empty() {
-                Url::parse(auth_endpoint).context("Invalid authorization_endpoint URL")?;
+        // An entry may hold several space-separated scopes; repeats are
+        // dropped when the relay is built.
+        for scope in spec.scope_tokens() {
+            if !super::relay::resolver::valid_scope_token(scope) {
+                return Err(anyhow!(
+                    "Invalid scope {scope:?}: OAuth scopes are printable ASCII without quotes or backslashes"
+                ));
             }
         }
-        if let Some(ref token_endpoint) = spec.token_endpoint {
-            if !token_endpoint.is_empty() {
-                Url::parse(token_endpoint).context("Invalid token_endpoint URL")?;
-            }
+
+        if spec.client_type == ClientType::Public
+            && spec.refresh_token_mode == Some(RefreshTokenMode::Sealed)
+        {
+            return Err(anyhow!(
+                "refresh_token_mode: sealed is not available for public clients; public clients always use rotating refresh tokens"
+            ));
         }
 
         Ok(())
@@ -321,26 +417,16 @@ impl Extension for OAuthProvider {
         let mut status: OAuthExtensionStatus =
             serde_json::from_value(ext.status).unwrap_or_default();
 
-        // Generate Rise client credentials if they don't exist in status
-        if status.rise_client_id.is_none() || status.rise_client_secret.is_none() {
-            info!(
-                "Generating Rise client credentials for OAuth extension {}/{}",
-                project_id, extension_name
-            );
-
-            // Generate credentials with deterministic client ID: {project_name}-{extension_name}
-            let rise_client_id = format!("{}-{}", project.name, extension_name);
-            let rise_client_secret = generate_rise_client_secret();
-
-            // Store credentials in status (plaintext)
-            status.rise_client_id = Some(rise_client_id);
-            status.rise_client_secret = Some(rise_client_secret);
-
-            info!(
-                "Generated Rise client credentials for OAuth extension {}/{}",
-                project_id, extension_name
-            );
-        }
+        let client_type = serde_json::from_value::<OAuthExtensionSpec>(new_spec.clone())
+            .context("Invalid OAuth extension spec format")?
+            .client_type;
+        apply_client_credentials(
+            &mut status,
+            client_type,
+            &project.name,
+            extension_name,
+            generate_rise_client_secret,
+        );
 
         // Always ensure redirect_uri is set/updated
         let redirect_uri = self.compute_redirect_uri(&project.name, extension_name);
@@ -353,6 +439,7 @@ impl Extension for OAuthProvider {
 
         // Check if auth-sensitive fields changed
         let auth_sensitive_fields = [
+            "client_type",
             "client_id",
             "client_secret_encrypted",
             "authorization_endpoint",
@@ -484,61 +571,23 @@ impl Extension for OAuthProvider {
 
         // Build env vars for each OAuth extension
         for ext in extensions {
-            // Parse status to get credentials
-            let status: OAuthExtensionStatus =
-                serde_json::from_value(ext.status.clone()).unwrap_or_default();
-
-            // Skip if credentials are not yet generated
-            if status.rise_client_id.is_none() || status.rise_client_secret.is_none() {
-                warn!(
+            match oauth_env_vars(&self.api_domain, &project.name, &ext) {
+                Some(vars) => {
+                    info!(
+                        "Prepared OAuth env vars for extension {} ({})",
+                        ext.extension,
+                        vars.iter()
+                            .map(|var| var.key.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    result.extend(vars);
+                }
+                None => warn!(
                     "OAuth extension {} for project {} missing credentials, skipping env var injection",
                     ext.extension, project.name
-                );
-                continue;
+                ),
             }
-
-            let rise_client_id = status.rise_client_id.as_ref().unwrap();
-            let rise_client_secret = status.rise_client_secret.as_ref().unwrap();
-
-            // Normalize extension name for env var (uppercase, replace hyphens with underscores)
-            // Pattern: {EXT_NAME}_{KEY} (e.g., OAUTH_DEX_CLIENT_ID)
-            let normalized_name = ext.extension.to_uppercase().replace('-', "_");
-            let client_id_key = format!("{}_CLIENT_ID", normalized_name);
-            let client_secret_key = format!("{}_CLIENT_SECRET", normalized_name);
-            let issuer_key = format!("{}_ISSUER", normalized_name);
-
-            // Compute Rise issuer URL (OIDC proxy)
-            let rise_issuer = format!(
-                "{}/oidc/{}/{}",
-                self.api_domain.trim_end_matches('/'),
-                project.name,
-                ext.extension
-            );
-
-            // CLIENT_ID (plaintext)
-            result.push(InjectedEnvVar {
-                key: client_id_key.clone(),
-                value: InjectedEnvVarValue::Plain(rise_client_id.clone()),
-            });
-
-            // CLIENT_SECRET is retrievable; the deployment boundary encrypts its snapshot.
-            result.push(InjectedEnvVar {
-                key: client_secret_key.clone(),
-                value: InjectedEnvVarValue::Secret {
-                    decrypted: rise_client_secret.clone(),
-                },
-            });
-
-            // ISSUER (plaintext)
-            result.push(InjectedEnvVar {
-                key: issuer_key.clone(),
-                value: InjectedEnvVarValue::Plain(rise_issuer),
-            });
-
-            info!(
-                "Prepared OAuth env vars for extension {} ({}, {}, {})",
-                ext.extension, client_id_key, client_secret_key, issuer_key
-            );
         }
 
         Ok(result)
@@ -652,115 +701,104 @@ Notion uses `token_endpoint_auth_method: "client_secret_basic"` and `scopes: []`
 For providers with explicit endpoints, use full URLs in `authorization_endpoint`
 and `token_endpoint`.
 
+## Client types
+
+- `client_type: confidential` (default): server-side apps. Rise injects
+  `{EXT}_CLIENT_ID`, `{EXT}_CLIENT_SECRET` and `{EXT}_ISSUER`. The app sends the
+  client secret on every token request (code and refresh). PKCE is optional.
+- `client_type: public`: browser and native apps that cannot keep a secret.
+  Rise injects `{EXT}_CLIENT_ID` and `{EXT}_ISSUER` only. PKCE (S256) is
+  required, and presenting a client secret is rejected with `invalid_client`.
+
+Refresh tokens are Rise handles, never the provider's tokens:
+`refresh_token_mode: sealed` (default for confidential clients) returns a
+reusable sealed handle; `rotating` (always for public clients) returns a
+single-use handle and a successor on every refresh.
+
 ## OAuth Flows
 
-The extension supports RFC 6749-compliant OAuth flows with PKCE support:
+Every flow uses the endpoints below
+`https://rise.example.com/oidc/my-app/oauth-provider`: `/authorize`, `/token`,
+`/jwks` and `/.well-known/openid-configuration`. `redirect_uri` is required at
+`/authorize` and must be sent again, unchanged, to `/token`. It must be on an
+origin of the project's active deployments, or an `http` loopback URL
+(`127.0.0.1`, `[::1]`, `localhost`, `*.localhost`, any port) for local
+development.
 
-### PKCE Flow (Recommended for SPAs)
-
-For single-page applications, use PKCE (RFC 7636) to securely exchange authorization codes
-for tokens. This prevents authorization code interception attacks.
-
-**Frontend Integration (using oauth4webapi):**
-
-```bash
-npm install oauth4webapi
-```
+### Public client (SPA) with PKCE
 
 ```javascript
 import * as oauth from 'oauth4webapi';
 
-// 1. Initiate OAuth login with PKCE
+const issuer = 'https://rise.example.com/oidc/my-app/oauth-provider';
+const redirectUri = `${window.location.origin}/callback`;
+
 async function login() {
   const codeVerifier = oauth.generateRandomCodeVerifier();
-  const codeChallenge = await oauth.calculatePKCECodeChallenge(codeVerifier);
   sessionStorage.setItem('pkce_verifier', codeVerifier);
-
-  const authUrl = new URL(
-    `https://api.rise.dev/oidc/my-app/oauth-provider/authorize`
-  );
-  authUrl.searchParams.set('code_challenge', codeChallenge);
+  const authUrl = new URL(`${issuer}/authorize`);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  authUrl.searchParams.set('code_challenge', await oauth.calculatePKCECodeChallenge(codeVerifier));
   authUrl.searchParams.set('code_challenge_method', 'S256');
-
   window.location.href = authUrl;
 }
 
-// 2. Handle callback and exchange code for tokens
 async function handleCallback() {
   const code = new URLSearchParams(window.location.search).get('code');
-  const codeVerifier = sessionStorage.getItem('pkce_verifier');
-
-  const tokens = await fetch(
-    'https://api.rise.dev/oidc/my-app/oauth-provider/token',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: code,
-        client_id: CONFIG.riseClientId,  // From build-time config
-        code_verifier: codeVerifier
-      })
-    }
-  ).then(r => r.json());
-
-  sessionStorage.setItem('tokens', JSON.stringify(tokens));
-  return tokens;
+  return fetch(`${issuer}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      client_id: CONFIG.riseClientId,
+      code_verifier: sessionStorage.getItem('pkce_verifier'),
+    }),
+  }).then(r => r.json());
 }
 ```
 
-### Token Endpoint Flow (For Backend Apps)
-
-For server-rendered applications, use the RFC 6749-compliant token endpoint with client credentials.
-Rise auto-generates client credentials for each OAuth extension.
-
-**Backend Integration (TypeScript/Express):**
+### Confidential client (backend)
 
 ```typescript
+const issuer = process.env.OAUTH_PROVIDER_ISSUER!;
+const redirectUri = 'https://my-app.rise.example.com/oauth/callback';
+
+app.get('/login', (req, res) => {
+  const authUrl = new URL(`${issuer}/authorize`);
+  authUrl.searchParams.set('redirect_uri', redirectUri);
+  res.redirect(authUrl.toString());
+});
+
 app.get('/oauth/callback', async (req, res) => {
-  const { code } = req.query;
-
-  const tokens = await fetch(
-    'https://api.rise.dev/oidc/my-app/oauth-provider/token',
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: code as string,
-        client_id: process.env.OAUTH_PROVIDER_CLIENT_ID!,
-        client_secret: process.env.OAUTH_PROVIDER_CLIENT_SECRET!
-      })
-    }
-  ).then(r => r.json());
-
+  const tokens = await fetch(`${issuer}/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: req.query.code as string,
+      redirect_uri: redirectUri,
+      client_id: process.env.OAUTH_PROVIDER_CLIENT_ID!,
+      client_secret: process.env.OAUTH_PROVIDER_CLIENT_SECRET!,
+    }),
+  }).then(r => r.json());
   req.session.tokens = tokens;
   res.redirect('/');
 });
 ```
 
-## Local Development
-
-For local development, add `redirect_uri` parameter:
-
-```javascript
-// PKCE flow
-authUrl.searchParams.set('redirect_uri', 'http://localhost:3000/callback');
-
-// Backend flow
-const authUrl = 'https://api.rise.dev/oidc/my-app/oauth-provider/authorize?redirect_uri=http://localhost:3000/oauth/callback';
-```
+Refresh with `grant_type=refresh_token`, the latest `refresh_token`, and (for
+confidential clients) `client_id` and `client_secret` again.
 
 ## Security Features
 
-- Client secrets stored encrypted in database
-- PKCE (RFC 7636): Prevents authorization code interception for public clients
-- Rise client credentials: Auto-generated per extension for token endpoint authentication
-- Temporary single-use authorization codes with 5-minute TTL
-- Redirect URI validation (localhost or project domains only)
-- CSRF protection via state tokens
-- Constant-time comparison for client secret and PKCE validation
-- Stateless OAuth proxy: clients own their tokens after exchange
+- Upstream client secrets stored encrypted and bound to their extension and token endpoint
+- Authorization codes are sealed, single-use, and expire after 5 minutes
+- PKCE (RFC 7636): required for public clients, enforced whenever used
+- Redirect URIs limited to the project's deployment origins and loopback hosts
+- Refresh tokens are Rise handles: sealed, or rotating with reuse detection
+- Constant-time comparison of client credentials and PKCE verifiers
 "#
     }
 
@@ -823,8 +861,21 @@ const authUrl = 'https://api.rise.dev/oidc/my-app/oauth-provider/authorize?redir
                     "items": {
                         "type": "string"
                     },
-                    "description": "OAuth scopes to request. Leave empty for providers without scopes (e.g. Notion).",
+                    "description": "OAuth scopes to request, one scope per entry. Apps may request a subset with the scope parameter, never more. Leave empty for providers without scopes (e.g. Notion).",
                     "example": ["openid", "email", "profile"]
+                },
+                "client_type": {
+                    "type": "string",
+                    "enum": ["confidential", "public"],
+                    "default": "confidential",
+                    "description": "confidential: the app holds the Rise client secret and sends it on every token request. public: browser or native apps without a secret; PKCE is required and refresh tokens always rotate.",
+                    "example": "public"
+                },
+                "refresh_token_mode": {
+                    "type": "string",
+                    "enum": ["sealed", "rotating"],
+                    "description": "How refresh tokens are handed to the app. sealed (default for confidential clients): a reusable sealed handle. rotating (always for public clients): a single-use handle, replaced on every refresh.",
+                    "example": "rotating"
                 }
             }
         })
@@ -909,6 +960,232 @@ mod tests {
             .unwrap()
             .get("token_endpoint_auth_method")
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod client_type_tests {
+    use super::*;
+
+    fn provider() -> OAuthProvider {
+        use crate::server::encryption::providers::local::LocalEncryptionProvider;
+        OAuthProvider::new(OAuthProviderConfig {
+            db_pool: sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://test:test@localhost/test")
+                .unwrap(),
+            encryption_provider: Arc::new(
+                LocalEncryptionProvider::new("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=")
+                    .unwrap(),
+            ),
+            ssrf_config: crate::server::ssrf::SsrfConfig::default(),
+            api_domain: "https://rise.example.com".into(),
+        })
+    }
+
+    fn valid_spec() -> Value {
+        json!({
+            "provider_name": "Test",
+            "client_id": "client",
+            "client_secret_encrypted": "rise:enc:v2:x",
+            "issuer_url": "https://idp.example.com",
+            "scopes": ["openid", "email"],
+        })
+    }
+
+    #[test]
+    fn specs_without_the_new_fields_are_confidential_and_sealed_and_reserialize_unchanged() {
+        let stored = valid_spec();
+        let spec: OAuthExtensionSpec = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(spec.client_type, ClientType::Confidential);
+        assert_eq!(spec.refresh_token_mode, None);
+        assert_eq!(
+            spec.effective_refresh_token_mode(),
+            RefreshTokenMode::Sealed
+        );
+        let reserialized = serde_json::to_value(&spec).unwrap();
+        assert!(reserialized.get("client_type").is_none(), "{reserialized}");
+        assert!(
+            reserialized.get("refresh_token_mode").is_none(),
+            "{reserialized}"
+        );
+        assert_eq!(
+            rise_deployment_spec::credential_binding::oauth_credential_binding(
+                &reserialized,
+                "https://idp.example.com/token"
+            ),
+            rise_deployment_spec::credential_binding::oauth_credential_binding(
+                &stored,
+                "https://idp.example.com/token"
+            )
+        );
+
+        let mut public = stored.clone();
+        public["client_type"] = json!("public");
+        let spec: OAuthExtensionSpec = serde_json::from_value(public).unwrap();
+        assert_eq!(
+            spec.effective_refresh_token_mode(),
+            RefreshTokenMode::Rotating
+        );
+        let mut rotating = stored;
+        rotating["refresh_token_mode"] = json!("rotating");
+        let spec: OAuthExtensionSpec = serde_json::from_value(rotating).unwrap();
+        assert_eq!(spec.client_type, ClientType::Confidential);
+        assert_eq!(
+            spec.effective_refresh_token_mode(),
+            RefreshTokenMode::Rotating
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_spec_rejects_what_the_relay_cannot_serve() {
+        let provider = provider();
+        provider.validate_spec(&valid_spec()).await.unwrap();
+        let mut public_rotating = valid_spec();
+        public_rotating["client_type"] = json!("public");
+        public_rotating["refresh_token_mode"] = json!("rotating");
+        provider.validate_spec(&public_rotating).await.unwrap();
+        // Legacy specs stay valid: empty endpoints count as unset, and entries
+        // may hold several scopes or repeat one.
+        let mut legacy = valid_spec();
+        legacy["authorization_endpoint"] = json!("");
+        legacy["token_endpoint"] = json!("");
+        legacy["scopes"] = json!(["openid email", "openid", "", "session:role:ANALYST"]);
+        provider.validate_spec(&legacy).await.unwrap();
+
+        let invalid = [
+            (
+                "client_type",
+                json!("public"),
+                Some(("refresh_token_mode", json!("sealed"))),
+            ),
+            ("issuer_url", json!("not a url"), None),
+            ("issuer_url", json!("ftp://idp.example.com"), None),
+            ("issuer_url", json!("mailto:a@example.com"), None),
+            ("token_endpoint", json!("idp.example.com/token"), None),
+            ("authorization_endpoint", json!("javascript:alert(1)"), None),
+            ("scopes", json!(["a\"b"]), None),
+            ("scopes", json!(["openid caf\u{e9}"]), None),
+            ("client_type", json!("unknown"), None),
+        ];
+        for (field, value, also) in invalid {
+            let mut spec = valid_spec();
+            spec[field] = value.clone();
+            if let Some((field, value)) = also {
+                spec[field] = value;
+            }
+            assert!(
+                provider.validate_spec(&spec).await.is_err(),
+                "{field}: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_follow_the_client_type() {
+        let mut status = OAuthExtensionStatus::default();
+        apply_client_credentials(&mut status, ClientType::Confidential, "demo", "ext", || {
+            "first".into()
+        });
+        assert_eq!(status.rise_client_id.as_deref(), Some("demo-ext"));
+        assert_eq!(status.rise_client_secret.as_deref(), Some("first"));
+
+        // Existing credentials are kept.
+        apply_client_credentials(&mut status, ClientType::Confidential, "demo", "ext", || {
+            "second".into()
+        });
+        assert_eq!(status.rise_client_secret.as_deref(), Some("first"));
+
+        // Public clients have no secret.
+        apply_client_credentials(
+            &mut status,
+            ClientType::Public,
+            "demo",
+            "ext",
+            || unreachable!(),
+        );
+        assert_eq!(status.rise_client_id.as_deref(), Some("demo-ext"));
+        assert_eq!(status.rise_client_secret, None);
+
+        // Switching back generates a new one.
+        apply_client_credentials(&mut status, ClientType::Confidential, "demo", "ext", || {
+            "third".into()
+        });
+        assert_eq!(status.rise_client_secret.as_deref(), Some("third"));
+    }
+
+    fn extension(spec: Value, status: Value) -> crate::db::models::ProjectExtension {
+        crate::db::models::ProjectExtension {
+            project_id: Uuid::new_v4(),
+            extension: "oauth-google".into(),
+            extension_type: "oauth".into(),
+            spec,
+            status,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+        }
+    }
+
+    fn keys(vars: &[InjectedEnvVar]) -> Vec<&str> {
+        vars.iter().map(|var| var.key.as_str()).collect()
+    }
+
+    #[test]
+    fn env_vars_carry_the_client_secret_only_for_confidential_clients() {
+        let creds = json!({"rise_client_id": "demo-oauth-google", "rise_client_secret": "s"});
+        let vars = oauth_env_vars(
+            "https://rise.example.com/",
+            "demo",
+            &extension(valid_spec(), creds.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&vars),
+            [
+                "OAUTH_GOOGLE_CLIENT_ID",
+                "OAUTH_GOOGLE_CLIENT_SECRET",
+                "OAUTH_GOOGLE_ISSUER"
+            ]
+        );
+        assert!(matches!(
+            &vars[2].value,
+            InjectedEnvVarValue::Plain(issuer) if issuer == "https://rise.example.com/oidc/demo/oauth-google"
+        ));
+
+        let mut public = valid_spec();
+        public["client_type"] = json!("public");
+        let vars = oauth_env_vars(
+            "https://rise.example.com",
+            "demo",
+            &extension(
+                public.clone(),
+                json!({"rise_client_id": "demo-oauth-google"}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&vars),
+            ["OAUTH_GOOGLE_CLIENT_ID", "OAUTH_GOOGLE_ISSUER"]
+        );
+        // A secret left in the status is not injected for a public client.
+        let vars = oauth_env_vars(
+            "https://rise.example.com",
+            "demo",
+            &extension(public, creds),
+        )
+        .unwrap();
+        assert_eq!(
+            keys(&vars),
+            ["OAUTH_GOOGLE_CLIENT_ID", "OAUTH_GOOGLE_ISSUER"]
+        );
+
+        // A confidential client without its secret is skipped.
+        assert!(oauth_env_vars(
+            "https://rise.example.com",
+            "demo",
+            &extension(valid_spec(), json!({"rise_client_id": "demo-oauth-google"})),
+        )
+        .is_none());
     }
 }
 

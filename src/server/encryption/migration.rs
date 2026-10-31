@@ -511,7 +511,7 @@ async fn oauth_context(
     let endpoint = if let Some(endpoint) = &spec.token_endpoint {
         endpoint.clone()
     } else {
-        crate::server::extensions::providers::oauth::handlers::resolve_oauth_endpoints(
+        crate::server::extensions::providers::oauth::endpoints::resolve_oauth_endpoints(
             &spec,
             &settings.server.ssrf,
         )

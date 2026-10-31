@@ -11,7 +11,7 @@ pub fn routes() -> Router<AppState> {
         .route("/extensions/types", get(handlers::list_extension_types))
         .route(
             "/projects/{project}/extensions/{extension}/oauth/credential-binding",
-            post(super::providers::oauth::handlers::credential_binding),
+            post(super::providers::oauth::binding::credential_binding),
         )
         // Project-specific extension routes
         .route(

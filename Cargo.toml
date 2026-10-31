@@ -94,6 +94,7 @@ cli = [
 ]
 backend = [
     # Server core (former "server" feature)
+    "dep:oauthrelay-core",
     "dep:rise-authz",
     "dep:rise-backend-auth",
     "dep:rise-backend-core",
@@ -151,6 +152,7 @@ backend = [
 
 [dependencies]
 # Workspace crates (backend only)
+oauthrelay-core = { git = "https://github.com/rise-deploy/oauthrelay", rev = "d2a6957c5cd6f77a5248be221dc3bffe3b5d31e9", optional = true }
 rise-authz = { path = "crates/rise-authz", optional = true }
 rise-backend-auth = { path = "crates/rise-backend-auth", optional = true }
 rise-backend-core = { path = "crates/rise-backend-core", optional = true }

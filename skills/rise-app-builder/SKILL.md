@@ -19,7 +19,7 @@ Full worked examples live at **`https://rise-deploy.github.io/rise/user/guides/`
 | Guide | URL slug | Covers |
 |-------|----------|--------|
 | Deploying from CI | `deploying-from-ci` | Service accounts, OIDC federation, preview environments, GitHub Actions / GitLab CI |
-| Authenticating end-users | `authenticating-end-users` | Generic OAuth extension, broker pattern, PKCE, token exchange |
+| Authenticating end-users | `authenticating-end-users` | Generic OAuth extension, broker pattern, public vs confidential clients, PKCE, refresh handles |
 | Choosing a build backend | `choosing-a-build-backend` | Docker vs Railpack vs Pack, auto-detection, when to use each |
 
 Point agents to `https://rise-deploy.github.io/rise/user/guides/<slug>.md` for full depth.
@@ -141,7 +141,7 @@ For the Generic OAuth extension, the callback URL registered with the upstream p
 {RISE_PUBLIC_URL}/oidc/{project}/{extension}/callback
 ```
 
-Rise receives the upstream callback and redirects the user back to the app.
+Rise receives the upstream callback and redirects the user back to the app. The app must send `redirect_uri` on every authorize request and repeat it at the token request; Rise accepts the project's active deployment URLs and http loopback (`localhost`, `127.0.0.1`, `[::1]`).
 
 ### 6. Build auto-detection: Dockerfile → Docker; else Railpack
 
@@ -189,17 +189,22 @@ Backend values: `docker`, `docker:build`, `docker:buildx`, `docker:buildctl`, `b
 
 ```
 Authenticating end-users via OAuth?
-├─ Browser SPA, no backend secret → PKCE flow (code_challenge + code_verifier)
-├─ Backend app with server-side secret → Authorization code flow (client_id + client_secret)
-└─ Token refresh needed → Use Rise token endpoint (grant_type=refresh_token)
+├─ Browser SPA, no backend secret → `"client_type": "public"`: PKCE required (code_challenge + code_verifier),
+│  no client secret (none is issued or injected), refresh tokens are single-use and rotate
+├─ Backend app with server-side secret → default `confidential`: client_id + client_secret on EVERY token
+│  request (code and refresh); PKCE optional
+└─ Token refresh needed → Rise token endpoint (grant_type=refresh_token). refresh_token is a Rise handle,
+   never the provider's token; with rotating handles always store the newly returned one
 
 Steps:
 1. Register OAuth app upstream with callback: {RISE_URL}/oidc/{project}/{ext}/callback
 2. Seal via stdin: rise encrypt --project my-app --extension-type oauth --extension oauth-google --slot /spec/client_secret_encrypted --oauth-spec oauth.json
 3. rise extension create oauth-google -p my-app --type oauth --spec '{...}'
-4. App redirects to: GET {OAUTH_<NAME>_ISSUER}/authorize
-5. App exchanges code at: POST {OAUTH_<NAME>_ISSUER}/token
+4. App redirects to: GET {OAUTH_<NAME>_ISSUER}/authorize?redirect_uri=<app callback>&state=...
+5. App exchanges code at: POST {OAUTH_<NAME>_ISSUER}/token (same redirect_uri; code_verifier or client_secret)
 ```
+
+Notes: `redirect_uri` is required. Optional spec fields are `client_type` (`confidential` default | `public`) and `refresh_token_mode` (`sealed` default | `rotating`; always rotating for public). Discovery's `issuer` is the upstream provider's issuer, not `{OAUTH_<NAME>_ISSUER}`; configure OIDC libraries with manual endpoints or skip the issuer comparison. Use "Test OAuth" on the extension page to verify the setup.
 
 ### CI/CD Pattern (two service accounts)
 

@@ -27,14 +27,15 @@ You register **one URL** at the provider:
 https://<rise-url>/oidc/<project>/<extension>/callback
 ```
 
-Rise allows forwarding to any URL associated with the project (all deployment group and environment URLs) as well as `localhost` for local development.
+Rise allows forwarding to the origin of any active deployment of the project (all deployment group and environment URLs, and custom domains) and to loopback addresses (`localhost`, `*.localhost`, `127.0.0.1`, `[::1]`) for local development. `redirect_uri` is required on every authorize request. When Rise's own `server.public_url` is `http`, `http` deployment origins are accepted too; behind an `https` Rise they are not.
 
 ## What It Does
 
 - Stores provider credentials securely (client secret encrypted at rest, never in client environments).
-- Exposes Rise OAuth endpoints (`authorize`, `token`, `callback`, OIDC discovery, JWKS).
-- Generates scoped client credentials injected into app environments.
-- Proxies OIDC discovery and JWKS so apps work identically in local dev and production.
+- Exposes Rise OAuth endpoints (`authorize`, `token`, `callback`, OIDC discovery, JWKS), served in-process by the embedded oauthrelay core on every deployment backend. URLs stay `/oidc/{project}/{extension}/…`.
+- Generates client credentials injected into app environments: a client ID, and a client secret for `confidential` extensions only.
+- Returns Rise refresh-token handles (`rrt1.` sealed, `rrt2.` rotating) instead of the provider's refresh token.
+- Proxies OIDC discovery and JWKS so apps work identically in local dev and production. The discovery document's `issuer` is the upstream issuer.
 
 ## Configuration
 
@@ -60,6 +61,18 @@ stdin workflow.
 
 - `authorization_endpoint`: explicit authorization endpoint for non-OIDC providers.
 - `token_endpoint`: explicit token endpoint for non-OIDC providers.
+- `client_type`: `confidential` (default) or `public`. Public clients require PKCE, get no secret (`{EXT}_CLIENT_SECRET` is not injected), and always use rotating refresh tokens.
+- `refresh_token_mode`: `sealed` (default for confidential) or `rotating`. `public` with `sealed` is rejected.
+
+## Operating Notes
+
+- **Secrets and keys.** Authorization codes, state and sealed handles are encrypted with a data key that the configured encryption provider (local AES or KMS) wraps; the wrapped key travels in each value. Rotating handles and single-use markers live in the database and are cleaned up when they expire, so storage grows with active sessions.
+- **Invalidation.** Deleting and recreating an extension, or changing its `issuer_url`, `client_id` or `token_endpoint`, invalidates its refresh tokens. A soft-deleted extension stops serving immediately.
+- **Upgrading.** Refresh tokens and in-flight codes issued before the upgrade are rejected once, so users sign in again. See the changelog entry for app-side changes.
+- **Status.** Only the "Test OAuth" button (`GET /api/v1/projects/{project}/extensions/{extension}/oauth/test`, project members and admins, Rise UI browser sessions only, refused when `Sec-Fetch-Site` is `same-site` or `cross-site`) updates the extension's status, and only the fields it owns (`auth_verified`, `error`, `configured_at`, `redirect_uri`), and only while the spec is the one it tested. It returns to the UI with `?error=oauth_authorization_failed` or `?error=oauth_token_exchange_failed` on failure. End-user logins do not touch the status.
+- **Resolution cache and limits.** The relay reuses an extension's resolved configuration for 5 seconds, so spec, deployment and deletion changes take effect within that time. Discovery and JWKS are limited to 600 requests per minute per client address; authorize, callback and token use `server.oauth_rate_limit`.
+- **Outbound requests.** Every upstream request passes `server.ssrf` (see [Configuration](/operator-docs/configuration/)): the URL's scheme and address literals are checked before the request, host names when connecting. A discovered `jwks_uri` that fails the check is never fetched; discovery and `/jwks` answer `502`.
+- **Snowflake provisioner.** Snowflake's 90-day refresh-token validity is cut to 30 days if the linked extension uses `rotating` or `public`.
 
 ## Setup Checklist
 
@@ -71,7 +84,7 @@ stdin workflow.
 
 ## Local Development Redirects
 
-For local development, send users to the authorize endpoint with a `redirect_uri` query parameter pointing at your localhost app callback. The upstream provider still redirects to Rise, and Rise then forwards to your local callback URL.
+For local development, send users to the authorize endpoint with a `redirect_uri` query parameter pointing at your localhost app callback, and repeat it at the token request. The upstream provider still redirects to Rise, and Rise then forwards to your local callback URL.
 
 Example:
 
