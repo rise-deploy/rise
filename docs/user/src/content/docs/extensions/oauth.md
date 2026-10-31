@@ -66,7 +66,7 @@ stdin workflow.
 2. Set callback URL to:
    `https://<rise-url>/oidc/<project>/<extension>/callback`
 3. Add provider values to extension config.
-4. Test the flow with **Test OAuth Flow** on the extension detail page. Only a signed-in project member can run it, and only the test updates the extension's status.
+4. Test the flow with **Test OAuth Flow** on the extension detail page. Only a signed-in project member (or a Rise admin) can run it, and only the test updates the extension's status.
 
 ## Local Development Redirects
 

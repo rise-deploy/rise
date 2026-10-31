@@ -201,6 +201,10 @@ server:
   docs_dir: "/var/rise/docs"   # Optional: directory containing built static documentation
   trusted_proxies:             # Optional: proxies whose forwarded-address headers are believed
     - "10.0.0.0/8"
+  ssrf:                        # Optional: limits on Rise's server-side requests
+    allow_http: false          # Development only: permit plain http targets
+    allow_private_networks: false  # Development only: permit private/loopback targets
+    trusted_hosts: []          # Host names (or address literals) allowed to be private
 ```
 
 **Documentation Serving (`docs_dir`):**
@@ -222,6 +226,12 @@ server:
   - Kubernetes: by default the chart's NetworkPolicy lets every pod in the cluster reach port 3000. Restrict `networkPolicy.httpIngressFrom` to the ingress controller (see `helm/rise/values.yaml`), and narrow `trusted_proxies` if the ingress controller's pod range is smaller than the private ranges.
 - Publishing Rise's port directly to untrusted networks is not covered by this setting. A published port can present a private source address to Rise: Docker's userland proxy (loopback traffic, rootless Docker, Docker Desktop, IPv6 without `ip6tables`) shows the bridge gateway as the peer, whereas rootful iptables DNAT keeps the client's source address. Put a proxy in front and narrow `trusted_proxies` to it.
 - The Metacontroller webhook and Traefik configuration listeners are separate and do not use this setting.
+
+**Server-side request protection (`ssrf`):**
+- Applies to every URL Rise requests itself: OIDC discovery and JWKS of trusted issuers and service-account issuers, and the OAuth extension's upstream discovery, JWKS and token requests.
+- Targets must use `https` unless `allow_http` is set, and must not be a loopback, private, link-local (including `169.254.169.254`), CGNAT or unspecified address unless `allow_private_networks` is set or the host is in `trusted_hosts`. `trusted_hosts` matches the URL's host exactly (case-insensitive), for example an internal Keycloak.
+- Host names are checked when Rise connects: the resolved addresses are filtered, so a name that resolves to a blocked address is never connected to, even if it resolved elsewhere when the URL was first checked. Address literals are checked before the request. URLs that upstreams hand out (a discovered `jwks_uri`) pass the same checks. Token requests do not follow redirects.
+- **Egress proxies bypass the connect-time check.** With `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` set, the proxy resolves the target's name, so Rise only sees the proxy's address (which it never filters). Rise still checks the scheme, address literals and, for its own fetches, the names it resolves beforehand, but a name that the proxy resolves to an internal address is not caught. Restrict internal destinations at the proxy, or exclude them from proxying with `NO_PROXY` only if they are meant to be reached.
 
 **JWT Configuration:**
 - `jwt_signing_secret`: Base64-encoded secret for HS256 JWT signing (generate with `openssl rand -base64 32`)

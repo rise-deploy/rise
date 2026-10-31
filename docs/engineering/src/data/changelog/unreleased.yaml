@@ -151,9 +151,26 @@ changes:
          rejects `request`, `request_uri` and non-`query` response modes.
       8. Only "Test OAuth" updates the extension's status; end-user logins never
          mark it configured.
-      9. A deleted extension stops serving immediately. Deleting and recreating
-         an extension, or changing its issuer, client ID or token endpoint,
-         invalidates its refresh tokens.
+      9. A deleted extension stops serving within 5 seconds (resolutions are
+         reused that long). Deleting and recreating an extension, or changing
+         its issuer, client ID or token endpoint, invalidates its refresh tokens.
+      10. Codes, flow state and refresh handles are sealed under a data key that
+          the configured encryption provider wraps. Changing the KMS key or the
+          local encryption key invalidates them all: every end user signs in
+          again.
+      11. The new `oauth_relay_store` table holds single-use markers and
+          rotating refresh-token families. The existing hourly cleanup removes
+          expired rows.
+      12. `/oidc/{project}/{extension}/…` answers `404` for an extension that is
+          not of type `oauth` (was `400`).
+      13. `invalid_client` is `401`, with `WWW-Authenticate` when the client
+          used HTTP Basic. A `429` from the rate limiter carries no CORS
+          headers, so browsers report it as a network error.
+      14. Discovery and JWKS are limited to 600 requests per minute per client
+          address.
+      15. Requests to the upstream are refused (`502`) when their URL is not
+          allowed by `server.ssrf`, including a `jwks_uri` the upstream's
+          discovery document names.
     action: |-
       Before upgrading, app owners must add `redirect_uri` to authorize and token
       requests, make confidential apps send the client secret on refresh, and set
@@ -195,6 +212,25 @@ changes:
     action: |-
       Existing extensions behave as `confidential` with `sealed` refresh tokens.
       Set `client_type: public` for apps that use PKCE without a secret.
+  - id: ssrf-connect-time-address-filter
+    title: Server-side requests filter blocked addresses when connecting
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: none
+    details: |-
+      Rise's server-side HTTP clients (OIDC discovery and JWKS of trusted and
+      service-account issuers, OAuth extension upstreams) now resolve host names
+      through a filter that drops loopback, private, link-local, CGNAT and
+      unspecified addresses, unless `server.ssrf.allow_private_networks` is set
+      or the host is in `server.ssrf.trusted_hosts`. A name that resolves to a
+      blocked address when Rise connects is refused even if it passed the
+      earlier check (DNS rebinding). The clients also refuse plain `http`
+      unless `server.ssrf.allow_http` is set. Hosts that already passed Rise's
+      checks are unaffected.
+    action: |-
+      If Rise reaches the internet through an egress proxy (`HTTPS_PROXY`), the
+      proxy resolves target names, so this filter does not apply to them; block
+      internal destinations at the proxy.
   - id: pack-build-private-env-files
     title: CLI secrets use safer files and logging
     group: security-and-upgrade-guidance

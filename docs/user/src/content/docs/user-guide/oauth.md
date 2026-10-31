@@ -187,7 +187,7 @@ Rise sends the provider's client credentials only to the token endpoint the secr
 
 ## Test the Extension
 
-Open the extension in the Rise UI and choose **Test OAuth Flow**. It signs you in through the provider as yourself, then marks the extension configured or shows the provider's error. Only a signed-in project member can run the test, and only the test updates the extension's status; end-user logins do not.
+Open the extension in the Rise UI and choose **Test OAuth Flow**. It signs you in through the provider as yourself, then marks the extension configured or shows the provider's error. Only a signed-in project member (or a Rise admin) can run the test, from the Rise UI in the same browser, and only the test updates the extension's status; end-user logins do not. A failed test returns to the UI with `?error=oauth_authorization_failed` when the provider refused the sign-in, or `?error=oauth_token_exchange_failed` when the code exchange failed; the extension's status shows the provider's error.
 
 ## Application Usage
 
@@ -209,7 +209,7 @@ Rise accepts these `redirect_uri` values:
 - `http` on `127.0.0.1`, `[::1]`, `localhost`, and `*.localhost`, with any port and path.
 - `http` deployment origins, only when Rise itself is served over `http` (local development setups).
 
-Anything else, including Rise's own URL, is refused.
+Anything else, including Rise's own URL, is refused. On a Rise served over `http` (local development only) Rise's own origin is accepted as well, because its test callback cannot be matched exactly there.
 
 After the upstream provider authenticates the user, Rise redirects back to your app with an authorization code:
 
