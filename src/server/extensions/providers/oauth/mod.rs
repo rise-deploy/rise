@@ -5,7 +5,7 @@ pub mod provider;
 pub mod binding;
 #[cfg(feature = "backend")]
 pub mod endpoints;
-// The handlers behind the routes the relay replaced. Removed in R2.
+// Unmounted. Removed in R2.
 #[cfg(feature = "backend")]
 #[allow(dead_code)]
 pub mod handlers;

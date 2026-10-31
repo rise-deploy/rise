@@ -15,6 +15,7 @@ pub mod sealer;
 pub mod store;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::{
@@ -41,6 +42,12 @@ pub type RelayService =
 /// The path every relay endpoint is served below, relative to Rise's root.
 pub const MOUNT_PREFIX: &str = "/oidc";
 
+/// How long a resolved relay or upstream (or its absence) is reused. The relay
+/// resolves on every request, including unauthenticated discovery and JWKS, and
+/// a resolution costs several queries plus the deployment URL computation. Spec,
+/// deployment and deletion changes therefore take effect within this time.
+pub const RESOLUTION_TTL: Duration = Duration::from_secs(5);
+
 /// What the relay needs from Rise.
 pub struct OAuthRelayDeps {
     pub pool: PgPool,
@@ -52,6 +59,8 @@ pub struct OAuthRelayDeps {
     pub ssrf: SsrfConfig,
     pub sealer: Arc<dyn Sealer>,
     pub store: Arc<dyn TransientStore>,
+    /// How long resolutions are reused ([`RESOLUTION_TTL`]); zero disables reuse.
+    pub resolution_ttl: Duration,
 }
 
 /// The OAuth extension relay: the oauthrelay router over Rise's extensions.
@@ -64,6 +73,7 @@ pub struct OAuthRelay {
     /// arriving at `/oidc/…` are rewritten below it before routing.
     public_path: Option<String>,
     store: Arc<dyn TransientStore>,
+    metadata_limiter: Arc<rate_limit::MetadataRateLimiter>,
 }
 
 impl OAuthRelay {
@@ -102,6 +112,7 @@ impl OAuthRelay {
             public_url,
             redirect,
             deps.ssrf.clone(),
+            deps.resolution_ttl,
         );
         let config = RelayConfig {
             public_url: relay_url,
@@ -111,6 +122,7 @@ impl OAuthRelay {
             client_assertion_http: http::client_assertion_http_client(&deps.ssrf)
                 .context("failed to build the OAuth relay's client assertion HTTP client")?,
             redirect,
+            outbound: Some(Arc::new(http::SsrfOutboundPolicy::new(deps.ssrf.clone()))),
         };
         let router =
             oauthrelay_core::router(Arc::new(resolver), config, Arc::new(layout::RiseLayout));
@@ -119,12 +131,14 @@ impl OAuthRelay {
             route_prefix,
             public_path,
             store: deps.store,
+            metadata_limiter: Arc::default(),
         })
     }
 
     /// The relay endpoints for mounting at `/oidc/{*path}`, behind the OAuth rate
-    /// limit on authorize, callback and token. A plain service rather than a
-    /// `Router`, so it mounts with `route_service` and sees the unstripped path.
+    /// limit on authorize, callback and token and a per-address budget on
+    /// discovery and JWKS. A plain service rather than a `Router`, so it mounts
+    /// with `route_service` and sees the unstripped path.
     pub fn service(&self, limiter: Arc<OAuthRateLimiter>) -> RelayService {
         let relay: RelayService =
             match &self.public_path {
@@ -147,7 +161,14 @@ impl OAuthRelay {
                 }
             };
         RelayService::new(
-            axum::middleware::from_fn_with_state(limiter, rate_limit::rate_limit).layer(relay),
+            axum::middleware::from_fn_with_state(
+                rate_limit::RelayLimits {
+                    oauth: limiter,
+                    metadata: self.metadata_limiter.clone(),
+                },
+                rate_limit::rate_limit,
+            )
+            .layer(relay),
         )
     }
 

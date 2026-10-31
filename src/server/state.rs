@@ -2038,6 +2038,7 @@ impl AppState {
                 deployment_backend: deployment_backend.clone(),
                 sealer: Arc::new(RiseSealer::new(encryption_provider.clone())),
                 store: Arc::new(PgTransientStore::new(db_pool.clone())),
+                resolution_ttl: crate::server::extensions::providers::oauth::relay::RESOLUTION_TTL,
                 encryption_provider,
                 public_url: public_url.clone(),
                 ssrf: settings.server.ssrf.clone(),

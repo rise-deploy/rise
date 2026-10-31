@@ -111,6 +111,9 @@ pub struct ExtensionResolver {
     ssrf: SsrfConfig,
     discovery: CachedDiscovery,
     secrets: moka::future::Cache<String, SecretString>,
+    resolution_ttl: Duration,
+    relays: moka::future::Cache<ResourceKey, Option<Arc<Relay>>>,
+    upstreams: moka::future::Cache<ResourceKey, Option<Arc<Upstream>>>,
 }
 
 impl ExtensionResolver {
@@ -121,8 +124,12 @@ impl ExtensionResolver {
         public_url: Url,
         redirect: RedirectOptions,
         ssrf: SsrfConfig,
+        resolution_ttl: Duration,
     ) -> Self {
         Self {
+            resolution_ttl,
+            relays: resolution_cache(resolution_ttl),
+            upstreams: resolution_cache(resolution_ttl),
             pool,
             deployment_backend,
             encryption_provider,
@@ -246,6 +253,15 @@ impl ExtensionResolver {
     }
 }
 
+fn resolution_cache<V: Clone + Send + Sync + 'static>(
+    ttl: Duration,
+) -> moka::future::Cache<ResourceKey, V> {
+    moka::future::Cache::builder()
+        .max_capacity(10_000)
+        .time_to_live(ttl.max(Duration::from_millis(1)))
+        .build()
+}
+
 /// Logs a resolution failure with its cause and turns it into a `ResolveError`
 /// (a `500` / `server_error` at the relay).
 fn failure(key: &ResourceKey, what: &str, cause: impl std::fmt::Debug) -> ResolveError {
@@ -256,6 +272,31 @@ fn failure(key: &ResourceKey, what: &str, cause: impl std::fmt::Debug) -> Resolv
 #[async_trait]
 impl ResourceResolver for ExtensionResolver {
     async fn resolve_relay(&self, key: &ResourceKey) -> Result<Option<Arc<Relay>>, ResolveError> {
+        if self.resolution_ttl.is_zero() {
+            return self.load_relay(key).await;
+        }
+        self.relays
+            .try_get_with_by_ref(key, self.load_relay(key))
+            .await
+            .map_err(|e: Arc<ResolveError>| ResolveError(e.0.clone()))
+    }
+
+    async fn resolve_upstream(
+        &self,
+        key: &ResourceKey,
+    ) -> Result<Option<Arc<Upstream>>, ResolveError> {
+        if self.resolution_ttl.is_zero() {
+            return self.load_upstream(key).await;
+        }
+        self.upstreams
+            .try_get_with_by_ref(key, self.load_upstream(key))
+            .await
+            .map_err(|e: Arc<ResolveError>| ResolveError(e.0.clone()))
+    }
+}
+
+impl ExtensionResolver {
+    async fn load_relay(&self, key: &ResourceKey) -> Result<Option<Arc<Relay>>, ResolveError> {
         let Some(active) = self.load(key).await? else {
             return Ok(None);
         };
@@ -273,7 +314,7 @@ impl ResourceResolver for ExtensionResolver {
         .map_err(|e| failure(key, "invalid relay configuration", e))
     }
 
-    async fn resolve_upstream(
+    async fn load_upstream(
         &self,
         key: &ResourceKey,
     ) -> Result<Option<Arc<Upstream>>, ResolveError> {
@@ -281,21 +322,25 @@ impl ResourceResolver for ExtensionResolver {
             return Ok(None);
         };
         let spec = &active.spec;
-        let needs_discovery =
-            spec.authorization_endpoint.is_none() || spec.token_endpoint.is_none();
-        // The relay may fetch the issuer's discovery document itself (to find the
-        // authorization endpoint, or best-effort for a JWKS), so the issuer must be
-        // a permitted request target even when both endpoints are explicit.
+        let needs_discovery = spec.explicit_authorization_endpoint().is_none()
+            || spec.explicit_token_endpoint().is_none();
         let discovered = match self.discovery.get(&spec.issuer_url).await {
             Ok(doc) => Some(doc),
+            // Both endpoints are explicit, so discovery only matters for the
+            // JWKS. The relay's outbound policy refuses a blocked issuer too, so
+            // its discovery and JWKS answer 502 while the flows keep working.
             Err(DiscoveryFailure::Unavailable(reason)) if !needs_discovery => {
                 debug!(%key, "No OIDC discovery for an explicit-endpoint upstream: {reason}");
                 None
             }
+            Err(DiscoveryFailure::Blocked(reason)) if !needs_discovery => {
+                warn!(%key, "OIDC discovery of an explicit-endpoint upstream is blocked: {reason}");
+                None
+            }
             Err(e) => return Err(failure(key, "OIDC discovery failed", e.to_string())),
         };
-        let token_endpoint = match (&spec.token_endpoint, &discovered) {
-            (Some(explicit), _) => explicit.clone(),
+        let token_endpoint = match (spec.explicit_token_endpoint(), &discovered) {
+            (Some(explicit), _) => explicit.to_owned(),
             (None, Some(doc)) => doc
                 .token_endpoint
                 .clone()
@@ -340,8 +385,7 @@ pub fn build_upstream(
         key: key.clone(),
         issuer_url: parse_http_url("issuer_url", &spec.issuer_url)?,
         authorization_endpoint: spec
-            .authorization_endpoint
-            .as_deref()
+            .explicit_authorization_endpoint()
             .map(|value| parse_http_url("authorization_endpoint", value))
             .transpose()?,
         token_endpoint: Some(parse_http_url("token_endpoint", token_endpoint)?),
@@ -370,13 +414,10 @@ pub fn valid_scope_token(token: &str) -> bool {
 /// The spec's scopes as RFC 6749 scope tokens: entries are split on ASCII
 /// whitespace, invalid tokens are dropped with a warning, and duplicates are
 /// removed keeping the first occurrence.
-pub fn normalize_scopes(key: &ResourceKey, scopes: &[String]) -> Vec<String> {
+pub fn normalize_scopes(key: &ResourceKey, spec: &OAuthExtensionSpec) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut normalized = Vec::new();
-    for token in scopes
-        .iter()
-        .flat_map(|entry| entry.split_ascii_whitespace())
-    {
+    for token in spec.scope_tokens() {
         if !valid_scope_token(token) {
             warn!(%key, scope = %token, "Dropping an invalid OAuth scope");
             continue;
@@ -432,7 +473,7 @@ pub fn build_relay(inputs: &RelayInputs<'_>) -> Result<Relay, String> {
         RefreshTokenMode::Sealed => RelayRefreshTokenMode::Sealed,
         RefreshTokenMode::Rotating => RelayRefreshTokenMode::Rotating,
     };
-    let scopes = normalize_scopes(key, &spec.scopes);
+    let scopes = normalize_scopes(key, spec);
     let relay = Relay {
         key: (*key).clone(),
         upstream: (*key).clone(),
@@ -781,6 +822,18 @@ mod tests {
             upstream.token_endpoint_auth_method,
             RelayAuthMethod::ClientSecretBasic
         );
+
+        // An empty endpoint counts as unset.
+        spec.authorization_endpoint = Some(String::new());
+        let upstream = build_upstream(
+            &key(),
+            &spec,
+            "https://idp.example.com/token",
+            None,
+            SecretString::new("upstream-secret"),
+        )
+        .unwrap();
+        assert_eq!(upstream.authorization_endpoint, None);
 
         spec.authorization_endpoint = Some("https://idp.example.com/authorize".into());
         let upstream = build_upstream(

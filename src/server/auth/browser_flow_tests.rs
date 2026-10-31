@@ -160,6 +160,7 @@ pub(crate) async fn fixture(pool: PgPool) -> Fixture {
                 ssrf: settings.server.ssrf.clone(),
                 sealer: Arc::new(oauthrelay_core::XChaChaSealer::new(&[7; 32], None).unwrap()),
                 store: Arc::new(oauthrelay_core::MemoryStore::default()),
+                resolution_ttl: std::time::Duration::ZERO,
             },
         )
         .unwrap(),

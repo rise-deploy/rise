@@ -45,6 +45,10 @@ struct MockState {
     issuer: String,
     oidc: bool,
     token_requests: Mutex<Vec<UpstreamRequest>>,
+    /// When set, the first discovery request fails and later ones name this
+    /// `jwks_uri`: an issuer that shows Rise nothing and the relay an attack.
+    malicious_jwks_uri: Mutex<Option<String>>,
+    discovery_requests: std::sync::atomic::AtomicUsize,
 }
 
 /// An OAuth provider on `127.0.0.1`: an OIDC one (discovery and JWKS), or a
@@ -91,6 +95,15 @@ impl MockUpstream {
 }
 
 async fn mock_discovery(State(state): State<Arc<MockState>>) -> Response {
+    let request = state
+        .discovery_requests
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(jwks_uri) = state.malicious_jwks_uri.lock().unwrap().clone() {
+        if request == 0 {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        return Json(json!({"issuer": state.issuer, "jwks_uri": jwks_uri})).into_response();
+    }
     if !state.oidc {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -1279,6 +1292,7 @@ async fn the_test_callback_is_bound_to_the_initiating_browser_and_user(pool: PgP
         "project_id": project_id(&fixture).await,
         "extension": "ext",
         "generation": "x",
+        "spec_hash": "x",
         "verifier": "v",
         "return_to": RETURN_TO,
     });
@@ -1368,6 +1382,7 @@ fn use_production_store_and_sealer(fixture: &mut Fixture) {
             deployment_backend: state.deployment_backend.clone(),
             sealer: Arc::new(RiseSealer::new(encryption_provider.clone())),
             store: Arc::new(PgTransientStore::new(state.db_pool.clone())),
+            resolution_ttl: std::time::Duration::ZERO,
             encryption_provider,
             public_url: state.public_url.clone(),
             ssrf: state.server_settings.ssrf.clone(),
@@ -1493,6 +1508,7 @@ async fn a_public_url_with_a_path_serves_the_relay_below_it(pool: PgPool) {
             ssrf: state.server_settings.ssrf.clone(),
             sealer: Arc::new(oauthrelay_core::XChaChaSealer::new(&[7; 32], None).unwrap()),
             store: Arc::new(oauthrelay_core::MemoryStore::default()),
+            resolution_ttl: std::time::Duration::ZERO,
         })
         .unwrap(),
     );
@@ -1517,4 +1533,263 @@ async fn a_public_url_with_a_path_serves_the_relay_below_it(pool: PgPool) {
         .token("demo", "ext", &[("grant_type", "refresh_token")])
         .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ---------------------------------------------------------------------------
+// Hardening
+// ---------------------------------------------------------------------------
+
+/// Replaces the fixture's relay with one using `ssrf` and `resolution_ttl`.
+fn use_relay(
+    fixture: &mut Fixture,
+    ssrf: crate::server::ssrf::SsrfConfig,
+    resolution_ttl: std::time::Duration,
+) {
+    let state = &mut fixture.state;
+    state.oauth_relay = Arc::new(
+        super::relay::OAuthRelay::new(super::relay::OAuthRelayDeps {
+            pool: state.db_pool.clone(),
+            deployment_backend: state.deployment_backend.clone(),
+            encryption_provider: state.encryption_provider.clone().unwrap(),
+            public_url: state.public_url.clone(),
+            ssrf,
+            sealer: Arc::new(oauthrelay_core::XChaChaSealer::new(&[7; 32], None).unwrap()),
+            store: Arc::new(oauthrelay_core::MemoryStore::default()),
+            resolution_ttl,
+        })
+        .unwrap(),
+    );
+}
+
+/// A listener on `addr` that counts the connections it accepts.
+async fn internal_service(
+    addr: &str,
+) -> (
+    u16,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let reached = Arc::new(AtomicUsize::new(0));
+    let counter = reached.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((_stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    (port, reached, server)
+}
+
+/// Production SSRF policy, except that the IdP itself is a trusted internal
+/// host served over http.
+fn internal_idp_ssrf() -> crate::server::ssrf::SsrfConfig {
+    crate::server::ssrf::SsrfConfig {
+        allow_http: true,
+        trusted_hosts: vec!["127.0.0.1".into()],
+        ..Default::default()
+    }
+}
+
+#[sqlx::test]
+async fn a_malicious_issuer_cannot_point_the_relay_at_internal_addresses(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+    let mut fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(false).await;
+    create_extension(&fixture, &upstream, Client::Confidential, true).await;
+    let (name_port, name_reached, name_server) = internal_service("127.0.0.1:0").await;
+    let (ip_port, ip_reached, ip_server) = internal_service("127.0.0.2:0").await;
+
+    for jwks_uri in [
+        // Cloud metadata.
+        "http://169.254.169.254/latest/meta-data".to_owned(),
+        "https://169.254.169.254/latest/meta-data".to_owned(),
+        // A private address literal, which no resolver sees.
+        format!("http://127.0.0.2:{ip_port}/keys"),
+        // A name resolving to a loopback address.
+        format!("http://localhost:{name_port}/keys"),
+    ] {
+        // Rise's own discovery fails first; the relay's then sees the attack.
+        *upstream.state.malicious_jwks_uri.lock().unwrap() = Some(jwks_uri.clone());
+        upstream.state.discovery_requests.store(0, Ordering::SeqCst);
+        use_relay(&mut fixture, internal_idp_ssrf(), std::time::Duration::ZERO);
+        let app = app(&fixture);
+        for _ in 0..2 {
+            let response = get_path(&app, "/oidc/demo/ext/jwks", &HeaderMap::new()).await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{jwks_uri}");
+        }
+        assert!(upstream.state.discovery_requests.load(Ordering::SeqCst) >= 2);
+    }
+    assert_eq!(name_reached.load(Ordering::SeqCst), 0);
+    assert_eq!(ip_reached.load(Ordering::SeqCst), 0);
+
+    // The trusted internal IdP itself keeps working.
+    let app = app(&fixture);
+    let code = app_code(&app, &upstream, false).await;
+    let (status, tokens) = token(
+        &app,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("redirect_uri", APP_REDIRECT),
+            ("client_id", RISE_CLIENT_ID),
+            ("client_secret", RISE_CLIENT_SECRET),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    name_server.abort();
+    ip_server.abort();
+}
+
+#[sqlx::test]
+async fn a_discovered_jwks_at_a_blocked_address_is_never_fetched(pool: PgPool) {
+    use std::sync::atomic::Ordering;
+    let mut fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(false).await;
+    create_extension(&fixture, &upstream, Client::Confidential, true).await;
+    let (port, reached, server) = internal_service("127.0.0.2:0").await;
+    // Every discovery names an internal JWKS, so Rise sees it too.
+    *upstream.state.malicious_jwks_uri.lock().unwrap() =
+        Some(format!("http://127.0.0.2:{port}/keys"));
+    upstream.state.discovery_requests.store(1, Ordering::SeqCst);
+    use_relay(&mut fixture, internal_idp_ssrf(), std::time::Duration::ZERO);
+    let app = app(&fixture);
+
+    let response = get_path(&app, "/oidc/demo/ext/jwks", &HeaderMap::new()).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(reached.load(Ordering::SeqCst), 0);
+    // The flows do not depend on it.
+    assert_eq!(
+        get_path(
+            &app,
+            &authorize_uri(&[("redirect_uri", APP_REDIRECT)]),
+            &HeaderMap::new()
+        )
+        .await
+        .status(),
+        StatusCode::FOUND
+    );
+    server.abort();
+}
+
+#[sqlx::test]
+async fn resolutions_are_reused_for_a_few_seconds(pool: PgPool) {
+    let mut fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(true).await;
+    create_extension(&fixture, &upstream, Client::Confidential, false).await;
+    let ssrf = fixture.state.server_settings.ssrf.clone();
+    use_relay(&mut fixture, ssrf, super::relay::RESOLUTION_TTL);
+    let app = app(&fixture);
+    let discovery = "/oidc/demo/ext/.well-known/openid-configuration";
+    assert_eq!(
+        get_path(&app, discovery, &HeaderMap::new()).await.status(),
+        StatusCode::OK
+    );
+
+    db_extensions::mark_deleted(&fixture.state.db_pool, project_id(&fixture).await, "ext")
+        .await
+        .unwrap();
+    // Within the reuse window the deleted extension is still served...
+    assert_eq!(
+        get_path(&app, discovery, &HeaderMap::new()).await.status(),
+        StatusCode::OK
+    );
+    // ...and not after it.
+    tokio::time::sleep(super::relay::RESOLUTION_TTL + std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        get_path(&app, discovery, &HeaderMap::new()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[sqlx::test]
+async fn the_test_flow_cannot_be_started_from_another_site(pool: PgPool) {
+    let fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(true).await;
+    create_extension(&fixture, &upstream, Client::Confidential, false).await;
+    let app = app(&fixture);
+    let session = rise_ui_session_headers(&fixture).await;
+
+    for (site, allowed) in [
+        ("same-origin", true),
+        ("none", true),
+        ("same-site", false),
+        ("cross-site", false),
+    ] {
+        let mut headers = session.clone();
+        headers.insert("sec-fetch-site", site.parse().unwrap());
+        let response = get_path(&app, &start_uri(RETURN_TO), &headers).await;
+        let expected = if allowed {
+            StatusCode::SEE_OTHER
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        assert_eq!(response.status(), expected, "{site}");
+        assert_eq!(flow_cookie(&response).is_some(), allowed, "{site}");
+    }
+}
+
+#[sqlx::test]
+async fn the_test_flow_keeps_concurrent_changes(pool: PgPool) {
+    let fixture = fixture(pool).await;
+    let upstream = MockUpstream::start(true).await;
+    create_extension(&fixture, &upstream, Client::Confidential, false).await;
+    let app = app(&fixture);
+    let session = rise_ui_session_headers(&fixture).await;
+    let project = project_id(&fixture).await;
+
+    // A status field written while the test runs survives it.
+    let started = start_test(&app, &session).await.unwrap();
+    let callback = through_relay(&app, &upstream, &started, &[("code", "upstream-code")]).await;
+    let mut status = extension_status(&fixture).await;
+    status["concurrent"] = json!("kept");
+    status["error"] = json!("an earlier failure");
+    db_extensions::update_status(&fixture.state.db_pool, project, "ext", &status)
+        .await
+        .unwrap();
+    let response = get_path(
+        &app,
+        &callback,
+        &with_flow_cookie(&session, &started.cookie),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let status = extension_status(&fixture).await;
+    assert_eq!(status["auth_verified"], true);
+    assert_eq!(status["concurrent"], "kept");
+    assert!(status.get("error").is_none(), "{status}");
+
+    // A spec changed during the test is not marked verified.
+    db_extensions::update_status(
+        &fixture.state.db_pool,
+        project,
+        "ext",
+        &json!({"rise_client_id": RISE_CLIENT_ID, "rise_client_secret": RISE_CLIENT_SECRET}),
+    )
+    .await
+    .unwrap();
+    let started = start_test(&app, &session).await.unwrap();
+    let callback = through_relay(&app, &upstream, &started, &[("code", "upstream-code")]).await;
+    let ext = db_extensions::find_by_project_and_name(&fixture.state.db_pool, project, "ext")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut spec = ext.spec.clone();
+    spec["description"] = json!("edited during the test");
+    db_extensions::update_spec(&fixture.state.db_pool, project, "ext", &spec)
+        .await
+        .unwrap();
+    let response = get_path(
+        &app,
+        &callback,
+        &with_flow_cookie(&session, &started.cookie),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(extension_status(&fixture)
+        .await
+        .get("auth_verified")
+        .is_none());
 }

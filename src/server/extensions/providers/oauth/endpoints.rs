@@ -5,7 +5,7 @@ use super::models::OAuthExtensionSpec;
 use crate::server::ssrf::{self, SsrfConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::error;
+use tracing::{error, warn};
 
 /// OIDC discovery document (partial).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -79,10 +79,13 @@ pub(crate) async fn resolve_oauth_endpoints(
     ssrf_config: &SsrfConfig,
 ) -> Result<ResolvedEndpoints, String> {
     // If both endpoints are provided in spec, use them directly
-    if let (Some(auth), Some(token)) = (&spec.authorization_endpoint, &spec.token_endpoint) {
+    if let (Some(auth), Some(token)) = (
+        spec.explicit_authorization_endpoint(),
+        spec.explicit_token_endpoint(),
+    ) {
         return Ok(ResolvedEndpoints {
-            authorization_endpoint: auth.clone(),
-            token_endpoint: token.clone(),
+            authorization_endpoint: auth.to_owned(),
+            token_endpoint: token.to_owned(),
         });
     }
 
@@ -90,14 +93,14 @@ pub(crate) async fn resolve_oauth_endpoints(
 
     // Use spec override if provided, otherwise use discovery
     let authorization_endpoint = spec
-        .authorization_endpoint
-        .clone()
+        .explicit_authorization_endpoint()
+        .map(str::to_owned)
         .or(discovery.authorization_endpoint)
         .ok_or_else(|| "No authorization_endpoint in spec or OIDC discovery".to_string())?;
 
     let token_endpoint = spec
-        .token_endpoint
-        .clone()
+        .explicit_token_endpoint()
+        .map(str::to_owned)
         .or(discovery.token_endpoint)
         .ok_or_else(|| "No token_endpoint in spec or OIDC discovery".to_string())?;
 
@@ -117,8 +120,7 @@ const DISCOVERY_FAILURE_TTL: Duration = Duration::from_secs(30);
 /// Why a discovery lookup produced no usable document.
 #[derive(Clone, Debug)]
 pub(crate) enum DiscoveryFailure {
-    /// The discovery URL, or the `jwks_uri` it names, is not a permitted
-    /// server-side request target. Nothing at that issuer may be fetched.
+    /// The discovery URL is not a permitted server-side request target.
     Blocked(String),
     /// The document could not be fetched or parsed.
     Unavailable(String),
@@ -153,9 +155,8 @@ impl moka::Expiry<String, DiscoveryResult> for DiscoveryExpiry {
 
 /// SSRF-checked OIDC discovery, cached per issuer.
 ///
-/// A cached document has passed SSRF validation of its discovery URL and of its
-/// `jwks_uri`, so every URL in it that Rise or the relay fetches server-side
-/// was checked.
+/// A cached document was fetched from an SSRF-checked discovery URL, and a
+/// `jwks_uri` that fails the check is dropped from it.
 pub(crate) struct CachedDiscovery {
     ssrf: SsrfConfig,
     cache: moka::future::Cache<String, DiscoveryResult>,
@@ -178,17 +179,24 @@ impl CachedDiscovery {
         self.cache
             .get_with(issuer.clone(), async move {
                 let url = discovery_url(&issuer);
-                if let Err(e) = ssrf::validate_url(&url, &self.ssrf).await {
-                    return Err(DiscoveryFailure::Blocked(format!("{url}: {e}")));
+                match ssrf::validate_url(&url, &self.ssrf).await {
+                    Ok(()) => {}
+                    // A name that does not resolve is unreachable, not forbidden.
+                    Err(e @ ssrf::SsrfError::DnsResolutionFailed(_)) => {
+                        return Err(DiscoveryFailure::Unavailable(format!("{url}: {e}")));
+                    }
+                    Err(e) => return Err(DiscoveryFailure::Blocked(format!("{url}: {e}"))),
                 }
                 let doc = fetch_oidc_discovery(&issuer, &self.ssrf)
                     .await
                     .map_err(DiscoveryFailure::Unavailable)?;
+                let mut doc = doc;
                 if let Some(jwks_uri) = &doc.jwks_uri {
                     if let Err(e) = ssrf::validate_url(jwks_uri, &self.ssrf).await {
-                        return Err(DiscoveryFailure::Blocked(format!(
-                            "jwks_uri {jwks_uri}: {e}"
-                        )));
+                        // The relay's outbound policy refuses it as well, so
+                        // the upstream has no usable JWKS.
+                        warn!(%jwks_uri, "Ignoring an OIDC jwks_uri that failed SSRF validation: {e}");
+                        doc.jwks_uri = None;
                     }
                 }
                 Ok(Arc::new(doc))

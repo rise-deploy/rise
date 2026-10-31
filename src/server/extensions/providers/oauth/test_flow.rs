@@ -28,7 +28,7 @@ use tracing::{error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-use super::models::{ClientType, OAuthExtensionStatus};
+use super::models::ClientType;
 use super::relay::resolver::{load_active_extension, test_callback_url, ActiveExtension};
 use crate::db::{extensions as db_extensions, projects as db_projects};
 use crate::server::auth::redirect::origins_match;
@@ -218,8 +218,15 @@ struct TestFlowRecord {
     project_id: Uuid,
     extension: String,
     generation: String,
+    /// Hash of the spec the test started with; a test of another spec never
+    /// marks the extension verified.
+    spec_hash: String,
     verifier: String,
     return_to: String,
+}
+
+fn spec_hash(spec: &serde_json::Value) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(spec.to_string().as_bytes()))
 }
 
 fn random_token() -> String {
@@ -325,6 +332,27 @@ async fn find_extension(
         ))
 }
 
+/// Refuses a start that another site triggered.
+///
+/// The start is a `GET` that writes state, and a top-level navigation from any
+/// site carries the `SameSite=Lax` session cookie. Browsers that send Fetch
+/// Metadata say where the navigation came from: only the Rise UI itself
+/// (`same-origin`) or a typed or bookmarked URL (`none`) may start a test.
+/// `same-site` is refused as well, because sibling hosts are deployed apps.
+/// Requests without the header (browsers without Fetch Metadata, and
+/// non-browser clients) are allowed: they still need the Rise UI session, and
+/// a forged start can only make the victim test the extension with their own
+/// provider login, which the callback binds to the starting browser.
+fn refuse_cross_site_start(headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    match headers.get("sec-fetch-site").map(HeaderValue::as_bytes) {
+        None | Some(b"same-origin") | Some(b"none") => Ok(()),
+        Some(_) => Err((
+            StatusCode::FORBIDDEN,
+            "Start the OAuth test from the Rise UI".to_string(),
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TestFlowStartQuery {
     /// The Rise UI page to return to; it must be on Rise's public origin.
@@ -344,6 +372,7 @@ pub async fn start(
     if let Some(response) = rate_limited(&state, &client_ip, &headers, &project_name).await {
         return Ok(response);
     }
+    refuse_cross_site_start(&headers)?;
     let project = find_project(&state, &project_name).await?;
     let user_id = authenticate_test_flow_initiator(&state, &headers, &project).await?;
     let active = find_extension(&state, &project_name, &extension_name).await?;
@@ -360,6 +389,7 @@ pub async fn start(
         project_id: project.id,
         extension: extension_name.clone(),
         generation: active.generation(),
+        spec_hash: spec_hash(&active.extension.spec),
         verifier: verifier.clone(),
         return_to: query.return_to,
     };
@@ -496,6 +526,7 @@ pub async fn callback(
     if record.project_id != project.id
         || record.extension != extension_name
         || record.generation != active.generation()
+        || record.spec_hash != spec_hash(&active.extension.spec)
     {
         return Err(bad_request(
             "The OAuth extension changed during the test; start it again",
@@ -505,7 +536,6 @@ pub async fn callback(
         return Err(bad_request("return_to must be a Rise UI URL"));
     }
 
-    let mut status = active.status.clone();
     let failure = if query.contains_key("error") {
         Some((
             authorization_failure_summary(
@@ -529,16 +559,20 @@ pub async fn callback(
     };
     let mut return_to = Url::parse(&record.return_to)
         .map_err(|_| bad_request("return_to must be a Rise UI URL"))?;
-    match failure {
+    // Only the test's own fields are written, and only while the spec is the
+    // one that was tested, so a concurrent spec or credential update is kept.
+    let (patch, remove): (serde_json::Value, &[&str]) = match failure {
         Some((summary, code)) => {
             info!(
                 project = %project_name,
                 extension = %extension_name,
                 "OAuth test flow failed: {summary}"
             );
-            status.error = Some(summary);
-            status.auth_verified = false;
             return_to.query_pairs_mut().append_pair("error", code);
+            (
+                serde_json::json!({"auth_verified": false, "error": summary}),
+                &[],
+            )
         }
         None => {
             info!(
@@ -546,16 +580,37 @@ pub async fn callback(
                 extension = %extension_name,
                 "OAuth test flow succeeded"
             );
-            status.redirect_uri = Some(format!(
-                "{}/oidc/{project_name}/{extension_name}/callback",
-                state.public_url.trim_end_matches('/')
-            ));
-            status.configured_at = Some(Utc::now());
-            status.auth_verified = true;
-            status.error = None;
+            (
+                serde_json::json!({
+                    "auth_verified": true,
+                    "configured_at": Utc::now(),
+                    "redirect_uri": format!(
+                        "{}/oidc/{project_name}/{extension_name}/callback",
+                        state.public_url.trim_end_matches('/')
+                    ),
+                }),
+                &["error"],
+            )
         }
+    };
+    let applied = db_extensions::merge_status_for_spec(
+        &state.db_pool,
+        project.id,
+        &extension_name,
+        &active.extension.spec,
+        &patch,
+        remove,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to update OAuth extension status: {:?}", e);
+        internal("Failed to update status")
+    })?;
+    if !applied {
+        return Err(bad_request(
+            "The OAuth extension changed during the test; start it again",
+        ));
     }
-    write_status(&state, project.id, &extension_name, &status).await?;
 
     let mut response = Redirect::to(return_to.as_str()).into_response();
     let cookie = flow_cookie(&state, &project_name, &extension_name, "", 0);
@@ -608,21 +663,6 @@ async fn exchange(
         status,
         &String::from_utf8_lossy(&body),
     ))
-}
-
-async fn write_status(
-    state: &AppState,
-    project_id: Uuid,
-    extension: &str,
-    status: &OAuthExtensionStatus,
-) -> Result<(), (StatusCode, String)> {
-    let value = serde_json::to_value(status).map_err(|_| internal("Failed to update status"))?;
-    db_extensions::update_status(&state.db_pool, project_id, extension, &value)
-        .await
-        .map_err(|e| {
-            error!("Failed to update OAuth extension status: {:?}", e);
-            internal("Failed to update status")
-        })
 }
 
 #[cfg(test)]

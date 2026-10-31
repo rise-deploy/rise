@@ -75,6 +75,25 @@ pub enum RefreshTokenMode {
 }
 
 impl OAuthExtensionSpec {
+    /// The explicitly configured authorization endpoint; an empty value counts
+    /// as unset.
+    pub fn explicit_authorization_endpoint(&self) -> Option<&str> {
+        non_empty(&self.authorization_endpoint)
+    }
+
+    /// The explicitly configured token endpoint; an empty value counts as unset.
+    pub fn explicit_token_endpoint(&self) -> Option<&str> {
+        non_empty(&self.token_endpoint)
+    }
+
+    /// The scope tokens of `scopes`: an entry holding several space-separated
+    /// scopes counts as each of them.
+    pub fn scope_tokens(&self) -> impl Iterator<Item = &str> {
+        self.scopes
+            .iter()
+            .flat_map(|entry| entry.split_ascii_whitespace())
+    }
+
     /// The refresh-token mode in effect: public clients always rotate.
     pub fn effective_refresh_token_mode(&self) -> RefreshTokenMode {
         match self.client_type {
@@ -271,4 +290,8 @@ pub struct OAuth2ErrorResponse {
     /// Error description (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_description: Option<String>,
+}
+
+fn non_empty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|value| !value.trim().is_empty())
 }

@@ -363,22 +363,21 @@ impl Extension for OAuthProvider {
         // The relay accepts only absolute http(s) URLs with a host, so a stored
         // spec never fails at request time.
         validate_http_url("issuer_url", &spec.issuer_url)?;
-        if let Some(ref auth_endpoint) = spec.authorization_endpoint {
+        // An empty endpoint counts as unset.
+        if let Some(auth_endpoint) = spec.explicit_authorization_endpoint() {
             validate_http_url("authorization_endpoint", auth_endpoint)?;
         }
-        if let Some(ref token_endpoint) = spec.token_endpoint {
+        if let Some(token_endpoint) = spec.explicit_token_endpoint() {
             validate_http_url("token_endpoint", token_endpoint)?;
         }
 
-        let mut seen = std::collections::HashSet::new();
-        for scope in &spec.scopes {
+        // An entry may hold several space-separated scopes; repeats are
+        // dropped when the relay is built.
+        for scope in spec.scope_tokens() {
             if !super::relay::resolver::valid_scope_token(scope) {
                 return Err(anyhow!(
-                    "Invalid scope {scope:?}: each entry must be a single OAuth scope without spaces or quotes"
+                    "Invalid scope {scope:?}: OAuth scopes are printable ASCII without quotes or backslashes"
                 ));
-            }
-            if !seen.insert(scope.as_str()) {
-                return Err(anyhow!("Duplicate scope {scope:?}"));
             }
         }
 
@@ -1045,6 +1044,13 @@ mod client_type_tests {
         public_rotating["client_type"] = json!("public");
         public_rotating["refresh_token_mode"] = json!("rotating");
         provider.validate_spec(&public_rotating).await.unwrap();
+        // Legacy specs stay valid: empty endpoints count as unset, and entries
+        // may hold several scopes or repeat one.
+        let mut legacy = valid_spec();
+        legacy["authorization_endpoint"] = json!("");
+        legacy["token_endpoint"] = json!("");
+        legacy["scopes"] = json!(["openid email", "openid", "", "session:role:ANALYST"]);
+        provider.validate_spec(&legacy).await.unwrap();
 
         let invalid = [
             (
@@ -1055,13 +1061,10 @@ mod client_type_tests {
             ("issuer_url", json!("not a url"), None),
             ("issuer_url", json!("ftp://idp.example.com"), None),
             ("issuer_url", json!("mailto:a@example.com"), None),
-            ("token_endpoint", json!(""), None),
             ("token_endpoint", json!("idp.example.com/token"), None),
             ("authorization_endpoint", json!("javascript:alert(1)"), None),
-            ("scopes", json!(["openid email"]), None),
-            ("scopes", json!(["openid", "openid"]), None),
-            ("scopes", json!([""]), None),
             ("scopes", json!(["a\"b"]), None),
+            ("scopes", json!(["openid caf\u{e9}"]), None),
             ("client_type", json!("unknown"), None),
         ];
         for (field, value, also) in invalid {
