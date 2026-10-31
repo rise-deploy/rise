@@ -67,8 +67,8 @@ impl ProjectController {
         .await
     }
 
-    /// Clean up expired OAuth transient state and device login rows
-    /// (leader-gated, hourly).
+    /// Clean up expired OAuth transient state, OAuth relay store records and
+    /// device login rows (leader-gated, hourly).
     async fn cleanup_expired_transient_state(&self) -> anyhow::Result<()> {
         let n = crate::db::oauth_transient_state::delete_expired(&self.state.db_pool).await?;
         if n > 0 {
@@ -77,6 +77,10 @@ impl ProjectController {
         let n = crate::db::device_authorizations::delete_expired(&self.state.db_pool).await?;
         if n > 0 {
             debug!("Cleaned up {} expired device authorization rows", n);
+        }
+        let n = crate::db::oauth_relay_store::delete_expired(&self.state.db_pool).await?;
+        if n > 0 {
+            debug!("Cleaned up {} expired OAuth relay store rows", n);
         }
         Ok(())
     }
