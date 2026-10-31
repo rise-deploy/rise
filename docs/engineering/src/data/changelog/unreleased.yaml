@@ -94,6 +94,20 @@ changes:
       `(get, Organization, policy-audit)` where needed. Retry ECR requests while
       generation metadata is provisioned; revoke existing AWS role sessions if
       immediate credential revocation is required. See [ECR operations](/operator-docs/operator-registry-operations/aws-ecr/).
+  - id: oauth-extension-test-flow-requires-member
+    title: OAuth extension test requires a signed-in project member
+    group: security-and-upgrade-guidance
+    type: fix
+    impact: none
+    details: |-
+      "Test OAuth" in the Rise UI now requires a signed-in browser session of a
+      user with platform access and access to the project, and the callback must
+      complete in that same session. Only a test run this way updates the
+      extension's stored status; its failure text is limited to the upstream's
+      OAuth `error` and `error_description`. A failed end-user login no longer
+      marks the extension configured or clears its error.
+    action: |-
+      Test states started before the upgrade are refused; re-run "Test OAuth".
   - id: pack-build-private-env-files
     title: CLI secrets use safer files and logging
     group: security-and-upgrade-guidance
