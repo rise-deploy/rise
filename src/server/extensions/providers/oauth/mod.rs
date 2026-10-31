@@ -11,6 +11,8 @@ pub mod endpoints;
 pub mod handlers;
 #[cfg(feature = "backend")]
 pub mod relay;
+#[cfg(all(test, feature = "backend"))]
+mod relay_tests;
 #[cfg(feature = "backend")]
 pub mod routes;
 #[cfg(feature = "backend")]
