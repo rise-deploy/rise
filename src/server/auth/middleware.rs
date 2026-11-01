@@ -515,6 +515,39 @@ pub async fn optional_auth_middleware(
 /// `error_code` of the 403 a user without platform access receives.
 pub const PLATFORM_ACCESS_DENIED: &str = "platform_access_denied";
 
+/// Whether `user` passes the platform-access gate.
+///
+/// Shared by [`platform_access_middleware`] and the session-cookie routes that
+/// authenticate outside the API middleware stack.
+pub async fn user_has_platform_access(state: &AppState, user: &User) -> bool {
+    use crate::server::auth::platform_access::{ConfigBasedAccessChecker, PlatformAccessChecker};
+
+    // Resolve the user's IdP groups. Only needed when some group list is
+    // configured, so an install that grants access by email alone never pays
+    // for the query.
+    let needs_groups = !state
+        .auth_settings
+        .platform_access
+        .allowed_idp_groups
+        .is_empty()
+        || !state.admin_idp_groups.is_empty()
+        || !state.operator_idp_groups.is_empty();
+    let groups = if needs_groups {
+        crate::server::auth::roles::resolve_idp_groups(&state.db_pool, user.id).await
+    } else {
+        Vec::new()
+    };
+
+    let checker = ConfigBasedAccessChecker {
+        config: &state.auth_settings.platform_access,
+        admin_users: &state.admin_users,
+        admin_idp_groups: &state.admin_idp_groups,
+        operator_users: &state.operator_users,
+        operator_idp_groups: &state.operator_idp_groups,
+    };
+    checker.has_platform_access(user, &groups)
+}
+
 /// Platform access middleware - blocks non-platform users from API endpoints
 ///
 /// Applied AFTER auth_middleware (which validates JWT and injects User or VerifiedExternalToken).
@@ -524,8 +557,6 @@ pub async fn platform_access_middleware(
     req: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
-    use crate::server::auth::platform_access::{ConfigBasedAccessChecker, PlatformAccessChecker};
-
     // Service accounts (legacy external tokens) bypass platform access checks.
     // Their access is validated per-project in phase 2.
     if req.extensions().get::<VerifiedExternalToken>().is_some() {
@@ -573,32 +604,7 @@ pub async fn platform_access_middleware(
         )
     })?;
 
-    // Resolve the user's IdP groups. Only needed when some group list is
-    // configured, so an install that grants access by email alone never pays
-    // for the query.
-    let needs_groups = !state
-        .auth_settings
-        .platform_access
-        .allowed_idp_groups
-        .is_empty()
-        || !state.admin_idp_groups.is_empty()
-        || !state.operator_idp_groups.is_empty();
-    let groups = if needs_groups {
-        crate::server::auth::roles::resolve_idp_groups(&state.db_pool, user.id).await
-    } else {
-        Vec::new()
-    };
-
-    // Check platform access dynamically
-    let checker = ConfigBasedAccessChecker {
-        config: &state.auth_settings.platform_access,
-        admin_users: &state.admin_users,
-        admin_idp_groups: &state.admin_idp_groups,
-        operator_users: &state.operator_users,
-        operator_idp_groups: &state.operator_idp_groups,
-    };
-
-    if !checker.has_platform_access(user, &groups) {
+    if !user_has_platform_access(&state, user).await {
         tracing::warn!(
             user_id = %user.id,
             user_email = %user.email,
