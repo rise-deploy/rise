@@ -2717,6 +2717,7 @@ mod test_flow_tests {
         authorize(
             State(fixture.state.clone()),
             Path(("demo".to_string(), "ext".to_string())),
+            ClientIp::UNKNOWN,
             headers,
             Query(AuthorizeFlowQuery {
                 redirect_uri: Some(format!("{PUBLIC_URL}/projects/demo")),
@@ -2812,6 +2813,7 @@ mod test_flow_tests {
         let response = authorize(
             State(fixture.state.clone()),
             Path(("demo".to_string(), "ext".to_string())),
+            ClientIp::UNKNOWN,
             HeaderMap::new(),
             Query(AuthorizeFlowQuery {
                 redirect_uri: Some("https://demo.apps.example.com/cb".to_string()),
@@ -2859,6 +2861,7 @@ mod test_flow_tests {
         let (status, _) = callback(
             State(fixture.state.clone()),
             Path(("demo".to_string(), "ext".to_string())),
+            ClientIp::UNKNOWN,
             HeaderMap::new(),
             Query(CallbackRequest {
                 code: "junk".into(),
@@ -3035,6 +3038,7 @@ mod test_flow_tests {
         callback(
             State(fixture.state.clone()),
             Path(("demo".to_string(), "ext".to_string())),
+            ClientIp::UNKNOWN,
             headers,
             Query(CallbackRequest {
                 code: "junk".into(),
