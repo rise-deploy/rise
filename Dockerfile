@@ -33,7 +33,7 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Stage 2.5: Build frontend assets
-FROM node:24-alpine AS frontend-builder
+FROM node:26-alpine AS frontend-builder
 WORKDIR /usr/src/frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
@@ -44,7 +44,7 @@ COPY static/assets/logo.svg ../static/assets/logo.svg
 RUN npm run build
 
 # Stage 2.6: Build bundled user documentation
-FROM node:24-alpine AS user-docs-builder
+FROM node:26-alpine AS user-docs-builder
 WORKDIR /usr/src/docs
 
 COPY docs/package.json docs/package-lock.json ./
