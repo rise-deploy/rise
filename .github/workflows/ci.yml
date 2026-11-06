@@ -631,7 +631,10 @@ jobs:
 
   e2e-build:
     name: E2E / build backends
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) runs Docker with the containerd image store, where
+    # pack's export to the daemon fails to read base layers in the proxy build
+    # (buildpacks/pack#2272). Move to ubuntu-latest once pack handles it.
+    runs-on: ubuntu-24.04
     needs: prepare
     timeout-minutes: 40
     steps:
@@ -792,7 +795,9 @@ jobs:
   # (which builds the fixture from source).
   e2e-minikube-harness-jfrog-vault:
     name: E2E / Minikube (JFrog+Vault)
-    runs-on: ubuntu-latest
+    # On ubuntu-latest (26.04), pushing to the local JFrog registry at
+    # localhost:3082 fails the TLS handshake ("tls: unrecognized name").
+    runs-on: ubuntu-24.04
     # The longest single job (provisions JFrog + Vault + a cluster). Run it on
     # every develop push and on ready trusted PRs, but skip it on draft PRs to
     # keep work-in-progress feedback fast.
