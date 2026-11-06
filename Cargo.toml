@@ -114,6 +114,7 @@ backend = [
     "dep:regex",
     "dep:aes-gcm",
     "dep:moka",
+    "dep:ipnet",
     "dep:async-trait",
     "dep:oci-distribution",
     "dep:thiserror",
@@ -211,6 +212,7 @@ aes-gcm = { version = "0.11", optional = true }
 
 # Server: OAuth2 proxy
 moka = { version = "0.12", features = ["sync", "future"], optional = true }
+ipnet = { version = "2.12", optional = true }
 
 # Server: OCI registry
 async-trait = { version = "0.1", optional = true }

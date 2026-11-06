@@ -407,6 +407,18 @@ pub struct ServerSettings {
     /// exchanged token cannot be revoked mid-life. Default: 600 (10 minutes).
     #[serde(default = "default_auth_token_max_ttl_seconds")]
     pub auth_token_max_ttl_seconds: u64,
+
+    /// Networks (CIDRs, or bare IP addresses) of reverse proxies whose
+    /// `X-Forwarded-For` / `X-Real-IP` headers are believed when resolving the
+    /// client address used by IP-keyed rate limits. A request from any other
+    /// peer is attributed to that peer and its forwarded headers are ignored.
+    /// Default: loopback, RFC 1918 and IPv6 unique-local ranges
+    /// (`127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12`,
+    /// `192.168.0.0/16`, `fc00::/7`). An explicit list replaces the default;
+    /// an empty list trusts no proxy.
+    #[serde(default)]
+    #[schemars(with = "Vec<String>")]
+    pub trusted_proxies: crate::server::client_ip::TrustedProxies,
 }
 
 /// Rate limiting configuration for OAuth endpoints (authorize, callback, token).
