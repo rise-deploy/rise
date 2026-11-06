@@ -506,6 +506,14 @@ containers on a single Docker host, routed by Traefik. Select it with
 - `reconcile_interval_secs` — in-process reconcile loop interval in seconds (default `5`).
 - `traefik_api_url?` — base URL of Traefik's API, read to drain old replicas via
   the top-level `serverStatus` map during a rolling cutover.
+- `traefik_config_secret?` — shared secret protecting Rise's Traefik HTTP-provider
+  endpoint (`GET /internal/traefik/config` on port `3001`, which lists every
+  deployment's hostnames and custom domains). When set, Rise answers `401` unless the
+  request carries `Authorization: Bearer <secret>`, compared in constant time; Traefik
+  sends it with `--providers.http.headers.Authorization="Bearer <secret>"`. At least 16
+  characters, no whitespace (`openssl rand -hex 32`). Unset leaves the endpoint
+  unauthenticated, and Rise logs a startup warning. The shipped configs read
+  `RISE_TRAEFIK_CONFIG_SECRET`. The ECS variant takes the same field.
 - `deployment_constraints.max_replicas` — upper bound on requested replicas (default `10`).
   The Docker controller additionally clamps every request to a hard backstop of `50`
   regardless of this value, so raising it above `50` silently clamps (with only a

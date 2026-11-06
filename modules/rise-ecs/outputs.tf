@@ -117,6 +117,7 @@ output "secret_arns_for_execution_role" {
     module.secrets.environment.RISE_JWT_SIGNING_SECRET,
     module.secrets.environment.RISE_ENCRYPTION_KEY,
     module.secrets.environment.OIDC_CLIENT_SECRET,
+    module.secrets.environment.RISE_TRAEFIK_CONFIG_SECRET,
     ], var.repository_credentials_secret_arn == null ? [] : [
     var.repository_credentials_secret_arn,
     ], var.control_plane_local_config_secret_arn == null ? [] : [

@@ -180,9 +180,9 @@ $ htpasswd -bnBC 10 "" 'your-password' | tr -d ':\n'
 
 ## Secrets and Terraform state
 
-`DATABASE_URL`, the JWT signing key, the encryption key and the OIDC client
-secret live in Secrets Manager and reach the task through the task definition's
-`secrets` block, so they never appear in a `DescribeTaskDefinition` response.
+`DATABASE_URL`, the JWT signing key, the encryption key, the OIDC client
+secret and the Traefik HTTP-provider token live in Secrets Manager and reach
+the tasks through the task definitions' `secrets` blocks, so they never appear in a `DescribeTaskDefinition` response.
 The secret-version resources use write-only arguments: planning and refresh do
 not call `GetSecretValue`, and the provider does not retain those values on the
 secret-version resources in state. This requires Terraform 1.11 or newer and
@@ -213,8 +213,9 @@ module "rise_ecs" {
 Use `control_plane_secret_environment` for credentials referenced through Rise
 configuration expansion. Keys are control-plane environment-variable names;
 values are full Secrets Manager ARNs in the format ECS accepts, including the
-optional JSON-key, version-stage and version-id selectors. The five built-in
-names—those four plus `RISE_LOCAL_CONFIG_YAML`—are reserved.
+optional JSON-key, version-stage and version-id selectors. The six built-in
+names—`DATABASE_URL`, `RISE_JWT_SIGNING_SECRET`, `RISE_ENCRYPTION_KEY`,
+`OIDC_CLIENT_SECRET`, `RISE_TRAEFIK_CONFIG_SECRET` and `RISE_LOCAL_CONFIG_YAML`—are reserved.
 
 ```hcl
 module "rise_ecs" {
@@ -233,7 +234,8 @@ selectors to the base secret ARN and deduplicates additional references to the
 same secret for IAM.
 
 **Generated source values remain in Terraform state.** The database password,
-JWT signing key and encryption key are outputs of persistent `random` resources;
+JWT signing key, encryption key and Traefik HTTP-provider token are outputs of
+persistent `random` resources;
 an OIDC client secret supplied as an ordinary Terraform input can also reach the
 calling configuration's state. Write-only secret versions prevent provider
 reads and duplicate plaintext storage, but do not make their source values

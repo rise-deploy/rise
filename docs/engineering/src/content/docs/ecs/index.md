@@ -215,6 +215,7 @@ credentials inside it needs no redeploy.
 | `capacity` | `fargate` (default) or `ec2`. Also decides how `cpu`/`memory` are resolved — see the [feature matrix](/operator-docs/deployment-backends/). Anything else is **refused at startup**: quietly falling back to Fargate would bill an operator who asked for their own instances for serverless capacity. Changing it does **not** move running services (ECS cannot); the next deployment of each project picks it up, and until then the mismatch is logged per service |
 | `auth_backend_url` | **must be reachable from inside the cluster** (a Cloud Map name or internal load balancer), never the public URL |
 | `traefik_api_url` | required for projects using `health_check` |
+| `traefik_config_secret` | optional bearer token for Rise's Traefik HTTP-provider endpoint (`:3001`); when set, Traefik must send it as `Authorization: Bearer <secret>`. The Terraform modules generate and wire it. |
 | `reconcile_interval_secs` | defaults to 30; ECS is a throttled API |
 
 :::caution[Set a customer-managed KMS key for secret isolation]

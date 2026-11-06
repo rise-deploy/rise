@@ -85,6 +85,7 @@ export ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory
 | `POSTGRES_PASSWORD` | `rise123` | Change it. |
 | `RISE_JWT_SIGNING_SECRET` | insecure repo placeholder | **Set it.** Overrides the demo secret baked into `config/docker.yaml`; Rise refuses placeholder keys unless insecure development mode is explicitly enabled. `openssl rand -base64 32`. |
 | `RISE_ENCRYPTION_KEY` | insecure repo placeholder | **Set it.** Overrides the demo AES key; refused like the signing secret. `openssl rand -base64 32`. |
+| `RISE_TRAEFIK_CONFIG_SECRET` | empty | **Recommended.** Bearer token guarding Rise's Traefik provider endpoint (`:3001`), which lists every deployment's hostnames and custom domains. The same variable feeds Rise (which requires it) and the `traefik` service (which sends it as `Authorization: Bearer …`). `openssl rand -hex 32`; empty leaves the endpoint open to anything on the `rise_default` network. |
 | `OIDC_CLIENT_SECRET` | `rise-backend-secret` | **Set it** to the client secret registered with your OIDC provider. |
 | `OIDC_GROUP_CLAIM` | `groups` | ID-token claim containing group names. Set to `cognito:groups` for AWS Cognito. |
 | `RISE_AUTH_ALLOW_MISSING_EMAIL_VERIFIED` | `false` | Accept ID tokens without an `email_verified` claim. See [`auth.allow_missing_email_verified`](/operator-docs/configuration/#auth-settings). |
@@ -116,6 +117,10 @@ env vars default to those placeholders when unset). Before any real use:
   reachable internally by the backend. Replace it with a proper IdP (see below).
   Do **not** layer `docker-compose.standalone.demo-idp.yaml` (which exposes Dex
   publicly at `dex.${RISE_DOMAIN}`) outside a throwaway demo.
+- **Protect the Traefik provider endpoint.** Set `RISE_TRAEFIK_CONFIG_SECRET`
+  (`openssl rand -hex 32`) in the environment that runs `docker compose`, so
+  Traefik and Rise agree on a bearer token for `:3001`. Changing it requires
+  recreating both containers (`docker compose up -d`).
 - **Lock down exposed host ports.** Postgres (`5432`) and the registry (`5000`)
   are published to the host for convenience; bind them to localhost or drop the
   mappings (the registry is reachable through Traefik).
