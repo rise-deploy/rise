@@ -631,7 +631,10 @@ jobs:
 
   e2e-build:
     name: E2E / build backends
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) runs Docker with the containerd image store, where
+    # pack's export to the daemon fails to read base layers in the proxy build
+    # (buildpacks/pack#2272). Move to ubuntu-latest once pack handles it.
+    runs-on: ubuntu-24.04
     needs: prepare
     timeout-minutes: 40
     steps:
