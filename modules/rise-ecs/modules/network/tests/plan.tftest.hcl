@@ -48,3 +48,39 @@ run "database_subnets_clear_the_private_range_at_four_azs" {
     error_message = "database subnet must start clear of the private /20 range"
   }
 }
+
+run "public_subnet_cidrs_are_exported_for_the_edge_trust_list" {
+  command = plan
+
+  assert {
+    condition     = output.vpc.public_subnet_cidrs == ["10.42.0.0/24", "10.42.1.0/24"]
+    error_message = "the load balancer's subnets are what Traefik trusts to report the client address"
+  }
+}
+
+run "brought_public_subnet_cidrs_come_from_the_subnets_themselves" {
+  command = plan
+
+  variables {
+    vpc = {
+      id                  = "vpc-abc"
+      public_subnet_ids   = ["subnet-pub"]
+      private_subnet_ids  = ["subnet-priv"]
+      database_subnet_ids = []
+    }
+  }
+
+  override_data {
+    target = data.aws_subnet.brought["subnet-pub"]
+    values = { vpc_id = "vpc-abc", cidr_block = "172.20.8.0/22" }
+  }
+  override_data {
+    target = data.aws_subnet.brought["subnet-priv"]
+    values = { vpc_id = "vpc-abc", cidr_block = "172.20.16.0/20" }
+  }
+
+  assert {
+    condition     = output.vpc.public_subnet_cidrs == tolist(["172.20.8.0/22"])
+    error_message = "a brought VPC's trust list must be its own public subnets"
+  }
+}

@@ -99,6 +99,10 @@ pub struct OAuthState {
     /// Client's PKCE code challenge method
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_code_challenge_method: Option<String>,
+    /// The Rise user who started a test flow (a redirect back to the Rise UI).
+    /// Only a state carrying this may write the extension's status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_flow_initiator: Option<Uuid>,
 }
 
 /// Token response from OAuth provider

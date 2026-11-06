@@ -365,6 +365,34 @@ fn signin(project: Option<&str>) -> SigninQuery {
     }
 }
 
+/// Request headers of a browser signed in to the Rise UI as the fixture's
+/// IdP user (`member@example.com`, a configured admin).
+pub(crate) async fn rise_ui_session_headers(fixture: &Fixture) -> HeaderMap {
+    let mut browser = Browser::default();
+    let response = oauth_signin_start(
+        State(fixture.state.clone()),
+        browser.headers("rise.example.com"),
+        Uri::from_static("/api/v1/auth/signin/start"),
+        axum::extract::Query(signin(None)),
+    )
+    .await
+    .unwrap();
+    browser.receive("rise.example.com", &response);
+    let state = query(&location(&response), "state");
+    let response = oauth_callback(
+        State(fixture.state.clone()),
+        browser.headers("rise.example.com"),
+        axum::extract::Query(CallbackQuery {
+            code: "test-code".into(),
+            state,
+        }),
+    )
+    .await
+    .unwrap();
+    browser.receive("rise.example.com", &response);
+    browser.headers("rise.example.com")
+}
+
 async fn start_app(fixture: &Fixture, browser: &mut Browser, host: &str) -> String {
     let response = oauth_signin_start(
         State(fixture.state.clone()),

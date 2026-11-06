@@ -1,5 +1,6 @@
 use crate::config::{normalize_backend_url, Config};
-use crate::login::token_utils::{format_token_expiration, log_token_debug};
+use crate::login::token_utils::format_token_expiration;
+use crate::token_trace::trace_token;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -178,7 +179,7 @@ pub async fn handle_device_flow(
 
             if let Some(token) = exchange_response.token {
                 // Store the token
-                log_token_debug(&token, "device flow response");
+                trace_token("device flow response", &token);
                 config
                     .save_login(&backend_url, token.clone())
                     .context("Failed to save authentication token")?;

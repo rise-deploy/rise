@@ -56,6 +56,12 @@ module "runtime" {
     access_point_id = module.ingress.acme.access_point_id
   }
   load_balancer_targets = module.ingress.target_groups
-  cpu_architecture      = var.cpu_architecture
-  tags                  = local.tags
+  # The load balancer is the only peer allowed to speak for the client, and its
+  # nodes sit in the public subnets.
+  client_ip = {
+    source        = local.acme_enabled ? "proxy-protocol" : "forwarded-headers"
+    trusted_cidrs = local.public_subnet_cidrs
+  }
+  cpu_architecture = var.cpu_architecture
+  tags             = local.tags
 }

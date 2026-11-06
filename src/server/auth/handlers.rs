@@ -9,6 +9,7 @@ use crate::server::auth::{
     },
     user_identity::{LoginError, LoginProfile, ResolvedIdentity, TokenStanding},
 };
+use crate::server::client_ip::ClientIp;
 use crate::server::frontend::load_auth_template;
 use crate::server::middleware::url_for_log;
 use crate::server::state::AppState;
@@ -18,7 +19,6 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     Json,
 };
-use base64::Engine;
 use rise_backend_auth::session_scope::AccessRequest;
 use rise_backend_auth::{SessionClient, SessionUser};
 use serde::{Deserialize, Serialize};
@@ -645,10 +645,10 @@ const DEVICE_START_RATE_LIMIT_BUCKET: &str = "auth-device-start";
 ///
 /// The device flow is served by Rise itself (see [`super::device`]): the user
 /// confirms the code on Rise's `/device` page, not at the IdP.
-#[instrument(skip(state, headers))]
+#[instrument(skip(state, client_ip))]
 pub async fn authorize(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    client_ip: ClientIp,
     Json(payload): Json<AuthorizeRequest>,
 ) -> Result<Json<AuthorizeResponse>, (StatusCode, String)> {
     match payload.flow.as_str() {
@@ -703,11 +703,14 @@ pub async fn authorize(
             }))
         }
         "device" => {
-            let client_ip = crate::server::rate_limit::extract_client_ip(&headers);
             // Unauthenticated, and each start stores a row until it expires.
             state
                 .oauth_rate_limiter
-                .increment_and_check(&client_ip, None, DEVICE_START_RATE_LIMIT_BUCKET)
+                .increment_and_check(
+                    &client_ip.rate_limit_key(),
+                    None,
+                    DEVICE_START_RATE_LIMIT_BUCKET,
+                )
                 .await
                 .map_err(|retry_after| {
                     (
@@ -715,7 +718,8 @@ pub async fn authorize(
                         format!("Too many device logins started; retry in {retry_after}s"),
                     )
                 })?;
-            let client_ip = (client_ip != "unknown").then_some(client_ip);
+            // The approver sees the full address, not the limiter's key.
+            let client_ip = client_ip.addr().map(|ip| ip.to_string());
             // Only the shape is checked here: the endpoint is unauthenticated,
             // so whether the named projects exist is the approver's to see.
             if let Some(access) = &payload.access {
@@ -798,20 +802,7 @@ pub async fn code_exchange(
         token_info.expires_in
     );
 
-    // Decode and log token claims for debugging (without validating yet)
-    if let Ok(header) = jsonwebtoken::decode_header(&token_info.id_token) {
-        tracing::debug!("ID token header: {:?}", header);
-    }
-
-    // Try to decode payload for logging (this doesn't validate signature)
-    let parts: Vec<&str> = token_info.id_token.split('.').collect();
-    if parts.len() == 3 {
-        if let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
-            if let Ok(claims_str) = String::from_utf8(decoded) {
-                tracing::debug!("ID token claims: {}", claims_str);
-            }
-        }
-    }
+    crate::token_trace::trace_token("IdP ID token", &token_info.id_token);
 
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();
@@ -1392,6 +1383,8 @@ pub async fn oauth_callback(
         })?;
 
     tracing::info!("Successfully exchanged code for tokens");
+
+    crate::token_trace::trace_token("IdP ID token", &token_info.id_token);
 
     // Validate the IdP JWT to extract claims
     let mut expected_claims = HashMap::new();

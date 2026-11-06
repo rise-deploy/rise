@@ -2263,6 +2263,13 @@
             "null"
           ]
         },
+        "trusted_proxies": {
+          "description": "Networks (CIDRs, or bare IP addresses) of reverse proxies whose\n`X-Forwarded-For` / `X-Real-IP` headers are believed when resolving the\nclient address used by IP-keyed rate limits. A request from any other\npeer is attributed to that peer and its forwarded headers are ignored.\nDefault: loopback, RFC 1918 and IPv6 unique-local ranges\n(`127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12`,\n`192.168.0.0/16`, `fc00::/7`). An explicit list replaces the default;\nan empty list trusts no proxy.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "workload_token_rate_limit": {
           "$ref": "#/$defs/WorkloadTokenRateLimitSettings",
           "description": "Rate limiting for the workload identity token-exchange endpoint."

@@ -199,3 +199,82 @@ run "rejects_incomplete_acme" {
   }
   expect_failures = [var.acme]
 }
+
+run "client_ip_is_untrusted_by_default" {
+  command = plan
+
+  assert {
+    condition = !anytrue([
+      for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command :
+      strcontains(flag, "trustedIPs")
+    ])
+    error_message = "With no load balancer in front, Traefik's direct peer is the client and no peer may be trusted."
+  }
+}
+
+run "forwarded_headers_are_trusted_on_web_only" {
+  command = plan
+  variables {
+    client_ip = { source = "forwarded-headers", trusted_cidrs = ["10.0.0.0/24", "10.0.1.0/24"] }
+  }
+
+  assert {
+    condition = [
+      for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command :
+      flag if strcontains(flag, "trustedIPs")
+    ] == ["--entrypoints.web.forwardedHeaders.trustedIPs=10.0.0.0/24,10.0.1.0/24"]
+    error_message = "ALB traffic arrives on web only; websecure and ping must stay untrusted."
+  }
+}
+
+run "proxy_protocol_is_read_on_every_entrypoint_the_nlb_reaches" {
+  command = plan
+  variables {
+    client_ip = { source = "proxy-protocol", trusted_cidrs = ["10.0.0.0/24", "10.0.1.0/24"] }
+  }
+
+  # web and websecure carry traffic and the ACME HTTP-01 challenge; ping carries
+  # the NLB health check, which is prefixed with the header too and would
+  # otherwise fail with a 400.
+  assert {
+    condition = toset([
+      for flag in jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].command :
+      flag if strcontains(flag, "trustedIPs")
+      ]) == toset([
+      "--entrypoints.web.proxyProtocol.trustedIPs=10.0.0.0/24,10.0.1.0/24",
+      "--entrypoints.websecure.proxyProtocol.trustedIPs=10.0.0.0/24,10.0.1.0/24",
+      "--entrypoints.ping.proxyProtocol.trustedIPs=10.0.0.0/24,10.0.1.0/24",
+    ])
+    error_message = "PROXY protocol must be accepted from the NLB on web, websecure and ping."
+  }
+
+  # The container's own health check connects from 127.0.0.1 without a header.
+  assert {
+    condition     = contains(jsondecode(aws_ecs_task_definition.traefik.container_definitions)[0].healthCheck.command, "--entrypoints.ping.address=:8082")
+    error_message = "the in-task health check must still address the ping entrypoint"
+  }
+}
+
+run "rejects_a_trusted_source_without_cidrs" {
+  command = plan
+  variables {
+    client_ip = { source = "proxy-protocol" }
+  }
+  expect_failures = [var.client_ip]
+}
+
+run "rejects_trusting_the_whole_internet" {
+  command = plan
+  variables {
+    client_ip = { source = "forwarded-headers", trusted_cidrs = ["0.0.0.0/0"] }
+  }
+  expect_failures = [var.client_ip]
+}
+
+run "rejects_an_unknown_client_ip_source" {
+  command = plan
+  variables {
+    client_ip = { source = "x-real-ip", trusted_cidrs = ["10.0.0.0/24"] }
+  }
+  expect_failures = [var.client_ip]
+}

@@ -6,7 +6,6 @@
 //! maps to a Rise principal, so every successful mint is audit-logged.
 
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine as _};
@@ -14,7 +13,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine as _}
 use crate::db::{projects, service_accounts, users};
 use crate::server::auth::controller::{self, ControllerResolution};
 use crate::server::auth::sa_match::{match_service_account, SaMatchError};
-use crate::server::rate_limit::extract_client_ip;
+use crate::server::client_ip::ClientIp;
 use crate::server::state::AppState;
 use rise_backend_auth::{
     is_rise_issued_jwt, verify_external_jwt, AuthError, PrincipalClaims, Scope,
@@ -46,10 +45,10 @@ fn peek_issuer(token: &str) -> Option<String> {
 /// `POST /api/v1/auth/token` — exchange an external OIDC token for a Rise access token.
 pub async fn exchange(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    client_ip: ClientIp,
     Json(req): Json<ExchangeRequest>,
 ) -> Response {
-    match exchange_inner(&state, &headers, req).await {
+    match exchange_inner(&state, client_ip, req).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => e.into_response(),
     }
@@ -57,10 +56,10 @@ pub async fn exchange(
 
 async fn exchange_inner(
     state: &AppState,
-    headers: &HeaderMap,
+    client_ip: ClientIp,
     req: ExchangeRequest,
 ) -> Result<ExchangeResponse, ExchangeError> {
-    let ip = extract_client_ip(headers);
+    let ip = client_ip.rate_limit_key();
 
     // 0. Input validation (cheap, pre-rate-limit).
     if req.grant_type != GRANT_TYPE_TOKEN_EXCHANGE {

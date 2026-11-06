@@ -26,7 +26,15 @@ variable "security_groups" {
 }
 
 variable "edge" {
-  description = "TLS topology, optional ALB certificate and load balancer deletion protection."
+  description = <<-EOT
+    TLS topology, optional ALB certificate and load balancer deletion protection.
+
+    In the NLB mode the target groups send PROXY protocol v2, so the runtime
+    module must be given `client_ip.source = "proxy-protocol"` with the
+    load balancer's subnets as `trusted_cidrs`; with its default (`none`)
+    Traefik cannot parse the header and every connection fails, health checks
+    included. `rise-ecs` couples the two; direct callers must too.
+  EOT
   type = object({
     mode                = string
     acm_certificate_arn = string

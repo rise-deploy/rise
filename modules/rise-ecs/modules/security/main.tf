@@ -1,7 +1,8 @@
 # One group per role, each admitting only its actual caller. The load balancer
-# gets its own group specifically so the Traefik group can reference it: an NLB
-# with IP targets preserves the client source address, so without an LB group
-# Traefik would have to admit the ingress CIDRs directly.
+# gets its own group specifically so the Traefik group can reference it. An NLB
+# with IP targets and TCP does not preserve the client source address -- Traefik
+# sees the NLB's private address, and the client travels in a PROXY protocol v2
+# header -- so a rule that references the group is enough.
 
 resource "aws_security_group" "edge" {
   name        = "${var.name}-edge"

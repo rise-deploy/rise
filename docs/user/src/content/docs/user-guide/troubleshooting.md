@@ -124,27 +124,31 @@ often from CI, where the token comes from `RISE_TOKEN`, `RISE_TOKEN_COMMAND`, or
 auto-detected GitHub Actions OIDC rather than an interactive login — the quickest
 way to see *what identity the CLI is actually presenting* is to raise the log
 level on the token-resolution path. The CLI logs the resolved token's decoded
-header and claims at `debug` (the signature is never logged):
+header and claims at `trace` on the dedicated `rise::auth::idtoken` target (the
+signature is never logged). The claims can contain personal data such as email,
+name, and group memberships, so this is strictly opt-in: `RUST_LOG=debug` does
+not enable it.
 
 ```bash
-RUST_LOG=rise::cli::login::token_utils=debug rise deploy
+RUST_LOG=info,rise::auth::idtoken=trace rise deploy
 ```
 
 ```
-DEBUG rise::cli::login::token_utils: Using token from RISE_TOKEN environment variable
-DEBUG rise::cli::login::token_utils: Token header.claims is {"alg":"RS256","typ":"JWT","kid":"38826b17-..."}.{"iss":"https://token.actions.githubusercontent.com","aud":"https://rise.example.net","sub":"repo:my-org/my-service:environment:production","repository":"my-org/my-service","repository_owner":"my-org","environment":"production","ref":"refs/heads/main","ref_protected":"false","event_name":"push","workflow_ref":"my-org/my-service/.github/workflows/rise.yml@refs/heads/main","exp":1780386362,"iat":1780386062,...}
+TRACE rise::auth::idtoken: RISE_TOKEN environment variable: token header.claims is {"alg":"RS256","typ":"JWT","kid":"38826b17-..."}.{"iss":"https://token.actions.githubusercontent.com","aud":"https://rise.example.net","sub":"repo:my-org/my-service:environment:production","repository":"my-org/my-service","repository_owner":"my-org","environment":"production","ref":"refs/heads/main","ref_protected":"false","event_name":"push","workflow_ref":"my-org/my-service/.github/workflows/rise.yml@refs/heads/main","exp":1780386362,"iat":1780386062,...}
 ```
 
-The source label names where the token came from — `RISE_TOKEN environment
-variable`, `RISE_TOKEN_COMMAND`, `GitHub Actions OIDC`, or `stored login token`.
+The label in front names where the token came from — `RISE_TOKEN environment
+variable`, `RISE_TOKEN_COMMAND`, `GitHub Actions OIDC`, `stored login token`, or
+(during `rise login`) `OAuth login response` / `device flow response`.
 
 Compare the printed `iss`, `aud`, and the rest of the claims against your service
 account configuration (`rise sa list -p <project>`). They must match exactly — a mismatched
 `iss` (e.g. a trailing slash) or a missing claim is the usual cause of
 [`No service account matched the token claims`](#no-service-account-matched-the-token-claims).
 
-`RUST_LOG=debug rise <command>` works too but is much noisier; the
-`rise::cli::login::token_utils=debug` target isolates just the token line.
+Enabling only this target adds the token lines on top of your normal log level;
+`RUST_LOG=trace` also shows them but is much noisier. Keep the output out of shared logs and CI artifacts
+unless you have checked it for sensitive claims.
 
 The line is emitted whether the token is static or **minted on demand through
 the token provider** (a `RISE_TOKEN_COMMAND` that prints a JWT, or a GitHub

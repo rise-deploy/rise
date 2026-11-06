@@ -29,8 +29,17 @@ resource "aws_lb_target_group" "traefik" {
   target_type = "ip" # awsvpc tasks have no instance to register.
   vpc_id      = var.network.vpc_id
 
+  # IP targets behind a TCP target group see the NLB node's private address,
+  # not the client's. PROXY protocol v2 carries the client address in-band, so
+  # Traefik (which must be told to parse it) keeps admitting only the edge
+  # security group. Enabling preserve_client_ip instead would make the source
+  # the client's address, and Traefik would have to admit ingress_cidr_blocks.
+  # The ALB reports the client as X-Forwarded-For and needs none of this.
+  proxy_protocol_v2 = local.is_nlb ? true : null
+
   # Traefik's own ping entrypoint, so a task that is up but not yet routing does
-  # not receive traffic.
+  # not receive traffic. With proxy_protocol_v2 the NLB prefixes health-check
+  # connections with the header as well, so that entrypoint must parse it.
   health_check {
     protocol = "HTTP"
     path     = "/ping"

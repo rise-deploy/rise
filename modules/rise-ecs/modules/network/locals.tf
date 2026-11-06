@@ -7,6 +7,11 @@ locals {
 
   public_subnet_ids  = local.create_vpc ? [for s in aws_subnet.public : s.id] : var.vpc.public_subnet_ids
   private_subnet_ids = local.create_vpc ? [for s in aws_subnet.private : s.id] : var.vpc.private_subnet_ids
+  # The address ranges the load balancer's nodes draw their private addresses
+  # from: the load balancer is placed in exactly these subnets.
+  public_subnet_cidrs = local.create_vpc ? [for az in local.azs : aws_subnet.public[az].cidr_block] : [
+    for id in var.vpc.public_subnet_ids : data.aws_subnet.brought[id].cidr_block
+  ]
   database_subnet_ids = local.create_vpc ? [for s in aws_subnet.database : s.id] : (
     length(var.vpc.database_subnet_ids) > 0 ? var.vpc.database_subnet_ids : var.vpc.private_subnet_ids
   )

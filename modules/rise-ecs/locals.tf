@@ -12,6 +12,7 @@ locals {
   create_vpc          = var.vpc == null
   vpc_id              = module.network.vpc.id
   public_subnet_ids   = module.network.vpc.public_subnet_ids
+  public_subnet_cidrs = module.network.vpc.public_subnet_cidrs
   private_subnet_ids  = module.network.vpc.private_subnet_ids
   database_subnet_ids = module.network.vpc.database_subnet_ids
   cluster_name        = module.cluster.cluster.name
