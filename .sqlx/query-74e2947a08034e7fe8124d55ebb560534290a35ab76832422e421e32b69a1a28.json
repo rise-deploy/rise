@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE project_extensions\n        SET status = (status - $4::text[]) || $3, updated_at = NOW()\n        WHERE project_id = $1 AND extension = $2 AND deleted_at IS NULL AND spec = $5\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "TextArray",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "74e2947a08034e7fe8124d55ebb560534290a35ab76832422e421e32b69a1a28"
+}

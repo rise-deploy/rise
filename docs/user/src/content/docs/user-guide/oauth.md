@@ -14,7 +14,7 @@ The OAuth extension gives the provider one stable callback URL:
 https://<rise-url>/oidc/<project>/<extension>/callback
 ```
 
-Rise receives the upstream callback and forwards the user back to the original app URL that started the flow.
+Rise receives the upstream callback and forwards the user back to the `redirect_uri` that started the flow.
 
 ```text
 App URL -> Rise authorize -> OAuth provider
@@ -25,30 +25,57 @@ App URL <- Rise callback  <-------+
 ## What Rise Provides
 
 - A stable provider callback URL per project and extension.
-- OAuth 2.0 authorization-code flow for backend applications.
-- PKCE support for browser applications and public clients.
-- Token refresh through the Rise token endpoint.
+- OAuth 2.0 authorization-code flow for backend applications (confidential clients) and browser applications (public clients with PKCE).
+- Refresh through the Rise token endpoint. Your app receives Rise refresh-token handles and never the provider's refresh token.
 - OIDC discovery and JWKS proxying when the upstream provider supports it.
 - Encrypted storage for upstream provider client secrets.
 - Local development support through `rise run --project`.
 
-Rise is a proxy, not a session store for your application. After the code exchange, your application owns the upstream tokens and decides how to store them.
+Rise is a proxy, not a session store for your application. After the code exchange, your application owns the access and ID tokens and decides how to store them.
 
-## Supported Flows
+## Client Types
 
-| Flow | Best for | Client authentication | Notes |
-| --- | --- | --- | --- |
-| Authorization code with PKCE | Browser apps and public clients | `client_id` plus `code_verifier` | No client secret in the browser. Uses RFC 7636 PKCE. |
-| Authorization code with client secret | Backend apps | `client_id` plus `client_secret` | Token exchange happens server-side. Store resulting tokens in an HttpOnly session or backend store. |
-| Refresh token | Backend apps or trusted clients | `client_id` plus `client_secret` | Proxies `grant_type=refresh_token` to the upstream provider. |
+`client_type` says how your application authenticates to the Rise token endpoint. It is independent of the upstream provider's client.
 
-The Rise client ID is deterministic:
+| | `confidential` (default) | `public` |
+| --- | --- | --- |
+| For | Apps with a backend | Browser and native apps that cannot keep a secret |
+| Client secret | Rise issues one and injects `{EXTENSION}_CLIENT_SECRET`. It is required on **every** token request, code and refresh. | None is issued or injected. Sending one is rejected with `invalid_client`. |
+| PKCE | Optional, and enforced when used. A `code_verifier` for a code issued without a `code_challenge` is rejected. | Required (`S256`). |
+| Refresh tokens | `sealed` (default) or `rotating` | Always `rotating` |
+
+The Rise client ID is deterministic for both types:
 
 ```text
 {project-name}-{extension-name}
 ```
 
 For project `my-app` and extension `oauth-google`, the Rise client ID is `my-app-oauth-google`.
+
+### Refresh Tokens
+
+The `refresh_token` in a token response is a Rise handle. Raw provider refresh tokens are never returned to your app, cannot be presented to the Rise token endpoint, and cannot be revoked or introspected through Rise.
+
+`refresh_token_mode` selects the handle type:
+
+| Mode | Handle | Behavior |
+| --- | --- | --- |
+| `sealed` (confidential default) | `rrt1.…` | Stateless. It contains the provider's token, encrypted by Rise. It keeps working until the provider's token expires. If the provider rotates its refresh token, the response carries a new handle. |
+| `rotating` (always for `public`) | `rrt2.…` | Single use. Every refresh returns a successor handle, so always store the latest one. Presenting a used handle within 30 seconds returns the same successor (for tabs and retries). Presenting it later revokes the whole session, so the user signs in again. A session also ends 30 days after the original sign-in, even if the provider's refresh token lives longer. |
+
+Rotating handles are stored in Rise's database until they expire, so storage grows with the number of signed-in users. Setting `public` together with `refresh_token_mode: sealed` is rejected.
+
+Changing `client_type` or `refresh_token_mode` does not require resealing the upstream secret. Switching `sealed` to `rotating` keeps existing users signed in. Switching `rotating` back to `sealed` signs them out. An app switched to `public` must stop sending its client secret, which is removed from its environment on the next deployment.
+
+Deleting and recreating an extension, or changing its `issuer_url`, `client_id`, or `token_endpoint`, invalidates every refresh token issued before, and users sign in again. Other edits, including scopes and the upstream secret, keep them valid.
+
+## Supported Flows
+
+| Flow | Best for | Client authentication | Notes |
+| --- | --- | --- | --- |
+| Authorization code with PKCE | Browser apps and public clients | `client_id`, `redirect_uri`, `code_verifier` | `client_type: public`. No client secret in the browser. Uses RFC 7636 PKCE. |
+| Authorization code with client secret | Backend apps | `client_id`, `client_secret`, `redirect_uri` | `client_type: confidential`. Token exchange happens server-side. Store resulting tokens in an HttpOnly session or backend store. |
+| Refresh token | Both | Same as the code exchange, without `code_verifier` | Presents a Rise handle. Confidential clients still send the secret. |
 
 ## Create an OAuth Extension
 
@@ -109,6 +136,8 @@ OIDC-compliant providers expose an OpenID configuration document, so Rise can di
 | `token_endpoint` | Auto-discovered | Required |
 | `token_endpoint_auth_method` | Optional, `client_secret_post` by default | Optional, `client_secret_post` by default |
 | `scopes` | Provider-specific | Provider-specific; `[]` for providers without scopes |
+| `client_type` | Optional, `confidential` by default | Optional, `confidential` by default |
+| `refresh_token_mode` | Optional, `sealed` by default | Optional, `sealed` by default |
 
 `token_endpoint_auth_method` sets how Rise authenticates to the upstream token endpoint: `client_secret_post` sends `client_id` and `client_secret` in the request body, `client_secret_basic` sends them as an HTTP Basic `Authorization` header (RFC 6749 §2.3.1). Query parameters in `authorization_endpoint` are kept on the authorization request.
 
@@ -154,25 +183,33 @@ Notion requires HTTP Basic client authentication and has no scopes:
 
 The **Configure** tab in the Rise UI offers these providers as templates.
 
+Rise sends the provider's client credentials only to the token endpoint the secret was sealed for. Authorization requests may carry the provider's extra parameters, such as `prompt`, `login_hint`, and `nonce`, which Rise forwards. The spec's `scopes` are the maximum: an app may request a subset with `scope`, but never more.
+
+## Test the Extension
+
+Open the extension in the Rise UI and choose **Test OAuth Flow**. It signs you in through the provider as yourself, then marks the extension configured or shows the provider's error. Only a signed-in project member (or a Rise admin) can run the test, from the Rise UI in the same browser, and only the test updates the extension's status; end-user logins do not. A failed test returns to the UI with `?error=oauth_authorization_failed` when the provider refused the sign-in, or `?error=oauth_token_exchange_failed` when the code exchange failed; the extension's status shows the provider's error.
+
 ## Application Usage
 
-Your application starts login by redirecting the user to Rise:
+Your application starts login by redirecting the user to Rise. `redirect_uri` is required: it is where Rise sends the user back, and it must be repeated unchanged at the token request.
 
 ```text
-GET {RISE_ISSUER}/oidc/{project}/{extension}/authorize
+GET {EXTENSION}_ISSUER/authorize?redirect_uri=https://my-app.example.com/callback&state=<state>
 ```
 
-For browser applications using PKCE, include:
+Public clients also send a PKCE challenge:
 
 ```text
 code_challenge=<challenge>&code_challenge_method=S256
 ```
 
-For local development or custom callback paths, include:
+Rise accepts these `redirect_uri` values:
 
-```text
-redirect_uri=http://localhost:3000/callback
-```
+- The origin of any active deployment of the project: default URLs, custom domains, and all deployment groups, with any path.
+- `http` on `127.0.0.1`, `[::1]`, `localhost`, and `*.localhost`, with any port and path.
+- `http` deployment origins, only when Rise itself is served over `http` (local development setups).
+
+Anything else, including Rise's own URL, is refused. On a Rise served over `http` (local development only) Rise's own origin is accepted as well, because its test callback cannot be matched exactly there.
 
 After the upstream provider authenticates the user, Rise redirects back to your app with an authorization code:
 
@@ -180,13 +217,24 @@ After the upstream provider authenticates the user, Rise redirects back to your 
 https://my-app.example.com/callback?code=<authorization-code>&state=<state>
 ```
 
-Your app exchanges that code at:
+Authorization codes are single-use, expire after 5 minutes, and are several kilobytes long, so make sure no proxy in front of your app limits URL length below that. Your app exchanges the code at:
 
 ```text
-POST {RISE_ISSUER}/oidc/{project}/{extension}/token
+POST {EXTENSION}_ISSUER/token
 ```
 
-Use `client_secret` for backend apps or `code_verifier` for PKCE clients.
+A backend app sends `client_id`, `client_secret`, and `redirect_uri`. A browser app sends `client_id`, `redirect_uri`, and `code_verifier`. For example, a backend:
+
+```bash
+curl -X POST "$OAUTH_GOOGLE_ISSUER/token" \
+  -d grant_type=authorization_code \
+  -d code="$CODE" \
+  -d redirect_uri=https://my-app.example.com/callback \
+  -d client_id="$OAUTH_GOOGLE_CLIENT_ID" \
+  -d client_secret="$OAUTH_GOOGLE_CLIENT_SECRET"
+```
+
+Refresh with `grant_type=refresh_token` and the latest `refresh_token`. Confidential apps send the secret again.
 
 ## Local Development
 
@@ -195,11 +243,11 @@ Use `client_secret` for backend apps or `code_verifier` for PKCE clients.
 | Variable | Purpose |
 | --- | --- |
 | `{EXTENSION}_CLIENT_ID` | Rise client ID, for example `OAUTH_GOOGLE_CLIENT_ID`. |
-| `{EXTENSION}_CLIENT_SECRET` | Rise client secret for confidential clients. |
+| `{EXTENSION}_CLIENT_SECRET` | Rise client secret. Set for confidential clients only. |
 | `{EXTENSION}_ISSUER` | Rise OIDC proxy URL for this extension. |
 | `RISE_ISSUER` | Rise server URL used to build authorize and token URLs. |
 
-Rise allows `redirect_uri` values that point to localhost, so the same provider registration can support production, preview, and local development.
+Use `http://localhost:<port>/<path>` as `redirect_uri` during development. The same provider registration then supports production, preview, and local development.
 
 ## API Reference
 
@@ -213,10 +261,13 @@ Query parameters:
 
 | Parameter | Required | Description |
 | --- | --- | --- |
-| `code_challenge` | PKCE clients only | Base64url-encoded SHA-256 hash of the code verifier. |
-| `code_challenge_method` | No | Only `S256` is supported. |
-| `redirect_uri` | No | Where Rise should redirect after OAuth. Allows localhost and project domains. |
-| `state` | No | Application state passed through the OAuth flow. |
+| `redirect_uri` | Yes | Where Rise redirects after OAuth. See [Application Usage](#application-usage) for the allowed targets. |
+| `code_challenge` | Public clients | Base64url-encoded SHA-256 hash of the code verifier. Optional for confidential clients. |
+| `code_challenge_method` | With `code_challenge` | Only `S256` is supported. |
+| `state` | Recommended | Application state, returned unchanged. |
+| `scope` | No | A subset of the extension's `scopes`. Defaults to all of them. |
+
+Other parameters, such as `prompt`, `login_hint`, and `nonce`, are forwarded to the provider. `request`, `request_uri`, and a `response_mode` other than `query` are rejected. A refused request answers with a plain `400` and no description.
 
 ### Callback Endpoint
 
@@ -224,7 +275,7 @@ Query parameters:
 GET /oidc/{project}/{extension}/callback?code=...&state=...
 ```
 
-This is the callback URL registered with the upstream provider. Rise handles it and redirects to the app with a Rise authorization code.
+This is the callback URL registered with the upstream provider. Rise handles it and redirects to the app with a Rise authorization code. Provider errors are returned to the validated `redirect_uri`.
 
 ### Token Endpoint
 
@@ -233,56 +284,64 @@ POST /oidc/{project}/{extension}/token
 Content-Type: application/x-www-form-urlencoded
 ```
 
+Confidential clients authenticate with `client_id` and `client_secret` in the body, or with an HTTP Basic `Authorization` header, never both. Wrong credentials answer `401 invalid_client`. Public clients identify themselves with `client_id` only.
+
 Authorization-code parameters:
 
 | Parameter | Required | Description |
 | --- | --- | --- |
 | `grant_type` | Yes | `authorization_code` |
 | `code` | Yes | Authorization code from the callback. |
+| `redirect_uri` | Yes | The value sent to the authorize endpoint. |
 | `client_id` | Yes | Rise client ID. |
 | `client_secret` | Confidential clients | Rise client secret. |
-| `code_verifier` | PKCE clients | Original PKCE verifier. |
+| `code_verifier` | Public clients, and whenever a `code_challenge` was sent | Original PKCE verifier. |
 
 Refresh-token parameters:
 
 | Parameter | Required | Description |
 | --- | --- | --- |
 | `grant_type` | Yes | `refresh_token` |
-| `refresh_token` | Yes | Refresh token from a previous token response. |
+| `refresh_token` | Yes | The latest Rise handle (`rrt1.` or `rrt2.`). Provider tokens are rejected with `invalid_grant`. |
 | `client_id` | Yes | Rise client ID. |
-| `client_secret` | Yes | Rise client secret. |
+| `client_secret` | Confidential clients | Rise client secret. |
 
-Token responses use the RFC 6749 shape:
+Token responses are the provider's response with only `refresh_token` replaced by a Rise handle, so provider-specific fields are preserved:
 
 ```json
 {
   "access_token": "eyJhbGc...",
   "token_type": "Bearer",
   "expires_in": 3600,
-  "refresh_token": "eyJhbGc...",
+  "refresh_token": "rrt1.v1....",
   "scope": "email profile",
   "id_token": "eyJhbGc..."
 }
 ```
 
+Browser apps can call the token endpoint cross-origin from any allowed `redirect_uri` origin.
+
 ### Discovery and JWKS
 
-Rise exposes an OIDC discovery endpoint for each OAuth extension:
+Rise exposes a discovery document for each OAuth extension:
 
 ```text
 GET /oidc/{project}/{extension}/.well-known/openid-configuration
 ```
 
-The response rewrites upstream URLs to Rise proxy URLs:
+The document starts from the provider's own metadata. Rise replaces the authorization and token endpoints with its own and describes what the relay accepts (`code` flow, `query` response mode, `S256`, and the client authentication methods of the extension's client type). Provider endpoints that the relay cannot honor, such as `revocation_endpoint` and `introspection_endpoint`, are removed.
 
 ```json
 {
-  "issuer": "https://rise.example.com/oidc/my-app/oauth-google",
+  "issuer": "https://accounts.google.com",
   "authorization_endpoint": "https://rise.example.com/oidc/my-app/oauth-google/authorize",
   "token_endpoint": "https://rise.example.com/oidc/my-app/oauth-google/token",
-  "jwks_uri": "https://rise.example.com/oidc/my-app/oauth-google/jwks"
+  "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs"
 }
 ```
+
+- `issuer` is the **upstream** issuer, because that is who signs ID tokens. It is not the `{EXTENSION}_ISSUER` URL. A client that requires the discovery `issuer` to equal the URL it fetched the document from fails that check; configure such clients with the authorization and token endpoints manually and the upstream issuer for ID-token validation.
+- Providers without OIDC discovery (GitHub, Notion, Snowflake) get a document with only the Rise endpoints and no `jwks_uri`.
 
 JWKS is proxied from the upstream provider:
 
@@ -293,11 +352,13 @@ GET /oidc/{project}/{extension}/jwks
 ## Security
 
 - Upstream client secrets are encrypted at rest and never exposed to browser clients.
-- Authorization codes are single-use and expire after 5 minutes.
-- OAuth state tokens protect against CSRF and expire after 10 minutes.
-- PKCE proves that a public client initiated the authorization flow.
+- Authorization codes are encrypted, single-use, and expire after 5 minutes.
+- State tokens protect against CSRF and expire after 10 minutes.
+- Refresh tokens are Rise handles. The provider's refresh token never reaches your app, and `rotating` handles detect theft through reuse.
+- Redirects go only to the project's deployment origins and loopback addresses. Rise's own origin is not a target.
+- PKCE is enforced for public clients. A confidential client that sends a `code_verifier` for a code issued without a challenge is rejected, so a downgrade cannot go unnoticed.
 - Secret validation uses constant-time comparison.
-- Applications own token storage and refresh behavior after exchange.
+- Applications own access-token storage after exchange.
 
 ## Troubleshooting
 
@@ -312,20 +373,28 @@ GET /oidc/{project}/{extension}/jwks
 - Use a valid HTTPS URL.
 - Avoid trailing slashes and paths unless the provider documents them as part of the issuer.
 
-**"Token exchange failed with status 400"**
+**Authorize answers `400`**
+
+- Send `redirect_uri` and make sure it is a deployment origin of this project or a loopback URL.
+- Public clients need `code_challenge` with `code_challenge_method=S256`.
+- `scope` may only narrow the extension's `scopes`.
+
+**Token request answers `invalid_grant`**
+
+- The code expired (5 minutes) or was already used. Restart the flow.
+- `redirect_uri` differs from the authorize request, or `code_verifier` does not match the challenge.
+- The refresh token is not a current Rise handle: a raw provider token, an already-used `rotating` handle, a session older than 30 days, or a token issued before the extension was recreated or its `issuer_url`, `client_id`, or `token_endpoint` changed. The user must sign in again.
+
+**Token request answers `401 invalid_client`**
+
+- Confidential clients must send the client secret on code and refresh requests. Public clients must not send one.
+
+**"Token exchange failed with status 400" in the extension status**
 
 - Verify `client_id` and `client_secret_encrypted`.
 - Check that the provider redirect URI matches the Rise callback URL.
 - Review provider logs for the upstream OAuth error.
 
-**"Token exchange failed with status 401"** with `invalid_client`
+**Upstream `401 invalid_client` in the extension status**
 
 - The provider may reject client credentials in the request body. Set `"token_endpoint_auth_method": "client_secret_basic"`.
-
-**"No cached state found for state token"**
-
-- The state token may have expired. Restart the OAuth flow.
-
-**"Invalid or expired authorization code"**
-
-- Authorization codes are single-use and expire after 5 minutes. Restart the OAuth flow.

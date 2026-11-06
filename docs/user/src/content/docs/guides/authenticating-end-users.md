@@ -33,14 +33,14 @@ App URL ← Rise /callback  ←────────┘
 
 ## The two OAuth extension flows
 
-| Flow | Best for | Client auth | Token storage |
-|------|----------|-------------|---------------|
-| **Authorization code with PKCE** | SPAs and public clients (no backend secret) | `client_id` + `code_verifier` | Browser/session storage |
-| **Confidential authorization code** | Server-rendered apps (confidential clients) | `client_id` + `client_secret` | Server-side session or HttpOnly cookie |
+| Flow | `client_type` | Best for | Client auth | Token storage |
+|------|---------------|----------|-------------|---------------|
+| **Authorization code with PKCE** | `public` | SPAs and native apps (no backend secret) | `client_id` + `code_verifier` | Browser/session storage |
+| **Confidential authorization code** | `confidential` (default) | Server-rendered apps | `client_id` + `client_secret`, on every token request | Server-side session or HttpOnly cookie |
 
 :::tip[Choosing a flow]
-- **SPAs / mobile apps** → PKCE. Your app generates a `code_verifier` and `code_challenge`. Requires HTTPS or localhost for Web Crypto.
-- **Server-rendered apps** → Confidential authorization code. Your backend presents the `client_secret` to Rise's token endpoint and stores tokens in a server-side session or HttpOnly cookie.
+- **SPAs / mobile apps** → set `"client_type": "public"` and use PKCE. Your app generates a `code_verifier` and `code_challenge`. Rise issues no client secret and gives your app single-use rotating refresh tokens. Requires HTTPS or localhost for Web Crypto.
+- **Server-rendered apps** → keep the default `confidential` type. Your backend presents the `client_secret` to Rise's token endpoint for the code exchange and for every refresh, and stores tokens in a server-side session or HttpOnly cookie.
 :::
 
 ## Step-by-step: Generic OAuth extension
@@ -91,6 +91,8 @@ Required fields (validated in `src/server/extensions/providers/oauth/provider.rs
 - `scopes` — provider-specific; use an empty array for providers without scopes
 
 Optional fields:
+- `client_type` — `confidential` (default) or `public`
+- `refresh_token_mode` — `sealed` (default) or `rotating`; public clients always rotate
 - `authorization_endpoint` — only needed for non-OIDC providers (auto-discovered for OIDC-compliant providers like Google, Auth0, Dex)
 - `token_endpoint` — same: only for non-OIDC providers (e.g., GitHub, Snowflake)
 :::
@@ -131,29 +133,45 @@ Rise injects these into every deployment (and `rise run`) for each OAuth extensi
 | Variable | Contains | Example (extension `oauth-google`) |
 |----------|----------|------------------------------------|
 | `{EXT}_CLIENT_ID` | Rise-issued client ID (deterministic: `{project}-{extension}`) | `OAUTH_GOOGLE_CLIENT_ID` = `my-app-oauth-google` |
-| `{EXT}_CLIENT_SECRET` | Rise-issued client secret (for confidential clients) | `OAUTH_GOOGLE_CLIENT_SECRET` |
+| `{EXT}_CLIENT_SECRET` | Rise-issued client secret. Confidential clients only; not set for `public` | `OAUTH_GOOGLE_CLIENT_SECRET` |
 | `{EXT}_ISSUER` | Rise OIDC proxy URL for this extension | `OAUTH_GOOGLE_ISSUER` = `https://rise.example.net/oidc/my-app/oauth-google` |
 
 Your app uses these to start the OAuth flow:
 
 ```text
-# Redirect user to authorize:
-GET {OAUTH_GOOGLE_ISSUER}/authorize?code_challenge=...&state=...
+# Redirect user to authorize (redirect_uri is required):
+GET {OAUTH_GOOGLE_ISSUER}/authorize?redirect_uri=https://my-app.example.com/callback&state=...
+    &code_challenge=...&code_challenge_method=S256      # public clients; optional otherwise
 
-# Exchange the authorization code:
+# Exchange the authorization code (same redirect_uri):
 POST {OAUTH_GOOGLE_ISSUER}/token
+  grant_type=authorization_code
+  code=...
+  redirect_uri=https://my-app.example.com/callback
   client_id=$OAUTH_GOOGLE_CLIENT_ID
   client_secret=$OAUTH_GOOGLE_CLIENT_SECRET   # confidential-client flow
   # OR
-  code_verifier=...                           # PKCE flow
+  code_verifier=...                           # PKCE flow (public client)
+
+# Refresh (confidential clients send client_secret again):
+POST {OAUTH_GOOGLE_ISSUER}/token
+  grant_type=refresh_token
+  refresh_token=<latest refresh_token>
+  client_id=$OAUTH_GOOGLE_CLIENT_ID
 ```
 
-Rise handles the upstream provider exchange internally and returns the upstream tokens to your app. Your app then owns those tokens and decides how to store them.
+Rise handles the upstream provider exchange internally and returns the upstream access and ID tokens to your app. The `refresh_token` is a Rise handle, not the provider's token; with `rotating` handles, store the new one after every refresh. Your app then owns the tokens and decides how to store them.
+
+`redirect_uri` must be the origin of an active deployment of the project, or `http` on `localhost`, `127.0.0.1` or `[::1]`. Rise's own URL is not a valid target.
 
 ## Common mistakes
 
 - **Registering the wrong redirect URI** — register the Rise broker URL (`/oidc/{project}/{extension}/callback`), not your app's URL. Rise forwards the user back to your app after the upstream callback.
 - **Choosing PKCE for a server-rendered app** — use the confidential-client flow instead. Your backend holds the `client_secret` and stores tokens outside browser JavaScript.
+- **Forgetting `client_type: public` for a SPA** — a confidential extension demands the client secret on every token request. A SPA cannot hold one, so set `public`.
+- **Omitting `redirect_uri`** — it is required at authorize and must be repeated identically at the token request.
+- **Expecting raw provider refresh tokens** — Rise returns its own handles. They only work at the Rise token endpoint.
+- **Comparing the discovery `issuer` with `{EXT}_ISSUER`** — discovery reports the upstream provider's issuer. Configure OIDC libraries with the authorize and token endpoints manually if they insist on the match.
 - **Forgetting HTTPS for browser PKCE** — generating the S256 challenge with `crypto.subtle.digest` requires a secure context (HTTPS or `localhost`).
 - **Putting the upstream secret directly in the app** — use `rise encrypt` and store it in the extension spec. The app receives Rise-issued credentials, never the upstream secret.
 - **Omitting `authorization_endpoint`/`token_endpoint` for non-OIDC providers** — Google, Auth0, and Dex auto-discover these. GitHub and Snowflake do not — you must specify them manually.

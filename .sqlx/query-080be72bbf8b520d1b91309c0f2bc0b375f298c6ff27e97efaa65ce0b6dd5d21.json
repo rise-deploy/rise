@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE oauth_relay_store\n         SET value = $3, expires_at = now() + make_interval(secs => $4::float8)\n         WHERE key = $1 AND value = $2 AND expires_at > now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bytea",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "080be72bbf8b520d1b91309c0f2bc0b375f298c6ff27e97efaa65ce0b6dd5d21"
+}

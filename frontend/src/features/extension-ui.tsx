@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { CONFIG } from '../lib/config';
@@ -99,7 +98,7 @@ export function AwsRdsExtensionUI({ spec, schema, onChange }) {
     // Update parent when values change
     useEffect(() => {
         // Build the spec object, omitting empty values
-        const newSpec = {
+        const newSpec: Record<string, unknown> = {
             engine,
             database_isolation: databaseIsolation,
             inject_pg_vars: injectPgVars,
@@ -233,28 +232,31 @@ const OAuthExtensionAPI = {
     },
 
     renderConfigureTab(spec, schema, onChange, projectName, instanceName, isEnabled) {
-        return <OAuthExtensionUI spec={spec} schema={schema} onChange={onChange} projectName={projectName} instanceName={instanceName} isEnabled={isEnabled} />;
+        return <OAuthExtensionUI spec={spec} onChange={onChange} projectName={projectName} instanceName={instanceName} isEnabled={isEnabled} />;
     }
 };
 
 // Integration Guide Modal Component
-function IntegrationGuideModal({ isOpen, onClose, projectName, extensionName }) {
-    const [activeTab, setActiveTab] = useState('fragment');
+function IntegrationGuideModal({ isOpen, onClose, projectName, extensionName, clientId, isPublic }) {
+    const [activeTab, setActiveTab] = useState(isPublic ? 'spa' : 'backend');
 
     const backendUrl = CONFIG.backendUrl.replace(/\/$/, '');
     const authorizeUrl = `${backendUrl}/oidc/${projectName}/${extensionName}/authorize`;
     const callbackUrl = `${backendUrl}/oidc/${projectName}/${extensionName}/callback`;
     const tokenUrl = `${backendUrl}/oidc/${projectName}/${extensionName}/token`;
+    const envPrefix = extensionName.toUpperCase().replace(/-/g, '_');
 
     const codeLabelStyle: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: 'var(--text)', margin: '0 0 6px' };
     const paraStyle: React.CSSProperties = { fontSize: 13, color: 'var(--text-muted)', margin: 0, lineHeight: 1.6 };
+    const strongStyle: React.CSSProperties = { color: 'var(--text)' };
+    const monoStyle: React.CSSProperties = { color: 'var(--text)' };
 
     return (
         <Modal isOpen={isOpen} onClose={onClose} title="Integration Guide" width="wide">
                 <Tabs
                     tabs={[
-                        { id: 'fragment', label: 'PKCE Flow (SPAs)' },
-                        { id: 'backend', label: 'Token Endpoint (Backend)' },
+                        { id: 'spa', label: 'Public client (SPAs)' },
+                        { id: 'backend', label: 'Confidential client (Backend)' },
                         { id: 'local', label: 'Local Development' },
                     ]}
                     active={activeTab}
@@ -263,12 +265,13 @@ function IntegrationGuideModal({ isOpen, onClose, projectName, extensionName }) 
 
                 {/* Modal Content */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 16, marginTop: 16 }}>
-                    {activeTab === 'fragment' && (
+                    {activeTab === 'spa' && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                             <p style={paraStyle}>
-                                <strong style={{ color: 'var(--text)' }}>Fragment Flow</strong> is the default and recommended approach for single-page applications (SPAs).
-                                Tokens are returned in the URL fragment (<code className="mono" style={{ color: 'var(--text)' }}>#access_token=...</code>),
-                                which never reaches the server.
+                                <strong style={strongStyle}>Public clients</strong> are browser and native apps that cannot keep a secret.
+                                They must use PKCE, receive no client secret, and get single-use refresh tokens.
+                                Set <code className="mono" style={monoStyle}>client_type</code> to <code className="mono" style={monoStyle}>public</code> in the extension configuration.
+                                {!isPublic && ' This extension is currently a confidential client, so the example below is rejected until you change it.'}
                             </p>
 
                             <div>
@@ -279,40 +282,70 @@ function IntegrationGuideModal({ isOpen, onClose, projectName, extensionName }) 
                             </div>
 
                             <div>
+                                <p style={codeLabelStyle}>Token Endpoint:</p>
+                                <CodeBlock style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                                    POST {tokenUrl}
+                                </CodeBlock>
+                            </div>
+
+                            <div>
                                 <p style={codeLabelStyle}>Example Code:</p>
                                 <CodeBlock>
-{`// Initiate OAuth login (fragment flow is default)
-function login() {
-  const authUrl = '${authorizeUrl}';
-  window.location.href = authUrl;
+{`const CLIENT_ID = '${clientId}';
+const REDIRECT_URI = window.location.origin + '/callback';
+
+const b64url = bytes => btoa(String.fromCharCode(...new Uint8Array(bytes)))
+  .replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+
+// 1. Start login with a PKCE challenge
+async function login() {
+  const verifier = b64url(crypto.getRandomValues(new Uint8Array(32)));
+  const challenge = b64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier)));
+  const state = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  sessionStorage.setItem('oauth', JSON.stringify({ verifier, state }));
+
+  window.location.href = '${authorizeUrl}?' + new URLSearchParams({
+    redirect_uri: REDIRECT_URI,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state,
+  });
 }
 
-// Extract tokens from URL fragment after redirect
-function handleCallback() {
-  const fragment = window.location.hash.substring(1);
-  const params = new URLSearchParams(fragment);
+// 2. On /callback, exchange the code. There is no client secret.
+async function handleCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const saved = JSON.parse(sessionStorage.getItem('oauth') || '{}');
+  if (params.get('state') !== saved.state) throw new Error('state mismatch');
 
-  const accessToken = params.get('access_token');
-  const idToken = params.get('id_token');
-  const expiresAt = params.get('expires_at');
-
-  if (accessToken) {
-    // Store securely (session storage for security)
-    sessionStorage.setItem('access_token', accessToken);
-    if (idToken) {
-      sessionStorage.setItem('id_token', idToken);
-    }
-
-    // Clear the fragment from URL
-    window.location.hash = '';
-
-    // Redirect to your app
-    window.location.href = '/dashboard';
-  }
+  const res = await fetch('${tokenUrl}', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: params.get('code'),
+      client_id: CLIENT_ID,
+      redirect_uri: REDIRECT_URI, // must match the authorize request
+      code_verifier: saved.verifier,
+    }),
+  });
+  if (!res.ok) throw new Error('Token exchange failed: ' + (await res.json()).error);
+  return res.json(); // { access_token, id_token, refresh_token, ... }
 }
 
-// Call on page load
-handleCallback();`}
+// 3. Refresh. Every refresh token is single use: store the new one.
+async function refresh(refreshToken) {
+  const res = await fetch('${tokenUrl}', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: CLIENT_ID,
+    }),
+  });
+  return res.json(); // refresh_token is the successor
+}`}
                                 </CodeBlock>
                             </div>
                         </div>
@@ -321,8 +354,11 @@ handleCallback();`}
                     {activeTab === 'backend' && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                             <p style={paraStyle}>
-                                <strong style={{ color: 'var(--text)' }}>Token Endpoint Flow</strong> is designed for server-rendered applications (confidential clients). Your backend receives an
-                                authorization code as a query parameter, which it exchanges for OAuth tokens via the RFC 6749-compliant token endpoint using client credentials.
+                                <strong style={strongStyle}>Confidential clients</strong> are apps with a backend. Your server exchanges the authorization code
+                                at the RFC 6749 token endpoint and must send the client secret on every token request, code and refresh.
+                                PKCE is optional and enforced when you use it. The <code className="mono" style={monoStyle}>refresh_token</code> in
+                                the response is a Rise handle, never the provider's token.
+                                {isPublic && ' This extension is currently a public client, so the example below is rejected until you change it.'}
                             </p>
 
                             <div>
@@ -342,51 +378,59 @@ handleCallback();`}
                             <div>
                                 <p style={codeLabelStyle}>Example Code (Node.js/Express):</p>
                                 <CodeBlock>
-{`// Initiate OAuth login
+{`const REDIRECT_URI = 'https://my-app.example.com/oauth/callback';
+
+// Initiate OAuth login
 app.get('/login', (req, res) => {
-  const authUrl = '${authorizeUrl}';
-  res.redirect(authUrl);
+  req.session.state = crypto.randomUUID();
+  const params = new URLSearchParams({ redirect_uri: REDIRECT_URI, state: req.session.state });
+  res.redirect('${authorizeUrl}?' + params);
 });
 
 // Handle OAuth callback
 app.get('/oauth/callback', async (req, res) => {
-  const code = req.query.code;
-
-  if (!code) {
-    return res.status(400).send('Missing authorization code');
+  const { code, state } = req.query;
+  if (!code || state !== req.session.state) {
+    return res.status(400).send('Invalid callback');
   }
 
-  try {
-    // Exchange authorization code for tokens
-    const response = await fetch('${tokenUrl}', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: code,
-        client_id: process.env.${extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_ID,
-        client_secret: process.env.${extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET
-      })
-    });
+  // Exchange authorization code for tokens
+  const response = await fetch('${tokenUrl}', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI, // must match the authorize request
+      client_id: process.env.${envPrefix}_CLIENT_ID,
+      client_secret: process.env.${envPrefix}_CLIENT_SECRET,
+    }),
+  });
 
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(\`Token exchange failed: \${error.error}\`);
-    }
-
-    const tokens = await response.json();
-    // { access_token, token_type, expires_in, refresh_token, ... }
-
-    // Store in HttpOnly session cookie (recommended)
-    req.session.tokens = tokens;
-
-    // Redirect to app
-    res.redirect('/dashboard');
-  } catch (error) {
-    console.error('OAuth error:', error);
-    res.status(500).send('Authentication failed');
+  if (!response.ok) {
+    console.error('Token exchange failed', await response.json());
+    return res.status(500).send('Authentication failed');
   }
-});`}
+
+  // { access_token, token_type, expires_in, refresh_token, id_token, ... }
+  req.session.tokens = await response.json(); // HttpOnly session cookie
+  res.redirect('/dashboard');
+});
+
+// Refresh: the secret is required here too
+async function refresh(refreshToken) {
+  const response = await fetch('${tokenUrl}', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: process.env.${envPrefix}_CLIENT_ID,
+      client_secret: process.env.${envPrefix}_CLIENT_SECRET,
+    }),
+  });
+  return response.json();
+}`}
                                 </CodeBlock>
                             </div>
                         </div>
@@ -395,50 +439,30 @@ app.get('/oauth/callback', async (req, res) => {
                     {activeTab === 'local' && (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                             <p style={paraStyle}>
-                                For local development, you can override the redirect URI to point to your local development server.
-                                Rise always handles the OAuth provider callback, so you don't need to register localhost URLs with your OAuth provider.
+                                Every authorize request carries a <code className="mono" style={monoStyle}>redirect_uri</code>. Rise accepts the URLs of the
+                                project's active deployments (including custom domains) and, for local development, http URLs on
+                                {' '}<code className="mono" style={monoStyle}>localhost</code>, <code className="mono" style={monoStyle}>127.0.0.1</code> and{' '}
+                                <code className="mono" style={monoStyle}>[::1]</code> with any port and path. Send the same value again with the code exchange.
                             </p>
 
                             <div>
-                                <p style={codeLabelStyle}>PKCE Flow (localhost):</p>
+                                <p style={codeLabelStyle}>Local redirect:</p>
                                 <CodeBlock>
-{`// Override redirect URI for local development
-const authUrl = '${authorizeUrl}?redirect_uri=' +
-  encodeURIComponent('http://localhost:3000/callback');
+{`const REDIRECT_URI = 'http://localhost:3000/callback';
 
-window.location.href = authUrl;
-
-// Handle the callback in your local app
-function handleCallback() {
-  const fragment = window.location.hash.substring(1);
-  const params = new URLSearchParams(fragment);
-  const accessToken = params.get('access_token');
-  // ... use the token
-}`}
-                                </CodeBlock>
-                            </div>
-
-                            <div>
-                                <p style={codeLabelStyle}>Token Endpoint Flow (localhost):</p>
-                                <CodeBlock>
-{`// Override redirect URI for local development
-app.get('/login', (req, res) => {
-  const authUrl = '${authorizeUrl}?redirect_uri=' +
-    encodeURIComponent('http://localhost:3000/oauth/callback');
-  res.redirect(authUrl);
+window.location.href = '${authorizeUrl}?' + new URLSearchParams({
+  redirect_uri: REDIRECT_URI,
+  // public clients also send code_challenge and code_challenge_method=S256
 });
 
-// Your local callback handler
-app.get('/oauth/callback', async (req, res) => {
-  const code = req.query.code;
-  // ... same token exchange logic as production
-});`}
+// In the callback handler, repeat redirect_uri in the token request
+// (plus code_verifier for public clients, or client_secret for confidential ones).`}
                                 </CodeBlock>
                             </div>
 
                             <Alert tone="info" icon="info">
                                 <strong>How It Works.</strong>{' '}
-                                The OAuth provider only redirects to <code className="mono" style={{ color: 'var(--text)' }}>{callbackUrl}</code> (Rise's callback URL).
+                                The OAuth provider only redirects to <code className="mono" style={monoStyle}>{callbackUrl}</code> (Rise's callback URL).
                                 Rise then redirects to your app's redirect_uri with the authorization code. You don't need to configure localhost URLs in your OAuth provider.
                             </Alert>
                         </div>
@@ -460,11 +484,14 @@ export function OAuthDetailView({ extension, projectName }) {
     // Build URLs using actual backend URL
     const backendUrl = CONFIG.backendUrl.replace(/\/$/, ''); // Remove trailing slash
 
+    const isPublic = spec.client_type === 'public';
+    const clientId = status?.rise_client_id || `${projectName}-${extensionName}`;
+
+    // The test runs through the project API, which checks the signed-in
+    // member and records the result; it returns to this page afterwards.
     const handleTestOAuth = () => {
-        // Include the current hash in the redirect URI so we return to the same page
-        const redirectUri = window.location.href;
-        const authUrl = `/oidc/${projectName}/${extensionName}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`;
-        window.location.href = authUrl;
+        const testUrl = `/api/v1/projects/${encodeURIComponent(projectName)}/extensions/${encodeURIComponent(extensionName)}/oauth/test`;
+        window.location.href = `${testUrl}?return_to=${encodeURIComponent(window.location.href)}`;
     };
 
     return (
@@ -474,6 +501,8 @@ export function OAuthDetailView({ extension, projectName }) {
                 onClose={() => setShowGuideModal(false)}
                 projectName={projectName}
                 extensionName={extensionName}
+                clientId={clientId}
+                isPublic={isPublic}
             />
 
             {/* Two-column layout */}
@@ -505,6 +534,14 @@ export function OAuthDetailView({ extension, projectName }) {
                                     {spec.token_endpoint_auth_method === 'client_secret_basic'
                                         ? 'HTTP Basic header (client_secret_basic)'
                                         : 'Request body (client_secret_post)'}
+                                </KVRow>
+                                <KVRow k="App Client Type">
+                                    {isPublic ? 'Public (PKCE required, no client secret)' : 'Confidential (client secret required)'}
+                                </KVRow>
+                                <KVRow k="Refresh Tokens">
+                                    {isPublic || spec.refresh_token_mode === 'rotating'
+                                        ? 'Rotating (single-use handles)'
+                                        : 'Sealed (stateless handles)'}
                                 </KVRow>
                                 <KVRow k={`Scopes (${scopesArray.length})`}>
                                     {scopesArray.length === 0 ? (
@@ -546,7 +583,7 @@ export function OAuthDetailView({ extension, projectName }) {
                                 ) : (
                                     <Alert tone="warn" icon="info">
                                         <strong>Waiting For Auth</strong>
-                                        <div style={{ fontSize: 12, marginTop: 2 }}>Complete OAuth flow to verify configuration</div>
+                                        <div style={{ fontSize: 12, marginTop: 2 }}>Run the OAuth test to verify configuration</div>
                                     </Alert>
                                 )
                             ) : (
@@ -563,7 +600,7 @@ export function OAuthDetailView({ extension, projectName }) {
                                 Test OAuth Flow
                             </Button>
                             <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 8 }}>
-                                Test the OAuth flow and return to this page with a notification.
+                                Sign in through this extension as yourself and return to this page with the result. Only project members can run the test.
                             </p>
                         </PanelBody>
                     </Panel>
@@ -576,7 +613,7 @@ export function OAuthDetailView({ extension, projectName }) {
                                 Integration Guide
                             </Button>
                             <p style={{ fontSize: 12, color: 'var(--text-soft)', marginTop: 8 }}>
-                                View code examples for PKCE Flow, Token Endpoint Flow, and local development.
+                                View code examples for public clients, confidential clients, and local development.
                             </p>
                         </PanelBody>
                     </Panel>
@@ -613,25 +650,27 @@ export function OAuthDetailView({ extension, projectName }) {
                                     />
                                 </td>
                             </tr>
-                            <tr>
-                                <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET</span></td>
-                                <td><span className="mono" style={{ color: 'var(--text-soft)' }}>••••••••</span></td>
-                                <td>
-                                    {status?.rise_client_secret && (
-                                        <CopyButton
-                                            title="Copy Client Secret"
-                                            onClick={async () => {
-                                                try {
-                                                    await copyToClipboard(status.rise_client_secret);
-                                                    showToast('Client secret copied', 'success');
-                                                } catch (err) {
-                                                    showToast(`Failed to copy: ${err.message}`, 'error');
-                                                }
-                                            }}
-                                        />
-                                    )}
-                                </td>
-                            </tr>
+                            {!isPublic && (
+                                <tr>
+                                    <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{extensionName.toUpperCase().replace(/-/g, '_')}_CLIENT_SECRET</span></td>
+                                    <td><span className="mono" style={{ color: 'var(--text-soft)' }}>••••••••</span></td>
+                                    <td>
+                                        {status?.rise_client_secret && (
+                                            <CopyButton
+                                                title="Copy Client Secret"
+                                                onClick={async () => {
+                                                    try {
+                                                        await copyToClipboard(status.rise_client_secret);
+                                                        showToast('Client secret copied', 'success');
+                                                    } catch (err) {
+                                                        showToast(`Failed to copy: ${err.message}`, 'error');
+                                                    }
+                                                }}
+                                            />
+                                        )}
+                                    </td>
+                                </tr>
+                            )}
                             <tr>
                                 <td><span className="mono" style={{ whiteSpace: 'nowrap' }}>{extensionName.toUpperCase().replace(/-/g, '_')}_ISSUER</span></td>
                                 <td>

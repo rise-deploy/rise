@@ -1,38 +1,31 @@
-use super::handlers;
+use super::relay::MOUNT_PREFIX;
+use super::test_flow;
 use crate::server::state::AppState;
-use axum::{
-    routing::{get, post},
-    Router,
-};
+use axum::{routing::get, Router};
 
-/// Create OAuth routes with short OIDC paths
+/// The OAuth relay at the root: `/oidc/{project}/{extension}/…` serves `authorize`,
+/// `callback`, `token`, `jwks` and `.well-known/openid-configuration` for every
+/// active OAuth extension.
 ///
-/// All endpoints are now consolidated under `/oidc/{project}/{extension}/...`:
-/// - `GET /oidc/{project}/{extension}/authorize` - Initiate OAuth flow
-/// - `GET /oidc/{project}/{extension}/callback` - Handle OAuth provider callback
-/// - `POST /oidc/{project}/{extension}/token` - Exchange code for tokens (RFC 6749)
-/// - `GET /oidc/{project}/{extension}/.well-known/openid-configuration` - OIDC discovery
-/// - `GET /oidc/{project}/{extension}/jwks` - JWKS
-pub fn oauth_routes() -> Router<AppState> {
+/// Mounted with `route_service`, which hands the relay the unstripped path: the
+/// relay interprets the raw path below `/oidc/` itself.
+pub fn relay_routes(state: &AppState) -> Router<AppState> {
+    Router::new().route_service(
+        &format!("{MOUNT_PREFIX}/{{*path}}"),
+        state.oauth_relay.service(state.oauth_rate_limiter.clone()),
+    )
+}
+
+/// The Rise UI's OAuth test flow, nested under `/api/v1` without the auth
+/// middleware: both handlers authenticate the Rise UI session cookie themselves.
+pub fn test_flow_routes() -> Router<AppState> {
     Router::new()
-        // OAuth flow endpoints (short paths)
         .route(
-            "/oidc/{project}/{extension}/authorize",
-            get(handlers::authorize),
+            "/projects/{project}/extensions/{extension}/oauth/test",
+            get(test_flow::start),
         )
         .route(
-            "/oidc/{project}/{extension}/callback",
-            get(handlers::callback),
+            "/projects/{project}/extensions/{extension}/oauth/test/callback",
+            get(test_flow::callback),
         )
-        // RFC 6749-compliant token endpoint with CORS support
-        .route(
-            "/oidc/{project}/{extension}/token",
-            post(handlers::token_endpoint).options(handlers::token_endpoint_options),
-        )
-        // OIDC discovery endpoints (proxied from upstream)
-        .route(
-            "/oidc/{project}/{extension}/.well-known/openid-configuration",
-            get(handlers::oidc_discovery),
-        )
-        .route("/oidc/{project}/{extension}/jwks", get(handlers::oidc_jwks))
 }
