@@ -221,7 +221,7 @@ thiserror = { version = "2.0", optional = true }
 
 # Server: Frontend
 mime_guess = { version = "2.0", optional = true }
-tera = { version = "1.20", optional = true }
+tera = { version = "2.0", optional = true }
 
 # AWS feature dependencies
 aws-config = { version = "1.5", features = ["behavior-version-latest"], optional = true }
