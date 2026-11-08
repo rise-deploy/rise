@@ -248,7 +248,7 @@ bollard = { version = "0.21", optional = true }
 tar = { version = "0.4", optional = true }
 
 # Snowflake feature dependencies
-snowflake-connector-rs = { version = "0.9", optional = true }
+snowflake-connector-rs = { version = "1.0", optional = true }
 
 # Server: OAuth2 token endpoint
 subtle = { version = "2.6.1", optional = true }
