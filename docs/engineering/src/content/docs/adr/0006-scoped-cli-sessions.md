@@ -137,6 +137,10 @@ and individual permissions second:
 | `develop` | `view`, `logs`, `deploy`, `env-vars` | project, environment |
 | `admin` | all eight | project |
 
+[ADR-0007](./0007-mcp-connector.md) §4.1–§4.2 proposes an `operate`
+permission (stop and same-environment rollback, which `deploy` includes) and a
+`manage` preset.
+
 Presets are fixed in code for now. The token always carries the expanded
 statements, never a preset name. So changing a preset's definition changes
 what future logins request, never what an existing session may do.

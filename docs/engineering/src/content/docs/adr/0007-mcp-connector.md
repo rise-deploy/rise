@@ -4,8 +4,7 @@ title: "ADR-0007: MCP Connector"
 
 ## Status
 
-**Proposed.** Date: 2026-11-09. Nothing is implemented. Open questions are
-collected at the end.
+**Proposed.** Date: 2026-11-09. Nothing is implemented.
 
 Builds on [ADR-0006](./0006-scoped-cli-sessions.md): the connector reuses its
 permission names, presets, ceiling format and typed-API choke point. It adds
@@ -39,8 +38,9 @@ from then on.
 user's machine and pushes it. An MCP server has no build context, so the
 connector can't deploy. Everything around a deployment can be done without
 one: creating and configuring projects, environments, variables and secrets,
-service accounts, and reading deployments and logs. When it's time to deploy,
-the connector hands over to the CLI (§7).
+service accounts, reading deployments and logs, and stopping or rolling back
+deployments that already exist (§4.2). When it's time to deploy new code, the
+connector hands over to the CLI (§7).
 
 ## Decision
 
@@ -191,14 +191,52 @@ is a grant capability rather than a ceiling entry:
   chosen at consent. It's the same row update, so the next tool call (in the
   same conversation) can configure the project.
 - A new preset, **`manage`**, is added to ADR-0006 §3: `view`, `logs`,
-  `env-vars`, `configure`, `service-accounts`, `project-admin`. It is `admin`
-  without `deploy` and `secrets`, so it suits a connector that never deploys
-  (§8). It is the default for created projects.
+  `operate` (§4.2), `env-vars`, `configure`, `service-accounts`,
+  `project-admin`. It is `admin` without `deploy` and `secrets`, so it suits a
+  connector that never deploys new code (§8). It is the default for created
+  projects. The consent page can lower it, for example to `develop`.
 
 This is the one place where a grant's ceiling grows after consent. It grows
 only by projects that this grant itself created, and the user consented to
 that at approval time. The ceiling is read from the row on each request, not
 from the token, which is why growth is possible (§6).
+
+#### 4.2 The `operate` permission
+
+Stopping a deployment and rolling back to an earlier one need no build. They
+belong in the connector, but not under `deploy`, which also lets its holder
+ship arbitrary new code. A new permission is added to ADR-0006 §3:
+
+| Permission | Allows | Statements | Project | Environment |
+|---|---|---|:-:|:-:|
+| `operate` | Stop deployments; roll back to a deployment that already ran in the same environment | `(update, Deployment)`, `(create, Deployment, rollback)` | ✅ | ✅ |
+
+Rollback in the typed API is `POST /projects/{p}/deployments` with
+`from_deployment`, the same `(create, Deployment)` a deploy needs. The create
+handler classifies the request instead (it is a *handler* route under
+ADR-0006 §7). A request is `(create, Deployment, rollback)` iff all of these
+hold:
+
+- it names `from_deployment`;
+- it overrides no image or container spec;
+- the source is in the same project and the same environment as the new
+  deployment;
+- the source reached a running state there before.
+
+Any other create, including promoting a deployment into a *different*
+environment, needs `(create, Deployment)`, which is `deploy`. `deploy` gains
+the `rollback` statement, so `deploy` ⊇ `operate`, and the `deploy`,
+`develop` and `admin` presets keep everything they have today.
+
+Stopping a whole deployment group (`POST …/deployments/stop`) stays
+project-wide, as in ADR-0006 §5. An environment grant with `operate` stops
+single deployments in its environment.
+
+`operate` can only run code that has already run in that environment, put
+there by someone holding `deploy`. It can't introduce code, so §8's secrets
+guarantees survive it. A rollback to an old debug build that printed its
+environment would expose secrets again. That build ran in the environment
+before, so the exposure isn't new.
 
 ### 5. Tools dispatch through the typed API
 
@@ -355,9 +393,12 @@ directly. The tool result reports only `set` / `pending` / `cancelled`.
 These guarantees hold for the connector because it **has no `deploy`**. As
 ADR-0006 §3 notes, anyone who can deploy can run code that prints its own
 environment. That's the reason `deploy` is not offered on the connector's
-access (the editor hides it). A CLI login approved through §7 may have
-`deploy`. The confirmation page shows ADR-0006's `deploy` + `secrets` note in
-that case.
+access (the editor hides it), while `operate` is (§4.2). A CLI login approved
+through §7 may have `deploy`. The confirmation page shows ADR-0006's `deploy`
++ `secrets` note in that case.
+
+Neither tool protects against the app itself: an app that logs its own
+environment exposes it to anyone holding `logs`, connector or not.
 
 ### 9. Tool surface
 
@@ -375,7 +416,7 @@ check itself happens in the typed API (§5).
 | Env vars | `list_env_vars` (secret values masked), `set_env_var`, `delete_env_var`, `generate_secret`, `request_secret` | `view`; `env-vars` |
 | Service accounts | `list_service_accounts`, `create_service_account`, `update_service_account`, `delete_service_account` | `view`; `service-accounts` |
 | Domains | `list_domains`, `add_domain`, `remove_domain` | `view`; `configure` |
-| Deployments | `list_deployments`, `get_deployment`, `get_deployment_logs` | `view`; `logs` |
+| Deployments | `list_deployments`, `get_deployment`, `get_deployment_logs`, `stop_deployment`, `stop_deployment_group`, `rollback_deployment` | `view`; `logs`; `operate` (§4.2; stopping a group is project-wide) |
 | CLI | `approve_cli_login`, `get_cli_login_status` | `cli_login` (§7) |
 
 Tools take names, not UUIDs, as the CLI does. `create_project` returns the
@@ -384,10 +425,16 @@ the repository. `delete_project` and `delete_environment` require
 confirmation the same way §7 does. An agent should not delete an app on one
 tool call, and destructive annotations are only advisory.
 
-Not included: deploying and anything that needs a build; stopping or rolling
-back deployments (Open questions); extensions (their specs carry encrypted
+Not included: deploying new code and anything that needs a build; promoting
+a deployment to another environment (that is `deploy`, §4.2); extensions (their specs carry encrypted
 client secrets and need their own design for secret input, after §8 has
 shipped); team management; the generic resource API.
+
+**Service accounts are the typed ones** (`/projects/{p}/service-accounts`).
+The connector doesn't use the generic resource API yet, and ADR-0006 §7
+refuses connector sessions there. `rise.dev/ServiceAccount` resources become
+reachable when ADR-0006 §8 migrates that kind. The tools then follow the API
+they call (§5), and their names and arguments don't change.
 
 The skill `skills/rise-app-builder` learns to prefer the connector when it is
 present, and to use the CLI for `deploy`, `build` and `run`.
@@ -415,8 +462,12 @@ per-backend gaps, and the feature matrix in
 - `SessionClient` gains `Connector`. Every check that distinguishes `Browser`
   from `Cli` must decide what `Connector` means. Device approval and the admin
   surface refuse it, and the route guard treats it like a scoped CLI session.
-- ADR-0006 gains the `manage` preset. A grant's ceiling can grow by projects
-  the grant itself created.
+- ADR-0006 gains the `operate` permission, the `rollback` subresource on
+  `Deployment`, and the `manage` preset. `deploy` gains the `rollback`
+  statement, so no existing preset loses anything. The shared session-ceiling
+  cases (`session-ceilings.json`) gain rollback-vs-deploy cases, including
+  promotion to another environment being refused under `operate`. A grant's
+  ceiling can grow by projects the grant itself created.
 - Settings: an `mcp` block (§3, §6) means a config schema regeneration and a
   changelog entry (`operator-impact`) in the PR that ships it.
 - The connector can't deploy. Users who want a fully hosted flow (claude.ai,
@@ -428,8 +479,9 @@ per-backend gaps, and the feature matrix in
 
 1. **Authorization + read.** Metadata, CIMD + DCR, consent, grants, tokens,
    Connected apps page, read-only tools.
-2. **Configure.** Project, environment, env var, domain and service account
-   writes; `generate_secret`; project creation (§4.1).
+2. **Configure and operate.** Project, environment, env var, domain and
+   service account writes; `generate_secret`; project creation (§4.1); the
+   `operate` permission and its tools (§4.2).
 3. **Hand-off.** `approve_cli_login`, `request_secret`, URL-mode elicitation.
 
 Every phase ships an e2e scenario that runs a real MCP client through
@@ -466,27 +518,15 @@ but a prompt injection could turn the connector into a way to give an
 attacker's CLI a session. Confirmation costs one click per CLI login, which
 happens at most once a day per machine.
 
+**Stop and rollback under `deploy`.** No new permission is needed, since the
+typed API already treats a rollback as a create. But a connector that should
+recover a broken release would then also be able to ship new code, and §8's
+secrets guarantees would no longer hold. A separate permission costs one
+subresource classification in the create handler.
+
 **OAuth scopes for permissions** (`projects:write`, …). This is rejected for
 the reasons in ADR-0006 §1. Some MCP clients would show scopes on their own
 consent UI, but Rise's consent page is where the decision happens either way.
-
-## Open questions
-
-1. **Deployment operations without a build.** Stopping and rolling back to an
-   earlier image need no build context. Including them brings back `deploy`,
-   and with it ADR-0006 §3's secrets caveat. A rollback can only run images
-   that already ran, but a rollback to a debug build still exposes the
-   environment. Leave them out, or add them as an explicitly consented
-   `operate` capability?
-2. **Sharing a generated secret between projects** (an HMAC key two services
-   both verify) without revealing it: a server-side `copy_secret` tool, or
-   should apps use workload identity for this instead?
-3. **Default on created projects:** `manage` (includes delete) or `develop`
-   without `project-admin`?
-4. **Generic resource API.** ServiceAccounts on the resource API
-   (`rise.dev/ServiceAccount`) are out of reach until ADR-0006 §8 lands. Should
-   phase 2 wait for that, or ship typed service accounts and migrate them with
-   the kind?
 
 ## References
 
