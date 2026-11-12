@@ -376,6 +376,20 @@ impl RegistryProvider for EcrProvider {
         anyhow::bail!("ECR pull credentials require a project repository")
     }
 
+    fn repository_finalizer(&self) -> Option<&'static str> {
+        Some(crate::server::ecr::ECR_FINALIZER)
+    }
+
+    async fn provision_repository(&self, repository: &str, project_id: Uuid) -> Result<()> {
+        crate::server::ecr::EcrRepoManager::with_client(
+            self.config.clone(),
+            self.ecr_client.clone(),
+        )
+        .create_repository(repository, project_id)
+        .await?;
+        Ok(())
+    }
+
     async fn get_project_pull_credentials(
         &self,
         repository: &str,

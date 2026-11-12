@@ -184,9 +184,11 @@ otherwise invisible — `registry.account_id` only formats image references, so
 repositories would be created in one account while every deployment pointed at
 another.
 
-Repositories are provisioned by a background controller on a 10-second poll, not
-at project-create time. A create-then-deploy within that window mints
-credentials against a repository that does not exist yet.
+Project creation provisions the project's repository before it returns, so a
+deploy right after `rise project create` finds it. If that attempt fails (it is
+logged as a warning), the background controller retries: within about a minute
+it notices the missing repository and creates it, and until then a deploy is
+refused with `409 Repository '…' is not provisioned yet`.
 
 ### A private registry that is not ECR
 

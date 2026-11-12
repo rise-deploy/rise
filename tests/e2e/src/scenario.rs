@@ -339,9 +339,9 @@ impl Scenario for RegistryBuildPushPull {
     fn run(&self, b: &dyn Backend) -> Result<()> {
         let project = unique("e2e-reg");
         create_public_project(b, &project)?;
-        // Repository provisioning is asynchronous on ECR; pushing before it
-        // lands fails with a repository-not-found that reads like a permissions
-        // problem.
+        // Project create provisions the ECR repository, but a failed inline
+        // attempt leaves it to the controller; pushing before it lands fails
+        // with a repository-not-found that reads like a permissions problem.
         b.wait_registry_ready(&project)?;
 
         // Build locally and push with the credentials Rise mints for this
