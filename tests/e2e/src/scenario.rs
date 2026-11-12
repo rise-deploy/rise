@@ -1986,7 +1986,7 @@ impl Scenario for HealthRollingCutover {
         std::fs::write(
             dir.join("rise.toml"),
             format!(
-                "[project]\nname = \"{project}\"\n\n[containers.app]\nimage = \"{}\"\nport = {}\nreplicas = 2\n\n[containers.app.deploy.health_check]\npath = \"/\"\n",
+                "[project]\nname = \"{project}\"\n\n[containers.app]\nimage = \"{}\"\nport = {}\n\n[containers.app.deploy]\nreplicas = 2\n\n[containers.app.deploy.health_check]\npath = \"/\"\n",
                 app.image, app.http_port
             ),
         )
