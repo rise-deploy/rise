@@ -37,6 +37,19 @@ carry no extra network alias of their own). The Compose project name is fixed to
 `rise` so the network is always named `rise_default` regardless of the launch
 directory.
 
+## Traefik provider endpoint
+
+Besides the Docker provider, Traefik polls Rise's HTTP provider
+(`http://rise:3001/internal/traefik/config`) for the routing snapshot: every
+active deployment's host rules, custom domains and forwardAuth addresses. Port
+`3001` is never published to the host, but anything on `rise_default` can reach
+it. Set `deployment_controller.traefik_config_secret`
+(`RISE_TRAEFIK_CONFIG_SECRET`) to require `Authorization: Bearer <secret>`; the
+standalone Compose files pass the same variable to Traefik as
+`--providers.http.headers.Authorization`. (Traefik reads static configuration from
+args *or* environment, never both, so the header is a command flag rather than a
+`TRAEFIK_PROVIDERS_HTTP_HEADERS_*` variable.)
+
 ## Cutover & health checks
 
 When a new deployment becomes the active one for its group, traffic moves from

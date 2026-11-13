@@ -25,3 +25,15 @@ run "write_only_secret_versions" {
     error_message = "managed secret versions must use a content-sensitive write-only version"
   }
 }
+
+run "traefik_config_secret_is_a_write_only_secret" {
+  command = plan
+  assert {
+    condition = (
+      random_bytes.traefik_config_secret.length == 32
+      && aws_secretsmanager_secret.traefik_config_secret.name == "rise/traefik-config-secret"
+      && aws_secretsmanager_secret_version.traefik_config_secret.secret_string == null
+    )
+    error_message = "the Traefik config secret must be 32 random bytes in a write-only Secrets Manager secret"
+  }
+}

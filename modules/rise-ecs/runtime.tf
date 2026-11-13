@@ -43,11 +43,12 @@ module "runtime" {
   environment        = local.rise_environment
   secret_environment = local.control_plane_secret_environment
   traefik = {
-    name            = "${local.name}-traefik"
-    discovery_name  = local.traefik_discovery_name
-    image           = var.traefik_image
-    refresh_seconds = var.traefik_refresh_seconds
-    constraints     = var.traefik_constraints
+    name              = "${local.name}-traefik"
+    discovery_name    = local.traefik_discovery_name
+    image             = var.traefik_image
+    config_secret_arn = module.secrets.environment.RISE_TRAEFIK_CONFIG_SECRET
+    refresh_seconds   = var.traefik_refresh_seconds
+    constraints       = var.traefik_constraints
   }
   acme = {
     enabled         = local.acme_enabled

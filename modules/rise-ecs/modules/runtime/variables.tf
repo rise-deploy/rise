@@ -108,6 +108,12 @@ variable "traefik" {
     refresh_seconds   = optional(number, 15)
     constraints       = optional(string, "")
     log_stream_prefix = optional(string, "traefik")
+    # Secrets Manager ARN of the bearer token the Rise backend requires on its
+    # HTTP-provider endpoint. When set, the task resolves it through the
+    # container `secrets` block and presents it as the provider's
+    # `Authorization` header; the same secret must reach Rise as
+    # RISE_TRAEFIK_CONFIG_SECRET. Null sends no header.
+    config_secret_arn = optional(string)
   })
 }
 

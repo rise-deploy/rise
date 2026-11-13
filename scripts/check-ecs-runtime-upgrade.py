@@ -8,6 +8,7 @@ infrastructure are used.
 
 import argparse
 import base64
+import ipaddress
 import json
 import re
 import shutil
@@ -40,6 +41,29 @@ mock_provider "aws" {
 }
 mock_provider "random" {}
 """
+TRAEFIK_CONFIG_SECRET_ARN = (
+    "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/traefik-config-secret-abc123"
+)
+TRAEFIK_CONFIG_SECRET_ENV = "RISE_TRAEFIK_CONFIG_SECRET"
+# The Traefik task appends the HTTP-provider Authorization header from the
+# injected secret, so the token is in neither task definition.
+TRAEFIK_CONFIG_ENTRYPOINT = [
+    "/bin/sh",
+    "-c",
+    'exec traefik "$@" "--providers.http.headers.Authorization=Bearer ${%s}"'
+    % TRAEFIK_CONFIG_SECRET_ENV,
+    "traefik",
+]
+TRAEFIK_CONFIG_SECRET_ENTRY = {
+    "name": TRAEFIK_CONFIG_SECRET_ENV,
+    "valueFrom": TRAEFIK_CONFIG_SECRET_ARN,
+}
+# Resources the upgrade creates for the Traefik HTTP-provider secret.
+NEW_TRAEFIK_SECRET_RESOURCES = {
+    "module.secrets.random_bytes.traefik_config_secret",
+    "module.secrets.aws_secretsmanager_secret.traefik_config_secret",
+    "module.secrets.aws_secretsmanager_secret_version.traefik_config_secret",
+}
 
 
 def run(args, cwd, **kwargs):
@@ -145,10 +169,24 @@ def prepare(repo, work, baseline):
                 if phase == "current" and case != "e2e"
                 else ""
             )
+            # A secret created by the plan has no ARN until apply. Give it a
+            # known one so the task definitions that reference it stay known,
+            # and the plan can be compared field by field. The E2E workspace
+            # passes its secrets as plain environment and creates none.
+            known_arn = (
+                f'''override_resource {{
+    target = module.secrets.aws_secretsmanager_secret.traefik_config_secret
+    override_during = plan
+    values = {{ arn = "{TRAEFIK_CONFIG_SECRET_ARN}" }}
+  }}
+  '''
+                if phase == "current" and case != "e2e"
+                else ""
+            )
             runs += f'''run "{phase}" {{
   command = {command}
   state_key = "{case}"
-  {added}module {{ source = "./{phase}/{relative}" }}
+  {added}{known_arn}module {{ source = "./{phase}/{relative}" }}
 }}
 '''
         (work / "tests" / f"{case}.tftest.hcl").write_text(
@@ -180,6 +218,14 @@ def only_expected_control_plane_env(before, after):
                         and entry["value"] == WORKLOAD_ROLE
                     ):
                         entry["value"] = normalize_workload_role(entry["value"])
+            if current:
+                # The new Secrets Manager reference, exactly once.
+                secrets = container.get("secrets") or []
+                if secrets.count(TRAEFIK_CONFIG_SECRET_ENTRY) != 1:
+                    return None
+                container["secrets"] = [
+                    entry for entry in secrets if entry != TRAEFIK_CONFIG_SECRET_ENTRY
+                ]
             container["environment"] = sorted(
                 (
                     e
@@ -190,7 +236,8 @@ def only_expected_control_plane_env(before, after):
             )
         return containers
 
-    return strip(before, False) == strip(after, True)
+    expected, actual = strip(before, False), strip(after, True)
+    return actual is not None and expected == actual
 
 
 def only_updated_dex_callbacks(before, after):
@@ -220,16 +267,61 @@ def changed_fields(delta):
     }
 
 
-def only_added_client_ip_trust(before, after):
-    """Allow only Traefik's client-address trust flags to be added to its command."""
+def container_definitions(address, delta, side):
+    """The rendered container definitions, which must be known at plan time.
+
+    A value derived from a secret created by the plan is unknown until apply
+    and absent from `after`; the fixture gives that secret a known ARN, so an
+    unknown value here means the comparison below would be vacuous.
+    """
+    assert not (delta.get("after_unknown") or {}).get("container_definitions"), (
+        address,
+        "container_definitions are unknown at plan time",
+    )
+    return delta[side]["container_definitions"]
+
+
+TRUSTED_IPS_FLAG = re.compile(
+    r"^--entrypoints\.(web|websecure|ping)\.(forwardedHeaders|proxyProtocol)"
+    r"\.trustedIPs=(?P<cidrs>.+)$"
+)
+
+
+def is_client_ip_trust_flag(flag):
+    """A trusted-peer flag for a load-balancer entrypoint, never the internet."""
+    match = TRUSTED_IPS_FLAG.match(flag)
+    if not match:
+        return False
+    try:
+        networks = [ipaddress.ip_network(c) for c in match["cidrs"].split(",")]
+    except ValueError:
+        return False
+    return all(network.prefixlen > 0 for network in networks)
+
+
+def only_added_traefik_changes(before, after):
+    """Allow only the Traefik task's expected additions.
+
+    Both are stripped from the new definition, and what remains must equal the
+    baseline exactly:
+    - the client-address trust flags in `command` (well-formed trustedIPs for
+      the load balancer's entrypoints), and
+    - the entry point that appends the HTTP-provider Authorization header from
+      the injected secret, with its `secrets` entry.
+    """
     before, after = json.loads(before), json.loads(after)
     for container in after:
-        if container["name"] == "traefik":
-            container["command"] = [
-                flag
-                for flag in container["command"]
-                if ".trustedIPs=" not in flag
-            ]
+        if container["name"] != "traefik":
+            continue
+        flags = container["command"]
+        trust = [flag for flag in flags if ".trustedIPs=" in flag]
+        if not all(is_client_ip_trust_flag(flag) for flag in trust):
+            return False
+        container["command"] = [flag for flag in flags if flag not in trust]
+        if container.pop("entryPoint", None) != TRAEFIK_CONFIG_ENTRYPOINT:
+            return False
+        if container.pop("secrets", None) != [TRAEFIK_CONFIG_SECRET_ENTRY]:
+            return False
     return before == after
 
 
@@ -335,8 +427,8 @@ def verify(log, repo):
                 }
                 == {"container_definitions"}
                 and only_updated_dex_callbacks(
-                    delta["before"]["container_definitions"],
-                    delta["after"]["container_definitions"],
+                    container_definitions(address, delta, "before"),
+                    container_definitions(address, delta, "after"),
                 )
             ):
                 continue
@@ -350,21 +442,36 @@ def verify(log, repo):
                 }
                 == {"container_definitions"}
                 and only_expected_control_plane_env(
-                    delta["before"]["container_definitions"],
-                    delta["after"]["container_definitions"],
+                    container_definitions(address, delta, "before"),
+                    container_definitions(address, delta, "after"),
                 )
             ):
                 continue
+            # The Traefik task gains its entry point and the secret reference.
             if (
                 case != "e2e"
                 and address == "module.runtime.aws_ecs_task_definition.traefik"
                 and delta["actions"] == ["update"]
                 and changed_fields(delta) == {"container_definitions"}
-                and only_added_client_ip_trust(
-                    delta["before"]["container_definitions"],
-                    delta["after"]["container_definitions"],
+                and only_added_traefik_changes(
+                    container_definitions(address, delta, "before"),
+                    container_definitions(address, delta, "after"),
                 )
             ):
+                continue
+            # The Traefik HTTP-provider secret: 32 random bytes in a new
+            # Secrets Manager secret. Nothing existing is touched.
+            if case != "e2e" and address in NEW_TRAEFIK_SECRET_RESOURCES:
+                assert delta["actions"] == ["create"], (case, address, delta["actions"])
+                after = delta["after"]
+                if address.endswith("random_bytes.traefik_config_secret"):
+                    assert after["length"] == 32, (case, address, after["length"])
+                if address.endswith("aws_secretsmanager_secret.traefik_config_secret"):
+                    assert after["name"] == "rise/traefik-config-secret", (
+                        case,
+                        address,
+                        after["name"],
+                    )
                 continue
             # NLB target groups start carrying the client in PROXY protocol v2.
             if (
@@ -415,6 +522,35 @@ def verify(log, repo):
                 } == delta["before"]
             ):
                 continue
+            # The new secret joins the injected-secret map and the ARNs the
+            # execution role must read; the rest of each output is unchanged.
+            if (
+                case != "e2e"
+                and name == "rise_task_secrets"
+                and delta["actions"] == ["update"]
+                and isinstance(delta.get("before"), dict)
+                and isinstance(delta.get("after"), dict)
+                and delta["after"].get(TRAEFIK_CONFIG_SECRET_ENV)
+                == TRAEFIK_CONFIG_SECRET_ARN
+                and {
+                    k: v
+                    for k, v in delta["after"].items()
+                    if k != TRAEFIK_CONFIG_SECRET_ENV
+                }
+                == delta["before"]
+            ):
+                continue
+            if (
+                case != "e2e"
+                and name == "secret_arns_for_execution_role"
+                and delta["actions"] == ["update"]
+                and isinstance(delta.get("before"), list)
+                and isinstance(delta.get("after"), list)
+                and delta["after"].count(TRAEFIK_CONFIG_SECRET_ARN) == 1
+                and [a for a in delta["after"] if a != TRAEFIK_CONFIG_SECRET_ARN]
+                == delta["before"]
+            ):
+                continue
             # A new output changes nothing the baseline state already holds.
             assert delta["actions"] in (["no-op"], ["create"]), (
                 case,
@@ -428,8 +564,8 @@ def verify(log, repo):
                 "only expected E2E task/service updates"
                 if case == "e2e"
                 else "only expected secret-version, startup-budget,"
-                " control-plane environment, Dex callback and client-address"
-                " trust updates"
+                " control-plane environment, Dex callback, client-address trust"
+                " and Traefik HTTP-provider secret updates"
             )
         )
     assert checked == {"nlb", "alb", "brought", "dex", "endpoints", "e2e"}, (
