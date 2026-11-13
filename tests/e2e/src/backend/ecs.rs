@@ -1336,8 +1336,8 @@ impl Backend for EcsBackend {
             }
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,
-                "ECR repository {repo:?} was not provisioned within 90s. Rise's ECR \
-                 controller creates it on a 10s poll under a leader lease — check the \
+                "ECR repository {repo:?} was not provisioned within 90s. Rise creates it \
+                 during project create, with the ECR controller as fallback — check the \
                  control plane's logs for AssumeRole or ecr:CreateRepository denials."
             );
             std::thread::sleep(Duration::from_secs(5));
