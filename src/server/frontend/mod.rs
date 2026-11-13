@@ -59,6 +59,11 @@ pub async fn load_auth_template(
     // Tera only escapes names ending in `.html`; these templates render
     // request-supplied values (project names, error messages), so escape them.
     tera.autoescape_on(vec![".html.tera"]);
+    // Tera 2 has no built-in `urlencode`; the templates build query strings with it.
+    tera.register_filter(
+        "urlencode",
+        |value: &str, _: tera::Kwargs, _: &tera::State| urlencoding::encode(value).into_owned(),
+    );
     for partial in AUTH_TEMPLATE_PARTIALS {
         let body = load_text(static_dir, partial).await?;
         tera.add_raw_template(partial, &body).map_err(|e| {
@@ -92,7 +97,7 @@ mod tests {
         let mut context = tera::Context::new();
         context.insert("success", &false);
         for (key, value) in values {
-            context.insert(*key, value);
+            context.insert(key.to_string(), value);
         }
         tera.render(template, &context).unwrap()
     }
