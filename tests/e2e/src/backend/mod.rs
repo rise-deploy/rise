@@ -90,10 +90,10 @@ pub trait Backend {
     /// Block until the registry has a repository ready for `project`, for
     /// backends whose registry provisions them asynchronously.
     ///
-    /// Default: nothing to wait for. ECS with an ECR registry overrides it —
-    /// repositories are created by a leader-elected controller on a 10-second
-    /// poll, not at project-create time, so a create-then-deploy inside that
-    /// window pushes against a repository that does not exist yet.
+    /// Default: nothing to wait for. ECS with an ECR registry overrides it.
+    /// Rise provisions the repository during project create, so this normally
+    /// returns at once; it guards the scenarios that exercise the registry
+    /// path against a failed inline attempt left to the ECR controller.
     fn wait_registry_ready(&self, project: &str) -> Result<()> {
         let _ = project;
         Ok(())
