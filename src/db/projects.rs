@@ -767,7 +767,10 @@ pub async fn lock_active_with_finalizer(
 
 /// Add a finalizer to a project (idempotent - won't add if already exists)
 #[cfg(feature = "backend")]
-pub async fn add_finalizer(pool: &PgPool, id: Uuid, finalizer: &str) -> Result<()> {
+pub async fn add_finalizer<'a, E>(executor: E, id: Uuid, finalizer: &str) -> Result<()>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
     sqlx::query!(
         r#"
         UPDATE projects
@@ -780,7 +783,7 @@ pub async fn add_finalizer(pool: &PgPool, id: Uuid, finalizer: &str) -> Result<(
         id,
         finalizer
     )
-    .execute(pool)
+    .execute(executor)
     .await
     .context("Failed to add finalizer")?;
 
