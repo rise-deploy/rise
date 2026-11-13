@@ -10,4 +10,10 @@ ignore = [
     # Rise signs AWS requests with SigV4 (HMAC) only. Even the latest aws-sigv4
     # still depends on crypto-bigint 0.5; drop this once it moves to >=0.7.6.
     "RUSTSEC-2026-0387",
+    # C SQLite CVE in libsqlite3-sys 0.30. It is in Cargo.lock only as an
+    # optional dependency of sqlx-macros-core (via sqlx-sqlite); Rise enables
+    # no sqlx SQLite feature, so `cargo tree --workspace --all-features
+    # --target all -i libsqlite3-sys` prints nothing and it is never built.
+    # sqlx 0.9 pins 0.30; drop this once it allows >=0.39 (rise-deploy/rise#626).
+    "RUSTSEC-2026-0459",
 ]

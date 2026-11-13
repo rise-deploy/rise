@@ -322,9 +322,32 @@ pub async fn create_project(
             .internal_err("Failed to add app team")?;
     }
 
+    // Record the registry's cleanup obligation with the project itself, so a
+    // project deleted before its repository is provisioned still has the
+    // repository cleaned up.
+    if let Some(finalizer) = state.registry_provider.repository_finalizer() {
+        projects::add_finalizer(&mut *tx, project.id, finalizer)
+            .await
+            .internal_err("Failed to record registry repository finalizer")?;
+    }
+
     tx.commit()
         .await
         .internal_err("Failed to commit transaction")?;
+
+    // Provision the project's registry repository now, so a deploy right after
+    // creation finds it (best-effort; the registry's controller converges
+    // regardless).
+    if let Err(e) = state
+        .registry_provider
+        .provision_repository(&project.name, project.id)
+        .await
+    {
+        tracing::warn!(
+            project = %project.name,
+            "Failed to provision registry repository on project creation: {:?}", e
+        );
+    }
 
     // Let the backend create whatever per-project runtime object it needs
     // (best-effort; the reconcile loop converges regardless).
