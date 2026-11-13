@@ -152,6 +152,27 @@ pub trait RegistryProvider: Send + Sync {
         })
     }
 
+    /// The finalizer a project carries while this provider holds a
+    /// per-project repository that must be cleaned up when the project is
+    /// deleted. `None` for providers whose repositories need no provisioning.
+    ///
+    /// Project creation stamps it in the same transaction that inserts the
+    /// project, so the cleanup obligation exists before the repository does.
+    fn repository_finalizer(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Provision the project's repository, for providers that keep one per
+    /// project. Called right after a project is created, so the first deploy
+    /// does not race the provider's background provisioning. Best-effort:
+    /// a provider that overrides this must also converge without it.
+    ///
+    /// Default: nothing to provision.
+    async fn provision_repository(&self, repository: &str, project_id: uuid::Uuid) -> Result<()> {
+        let _ = (repository, project_id);
+        Ok(())
+    }
+
     /// Get the registry host (for credentials map key)
     ///
     /// Returns the registry hostname without protocol or path

@@ -339,9 +339,9 @@ impl Scenario for RegistryBuildPushPull {
     fn run(&self, b: &dyn Backend) -> Result<()> {
         let project = unique("e2e-reg");
         create_public_project(b, &project)?;
-        // Repository provisioning is asynchronous on ECR; pushing before it
-        // lands fails with a repository-not-found that reads like a permissions
-        // problem.
+        // Project create provisions the ECR repository, but a failed inline
+        // attempt leaves it to the controller; pushing before it lands fails
+        // with a repository-not-found that reads like a permissions problem.
         b.wait_registry_ready(&project)?;
 
         // Build locally and push with the credentials Rise mints for this
@@ -1986,7 +1986,7 @@ impl Scenario for HealthRollingCutover {
         std::fs::write(
             dir.join("rise.toml"),
             format!(
-                "[project]\nname = \"{project}\"\n\n[containers.app]\nimage = \"{}\"\nport = {}\nreplicas = 2\n\n[containers.app.deploy.health_check]\npath = \"/\"\n",
+                "[project]\nname = \"{project}\"\n\n[containers.app]\nimage = \"{}\"\nport = {}\n\n[containers.app.deploy]\nreplicas = 2\n\n[containers.app.deploy.health_check]\npath = \"/\"\n",
                 app.image, app.http_port
             ),
         )

@@ -197,7 +197,13 @@ impl EcrRepoManager {
 
         let ecr_client = EcrClient::new(&aws_config);
 
-        Ok(Self { config, ecr_client })
+        Ok(Self::with_client(config, ecr_client))
+    }
+
+    /// A manager over an existing client, so callers that already hold one on
+    /// the backend's identity (the ECR registry provider) share it.
+    pub fn with_client(config: EcrConfig, ecr_client: EcrClient) -> Self {
+        Self { config, ecr_client }
     }
 
     /// Get the full ECR repository name for a project
@@ -282,7 +288,8 @@ impl EcrRepoManager {
             .context("Failed to build project tag")?;
 
         // Create the repository with tags
-        self.ecr_client
+        let created = self
+            .ecr_client
             .create_repository()
             .repository_name(&repo_name)
             .tags(managed_tag)
@@ -301,14 +308,29 @@ impl EcrRepoManager {
                     .build(),
             )
             .send()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
+            .await;
+        match created {
+            Ok(_) => {}
+            // Project creation and the provisioning controller can both reach
+            // this point for one project; whoever loses the race adopts the
+            // winner's repository under the same ownership checks.
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|e| e.is_repository_already_exists_exception()) =>
+            {
+                self.ensure_project_access(project, project_id, false)
+                    .await?;
+                tracing::debug!("ECR repository {} was created concurrently", repo_name);
+                return Ok(false);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
                     "Failed to create ECR repository '{}': {}",
                     repo_name,
                     format_sdk_error(&e)
-                )
-            })?;
+                ));
+            }
+        }
 
         tracing::info!("Created ECR repository: {}", repo_name);
         Ok(true)
@@ -450,6 +472,9 @@ mod tests {
         tags: Option<Vec<serde_json::Value>>,
         writes: Vec<String>,
         fail_create_response: bool,
+        /// Tags a concurrent creator wrote between the caller's existence
+        /// check and its CreateRepository, which then reports the conflict.
+        concurrent_creation: Option<Vec<serde_json::Value>>,
     }
 
     async fn mock_ecr(
@@ -474,6 +499,16 @@ mod tests {
         } else if target.ends_with("ListTagsForResource") {
             serde_json::json!({"tags": state.tags})
         } else if target.ends_with("CreateRepository") {
+            if let Some(tags) = state.concurrent_creation.take() {
+                state.tags = Some(tags);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "__type": "RepositoryAlreadyExistsException", "message": "exists"
+                    })),
+                )
+                    .into_response();
+            }
             state.writes.push("create".into());
             state.tags = Some(payload["tags"].as_array().unwrap().clone());
             if state.fail_create_response {
@@ -615,6 +650,36 @@ mod tests {
         assert!(tags
             .iter()
             .any(|tag| tag["Key"] == PROJECT_ID_TAG_KEY && tag["Value"] == owner.to_string()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn losing_a_creation_race_adopts_only_the_same_projects_repository() {
+        let owner = Uuid::new_v4();
+        let winner_tags = vec![
+            serde_json::json!({"Key": PROJECT_ID_TAG_KEY, "Value": owner.to_string()}),
+            serde_json::json!({"Key": CREDENTIAL_GENERATION_TAG_KEY, "Value": "first"}),
+        ];
+
+        let state = Arc::new(Mutex::new(MockRepository {
+            concurrent_creation: Some(winner_tags.clone()),
+            ..Default::default()
+        }));
+        let (manager, server) = mock_manager(state.clone()).await;
+        assert!(!manager.create_repository("app", owner).await.unwrap());
+        assert!(state.lock().unwrap().writes.is_empty());
+        server.abort();
+
+        let state = Arc::new(Mutex::new(MockRepository {
+            concurrent_creation: Some(winner_tags),
+            ..Default::default()
+        }));
+        let (manager, server) = mock_manager(state.clone()).await;
+        assert!(manager
+            .create_repository("app", Uuid::new_v4())
+            .await
+            .is_err());
+        assert!(state.lock().unwrap().writes.is_empty());
         server.abort();
     }
 
