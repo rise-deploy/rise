@@ -2643,7 +2643,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3108,21 +3107,6 @@ dependencies = [
  "num-traits",
  "serde_json",
  "zmij",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64 0.22.1",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
 ]
 
 [[package]]
@@ -4344,7 +4328,6 @@ dependencies = [
  "http-body 1.1.0",
  "http-body-util",
  "hyper",
- "hyper-rustls",
  "hyper-tls",
  "hyper-util",
  "js-sys",
@@ -4352,8 +4335,6 @@ dependencies = [
  "native-tls",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
- "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4361,7 +4342,6 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
- "tokio-rustls",
  "tokio-util",
  "tower",
  "tower-http 0.6.11",
@@ -4371,7 +4351,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots",
 ]
 
 [[package]]
@@ -4463,7 +4442,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
- "jsonwebtoken 11.1.0",
+ "jsonwebtoken",
  "rand 0.10.3",
  "rsa",
  "serde",
@@ -4636,7 +4615,7 @@ dependencies = [
  "dirs",
  "futures",
  "ipnet",
- "jsonwebtoken 11.1.0",
+ "jsonwebtoken",
  "k8s-openapi",
  "kube",
  "mime_guess",
@@ -5336,25 +5315,37 @@ dependencies = [
 
 [[package]]
 name = "snowflake-connector-rs"
-version = "0.9.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab6cf61174f3727f62abad67b3e407861024f959dd7cd08d23e867a8df9cec9a"
+checksum = "dfdf4ddb1da4bc3653958c15127b4aa6c7a026df5f496bbf8221f1219441290f"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
+ "bytes",
  "chrono",
  "flate2",
  "http 1.5.0",
- "jsonwebtoken 9.3.1",
+ "indexmap",
  "pkcs8",
- "reqwest 0.12.28",
+ "reqwest 0.13.5",
  "rsa",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.21",
+ "sha2 0.11.1",
+ "snowflake-connector-rs-derive",
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "snowflake-connector-rs-derive"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40fd90df3aac2e530362b09bbfbe433260eee233bb935d7b087994e945b58685"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -5843,9 +5834,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.3"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
@@ -6245,9 +6236,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.1"
+version = "1.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
+checksum = "4a06f08a856b009bc7bbaf7d3e79808595d032dd19074c0c2ef26e49e03e6bdc"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -6445,15 +6436,6 @@ name = "webpki-root-certs"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]
