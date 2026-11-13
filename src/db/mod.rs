@@ -10,6 +10,7 @@ pub mod env_vars;
 pub mod environments;
 pub mod extensions;
 pub mod models;
+pub mod oauth_relay_store;
 pub mod oauth_transient_state;
 pub mod organization_links;
 pub mod postgres_admin;

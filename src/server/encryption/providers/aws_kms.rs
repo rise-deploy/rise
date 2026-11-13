@@ -5,7 +5,7 @@ use aws_sdk_kms::Client as KmsClient;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
-use rise_backend_core::encryption::{decode_envelope, encode_envelope};
+use rise_backend_core::encryption::{decode_envelope, encode_envelope, CiphertextRejected};
 
 /// AWS KMS encryption provider
 /// Uses AWS KMS for encryption/decryption operations
@@ -131,12 +131,35 @@ impl AwsKmsEncryptionProvider {
             .decrypt_request(ciphertext, context)
             .send()
             .await
-            .context("KMS ciphertext authentication failed")?;
+            .map_err(decrypt_error)?;
         let plaintext = response
             .plaintext()
             .context("No plaintext in KMS response")?;
         String::from_utf8(plaintext.clone().into_inner())
             .context("Decrypted data is not valid UTF-8")
+            .map_err(CiphertextRejected::tag)
+    }
+}
+
+/// Tags the KMS verdicts on the ciphertext itself as [`CiphertextRejected`]; every other
+/// failure (transport, timeout, throttling, a disabled or unavailable key, missing
+/// permissions) stays untagged.
+fn decrypt_error(
+    error: aws_sdk_kms::error::SdkError<
+        aws_sdk_kms::operation::decrypt::DecryptError,
+        aws_sdk_kms::config::http::HttpResponse,
+    >,
+) -> anyhow::Error {
+    let rejected = error.as_service_error().is_some_and(|e| {
+        e.is_invalid_ciphertext_exception()
+            || e.is_incorrect_key_exception()
+            || e.is_invalid_key_usage_exception()
+    });
+    let error = anyhow::Error::new(error).context("KMS ciphertext authentication failed");
+    if rejected {
+        CiphertextRejected::tag(error)
+    } else {
+        error
     }
 }
 
@@ -188,5 +211,62 @@ mod tests {
             .as_input()
             .get_encryption_context()
             .is_none());
+    }
+
+    #[test]
+    fn only_kms_verdicts_on_the_ciphertext_are_tagged_rejected() {
+        use aws_sdk_kms::config::http::HttpResponse;
+        use aws_sdk_kms::error::SdkError;
+        use aws_sdk_kms::operation::decrypt::DecryptError;
+        use aws_sdk_kms::types::error::{
+            DisabledException, IncorrectKeyException, InvalidCiphertextException,
+            InvalidKeyUsageException, KeyUnavailableException, KmsInternalException,
+            KmsInvalidStateException, NotFoundException,
+        };
+        use rise_backend_core::encryption::is_ciphertext_rejected;
+
+        fn service(error: DecryptError) -> SdkError<DecryptError, HttpResponse> {
+            SdkError::service_error(error, HttpResponse::new(400.try_into().unwrap(), "".into()))
+        }
+
+        let rejected = [
+            DecryptError::InvalidCiphertextException(InvalidCiphertextException::builder().build()),
+            DecryptError::IncorrectKeyException(IncorrectKeyException::builder().build()),
+            DecryptError::InvalidKeyUsageException(InvalidKeyUsageException::builder().build()),
+        ];
+        for error in rejected {
+            let error = decrypt_error(service(error));
+            assert!(is_ciphertext_rejected(&error), "{error:?}");
+            assert_eq!(error.to_string(), "KMS ciphertext authentication failed");
+            assert!(error
+                .chain()
+                .any(|c| c.is::<SdkError<DecryptError, HttpResponse>>()));
+        }
+
+        let transient = [
+            service(DecryptError::KmsInternalException(
+                KmsInternalException::builder().build(),
+            )),
+            service(DecryptError::KeyUnavailableException(
+                KeyUnavailableException::builder().build(),
+            )),
+            service(DecryptError::DisabledException(
+                DisabledException::builder().build(),
+            )),
+            service(DecryptError::KmsInvalidStateException(
+                KmsInvalidStateException::builder().build(),
+            )),
+            service(DecryptError::NotFoundException(
+                NotFoundException::builder().build(),
+            )),
+            service(DecryptError::unhandled("AccessDeniedException")),
+            SdkError::timeout_error("timed out"),
+            SdkError::construction_failure("no credentials"),
+        ];
+        for error in transient {
+            let error = decrypt_error(error);
+            assert!(!is_ciphertext_rejected(&error), "{error:?}");
+            assert_eq!(error.to_string(), "KMS ciphertext authentication failed");
+        }
     }
 }

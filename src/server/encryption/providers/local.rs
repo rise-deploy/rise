@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 
 use crate::server::encryption::{EncryptionContext, EncryptionProvider};
-use rise_backend_core::encryption::{decode_envelope, encode_envelope};
+use rise_backend_core::encryption::{decode_envelope, encode_envelope, CiphertextRejected};
 
 /// Local encryption provider using AES-256-GCM
 /// Encrypts data using a symmetric key stored in backend configuration
@@ -113,10 +113,14 @@ impl LocalEncryptionProvider {
 
     fn decrypt_with_cipher(cipher: &Aes256Gcm, combined: &[u8], aad: &[u8]) -> Result<String> {
         if combined.len() < 28 {
-            bail!("Invalid ciphertext: too short");
+            return Err(CiphertextRejected::tag(anyhow::anyhow!(
+                "Invalid ciphertext: too short"
+            )));
         }
         let (nonce_bytes, ciphertext) = combined.split_at(12);
-        let nonce = Nonce::try_from(nonce_bytes).context("Invalid ciphertext nonce")?;
+        let nonce = Nonce::try_from(nonce_bytes)
+            .context("Invalid ciphertext nonce")
+            .map_err(CiphertextRejected::tag)?;
         let plaintext = cipher
             .decrypt(
                 &nonce,
@@ -125,8 +129,12 @@ impl LocalEncryptionProvider {
                     aad,
                 },
             )
-            .map_err(|_| anyhow::anyhow!("Ciphertext authentication failed"))?;
-        String::from_utf8(plaintext).context("Decrypted data is not valid UTF-8")
+            .map_err(|_| {
+                CiphertextRejected::tag(anyhow::anyhow!("Ciphertext authentication failed"))
+            })?;
+        String::from_utf8(plaintext)
+            .context("Decrypted data is not valid UTF-8")
+            .map_err(CiphertextRejected::tag)
     }
 }
 
@@ -263,5 +271,68 @@ mod tests {
             .decrypt_legacy_for_migration(&stripped)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_ciphertexts_are_tagged_with_unchanged_messages() {
+        use rise_backend_core::encryption::is_ciphertext_rejected;
+        let provider = LocalEncryptionProvider::new(&BASE64.encode([7u8; 32])).unwrap();
+        let other_key = LocalEncryptionProvider::new(&BASE64.encode([8u8; 32])).unwrap();
+        let context = EncryptionContext::internal("test");
+        let ciphertext = provider.encrypt("credential", &context).await.unwrap();
+
+        let cases = [
+            (
+                provider
+                    .decrypt(&ciphertext, &context.with_slot("other"))
+                    .await,
+                "Ciphertext authentication failed",
+            ),
+            (
+                other_key.decrypt(&ciphertext, &context).await,
+                "Ciphertext authentication failed",
+            ),
+            (
+                provider
+                    .decrypt(&encode_envelope(&[0u8; 27]), &context)
+                    .await,
+                "Invalid ciphertext: too short",
+            ),
+            (
+                provider.decrypt("rise:enc:v2:***", &context).await,
+                "Invalid v2 ciphertext encoding",
+            ),
+            (
+                provider.decrypt("plain", &context).await,
+                "A context-bound rise:enc:v2 envelope is required",
+            ),
+        ];
+        for (result, message) in cases {
+            let error = result.unwrap_err();
+            assert!(is_ciphertext_rejected(&error), "{error:#}");
+            assert_eq!(error.to_string(), message);
+        }
+
+        let mut combined = decode_envelope(&ciphertext).unwrap();
+        let nonce = Nonce::try_from(&combined[..12]).unwrap();
+        let invalid_utf8 = provider
+            .cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &[0xff, 0xfe],
+                    aad: &context.authenticated_bytes(),
+                },
+            )
+            .unwrap();
+        combined.truncate(12);
+        combined.extend(invalid_utf8);
+        let error = provider
+            .decrypt(&encode_envelope(&combined), &context)
+            .await
+            .unwrap_err();
+        assert!(is_ciphertext_rejected(&error));
+        assert_eq!(error.to_string(), "Decrypted data is not valid UTF-8");
+        assert!(error.chain().any(|c| c.is::<std::string::FromUtf8Error>()));
     }
 }

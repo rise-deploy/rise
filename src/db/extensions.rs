@@ -152,6 +152,38 @@ pub async fn update_status(
     Ok(())
 }
 
+/// Merge `patch`'s top-level keys into an active extension's status and remove
+/// the `remove` keys, leaving every other key as concurrent writers left it.
+/// Applies only while the extension's spec still equals `expected_spec`, and
+/// returns whether it applied.
+pub async fn merge_status_for_spec(
+    pool: &PgPool,
+    project_id: Uuid,
+    extension: &str,
+    expected_spec: &Value,
+    patch: &Value,
+    remove: &[&str],
+) -> Result<bool> {
+    let remove: Vec<String> = remove.iter().map(|key| key.to_string()).collect();
+    let result = sqlx::query!(
+        r#"
+        UPDATE project_extensions
+        SET status = (status - $4::text[]) || $3, updated_at = NOW()
+        WHERE project_id = $1 AND extension = $2 AND deleted_at IS NULL AND spec = $5
+        "#,
+        project_id,
+        extension,
+        patch,
+        &remove,
+        expected_spec
+    )
+    .execute(pool)
+    .await
+    .context("Failed to merge extension status")?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 /// Update extension spec
 pub async fn update_spec(
     pool: &PgPool,

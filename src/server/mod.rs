@@ -294,7 +294,10 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         // RFC 8693 token exchange — the source token is the credential, so the
         // endpoint is public.
         .merge(auth::exchange::routes::routes())
-        .merge(workload_tokens::routes::routes());
+        .merge(workload_tokens::routes::routes())
+        // The Rise UI's OAuth extension test; the handlers authenticate the
+        // session cookie themselves.
+        .merge(extensions::providers::oauth::routes::test_flow_routes());
 
     // The generic resource API carries its own authentication and
     // platform-access layers: they are the platform-wide ones, except that a
@@ -361,8 +364,8 @@ pub async fn run_server(settings: settings::Settings) -> Result<()> {
         .merge(auth::routes::well_known_routes())
         // Root-level auth routes for custom domain support via Ingress routing
         .merge(auth::routes::rise_auth_routes())
-        // OAuth/OIDC routes at root level (before frontend fallback)
-        .merge(extensions::providers::oauth::routes::oauth_routes())
+        // OAuth extension relay at root level (before frontend fallback)
+        .merge(extensions::providers::oauth::routes::relay_routes(&state))
         .merge(frontend::routes::docs_routes())
         .merge(frontend::routes::frontend_routes())
         .with_state(state.clone())

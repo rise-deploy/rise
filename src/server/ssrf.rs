@@ -136,6 +136,35 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
     }
 }
 
+/// The checks of [`validate_url`] that need no DNS: the scheme, a host, and the
+/// address of an IP-literal host. A host name passes; the connect-time
+/// [`SsrfResolver`] filters the addresses it resolves to, so the name is
+/// checked against the addresses actually connected to rather than an earlier
+/// lookup.
+pub fn validate_url_without_dns(url: &url::Url, config: &SsrfConfig) -> Result<(), SsrfError> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(SsrfError::InvalidUrl(format!(
+            "unsupported scheme {}",
+            url.scheme()
+        )));
+    }
+    if !config.http_allowed() && url.scheme() != "https" {
+        return Err(SsrfError::HttpsRequired);
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| SsrfError::InvalidUrl("URL has no host".to_string()))?;
+    let ip = match url.host() {
+        Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
+        Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip),
+        _ => return Ok(()),
+    };
+    if !config.allow_private_networks && !config.is_trusted_host(host) && is_blocked_ip(&ip) {
+        return Err(SsrfError::BlockedIpRange(ip));
+    }
+    Ok(())
+}
+
 /// Validate that a URL is safe to fetch (SSRF protection).
 ///
 /// Checks:
@@ -227,11 +256,20 @@ pub(crate) fn token_client_builder(config: &SsrfConfig) -> reqwest::ClientBuilde
     safe_client_builder(config).redirect(reqwest::redirect::Policy::none())
 }
 
+/// The base of every SSRF-safe client. Besides the redirect policy below, it
+/// refuses plain `http` URLs unless `http_allowed()`, and resolves host names
+/// through [`SsrfResolver`], so a name that resolves to a blocked address at
+/// connect time (DNS rebinding, or a URL that was never passed through
+/// [`validate_url`]) is never connected to. IP-literal hosts bypass DNS and are
+/// covered by [`validate_url`] only.
 pub(crate) fn safe_client_builder(config: &SsrfConfig) -> reqwest::ClientBuilder {
+    let resolver = SsrfResolver::new(config.clone());
     let config = config.clone();
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .connect_timeout(Duration::from_secs(5))
+        .https_only(!config.http_allowed())
+        .dns_resolver(resolver)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 3 {
                 attempt.error("too many redirects")
@@ -251,6 +289,87 @@ pub(crate) fn safe_client_builder(config: &SsrfConfig) -> reqwest::ClientBuilder
                 attempt.error("redirect target has no host")
             }
         }))
+}
+
+/// A DNS resolver that drops blocked addresses (see [`validate_url`]): a name
+/// whose addresses are all blocked fails to resolve. Names in `trusted_hosts`,
+/// and every name when `allow_private_networks` is on, resolve unfiltered, as
+/// does the host of an egress proxy configured through the environment
+/// (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`), which usually sits on a private
+/// network. Through such a proxy the target's DNS is resolved by the proxy,
+/// so only [`validate_url`] applies to the target.
+#[derive(Clone, Debug)]
+pub struct SsrfResolver {
+    config: SsrfConfig,
+    proxy_hosts: Vec<String>,
+}
+
+impl SsrfResolver {
+    pub fn new(config: SsrfConfig) -> Self {
+        Self {
+            config,
+            proxy_hosts: env_proxy_hosts(),
+        }
+    }
+
+    fn unfiltered(&self, host: &str) -> bool {
+        self.config.allow_private_networks
+            || self.config.is_trusted_host(host)
+            || self
+                .proxy_hosts
+                .iter()
+                .any(|proxy| proxy.eq_ignore_ascii_case(host))
+    }
+}
+
+/// The hosts of the egress proxies reqwest picks up from the environment.
+fn env_proxy_hosts() -> Vec<String> {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .filter_map(|value| {
+        let value = if value.contains("://") {
+            value
+        } else {
+            format!("http://{value}")
+        };
+        url::Url::parse(&value).ok()?.host_str().map(str::to_owned)
+    })
+    .collect()
+}
+
+impl reqwest::dns::Resolve for SsrfResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let unfiltered = self.unfiltered(&host);
+        Box::pin(async move {
+            let resolved: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let allowed: Vec<std::net::SocketAddr> = resolved
+                .iter()
+                .copied()
+                .filter(|addr| unfiltered || !is_blocked_ip(&addr.ip()))
+                .collect();
+            if allowed.is_empty() {
+                let reason = match resolved.first() {
+                    Some(addr) => SsrfError::BlockedIpRange(addr.ip()),
+                    None => {
+                        SsrfError::DnsResolutionFailed(format!("{host}: no addresses resolved"))
+                    }
+                };
+                return Err(Box::new(std::io::Error::other(reason.to_string()))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -509,5 +628,109 @@ mod tests {
             "expected private IP to be blocked even with allow_http, got: {:?}",
             result
         );
+    }
+
+    async fn resolve(config: SsrfConfig, host: &str) -> Result<Vec<IpAddr>, String> {
+        use reqwest::dns::Resolve;
+        SsrfResolver::new(config)
+            .resolve(host.parse().unwrap())
+            .await
+            .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn resolver_drops_blocked_addresses_unless_trusted() {
+        let error = resolve(with_allow_http(), "localhost").await.unwrap_err();
+        assert!(error.contains("blocked"), "{error}");
+        let addrs = resolve(with_trusted(&["LOCALHOST"]), "localhost")
+            .await
+            .unwrap();
+        assert!(addrs.iter().all(|ip| ip.is_loopback()), "{addrs:?}");
+        assert!(!resolve(permissive(), "localhost").await.unwrap().is_empty());
+    }
+
+    /// A listener that counts the connections it accepts.
+    async fn counting_listener() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await;
+            }
+        });
+        (port, accepted)
+    }
+
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn clients_never_connect_to_blocked_or_plain_http_targets() {
+        use std::sync::atomic::Ordering;
+        let (port, accepted) = counting_listener().await;
+        let url = format!("http://localhost:{port}/");
+
+        // A name resolving to a blocked address, without validate_url.
+        for client in [
+            safe_client(&with_allow_http()),
+            token_client(&with_allow_http()),
+        ] {
+            assert!(client.get(&url).send().await.is_err());
+        }
+        // Plain http when it is not allowed.
+        assert!(safe_client(&with_trusted(&["localhost"]))
+            .get(&url)
+            .send()
+            .await
+            .is_err());
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
+        // A trusted host is reached.
+        let trusted = SsrfConfig {
+            allow_http: true,
+            trusted_hosts: vec!["localhost".into()],
+            ..SsrfConfig::default()
+        };
+        assert!(safe_client(&trusted)
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dns_free_validation_checks_scheme_and_address_literals() {
+        let check = |url: &str, config: &SsrfConfig| {
+            validate_url_without_dns(&url::Url::parse(url).unwrap(), config).is_ok()
+        };
+        assert!(check("https://idp.example.com/jwks", &strict()));
+        assert!(check("https://93.184.215.14/jwks", &strict()));
+        for url in [
+            "http://idp.example.com/jwks",
+            "ftp://idp.example.com/jwks",
+            "https://169.254.169.254/latest",
+            "https://10.0.0.1/",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://0.0.0.0/",
+        ] {
+            assert!(!check(url, &strict()), "{url}");
+        }
+        assert!(check("http://idp.example.com/", &with_allow_http()));
+        assert!(!check("http://10.0.0.1/", &with_allow_http()));
+        assert!(check("https://10.0.0.1/", &with_trusted(&["10.0.0.1"])));
+        assert!(check("http://10.0.0.1/", &permissive()));
     }
 }
