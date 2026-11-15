@@ -48,6 +48,17 @@
       "groupName": "GitHub Actions"
     },
     {
+      "description": "Re-vendor Helm subchart tarballs into helm/rise/charts and refresh helm/rise/charts.sha256, which CI verifies byte-for-byte. Without this a subchart bump only touches Chart.yaml/Chart.lock and fails the vendored-chart check. The post-upgrade command must be allowed by the self-hosted Renovate's allowedCommands.",
+      "matchManagers": ["helmv3"],
+      "matchFileNames": ["helm/rise/Chart.yaml"],
+      "postUpdateOptions": ["helmUpdateSubChartArchives"],
+      "postUpgradeTasks": {
+        "commands": ["bash scripts/update-chart-digests.sh"],
+        "fileFilters": ["helm/rise/charts.sha256"],
+        "executionMode": "branch"
+      }
+    },
+    {
       "description": "Batch every example app dependency update into one PR on the first of the month. Must stay last so it overrides the per-ecosystem groups above for anything under example/.",
       "matchFileNames": ["example/**"],
       "groupName": "example dependencies",

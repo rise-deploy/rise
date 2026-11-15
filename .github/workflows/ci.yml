@@ -325,7 +325,7 @@ jobs:
             echo "ERROR: vendored chart tarball digest mismatch against helm/rise/charts.sha256." >&2
             echo "Either the tarball was tampered with, or the upstream chart was re-released." >&2
             echo "If legitimate, regenerate the manifest:" >&2
-            echo "  (cd helm/rise/charts && shasum -a 256 *.tgz) > helm/rise/charts.sha256" >&2
+            echo "  scripts/update-chart-digests.sh" >&2
             exit 1
           }
           # Also check there are no extra/unexpected tarballs in charts/.
