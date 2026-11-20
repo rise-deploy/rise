@@ -235,7 +235,7 @@ aws-sdk-s3 = { version = "1.80", default-features = false, features = ["default-
 aws-sdk-sts = { version = "1.80", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a"], optional = true }
 
 # Kubernetes feature dependencies
-kube = { version = "4", features = ["client", "derive"], optional = true }
+kube = { version = "5", features = ["client", "derive"], optional = true }
 # The version feature is the oldest Kubernetes API k8s-openapi supports, and it
 # is Rise's minimum supported Kubernetes version. Raise it with k8s-openapi, and
 # with it `kubeVersion` in helm/rise/Chart.yaml and the Kubernetes backend docs.
