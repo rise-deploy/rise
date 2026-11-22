@@ -10,5 +10,5 @@
 # Regenerate by running: cd helm/rise/charts && shasum -a 256 *.tgz > ../charts.sha256
 # (then re-add the leading comment block).
 efb95c875245af3c73a93b50331dfcece7cd573d5f788d934748a741c9c1747a  alloy-1.16.0.tgz
-bb8b254a57afc6b31ab23a6061216760c91c8ad3499d340442398b88ec603ca8  loki-7.5.0.tgz
+174c803546f65879a5b4dac60d2780621fd69bc790c1e66de936046e43ccbc43  loki-7.7.0.tgz
 92ea1f1b15353d434b059c9054695b5234c9a694ed97a2284b52adc5b6660ab9  metacontroller-helm-4.17.7.tgz
