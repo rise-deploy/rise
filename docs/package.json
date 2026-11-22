@@ -10,7 +10,7 @@
     "engineering"
   ],
   "dependencies": {
-    "@astrojs/starlight": "^0.42.7",
+    "@astrojs/starlight": "^0.43.0",
     "yaml": "2.9.1"
   }
 }
