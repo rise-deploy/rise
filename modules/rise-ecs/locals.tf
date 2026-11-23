@@ -74,6 +74,9 @@ locals {
     RISE_JWT_SIGNING_SECRET = module.secrets.environment.RISE_JWT_SIGNING_SECRET
     RISE_ENCRYPTION_KEY     = module.secrets.environment.RISE_ENCRYPTION_KEY
     OIDC_CLIENT_SECRET      = module.secrets.environment.OIDC_CLIENT_SECRET
+    # Rise requires this bearer token on the Traefik HTTP-provider endpoint; the
+    # Traefik task presents the same secret (see `traefik.config_secret_arn`).
+    RISE_TRAEFIK_CONFIG_SECRET = module.secrets.environment.RISE_TRAEFIK_CONFIG_SECRET
     }, var.control_plane_local_config_secret_arn == null ? {} : {
     RISE_LOCAL_CONFIG_YAML = var.control_plane_local_config_secret_arn
   })

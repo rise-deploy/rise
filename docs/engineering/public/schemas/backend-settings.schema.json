@@ -709,6 +709,14 @@
                 "null"
               ]
             },
+            "traefik_config_secret": {
+              "default": null,
+              "description": "Shared secret protecting the Traefik HTTP-provider endpoint\n(`GET /internal/traefik/config` on port 3001). When set, requests must\ncarry `Authorization: Bearer <secret>` and are answered `401` otherwise;\nconfigure Traefik with\n`--providers.http.headers.Authorization=\"Bearer <secret>\"`. When unset\nthe endpoint is unauthenticated and must be kept off untrusted\nnetworks. At least 16 characters, no whitespace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "traefik_entrypoint": {
               "default": "web",
               "description": "Traefik entrypoint name routers bind to (e.g. `web`, `websecure`).\nDefaults to `web`.",
@@ -980,6 +988,14 @@
             "traefik_certresolver": {
               "default": null,
               "description": "Optional Traefik certresolver name for automatic TLS.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "traefik_config_secret": {
+              "default": null,
+              "description": "Shared secret protecting the Traefik HTTP-provider endpoint\n(`GET /internal/traefik/config` on port 3001). When set, requests must\ncarry `Authorization: Bearer <secret>` and are answered `401` otherwise;\nconfigure Traefik with\n`--providers.http.headers.Authorization=\"Bearer <secret>\"`. When unset\nthe endpoint is unauthenticated and must be kept off untrusted\nnetworks. At least 16 characters, no whitespace.",
               "type": [
                 "string",
                 "null"

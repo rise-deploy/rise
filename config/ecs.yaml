@@ -160,6 +160,13 @@ deployment_controller:
   # the authoritative readiness signal with no fallback, so without a reachable
   # API such a deployment never becomes Healthy.
   traefik_api_url: "${RISE_TRAEFIK_API_URL:-}"
+  # Shared secret for Traefik's HTTP provider endpoint (:3001
+  # /internal/traefik/config). When set, Rise requires `Authorization: Bearer
+  # <secret>` there and Traefik must send the same value
+  # (`--providers.http.headers.Authorization="Bearer <secret>"`). Empty leaves
+  # the endpoint unauthenticated, which is only safe while port 3001 is reachable
+  # by Traefik alone.
+  traefik_config_secret: "${RISE_TRAEFIK_CONFIG_SECRET:-}"
 
   # Workload identity. Every task runs a small sidecar (`rise identity agent`
   # from the rise-cli image) that writes the credential and [identity] token

@@ -17,6 +17,12 @@ resource "random_bytes" "encryption_key" {
   length = 32 # AES-GCM-256.
 }
 
+# Bearer token Traefik presents to Rise's HTTP-provider endpoint. Hex, so it is
+# safe inside an HTTP header and a shell word without quoting.
+resource "random_bytes" "traefik_config_secret" {
+  length = 32
+}
+
 resource "aws_secretsmanager_secret" "jwt_signing_secret" {
   name                    = "${var.name}/jwt-signing-secret"
   description             = "Rise JWT signing key"
@@ -54,4 +60,17 @@ resource "aws_secretsmanager_secret_version" "oidc_client_secret" {
   secret_id                = aws_secretsmanager_secret.oidc_client_secret.id
   secret_string_wo         = var.oidc_client_secret
   secret_string_wo_version = parseint(substr(sha256(var.oidc_client_secret), 0, 13), 16)
+}
+
+resource "aws_secretsmanager_secret" "traefik_config_secret" {
+  name                    = "${var.name}/traefik-config-secret"
+  description             = "Bearer token Traefik presents to Rise's HTTP-provider endpoint"
+  recovery_window_in_days = var.recovery_window_days
+  tags                    = var.tags
+}
+
+resource "aws_secretsmanager_secret_version" "traefik_config_secret" {
+  secret_id                = aws_secretsmanager_secret.traefik_config_secret.id
+  secret_string_wo         = random_bytes.traefik_config_secret.hex
+  secret_string_wo_version = parseint(substr(sha256(random_bytes.traefik_config_secret.hex), 0, 13), 16)
 }

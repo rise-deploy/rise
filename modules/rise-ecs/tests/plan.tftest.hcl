@@ -113,6 +113,37 @@ run "creates_a_whole_install" {
   }
 }
 
+# One generated secret guards Rise's HTTP-provider endpoint. Rise receives it as
+# an injected secret and Traefik presents it, so neither task definition carries
+# the value. The rendered Traefik container definition is unknown at plan time
+# (it embeds the secret's ARN), so the wiring is asserted on its inputs.
+run "traefik_config_secret_reaches_rise_through_secret_injection" {
+  command = plan
+  assert {
+    condition = (
+      contains(keys(local.control_plane_secret_environment), "RISE_TRAEFIK_CONFIG_SECRET")
+      && !contains(keys(local.rise_environment), "RISE_TRAEFIK_CONFIG_SECRET")
+    )
+    error_message = "the Traefik config secret must reach Rise as a secret, never a plain environment value"
+  }
+  assert {
+    # Database, JWT, encryption, OIDC and Traefik config secrets. The ARNs are
+    # unknown at plan time, so only the count is observable.
+    condition     = length(output.secret_arns_for_execution_role) == 5
+    error_message = "the execution role must be allowed to read the Traefik config secret"
+  }
+}
+
+run "rejects_overriding_the_traefik_config_secret" {
+  command = plan
+  variables {
+    control_plane_secret_environment = {
+      RISE_TRAEFIK_CONFIG_SECRET = "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/other-abc123"
+    }
+  }
+  expect_failures = [var.control_plane_secret_environment]
+}
+
 run "maintenance_startup_settings_reach_runtime" {
   command = plan
   variables {
@@ -184,8 +215,8 @@ run "injects_additional_control_plane_secrets" {
 
   assert {
     condition = (
-      length(output.secret_arns_for_execution_role) == 5
-      && output.secret_arns_for_execution_role[4] == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123"
+      length(output.secret_arns_for_execution_role) == 6
+      && output.secret_arns_for_execution_role[5] == "arn:aws:secretsmanager:eu-central-1:123456789012:secret:rise/snowflake-oauth-abc123"
     )
     error_message = "execution-role output must contain each base secret ARN once"
   }
