@@ -155,9 +155,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.104"
+version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
 name = "arc-swap"
@@ -550,7 +550,7 @@ dependencies = [
  "lru",
  "percent-encoding",
  "regex-lite",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tracing",
  "url",
 ]
@@ -680,7 +680,7 @@ dependencies = [
  "http 1.5.0",
  "p256",
  "percent-encoding",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "subtle",
  "time",
  "tracing",
@@ -715,7 +715,7 @@ dependencies = [
  "md-5",
  "pin-project-lite",
  "sha1 0.11.0",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tracing",
 ]
 
@@ -1277,9 +1277,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.9"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "844c5c0b65be192cb68d570cca1b21a6444431d24e39c084dc0336177015337c"
+checksum = "50066ca966813ca8957ee15361752f19424a8ff620dbe9c8993d9f99d99b04b3"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -1287,9 +1287,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.7"
+version = "4.6.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
+checksum = "a0ed97c96ef4efb3cc84e09fa388df4463e7cc3224ec38d7b1d9e45749333590"
 dependencies = [
  "anstream",
  "anstyle",
@@ -3082,9 +3082,9 @@ dependencies = [
 
 [[package]]
 name = "kube"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "208d7fe1380066abb194812a8a8e303cb896a33bb3d7b3177b71bd03ff39bf18"
+checksum = "e0a034a7cb6141527e9225e660e48565305b8557f9fb71946d5436aee929d82f"
 dependencies = [
  "k8s-openapi",
  "kube-client",
@@ -3095,9 +3095,9 @@ dependencies = [
 
 [[package]]
 name = "kube-client"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31e940a73033a7c5c7918b5ece7851d84571b58be25e937198da37fa13f116d3"
+checksum = "0dd59e09518478bda46674fb056103318e443a000089b342d32e440a52afe552"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3131,9 +3131,9 @@ dependencies = [
 
 [[package]]
 name = "kube-core"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d2353c118cf3462c352ee0b5bd5b0cf17990af456dfd8662d136ff9812eeb4"
+checksum = "10b14df286fa701cd30920fa5251f26d8fcbd0fc54b50e02281cafe0a4505743"
 dependencies = [
  "derive_more",
  "form_urlencoded",
@@ -3150,9 +3150,9 @@ dependencies = [
 
 [[package]]
 name = "kube-derive"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92141c19e1fa83bf91633c1234c66b03375c29aa8ca5486331ddb47e3a3da9c0"
+checksum = "765bfab0ab9f36780fc2d99b53f28d5594df530bb9c1164a82028276a3669b61"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -3164,9 +3164,9 @@ dependencies = [
 
 [[package]]
 name = "kube-runtime"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eb064ef71c7bea55e934a443960da9e9ec31fbb2ba63e47e4aeca32603d5cc7"
+checksum = "5733225dce4bcc855a689f57b741423d27e593631987724067bc0c3ac5e10342"
 dependencies = [
  "ahash",
  "async-broadcast",
@@ -4333,7 +4333,7 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
@@ -4355,7 +4355,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "tokio",
  "tracing",
@@ -4383,7 +4383,7 @@ dependencies = [
  "rise-runtime-sync",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "tar",
  "tokio",
@@ -4416,7 +4416,7 @@ dependencies = [
  "rise-runtime-sync",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "tokio",
  "tokio-util",
@@ -4445,7 +4445,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "tokio",
  "tokio-util",
@@ -4465,7 +4465,7 @@ dependencies = [
  "rise-deployment-spec",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "tokio",
  "tracing",
  "url",
@@ -4531,7 +4531,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "serde_yaml",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "snowflake-connector-rs",
  "sqlx",
  "subtle",
@@ -4603,7 +4603,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
@@ -5090,9 +5090,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.1"
+version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+checksum = "5b0e5c7d67bc53f435386b2130fdc900488c5703770f6d8a4633060e34288a27"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -5281,7 +5281,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "smallvec",
  "thiserror 2.0.21",
  "tokio",
@@ -5319,7 +5319,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx-core",
  "sqlx-mysql",
  "sqlx-postgres",
@@ -5351,7 +5351,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "sha1 0.11.0",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "sqlx-core",
  "thiserror 2.0.21",
  "tracing",
@@ -5385,7 +5385,7 @@ dependencies = [
  "rand 0.10.4",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.2",
  "smallvec",
  "sqlx-core",
  "stringprep",
@@ -5558,7 +5558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
