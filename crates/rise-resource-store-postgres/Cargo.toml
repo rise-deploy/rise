@@ -10,7 +10,7 @@ publish = false
 rise-resource-api = { path = "../rise-resource-api" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
-jsonschema = "0.60"
+jsonschema = "0.63"
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
