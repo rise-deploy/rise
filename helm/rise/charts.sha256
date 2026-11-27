@@ -7,8 +7,8 @@
 # dependency build` alone. This file pins the exact bytes.
 #
 # Format: <sha256>  <filename>  (compatible with `shasum -a 256 -c`).
-# Regenerate by running: cd helm/rise/charts && shasum -a 256 *.tgz > ../charts.sha256
-# (then re-add the leading comment block).
+# Regenerate with `mise helm:deps` (or scripts/update-chart-digests.sh alone);
+# Renovate runs the script on subchart bumps.
 efb95c875245af3c73a93b50331dfcece7cd573d5f788d934748a741c9c1747a  alloy-1.16.0.tgz
 174c803546f65879a5b4dac60d2780621fd69bc790c1e66de936046e43ccbc43  loki-7.7.0.tgz
 771708dc58ab0a46e330a9128ea0dbbe6e6ff3eca854bbed67f7ce57862266f3  metacontroller-helm-4.17.11.tgz
